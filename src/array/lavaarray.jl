@@ -1,0 +1,162 @@
+# LavaArray{T,N} — GPU array backed by Vulkan buffer
+#
+# Full GPUArrays.jl compatible implementation with DataRef, offset, derive.
+
+import GPUArraysCore: AbstractGPUArray, AbstractGPUVector, AbstractGPUMatrix
+
+"""
+    LavaArray{T,N} <: AbstractGPUArray{T,N}
+
+GPU array backed by a Vulkan device-local buffer with BDA (Buffer Device Address).
+"""
+mutable struct LavaArray{T,N} <: AbstractGPUArray{T,N}
+    buf::GPUArrays.DataRef{VkManagedBuffer}
+    dims::NTuple{N,Int}
+    offset::Int  # offset in number of elements (not bytes)
+
+    function LavaArray{T,N}(buf::GPUArrays.DataRef{VkManagedBuffer}, dims::NTuple{N,Int};
+                            offset::Integer=0) where {T,N}
+        new{T,N}(buf, dims, offset)
+    end
+end
+
+function LavaArray{T,N}(::UndefInitializer, dims::NTuple{N,Int}) where {T,N}
+    nbytes = prod(dims) * sizeof(T)
+    managed_buf = vk_alloc(max(nbytes, 16))
+    ref = GPUArrays.DataRef(managed_buf) do buf
+        vk_free!(buf)
+    end
+    LavaArray{T,N}(ref, dims)
+end
+
+# Varargs constructor for LavaArray{T,N}(undef, d1, d2, ...)
+LavaArray{T,N}(::UndefInitializer, dims::Int...) where {T,N} = LavaArray{T,N}(undef, dims)
+LavaArray{T,N}(::UndefInitializer, dims::Integer...) where {T,N} = LavaArray{T,N}(undef, Int.(dims))
+LavaArray{T,N}(::UndefInitializer, dims::NTuple{N,Integer}) where {T,N} = LavaArray{T,N}(undef, Int.(dims))
+
+# Empty vector constructor (matches Array{T,1}() behavior)
+LavaArray{T,1}() where {T} = LavaArray{T,1}(undef, (0,))
+
+LavaArray{T}(::UndefInitializer, dims::NTuple{N,Int}) where {T,N} = LavaArray{T,N}(undef, dims)
+LavaArray{T}(::UndefInitializer, dims::NTuple{N,Integer}) where {T,N} = LavaArray{T,N}(undef, Int.(dims))
+LavaArray{T}(::UndefInitializer, dims::Integer...) where {T} = LavaArray{T}(undef, Int.(dims))
+
+# Construct from host data
+function LavaArray{T,N}(data::AbstractArray{T,N}) where {T,N}
+    arr = LavaArray{T,N}(undef, size(data))
+    upload!(arr, data)
+    return arr
+end
+LavaArray(data::AbstractArray{T,N}) where {T,N} = LavaArray{T,N}(data)
+
+# Type-converting constructors: LavaArray{T}(array_of_S)
+function LavaArray{T}(data::AbstractArray{S,N}) where {T,S,N}
+    LavaArray{T,N}(convert(AbstractArray{T}, data))
+end
+function LavaArray{T,N}(data::AbstractArray{S,N}) where {T,S,N}
+    LavaArray{T,N}(convert(AbstractArray{T}, data))
+end
+
+# UniformScaling constructor (resolve ambiguity with GPUArrays inner constructor)
+import LinearAlgebra: UniformScaling
+function (::Type{LavaArray{T,N}})(s::UniformScaling, dims::Tuple{Int,Int}) where {T,N}
+    res = similar(LavaArray{T,N}, dims)
+    fill!(res, zero(T))
+    isempty(res) && return res
+    @kernel function identity_kernel!(res, stride, val)
+        i = @index(Global, Linear)
+        ilin = (stride * (i - 1)) + i
+        if ilin <= length(res)
+            @inbounds res[ilin] = val
+        end
+    end
+    kernel = identity_kernel!(LavaBackend())
+    kernel(res, size(res, 1), T(s.λ); ndrange=minimum(dims))
+    return res
+end
+(::Type{LavaArray{T}})(s::UniformScaling, dims::Tuple{Int,Int}) where {T} =
+    LavaArray{T,2}(s, dims)
+
+# ── GPUArrays interface: storage & derive ──
+
+GPUArrays.storage(a::LavaArray) = a.buf
+
+function GPUArrays.derive(::Type{T}, a::LavaArray, dims::Dims{N}, offset::Int) where {T,N}
+    ref = copy(a.buf)
+    offset += (a.offset * Base.elsize(a)) ÷ sizeof(T)
+    LavaArray{T,N}(ref, dims; offset)
+end
+
+# ── copy ──
+
+function Base.copy(a::LavaArray{T,N}) where {T,N}
+    b = similar(a)
+    copyto!(b, 1, a, 1, length(a))
+    return b
+end
+
+# ── similar ──
+
+Base.similar(a::LavaArray{T,N}) where {T,N} = LavaArray{T,N}(undef, a.dims)
+Base.similar(a::LavaArray{T}, dims::Base.Dims{N}) where {T,N} = LavaArray{T,N}(undef, dims)
+Base.similar(a::LavaArray, ::Type{T}, dims::Base.Dims{N}) where {T,N} = LavaArray{T,N}(undef, dims)
+
+# ── Base interface ──
+
+Base.size(a::LavaArray) = a.dims
+Base.length(a::LavaArray) = prod(a.dims)
+Base.sizeof(a::LavaArray{T}) where T = length(a) * sizeof(T)
+Base.eltype(::LavaArray{T}) where T = T
+Base.ndims(::LavaArray{T,N}) where {T,N} = N
+Base.IndexStyle(::Type{<:LavaArray}) = IndexLinear()
+Base.elsize(::Type{<:LavaArray{T}}) where T = sizeof(T)
+
+# BDA address for kernel argument passing (includes offset)
+function bda_address(a::LavaArray{T}) where T
+    a.buf[].address + a.offset * sizeof(T)
+end
+
+# ── Transfers ──
+
+"""Upload host data to GPU array."""
+function upload!(dst::LavaArray{T}, data::AbstractArray{T}) where T
+    @assert length(data) == length(dst) "Size mismatch: $(length(data)) vs $(length(dst))"
+    bytes = Vector{UInt8}(reinterpret(UInt8, vec(collect(data))))
+    upload!(dst.buf[], bytes; offset=dst.offset * sizeof(T))
+end
+
+"""Download GPU array to host."""
+function Base.Array(src::LavaArray{T,N}) where {T,N}
+    result = Array{T}(undef, src.dims...)
+    download_typed!(vec(result), src.buf[]; offset=src.offset * sizeof(T))
+    return result
+end
+
+"""Convenience: collect downloads to host."""
+Base.collect(a::LavaArray) = Array(a)
+
+# ── Memory management ──
+
+function unsafe_free!(a::LavaArray)
+    GPUArrays.unsafe_free!(a.buf)
+end
+
+# ── Device-side array (isbits, passed to GPU kernels) ──
+
+"""
+    LavaDeviceArray{T,N}
+
+Device-side isbits array representation for GPU kernels.
+Contains a Ptr{T} (actually a BDA address) and dimensions.
+"""
+struct LavaDeviceArray{T,N} <: GPUArrays.AbstractDeviceArray{T,N}
+    ptr::Ptr{T}
+    dims::NTuple{N,Int}
+end
+
+Base.size(a::LavaDeviceArray) = a.dims
+
+# Convert LavaArray → LavaDeviceArray for kernel arguments
+function LavaDeviceArray(a::LavaArray{T,N}) where {T,N}
+    LavaDeviceArray{T,N}(Ptr{T}(bda_address(a)), a.dims)
+end
