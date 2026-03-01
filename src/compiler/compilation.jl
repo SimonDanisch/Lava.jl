@@ -161,9 +161,46 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # entry function. After inlining, the error paths become dead code.
     _force_inline_all!(mod, entry_fn)
 
+    # ── Post-inlining optimization ──
+    # After force-inlining, newly visible optimization opportunities appear:
+    # - The BDA wrapper stores args into individual allocas, then the inlined
+    #   kernel body constructs tuples from them. Without SROA, the tuple
+    #   construction creates GEPs that read across alloca boundaries (using the
+    #   full original struct type on a decomposed alloca). This is valid with
+    #   opaque pointers on CPU but invalid in SPIR-V where allocas are separate.
+    # - SROA decomposes these intermediate allocas, eliminating the cross-alloca reads.
+    LLVM.run!(LLVM.InstCombinePass(), mod)
+    LLVM.run!(LLVM.SROAPass(), mod)
+    LLVM.run!(LLVM.InstCombinePass(), mod)
+
+    # ── Fix inttoptr address spaces after SROA ──
+    # SROA eliminates allocas and creates `inttoptr i64 %bda_val to ptr` (addrspace 0)
+    # for BDA pointer fields. These should be addrspace 1 (PhysicalStorageBuffer)
+    # for correct SPIR-V emission. Convert them and update all downstream uses.
+    _fix_inttoptr_addrspace!(mod)
+
+    # ── Remove Julia runtime artifacts from inlined error paths ──
+    # After force-inlining, error/boxing helpers may reference Julia runtime:
+    # - `load i64, ptr @jl_int64_type` (type tags for boxing)
+    # - `store i64, ptr inttoptr(1)` (GC tag slot writes)
+    # These are dead error paths that will never execute on GPU. Remove them
+    # so the SPIR-V emitter doesn't need to handle runtime declarations.
+    _remove_julia_runtime_artifacts!(mod)
+
     # ── Lower LLVM intrinsics unsupported by SPIR-V ──
     # memcpy → typed loads/stores, lifetime markers → removed
     _lower_unsupported_intrinsics!(mod)
+
+    # ── Fix GEPs with mismatched source types on allocas ──
+    # After SROA + inlining, some GEPs reference the original full tuple type
+    # through a smaller alloca pointer. Convert these to byte-offset GEPs so the
+    # lift_byte_geps pass can properly convert them using the alloca's type.
+    _fix_gep_alloca_type_mismatches!(mod)
+
+    # ── Flatten chained GEPs on allocas ──
+    # Pattern: gep i8 alloca -4 → gep i32 result %idx  →  gep i8 alloca (-4 + idx*4)
+    # This handles Julia's 1-based MArray indexing where the base is shifted.
+    _flatten_chained_geps_on_allocas!(mod)
 
     # ── Lift byte-offset GEPs to typed GEPs ──
     # Julia accesses struct fields via `getelementptr i8, ptr %p, i64 <offset>`.
@@ -208,16 +245,49 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # new struct stores to workgroup memory that need field-by-field decomposition.
     _decompose_composite_workgroup_accesses!(mod, dl)
 
+    # Decompose type-punned loads through GEPs into struct allocas.
+    # LLVM memcpy optimization creates `load i64, ptr %gep_to_float_field` —
+    # reads crossing struct field boundaries. Decompose into per-field loads + pack.
+    _decompose_typepun_gep_loads!(mod, dl)
+
     # LLVM may create loads where the type differs from the alloca type
     # (e.g., `load i16` from `alloca { [2 x i8] }`). SPIR-V requires strict
     # type matching, so rewrite these to byte-by-byte extraction.
     _fix_alloca_type_mismatched_loads!(mod)
+
+    # LLVM SROA/memcpy lowering creates `store i32, ptr %alloca_of_[16 x i64]`.
+    # SPIR-V requires the stored value type to match the pointer's pointee type.
+    # Rewrite these stores to drill into the alloca type via GEP.
+    _fix_alloca_type_mismatched_stores!(mod, dl)
+
+    # Lower chained mismatched-type GEPs on allocas.
+    # Julia's MArray/StaticArray patterns create chains like:
+    #   %base = getelementptr i32, ptr %alloca_[16 x i64], i64 -1
+    #   %elem = getelementptr i32, ptr %base, i64 %var
+    #   store i32 %val, ptr %elem
+    # Lower to proper element-level access with runtime index computation.
+    _lower_chained_mismatched_geps!(mod)
+
+    # ── Lower byte-offset GEP chains on MArray allocas ──
+    # After InstCombine splits flattened byte-offset GEPs back into chains:
+    #   %gep1 = gep i8, ptr %alloca_[16xi64], %dynamic
+    #   %gep2 = gep i8, ptr %gep1, -4
+    #   store i32 %val, ptr %gep2
+    # Lower to proper element-level access with shift/mask (no integer divide).
+    _lower_byte_gep_chain_on_allocas!(mod)
 
     # ── Lift byte-offset GEPs on workgroup globals ──
     # The decompose passes above may create byte-offset ConstantExpr GEPs like
     # `gep i8, @shared, <offset>` when splitting struct loads from workgroup globals.
     # Convert these to typed struct-member GEPs so the emitter produces proper OpAccessChain.
     _lift_byte_geps_on_workgroup_globals!(mod, dl)
+
+    # ── Final cleanup: fix GEPs with mismatched source types on allocas ──
+    # LLVM's SROA/memcpy lowering can create typed GEPs using wrong source types
+    # (e.g., `gep [3 x float]` on `alloca [3 x i32]`). Convert these to byte-offset
+    # GEPs followed by the lift pass to normalize types.
+    _fix_gep_alloca_type_mismatches!(mod)
+    _lift_byte_geps_on_allocas!(mod)
 
     return nothing
 end
@@ -808,6 +878,9 @@ function _lower_unsupported_intrinsics!(mod::LLVM.Module)
                 if startswith(fname, "llvm.memcpy")
                     _lower_memcpy!(inst)
                     push!(to_erase, inst)
+                elseif startswith(fname, "llvm.memset")
+                    _lower_memset!(inst)
+                    push!(to_erase, inst)
                 elseif startswith(fname, "llvm.lifetime")
                     push!(to_erase, inst)
                 end
@@ -822,8 +895,8 @@ function _lower_unsupported_intrinsics!(mod::LLVM.Module)
     # Remove dead intrinsic declarations
     for fn in collect(LLVM.functions(mod))
         fname = LLVM.name(fn)
-        if (startswith(fname, "llvm.memcpy") || startswith(fname, "llvm.lifetime")) &&
-           isempty(LLVM.uses(fn))
+        if (startswith(fname, "llvm.memcpy") || startswith(fname, "llvm.memset") ||
+            startswith(fname, "llvm.lifetime")) && isempty(LLVM.uses(fn))
             LLVM.erase!(fn)
         end
     end
@@ -878,6 +951,58 @@ function _lower_memcpy!(inst::LLVM.CallInst)
                 LLVM.store!(builder, val, dst_ptr)
                 offset += 1
             end
+        end
+    end
+end
+
+"""
+Lower a single memset call to explicit stores.
+SPIR-V has no memset intrinsic, so we replace with i32 stores (4-byte chunks)
+plus i8 tail stores. For addrspace 0 (allocas), uses GEP-based addressing.
+"""
+function _lower_memset!(inst::LLVM.CallInst)
+    ops = LLVM.operands(inst)
+    dst = ops[1]
+    fill_val = ops[2]  # i8
+    len_val = ops[3]
+
+    if !(len_val isa LLVM.ConstantInt)
+        error("Cannot lower memset with non-constant length: $inst")
+    end
+    nbytes = convert(Int, len_val)
+
+    T_i8 = LLVM.Int8Type()
+    T_i32 = LLVM.Int32Type()
+    T_i64 = LLVM.Int64Type()
+
+    LLVM.@dispose builder=LLVM.IRBuilder() begin
+        LLVM.position!(builder, inst)
+
+        # Build fill word: replicate i8 val to i32
+        val32 = LLVM.zext!(builder, fill_val, T_i32)
+        v1 = LLVM.shl!(builder, val32, LLVM.ConstantInt(T_i32, 8))
+        val32 = LLVM.or!(builder, val32, v1)
+        v2 = LLVM.shl!(builder, val32, LLVM.ConstantInt(T_i32, 16))
+        val32 = LLVM.or!(builder, val32, v2)
+
+        # Store i32 chunks via byte-offset GEPs
+        n_words = nbytes ÷ 4
+        for i in 0:(n_words-1)
+            off = i * 4
+            ptr = if off == 0
+                dst
+            else
+                LLVM.gep!(builder, T_i8, dst, [LLVM.ConstantInt(T_i64, off)])
+            end
+            st = LLVM.store!(builder, val32, ptr)
+            LLVM.alignment!(st, 4)
+        end
+
+        # Handle tail bytes
+        for i in (n_words*4):(nbytes-1)
+            ptr = LLVM.gep!(builder, T_i8, dst, [LLVM.ConstantInt(T_i64, i)])
+            st = LLVM.store!(builder, fill_val, ptr)
+            LLVM.alignment!(st, 1)
         end
     end
 end

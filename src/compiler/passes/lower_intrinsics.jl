@@ -196,6 +196,64 @@ function _strip_assume!(mod::LLVM.Module)
 end
 
 """
+    _remove_julia_runtime_artifacts!(mod::LLVM.Module)
+
+Remove Julia runtime artifacts that appear after force-inlining error paths.
+
+After GPUCompiler's lower_throw! + rm_trap! + force inlining, the entry function
+may contain code from inlined error helpers that references Julia runtime:
+- `load i64, ptr @jl_int64_type` — loading type tags for boxing
+- `store i64 %val, ptr inttoptr (i64 1 to ptr)` — stores to GC tag slots
+
+These are dead error paths that should never execute on GPU. We replace:
+1. Stores to ConstantExpr inttoptr with small constants → delete
+2. Loads from external function declarations (jl_*_type) → replace with zero
+3. Runs DCE to clean up dead code chains
+"""
+function _remove_julia_runtime_artifacts!(mod::LLVM.Module)
+    for fn in LLVM.functions(mod)
+        isempty(LLVM.blocks(fn)) && continue
+        to_erase = LLVM.Instruction[]
+
+        for bb in LLVM.blocks(fn)
+            for inst in LLVM.instructions(bb)
+                # Remove stores to inttoptr(small_constant) — Julia GC/error paths
+                if inst isa LLVM.StoreInst
+                    ops = LLVM.operands(inst)
+                    ptr_op = ops[2]
+                    if ptr_op isa LLVM.ConstantExpr && LLVM.opcode(ptr_op) == LLVM.API.LLVMIntToPtr
+                        ce_ops = LLVM.operands(ptr_op)
+                        if ce_ops[1] isa LLVM.ConstantInt
+                            addr = convert(UInt64, ce_ops[1])
+                            if addr < 4096  # Small addresses are error paths
+                                push!(to_erase, inst)
+                            end
+                        end
+                    end
+                end
+
+                # Replace loads from external function decls (jl_*_type) with zero
+                if inst isa LLVM.LoadInst
+                    ptr_op = LLVM.operands(inst)[1]
+                    if ptr_op isa LLVM.Function && isempty(LLVM.blocks(ptr_op))
+                        load_ty = LLVM.value_type(inst)
+                        if load_ty isa LLVM.IntegerType
+                            zero = LLVM.ConstantInt(load_ty, 0)
+                            LLVM.replace_uses!(inst, zero)
+                            push!(to_erase, inst)
+                        end
+                    end
+                end
+            end
+        end
+
+        for inst in to_erase
+            LLVM.erase!(inst)
+        end
+    end
+end
+
+"""
     run_cfg_cleanup!(mod::LLVM.Module)
 
 Run the full CFG cleanup pipeline. Must be called BEFORE the structurize_cfg pipeline.

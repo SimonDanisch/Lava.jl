@@ -324,13 +324,25 @@ end
 function _infer_pointee_from_users(ptr_value::LLVM.Value, visited::Set{LLVM.Value})
     ptr_value in visited && return nothing
     push!(visited, ptr_value)
+    # Two passes: first prefer struct GEPs (non-byte-offset) which give the real base type,
+    # then fall back to byte-offset GEPs, loads, stores, atomics, PHIs.
+    # This prevents byte-offset GEPs (accessing individual fields) from overriding the
+    # struct source type when both exist on the same pointer.
     for use in LLVM.uses(ptr_value)
         user = LLVM.user(use)
         if user isa LLVM.GetElementPtrInst
             src_ty = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(user))
             if !(src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8)
                 return src_ty
-            else
+            end
+        end
+    end
+    # Second pass: byte-offset GEPs, loads, stores, atomics, PHIs
+    for use in LLVM.uses(ptr_value)
+        user = LLVM.user(use)
+        if user isa LLVM.GetElementPtrInst
+            src_ty = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(user))
+            if src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8
                 result = _infer_type_from_gep_users(user)
                 result !== nothing && return result
             end
@@ -345,7 +357,6 @@ function _infer_pointee_from_users(ptr_value::LLVM.Value, visited::Set{LLVM.Valu
         elseif user isa LLVM.AtomicCmpXchgInst
             return LLVM.value_type(LLVM.operands(user)[2])
         elseif user isa LLVM.PHIInst
-            # Follow through PHI chains with cycle detection
             result = _infer_pointee_from_users(user, visited)
             result !== nothing && return result
         end
@@ -1105,10 +1116,23 @@ function map_pointer_type_for_value!(ctx::SPIRVTypeContext, ptr_value::LLVM.Valu
         pointee_llvm = _infer_ptr_type_from_source_gep(ctx, ptr_value)
     end
     if pointee_llvm === nothing
-        # Last resort: for loaded pointers that are only stored (never dereferenced),
-        # default to i8. This produces a valid typed pointer in SPIR-V.
+        # Last resort fallbacks:
         if ptr_value isa LLVM.LoadInst && LLVM.value_type(ptr_value) isa LLVM.PointerType
+            # Loaded pointers that are only stored (never dereferenced) → i8
             pointee_llvm = LLVM.Int8Type()
+        elseif ptr_value isa LLVM.BitCastInst
+            # Pointer bitcast (typepun): try to get pointee from source operand
+            src_op = LLVM.operands(ptr_value)[1]
+            if LLVM.value_type(src_op) isa LLVM.PointerType
+                src_pointee = get_pointee_type(ctx.ptm, src_op)
+                if src_pointee !== nothing
+                    pointee_llvm = src_pointee
+                else
+                    pointee_llvm = LLVM.Int8Type()
+                end
+            else
+                pointee_llvm = LLVM.Int8Type()
+            end
         else
             error("Could not recover pointee type for pointer value: $(LLVM.name(ptr_value))")
         end
@@ -1177,7 +1201,9 @@ function _map_constant_int!(ctx::SPIRVTypeContext, val::LLVM.ConstantInt, ty::LL
     elseif w <= 32
         # Create constant with the CORRECT type (not always i32).
         # SPIR-V requires type-matched operands in comparisons.
-        bits = UInt32(int_val & 0xFFFFFFFF)
+        # Mask to actual bit width — SPIR-V requires high bits to be 0 for unsigned
+        # integer types (Signedness=0), which is what we emit.
+        bits = UInt32(int_val & ((UInt64(1) << w) - 1))
         key = (:const, type_id, bits)
         return get!(ctx.mod.constant_cache, key) do
             id = fresh_id!(ctx.mod)

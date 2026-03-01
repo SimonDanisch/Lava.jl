@@ -19,10 +19,23 @@ KA.synchronize(::LavaBackend) = vk_flush!()
 KA.allocate(::LavaBackend, ::Type{T}, dims::Tuple) where T = LavaArray{T}(undef, Int.(dims))
 KA.unsafe_free!(x::LavaArray) = unsafe_free!(x)
 
+function KA.copyto!(::LavaBackend, A, B)
+    GC.@preserve A B begin
+        copyto!(A, 1, B, 1, length(A))
+    end
+    return
+end
+
 # Adapt: convert Array ↔ LavaArray
-Adapt.adapt_storage(::LavaBackend, a::Array) = LavaArray(a)
+# Use Adapt.adapt(LavaArray, a) for recursive element adaptation (like AMDGPU does).
+# This handles non-isbits element types by recursively adapting struct fields.
+Adapt.adapt_storage(::LavaBackend, a::Array) = Adapt.adapt(LavaArray, a)
 Adapt.adapt_storage(::LavaBackend, a::LavaArray) = a
 Adapt.adapt_storage(::KA.CPU, a::LavaArray) = Array(a)
+
+# Type-based adapt_storage for Adapt.adapt(LavaArray, x) dispatch
+Adapt.adapt_storage(::Type{<:LavaArray}, a::Array) = LavaArray(a)
+Adapt.adapt_storage(::Type{<:LavaArray}, a::LavaArray) = a
 
 # ── Launch configuration ──
 

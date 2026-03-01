@@ -35,8 +35,8 @@ end
     PtrRef{T}(a.ptr)
 end
 
-@lava_device_override function Base.getindex(r::PtrRef{T}, i::Int) where T
-    PtrIndexableRef{T}(r.ptr, i)
+@lava_device_override function Base.getindex(r::PtrRef{T}, i::Integer) where T
+    PtrIndexableRef{T}(r.ptr, Int(i))
 end
 
 @lava_device_override function Atomix.pointer(ref::PtrIndexableRef{T}) where T
@@ -294,4 +294,17 @@ for T in (Int32, UInt32, Float32)
             UnsafeAtomics.modify!(ptr, op, val, UnsafeAtomics.monotonic)
         end
     end
+end
+
+# ── Base.modifyindex_atomic! override for LavaDeviceArray ──
+# Atomix 1.1.2+ @atomic macro expands to Base.modifyindex_atomic! on Julia 1.12+.
+# Without this override, the kernel tries to call jl_f_throw_methoderror on GPU.
+
+@lava_device_override @inline function Base.modifyindex_atomic!(
+    arr::LavaDeviceArray{T,N}, order::Symbol, op::OP, val, i::Integer
+) where {T, N, OP}
+    @inbounds ptr = pointer(arr, i)
+    v = convert(T, val)
+    result = UnsafeAtomics.modify!(ptr, op, v, UnsafeAtomics.seq_cst)
+    return result
 end

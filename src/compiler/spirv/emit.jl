@@ -107,6 +107,18 @@ function get_value_id!(state::SPIRVEmitterState, val::LLVM.Value)
         return _emit_constant_expr!(state, val)
     end
 
+    # Julia runtime function declarations used as global variables (type tags):
+    # e.g., @jl_int64_type is declared as a function but used as `load i64, ptr @jl_int64_type`.
+    # These appear in error/boxing paths that should never execute on GPU.
+    # Emit a zero constant of pointer-width as a safe fallback.
+    if val isa LLVM.Function && LLVM.isintrinsic(val) == false && isempty(LLVM.blocks(val))
+        # This is a declaration (no body) used as a value — Julia runtime type tag
+        u64_ty = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+        zero_id = _emit_u64_constant!(state.mod, UInt64(0))
+        state.value_map[val] = zero_id
+        return zero_id
+    end
+
     error("LLVM value not in value map and not a constant: $(typeof(val)) = $val")
 end
 
@@ -353,12 +365,52 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
         push!(state.used_merge_blocks, merge_id)
     end
 
+    # SPIR-V requires all Function-scope OpVariable at the start of the entry block.
+    # Pre-emit all allocas into a temporary buffer, register them in value_map,
+    # then inject the preamble right after the entry block's OpLabel during emission.
+    all_allocas = LLVM.AllocaInst[]
+    for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+        inst isa LLVM.AllocaInst && push!(all_allocas, inst)
+    end
+    # Emit allocas to a temporary buffer (not state.mod.functions)
+    preamble_words = UInt32[]
+    if !isempty(all_allocas)
+        # Temporarily swap functions buffer to capture preamble
+        real_buf = state.mod.functions
+        state.mod.functions = preamble_words
+        for alloca_inst in all_allocas
+            _emit_alloca!(state, alloca_inst)
+        end
+        state.mod.functions = real_buf
+    end
+
     # Emit basic blocks in reverse post-order (dominators before dominated blocks).
     # After StructurizeCFG, LLVM block order may not respect dominance, causing
     # forward references in non-PHI instructions.
     rpo_blocks = _reverse_postorder(fn)
+    entry_label_emitted = false
+    entry_label_pos = 0
     for bb in rpo_blocks
+        if !entry_label_emitted
+            entry_label_pos = length(state.mod.functions) + 1  # OpLabel will be emitted here
+        end
         emit_block!(state, bb)
+        # After the entry block is emitted (first block), inject OpVariable preamble
+        # right after the OpLabel (which is the first instruction emitted by emit_block!).
+        if !entry_label_emitted
+            entry_label_emitted = true
+            if !isempty(preamble_words)
+                # The entry block's OpLabel was emitted at `entry_label_pos`.
+                # OpLabel is 2 words. Insert preamble at entry_label_pos + 2.
+                insert_pos = entry_label_pos + 2
+                # Use a tail copy to avoid overlapping copyto! issues
+                tail_words = state.mod.functions[insert_pos:end]
+                n_preamble = length(preamble_words)
+                resize!(state.mod.functions, insert_pos - 1 + n_preamble + length(tail_words))
+                copyto!(state.mod.functions, insert_pos, preamble_words, 1, n_preamble)
+                copyto!(state.mod.functions, insert_pos + n_preamble, tail_words, 1, length(tail_words))
+            end
+        end
         # Emit any trampolines targeting the NEXT block in RPO order.
         # Trampolines must appear before the blocks that reference them.
         _emit_pending_trampolines!(state, bb, rpo_blocks)
@@ -481,7 +533,11 @@ function emit_instruction!(state::SPIRVEmitterState, inst::LLVM.Instruction)
     elseif inst isa LLVM.GetElementPtrInst
         _emit_gep!(state, inst)
     elseif inst isa LLVM.AllocaInst
-        _emit_alloca!(state, inst)
+        # Allocas are emitted as OpVariable at the start of the entry block
+        # (see emit_function!). Skip them during normal block emission.
+        if !haskey(state.value_map, inst)
+            _emit_alloca!(state, inst)
+        end
     # Conversions
     elseif inst isa LLVM.SExtInst
         _emit_sext!(state, inst)
@@ -776,7 +832,15 @@ function _emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
         # from ptr<[2 x half]> for ComplexF16, or loading i64 from ptr<[2 x float]>).
         actual_load = needs_bitcast ? actual_load_ty : load_ty
         pointee_ty_ld = get_pointee_type(state.type_ctx.ptm, ptr)
-        if pointee_ty_ld !== nothing && actual_load != pointee_ty_ld &&
+
+        # Special case: loading ptr from PSB where pointee was mapped to i64
+        # (from _emit_psb_byte_offset_with_user_type!). Load i64, then ConvertUToPtr.
+        psb_ptr_as_i64 = false
+        if actual_load isa LLVM.PointerType && pointee_ty_ld !== nothing &&
+           pointee_ty_ld isa LLVM.IntegerType && LLVM.width(pointee_ty_ld) == 64
+            psb_ptr_as_i64 = true
+            align = UInt32(8)
+        elseif pointee_ty_ld !== nothing && actual_load != pointee_ty_ld &&
            !(actual_load isa LLVM.PointerType) && !(pointee_ty_ld isa LLVM.PointerType)
             ld_spirv_ty = map_type!(state.type_ctx, actual_load)
             ld_ptr_ty = map_pointer_type!(state.type_ctx, ld_spirv_ty, SC.PhysicalStorageBuffer)
@@ -784,25 +848,41 @@ function _emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
             encode_instruction!(state.mod.functions, Op.OpBitcast, ld_ptr_ty, new_ptr_id, ptr_id)
             ptr_id = new_ptr_id
         end
-        # OpLoad: result_type, result_id, ptr, memory_operand, alignment
-        push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
-        push!(state.mod.functions, spirv_load_ty)
-        push!(state.mod.functions, load_id)
-        push!(state.mod.functions, ptr_id)
-        push!(state.mod.functions, UInt32(0x02))  # Aligned
-        push!(state.mod.functions, align)
+
+        if psb_ptr_as_i64
+            # Load as i64, then convert to typed pointer
+            i64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+            raw_load_id = fresh_id!(state.mod)
+            push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
+            push!(state.mod.functions, i64_spirv)
+            push!(state.mod.functions, raw_load_id)
+            push!(state.mod.functions, ptr_id)
+            push!(state.mod.functions, UInt32(0x02))  # Aligned
+            push!(state.mod.functions, align)
+            # Convert i64 → typed PSB pointer
+            encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ty, load_id, raw_load_id)
+        else
+            # OpLoad: result_type, result_id, ptr, memory_operand, alignment
+            push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
+            push!(state.mod.functions, spirv_load_ty)
+            push!(state.mod.functions, load_id)
+            push!(state.mod.functions, ptr_id)
+            push!(state.mod.functions, UInt32(0x02))  # Aligned
+            push!(state.mod.functions, align)
+        end
     else
         sc = _get_pointer_storage_class(ptr)
-        if sc == SC.Workgroup
-            # For Workgroup loads: if load type doesn't match pointer's pointee type,
-            # bitcast the POINTER to match the load type. Same rationale as workgroup stores —
-            # byte-offset GEPs produce i8* but the actual field may be i64.
+        if sc == SC.Workgroup || sc == SC.Function
+            # For Workgroup/Function loads: if load type doesn't match pointer's pointee type,
+            # bitcast the POINTER to match the load type. This happens when:
+            # - byte-offset GEPs produce i8* but the actual field may be i64
+            # - GEP chains access sub-elements (e.g. i32 within [16 x i64])
             pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
             if pointee_ty !== nothing
                 eff_load_ty = needs_bitcast ? actual_load_ty : load_ty
                 if eff_load_ty != pointee_ty && eff_load_ty isa LLVM.IntegerType && pointee_ty isa LLVM.IntegerType
                     val_spirv_ty = map_type!(state.type_ctx, eff_load_ty)
-                    new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, SC.Workgroup)
+                    new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
                     cast_id = fresh_id!(state.mod)
                     encode_instruction!(state.mod.functions, Op.OpBitcast, new_ptr_ty, cast_id, ptr_id)
                     ptr_id = cast_id
@@ -1359,12 +1439,15 @@ function _emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
     # LLVM may optimize bit-identical constants to a different type.
     # In SPIR-V, we need to bitcast the value to match the pointer's declared type.
     # Skip if we already resolved the pointer to a scalar field above.
-    if ptr_id == orig_ptr_id && store_val_bitcast_to === nothing
+    # Also skip for PSB stores — those use _fix_psb_ptr_type_for_store! instead
+    # (bitcasting the pointer to match the LLVM store type, not the other way around).
+    is_psb = _is_psb_pointer(ptr)
+    if !is_psb && ptr_id == orig_ptr_id && store_val_bitcast_to === nothing
         val_id = _bitcast_store_value_if_needed!(state, ptr, value, val_id)
     end
 
     # PhysicalStorageBuffer stores MUST have Aligned memory operand
-    if _is_psb_pointer(ptr)
+    if is_psb
         align = _get_alignment_for_type(LLVM.value_type(value))
         ptr_id = _fix_psb_ptr_type_for_store!(state, ptr, ptr_id, value)
         word_count = UInt32(5)  # opcode + ptr + val + mem_operand + alignment
@@ -1374,20 +1457,21 @@ function _emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
         push!(state.mod.functions, UInt32(0x02))  # Aligned
         push!(state.mod.functions, align)
     else
-        # For Workgroup stores: if value type doesn't match pointer's pointee type,
-        # bitcast the POINTER to match the value type. This happens when the
-        # _decompose_composite_workgroup_accesses! pass creates byte-offset GEPs
-        # (gep i8) to access struct fields — the GEP result is typed as i8* in SPIR-V,
-        # but the actual value being stored may be i64 (the struct field's true type).
+        # For Workgroup/Function stores: if value type doesn't match pointer's pointee type,
+        # bitcast the POINTER to match the value type. This happens when:
+        # - _decompose_composite_workgroup_accesses! creates byte-offset GEPs to struct fields
+        # - GEP chains access sub-elements (e.g. i32 within [16 x i64]) through byte-offset
+        #   GEPs that the lift pass couldn't fully resolve
         # We must NOT truncate the value — that loses data. Instead, OpBitcast the pointer.
-        if _get_pointer_storage_class(ptr) == SC.Workgroup
+        sc = _get_pointer_storage_class(ptr)
+        if sc == SC.Workgroup || sc == SC.Function
             pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
             if pointee_ty !== nothing
                 val_ty = LLVM.value_type(value)
                 if val_ty != pointee_ty && val_ty isa LLVM.IntegerType && pointee_ty isa LLVM.IntegerType
                     # Bitcast pointer to match value type
                     val_spirv_ty = map_type!(state.type_ctx, val_ty)
-                    new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, SC.Workgroup)
+                    new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
                     cast_id = fresh_id!(state.mod)
                     encode_instruction!(state.mod.functions, Op.OpBitcast, new_ptr_ty, cast_id, ptr_id)
                     ptr_id = cast_id
@@ -1409,11 +1493,27 @@ function _bitcast_store_value_if_needed!(state::SPIRVEmitterState, ptr::LLVM.Val
     pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
     pointee_ty === nothing && return val_id
 
+    # For pointer-to-pointer stores: LLVM opaque ptrs are always equal at the LLVM level,
+    # but the SPIR-V types may differ (e.g., _ptr_PSB_float vs _ptr_PSB__struct).
+    # This happens when PTM infers a different pointee type for the loaded ptr vs what the
+    # struct member declared. OpBitcast between pointer types of same storage class is valid.
+    # Must check BEFORE the val_ty == pointee_ty early return since both are opaque `ptr`.
+    if val_ty isa LLVM.PointerType && pointee_ty isa LLVM.PointerType
+        expected_spirv_ty = get(state.spirv_ptr_element_type, ptr, UInt32(0))
+        if expected_spirv_ty != UInt32(0)
+            actual_spirv_ty = map_pointer_type_for_value!(state.type_ctx, value)
+            if actual_spirv_ty != expected_spirv_ty
+                cast_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpBitcast, expected_spirv_ty, cast_id, val_id)
+                return cast_id
+            end
+        end
+        return val_id
+    end
+
     # If types already match, no bitcast needed
     val_ty == pointee_ty && return val_id
 
-    # Only bitcast between same-size scalar types (i32↔f32, i64↔f64)
-    # Skip if either type is a pointer (can't bitcast pointers in SPIR-V)
     if val_ty isa LLVM.PointerType || pointee_ty isa LLVM.PointerType
         return val_id
     end
@@ -1432,8 +1532,11 @@ function _bitcast_store_value_if_needed!(state::SPIRVEmitterState, ptr::LLVM.Val
         encode_instruction!(state.mod.functions, Op.OpBitcast, target_spirv_ty, cast_id, val_id)
         return cast_id
     else
-        # Different widths — PTM inferred wrong type, skip
-        return val_id
+        # Different widths — bitcast the pointer to match the value type.
+        # This happens when GEP chains access sub-elements (e.g. i32 within [16 x i64])
+        # through byte-offset GEPs that the lift pass couldn't fully resolve.
+        # Bitcast pointer: ptr<pointee_ty> → ptr<val_ty>, then store val_ty.
+        return val_id  # Return original val_id — we'll handle this in _emit_store! instead
     end
 end
 
@@ -1586,8 +1689,19 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
     if source_ty isa LLVM.IntegerType && LLVM.width(source_ty) == 8 && n_indices == 1
         base_pointee = get_pointee_type(state.type_ctx.ptm, base_ptr)
         if base_pointee !== nothing && !(base_pointee isa LLVM.IntegerType && LLVM.width(base_pointee) == 8)
-            _emit_byte_offset_gep!(state, inst, base_ptr, base_id, base_pointee)
-            return
+            if base_pointee isa LLVM.PointerType
+                # Opaque pointer base (e.g. BDA inttoptr after SROA): infer actual access
+                # type from users and use PSB byte arithmetic.
+                sc = _get_pointer_storage_class(base_ptr)
+                if sc == SC.PhysicalStorageBuffer
+                    _emit_psb_byte_offset_with_user_type!(state, inst, base_id, ops)
+                    return
+                end
+                # Non-PSB: fall through to regular GEP path
+            else
+                _emit_byte_offset_gep!(state, inst, base_ptr, base_id, base_pointee)
+                return
+            end
         end
     end
 
@@ -1623,25 +1737,39 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
         # `ptr → [N x T]` but LLVM generates `gep T, ptr @global, i64 %idx`.
         # In SPIR-V we must use OpAccessChain into the array, not OpPtrAccessChain.
         base_pointee = get_pointee_type(state.type_ctx.ptm, base_ptr)
-        if base_pointee isa LLVM.ArrayType && LLVM.eltype(base_pointee) == source_ty
+        if base_pointee isa LLVM.ArrayType && (LLVM.eltype(base_pointee) == source_ty ||
+            _compute_type_size(LLVM.eltype(base_pointee)) == _compute_type_size(source_ty))
             idx_i32 = _ensure_index_i32!(state, ops[2])
             result_id = fresh_id!(state.mod)
+
+            # When source_ty differs from array element type (type-punning via opaque ptrs,
+            # e.g. gep float, ptr @alloca_of_i32_array, i64 %idx), use the array's actual
+            # element type for OpAccessChain. Downstream load/store handles the bitcast.
+            arr_elem_ty = LLVM.eltype(base_pointee)
+            actual_result_ptr_ty = if arr_elem_ty != source_ty
+                elem_spirv = sc == SC.Workgroup ? map_workgroup_type!(state.type_ctx, arr_elem_ty) :
+                    map_type!(state.type_ctx, arr_elem_ty)
+                map_pointer_type!(state.type_ctx, elem_spirv, sc)
+            else
+                result_ptr_ty
+            end
 
             # Standard OpAccessChain to index into the array.
             # For struct arrays in Workgroup, this gives a pointer to the struct element.
             # Subsequent field accesses use byte-offset GEPs → struct member AccessChains.
             word_count = UInt32(5)  # result_type, result_id, base, index
             push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
-            push!(state.mod.functions, result_ptr_ty)
+            push!(state.mod.functions, actual_result_ptr_ty)
             push!(state.mod.functions, result_id)
             push!(state.mod.functions, base_id)
             push!(state.mod.functions, idx_i32)
             state.value_map[inst] = result_id
-            # Set PTM so downstream byte-offset GEPs can decompose struct accesses
-            set_pointee_type!(state.type_ctx.ptm, inst, source_ty; priority=5)
+            # Set PTM to actual array element type so loads/stores can bitcast correctly
+            ptm_ty = arr_elem_ty != source_ty ? arr_elem_ty : source_ty
+            set_pointee_type!(state.type_ctx.ptm, inst, ptm_ty; priority=5)
             # Record array element origin for folding chained GEPs (e.g. array[a][b] → array[a+b])
             state.array_element_origin[inst] = (base_id, idx_i32, base_pointee)
-        elseif sc == SC.Function && haskey(state.array_element_origin, base_ptr)
+        elseif (sc == SC.Function || sc == SC.Private) && haskey(state.array_element_origin, base_ptr)
             # Chained single-index GEP on a Function-SC array element:
             # base was from OpAccessChain into an array, fold by adding indices.
             # gep T, ptr (AccessChain array[a]), b  →  AccessChain array[a + b]
@@ -1673,6 +1801,11 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                 # Function storage class: OpPtrAccessChain is NOT valid.
                 # Use base pointer directly; load/store handlers resolve type mismatches.
                 result_id = base_id
+            elseif sc == SC.Private
+                # Private storage class: OpPtrAccessChain is NOT valid.
+                # Use OpAccessChain with element index for Private array globals.
+                result_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpAccessChain, result_ptr_ty, result_id, base_id, idx)
             else
                 # Normal pointer arithmetic: OpPtrAccessChain (Workgroup, StorageBuffer)
                 result_id = fresh_id!(state.mod)
@@ -1698,6 +1831,7 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
             # This happens when LLVM uses a sub-struct as GEP source type knowing the
             # first field is at offset 0 of the outer struct.
             ptm_pointee = get_pointee_type(state.type_ctx.ptm, base_ptr)
+            use_ptr_arithmetic = false
             if ptm_pointee !== nothing && ptm_pointee != source_ty
                 prefix_path = _find_zero_index_path(ptm_pointee, source_ty)
                 if prefix_path !== nothing
@@ -1705,9 +1839,80 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     for _ in prefix_path
                         push!(index_ids, zero_id)
                     end
+                elseif sc == SC.PhysicalStorageBuffer
+                    # Type-punned GEP on PSB pointer: GEP source type doesn't match the
+                    # SPIR-V pointee type and there's no zero-index navigation path.
+                    # This happens when LLVM SROA/memcpy expansion creates GEPs with a
+                    # different type view (e.g., flat [36 x i32] array, or smaller struct
+                    # reinterpretation of a larger struct). Compute byte offset from the
+                    # GEP indices on the GEP's own source type and use PSB ptr arithmetic.
+                    use_ptr_arithmetic = true
                 end
             end
 
+            if use_ptr_arithmetic
+                # Compute total byte offset by walking GEP indices through the source type
+                u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+                total_byte_offset = Int64(0)
+                all_const = true
+
+                current_walk_ty = source_ty
+                for i in 3:length(ops)
+                    idx_op = ops[i]
+                    if !(idx_op isa LLVM.ConstantInt)
+                        all_const = false
+                        break
+                    end
+                    idx_val = convert(Int64, idx_op)
+                    if current_walk_ty isa LLVM.StructType
+                        elems = LLVM.elements(current_walk_ty)
+                        for j in 0:(idx_val-1)
+                            total_byte_offset += Int64(_compute_type_size(elems[j+1]))
+                        end
+                        current_walk_ty = elems[idx_val+1]
+                    elseif current_walk_ty isa LLVM.ArrayType
+                        elem_ty = LLVM.eltype(current_walk_ty)
+                        total_byte_offset += idx_val * Int64(_compute_type_size(elem_ty))
+                        current_walk_ty = elem_ty
+                    else
+                        total_byte_offset += idx_val * Int64(_compute_type_size(current_walk_ty))
+                    end
+                end
+
+                if all_const
+                    byte_offset_id = _emit_u64_constant!(state.mod, UInt64(total_byte_offset))
+                else
+                    # Fallback: compute byte offset dynamically (rare, only if non-const index)
+                    # For now, just handle the simple [N x T] single-index case
+                    if length(ops) == 3 && source_ty isa LLVM.ArrayType
+                        elem_ty = LLVM.eltype(source_ty)
+                        elem_size = _compute_type_size(elem_ty)
+                        idx_op = ops[3]
+                        idx_id = get_value_id!(state, idx_op)
+                        idx_u64 = idx_id
+                        idx_ty = LLVM.value_type(idx_op)
+                        if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) < 64
+                            idx_u64 = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpSConvert, u64_spirv, idx_u64, idx_id)
+                        end
+                        stride_const = _emit_u64_constant!(state.mod, UInt64(elem_size))
+                        byte_offset_id = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, Op.OpIMul, u64_spirv, byte_offset_id, idx_u64, stride_const)
+                    else
+                        error("Type-punned GEP on PSB with non-constant indices not fully supported: $inst")
+                    end
+                end
+
+                # base_addr + byte_offset → result pointer
+                base_u64 = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, base_id)
+                elem_addr_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpIAdd, u64_spirv, elem_addr_id, base_u64, byte_offset_id)
+                result_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ptr_ty, result_id, elem_addr_id)
+                state.value_map[inst] = result_id
+                set_pointee_type!(state.type_ctx.ptm, inst, result_pointee; priority=3)
+            else
             for i in 3:length(ops)
                 push!(index_ids, _ensure_index_i32!(state, ops[i]))
             end
@@ -1722,6 +1927,7 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
             state.value_map[inst] = result_id
             # Track pointee type for downstream GEPs (e.g. single-index array element access)
             set_pointee_type!(state.type_ctx.ptm, inst, result_pointee; priority=3)
+            end
         else
             # First index is non-zero.
             # Check if the base pointer's pointee is an array whose element matches source_ty.
@@ -1785,6 +1991,21 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     # Function storage class: OpPtrAccessChain is NOT valid.
                     # Use base pointer directly; load/store handlers resolve type mismatches.
                     result_id = base_id
+                elseif sc == SC.Private
+                    # Private storage class: OpPtrAccessChain is NOT valid.
+                    # Use OpAccessChain with all indices for Private array globals.
+                    index_ids = UInt32[]
+                    push!(index_ids, get_value_id!(state, ops[2]))
+                    for i in 3:length(ops)
+                        push!(index_ids, _ensure_index_i32!(state, ops[i]))
+                    end
+                    result_id = fresh_id!(state.mod)
+                    word_count = UInt32(4 + length(index_ids))
+                    push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                    push!(state.mod.functions, result_ptr_ty)
+                    push!(state.mod.functions, result_id)
+                    push!(state.mod.functions, base_id)
+                    append!(state.mod.functions, index_ids)
                 else
                     # Normal case: OpPtrAccessChain with all indices (Workgroup, StorageBuffer)
                     _ensure_array_stride_decoration!(state, result_ptr_ty, source_ty)
@@ -1967,6 +2188,9 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
         push!(state.mod.functions, idx_i32)
         state.value_map[inst] = result_id
         set_pointee_type!(state.type_ctx.ptm, inst, elem_ty; priority=4)
+        # Register array element origin so chained byte-offset GEPs can fold offsets.
+        # E.g., gep i8, (gep i8, ptr @alloca, i64 %a), i64 %b  → AccessChain @alloca[a/sz + b/sz]
+        state.array_element_origin[inst] = (base_id, idx_i32, base_pointee)
         return
     end
 
@@ -2010,7 +2234,7 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
             # Use the base pointer directly — the load handler (_resolve_struct_field_load!)
             # will drill into the struct to find a compatible type. Since padding bytes are
             # undefined, any loaded value is semantically acceptable.
-            if sc == SC.Function
+            if sc == SC.Function || sc == SC.Private
                 state.value_map[inst] = base_id
                 set_pointee_type!(state.type_ctx.ptm, inst, base_pointee; priority=4)
                 return
@@ -2019,9 +2243,24 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
     end
 
     # For non-composite types: divide byte offset by type size for OpPtrAccessChain
-    elem_size = _compute_type_size(base_pointee)
+    # For PSB pointers from SROA-decomposed BDA struct accesses, the base pointee
+    # (from the first load) may differ from the actual field type at this byte offset.
+    # Infer the correct type from GEP users.
+    effective_pointee = base_pointee
+    if sc == SC.PhysicalStorageBuffer
+        user_type = _infer_type_from_gep_users(inst)
+        if user_type !== nothing
+            if user_type isa LLVM.PointerType
+                effective_pointee = LLVM.IntType(64)  # PSB pointers are 8-byte addresses
+            else
+                effective_pointee = user_type
+            end
+        end
+    end
 
-    pointee_spirv = map_type!(state.type_ctx, base_pointee)
+    elem_size = _compute_type_size(effective_pointee)
+
+    pointee_spirv = map_type!(state.type_ctx, effective_pointee)
     result_ptr_ty = map_pointer_type!(state.type_ctx, pointee_spirv, sc)
 
     if elem_size == 1
@@ -2049,10 +2288,42 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
         encode_instruction!(state.mod.functions, Op.OpIAdd, u64_spirv, elem_addr, base_u64, bo_u64)
         result_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ptr_ty, result_id, elem_addr)
-    elseif sc == SC.Function
-        # Function storage class: OpPtrAccessChain is NOT valid (VUID-StandaloneSpirv-Base-07650).
-        # Use base pointer directly and let load/store handlers resolve type mismatches.
-        result_id = base_id
+    elseif sc == SC.Function || sc == SC.Private
+        # Function/Private storage class: OpPtrAccessChain is NOT valid (VUID-StandaloneSpirv-Base-07650).
+        if sc == SC.Private
+            result_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpAccessChain, result_ptr_ty, result_id, base_id, idx_id)
+        elseif haskey(state.array_element_origin, base_ptr)
+            # Chained byte-offset GEP on a Function-SC array element pointer:
+            # base was from OpAccessChain into an array, fold by adding the element index offset.
+            # E.g., gep i8, ptr (AccessChain array[a]), -4  →  AccessChain array[a + (-4/elemsize)]
+            arr_base_id, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
+            # idx_id is already byte_offset / elem_size (computed above as SDiv)
+            # Convert idx_id to i32 for OpAccessChain
+            new_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
+                u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+                conv_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, idx_id)
+                conv_id
+            else
+                idx_id
+            end
+            u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+            combined_idx = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, combined_idx, prev_idx_id, new_idx_i32)
+            result_id = fresh_id!(state.mod)
+            word_count = UInt32(5)
+            push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+            push!(state.mod.functions, result_ptr_ty)
+            push!(state.mod.functions, result_id)
+            push!(state.mod.functions, arr_base_id)
+            push!(state.mod.functions, combined_idx)
+            # Propagate origin for further chaining
+            state.array_element_origin[inst] = (arr_base_id, combined_idx, arr_type)
+        else
+            # Function: use base pointer directly, let load/store handlers resolve.
+            result_id = base_id
+        end
     else
         _ensure_array_stride_decoration!(state, result_ptr_ty, base_pointee)
         result_id = fresh_id!(state.mod)
@@ -2061,7 +2332,7 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
     state.value_map[inst] = result_id
 
     # Update PTM so downstream stores/loads see the correct type
-    set_pointee_type!(state.type_ctx.ptm, inst, base_pointee; priority=4)
+    set_pointee_type!(state.type_ctx.ptm, inst, effective_pointee; priority=4)
 end
 
 """
@@ -2083,6 +2354,105 @@ function _emit_int_constant!(state::SPIRVEmitterState, ty::LLVM.LLVMType, value:
             id
         end
     end
+end
+
+"""
+Emit a PSB byte-offset GEP when the base pointee is an opaque PointerType.
+This happens after SROA decomposes BDA argument struct loads into individual
+field accesses via byte-offset GEPs. We infer the actual access type from
+the GEP's users (loads/stores) and produce a correctly-typed PSB pointer.
+"""
+function _emit_psb_byte_offset_with_user_type!(state::SPIRVEmitterState,
+                                                inst::LLVM.GetElementPtrInst,
+                                                base_id::UInt32,
+                                                ops)
+    byte_offset_id = get_value_id!(state, ops[2])
+    idx_ty = LLVM.value_type(ops[2])
+
+    # Infer the result pointee type from users (what type will be loaded/stored)
+    result_pointee = _infer_type_from_gep_users(inst)
+    if result_pointee === nothing
+        # Default to i64 (covers pointer loads — ptrs are 8 bytes)
+        result_pointee = LLVM.IntType(64)
+    end
+
+    # Map the inferred pointee type to SPIR-V
+    effective_pointee = if result_pointee isa LLVM.PointerType
+        # Loading a pointer — PSB pointers are 8-byte addresses.
+        # Use i64 as pointee; the load handler will convert i64 → typed ptr.
+        LLVM.IntType(64)
+    else
+        result_pointee
+    end
+    pointee_spirv = map_type!(state.type_ctx, effective_pointee)
+    result_ptr_ty = map_pointer_type!(state.type_ctx, pointee_spirv, SC.PhysicalStorageBuffer)
+
+    # PSB byte arithmetic: ptr→u64, add byte_offset, u64→ptr
+    u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+    base_u64 = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, base_id)
+
+    bo_u64 = byte_offset_id
+    if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) < 64
+        bo_u64 = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpSConvert, u64_spirv, bo_u64, byte_offset_id)
+    end
+
+    elem_addr = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpIAdd, u64_spirv, elem_addr, base_u64, bo_u64)
+
+    result_id = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ptr_ty, result_id, elem_addr)
+
+    state.value_map[inst] = result_id
+    set_pointee_type!(state.type_ctx.ptm, inst, effective_pointee; priority=4)
+end
+
+# _infer_type_from_gep_users is defined in types.jl
+
+"""
+Infer what a loaded pointer value points to by examining its users.
+When a `load ptr` produces a pointer, look at how that pointer is used
+(GEPs with struct source type, loads, stores) to determine the pointee.
+"""
+function _infer_inner_ptr_pointee(gep_or_load::LLVM.Instruction)
+    # Look at users of loads from this GEP/inttoptr
+    for use in LLVM.uses(gep_or_load)
+        user = LLVM.user(use)
+        if user isa LLVM.LoadInst
+            # The load produces a ptr — look at how that ptr is used.
+            # Two passes: prefer struct GEPs (non-byte-offset) over byte-offset GEPs,
+            # since byte-offset GEPs access individual fields while struct GEPs give
+            # the real base type.
+            for inner_use in LLVM.uses(user)
+                inner_user = LLVM.user(inner_use)
+                if inner_user isa LLVM.GetElementPtrInst
+                    src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inner_user))
+                    if !(src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8)
+                        return src_ty
+                    end
+                end
+            end
+            # Second pass: byte-offset GEPs, loads, stores
+            for inner_use in LLVM.uses(user)
+                inner_user = LLVM.user(inner_use)
+                if inner_user isa LLVM.GetElementPtrInst
+                    src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inner_user))
+                    if src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8
+                        inner_result = _infer_type_from_gep_users(inner_user)
+                        inner_result !== nothing && return inner_result
+                    end
+                elseif inner_user isa LLVM.LoadInst
+                    return LLVM.value_type(inner_user)
+                elseif inner_user isa LLVM.StoreInst
+                    if LLVM.operands(inner_user)[2] === user
+                        return LLVM.value_type(LLVM.operands(inner_user)[1])
+                    end
+                end
+            end
+        end
+    end
+    return nothing
 end
 
 """
@@ -2425,6 +2795,9 @@ function _emit_alloca!(state::SPIRVEmitterState, inst::LLVM.AllocaInst)
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, Op.OpVariable, ptr_ty, result_id, SC.Function)
     state.value_map[inst] = result_id
+    # Register pointee type so byte-offset GEPs (gep i8, ptr %alloca, i64 %offset)
+    # can resolve the actual element type and emit proper OpAccessChain.
+    set_pointee_type!(state.type_ctx.ptm, inst, alloc_ty; priority=5)
 end
 
 # ================================================================
@@ -2434,7 +2807,12 @@ end
 function _emit_conversion!(state::SPIRVEmitterState, inst::LLVM.Instruction, opcode::UInt16)
     ops = LLVM.operands(inst)
     src = get_value_id!(state, ops[1])
-    result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+    llvm_ty = LLVM.value_type(inst)
+    result_ty = if llvm_ty isa LLVM.PointerType
+        map_pointer_type_for_value!(state.type_ctx, inst)
+    else
+        map_type!(state.type_ctx, llvm_ty)
+    end
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, opcode, result_ty, result_id, src)
     state.value_map[inst] = result_id
@@ -2789,17 +3167,61 @@ The ipdom of the branch's parent block is the correct merge block for SPIR-V's
 OpSelectionMerge, since the merge is where all paths from the selection reconverge.
 """
 function _find_merge_block(state::SPIRVEmitterState, inst::LLVM.BrInst)
+    # After StructurizeCFG, one of the two branch targets is the merge (convergence) point.
+    # The merge is the target that the OTHER target's path eventually reaches.
+    # Two patterns:
+    #   Pattern 1 (if-then): true does work, false is merge. false_bb reachable from true path.
+    #   Pattern 2 (if-else-then): false does work, true is merge. true_bb reachable from false path.
+    #
+    # We check reachability: follow forward edges from one branch target to see if it
+    # reaches the other (without going through loop back-edges or the header itself).
     current_bb = LLVM.parent(inst)
-    ipdom_bb = get(state.ipdom, current_bb, nothing)
+    true_bb = LLVM.successors(inst)[1]
+    false_bb = LLVM.successors(inst)[2]
 
-    if ipdom_bb !== nothing && ipdom_bb !== current_bb
-        return get_block_id!(state, ipdom_bb)
+    # Check if true_bb is reachable from false_bb's path (pattern 2: true is merge)
+    if _is_forward_reachable(false_bb, true_bb, current_bb, state)
+        return get_block_id!(state, true_bb)
     end
 
-    # Fallback: if ipdom not found (shouldn't happen for structured CFGs),
-    # use the false branch as merge target
-    false_bb = LLVM.successors(inst)[2]
+    # Default: false branch is merge (pattern 1, most common after StructurizeCFG)
     return get_block_id!(state, false_bb)
+end
+
+"""
+Check if `target` is reachable from `start` following forward edges only,
+without going through `avoid` (the header block). Uses BFS.
+Only blocks back-edges: edges from a loop's continue block back to its header.
+"""
+function _is_forward_reachable(start::LLVM.BasicBlock, target::LLVM.BasicBlock,
+                                avoid::LLVM.BasicBlock, state::SPIRVEmitterState)
+    visited = Set{LLVM.BasicBlock}()
+    queue = LLVM.BasicBlock[start]
+    push!(visited, start)
+    push!(visited, avoid)  # Don't go through the header
+
+    while !isempty(queue)
+        bb = popfirst!(queue)
+        term = LLVM.terminator(bb)
+        for succ in LLVM.successors(term)
+            succ === target && return true
+            if succ ∉ visited
+                # Only block actual back-edges: from a loop's continue block to its header
+                is_backedge = false
+                if haskey(state.loop_info.loops, succ)
+                    # succ is a loop header. This is a back-edge only if bb is the
+                    # continue block for that loop.
+                    _, continue_bb = state.loop_info.loops[succ]
+                    is_backedge = (bb === continue_bb)
+                end
+                if !is_backedge
+                    push!(visited, succ)
+                    push!(queue, succ)
+                end
+            end
+        end
+    end
+    return false
 end
 
 """
@@ -2853,56 +3275,74 @@ end
 
 """
 Find the merge block for a selection inside a loop header.
-Both true_bb and false_bb are inside the loop (neither is the merge block).
-The inner merge is where both paths reconverge, which is the block that both
-paths eventually reach. Use BFS from false_bb since it's typically the "skip"
-path that goes directly to the reconvergence point.
+Both true_bb and false_bb are inside the loop (neither is the loop merge block).
+The inner merge is where both paths reconverge.
+
+After StructurizeCFG, two patterns occur:
+1. true_bb does work, then joins at false_bb (false_bb is merge) — "if-then" pattern
+2. false_bb does work, then joins at true_bb (true_bb is merge) — "if-else" pattern
+
+Pattern 2 happens when the loop header's condition gates a skip: if true, go directly
+to the flow block (convergence); if false, do the body then reach the same flow block.
+In this case true_bb IS the merge and one branch target equals the merge block, which
+is valid in SPIR-V.
 """
 function _find_inner_selection_merge(state::SPIRVEmitterState,
                                       true_bb::LLVM.BasicBlock,
                                       false_bb::LLVM.BasicBlock,
                                       loop_merge_bb::LLVM.BasicBlock)
-    # The inner merge is the first block reachable from BOTH true_bb and false_bb
-    # that's inside the loop (not the loop merge itself).
-    # In practice after StructurizeCFG, the false branch usually goes directly
-    # to the reconvergence point, and the true branch reaches it after some work.
+    # After StructurizeCFG, one branch does work and the other is the merge (skip).
+    # Use _is_forward_reachable to determine which is which.
+    # Must avoid back-edges AND the loop merge block.
 
-    # Collect blocks reachable from true_bb (stop at loop_merge)
-    true_reachable = Set{LLVM.BasicBlock}()
-    queue = LLVM.BasicBlock[true_bb]
-    while !isempty(queue)
-        bb = popfirst!(queue)
-        bb == loop_merge_bb && continue
-        bb in true_reachable && continue
-        push!(true_reachable, bb)
-        for succ in LLVM.successors(LLVM.terminator(bb))
-            push!(queue, succ)
-        end
-    end
-
-    # BFS from false_bb — first block that's also in true_reachable is the merge
-    visited = Set{LLVM.BasicBlock}()
-    queue = LLVM.BasicBlock[false_bb]
-    while !isempty(queue)
-        bb = popfirst!(queue)
-        bb == loop_merge_bb && continue
-        bb in visited && continue
-        push!(visited, bb)
-        if bb in true_reachable && bb != true_bb
-            return get_block_id!(state, bb)
-        end
-        for succ in LLVM.successors(LLVM.terminator(bb))
-            push!(queue, succ)
-        end
-    end
-
-    # Fallback: false_bb itself (it might be the convergence point)
-    if false_bb in true_reachable
+    # Check pattern 1: true does work, false is merge
+    # (true_bb eventually reaches false_bb without back-edges)
+    if _is_forward_reachable_inner(true_bb, false_bb, loop_merge_bb, state)
         return get_block_id!(state, false_bb)
     end
 
-    # Last resort: use the loop merge
-    return get_block_id!(state, loop_merge_bb)
+    # Check pattern 2: false does work, true is merge
+    # (false_bb eventually reaches true_bb without back-edges)
+    if _is_forward_reachable_inner(false_bb, true_bb, loop_merge_bb, state)
+        return get_block_id!(state, true_bb)
+    end
+
+    # Fallback: use false_bb as merge (most common after StructurizeCFG)
+    return get_block_id!(state, false_bb)
+end
+
+"""
+BFS reachability check that stops at `avoid` blocks and doesn't follow
+back-edges to loop headers. Used by _find_inner_selection_merge.
+"""
+function _is_forward_reachable_inner(start::LLVM.BasicBlock, target::LLVM.BasicBlock,
+                                      loop_merge_bb::LLVM.BasicBlock,
+                                      state::SPIRVEmitterState)
+    visited = Set{LLVM.BasicBlock}()
+    queue = LLVM.BasicBlock[start]
+    push!(visited, start)
+
+    while !isempty(queue)
+        bb = popfirst!(queue)
+        term = LLVM.terminator(bb)
+        for succ in LLVM.successors(term)
+            succ === target && return true
+            succ === loop_merge_bb && continue
+            if succ ∉ visited
+                # Don't follow back-edges to loop headers
+                is_backedge = false
+                if haskey(state.loop_info.loops, succ)
+                    _, continue_bb = state.loop_info.loops[succ]
+                    is_backedge = (bb === continue_bb)
+                end
+                if !is_backedge
+                    push!(visited, succ)
+                    push!(queue, succ)
+                end
+            end
+        end
+    end
+    return false
 end
 
 # Get or create a trampoline block that branches from current_block to target_id.
@@ -2961,7 +3401,39 @@ function _emit_select!(state::SPIRVEmitterState, inst::LLVM.SelectInst)
     cond = get_value_id!(state, ops[1])
     true_val = get_value_id!(state, ops[2])
     false_val = get_value_id!(state, ops[3])
-    result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+    llvm_ty = LLVM.value_type(inst)
+    result_ty = if llvm_ty isa LLVM.PointerType
+        # Opaque pointer — try to get type from true/false operands first
+        pointee = get_pointee_type(state.type_ctx.ptm, ops[2])
+        if pointee === nothing
+            pointee = get_pointee_type(state.type_ctx.ptm, ops[3])
+        end
+        if pointee !== nothing
+            set_pointee_type!(state.type_ctx.ptm, inst, pointee; priority=3)
+        end
+        map_pointer_type_for_value!(state.type_ctx, inst)
+    else
+        map_type!(state.type_ctx, llvm_ty)
+    end
+    # For pointer selects, ensure both operands have the same SPIR-V type as result.
+    # LLVM opaque pointers are all `ptr`, but SPIR-V has distinct typed pointers.
+    # Try to map each operand's pointer type; if it differs from result_ty, bitcast.
+    if llvm_ty isa LLVM.PointerType
+        for (i, op_llvm) in ((2, ops[2]), (3, ops[3]))
+            op_pointee = get_pointee_type(state.type_ctx.ptm, op_llvm)
+            res_pointee = get_pointee_type(state.type_ctx.ptm, inst)
+            if op_pointee !== nothing && res_pointee !== nothing && op_pointee != res_pointee
+                val_to_cast = i == 2 ? true_val : false_val
+                cast_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpBitcast, result_ty, cast_id, val_to_cast)
+                if i == 2
+                    true_val = cast_id
+                else
+                    false_val = cast_id
+                end
+            end
+        end
+    end
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, Op.OpSelect, result_ty, result_id, cond, true_val, false_val)
     state.value_map[inst] = result_id
@@ -3044,6 +3516,10 @@ function _resolve_deferred_phis!(state::SPIRVEmitterState)
 
     # Build: block_label_id → [phi_words...]
     phi_insertions = Dict{UInt32, Vector{UInt32}}()
+    # Pre-terminator insertions: block_label_id → [bitcast_words...]
+    # For pointer-type mismatches in PHI operands, we insert OpBitcast
+    # in the predecessor block before its terminator instruction.
+    pre_terminator_insertions = Dict{UInt32, Vector{UInt32}}()
 
     for (result_id, type_id, incoming, block_label_id) in state.deferred_phis
         operands = UInt32[]
@@ -3060,6 +3536,42 @@ function _resolve_deferred_phis!(state::SPIRVEmitterState)
             else
                 get_value_id!(state, val)
             end
+
+            # Check for pointer type mismatch: LLVM opaque ptrs may map to different
+            # SPIR-V pointer types. PHI requires all operands match result type.
+            # Insert OpBitcast in predecessor block if types differ.
+            # Skip PHI values themselves — their pointee types aren't in PTM.
+            if LLVM.value_type(val) isa LLVM.PointerType && !(val isa LLVM.UndefValue || val isa LLVM.PoisonValue) && !(val isa LLVM.PHIInst)
+                val_spirv_ty = try
+                    map_pointer_type_for_value!(state.type_ctx, val)
+                catch
+                    type_id  # If we can't determine the type, assume it matches
+                end
+                if val_spirv_ty != type_id
+                    # Need bitcast from val_spirv_ty to type_id
+                    bitcast_id = fresh_id!(state.mod)
+                    bitcast_words = UInt32[]
+                    push!(bitcast_words, (UInt32(4) << 16) | UInt32(Op.OpBitcast))
+                    push!(bitcast_words, type_id)
+                    push!(bitcast_words, bitcast_id)
+                    push!(bitcast_words, val_id)
+
+                    # Find the predecessor block ID for insertion
+                    from_id = get_block_id!(state, bb)
+                    redirect = get(state.trampolines, (from_id, block_label_id), nothing)
+                    if redirect === nothing
+                        redirect = get(state.phi_block_redirects, (from_id, block_label_id), nothing)
+                    end
+                    pred_block_id = redirect !== nothing ? redirect : from_id
+
+                    if !haskey(pre_terminator_insertions, pred_block_id)
+                        pre_terminator_insertions[pred_block_id] = UInt32[]
+                    end
+                    append!(pre_terminator_insertions[pred_block_id], bitcast_words)
+                    val_id = bitcast_id
+                end
+            end
+
             push!(operands, val_id)
             # Check if this incoming edge was redirected through a trampoline or block split
             from_id = get_block_id!(state, bb)
@@ -3083,25 +3595,43 @@ function _resolve_deferred_phis!(state::SPIRVEmitterState)
         append!(phi_insertions[block_label_id], phi_words)
     end
 
-    # Scan the functions buffer and insert PHIs right after each OpLabel
+    # Scan the functions buffer and insert:
+    # 1. PHIs right after each OpLabel
+    # 2. Bitcasts before terminators in predecessor blocks (for PHI type mismatches)
     new_functions = UInt32[]
     i = 1
     buf = state.mod.functions
+
+    # Terminator opcodes (instructions that end a block)
+    TERMINATOR_OPCODES = Set{UInt32}([
+        UInt32(Op.OpBranch), UInt32(Op.OpBranchConditional),
+        UInt32(Op.OpReturn), UInt32(Op.OpReturnValue),
+    ])
+
+    # Track current block label for pre-terminator insertions
+    current_block_label = UInt32(0)
+
     while i <= length(buf)
         word = buf[i]
         opcode = word & 0xFFFF
         wc = word >> 16
+
+        # Before emitting a terminator, check for pre-terminator insertions
+        if opcode in TERMINATOR_OPCODES && haskey(pre_terminator_insertions, current_block_label)
+            append!(new_functions, pre_terminator_insertions[current_block_label])
+            delete!(pre_terminator_insertions, current_block_label)
+        end
 
         push!(new_functions, word)
         for j in 1:(wc-1)
             push!(new_functions, buf[i+j])
         end
 
-        # If this was an OpLabel, check for PHI insertions
+        # If this was an OpLabel, track current block and check for PHI insertions
         if opcode == UInt32(Op.OpLabel) && wc >= 2
-            label_id = buf[i+1]
-            if haskey(phi_insertions, label_id)
-                append!(new_functions, phi_insertions[label_id])
+            current_block_label = buf[i+1]
+            if haskey(phi_insertions, current_block_label)
+                append!(new_functions, phi_insertions[current_block_label])
             end
         end
 
@@ -3145,7 +3675,32 @@ const GLSL_STD_450_MAP = Dict{String, UInt32}(
     "llvm.fmuladd"  => UInt32(50),  # Fma (fmuladd ≈ fma for GPU)
     "llvm.rint"     => UInt32(1),   # RoundEven (rint = round to nearest even)
     "llvm.nearbyint"=> UInt32(1),   # RoundEven
+    # Additional trig/hyperbolic (for future use via LLVM intrinsics)
+    "llvm.asin"     => UInt32(16),  # Asin
+    "llvm.acos"     => UInt32(17),  # Acos
+    "llvm.atan"     => UInt32(18),  # Atan
+    "llvm.sinh"     => UInt32(19),  # Sinh
+    "llvm.cosh"     => UInt32(20),  # Cosh
+    "llvm.tanh"     => UInt32(21),  # Tanh
+    "llvm.atan2"    => UInt32(25),  # Atan2
     # copysign handled specially below (not a direct GLSL.std.450 op)
+)
+
+# Custom _lava_glsl_* function names → GLSL.std.450 instruction numbers.
+# These are for GLSL.std.450 ops that LLVM has no intrinsic for (tan, asin, etc.).
+# Name format: _lava_glsl_<op>_<suffix> where suffix is f32 or f64.
+const LAVA_GLSL_MAP = Dict{String, UInt32}(
+    "_lava_glsl_tan"   => UInt32(15),  # Tan
+    "_lava_glsl_asin"  => UInt32(16),  # Asin
+    "_lava_glsl_acos"  => UInt32(17),  # Acos
+    "_lava_glsl_atan"  => UInt32(18),  # Atan
+    "_lava_glsl_sinh"  => UInt32(19),  # Sinh
+    "_lava_glsl_cosh"  => UInt32(20),  # Cosh
+    "_lava_glsl_tanh"  => UInt32(21),  # Tanh
+    "_lava_glsl_asinh" => UInt32(22),  # Asinh
+    "_lava_glsl_acosh" => UInt32(23),  # Acosh
+    "_lava_glsl_atanh" => UInt32(24),  # Atanh
+    "_lava_glsl_atan2" => UInt32(25),  # Atan2
 )
 
 function _emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
@@ -3159,11 +3714,26 @@ function _emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return _emit_llvm_intrinsic!(state, inst, fn_name)
         end
 
+        # Check for custom _lava_glsl_* → GLSL.std.450
+        if startswith(fn_name, "_lava_glsl_")
+            return _emit_lava_glsl!(state, inst, fn_name)
+        end
+
         # Regular function call
         _emit_direct_call!(state, inst, called)
     else
         error("Indirect calls not supported: $inst")
     end
+end
+
+function _emit_lava_glsl!(state::SPIRVEmitterState, inst::LLVM.CallInst, name::String)
+    # Strip type suffix: "_lava_glsl_tan_f32" → "_lava_glsl_tan"
+    base = replace(name, r"_f(16|32|64)$" => "")
+    glsl_num = get(LAVA_GLSL_MAP, base, nothing)
+    if glsl_num !== nothing
+        return _emit_glsl_ext_inst!(state, inst, glsl_num)
+    end
+    error("Unknown _lava_glsl function: $name")
 end
 
 function _emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, name::String)
@@ -3302,6 +3872,14 @@ function _emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, na
         result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
         result_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpBitCount, result_ty, result_id, val_id)
+        state.value_map[inst] = result_id
+        return
+    elseif startswith(base_name, "llvm.bitreverse")
+        # Bit reverse → OpBitReverse
+        val_id = get_value_id!(state, LLVM.operands(inst)[1])
+        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+        result_id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpBitReverse, result_ty, result_id, val_id)
         state.value_map[inst] = result_id
         return
     elseif startswith(base_name, "llvm.bswap")
@@ -3616,8 +4194,20 @@ function _emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
         error("Unsupported atomicrmw operation: $binop")
     end
 
-    # SPIR-V atomic instructions require a pointer to the value type
-    # For PSB pointers, we may need Aligned memory access
+    # SPIR-V atomic instructions require a pointer to the value type.
+    # Byte-offset GEPs (gep i8) produce pointers-to-i8, but atomicrmw needs
+    # a pointer to the actual value type (e.g., i32). Bitcast if needed.
+    ptr_pointee = get_pointee_type(state.type_ctx.ptm, ptr)
+    if ptr_pointee !== nothing && ptr_pointee != result_llvm_ty
+        # Need to bitcast pointer to correct type
+        sc = _get_pointer_storage_class(ptr)
+        correct_ptr_ty = map_pointer_type!(state.type_ctx, result_ty, sc)
+        bitcast_id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpBitcast,
+            correct_ptr_ty, bitcast_id, ptr_id)
+        ptr_id = bitcast_id
+    end
+
     # Format: OpAtomic* result_type result_id pointer scope mem_semantics value
     encode_instruction!(state.mod.functions, opcode,
         result_ty, result_id, ptr_id, scope_id, mem_sem_id, val_id)
@@ -3651,6 +4241,17 @@ function _emit_cmpxchg!(state::SPIRVEmitterState, inst::LLVM.AtomicCmpXchgInst)
     # Memory semantics — Relaxed for monotonic
     mem_sem_equal_id = emit_constant_u32!(state.mod, MemSem.Relaxed)
     mem_sem_unequal_id = emit_constant_u32!(state.mod, MemSem.Relaxed)
+
+    # Bitcast pointer if pointee type doesn't match value type (byte-offset GEPs)
+    ptr_pointee = get_pointee_type(state.type_ctx.ptm, ptr)
+    if ptr_pointee !== nothing && ptr_pointee != val_llvm_ty
+        sc = _get_pointer_storage_class(ptr)
+        correct_ptr_ty = map_pointer_type!(state.type_ctx, val_ty, sc)
+        bitcast_id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpBitcast,
+            correct_ptr_ty, bitcast_id, ptr_id)
+        ptr_id = bitcast_id
+    end
 
     # OpAtomicCompareExchange returns just the old value (not a struct like LLVM)
     # LLVM cmpxchg returns { T, i1 } where T is the old value and i1 is success
@@ -3812,6 +4413,18 @@ function _emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
         # Constant bitcast / addrspacecast — pass through
         ops = LLVM.operands(val)
         return get_value_id!(state, ops[1])
+    elseif op == LLVM.API.LLVMIntToPtr
+        # inttoptr(small_constant) — Julia runtime error paths (GC tag slots).
+        # These stores should have been removed by _remove_julia_runtime_artifacts!
+        # but if any survive, emit as a zero pointer constant (dead code path).
+        # SPIR-V doesn't have inttoptr; use OpConvertUToPtr if available,
+        # or just return a null/zero constant since this is dead error code.
+        result_ty = LLVM.value_type(val)
+        # Create a null pointer — these paths never execute on GPU
+        spirv_ty = map_type!(state.type_ctx, result_ty)
+        null_id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.types_constants, Op.OpConstantNull, spirv_ty, null_id)
+        return null_id
     else
         error("Unsupported ConstantExpr opcode: $op in $val")
     end

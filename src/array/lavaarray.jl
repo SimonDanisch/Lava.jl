@@ -121,7 +121,12 @@ end
 """Upload host data to GPU array."""
 function upload!(dst::LavaArray{T}, data::AbstractArray{T}) where T
     @assert length(data) == length(dst) "Size mismatch: $(length(data)) vs $(length(dst))"
-    bytes = Vector{UInt8}(reinterpret(UInt8, vec(collect(data))))
+    src = vec(collect(data))
+    nbytes = length(src) * sizeof(T)
+    bytes = Vector{UInt8}(undef, nbytes)
+    GC.@preserve src bytes begin
+        unsafe_copyto!(Ptr{UInt8}(pointer(bytes)), Ptr{UInt8}(pointer(src)), nbytes)
+    end
     upload!(dst.buf[], bytes; offset=dst.offset * sizeof(T))
 end
 

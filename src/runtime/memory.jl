@@ -170,9 +170,12 @@ end
 Download data from a device-local buffer into a typed array.
 """
 function download_typed!(data::AbstractVector{T}, src::VkManagedBuffer; offset::Int=0) where T
-    bytes = Vector{UInt8}(undef, length(data) * sizeof(T))
+    nbytes = length(data) * sizeof(T)
+    bytes = Vector{UInt8}(undef, nbytes)
     download!(bytes, src; offset)
-    copyto!(data, reinterpret(T, bytes))
+    GC.@preserve data bytes begin
+        unsafe_copyto!(Ptr{UInt8}(pointer(data)), Ptr{UInt8}(pointer(bytes)), nbytes)
+    end
 end
 
 # ── Internal helpers ──

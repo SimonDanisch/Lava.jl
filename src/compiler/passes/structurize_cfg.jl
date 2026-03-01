@@ -191,10 +191,13 @@ pre-StructurizeCFG fixup pass inserted:
 3. LowerSwitch - converts switch to if-else chains (SPIR-V OpSwitch has limitations)
 4. UnifyFunctionExitNodes - ensures single return point (required by StructurizeCFG)
 5. FixIrreducible - converts irreducible loops to reducible ones
-6. StructurizeCFG - the critical pass: converts arbitrary CFG to structured control flow
-7. InstCombine - cleanup bitcasts from StructurizeCFG's reg2mem patterns
+6. LoopSimplify - creates dedicated exit blocks for nested loops, preventing
+   StructurizeCFG from producing constant `br i1 true` on inner loop back-edges
+   when inner loops have multi-level exits (exits bypassing outer loops)
+7. StructurizeCFG - the critical pass: converts arbitrary CFG to structured control flow
+8. InstCombine - cleanup bitcasts from StructurizeCFG's reg2mem patterns
    NOTE: Do NOT run SimplifyCFG after StructurizeCFG -- it destroys structured flow!
-8. _fixup_post_structurize! - insert trampolines for continue-target merge conflicts
+9. _fixup_post_structurize! - insert trampolines for continue-target merge conflicts
 """
 function run_structurize_cfg_pipeline!(mod::LLVM.Module)
     LLVM.run!(LLVM.SimplifyCFGPass(), mod)
@@ -202,6 +205,7 @@ function run_structurize_cfg_pipeline!(mod::LLVM.Module)
     LLVM.run!(LLVM.LowerSwitchPass(), mod)
     LLVM.run!(LLVM.UnifyFunctionExitNodesPass(), mod)
     LLVM.run!(LLVM.FixIrreduciblePass(), mod)
+    LLVM.run!(LLVM.LoopSimplifyPass(), mod)
     LLVM.run!(LLVM.StructurizeCFGPass(), mod)
     LLVM.run!(LLVM.InstCombinePass(), mod)
     _fixup_post_structurize!(mod)

@@ -69,6 +69,8 @@ const known_intrinsics = String[]
 function GPUCompiler.isintrinsic(::LavaCompilerJob, fn::String)
     # LLVM SPIR-V intrinsics (used by the SPIR-V backend for workgroup/subgroup ops)
     startswith(fn, "llvm.spv.") && return true
+    # Custom _lava_glsl_* externals → SPIR-V emitter maps to GLSL.std.450
+    startswith(fn, "_lava_glsl_") && return true
     # OpenCL C++ mangled builtins (thread indices, barriers, math)
     fn in known_intrinsics && return true
     return false
