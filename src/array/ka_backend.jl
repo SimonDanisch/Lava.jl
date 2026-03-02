@@ -16,7 +16,21 @@ struct LavaBackend <: KA.GPU end
 
 KA.get_backend(::LavaArray) = LavaBackend()
 KA.synchronize(::LavaBackend) = vk_flush!()
-KA.allocate(::LavaBackend, ::Type{T}, dims::Tuple) where T = LavaArray{T}(undef, Int.(dims))
+KA.supports_unified(::LavaBackend) = true
+function KA.allocate(::LavaBackend, ::Type{T}, dims::Tuple; unified::Bool=false) where T
+    nbytes = prod(dims) * sizeof(T)
+    # Use unified (BAR) memory when explicitly requested OR for tiny allocations
+    # (≤ 64 bytes, e.g. WorkQueue.size counters). BAR memory enables direct CPU
+    # readback without staging copy — 2x faster for queue length checks.
+    if unified || nbytes <= 64
+        managed = vk_alloc_unified(nbytes)
+        ref = GPUArrays.DataRef(managed) do buf
+            vk_free!(buf)
+        end
+        return LavaArray{T,length(dims)}(ref, Int.(dims))
+    end
+    LavaArray{T}(undef, Int.(dims))
+end
 KA.unsafe_free!(x::LavaArray) = unsafe_free!(x)
 
 function KA.copyto!(::LavaBackend, A, B)

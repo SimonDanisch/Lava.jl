@@ -7,11 +7,14 @@
     VkManagedBuffer
 
 A GPU buffer with a known device address (BDA).
+When `mapped_ptr` is non-null, the buffer is in BAR memory (host-visible + device-local)
+and can be read/written directly from the CPU without staging copies.
 """
 mutable struct VkManagedBuffer
     buffer::Vulkan.Buffer
     memory::Vulkan.DeviceMemory
     address::UInt64     # BDA for PhysicalStorageBuffer access
+    mapped_ptr::Ptr{UInt8}  # Non-null for unified/BAR memory
     size::Int
 end
 
@@ -57,7 +60,7 @@ function vk_alloc(nbytes::Integer)
     addr_info = Vulkan.BufferDeviceAddressInfo(buf)
     address = Vulkan.get_buffer_device_address(dev, addr_info)
 
-    result = VkManagedBuffer(buf, memory, address, Int(nbytes))
+    result = VkManagedBuffer(buf, memory, address, Ptr{UInt8}(0), Int(nbytes))
     push!(_live_buffers, result)
     return result
 end
@@ -69,6 +72,11 @@ Free a managed buffer's Vulkan resources.
 """
 function vk_free!(buf::VkManagedBuffer)
     delete!(_live_buffers, buf)
+    # Unmap if this was a unified/BAR buffer
+    if buf.mapped_ptr != Ptr{UInt8}(0)
+        Vulkan.unmap_memory(vk_device(), buf.memory)
+        buf.mapped_ptr = Ptr{UInt8}(0)
+    end
     # Explicitly destroy in correct order: buffer before memory.
     # Vulkan.jl handles are refcounted — calling destructor() sets refcount to 0,
     # so the GC finalizer's second call will be a no-op (refcount underflows, iszero → false).
@@ -134,6 +142,16 @@ function upload!(dst::VkManagedBuffer, host_data::Vector{UInt8}; offset::Int=0)
     nbytes = length(host_data)
     nbytes == 0 && return
 
+    # Fast path: if buffer is in BAR memory (mapped), write directly via mapped ptr.
+    if dst.mapped_ptr != Ptr{UInt8}(0)
+        ctx = vk_context()
+        if ctx.recording
+            vk_flush!()
+        end
+        unsafe_copyto!(dst.mapped_ptr + offset, pointer(host_data), nbytes)
+        return
+    end
+
     staging_buf, _, mapped_ptr, _ = _get_staging(nbytes)
     unsafe_copyto!(Ptr{UInt8}(mapped_ptr), pointer(host_data), nbytes)
 
@@ -148,6 +166,17 @@ Download data from a device-local buffer to host via staging.
 function download!(host_data::Vector{UInt8}, src::VkManagedBuffer; offset::Int=0)
     nbytes = length(host_data)
     nbytes == 0 && return
+
+    # Fast path: if buffer is in BAR memory (mapped), just flush and read directly.
+    # Saves one fence wait by avoiding the staging copy command.
+    if src.mapped_ptr != Ptr{UInt8}(0)
+        ctx = vk_context()
+        if ctx.recording
+            vk_flush!()
+        end
+        unsafe_copyto!(pointer(host_data), src.mapped_ptr + offset, nbytes)
+        return
+    end
 
     staging_buf, _, mapped_ptr, _ = _get_staging(nbytes)
     _one_shot_copy(src.buffer, offset, staging_buf, 0, nbytes)
@@ -273,6 +302,20 @@ function vk_alloc_mapped(nbytes::Integer)
 
     result = VkMappedBuffer(buf, memory, address, mapped_ptr, Int(nbytes))
     return result
+end
+
+"""
+    vk_alloc_unified(nbytes::Integer) -> VkManagedBuffer
+
+Allocate a unified (BAR) buffer as VkManagedBuffer with `mapped_ptr` set.
+Used by `KA.allocate(; unified=true)` for host-readable GPU buffers.
+"""
+function vk_alloc_unified(nbytes::Integer)
+    mapped = vk_alloc_mapped(max(nbytes, 16))
+    managed = VkManagedBuffer(mapped.buffer, mapped.memory, mapped.address,
+                               mapped.mapped_ptr, Int(mapped.size))
+    push!(_live_buffers, managed)
+    return managed
 end
 
 # ── Indirect dispatch buffer pool ──

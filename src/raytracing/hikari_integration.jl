@@ -349,6 +349,9 @@ function Base.getproperty(hwtlas::HWTLAS, s::Symbol)
     end
 end
 
+# ── Indirect dispatch for WorkQueue foreach (no CPU readback) ──
+Hikari._gpu_ndrange(::LavaBackend, size_buf::LavaArray) = size_buf
+
 # ── HWAdaptedAccel — GPU-adapted form of HWTLAS ──
 
 """
