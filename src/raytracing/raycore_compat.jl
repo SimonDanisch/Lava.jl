@@ -104,6 +104,15 @@ function trace_closest_hits!(results, rays, accel::HardwareAccel, n_rays::Intege
                 width=Int(n_rays), height=1)
 end
 
+"""
+    trace_closest_hits_indirect!(results, rays, accel::HardwareAccel, n_rays::LavaArray{Int32})
+
+Indirect RT trace — reads ray count from GPU buffer. No CPU readback.
+"""
+function trace_closest_hits_indirect!(results, rays, accel::HardwareAccel, n_rays::LavaArray{Int32})
+    trace_rays_indirect!(accel.rt_pipeline, accel.tlas, rays, results; n_rays=n_rays)
+end
+
 # ── Built-in RT Shaders ──
 
 function _hw_raygen(rays::Ptr{RTRay}, results::Ptr{RTHitResult})

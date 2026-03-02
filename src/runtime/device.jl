@@ -39,6 +39,7 @@ mutable struct VkContext
     # Dispatch batching state
     recording::Bool
     dispatch_count::Int
+    last_was_rt::Bool   # Track last dispatch type for barriers
     # Ray tracing (nothing if not available)
     rt_pipeline_properties::Union{Nothing, RTPipelineProperties}
 end
@@ -143,7 +144,7 @@ function _init_vulkan!()
             true,   # ray_tracing_pipeline
             false,  # ray_tracing_pipeline_shader_group_handle_capture_replay
             false,  # ray_tracing_pipeline_shader_group_handle_capture_replay_mixed
-            false,  # ray_tracing_pipeline_trace_rays_indirect
+            true,   # ray_tracing_pipeline_trace_rays_indirect
             false;  # ray_traversal_primitive_culling
             next=as_features
         )
@@ -205,7 +206,7 @@ function _init_vulkan!()
     return VkContext(
         instance, phys_dev, device, queue, qf_idx,
         cmd_pool, cmd_buf, fence, dev_name,
-        false, 0,
+        false, 0, false,
         rt_props
     )
 end

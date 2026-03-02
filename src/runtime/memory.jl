@@ -275,6 +275,79 @@ function vk_alloc_mapped(nbytes::Integer)
     return result
 end
 
+# ── Indirect dispatch buffer pool ──
+
+"""
+    VkIndirectBuffer — A small mapped buffer for VkDispatchIndirectCommand (3×UInt32).
+    Has INDIRECT_BUFFER_BIT + STORAGE_BUFFER_BIT + SHADER_DEVICE_ADDRESS_BIT.
+"""
+mutable struct VkIndirectBuffer
+    buffer::Vulkan.Buffer
+    memory::Vulkan.DeviceMemory
+    address::UInt64
+    mapped_ptr::Ptr{UInt8}
+    size::Int
+end
+
+const _indirect_buffers = VkIndirectBuffer[]
+const _indirect_buffer_idx = Ref(0)
+
+"""Get or create an indirect dispatch buffer from the pool."""
+function _get_indirect_buffer()
+    _indirect_buffer_idx[] += 1
+    idx = _indirect_buffer_idx[]
+
+    while length(_indirect_buffers) < idx
+        push!(_indirect_buffers, _alloc_indirect_buffer())
+    end
+
+    return _indirect_buffers[idx]
+end
+
+"""Reset indirect buffer pool index after flush."""
+function _reset_indirect_buffer_pool!()
+    _indirect_buffer_idx[] = 0
+end
+
+function _alloc_indirect_buffer()
+    dev = vk_device()
+    nbytes = 16  # 3×UInt32 = 12 bytes, round to 16
+
+    buf = Vulkan.Buffer(
+        dev, nbytes,
+        Vulkan.BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+        Vulkan.BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        Vulkan.BUFFER_USAGE_TRANSFER_DST_BIT,
+        Vulkan.SHARING_MODE_EXCLUSIVE,
+        UInt32[]
+    )
+
+    mem_reqs = Vulkan.get_buffer_memory_requirements(dev, buf)
+
+    # Prefer device-local + host-visible (BAR), fall back to host-visible
+    preferred = Vulkan.MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                Vulkan.MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT
+    mem_type_idx = _find_memory_type_optional(mem_reqs.memory_type_bits, preferred)
+    if mem_type_idx === nothing
+        fallback = Vulkan.MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                   Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT
+        mem_type_idx = _find_memory_type(mem_reqs.memory_type_bits, fallback)
+    end
+
+    alloc_flags = Vulkan.MemoryAllocateFlagsInfo(
+        UInt32(0); flags=Vulkan.MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT)
+    memory = Vulkan.DeviceMemory(dev, mem_reqs.size, mem_type_idx; next=alloc_flags)
+    unwrap(Vulkan.bind_buffer_memory(dev, buf, memory, 0))
+
+    addr_info = Vulkan.BufferDeviceAddressInfo(buf)
+    address = Vulkan.get_buffer_device_address(dev, addr_info)
+    mapped_ptr = Ptr{UInt8}(unwrap(Vulkan.map_memory(dev, memory, 0, nbytes)))
+
+    return VkIndirectBuffer(buf, memory, address, mapped_ptr, Int(nbytes))
+end
+
 function _find_memory_type_optional(type_bits::UInt32, required_flags)
     ctx = vk_context()
     mem_props = Vulkan.get_physical_device_memory_properties(ctx.physical_device)

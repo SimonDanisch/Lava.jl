@@ -36,6 +36,11 @@ end
 
 # Cache compiled GPU kernels by (function, type tuple, workgroup_size)
 const _kernel_cache = Dict{UInt64, LavaGPUKernel}()
+# Cache pipelines alongside compiled kernels (avoids re-hashing SPIR-V bytes)
+const _pipeline_by_kernel = Dict{UInt64, LavaComputePipeline}()
+# Cache arg layout offsets as Vector{Int} (Vector{Int} indexing is zero-alloc,
+# unlike Vector{Pair{Int,Int}} which boxes Pair on access)
+const _arg_offsets_cache = Dict{UInt64, Vector{Int}}()
 
 """
     lava_launch!(f, args...; ndrange, workgroup_size=(64,1,1))
@@ -74,32 +79,23 @@ function lava_launch!(@nospecialize(f), args...;
     # Build the type tuple from arguments
     tt = Tuple{map(_arg_llvm_type, args)...}
 
-    # Compile (cached)
-    compiled = _get_compiled_kernel(f, tt, workgroup_size)
+    # Compile + pipeline (cached, single lookup — avoids re-hashing SPIR-V)
+    compiled, pipeline, offsets = _get_compiled_kernel_and_pipeline(f, tt, workgroup_size)
 
-    # Create pipeline (cached in pipeline.jl)
-    pipeline = get_compute_pipeline(compiled.spirv_bytes, compiled.entry_name;
-                                     push_constant_size=compiled.push_info.push_size)
-
-    # Pack arguments into BDA buffer
     # Include f as first arg — GPUCompiler includes typeof(f) as the first LLVM parameter,
     # and wrap_entry_for_vulkan! creates a BDA slot for it (unless ghost-elided).
-    bda_args = _args_to_bda_filtered((f, args...))
+    all_args = (f, args...)
 
-    # Compute total size: base layout + inline struct data
-    inline_extra = sum(arg isa InlineStructArg ? ((length(arg.bytes) + 7) & ~7) : 0
-                       for arg in bda_args; init=0)
+    # Compute total size: base layout + inline struct data (compile-time constant)
+    inline_extra = _compute_inline_extra(typeof(all_args))
     total_size = compiled.push_info.arg_buffer_size + inline_extra
 
-    # Get host-visible mapped arg buffer (zero-cost write via memcpy)
+    # Get host-visible mapped arg buffer
     arg_buf = _get_arg_buffer(total_size)
 
-    # Pack with self-referencing BDAs for inline structs
-    arg_data = pack_kernel_args_inline(bda_args, compiled.push_info.arg_layout,
-                                        compiled.push_info.arg_buffer_size,
-                                        arg_buf.address)
-    # Write directly to mapped memory — no staging copy needed
-    unsafe_copyto!(arg_buf.mapped_ptr, pointer(arg_data), length(arg_data))
+    # Pack args directly to mapped memory (zero intermediate allocations)
+    _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
+                       compiled.push_info.arg_buffer_size, all_args)
 
     # Push constant = BDA of arg buffer
     push_data = Vector{UInt8}(undef, 8)
@@ -170,6 +166,105 @@ function pack_kernel_args_inline(args::Tuple, layout::Vector{Pair{Int,Int}},
     return buf
 end
 
+# ── Zero-allocation arg packing (replaces _args_to_bda + pack_kernel_args_inline) ──
+
+"""
+    _is_bda_buffer(::Type{T})
+
+Check at compile time whether a type is a GPU buffer that should be passed as a BDA address.
+"""
+_is_bda_buffer(::Type{<:LavaBuffer}) = true
+_is_bda_buffer(::Type{<:LavaArray}) = true
+_is_bda_buffer(::Type{VkManagedBuffer}) = true
+_is_bda_buffer(::Type) = false
+
+"""
+    _compute_inline_extra(::Type{T}) where T <: Tuple
+
+Compute at compile time the total bytes needed for inline struct data appended
+after the base arg layout. Returns a constant. Buffer types (LavaBuffer, LavaArray,
+VkManagedBuffer) are passed as UInt64 BDA addresses, not inlined.
+"""
+@generated function _compute_inline_extra(::Type{T}) where T <: Tuple
+    types = T.parameters
+    extra = 0
+    for Ti in types
+        sizeof(Ti) == 0 && continue
+        _is_bda_buffer(Ti) && continue  # buffers → UInt64 BDA, no inline data
+        if isbitstype(Ti) && !isprimitivetype(Ti)
+            extra = (extra + 7) & ~7  # align to 8
+            extra += sizeof(Ti)
+        end
+    end
+    return :($extra)
+end
+
+"""
+    _pack_args_direct!(mapped_ptr, arg_buf_bda, offsets, base_size, all_args)
+
+Write kernel arguments directly to mapped GPU memory, inlining struct data.
+This is a `@generated` function that statically filters ghost types and avoids
+intermediate `Any[]` boxing and `Vector{UInt8}` allocations — zero allocations
+for the arg packing itself.
+
+Handles all argument types:
+- Ghost types (sizeof==0): skipped
+- LavaBuffer/LavaArray/VkManagedBuffer: written as UInt64 BDA address
+- isbits structs: inlined after base layout, BDA pointer at arg slot
+- UInt64/Ptr: written directly
+- Other primitives: written directly
+"""
+@generated function _pack_args_direct!(mapped_ptr::Ptr{UInt8}, arg_buf_bda::UInt64,
+                                        offsets::Vector{Int}, base_size::Int,
+                                        all_args::T) where {T <: Tuple}
+    types = T.parameters
+    non_ghost = Int[]
+    for (i, Ti) in enumerate(types)
+        sizeof(Ti) == 0 && continue
+        push!(non_ghost, i)
+    end
+
+    exprs = Expr[]
+    for (layout_i, arg_i) in enumerate(non_ghost)
+        Ti = types[arg_i]
+        if _is_bda_buffer(Ti)
+            # GPU buffer → write BDA address as UInt64
+            if Ti <: LavaBuffer
+                push!(exprs, :(unsafe_store!(Ptr{UInt64}(mapped_ptr + @inbounds(offsets[$layout_i])),
+                                             all_args[$arg_i].buf.address)))
+            elseif Ti <: LavaArray
+                push!(exprs, :(unsafe_store!(Ptr{UInt64}(mapped_ptr + @inbounds(offsets[$layout_i])),
+                                             bda_address(all_args[$arg_i]))))
+            else  # VkManagedBuffer
+                push!(exprs, :(unsafe_store!(Ptr{UInt64}(mapped_ptr + @inbounds(offsets[$layout_i])),
+                                             all_args[$arg_i].address)))
+            end
+        elseif isbitstype(Ti) && !isprimitivetype(Ti)
+            push!(exprs, quote
+                let x = all_args[$arg_i]
+                    inline_offset = (inline_offset + 7) & ~7
+                    unsafe_store!(Ptr{$Ti}(mapped_ptr + inline_offset), x)
+                    unsafe_store!(Ptr{UInt64}(mapped_ptr + @inbounds(offsets[$layout_i])),
+                                  arg_buf_bda + UInt64(inline_offset))
+                    inline_offset += $(sizeof(Ti))
+                end
+            end)
+        elseif Ti === UInt64
+            push!(exprs, :(unsafe_store!(Ptr{UInt64}(mapped_ptr + @inbounds(offsets[$layout_i])), all_args[$arg_i])))
+        elseif Ti <: Ptr
+            push!(exprs, :(unsafe_store!(Ptr{UInt64}(mapped_ptr + @inbounds(offsets[$layout_i])), UInt64(all_args[$arg_i]))))
+        else
+            push!(exprs, :(unsafe_store!(Ptr{$Ti}(mapped_ptr + @inbounds(offsets[$layout_i])), all_args[$arg_i])))
+        end
+    end
+
+    quote
+        inline_offset = base_size
+        $(exprs...)
+        return nothing
+    end
+end
+
 # ── Argument type mapping ──
 
 # Map Julia arg types to LLVM-level types for compilation
@@ -192,6 +287,10 @@ function _arg_to_bda(x)
     return x
 end
 
+# Fast ghost type check — sizeof(T)==0 is equivalent to GPUCompiler.isghosttype for isbits types.
+# Avoids creating an LLVM Context on every call (~4μs → ~0.01μs per type).
+_is_ghost(@nospecialize(T::Type)) = sizeof(T) == 0
+
 """
     _args_to_bda_filtered(args) -> Tuple
 
@@ -202,9 +301,7 @@ function _args_to_bda_filtered(args::Tuple)
     result = Any[]
     for x in args
         T = typeof(x)
-        if GPUCompiler.isghosttype(T) || Core.Compiler.isconstType(T)
-            continue
-        end
+        _is_ghost(T) && continue
         push!(result, _arg_to_bda(x))
     end
     return tuple(result...)
@@ -219,6 +316,31 @@ function _get_compiled_kernel(@nospecialize(f), @nospecialize(tt), workgroup_siz
     compiled = lava_compile_gpu(f, tt; workgroup_size)
     _kernel_cache[key] = compiled
     return compiled
+end
+
+function _get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), workgroup_size)
+    key = hash((f, tt, workgroup_size))
+
+    compiled = get(_kernel_cache, key, nothing)
+    if compiled === nothing
+        compiled = lava_compile_gpu(f, tt; workgroup_size)
+        _kernel_cache[key] = compiled
+    end
+
+    pipeline = get(_pipeline_by_kernel, key, nothing)
+    if pipeline === nothing
+        pipeline = get_compute_pipeline(compiled.spirv_bytes, compiled.entry_name;
+                                        push_constant_size=compiled.push_info.push_size)
+        _pipeline_by_kernel[key] = pipeline
+    end
+
+    offsets = get(_arg_offsets_cache, key, nothing)
+    if offsets === nothing
+        offsets = Int[p.first for p in compiled.push_info.arg_layout]
+        _arg_offsets_cache[key] = offsets
+    end
+
+    return compiled, pipeline, offsets
 end
 
 # Reusable arg buffer pool — host-visible mapped memory for zero-cost upload.

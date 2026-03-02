@@ -43,12 +43,12 @@ mutable struct RayTracingPipeline
     payload_type::Symbol
     # Compiled state (lazy)
     _compiled::Union{Nothing, NamedTuple}
-    _pipeline_cache::Dict{UInt64, Tuple{LavaRTPipeline, LavaRTShader}}
+    _pipeline_cache::Dict{UInt64, Tuple{LavaRTPipeline, LavaRTShader, Vector{Int}}}
 end
 
 function RayTracingPipeline(; raygen, closest_hit, miss, payload_type::Symbol=:f32)
     RayTracingPipeline(raygen, closest_hit, miss, payload_type, nothing,
-                        Dict{UInt64, Tuple{LavaRTPipeline, LavaRTShader}}())
+                        Dict{UInt64, Tuple{LavaRTPipeline, LavaRTShader, Vector{Int}}}())
 end
 
 """
@@ -73,28 +73,79 @@ function trace_rays!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args...;
         cached = _compile_rt_pipeline(pipeline, tt)
         pipeline._pipeline_cache[cache_key] = cached
     end
-    vk_pipeline, raygen_compiled = cached
+    vk_pipeline, raygen_compiled, offsets = cached
 
-    # Pack arguments into BDA arg buffer
-    bda_args = _rt_args_to_bda_filtered((pipeline.raygen_func, args...))
-
-    inline_extra = sum(arg isa InlineStructArg ? ((length(arg.bytes) + 7) & ~7) : 0
-                       for arg in bda_args; init=0)
+    # Pack args directly to mapped memory (unified path with compute)
+    all_args = (pipeline.raygen_func, args...)
+    inline_extra = _compute_inline_extra(typeof(all_args))
     total_size = raygen_compiled.push_info.arg_buffer_size + inline_extra
 
-    # Allocate arg buffer
-    arg_buf = vk_alloc(total_size)
-    arg_data = pack_kernel_args_inline(bda_args, raygen_compiled.push_info.arg_layout,
-                                        raygen_compiled.push_info.arg_buffer_size,
-                                        arg_buf.address)
-    upload!(arg_buf, arg_data)
+    arg_buf = _get_arg_buffer(total_size)
+    _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
+                       raygen_compiled.push_info.arg_buffer_size, all_args)
 
     # Push constant = BDA of arg buffer
     push_data = Vector{UInt8}(undef, 8)
     unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
 
-    # Dispatch
+    # Dispatch (records into batched command buffer, no separate submit)
     rt_dispatch!(vk_pipeline, tlas, push_data, width, height; depth=depth)
+end
+
+"""
+    trace_rays_indirect!(pipeline, tlas, args...; n_rays::LavaArray{Int32})
+
+Dispatch a ray tracing pipeline with the ray count read from a GPU buffer.
+No CPU readback — a prepare kernel writes the indirect command, then
+`cmd_trace_rays_indirect_khr` reads it from GPU memory.
+"""
+function trace_rays_indirect!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args...;
+                              n_rays::LavaArray{Int32})
+    # Build type tuple from arguments
+    tt = Tuple{map(_rt_arg_llvm_type, args)...}
+    cache_key = hash((tt,))
+
+    # Get or compile pipeline for this argument signature
+    cached = get(pipeline._pipeline_cache, cache_key, nothing)
+    if cached === nothing
+        cached = _compile_rt_pipeline(pipeline, tt)
+        pipeline._pipeline_cache[cache_key] = cached
+    end
+    vk_pipeline, raygen_compiled, offsets = cached
+
+    # Pack args directly to mapped memory (unified path with compute)
+    all_args = (pipeline.raygen_func, args...)
+    inline_extra = _compute_inline_extra(typeof(all_args))
+    total_size = raygen_compiled.push_info.arg_buffer_size + inline_extra
+
+    arg_buf = _get_arg_buffer(total_size)
+    _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
+                       raygen_compiled.push_info.arg_buffer_size, all_args)
+
+    push_data = Vector{UInt8}(undef, 8)
+    unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
+
+    # Prepare indirect RT buffer: kernel writes (n_rays, 1, 1) from GPU queue size
+    indirect_buf = _get_indirect_buffer()
+    _prepare_indirect_rt_dispatch!(indirect_buf, n_rays)
+
+    # Indirect RT dispatch
+    rt_dispatch_indirect!(vk_pipeline, tlas, push_data, indirect_buf)
+end
+
+"""Prepare indirect RT dispatch buffer: writes (n_rays, 1, 1) from a GPU-resident count."""
+function _prepare_indirect_rt_dispatch!(indirect_buf::VkIndirectBuffer, n_rays_buf::LavaArray{Int32})
+    lava_launch!(_prepare_indirect_rt_kernel,
+                 Ptr{UInt32}(indirect_buf.address), n_rays_buf;
+                 ndrange=1, workgroup_size=(1, 1, 1))
+end
+
+function _prepare_indirect_rt_kernel(indirect::Ptr{UInt32}, n_rays_buf::Ptr{Int32})
+    n = UInt32(unsafe_load(n_rays_buf, 1))
+    unsafe_store!(indirect, n, 1)          # width = n_rays
+    unsafe_store!(indirect, UInt32(1), 2)  # height = 1
+    unsafe_store!(indirect, UInt32(1), 3)  # depth = 1
+    return nothing
 end
 
 # ── Internal: Compile RT pipeline ──
@@ -123,7 +174,10 @@ function _compile_rt_pipeline(pipeline::RayTracingPipeline, raygen_tt)
         chit_compiled.spirv_bytes;
         push_constant_size=8)
 
-    return (vk_pipeline, raygen_compiled)
+    # Cache arg layout offsets as Vector{Int} for zero-alloc packing
+    offsets = Int[p.first for p in raygen_compiled.push_info.arg_layout]
+
+    return (vk_pipeline, raygen_compiled, offsets)
 end
 
 # ── RT Argument Type Mapping ──
@@ -133,28 +187,3 @@ _rt_arg_llvm_type(::VkManagedBuffer) = Ptr{UInt8}
 _rt_arg_llvm_type(buf::LavaBuffer{T}) where T = Ptr{T}
 _rt_arg_llvm_type(a::LavaArray{T}) where T = Ptr{T}
 _rt_arg_llvm_type(x) = typeof(x)
-
-_rt_arg_to_bda(buf::VkManagedBuffer) = buf.address
-_rt_arg_to_bda(buf::LavaBuffer) = buf.buf.address
-_rt_arg_to_bda(a::LavaArray) = bda_address(a)
-function _rt_arg_to_bda(x)
-    T = typeof(x)
-    if isbitstype(T) && !isprimitivetype(T)
-        data = Vector{UInt8}(undef, sizeof(T))
-        unsafe_store!(Ptr{T}(pointer(data)), x)
-        return InlineStructArg(data)
-    end
-    return x
-end
-
-function _rt_args_to_bda_filtered(args::Tuple)
-    result = Any[]
-    for x in args
-        T = typeof(x)
-        if GPUCompiler.isghosttype(T) || Core.Compiler.isconstType(T)
-            continue
-        end
-        push!(result, _rt_arg_to_bda(x))
-    end
-    return tuple(result...)
-end

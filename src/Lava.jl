@@ -4,7 +4,7 @@ export LavaArray, LavaBackend, LavaBuffer, LavaDeviceArray
 
 # Ray tracing exports
 export HardwareAccel, RTRay, RTHitResult
-export trace_closest_hits!, RayTracingPipeline, trace_rays!
+export trace_closest_hits!, trace_closest_hits_indirect!, RayTracingPipeline, trace_rays!, trace_rays_indirect!
 
 using Vulkan
 using GPUCompiler

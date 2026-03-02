@@ -25,8 +25,8 @@
 
 using Base: @propagate_inbounds
 using Lava: RTRay, RTHitResult, LavaArray, LavaBackend, LavaBLAS, LavaTLAS,
-            lava_global_invocation_id_x, trace_closest_hits!, vk_flush!,
-            build_blas, build_tlas, _mat4_to_vk_transform
+            lava_global_invocation_id_x, trace_closest_hits!, trace_closest_hits_indirect!,
+            vk_flush!, build_blas, build_tlas, _mat4_to_vk_transform
 using Adapt
 using KernelAbstractions
 using StaticArrays
@@ -441,37 +441,35 @@ function Hikari._detect_initial_medium(backend, accel::HWAdaptedAccel, mi, pos, 
     return Raycore.SetKey()  # No medium (camera outside all geometry)
 end
 
-# Primary ray tracing: HW RT dispatch
+# Primary ray tracing: HW RT dispatch (indirect — zero CPU readbacks)
 function Hikari.vp_trace_rays!(state::Hikari.VolPathState, accel::HWAdaptedAccel, media_interfaces, materials, ::Hikari.VolPath)
     hwtlas = accel.hwtlas
     hw = hwtlas.hw_accel
 
     input_queue = state.current_ray_queue == :a ? state.ray_queue_a : state.ray_queue_b
-    n_rays = Int(Array(input_queue.size)[1])
-    n_rays == 0 && return nothing
-
     backend = KernelAbstractions.get_backend(input_queue.items)
 
-    # Ensure pre-allocated buffers are large enough (lazy resize)
-    if hwtlas.primary_ray_buf === nothing || length(hwtlas.primary_ray_buf) < n_rays
-        hwtlas.primary_ray_buf = LavaArray{RTRay}(undef, n_rays)
-        hwtlas.primary_result_buf = LavaArray{RTHitResult}(undef, n_rays)
+    # Use queue capacity for buffer sizing (no CPU readback for actual size)
+    cap = Int(input_queue.capacity)
+    if hwtlas.primary_ray_buf === nothing || length(hwtlas.primary_ray_buf) < cap
+        hwtlas.primary_ray_buf = LavaArray{RTRay}(undef, cap)
+        hwtlas.primary_result_buf = LavaArray{RTHitResult}(undef, cap)
     end
     ray_buf = hwtlas.primary_ray_buf
     result_buf = hwtlas.primary_result_buf
 
-    # Phase 1: Extract rays from work queue → flat RTRay buffer
+    # Phase 1: Extract rays (indirect dispatch — reads n_rays from queue.size on GPU)
     extract_kernel! = _extract_rays_kernel!(backend, 256)
-    extract_kernel!(ray_buf, input_queue.items, input_queue.size; ndrange=n_rays)
-    vk_flush!()
+    extract_kernel!(ray_buf, input_queue.items, input_queue.size; ndrange=input_queue.size)
+    # No vk_flush!() — stays in same command buffer
 
-    # Phase 2: RT dispatch — trace all rays via hardware
-    trace_closest_hits!(result_buf, ray_buf, hw, n_rays)
+    # Phase 2: RT dispatch — indirect (reads n_rays from queue.size on GPU)
+    trace_closest_hits_indirect!(result_buf, ray_buf, hw, input_queue.size)
 
     # Phase 3: Create precomputed accel with triangle data on GPU
     precomputed = PrecomputedHitsAccel(result_buf, hwtlas.tri_gpu, hwtlas.off_gpu)
 
-    # Phase 4: Run original trace kernel with precomputed results
+    # Phase 4: Run original trace kernel (indirect dispatch via queue.size)
     foreach(Hikari.vp_trace_rays_kernel!,
         input_queue,
         state.medium_sample_queue,
@@ -707,59 +705,51 @@ end
     end
 end
 
-# Shadow ray tracing dispatch
+# Shadow ray tracing dispatch (indirect — minimal CPU readbacks)
 function Hikari.vp_trace_shadow_rays!(state::Hikari.VolPathState, accel::HWAdaptedAccel, media_interfaces, media, materials, ::Hikari.VolPath)
     hwtlas = accel.hwtlas
     hw = hwtlas.hw_accel
 
     shadow_queue = state.shadow_queue
-    n = Int(Array(shadow_queue.size)[1])
-    n == 0 && return nothing
-
     backend = KernelAbstractions.get_backend(shadow_queue.items)
 
-    # Ensure pre-allocated shadow buffers are large enough
-    if hwtlas.shadow_states === nothing || length(hwtlas.shadow_states) < n
-        hwtlas.shadow_states = LavaArray{ShadowIterState}(undef, n)
-        hwtlas.shadow_ray_buf = LavaArray{RTRay}(undef, n)
-        hwtlas.shadow_result_buf = LavaArray{RTHitResult}(undef, n)
+    # Use queue capacity for buffer sizing (no CPU readback)
+    cap = Int(shadow_queue.capacity)
+    if hwtlas.shadow_states === nothing || length(hwtlas.shadow_states) < cap
+        hwtlas.shadow_states = LavaArray{ShadowIterState}(undef, cap)
+        hwtlas.shadow_ray_buf = LavaArray{RTRay}(undef, cap)
+        hwtlas.shadow_result_buf = LavaArray{RTHitResult}(undef, cap)
         hwtlas.shadow_active_counter = LavaArray{Int32}(undef, 1)
     end
     states = hwtlas.shadow_states
     ray_buf = hwtlas.shadow_ray_buf
     result_buf = hwtlas.shadow_result_buf
     active_counter = hwtlas.shadow_active_counter
+    n_rays_gpu = shadow_queue.size  # GPU-resident ray count
 
-    # Initialize shadow ray iteration state
+    # Initialize shadow ray iteration state (indirect — reads count from GPU)
     init_k! = _init_shadow_states_kernel!(backend, 256)
-    init_k!(states, shadow_queue.items, shadow_queue.size, Int32(n); ndrange=n)
-    vk_flush!()
+    init_k!(states, shadow_queue.items, shadow_queue.size, Int32(cap); ndrange=n_rays_gpu)
+    # No flush — stays in command buffer
 
     extract_k! = _extract_shadow_rays2_kernel!(backend, 256)
     process_k! = _process_shadow_round_kernel!(backend, 256)
     count_k! = _count_active_shadows_kernel!(backend, 256)
 
+    # Run all rounds without early termination — inactive rays have active=0
+    # and produce no-op work in extract/process kernels. This avoids expensive
+    # GPU→CPU sync (vk_flush + Array readback) on every round.
     for _round in 1:10
-        extract_k!(ray_buf, states, Int32(n); ndrange=n)
-        vk_flush!()
-
-        trace_closest_hits!(result_buf, ray_buf, hw, n)
-
+        extract_k!(ray_buf, states, Int32(cap); ndrange=n_rays_gpu)
+        trace_closest_hits_indirect!(result_buf, ray_buf, hw, n_rays_gpu)
         process_k!(states, result_buf, hwtlas.tri_gpu, hwtlas.off_gpu,
                    media_interfaces, media, materials, state.rgb2spec_table,
-                   Int32(n); ndrange=n)
-
-        KernelAbstractions.fill!(active_counter, Int32(0))
-        count_k!(active_counter, states, Int32(n); ndrange=n)
-        vk_flush!()
-
-        n_active = Int(Array(active_counter)[1])
-        n_active == 0 && break
+                   Int32(cap); ndrange=n_rays_gpu)
     end
 
     # Finalize — accumulate completed visible rays to pixel_L
     finalize_k! = _finalize_shadow_kernel!(backend, 256)
-    finalize_k!(states, state.pixel_L, Int32(n); ndrange=n)
+    finalize_k!(states, state.pixel_L, Int32(cap); ndrange=n_rays_gpu)
 
     return nothing
 end

@@ -145,39 +145,32 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
     )
 end
 
-"""
-    rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
-                 push_data::Vector{UInt8}, width, height; depth=1)
+# Descriptor set cache: (pipeline ds_layout handle, tlas accel handle) → (pool, descriptor_set)
+# Kept alive as long as the pipeline and TLAS objects exist (GC-safe via Vulkan.jl handles).
+const _rt_desc_cache = Dict{Tuple{UInt64, UInt64}, Tuple{Vulkan.DescriptorPool, Vulkan.DescriptorSet}}()
 
-Record an RT trace dispatch.
-"""
-function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
-                      push_data::Vector{UInt8}, width::Integer, height::Integer;
-                      depth::Integer=1)
-    ctx = vk_context()
-    dev = ctx.device
-    cmd = ctx.cmd_buf
+# In-flight descriptor pools to keep alive until vk_flush!()
+const _inflight_rt_desc_pools = Vulkan.DescriptorPool[]
 
-    # Flush pending compute dispatches
-    if ctx.recording
-        vk_flush!()
+function _get_rt_descriptor_set(pipeline::LavaRTPipeline, tlas::LavaTLAS)
+    # Cache key: use raw Vulkan handle values for identity
+    key = (UInt64(pipeline.descriptor_set_layout.vks),
+           UInt64(tlas.accel.vks))
+    cached = get(_rt_desc_cache, key, nothing)
+    if cached !== nothing
+        return cached[2]
     end
 
-    # Allocate descriptor set for TLAS
+    dev = vk_device()
     desc_pool = Vulkan.DescriptorPool(dev, UInt32(1), [
         Vulkan.DescriptorPoolSize(
             Vulkan.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, UInt32(1)),
     ])
-
     desc_sets = unwrap(Vulkan.allocate_descriptor_sets(dev,
         Vulkan.DescriptorSetAllocateInfo(desc_pool, [pipeline.descriptor_set_layout])))
     desc_set = desc_sets[1]
 
-    # Write TLAS descriptor
-    # Need to use the WriteDescriptorSetAccelerationStructureKHR extension
-    as_write = Vulkan.WriteDescriptorSetAccelerationStructureKHR(
-        [tlas.accel],
-    )
+    as_write = Vulkan.WriteDescriptorSetAccelerationStructureKHR([tlas.accel])
     write_ds = Vulkan.WriteDescriptorSet(
         desc_set, UInt32(0), UInt32(0),
         Vulkan.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
@@ -189,10 +182,52 @@ function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
     )
     Vulkan.update_descriptor_sets(dev, [write_ds], [])
 
-    # Record command buffer
-    unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
-        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    )))
+    _rt_desc_cache[key] = (desc_pool, desc_set)
+    return desc_set
+end
+
+"""
+    rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
+                 push_data::Vector{UInt8}, width, height; depth=1)
+
+Record an RT trace dispatch into the batched command buffer.
+Call `vk_flush!()` to submit and wait for completion.
+Compute→RT barriers are inserted automatically.
+"""
+function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
+                      push_data::Vector{UInt8}, width::Integer, height::Integer;
+                      depth::Integer=1)
+    ctx = vk_context()
+    cmd = ctx.cmd_buf
+
+    # Begin recording if not already
+    if !ctx.recording
+        unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
+            flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        )))
+        ctx.recording = true
+    end
+
+    # Barrier: previous dispatches → RT
+    if ctx.dispatch_count > 0
+        src_stage = ctx.last_was_rt ?
+            Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR :
+            Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT
+        barrier = Vulkan.MemoryBarrier(
+            C_NULL,
+            Vulkan.ACCESS_SHADER_WRITE_BIT,
+            Vulkan.ACCESS_SHADER_READ_BIT | Vulkan.ACCESS_SHADER_WRITE_BIT |
+            Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+        )
+        Vulkan.cmd_pipeline_barrier(
+            cmd, [barrier], [], [];
+            src_stage_mask=src_stage,
+            dst_stage_mask=Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+        )
+    end
+
+    # Get cached descriptor set
+    desc_set = _get_rt_descriptor_set(pipeline, tlas)
 
     Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline.pipeline)
     Vulkan.cmd_bind_descriptor_sets(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR,
@@ -219,17 +254,83 @@ function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
         UInt32(width), UInt32(height), UInt32(depth),
     )
 
-    unwrap(Vulkan.end_command_buffer(cmd))
+    ctx.dispatch_count += 1
+    ctx.last_was_rt = true
+    return nothing
+end
 
-    # Submit and wait
-    submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=ctx.fence))
-    unwrap(Vulkan.wait_for_fences(dev, [ctx.fence], true, typemax(UInt64)))
-    unwrap(Vulkan.reset_fences(dev, [ctx.fence]))
+"""
+    rt_dispatch_indirect!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
+                          push_data::Vector{UInt8}, indirect_buf::VkIndirectBuffer;
+                          indirect_offset::Integer=0)
 
-    # Descriptor pool is GC-managed via Vulkan.jl finalizers.
-    # Do NOT manually destroy — causes double-free segfault.
+Record an indirect RT trace dispatch into the batched command buffer.
+The `indirect_buf` must contain a VkTraceRaysIndirectCommandKHR at the given offset
+(3×UInt32: width, height, depth), written by a previous GPU kernel.
+"""
+function rt_dispatch_indirect!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
+                               push_data::Vector{UInt8}, indirect_buf;
+                               indirect_offset::Integer=0)
+    ctx = vk_context()
+    cmd = ctx.cmd_buf
 
+    # Begin recording if not already
+    if !ctx.recording
+        unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
+            flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        )))
+        ctx.recording = true
+    end
+
+    # Barrier: previous dispatches → RT
+    if ctx.dispatch_count > 0
+        src_stage = ctx.last_was_rt ?
+            Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR :
+            Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT
+        barrier = Vulkan.MemoryBarrier(
+            C_NULL,
+            Vulkan.ACCESS_SHADER_WRITE_BIT,
+            Vulkan.ACCESS_SHADER_READ_BIT | Vulkan.ACCESS_SHADER_WRITE_BIT |
+            Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+        )
+        Vulkan.cmd_pipeline_barrier(
+            cmd, [barrier], [], [];
+            src_stage_mask=src_stage,
+            dst_stage_mask=Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+        )
+    end
+
+    desc_set = _get_rt_descriptor_set(pipeline, tlas)
+
+    Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline.pipeline)
+    Vulkan.cmd_bind_descriptor_sets(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR,
+        pipeline.pipeline_layout, UInt32(0), [desc_set], UInt32[])
+
+    if !isempty(push_data)
+        GC.@preserve push_data begin
+            Vulkan.cmd_push_constants(
+                cmd, pipeline.pipeline_layout,
+                Vulkan.SHADER_STAGE_RAYGEN_BIT_KHR |
+                Vulkan.SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+                Vulkan.SHADER_STAGE_MISS_BIT_KHR,
+                UInt32(0), UInt32(length(push_data)),
+                Ptr{Nothing}(pointer(push_data)),
+            )
+        end
+    end
+
+    # Indirect dispatch — reads dimensions from BDA
+    indirect_address = indirect_buf isa VkIndirectBuffer ? indirect_buf.address : indirect_buf.address
+    Vulkan.cmd_trace_rays_indirect_khr(cmd,
+        pipeline.raygen_region,
+        pipeline.miss_region,
+        pipeline.hit_region,
+        pipeline.callable_region,
+        UInt64(indirect_address + indirect_offset),
+    )
+
+    ctx.dispatch_count += 1
+    ctx.last_was_rt = true
     return nothing
 end
 
