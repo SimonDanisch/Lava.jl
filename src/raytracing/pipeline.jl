@@ -24,6 +24,8 @@ struct LavaRTPipeline
     callable_region::Vulkan.StridedDeviceAddressRegionKHR
     # Push constant size
     push_constant_size::UInt32
+    # Stage flags for push constants and descriptor sets
+    stage_flags::Vulkan.ShaderStageFlag
 end
 
 """
@@ -42,6 +44,7 @@ Layout:
 function create_rt_pipeline(raygen_spirv::Vector{UInt8},
                             miss_spirv::Vector{UInt8},
                             chit_spirv::Vector{UInt8};
+                            anyhit_spirv::Union{Nothing, Vector{UInt8}}=nothing,
                             push_constant_size::Integer=8)
     ctx = vk_context()
     dev = ctx.device
@@ -55,8 +58,11 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
     raygen_mod = _create_shader_module(dev, raygen_spirv)
     miss_mod = _create_shader_module(dev, miss_spirv)
     chit_mod = _create_shader_module(dev, chit_spirv)
+    shader_modules = [raygen_mod, miss_mod, chit_mod]
 
-    # Shader stages (index 0=raygen, 1=miss, 2=closest-hit)
+    has_anyhit = anyhit_spirv !== nothing
+
+    # Shader stages (index 0=raygen, 1=miss, 2=closest-hit, [3=any-hit])
     stages = [
         Vulkan.PipelineShaderStageCreateInfo(
             Vulkan.SHADER_STAGE_RAYGEN_BIT_KHR, raygen_mod, "main"),
@@ -65,6 +71,21 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
         Vulkan.PipelineShaderStageCreateInfo(
             Vulkan.SHADER_STAGE_CLOSEST_HIT_BIT_KHR, chit_mod, "main"),
     ]
+
+    if has_anyhit
+        anyhit_mod = _create_shader_module(dev, anyhit_spirv)
+        push!(stages, Vulkan.PipelineShaderStageCreateInfo(
+            Vulkan.SHADER_STAGE_ANY_HIT_BIT_KHR, anyhit_mod, "main"))
+        push!(shader_modules, anyhit_mod)
+    end
+
+    # All stage flags (for descriptor set and push constant visibility)
+    all_stage_flags = Vulkan.SHADER_STAGE_RAYGEN_BIT_KHR |
+                      Vulkan.SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+                      Vulkan.SHADER_STAGE_MISS_BIT_KHR
+    if has_anyhit
+        all_stage_flags |= Vulkan.SHADER_STAGE_ANY_HIT_BIT_KHR
+    end
 
     # Shader groups
     groups = [
@@ -84,12 +105,12 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
             VK_SHADER_UNUSED_KHR,
             VK_SHADER_UNUSED_KHR,
         ),
-        # Group 2: closest-hit (TRIANGLES_HIT_GROUP, shader index 2)
+        # Group 2: triangles hit group (closest-hit at index 2, optional any-hit at index 3)
         Vulkan.RayTracingShaderGroupCreateInfoKHR(
             Vulkan.RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR,
             VK_SHADER_UNUSED_KHR,  # general_shader (not used for hit groups)
             UInt32(2),              # closest_hit_shader = stage index 2
-            VK_SHADER_UNUSED_KHR,  # any_hit_shader
+            has_anyhit ? UInt32(3) : VK_SHADER_UNUSED_KHR,  # any_hit_shader
             VK_SHADER_UNUSED_KHR,  # intersection_shader
         ),
     ]
@@ -99,9 +120,7 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
         Vulkan.DescriptorSetLayoutBinding(
             UInt32(0),
             Vulkan.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
-            Vulkan.SHADER_STAGE_RAYGEN_BIT_KHR |
-            Vulkan.SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
-            Vulkan.SHADER_STAGE_MISS_BIT_KHR;
+            all_stage_flags;
             descriptor_count=1,
         ),
     ])
@@ -109,9 +128,7 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
     # Pipeline layout: descriptor set + push constants
     push_ranges = if push_constant_size > 0
         [Vulkan.PushConstantRange(
-            Vulkan.SHADER_STAGE_RAYGEN_BIT_KHR |
-            Vulkan.SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
-            Vulkan.SHADER_STAGE_MISS_BIT_KHR,
+            all_stage_flags,
             UInt32(0),
             UInt32(push_constant_size),
         )]
@@ -132,16 +149,17 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
     pipelines, _ = unwrap(Vulkan.create_ray_tracing_pipelines_khr(dev, [rt_ci]))
     pipeline = pipelines[1]
 
-    # Build SBT
+    # Build SBT (still 3 groups — any-hit is part of the hit group, not a separate group)
     sbt_buf, raygen_region, miss_region, hit_region, callable_region =
         _build_sbt(dev, pipeline, rt_props, 3)
 
     return LavaRTPipeline(
         pipeline, layout, ds_layout,
-        [raygen_mod, miss_mod, chit_mod],
+        shader_modules,
         sbt_buf,
         raygen_region, miss_region, hit_region, callable_region,
         UInt32(push_constant_size),
+        all_stage_flags,
     )
 end
 
@@ -237,9 +255,7 @@ function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
         GC.@preserve push_data begin
             Vulkan.cmd_push_constants(
                 cmd, pipeline.pipeline_layout,
-                Vulkan.SHADER_STAGE_RAYGEN_BIT_KHR |
-                Vulkan.SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
-                Vulkan.SHADER_STAGE_MISS_BIT_KHR,
+                pipeline.stage_flags,
                 UInt32(0), UInt32(length(push_data)),
                 Ptr{Nothing}(pointer(push_data)),
             )
@@ -310,9 +326,7 @@ function rt_dispatch_indirect!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
         GC.@preserve push_data begin
             Vulkan.cmd_push_constants(
                 cmd, pipeline.pipeline_layout,
-                Vulkan.SHADER_STAGE_RAYGEN_BIT_KHR |
-                Vulkan.SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
-                Vulkan.SHADER_STAGE_MISS_BIT_KHR,
+                pipeline.stage_flags,
                 UInt32(0), UInt32(length(push_data)),
                 Ptr{Nothing}(pointer(push_data)),
             )

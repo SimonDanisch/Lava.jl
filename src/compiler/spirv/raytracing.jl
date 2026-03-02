@@ -428,3 +428,23 @@ function _emit_rt_hit_attrib_load_at!(state::SPIRVEmitterState, inst::LLVM.CallI
 
     state.value_map[inst] = result_id
 end
+
+# ── OpIgnoreIntersectionKHR / OpTerminateRayKHR Emission ──
+
+"""
+Emit OpIgnoreIntersectionKHR — block terminator in any-hit shaders.
+Rejects the current intersection and continues traversal.
+"""
+function _emit_rt_ignore_intersection!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    encode_instruction!(state.mod.functions, Op.OpIgnoreIntersectionKHR)
+    state.rt_block_terminated = true
+end
+
+"""
+Emit OpTerminateRayKHR — block terminator in any-hit shaders.
+Accepts the current hit and stops traversal immediately.
+"""
+function _emit_rt_terminate_ray!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    encode_instruction!(state.mod.functions, Op.OpTerminateRayKHR)
+    state.rt_block_terminated = true
+end

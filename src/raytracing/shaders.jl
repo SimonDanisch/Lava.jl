@@ -40,14 +40,15 @@ mutable struct RayTracingPipeline
     raygen_func::Any
     closesthit_func::Any
     miss_func::Any
+    anyhit_func::Any          # nothing = no any-hit shader
     payload_type::Symbol
     # Compiled state (lazy)
     _compiled::Union{Nothing, NamedTuple}
     _pipeline_cache::Dict{UInt64, Tuple{LavaRTPipeline, LavaRTShader, Vector{Int}}}
 end
 
-function RayTracingPipeline(; raygen, closest_hit, miss, payload_type::Symbol=:f32)
-    RayTracingPipeline(raygen, closest_hit, miss, payload_type, nothing,
+function RayTracingPipeline(; raygen, closest_hit, miss, any_hit=nothing, payload_type::Symbol=:f32)
+    RayTracingPipeline(raygen, closest_hit, miss, any_hit, payload_type, nothing,
                         Dict{UInt64, Tuple{LavaRTPipeline, LavaRTShader, Vector{Int}}}())
 end
 
@@ -167,11 +168,21 @@ function _compile_rt_pipeline(pipeline::RayTracingPipeline, raygen_tt)
     miss_compiled = lava_compile_rt_shader(pipeline.miss_func, miss_tt;
         stage=:miss, push_constant_size=0, payload_type=pt, validate=true)
 
+    # Compile any-hit (optional)
+    anyhit_spirv = nothing
+    if pipeline.anyhit_func !== nothing
+        # Any-hit gets same args as raygen (shares BDA arg buffer via push constant)
+        anyhit_compiled = lava_compile_rt_shader(pipeline.anyhit_func, raygen_tt;
+            stage=:anyhit, push_constant_size=8, payload_type=pt, validate=true)
+        anyhit_spirv = anyhit_compiled.spirv_bytes
+    end
+
     # Create Vulkan RT pipeline from compiled SPIR-V
     vk_pipeline = create_rt_pipeline(
         raygen_compiled.spirv_bytes,
         miss_compiled.spirv_bytes,
         chit_compiled.spirv_bytes;
+        anyhit_spirv=anyhit_spirv,
         push_constant_size=8)
 
     # Cache arg layout offsets as Vector{Int} for zero-alloc packing

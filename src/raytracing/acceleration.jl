@@ -36,7 +36,8 @@ end
 Build a bottom-level acceleration structure from triangle vertices and indices.
 `indices` are triplets (0-based) defining triangles.
 """
-function build_blas(vertices::Vector{NTuple{3,Float32}}, indices::Vector{UInt32})
+function build_blas(vertices::Vector{NTuple{3,Float32}}, indices::Vector{UInt32};
+                    opaque::Bool=true)
     ctx = vk_context()
     dev = ctx.device
 
@@ -55,7 +56,7 @@ function build_blas(vertices::Vector{NTuple{3,Float32}}, indices::Vector{UInt32}
     vstride = UInt64(sizeof(NTuple{3,Float32}))
     itype = UInt32(Vulkan.INDEX_TYPE_UINT32)
     build_flags = UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
-    geo_flags = UInt32(Vulkan.GEOMETRY_OPAQUE_BIT_KHR)
+    geo_flags = opaque ? UInt32(Vulkan.GEOMETRY_OPAQUE_BIT_KHR) : UInt32(0)
 
     # Query build sizes using correctly-packed geometry
     sizes = _query_as_build_sizes(dev;
@@ -514,7 +515,7 @@ Each primitive must have a `.vertices` field with 3 vertex positions
 
 Primitives on GPU (LavaArray, etc.) are downloaded to CPU automatically.
 """
-function build_blas_from_primitives(primitives)
+function build_blas_from_primitives(primitives; opaque::Bool=true)
     cpu_prims = _to_cpu_vector(primitives)
     n_tris = length(cpu_prims)
 
@@ -534,7 +535,7 @@ function build_blas_from_primitives(primitives)
         indices[i+1] = UInt32(i)
     end
 
-    return build_blas(vertices, indices)
+    return build_blas(vertices, indices; opaque)
 end
 
 """

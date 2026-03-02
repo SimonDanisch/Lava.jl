@@ -281,6 +281,33 @@ end
 @inline lava_rt_hit_bary_u() = _lava_rt_hit_attrib_load_f32_at(UInt32(0))
 @inline lava_rt_hit_bary_v() = _lava_rt_hit_attrib_load_f32_at(UInt32(1))
 
+# ── OpIgnoreIntersectionKHR / OpTerminateRayKHR Intrinsics ──
+# These are SPIR-V block terminators — valid only in any-hit shaders.
+# OpIgnoreIntersectionKHR: reject the current intersection, continue traversal.
+# OpTerminateRayKHR: accept the current hit and stop traversal immediately.
+
+@inline function _lava_rt_ignore_intersection()
+    Base.llvmcall(("""
+        declare void @_lava_rt_ignore_intersection() #0
+        define void @entry() #0 {
+            call void @_lava_rt_ignore_intersection()
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{})
+end
+
+@inline function _lava_rt_terminate_ray()
+    Base.llvmcall(("""
+        declare void @_lava_rt_terminate_ray() #0
+        define void @entry() #0 {
+            call void @_lava_rt_terminate_ray()
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{})
+end
+
 # Register RT intrinsic names for GPUCompiler validation
 push!(known_intrinsics, "_lava_rt_trace_ray")
 push!(known_intrinsics, "_lava_rt_payload_store_f32")
@@ -288,3 +315,5 @@ push!(known_intrinsics, "_lava_rt_payload_load_f32")
 push!(known_intrinsics, "_lava_rt_payload_store_f32_at")
 push!(known_intrinsics, "_lava_rt_payload_load_f32_at")
 push!(known_intrinsics, "_lava_rt_hit_attrib_load_f32_at")
+push!(known_intrinsics, "_lava_rt_ignore_intersection")
+push!(known_intrinsics, "_lava_rt_terminate_ray")

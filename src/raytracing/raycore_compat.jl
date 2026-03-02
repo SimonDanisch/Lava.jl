@@ -62,6 +62,8 @@ mutable struct HardwareAccel
     triangle_data::Vector           # CPU primitives for lookup
     blas_offsets::Vector{UInt32}
     rt_pipeline::RayTracingPipeline
+    # Optional any-hit pipeline (lazy — created on first use via set_anyhit_pipeline!)
+    anyhit_pipeline::Union{Nothing, RayTracingPipeline}
 end
 
 """
@@ -87,7 +89,24 @@ function HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets)
         miss=_hw_miss,
         payload_type=:f32_6,
     )
-    HardwareAccel(hw_tlas, triangle_data, blas_offsets, rt)
+    HardwareAccel(hw_tlas, triangle_data, blas_offsets, rt, nothing)
+end
+
+"""
+    set_anyhit_pipeline!(accel::HardwareAccel, anyhit_func, raygen_func)
+
+Create and cache an any-hit pipeline variant for this HardwareAccel.
+The `anyhit_func` and `raygen_func` must have matching BDA arg signatures.
+"""
+function set_anyhit_pipeline!(accel::HardwareAccel, anyhit_func, raygen_func)
+    accel.anyhit_pipeline = RayTracingPipeline(
+        raygen=raygen_func,
+        closest_hit=_hw_closesthit,
+        miss=_hw_miss,
+        any_hit=anyhit_func,
+        payload_type=:f32_6,
+    )
+    return accel
 end
 
 """
@@ -111,6 +130,30 @@ Indirect RT trace — reads ray count from GPU buffer. No CPU readback.
 """
 function trace_closest_hits_indirect!(results, rays, accel::HardwareAccel, n_rays::LavaArray{Int32})
     trace_rays_indirect!(accel.rt_pipeline, accel.tlas, rays, results; n_rays=n_rays)
+end
+
+"""
+    trace_closest_hits_anyhit!(results, rays, accel, n_rays, extra_args...)
+
+RT trace with any-hit shader. `extra_args` are passed after (rays, results) to the
+raygen and any-hit functions via the shared BDA arg buffer.
+"""
+function trace_closest_hits_anyhit!(results, rays, accel::HardwareAccel, n_rays::Integer, extra_args...)
+    pipeline = accel.anyhit_pipeline
+    pipeline === nothing && error("No any-hit pipeline set. Call set_anyhit_pipeline! first.")
+    trace_rays!(pipeline, accel.tlas, rays, results, extra_args...;
+                width=Int(n_rays), height=1)
+end
+
+"""
+    trace_closest_hits_anyhit_indirect!(results, rays, accel, n_rays_buf, extra_args...)
+
+Indirect RT trace with any-hit shader — reads ray count from GPU buffer.
+"""
+function trace_closest_hits_anyhit_indirect!(results, rays, accel::HardwareAccel, n_rays::LavaArray{Int32}, extra_args...)
+    pipeline = accel.anyhit_pipeline
+    pipeline === nothing && error("No any-hit pipeline set. Call set_anyhit_pipeline! first.")
+    trace_rays_indirect!(pipeline, accel.tlas, rays, results, extra_args...; n_rays=n_rays)
 end
 
 # ── Built-in RT Shaders ──
