@@ -72,15 +72,22 @@ The TLAS must have `.blas_array` and `.instances` fields.
 """
 function HardwareAccel(tlas)
     hw_tlas, tri_data, offsets = build_hw_accel_from_tlas(tlas)
+    HardwareAccel(hw_tlas, tri_data, offsets)
+end
 
+"""
+    HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets) -> HardwareAccel
+
+Build a HardwareAccel from a pre-built Vulkan TLAS + triangle data + offsets.
+"""
+function HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets)
     rt = RayTracingPipeline(
         raygen=_hw_raygen,
         closest_hit=_hw_closesthit,
         miss=_hw_miss,
         payload_type=:f32_6,
     )
-
-    HardwareAccel(hw_tlas, tri_data, offsets, rt)
+    HardwareAccel(hw_tlas, triangle_data, blas_offsets, rt)
 end
 
 """

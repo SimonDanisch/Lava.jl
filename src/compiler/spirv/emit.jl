@@ -2455,6 +2455,10 @@ function _infer_inner_ptr_pointee(gep_or_load::LLVM.Instruction)
                     if LLVM.operands(inner_user)[2] === user
                         return LLVM.value_type(LLVM.operands(inner_user)[1])
                     end
+                elseif inner_user isa LLVM.AtomicRMWInst
+                    return LLVM.value_type(LLVM.operands(inner_user)[2])
+                elseif inner_user isa LLVM.AtomicCmpXchgInst
+                    return LLVM.value_type(LLVM.operands(inner_user)[2])
                 end
             end
         end

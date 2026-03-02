@@ -1,38 +1,385 @@
 # Hikari Hardware RT Integration for Lava.jl
 #
-# This file bridges Lava's hardware RT infrastructure with Hikari's wavefront
-# renderer. It is NOT included from Lava.jl (no Hikari/Raycore dependency).
-# Users include it after loading both Lava, Hikari, and Raycore:
+# This file provides HWTLAS — a drop-in replacement for Raycore.TLAS that uses
+# Vulkan's VK_KHR_ray_tracing_pipeline for hardware BVH traversal.
 #
-#   using Lava, Hikari, Raycore
-#   include("path/to/hikari_integration.jl")
+# NOT included from Lava.jl (no Hikari/Raycore dependency).
+# Loaded automatically via RayMakie's package extension (RayMakieLavaExt).
 #
-# Usage:
-#   scene = Hikari.Scene(...)
-#   Hikari.sync!(scene)
-#   hw_accel = Lava.HardwareAccel(scene.accel)
-#   # In render loop, replace vp_trace_rays! with:
-#   hw_vp_trace_rays!(state, hw_accel, media_interfaces, materials)
+# Usage (drop-in TLAS replacement):
+#   hwtlas = HWTLAS()
+#   scene = Hikari.Scene(pairs; accel=hwtlas)
+#   # or for RayMakie:
+#   scene = Hikari.Scene(; backend=LavaBackend(), accel=HWTLAS())
+#
+# The HWTLAS implements the same push!/sync! API as Raycore.TLAS.
+# On push!, a Vulkan BLAS is built immediately from the mesh geometry.
+# On sync!(), a Vulkan TLAS is built from all accumulated BLASes.
+#
+# When a scene has an HWTLAS, vp_trace_rays! and vp_trace_shadow_rays!
+# automatically dispatch to hardware implementations via the adapted accel type.
 #
 # Current limitations:
 # - Alpha transparency (cutout textures) is NOT supported — surfaces are treated
 #   as fully opaque. Full alpha support requires an any_hit shader (future work).
-# - Shadow ray tracing still uses software BVH (vp_trace_shadow_rays! unchanged).
 
 using Base: @propagate_inbounds
-using Lava: RTRay, RTHitResult, LavaArray, LavaBackend,
-            lava_global_invocation_id_x, trace_closest_hits!, vk_flush!
+using Lava: RTRay, RTHitResult, LavaArray, LavaBackend, LavaBLAS, LavaTLAS,
+            lava_global_invocation_id_x, trace_closest_hits!, vk_flush!,
+            build_blas, build_tlas, _mat4_to_vk_transform
 using Adapt
 using KernelAbstractions
 using StaticArrays
+using GeometryBasics
+using GeometryBasics: Point3f, Vec3f, Point2f, decompose, decompose_normals,
+                      TriangleFace
+using LinearAlgebra: dot, I
+using Colors
 
 import Raycore
+import Raycore: TLASHandle, Bounds3, Triangle, TriangleMesh, to_triangle_mesh,
+                is_degenerate, get_vertices, build_triangle, is_degenerate_face
+import Hikari
+import Atomix
+
+const Mat4f = SMatrix{4, 4, Float32, 16}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HWTLAS — Hardware-accelerated TLAS (no CPU BVH)
+# ══════════════════════════════════════════════════════════════════════════════
+
+"""
+    HWTLAS
+
+Hardware-accelerated TLAS using Vulkan's `VK_KHR_ray_tracing_pipeline`.
+Drop-in replacement for `Raycore.TLAS` — same `push!/sync!` API.
+
+On `push!()`, builds a Vulkan BLAS immediately from the mesh geometry.
+On `sync!()`, builds the Vulkan TLAS from all accumulated BLASes.
+No CPU BVH is ever constructed.
+
+# Usage
+```julia
+hwtlas = HWTLAS()
+scene = Hikari.Scene(pairs; accel=hwtlas)
+vp = Hikari.VolPath(samples=10, max_depth=8)
+vp(scene, gpu_film, camera)  # automatically uses HW RT
+```
+"""
+mutable struct HWTLAS
+    # ── Geometry storage (accumulated on push!) ──
+    blas_list::Vector{LavaBLAS}             # One per unique geometry
+    blas_triangles::Vector{Vector{Any}}     # Per-BLAS triangle data (for shading)
+    blas_offsets::Vector{UInt32}            # Per-BLAS offset into flat triangle array
+
+    # ── Instance management ──
+    instance_blas_indices::Vector{Int}       # Which BLAS each instance references (1-based)
+    instance_transforms::Vector{NTuple{12,Float32}}  # VkTransformMatrixKHR per instance
+    instance_custom_indices::Vector{UInt32}  # BLAS index (0-based) per instance
+
+    handle_to_range::Dict{TLASHandle, UnitRange{Int}}
+    deleted_handles::Set{TLASHandle}
+    next_handle_id::UInt32
+
+    # ── Bounding box ──
+    root_aabb::Bounds3
+
+    # ── Built on sync! ──
+    hw_tlas::Union{Nothing, LavaTLAS}
+    hw_accel::Union{Nothing, Lava.HardwareAccel}  # Wraps hw_tlas + RT pipeline
+    tri_gpu::Union{Nothing, LavaArray}             # All triangles (flat) on GPU
+    off_gpu::Union{Nothing, LavaArray{UInt32, 1}}  # BLAS offsets on GPU
+
+    dirty::Bool
+
+    # ── Pre-allocated ray trace buffers (reused across frames) ──
+    primary_ray_buf::Union{Nothing, LavaArray{RTRay, 1}}
+    primary_result_buf::Union{Nothing, LavaArray{RTHitResult, 1}}
+    shadow_states::Union{Nothing, LavaArray}
+    shadow_ray_buf::Union{Nothing, LavaArray{RTRay, 1}}
+    shadow_result_buf::Union{Nothing, LavaArray{RTHitResult, 1}}
+    shadow_active_counter::Union{Nothing, LavaArray{Int32, 1}}
+end
+
+"""
+    HWTLAS()
+
+Create an empty HWTLAS. Use `push!` to add geometry (builds Vulkan BLAS
+immediately), then `sync!` to build the Vulkan TLAS.
+"""
+HWTLAS() = HWTLAS(
+    LavaBLAS[], Vector{Any}[], UInt32[],
+    Int[], NTuple{12,Float32}[], UInt32[],
+    Dict{TLASHandle, UnitRange{Int}}(), Set{TLASHandle}(), UInt32(1),
+    Bounds3(),
+    nothing, nothing, nothing, nothing,
+    true,
+    nothing, nothing, nothing, nothing, nothing, nothing,
+)
+
+# ── push! — build Vulkan BLAS immediately ──
+
+function Base.push!(hwtlas::HWTLAS, geometry, material_idx; arealight_indices=nothing)
+    return push!(hwtlas, Raycore.Instance(geometry; metadata=material_idx); arealight_indices)
+end
+
+function Base.push!(hwtlas::HWTLAS, geometry, material_idx, transform::Mat4f; arealight_indices=nothing)
+    return push!(hwtlas, Raycore.Instance(geometry, transform, material_idx); arealight_indices)
+end
+
+function Base.push!(hwtlas::HWTLAS, geometry, material_idx, transforms::AbstractVector{Mat4f}; arealight_indices=nothing)
+    return push!(hwtlas, Raycore.Instance(geometry, transforms; metadata=material_idx); arealight_indices)
+end
+
+function Base.push!(hwtlas::HWTLAS, geometry)
+    return push!(hwtlas, Raycore.Instance(geometry))
+end
+
+"""
+    push!(hwtlas::HWTLAS, mesh::GeometryBasics.Mesh, transform::Mat4f=Mat4f(I))
+
+Add a GeometryBasics.Mesh to the HWTLAS. Per-face metadata is read from the mesh's
+`face_meta` attribute (if present). Mirrors `push!(::TLAS, ::Mesh, ::Mat4f)`.
+"""
+function Base.push!(hwtlas::HWTLAS, mesh::GeometryBasics.Mesh, transform::Mat4f=Mat4f(I))
+    nmesh = GeometryBasics.expand_faceviews(mesh)
+    fs = decompose(TriangleFace{UInt32}, nmesh)
+    verts = decompose(Point3f, nmesh)
+    norms = Raycore.Normal3f.(decompose_normals(nmesh))
+    uvs_raw = GeometryBasics.decompose_uv(nmesh)
+    uvs = isnothing(uvs_raw) ? Point2f[] : Point2f.(uvs_raw)
+    indices = collect(reinterpret(UInt32, fs))
+
+    has_meta = hasproperty(nmesh, :face_meta)
+    n_faces = length(fs)
+
+    cpu_triangles = [begin
+            meta = has_meta ? nmesh.face_meta[indices[3*(i-1)+1]] : UInt32(i)
+            build_triangle(verts, norms, uvs, indices, i, meta)
+        end
+        for i in 1:n_faces
+        if !is_degenerate_face(verts, indices, i)
+    ]
+    isempty(cpu_triangles) && error("Geometry has no valid triangles")
+
+    # Extract vertex positions for Vulkan BLAS build
+    n_tris = length(cpu_triangles)
+    blas_vertices = Vector{NTuple{3,Float32}}(undef, n_tris * 3)
+    for i in 1:n_tris
+        vs = cpu_triangles[i].vertices
+        for j in 1:3
+            v = vs[j]
+            blas_vertices[(i-1)*3 + j] = (Float32(v[1]), Float32(v[2]), Float32(v[3]))
+        end
+    end
+    blas_indices = Vector{UInt32}(undef, n_tris * 3)
+    for i in 0:(n_tris*3 - 1)
+        blas_indices[i+1] = UInt32(i)
+    end
+
+    hw_blas = build_blas(blas_vertices, blas_indices)
+    push!(hwtlas.blas_list, hw_blas)
+    push!(hwtlas.blas_triangles, cpu_triangles)
+    blas_idx = length(hwtlas.blas_list)
+
+    offset = isempty(hwtlas.blas_offsets) ? UInt32(0) :
+             hwtlas.blas_offsets[end] + UInt32(length(hwtlas.blas_triangles[end-1]))
+    push!(hwtlas.blas_offsets, offset)
+
+    for tri in cpu_triangles
+        for v in tri.vertices
+            hwtlas.root_aabb = union(hwtlas.root_aabb, Bounds3(Point3f(v)))
+        end
+    end
+
+    start_idx = length(hwtlas.instance_blas_indices) + 1
+    push!(hwtlas.instance_blas_indices, blas_idx)
+    push!(hwtlas.instance_transforms, _mat4_to_vk_transform(transform))
+    push!(hwtlas.instance_custom_indices, UInt32(blas_idx - 1))
+    end_idx = length(hwtlas.instance_blas_indices)
+
+    handle = TLASHandle(hwtlas.next_handle_id)
+    hwtlas.next_handle_id += UInt32(1)
+    hwtlas.handle_to_range[handle] = start_idx:end_idx
+
+    hwtlas.dirty = true
+    return handle
+end
+
+function Base.push!(hwtlas::HWTLAS, inst::Raycore.Instance; arealight_indices=nothing)
+    # Decompose mesh → triangles (same as Raycore)
+    mesh = to_triangle_mesh(inst.geometry)
+    has_per_face_mat = !isempty(mesh.material_indices)
+    n_faces = div(length(mesh.indices), 3)
+
+    cpu_triangles = [begin
+            mat_key = has_per_face_mat ? mesh.material_indices[i] : inst.metadata[1]
+            al_idx = !isnothing(arealight_indices) ? arealight_indices[i] : UInt32(0)
+            Triangle(mesh, i, Hikari.TriangleMeta(mat_key, UInt32(i), al_idx))
+        end
+        for i in 1:n_faces
+        if !is_degenerate(get_vertices(mesh, i))]
+    isempty(cpu_triangles) && error("Geometry has no valid triangles")
+
+    # Extract vertices + indices for Vulkan BLAS build
+    n_tris = length(cpu_triangles)
+    vertices = Vector{NTuple{3,Float32}}(undef, n_tris * 3)
+    for i in 1:n_tris
+        verts = cpu_triangles[i].vertices
+        for j in 1:3
+            v = verts[j]
+            vertices[(i-1)*3 + j] = (Float32(v[1]), Float32(v[2]), Float32(v[3]))
+        end
+    end
+    indices = Vector{UInt32}(undef, n_tris * 3)
+    for i in 0:(n_tris*3 - 1)
+        indices[i+1] = UInt32(i)
+    end
+
+    # Build Vulkan BLAS immediately
+    hw_blas = build_blas(vertices, indices)
+    push!(hwtlas.blas_list, hw_blas)
+    push!(hwtlas.blas_triangles, cpu_triangles)
+    blas_idx = length(hwtlas.blas_list)
+
+    # Compute offset into flat triangle array
+    offset = isempty(hwtlas.blas_offsets) ? UInt32(0) :
+             hwtlas.blas_offsets[end] + UInt32(length(hwtlas.blas_triangles[end-1]))
+    push!(hwtlas.blas_offsets, offset)
+
+    # Update bounding box from triangle vertices
+    for tri in cpu_triangles
+        for v in tri.vertices
+            hwtlas.root_aabb = union(hwtlas.root_aabb, Bounds3(Point3f(v)))
+        end
+    end
+
+    # Add instances (one per transform)
+    start_idx = length(hwtlas.instance_blas_indices) + 1
+    for transform in inst.transforms
+        push!(hwtlas.instance_blas_indices, blas_idx)
+        push!(hwtlas.instance_transforms, _mat4_to_vk_transform(transform))
+        push!(hwtlas.instance_custom_indices, UInt32(blas_idx - 1))  # 0-based for HW RT
+    end
+    end_idx = length(hwtlas.instance_blas_indices)
+
+    # Create handle
+    handle = TLASHandle(hwtlas.next_handle_id)
+    hwtlas.next_handle_id += UInt32(1)
+    hwtlas.handle_to_range[handle] = start_idx:end_idx
+
+    hwtlas.dirty = true
+    return handle
+end
+
+# ── delete! ──
+
+function Base.delete!(hwtlas::HWTLAS, handle::TLASHandle)::Bool
+    haskey(hwtlas.handle_to_range, handle) || return false
+    handle in hwtlas.deleted_handles && return false
+    push!(hwtlas.deleted_handles, handle)
+    hwtlas.dirty = true
+    return true
+end
+
+# ── sync! — build Vulkan TLAS from accumulated BLASes ──
+
+function Raycore.sync!(hwtlas::HWTLAS)
+    hwtlas.dirty || return hwtlas
+
+    n_instances = length(hwtlas.instance_blas_indices)
+    if n_instances == 0
+        hwtlas.hw_tlas = nothing
+        hwtlas.hw_accel = nothing
+        hwtlas.dirty = false
+        return hwtlas
+    end
+
+    # Build BLAS reference list + transforms for TLAS
+    hw_blas_refs = [hwtlas.blas_list[hwtlas.instance_blas_indices[i]] for i in 1:n_instances]
+
+    hwtlas.hw_tlas = build_tlas(hw_blas_refs;
+        transforms=hwtlas.instance_transforms,
+        custom_indices=hwtlas.instance_custom_indices)
+
+    # Build the HardwareAccel wrapper (holds RT pipeline + TLAS)
+    # Collect all triangles into a typed vector (blas_triangles stores Vector{Any})
+    all_tris_any = reduce(vcat, hwtlas.blas_triangles)
+    T = typeof(all_tris_any[1])
+    all_tris = T[t for t in all_tris_any]
+    hwtlas.hw_accel = Lava.HardwareAccel(hwtlas.hw_tlas, all_tris, hwtlas.blas_offsets)
+
+    # Upload triangle data + offsets to GPU
+    hwtlas.tri_gpu = LavaArray(all_tris)
+    hwtlas.off_gpu = LavaArray(hwtlas.blas_offsets)
+
+    hwtlas.dirty = false
+    return hwtlas
+end
+
+# ── Scene sync! for HWTLAS scenes ──
+
+function Hikari.sync!(scene::Hikari.Scene{<:HWTLAS})
+    Raycore.sync!(scene.accel)
+    bound = Raycore.world_bound(scene.accel)
+    scene.bounds[] = (bound, Hikari.bounding_sphere(bound))
+    return scene
+end
+
+# ── Accessors ──
+
+Raycore.world_bound(hwtlas::HWTLAS) = hwtlas.root_aabb
+Raycore.n_geometries(hwtlas::HWTLAS) = length(hwtlas.blas_list)
+Raycore.n_instances(hwtlas::HWTLAS) = length(hwtlas.instance_blas_indices)
+Raycore.refit_tlas!(hwtlas::HWTLAS) = nothing  # HW TLAS doesn't need refit (rebuilt on sync!)
+
+# RayMakie accesses tlas.instances directly for `isempty(tlas.instances)`
+# Provide a lightweight view
+struct _HWTLASInstances
+    n::Int
+end
+Base.isempty(x::_HWTLASInstances) = x.n == 0
+Base.length(x::_HWTLASInstances) = x.n
+
+function Base.getproperty(hwtlas::HWTLAS, s::Symbol)
+    if s === :instances
+        return _HWTLASInstances(length(getfield(hwtlas, :instance_blas_indices)))
+    else
+        return getfield(hwtlas, s)
+    end
+end
+
+# ── HWAdaptedAccel — GPU-adapted form of HWTLAS ──
+
+"""
+    HWAdaptedAccel
+
+The GPU-adapted form of HWTLAS. Returned by `Adapt.adapt_structure(to, ::HWTLAS)`.
+Dispatches `vp_trace_rays!` and `vp_trace_shadow_rays!` to hardware implementations.
+"""
+struct HWAdaptedAccel
+    hwtlas::HWTLAS
+end
+
+function Adapt.adapt_structure(to, hwtlas::HWTLAS)
+    HWAdaptedAccel(hwtlas)
+end
+
+# ── fill_aux_buffers! override for HWTLAS scenes ──
+# The default kernel calls intersect! inside compute, which can't use HW RT.
+# Fill with defaults (depth=miss, normal=0, albedo=0.8) — rendering is correct,
+# denoising won't have useful normals/depth but still functions.
+function Hikari.fill_aux_buffers!(film::Hikari.Film, scene::Hikari.Scene{<:HWAdaptedAccel}, camera; has_infinite_lights::Bool=false)
+    fill!(film.depth, 0f0)  # Must be finite — Inf triggers escaped-pixel masking in postprocess
+    fill!(film.normal, Vec3f(0f0, 0f0, 0f0))
+    fill!(film.albedo, Colors.RGB{Float32}(0.8f0, 0.8f0, 0.8f0))
+    return nothing
+end
 
 # ── PrecomputedHitsAccel ──
 # A "fake" acceleration structure that returns pre-computed RT results.
-# Used as the `accel` argument to vp_trace_rays_kernel!, replacing the
-# software BVH. The `closest_hit` method reads from the results buffer
-# using the thread's GlobalInvocationID as the index.
+# The kernel calls Raycore.closest_hit(precomputed, ray), which reads from
+# the results buffer using the thread's GlobalInvocationID as index.
 
 struct PrecomputedHitsAccel{R, T, O}
     results::R       # RTHitResult array (1 per ray)
@@ -48,25 +395,19 @@ function Adapt.adapt_structure(to, p::PrecomputedHitsAccel)
     )
 end
 
-# closest_hit for pre-computed results — reads from buffer by thread index.
-# The thread index matches the work queue item index because foreach() launches
-# one thread per queue item in order.
 @propagate_inbounds function Raycore.closest_hit(accel::PrecomputedHitsAccel, ray)
     tid = lava_global_invocation_id_x() + UInt32(1)  # 1-based
     result = accel.results[tid]
 
     if result.hit == UInt32(0)
-        # Miss — return a dummy triangle (caller checks `hit` flag first)
         dummy = accel.triangles[1]
         return (false, dummy, 0f0, SVector{3,Float32}(1f0, 0f0, 0f0))
     end
 
-    # Look up the original triangle from triangle_data
     tri_idx = Int(accel.offsets[result.instance_custom_index + UInt32(1)]) +
               Int(result.primitive_id) + 1
     tri = accel.triangles[tri_idx]
 
-    # Reconstruct barycentric coordinates (w, u, v)
     w = 1f0 - result.bary_u - result.bary_v
     bary = SVector{3,Float32}(w, result.bary_u, result.bary_v)
 
@@ -74,7 +415,6 @@ end
 end
 
 # ── Ray Extraction Kernel ──
-# Extracts rays from a Hikari work queue into a flat RTRay buffer.
 
 @kernel function _extract_rays_kernel!(ray_buf, @Const(queue_items), @Const(queue_size))
     i = @index(Global)
@@ -83,64 +423,55 @@ end
         ray = work.ray
         ray_buf[i] = RTRay(
             Float32(ray.o[1]), Float32(ray.o[2]), Float32(ray.o[3]),
-            0.001f0,  # tmin (small offset to avoid self-intersection)
+            0.001f0,
             Float32(ray.d[1]), Float32(ray.d[2]), Float32(ray.d[3]),
             ray.t_max,
         )
     end
 end
 
-# ── Hardware Ray Trace Function ──
+# ══════════════════════════════════════════════════════════════════════════════
+# Dispatch overrides — route to HW RT when accel is HWAdaptedAccel
+# ══════════════════════════════════════════════════════════════════════════════
 
-"""
-    hw_vp_trace_rays!(state, hw_accel, media_interfaces, materials)
+# Camera medium detection: use bounding box check (no CPU BVH needed)
+# For now, assume camera is outside all media (correct for most scenes).
+# A proper implementation would do a single HW RT trace on GPU.
+function Hikari._detect_initial_medium(backend, accel::HWAdaptedAccel, mi, pos, vp::Hikari.VolPath)
+    return Raycore.SetKey()  # No medium (camera outside all geometry)
+end
 
-Hardware-accelerated replacement for `Hikari.VolPath.vp_trace_rays!`.
+# Primary ray tracing: HW RT dispatch
+function Hikari.vp_trace_rays!(state::Hikari.VolPathState, accel::HWAdaptedAccel, media_interfaces, materials, ::Hikari.VolPath)
+    hwtlas = accel.hwtlas
+    hw = hwtlas.hw_accel
 
-Traces rays from the current work queue using the GPU's RT hardware
-(VK_KHR_ray_tracing_pipeline) instead of software BVH traversal.
-
-# Arguments
-- `state`: VolPathState (Hikari's wavefront state)
-- `hw_accel`: HardwareAccel built from the scene's TLAS
-- `media_interfaces`: Media interface array (passed through to kernel)
-- `materials`: Material array (passed through to kernel)
-
-# Limitations
-- Alpha transparency (cutout textures) NOT supported — treated as opaque.
-  The alpha testing loop in vp_trace_rays_kernel! may return incorrect results
-  for transparent surfaces. Full support requires any_hit shader.
-- Only primary ray tracing is accelerated; shadow rays still use software BVH.
-"""
-function hw_vp_trace_rays!(state, hw_accel::Lava.HardwareAccel,
-                            media_interfaces, materials;
-                            _tri_gpu=nothing, _off_gpu=nothing)
-    # Access Hikari's internal work queue
     input_queue = state.current_ray_queue == :a ? state.ray_queue_a : state.ray_queue_b
     n_rays = Int(Array(input_queue.size)[1])
     n_rays == 0 && return nothing
 
     backend = KernelAbstractions.get_backend(input_queue.items)
 
-    # Phase 1: Extract rays from work queue → flat RTRay buffer (GPU kernel)
-    ray_buf = LavaArray{RTRay}(undef, n_rays)
+    # Ensure pre-allocated buffers are large enough (lazy resize)
+    if hwtlas.primary_ray_buf === nothing || length(hwtlas.primary_ray_buf) < n_rays
+        hwtlas.primary_ray_buf = LavaArray{RTRay}(undef, n_rays)
+        hwtlas.primary_result_buf = LavaArray{RTHitResult}(undef, n_rays)
+    end
+    ray_buf = hwtlas.primary_ray_buf
+    result_buf = hwtlas.primary_result_buf
+
+    # Phase 1: Extract rays from work queue → flat RTRay buffer
     extract_kernel! = _extract_rays_kernel!(backend, 256)
     extract_kernel!(ray_buf, input_queue.items, input_queue.size; ndrange=n_rays)
     vk_flush!()
 
-    # Phase 2: RT dispatch — trace all rays at once via hardware
-    result_buf = LavaArray{RTHitResult}(undef, n_rays)
-    trace_closest_hits!(result_buf, ray_buf, hw_accel, n_rays)
+    # Phase 2: RT dispatch — trace all rays via hardware
+    trace_closest_hits!(result_buf, ray_buf, hw, n_rays)
 
     # Phase 3: Create precomputed accel with triangle data on GPU
-    # Use cached GPU arrays if provided (avoids re-uploading each frame)
-    tri_gpu = _tri_gpu !== nothing ? _tri_gpu : LavaArray(hw_accel.triangle_data)
-    off_gpu = _off_gpu !== nothing ? _off_gpu : LavaArray(hw_accel.blas_offsets)
-    precomputed = PrecomputedHitsAccel(result_buf, tri_gpu, off_gpu)
+    precomputed = PrecomputedHitsAccel(result_buf, hwtlas.tri_gpu, hwtlas.off_gpu)
 
     # Phase 4: Run original trace kernel with precomputed results
-    # The kernel calls Raycore.closest_hit(precomputed, ray) which reads
-    # from the pre-computed results buffer instead of traversing BVH.
     foreach(Hikari.vp_trace_rays_kernel!,
         input_queue,
         state.medium_sample_queue,
@@ -153,56 +484,282 @@ function hw_vp_trace_rays!(state, hw_accel::Lava.HardwareAccel,
     return nothing
 end
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Hardware-Accelerated Shadow Ray Tracing (Multi-Round Dispatch)
+# ══════════════════════════════════════════════════════════════════════════════
+
+const _SS4 = Hikari.SampledSpectrum{4}
+const _SW4 = Hikari.SampledWavelengths{4}
+const _SK = Raycore.SetKey
+
 """
-    build_hardware_accel(scene_or_tlas) -> HardwareAccel
+    ShadowIterState
 
-Build a HardwareAccel from a Hikari Scene or a Raycore TLAS.
-
-For GPU-backed scenes: the TLAS stores LavaDeviceArrays (GPU pointers)
-which can't be directly downloaded. You should either:
-1. Build from a CPU-backed scene: `Scene(pairs; backend=CPU())`
-2. Build from the CPU TLAS before GPU upload
-
-Returns a `HardwareAccel` that can be used with `hw_vp_trace_rays!`.
+Per-shadow-ray state for iterative hardware-accelerated shadow tracing.
 """
-function build_hardware_accel(scene)
-    return Lava.HardwareAccel(scene.accel)
+struct ShadowIterState
+    Ld::_SS4
+    r_u_path::_SS4
+    r_l_path::_SS4
+    lambda::_SW4
+    pixel_index::Int32
+    ray_o::Point3f
+    dir::Vec3f
+    t_remaining::Float32
+    medium_idx::_SK
+    T_ray::_SS4
+    tr_r_u::_SS4
+    tr_r_l::_SS4
+    active::UInt32
+    visible::UInt32
 end
 
-"""
-    build_hardware_accel(mesh_material_pairs; backend=CPU()) -> HardwareAccel
-
-Build a HardwareAccel from mesh-material pairs by constructing a temporary
-CPU-backed scene. This is the recommended way when using a GPU backend,
-since it avoids the GPU↔CPU data extraction issue.
-
-# Example
-```julia
-hw_accel = build_hardware_accel([(mesh1, mat1), (mesh2, mat2)])
-```
-"""
-function build_hardware_accel(pairs::Vector{<:Tuple}; backend=KernelAbstractions.CPU())
-    cpu_scene = Hikari.Scene(pairs; backend=backend)
-    return Lava.HardwareAccel(cpu_scene.accel)
+@kernel inbounds=true function _init_shadow_states_kernel!(
+    states, @Const(queue_items), @Const(queue_size), @Const(n::Int32)
+)
+    i = @index(Global)
+    if i <= n
+        work = queue_items[i]
+        states[i] = ShadowIterState(
+            work.Ld, work.r_u, work.r_l, work.lambda, work.pixel_index,
+            Point3f(work.ray.o), Vec3f(work.ray.d), work.t_max, work.medium_idx,
+            _SS4(1f0), _SS4(1f0), _SS4(1f0),
+            UInt32(1), UInt32(1),
+        )
+    end
 end
 
-"""
-    HWAccelCache
-
-Caches GPU-side triangle data and offsets to avoid re-uploading every frame.
-Create once, pass to `hw_vp_trace_rays!` via keyword arguments.
-
-    cache = HWAccelCache(hw_accel)
-    hw_vp_trace_rays!(state, hw_accel, mi, mat; _tri_gpu=cache.tri_gpu, _off_gpu=cache.off_gpu)
-"""
-struct HWAccelCache
-    tri_gpu::LavaArray
-    off_gpu::LavaArray{UInt32, 1}
+@kernel inbounds=true function _extract_shadow_rays2_kernel!(
+    ray_buf, @Const(states), @Const(n::Int32)
+)
+    i = @index(Global)
+    if i <= n
+        st = states[i]
+        if st.active == UInt32(1) && st.t_remaining >= 1f-6
+            ray_buf[i] = RTRay(
+                Float32(st.ray_o[1]), Float32(st.ray_o[2]), Float32(st.ray_o[3]),
+                0.001f0,
+                Float32(st.dir[1]), Float32(st.dir[2]), Float32(st.dir[3]),
+                st.t_remaining,
+            )
+        else
+            ray_buf[i] = RTRay(0f0, 0f0, 0f0, 0f0, 0f0, 0f0, 1f0, -1f0)
+        end
+    end
 end
 
-function HWAccelCache(hw_accel::Lava.HardwareAccel)
-    HWAccelCache(
-        LavaArray(hw_accel.triangle_data),
-        LavaArray(hw_accel.blas_offsets),
-    )
+@kernel inbounds=true function _process_shadow_round_kernel!(
+    states, @Const(result_buf), @Const(tri_gpu), @Const(off_gpu),
+    media_interfaces, media, materials, rgb2spec_table,
+    @Const(n::Int32)
+)
+    i = @index(Global)
+    if i <= n
+        st = states[i]
+        if st.active == UInt32(1)
+            if st.t_remaining < 1f-6
+                states[i] = ShadowIterState(
+                    st.Ld, st.r_u_path, st.r_l_path, st.lambda, st.pixel_index,
+                    st.ray_o, st.dir, st.t_remaining, st.medium_idx,
+                    st.T_ray, st.tr_r_u, st.tr_r_l,
+                    UInt32(0), UInt32(1))
+            else
+                result = result_buf[i]
+                if result.hit == UInt32(0)
+                    T_new = st.T_ray
+                    r_u_new = st.tr_r_u
+                    r_l_new = st.tr_r_l
+                    if Hikari.has_medium(st.medium_idx)
+                        seg_T, seg_r_u, seg_r_l = Hikari.compute_transmittance_ratio_tracking(
+                            rgb2spec_table, media, st.medium_idx,
+                            st.ray_o, st.dir, st.t_remaining, st.lambda)
+                        T_new = T_new * seg_T
+                        r_u_new = r_u_new * seg_r_u
+                        r_l_new = r_l_new * seg_r_l
+                    end
+                    states[i] = ShadowIterState(
+                        st.Ld, st.r_u_path, st.r_l_path, st.lambda, st.pixel_index,
+                        st.ray_o, st.dir, st.t_remaining, st.medium_idx,
+                        T_new, r_u_new, r_l_new,
+                        UInt32(0), UInt32(1))
+                else
+                    tri_idx = Int(off_gpu[result.instance_custom_index + UInt32(1)]) +
+                              Int(result.primitive_id) + 1
+                    tri = tri_gpu[tri_idx]
+                    t_hit = result.t
+                    w_bary = 1f0 - result.bary_u - result.bary_v
+                    bary = SVector{3,Float32}(w_bary, result.bary_u, result.bary_v)
+
+                    mi_idx = tri.metadata.medium_interface_idx
+                    mi = media_interfaces[mi_idx]
+                    ng = Hikari.vp_compute_geometric_normal(tri)
+                    entering = dot(Vec3f(st.dir), ng) < 0f0
+
+                    is_xmit = Hikari.is_medium_transition(mi)
+                    handled = false
+
+                    if is_xmit
+                        T_new = st.T_ray
+                        r_u_new = st.tr_r_u
+                        r_l_new = st.tr_r_l
+                        if Hikari.has_medium(st.medium_idx)
+                            seg_T, seg_r_u, seg_r_l = Hikari.compute_transmittance_ratio_tracking(
+                                rgb2spec_table, media, st.medium_idx,
+                                st.ray_o, st.dir, t_hit, st.lambda)
+                            T_new = T_new * seg_T
+                            r_u_new = r_u_new * seg_r_u
+                            r_l_new = r_l_new * seg_r_l
+                        end
+                        if Hikari.is_black(T_new)
+                            states[i] = ShadowIterState(
+                                st.Ld, st.r_u_path, st.r_l_path, st.lambda, st.pixel_index,
+                                st.ray_o, st.dir, st.t_remaining, st.medium_idx,
+                                T_new, r_u_new, r_l_new,
+                                UInt32(0), UInt32(1))
+                        else
+                            new_medium = Hikari.get_crossing_medium(mi, entering)
+                            new_ray_o = Point3f(st.ray_o + st.dir * (t_hit + 1f-4))
+                            new_t_rem = st.t_remaining - t_hit - 1f-4
+                            states[i] = ShadowIterState(
+                                st.Ld, st.r_u_path, st.r_l_path, st.lambda, st.pixel_index,
+                                new_ray_o, st.dir, new_t_rem, new_medium,
+                                T_new, r_u_new, r_l_new,
+                                UInt32(1), UInt32(1))
+                        end
+                        handled = true
+                    end
+
+                    if !is_xmit && !handled
+                        uv = Hikari.vp_compute_uv_barycentric(tri, bary)
+                        mat_idx = mi.material
+                        alpha = Hikari.get_surface_alpha_dispatch(materials, mat_idx, uv)
+                        alpha_pass = false
+
+                        if alpha < 1f0
+                            rng = Hikari.pcg32_init(Hikari.pbrt_hash(st.ray_o), Hikari.pbrt_hash(st.dir))
+                            alpha_u, _ = Hikari.pcg32_uniform_f32(rng)
+                            if alpha_u > alpha
+                                T_new = st.T_ray
+                                r_u_new = st.tr_r_u
+                                r_l_new = st.tr_r_l
+                                if Hikari.has_medium(st.medium_idx)
+                                    seg_T, seg_r_u, seg_r_l = Hikari.compute_transmittance_ratio_tracking(
+                                        rgb2spec_table, media, st.medium_idx,
+                                        st.ray_o, st.dir, t_hit, st.lambda)
+                                    T_new = T_new * seg_T
+                                    r_u_new = r_u_new * seg_r_u
+                                    r_l_new = r_l_new * seg_r_l
+                                end
+                                new_ray_o = Point3f(st.ray_o + st.dir * (t_hit + 1f-4))
+                                new_t_rem = st.t_remaining - t_hit - 1f-4
+                                states[i] = ShadowIterState(
+                                    st.Ld, st.r_u_path, st.r_l_path, st.lambda, st.pixel_index,
+                                    new_ray_o, st.dir, new_t_rem, st.medium_idx,
+                                    T_new, r_u_new, r_l_new,
+                                    UInt32(1), UInt32(1))
+                                alpha_pass = true
+                            end
+                        end
+
+                        if !alpha_pass
+                            states[i] = ShadowIterState(
+                                st.Ld, st.r_u_path, st.r_l_path, st.lambda, st.pixel_index,
+                                st.ray_o, st.dir, st.t_remaining, st.medium_idx,
+                                _SS4(0f0), _SS4(1f0), _SS4(1f0),
+                                UInt32(0), UInt32(0))
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+@kernel inbounds=true function _count_active_shadows_kernel!(
+    counter, @Const(states), @Const(n::Int32)
+)
+    i = @index(Global)
+    if i <= n
+        if states[i].active == UInt32(1)
+            Atomix.@atomic counter[1] += Int32(1)
+        end
+    end
+end
+
+@kernel inbounds=true function _finalize_shadow_kernel!(
+    states, pixel_L, @Const(n::Int32)
+)
+    i = @index(Global)
+    if i <= n
+        st = states[i]
+        if st.visible == UInt32(1) && !Hikari.is_black(st.T_ray)
+            mis_weight = st.r_u_path * st.tr_r_u + st.r_l_path * st.tr_r_l
+            mis_denom = Hikari.average(mis_weight)
+            if mis_denom > 1f-10
+                final_L = st.Ld * st.T_ray / mis_denom
+                if !Hikari.is_black(final_L)
+                    pixel_idx = st.pixel_index
+                    base_idx = (pixel_idx - Int32(1)) * Int32(4)
+                    Hikari.accumulate_spectrum!(pixel_L, base_idx, final_L)
+                end
+            end
+        end
+    end
+end
+
+# Shadow ray tracing dispatch
+function Hikari.vp_trace_shadow_rays!(state::Hikari.VolPathState, accel::HWAdaptedAccel, media_interfaces, media, materials, ::Hikari.VolPath)
+    hwtlas = accel.hwtlas
+    hw = hwtlas.hw_accel
+
+    shadow_queue = state.shadow_queue
+    n = Int(Array(shadow_queue.size)[1])
+    n == 0 && return nothing
+
+    backend = KernelAbstractions.get_backend(shadow_queue.items)
+
+    # Ensure pre-allocated shadow buffers are large enough
+    if hwtlas.shadow_states === nothing || length(hwtlas.shadow_states) < n
+        hwtlas.shadow_states = LavaArray{ShadowIterState}(undef, n)
+        hwtlas.shadow_ray_buf = LavaArray{RTRay}(undef, n)
+        hwtlas.shadow_result_buf = LavaArray{RTHitResult}(undef, n)
+        hwtlas.shadow_active_counter = LavaArray{Int32}(undef, 1)
+    end
+    states = hwtlas.shadow_states
+    ray_buf = hwtlas.shadow_ray_buf
+    result_buf = hwtlas.shadow_result_buf
+    active_counter = hwtlas.shadow_active_counter
+
+    # Initialize shadow ray iteration state
+    init_k! = _init_shadow_states_kernel!(backend, 256)
+    init_k!(states, shadow_queue.items, shadow_queue.size, Int32(n); ndrange=n)
+    vk_flush!()
+
+    extract_k! = _extract_shadow_rays2_kernel!(backend, 256)
+    process_k! = _process_shadow_round_kernel!(backend, 256)
+    count_k! = _count_active_shadows_kernel!(backend, 256)
+
+    for _round in 1:10
+        extract_k!(ray_buf, states, Int32(n); ndrange=n)
+        vk_flush!()
+
+        trace_closest_hits!(result_buf, ray_buf, hw, n)
+
+        process_k!(states, result_buf, hwtlas.tri_gpu, hwtlas.off_gpu,
+                   media_interfaces, media, materials, state.rgb2spec_table,
+                   Int32(n); ndrange=n)
+
+        KernelAbstractions.fill!(active_counter, Int32(0))
+        count_k!(active_counter, states, Int32(n); ndrange=n)
+        vk_flush!()
+
+        n_active = Int(Array(active_counter)[1])
+        n_active == 0 && break
+    end
+
+    # Finalize — accumulate completed visible rays to pixel_L
+    finalize_k! = _finalize_shadow_kernel!(backend, 256)
+    finalize_k!(states, state.pixel_L, Int32(n); ndrange=n)
+
+    return nothing
 end
