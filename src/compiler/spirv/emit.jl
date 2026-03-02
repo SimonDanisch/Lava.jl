@@ -60,6 +60,12 @@ mutable struct SPIRVEmitterState
     # Used to detect when a load's expected result type differs from the pointer's declared
     # element type (e.g., same LLVM struct type used for ptr<i64> and ptr<i16> members).
     spirv_ptr_element_type::Dict{LLVM.Value, UInt32}
+    # ── RT shader state (set by _emit_spirv_from_llvm_rt, unused for compute) ──
+    rt_payload_var_id::Union{Nothing, UInt32}
+    rt_tlas_var_id::Union{Nothing, UInt32}
+    rt_accel_type_id::Union{Nothing, UInt32}
+    rt_payload_type::Symbol  # :f32, :struct, etc.
+    rt_hit_attrib_var_id::Union{Nothing, UInt32}  # HitAttributeKHR variable (vec2 barycentrics)
 end
 
 function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
@@ -76,6 +82,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{Tuple{UInt32, UInt32}, UInt32}(),
         Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.ArrayType}}(),
         Dict{LLVM.Value, UInt32}(),
+        nothing, nothing, nothing, :none, nothing,
     )
 end
 
@@ -3717,6 +3724,21 @@ function _emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
         # Check for custom _lava_glsl_* → GLSL.std.450
         if startswith(fn_name, "_lava_glsl_")
             return _emit_lava_glsl!(state, inst, fn_name)
+        end
+
+        # Check for RT intrinsics → OpTraceRayKHR, payload load/store
+        if fn_name == "_lava_rt_trace_ray"
+            return _emit_rt_trace_ray!(state, inst)
+        elseif fn_name == "_lava_rt_payload_store_f32"
+            return _emit_rt_payload_store!(state, inst)
+        elseif fn_name == "_lava_rt_payload_load_f32"
+            return _emit_rt_payload_load!(state, inst)
+        elseif fn_name == "_lava_rt_payload_store_f32_at"
+            return _emit_rt_payload_store_at!(state, inst)
+        elseif fn_name == "_lava_rt_payload_load_f32_at"
+            return _emit_rt_payload_load_at!(state, inst)
+        elseif fn_name == "_lava_rt_hit_attrib_load_f32_at"
+            return _emit_rt_hit_attrib_load_at!(state, inst)
         end
 
         # Regular function call

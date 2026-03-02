@@ -145,6 +145,14 @@ module Op
     const OpCompositeExtract        = UInt16(81)
     const OpVectorExtractDynamic    = UInt16(77)
     const OpCompositeConstruct      = UInt16(80)
+    # Ray tracing (SPV_KHR_ray_tracing)
+    const OpTraceRayKHR             = UInt16(4445)
+    const OpExecuteCallableKHR      = UInt16(4446)
+    const OpIgnoreIntersectionKHR   = UInt16(4448)
+    const OpTerminateRayKHR         = UInt16(4449)
+    const OpReportIntersectionKHR   = UInt16(5334)
+    const OpTypeAccelerationStructureKHR = UInt16(5341)
+    const OpConstantNull            = UInt16(46)
 end
 
 # ---- Capabilities ----
@@ -160,6 +168,7 @@ module Cap
     const PhysicalStorageBufferAddresses = UInt32(5347)
     const VariablePointers              = UInt32(4442)
     const VariablePointersStorageBuffer = UInt32(4441)
+    const RayTracingKHR             = UInt32(4479)
 end
 
 # ---- Storage Classes ----
@@ -174,6 +183,13 @@ module SC
     const PushConstant          = UInt32(9)
     const StorageBuffer         = UInt32(12)
     const PhysicalStorageBuffer = UInt32(5349)
+    # Ray tracing storage classes
+    const RayPayloadKHR         = UInt32(5338)
+    const HitAttributeKHR       = UInt32(5339)
+    const IncomingRayPayloadKHR = UInt32(5342)
+    const CallableDataKHR       = UInt32(5328)
+    const IncomingCallableDataKHR = UInt32(5329)
+    const ShaderRecordBufferKHR = UInt32(5343)
 end
 
 # ---- Decorations ----
@@ -221,6 +237,11 @@ module BuiltIn
     const RayTmaxKHR                = UInt32(5326)
     const IncomingRayFlagsKHR       = UInt32(5328)
     const HitKindKHR                = UInt32(5333)
+    const InstanceCustomIndexKHR    = UInt32(5327)
+    const ObjectToWorldKHR          = UInt32(5330)
+    const WorldToObjectKHR          = UInt32(5331)
+    const PrimitiveId               = UInt32(7)
+    const InstanceId                = UInt32(6)
 end
 
 # ---- Execution Models ----
@@ -581,6 +602,16 @@ function emit_type_pointer!(mod::SPIRVModule, storage_class::UInt32, pointee_typ
     end
 end
 
+function emit_type_acceleration_structure!(mod::SPIRVModule)
+    key = :acceleration_structure
+    get!(mod.type_cache, key) do
+        id = fresh_id!(mod)
+        encode_instruction!(mod.types_constants, Op.OpTypeAccelerationStructureKHR, id)
+        require_capability!(mod, Cap.RayTracingKHR)
+        id
+    end
+end
+
 function emit_type_function!(mod::SPIRVModule, return_type_id::UInt32, param_type_ids::Vector{UInt32}=UInt32[])
     key = (:function, return_type_id, Tuple(param_type_ids))
     get!(mod.type_cache, key) do
@@ -634,6 +665,15 @@ function emit_constant_u64!(mod::SPIRVModule, value::UInt64)
     get!(mod.constant_cache, key) do
         id = fresh_id!(mod)
         encode_instruction!(mod.types_constants, Op.OpConstant, type_id, id, lo, hi)
+        id
+    end
+end
+
+function emit_constant_null!(mod::SPIRVModule, type_id::UInt32)
+    key = (:const_null, type_id)
+    get!(mod.constant_cache, key) do
+        id = fresh_id!(mod)
+        encode_instruction!(mod.types_constants, Op.OpConstantNull, type_id, id)
         id
     end
 end

@@ -142,6 +142,77 @@ function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
     end
 end
 
+# ── RT Shader Compilation ──
+
+"""
+    LavaRTShader
+
+Compilation result for a ray tracing shader stage.
+"""
+struct LavaRTShader
+    spirv_bytes::Vector{UInt8}
+    stage::Symbol
+    push_info::PushConstantInfo
+    ir::String
+end
+
+"""
+    lava_compile_rt_shader(f, tt; stage=:raygen, push_constant_size=8,
+                            payload_type=:f32, validate=true) -> LavaRTShader
+
+Compile a Julia function to a ray tracing shader stage (raygen, closesthit, miss).
+
+The function receives its arguments via a BDA push constant buffer (same as compute),
+except that RT-specific data (TLAS, payload, builtins) is handled automatically by
+the emitter.
+
+# Stages
+- `:raygen` — Ray generation shader. Can call `lava_rt_trace_ray!()`.
+- `:closesthit` — Closest hit shader. Can read hit builtins, write payload.
+- `:miss` — Miss shader. Can write payload.
+
+# Payload
+Currently only Float32 payload supported (`payload_type=:f32`).
+"""
+function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
+                                 stage::Symbol=:raygen,
+                                 push_constant_size::Integer=8,
+                                 payload_type::Symbol=:f32,
+                                 validate::Bool=true)
+    config = lava_compiler_config(; workgroup_size=(1, 1, 1))
+    source = GPUCompiler.methodinstance(typeof(f), tt)
+    job = GPUCompiler.CompilerJob(source, config)
+
+    GPUCompiler.JuliaContext() do ctx
+        mod, meta = GPUCompiler.compile(:llvm, job)
+        entry_fn = meta.entry
+        entry_name = LLVM.name(entry_fn)
+
+        # BDA entry wrapper (same as compute — args via push constant buffer)
+        push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
+        wrapper_name = push_info.wrapper_name
+        wrapper_fn = LLVM.functions(mod)[wrapper_name]
+
+        # LLVM passes (same as compute)
+        _run_llvm_passes!(mod, wrapper_fn)
+
+        ir = string(mod)
+        write("/tmp/lava_last_rt.ll", ir)
+
+        # RT-specific SPIR-V emission
+        spirv_bytes = _emit_spirv_from_llvm_rt(mod, wrapper_name, stage;
+                                                payload_type=payload_type)
+
+        write("/tmp/lava_last_rt.spv", spirv_bytes)
+
+        if validate
+            _validate_spirv(spirv_bytes, ir)
+        end
+
+        return LavaRTShader(spirv_bytes, stage, push_info, ir)
+    end
+end
+
 # ── Stage 1: LLVM Pass Pipeline ──
 
 function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)

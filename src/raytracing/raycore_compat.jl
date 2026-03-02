@@ -1,0 +1,168 @@
+# RayCore-compatible hardware ray tracing interface for Lava.jl
+#
+# Provides HardwareAccel and trace_closest_hits!() as a drop-in replacement
+# for Raycore's software BVH traversal closest_hit().
+
+"""
+    RTHitResult
+
+Result of a hardware ray trace for a single ray.
+After tracing, use `blas_offsets` and `triangle_data` to look up the full
+triangle geometry:
+
+    tri = triangle_data[blas_offsets[result.instance_custom_index + 1] + result.primitive_id + 1]
+"""
+struct RTHitResult
+    hit::UInt32             # 1 if hit, 0 if miss
+    t::Float32              # Ray parameter at hit (distance)
+    primitive_id::UInt32    # Triangle index within the BLAS (0-based)
+    instance_custom_index::UInt32  # BLAS index (0-based, set by build_hw_accel_from_tlas)
+    bary_u::Float32         # Barycentric u coordinate
+    bary_v::Float32         # Barycentric v coordinate
+    _pad1::UInt32           # Padding to 32 bytes
+    _pad2::UInt32
+end
+
+"""
+    RTRay
+
+Input ray for hardware ray tracing.
+"""
+struct RTRay
+    origin_x::Float32
+    origin_y::Float32
+    origin_z::Float32
+    tmin::Float32
+    dir_x::Float32
+    dir_y::Float32
+    dir_z::Float32
+    tmax::Float32
+end
+
+"""
+    HardwareAccel
+
+Hardware-accelerated ray tracing context. Built from a Raycore-compatible TLAS.
+
+# Fields
+- `tlas::LavaTLAS` — Vulkan top-level acceleration structure
+- `triangle_data::Vector` — CPU vector of all primitives (for lookup after trace)
+- `blas_offsets::Vector{UInt32}` — Per-BLAS offset into triangle_data
+- `rt_pipeline::RayTracingPipeline` — Pre-compiled raygen+closesthit+miss
+
+# Usage
+```julia
+hw = HardwareAccel(raycore_tlas)
+results = LavaArray{RTHitResult}(n_rays)
+trace_closest_hits!(results, rays, hw)
+```
+"""
+mutable struct HardwareAccel
+    tlas::LavaTLAS
+    triangle_data::Vector           # CPU primitives for lookup
+    blas_offsets::Vector{UInt32}
+    rt_pipeline::RayTracingPipeline
+end
+
+"""
+    HardwareAccel(tlas) -> HardwareAccel
+
+Build a HardwareAccel from a Raycore-compatible TLAS.
+The TLAS must have `.blas_array` and `.instances` fields.
+"""
+function HardwareAccel(tlas)
+    hw_tlas, tri_data, offsets = build_hw_accel_from_tlas(tlas)
+
+    rt = RayTracingPipeline(
+        raygen=_hw_raygen,
+        closest_hit=_hw_closesthit,
+        miss=_hw_miss,
+        payload_type=:f32_6,
+    )
+
+    HardwareAccel(hw_tlas, tri_data, offsets, rt)
+end
+
+"""
+    trace_closest_hits!(results, rays, accel::HardwareAccel, n_rays::Integer)
+
+Trace `n_rays` rays against the hardware acceleration structure.
+Results are written to `results` buffer (one RTHitResult per ray).
+
+`results` and `rays` can be `LavaBuffer{RTHitResult}`/`LavaBuffer{RTRay}`,
+`LavaArray{RTHitResult}`/`LavaArray{RTRay}`, or any type accepted by `trace_rays!`.
+"""
+function trace_closest_hits!(results, rays, accel::HardwareAccel, n_rays::Integer)
+    trace_rays!(accel.rt_pipeline, accel.tlas, rays, results;
+                width=Int(n_rays), height=1)
+end
+
+# ── Built-in RT Shaders ──
+
+function _hw_raygen(rays::Ptr{RTRay}, results::Ptr{RTHitResult})
+    lid = lava_rt_launch_id_x()
+
+    # Read ray from input buffer
+    ray = unsafe_load(rays, lid + 1)
+
+    # Initialize payload to miss
+    _lava_rt_payload_store_f32_at(0f0, UInt32(0))   # hit=0
+    _lava_rt_payload_store_f32_at(-1f0, UInt32(1))   # t=-1
+
+    # Trace
+    _lava_rt_trace_ray(
+        UInt32(0),    # flags
+        UInt32(0xFF), # cull mask
+        UInt32(0),    # sbt offset
+        UInt32(0),    # sbt stride
+        UInt32(0),    # miss index
+        ray.origin_x, ray.origin_y, ray.origin_z, ray.tmin,
+        ray.dir_x, ray.dir_y, ray.dir_z, ray.tmax
+    )
+
+    # Read payload results
+    hit  = _lava_rt_payload_load_f32_at(UInt32(0))
+    t    = _lava_rt_payload_load_f32_at(UInt32(1))
+    pid  = _lava_rt_payload_load_f32_at(UInt32(2))
+    ci   = _lava_rt_payload_load_f32_at(UInt32(3))
+    bu   = _lava_rt_payload_load_f32_at(UInt32(4))
+    bv   = _lava_rt_payload_load_f32_at(UInt32(5))
+
+    # Write result to output buffer
+    result = RTHitResult(
+        reinterpret(UInt32, hit),
+        t,
+        reinterpret(UInt32, pid),
+        reinterpret(UInt32, ci),
+        bu, bv,
+        UInt32(0), UInt32(0)
+    )
+    unsafe_store!(results, result, lid + 1)
+    return nothing
+end
+
+function _hw_closesthit()
+    t = lava_rt_ray_tmax()
+    ci = lava_rt_instance_custom_index()
+    pid = lava_rt_primitive_id()
+    bu = lava_rt_hit_bary_u()
+    bv = lava_rt_hit_bary_v()
+
+    _lava_rt_payload_store_f32_at(reinterpret(Float32, UInt32(1)), UInt32(0))  # hit=1
+    _lava_rt_payload_store_f32_at(t, UInt32(1))
+    _lava_rt_payload_store_f32_at(reinterpret(Float32, pid), UInt32(2))
+    _lava_rt_payload_store_f32_at(reinterpret(Float32, ci), UInt32(3))
+    _lava_rt_payload_store_f32_at(bu, UInt32(4))
+    _lava_rt_payload_store_f32_at(bv, UInt32(5))
+    return nothing
+end
+
+function _hw_miss()
+    _lava_rt_payload_store_f32_at(0f0, UInt32(0))   # hit=0
+    _lava_rt_payload_store_f32_at(-1f0, UInt32(1))   # t=-1
+    _lava_rt_payload_store_f32_at(0f0, UInt32(2))
+    _lava_rt_payload_store_f32_at(0f0, UInt32(3))
+    _lava_rt_payload_store_f32_at(0f0, UInt32(4))
+    _lava_rt_payload_store_f32_at(0f0, UInt32(5))
+    return nothing
+end

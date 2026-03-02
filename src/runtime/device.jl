@@ -4,6 +4,21 @@
 # Lazy initialization: first use triggers device creation.
 #
 # Required features: BufferDeviceAddress, VariablePointers, Int64, Float64
+# Optional features: AccelerationStructure, RayTracingPipeline
+
+"""
+    RTPipelineProperties
+
+Ray tracing pipeline properties queried from the physical device.
+`nothing` if RT extensions are not available.
+"""
+struct RTPipelineProperties
+    shader_group_handle_size::UInt32
+    shader_group_base_alignment::UInt32
+    shader_group_handle_alignment::UInt32
+    max_ray_recursion_depth::UInt32
+    max_ray_hit_attribute_size::UInt32
+end
 
 """
     VkContext
@@ -24,6 +39,8 @@ mutable struct VkContext
     # Dispatch batching state
     recording::Bool
     dispatch_count::Int
+    # Ray tracing (nothing if not available)
+    rt_pipeline_properties::Union{Nothing, RTPipelineProperties}
 end
 
 const _vk_context = Ref{Union{Nothing, VkContext}}(nothing)
@@ -86,6 +103,19 @@ function _init_vulkan!()
     # Create logical device with required features
     queue_ci = [Vulkan.DeviceQueueCreateInfo(qf_idx, [1.0f0])]
 
+    # Check for RT extension support
+    has_rt = _has_rt_extensions(phys_dev)
+
+    # Device extensions
+    extensions = String[]
+    if has_rt
+        append!(extensions, [
+            "VK_KHR_acceleration_structure",
+            "VK_KHR_ray_tracing_pipeline",
+            "VK_KHR_deferred_host_operations",
+        ])
+    end
+
     # Chain required features
     bda_features = Vulkan.PhysicalDeviceBufferDeviceAddressFeatures(
         true,   # buffer_device_address
@@ -97,6 +127,29 @@ function _init_vulkan!()
         true;   # variable_pointers
         next=bda_features
     )
+
+    # Chain RT features if available
+    feature_chain = var_ptr_features
+    if has_rt
+        as_features = Vulkan.PhysicalDeviceAccelerationStructureFeaturesKHR(
+            true,   # acceleration_structure
+            false,  # acceleration_structure_capture_replay
+            false,  # acceleration_structure_indirect_build
+            false,  # acceleration_structure_host_commands
+            false;  # descriptor_binding_acceleration_structure_update_after_bind
+            next=feature_chain
+        )
+        rt_features = Vulkan.PhysicalDeviceRayTracingPipelineFeaturesKHR(
+            true,   # ray_tracing_pipeline
+            false,  # ray_tracing_pipeline_shader_group_handle_capture_replay
+            false,  # ray_tracing_pipeline_shader_group_handle_capture_replay_mixed
+            false,  # ray_tracing_pipeline_trace_rays_indirect
+            false;  # ray_traversal_primitive_culling
+            next=as_features
+        )
+        feature_chain = rt_features
+    end
+
     # Enable shader int64, float64
     core_features = Vulkan.PhysicalDeviceFeatures(
         :shader_int_64, :shader_float_64
@@ -105,13 +158,28 @@ function _init_vulkan!()
     device = Vulkan.Device(
         phys_dev,
         queue_ci,
-        [],     # layers
-        [];     # extensions
+        [],         # layers
+        extensions;
         enabled_features=core_features,
-        next=var_ptr_features
+        next=feature_chain
     )
 
     queue = Vulkan.get_device_queue(device, qf_idx, 0)
+
+    # Query RT pipeline properties
+    rt_props = nothing
+    if has_rt
+        props2 = Vulkan.get_physical_device_properties_2(phys_dev,
+            Vulkan.PhysicalDeviceRayTracingPipelinePropertiesKHR)
+        rtp = props2.next
+        rt_props = RTPipelineProperties(
+            rtp.shader_group_handle_size,
+            rtp.shader_group_base_alignment,
+            rtp.shader_group_handle_alignment,
+            rtp.max_ray_recursion_depth,
+            rtp.max_ray_hit_attribute_size,
+        )
+    end
 
     # Command pool (resettable command buffers)
     cmd_pool = Vulkan.CommandPool(
@@ -128,12 +196,17 @@ function _init_vulkan!()
 
     fence = Vulkan.Fence(device)
 
-    @info "Lava: initialized Vulkan device" device=dev_name queue_family=qf_idx
+    if has_rt
+        @info "Lava: initialized Vulkan device with RT" device=dev_name queue_family=qf_idx handle_size=rt_props.shader_group_handle_size max_recursion=rt_props.max_ray_recursion_depth
+    else
+        @info "Lava: initialized Vulkan device (no RT)" device=dev_name queue_family=qf_idx
+    end
 
     return VkContext(
         instance, phys_dev, device, queue, qf_idx,
         cmd_pool, cmd_buf, fence, dev_name,
-        false, 0
+        false, 0,
+        rt_props
     )
 end
 
@@ -168,4 +241,16 @@ function _find_compute_queue_family(phys_dev)
         "device initialization",
         "No compute-capable queue family found",
         "Ensure your GPU supports Vulkan compute"))
+end
+
+"""Check if the physical device supports the RT extensions we need."""
+function _has_rt_extensions(phys_dev)
+    available = unwrap(Vulkan.enumerate_device_extension_properties(phys_dev))
+    names = Set{String}()
+    for ext in available
+        push!(names, String(filter(!=('\0'), collect(ext.extension_name))))
+    end
+    return "VK_KHR_acceleration_structure" in names &&
+           "VK_KHR_ray_tracing_pipeline" in names &&
+           "VK_KHR_deferred_host_operations" in names
 end
