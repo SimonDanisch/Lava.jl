@@ -153,6 +153,15 @@ module Op
     const OpReportIntersectionKHR   = UInt16(5334)
     const OpTypeAccelerationStructureKHR = UInt16(5341)
     const OpConstantNull            = UInt16(46)
+    # Image/sampler instructions
+    const OpTypeImage               = UInt16(25)
+    const OpTypeSampler             = UInt16(26)
+    const OpTypeSampledImage        = UInt16(27)
+    const OpImageSampleImplicitLod  = UInt16(87)
+    const OpImageSampleExplicitLod  = UInt16(88)
+    # Geometry shader
+    const OpEmitVertex              = UInt16(218)
+    const OpEndPrimitive            = UInt16(219)
 end
 
 # ---- Capabilities ----
@@ -168,6 +177,9 @@ module Cap
     const PhysicalStorageBufferAddresses = UInt32(5347)
     const VariablePointers              = UInt32(4442)
     const VariablePointersStorageBuffer = UInt32(4441)
+    const Geometry                  = UInt32(22)
+    const Tessellation              = UInt32(9)
+    const InputAttachment           = UInt32(40)
     const RayTracingKHR             = UInt32(4479)
 end
 
@@ -240,8 +252,21 @@ module BuiltIn
     const InstanceCustomIndexKHR    = UInt32(5327)
     const ObjectToWorldKHR          = UInt32(5330)
     const WorldToObjectKHR          = UInt32(5331)
-    const PrimitiveId               = UInt32(7)
+    const ClipDistance              = UInt32(3)
+    const CullDistance              = UInt32(4)
     const InstanceId                = UInt32(6)
+    const PrimitiveId               = UInt32(7)
+    const InvocationId              = UInt32(8)
+    const Layer                     = UInt32(9)
+    const ViewportIndex             = UInt32(10)
+    const TessLevelOuter            = UInt32(11)
+    const TessLevelInner            = UInt32(12)
+    const TessCoord                 = UInt32(13)
+    const PatchVertices             = UInt32(14)
+    const FrontFacing               = UInt32(17)
+    const SampleId                  = UInt32(18)
+    const SamplePosition            = UInt32(19)
+    const SampleMask                = UInt32(20)
 end
 
 # ---- Execution Models ----
@@ -262,10 +287,28 @@ end
 
 # ---- Execution Modes ----
 module ExecMode
-    const OriginUpperLeft   = UInt32(7)
-    const OriginLowerLeft   = UInt32(8)
-    const LocalSize         = UInt32(17)
-    const DepthReplacing    = UInt32(12)
+    const Invocations           = UInt32(0)
+    const SpacingEqual          = UInt32(1)
+    const SpacingFractionalEven = UInt32(2)
+    const SpacingFractionalOdd  = UInt32(3)
+    const VertexOrderCw         = UInt32(4)
+    const VertexOrderCcw        = UInt32(5)
+    const OriginUpperLeft       = UInt32(7)
+    const OriginLowerLeft       = UInt32(8)
+    const DepthReplacing        = UInt32(12)
+    const PointMode             = UInt32(10)
+    const LocalSize             = UInt32(17)
+    const InputPoints           = UInt32(19)
+    const InputLines            = UInt32(20)
+    const InputLinesAdjacency   = UInt32(21)
+    const Triangles             = UInt32(22)
+    const InputTrianglesAdjacency = UInt32(23)
+    const Quads                 = UInt32(24)
+    const Isolines              = UInt32(25)
+    const OutputVertices        = UInt32(26)
+    const OutputPoints          = UInt32(27)
+    const OutputLineStrip       = UInt32(28)
+    const OutputTriangleStrip   = UInt32(29)
 end
 
 # ---- Addressing / Memory Models ----

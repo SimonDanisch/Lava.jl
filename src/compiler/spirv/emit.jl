@@ -69,6 +69,8 @@ mutable struct SPIRVEmitterState
     # Set true when OpIgnoreIntersectionKHR/OpTerminateRayKHR is emitted (block terminators).
     # Suppresses the redundant OpReturn from the trailing `ret void`.
     rt_block_terminated::Bool
+    # ── Graphics shader state (set by _emit_spirv_from_llvm_gfx, unused for compute/RT) ──
+    gfx_io::Any  # GfxIOState or nothing
 end
 
 function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
@@ -86,6 +88,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.ArrayType}}(),
         Dict{LLVM.Value, UInt32}(),
         nothing, nothing, nothing, :none, nothing, false,
+        nothing,  # gfx_io
     )
 end
 
@@ -3755,6 +3758,39 @@ function _emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return _emit_rt_ignore_intersection!(state, inst)
         elseif fn_name == "_lava_rt_terminate_ray"
             return _emit_rt_terminate_ray!(state, inst)
+        end
+
+        # Check for graphics intrinsics → I/O stores/loads, emit_vertex, etc.
+        if fn_name == "_lava_gfx_set_position"
+            return _emit_gfx_set_position!(state, inst)
+        elseif fn_name == "_lava_gfx_set_point_size"
+            return _emit_gfx_set_point_size!(state, inst)
+        elseif fn_name == "_lava_gfx_output_vec4"
+            return _emit_gfx_output_vec4!(state, inst)
+        elseif fn_name == "_lava_gfx_output_vec3"
+            return _emit_gfx_output_vec3!(state, inst)
+        elseif fn_name == "_lava_gfx_output_vec2"
+            return _emit_gfx_output_vec2!(state, inst)
+        elseif fn_name == "_lava_gfx_output_f32"
+            return _emit_gfx_output_f32!(state, inst)
+        elseif fn_name == "_lava_gfx_input_vec4"
+            return _emit_gfx_input!(state, inst, :vec4)
+        elseif fn_name == "_lava_gfx_input_vec3"
+            return _emit_gfx_input!(state, inst, :vec3)
+        elseif fn_name == "_lava_gfx_input_vec2"
+            return _emit_gfx_input!(state, inst, :vec2)
+        elseif fn_name == "_lava_gfx_input_f32"
+            return _emit_gfx_input!(state, inst, :f32)
+        elseif fn_name == "_lava_gfx_emit_vertex"
+            return _emit_gfx_emit_vertex!(state, inst)
+        elseif fn_name == "_lava_gfx_end_primitive"
+            return _emit_gfx_end_primitive!(state, inst)
+        elseif fn_name == "_lava_gfx_set_tess_level_outer"
+            return _emit_gfx_set_tess_level!(state, inst, true)
+        elseif fn_name == "_lava_gfx_set_tess_level_inner"
+            return _emit_gfx_set_tess_level!(state, inst, false)
+        elseif fn_name == "_lava_gfx_sample_2d"
+            return _emit_gfx_sample_2d!(state, inst)
         end
 
         # Regular function call

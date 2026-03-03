@@ -213,6 +213,73 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
     end
 end
 
+# ── Graphics Shader Compilation ──
+
+"""
+    LavaGfxShader
+
+Compilation result for a graphics shader stage.
+"""
+struct LavaGfxShader
+    spirv_bytes::Vector{UInt8}
+    stage::Symbol
+    push_info::PushConstantInfo
+    ir::String
+end
+
+"""
+    lava_compile_gfx_shader(f, tt; stage=:vertex, config=nothing, validate=true) -> LavaGfxShader
+
+Compile a Julia function to a graphics shader stage (vertex, fragment, geometry,
+tess_control, tess_eval).
+
+The function receives its arguments via a BDA push constant buffer (same as compute/RT).
+Graphics-specific builtins and I/O variables are handled automatically by the emitter.
+
+# Stages
+- `:vertex` — Vertex shader. Can use `_lava_gfx_vertex_index()`, `_lava_gfx_set_position()`.
+- `:fragment` — Fragment shader. Can use `_lava_gfx_frag_coord()`, `_lava_gfx_output_vec4()`.
+- `:geometry` — Geometry shader. Requires `config::GeometryConfig`.
+- `:tess_control` — Tessellation control shader. Requires `config::TessConfig`.
+- `:tess_eval` — Tessellation evaluation shader. Requires `config::TessConfig`.
+"""
+function lava_compile_gfx_shader(@nospecialize(f), @nospecialize(tt);
+                                   stage::Symbol=:vertex,
+                                   config=nothing,
+                                   validate::Bool=true)
+    config_wg = lava_compiler_config(; workgroup_size=(1, 1, 1))
+    source = GPUCompiler.methodinstance(typeof(f), tt)
+    job = GPUCompiler.CompilerJob(source, config_wg)
+
+    GPUCompiler.JuliaContext() do ctx
+        mod, meta = GPUCompiler.compile(:llvm, job)
+        entry_fn = meta.entry
+        entry_name = LLVM.name(entry_fn)
+
+        # BDA entry wrapper (same as compute — args via push constant buffer)
+        push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
+        wrapper_name = push_info.wrapper_name
+        wrapper_fn = LLVM.functions(mod)[wrapper_name]
+
+        # LLVM passes (same as compute)
+        _run_llvm_passes!(mod, wrapper_fn)
+
+        ir = string(mod)
+        write("/tmp/lava_last_gfx_$(stage).ll", ir)
+
+        # Graphics-specific SPIR-V emission
+        spirv_bytes = _emit_spirv_from_llvm_gfx(mod, wrapper_name, stage; config=config)
+
+        write("/tmp/lava_last_gfx_$(stage).spv", spirv_bytes)
+
+        if validate
+            _validate_spirv(spirv_bytes, ir)
+        end
+
+        return LavaGfxShader(spirv_bytes, stage, push_info, ir)
+    end
+end
+
 # ── Stage 1: LLVM Pass Pipeline ──
 
 function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
