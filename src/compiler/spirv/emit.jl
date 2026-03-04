@@ -72,6 +72,13 @@ mutable struct SPIRVEmitterState
     rt_block_terminated::Bool
     # ── Graphics shader state (set by _emit_spirv_from_llvm_gfx, unused for compute/RT) ──
     gfx_io::Any  # GfxIOState or nothing
+    # ── PSB conversion cache ──
+    # Block-local cache: (base_ptr_spirv_id, block_label_id) → u64_spirv_id
+    # Avoids emitting redundant OpConvertPtrToU for repeated accesses to the same
+    # PSB base pointer within a block. Keyed by block to prevent dominance errors.
+    psb_ptr_to_u64::Dict{Tuple{UInt32, UInt32}, UInt32}
+    # Current block label ID (updated when emitting each block)
+    current_block_label::UInt32
 end
 
 function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
@@ -90,6 +97,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{LLVM.Value, UInt32}(),
         nothing, nothing, nothing, :none, nothing, false,
         nothing,  # gfx_io
+        Dict{Tuple{UInt32, UInt32}, UInt32}(), UInt32(0),
     )
 end
 
@@ -455,6 +463,9 @@ function emit_block!(state::SPIRVEmitterState, bb::LLVM.BasicBlock)
     end
 
     encode_instruction!(state.mod.functions, Op.OpLabel, label_id)
+
+    # Track current block for PSB conversion cache
+    state.current_block_label = label_id
 
     # Reset RT block termination flag for this block
     state.rt_block_terminated = false
@@ -1976,8 +1987,7 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                 end
 
                 # base_addr + byte_offset → result pointer
-                base_u64 = fresh_id!(state.mod)
-                encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, base_id)
+                base_u64 = _cached_psb_ptr_to_u64!(state, base_id)
                 elem_addr_id = fresh_id!(state.mod)
                 encode_instruction!(state.mod.functions, Op.OpIAdd, u64_spirv, elem_addr_id, base_u64, byte_offset_id)
                 result_id = fresh_id!(state.mod)
@@ -2494,8 +2504,7 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
         # PSB: use manual byte-offset arithmetic (OpPtrAccessChain broken on AMD RADV)
         # byte_offset_id is already the byte offset, just add it directly
         u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
-        base_u64 = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, base_id)
+        base_u64 = _cached_psb_ptr_to_u64!(state, base_id)
         # Widen byte offset to u64 if needed
         bo_u64 = byte_offset_id
         if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) < 64
@@ -2576,6 +2585,26 @@ function _emit_int_constant!(state::SPIRVEmitterState, ty::LLVM.LLVMType, value:
 end
 
 """
+    _cached_psb_ptr_to_u64!(state, base_id) -> UInt32
+
+Emit OpConvertPtrToU for a PSB pointer, with block-local caching.
+If the same `base_id` was already converted in the current block,
+returns the cached u64 result ID instead of emitting a new instruction.
+This eliminates redundant ptr→u64 conversions when the same PSB pointer
+is accessed multiple times in one block (common in struct field accesses).
+"""
+function _cached_psb_ptr_to_u64!(state::SPIRVEmitterState, base_id::UInt32)
+    key = (base_id, state.current_block_label)
+    cached = get(state.psb_ptr_to_u64, key, nothing)
+    cached !== nothing && return cached
+    u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+    base_u64 = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, base_id)
+    state.psb_ptr_to_u64[key] = base_u64
+    return base_u64
+end
+
+"""
 Emit a PSB byte-offset GEP when the base pointee is an opaque PointerType.
 This happens after SROA decomposes BDA argument struct loads into individual
 field accesses via byte-offset GEPs. We infer the actual access type from
@@ -2608,8 +2637,7 @@ function _emit_psb_byte_offset_with_user_type!(state::SPIRVEmitterState,
 
     # PSB byte arithmetic: ptr→u64, add byte_offset, u64→ptr
     u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
-    base_u64 = fresh_id!(state.mod)
-    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, base_id)
+    base_u64 = _cached_psb_ptr_to_u64!(state, base_id)
 
     bo_u64 = byte_offset_id
     if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) < 64
@@ -2691,9 +2719,8 @@ function _emit_psb_ptr_arithmetic!(state::SPIRVEmitterState, base_id::UInt32,
     stride = UInt64(_compute_type_size(element_ty))
     u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
 
-    # OpConvertPtrToU: base_ptr → u64
-    base_u64 = fresh_id!(state.mod)
-    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, base_id)
+    # OpConvertPtrToU: base_ptr → u64 (cached per block)
+    base_u64 = _cached_psb_ptr_to_u64!(state, base_id)
 
     # Ensure index is u64 — widen i32 indices to i64
     idx_u64 = idx_id
