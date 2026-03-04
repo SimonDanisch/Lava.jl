@@ -91,7 +91,7 @@ function lava_launch!(@nospecialize(f), args...;
     total_size = compiled.push_info.arg_buffer_size + inline_extra
 
     # Get host-visible mapped arg buffer
-    arg_buf = _get_arg_buffer(total_size)
+    arg_buf = get_arg_buffer(total_size)
 
     # Pack args directly to mapped memory (zero intermediate allocations)
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
@@ -100,6 +100,10 @@ function lava_launch!(@nospecialize(f), args...;
     # Push constant = BDA of arg buffer
     push_data = Vector{UInt8}(undef, 8)
     unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
+
+    # Keep data buffer references alive until vk_flush!() — BDA addresses in the
+    # arg buffer are raw pointers with no GC reference to the backing VkManagedBuffer.
+    keep_data_alive!(args)
 
     # Dispatch (batched — call vk_flush!() to submit)
     vk_dispatch!(pipeline, push_data, groups)
@@ -350,7 +354,7 @@ end
 const _arg_buffers = VkMappedBuffer[]
 const _arg_buffer_idx = Ref(0)
 
-function _get_arg_buffer(nbytes::Integer)
+function get_arg_buffer(nbytes::Integer)
     alloc_size = max(256, nextpow(2, nbytes))
 
     _arg_buffer_idx[] += 1
@@ -373,6 +377,6 @@ function _get_arg_buffer(nbytes::Integer)
 end
 
 """Reset arg buffer pool index after flush (all in-flight dispatches completed)."""
-function _reset_arg_buffer_pool!()
+function reset_arg_buffer_pool!()
     _arg_buffer_idx[] = 0
 end

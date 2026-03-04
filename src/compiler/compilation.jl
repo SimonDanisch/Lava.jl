@@ -32,6 +32,203 @@ struct LavaGPUKernel
     ir::String
 end
 
+# ── Unified introspection result ──
+
+"""
+    CompilationResult
+
+Unified compilation result capturing every pipeline stage for introspection
+and cross-platform validation. Returned by `lava_compile()`.
+"""
+struct CompilationResult
+    pre_pass_ir::String           # Raw GPUCompiler LLVM IR (before our passes)
+    post_pass_ir::String          # LLVM IR after all passes (what the emitter sees)
+    spirv_bytes::Vector{UInt8}    # Raw SPIR-V binary
+    spirv_disasm::String          # spirv-dis output
+    entry_name::String
+    stage::Symbol                 # :compute, :vertex, :fragment, :raygen, etc.
+    workgroup_size::NTuple{3,Int}
+    push_info::Union{Nothing, PushConstantInfo}
+end
+
+"""
+    lava_compile(f, tt; stage=:compute, workgroup_size=(64,1,1),
+                 config=nothing, payload_type=:f32, validate=true) -> CompilationResult
+
+Compile a Julia function through the full Lava pipeline, returning a `CompilationResult`
+with IR at every stage for introspection and validation.
+
+Supports all shader stages: `:compute`, `:vertex`, `:fragment`, `:geometry`,
+`:tess_control`, `:tess_eval`, `:raygen`, `:closesthit`, `:miss`, `:anyhit`,
+`:intersection`, `:callable`.
+"""
+function lava_compile(@nospecialize(f), @nospecialize(tt);
+                      stage::Symbol=:compute,
+                      workgroup_size::NTuple{3,Int}=(64, 1, 1),
+                      config=nothing,
+                      payload_type::Symbol=:f32,
+                      validate::Bool=true)
+    if stage == :compute
+        result = _lava_compile_full(f, tt; workgroup_size, validate)
+        return result
+    elseif stage in (:vertex, :fragment, :geometry, :tess_control, :tess_eval)
+        return _lava_compile_gfx_full(f, tt; stage, config, validate)
+    elseif stage in (:raygen, :closesthit, :miss, :anyhit, :intersection, :callable)
+        return _lava_compile_rt_full(f, tt; stage, payload_type, validate)
+    else
+        error("Unknown stage: $stage")
+    end
+end
+
+"""Compile compute kernel, capturing pre/post IR."""
+function _lava_compile_full(@nospecialize(f), @nospecialize(tt);
+                            workgroup_size::NTuple{3,Int}=(64, 1, 1),
+                            validate::Bool=true)
+    config = lava_compiler_config(; workgroup_size)
+    source = GPUCompiler.methodinstance(typeof(f), tt)
+    job = GPUCompiler.CompilerJob(source, config)
+
+    GPUCompiler.JuliaContext() do ctx
+        mod, meta = GPUCompiler.compile(:llvm, job)
+        entry_fn = meta.entry
+        entry_name = LLVM.name(entry_fn)
+
+        # Capture pre-pass IR
+        pre_pass_ir = string(mod)
+
+        # BDA entry wrapper
+        push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size)
+        wrapper_name = push_info.wrapper_name
+        wrapper_fn = LLVM.functions(mod)[wrapper_name]
+
+        # LLVM passes
+        _run_llvm_passes!(mod, wrapper_fn)
+        post_pass_ir = string(mod)
+
+        # SPIR-V emission
+        spirv_bytes = _emit_spirv_from_llvm(mod, wrapper_name, workgroup_size)
+
+        # Validation
+        write("/tmp/lava_last.spv", spirv_bytes)
+        write("/tmp/lava_last.ll", post_pass_ir)
+        if validate
+            _validate_spirv(spirv_bytes, post_pass_ir)
+        end
+
+        spirv_disasm = disassemble_spirv(spirv_bytes)
+
+        return CompilationResult(pre_pass_ir, post_pass_ir, spirv_bytes, spirv_disasm,
+                                 wrapper_name, :compute, workgroup_size, push_info)
+    end
+end
+
+"""Compile graphics shader, capturing pre/post IR."""
+function _lava_compile_gfx_full(@nospecialize(f), @nospecialize(tt);
+                                 stage::Symbol=:vertex,
+                                 config=nothing,
+                                 validate::Bool=true)
+    config_wg = lava_compiler_config(; workgroup_size=(1, 1, 1))
+    source = GPUCompiler.methodinstance(typeof(f), tt)
+    job = GPUCompiler.CompilerJob(source, config_wg)
+
+    GPUCompiler.JuliaContext() do ctx
+        mod, meta = GPUCompiler.compile(:llvm, job)
+        entry_fn = meta.entry
+        entry_name = LLVM.name(entry_fn)
+
+        pre_pass_ir = string(mod)
+
+        push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
+        wrapper_name = push_info.wrapper_name
+        wrapper_fn = LLVM.functions(mod)[wrapper_name]
+
+        _run_llvm_passes!(mod, wrapper_fn)
+        post_pass_ir = string(mod)
+
+        spirv_bytes = _emit_spirv_from_llvm_gfx(mod, wrapper_name, stage; config=config)
+
+        write("/tmp/lava_last.spv", spirv_bytes)
+        write("/tmp/lava_last.ll", post_pass_ir)
+        if validate
+            _validate_spirv(spirv_bytes, post_pass_ir)
+        end
+
+        spirv_disasm = disassemble_spirv(spirv_bytes)
+
+        return CompilationResult(pre_pass_ir, post_pass_ir, spirv_bytes, spirv_disasm,
+                                 wrapper_name, stage, (1, 1, 1), push_info)
+    end
+end
+
+"""Compile RT shader, capturing pre/post IR."""
+function _lava_compile_rt_full(@nospecialize(f), @nospecialize(tt);
+                                stage::Symbol=:raygen,
+                                payload_type::Symbol=:f32,
+                                validate::Bool=true)
+    config = lava_compiler_config(; workgroup_size=(1, 1, 1))
+    source = GPUCompiler.methodinstance(typeof(f), tt)
+    job = GPUCompiler.CompilerJob(source, config)
+
+    GPUCompiler.JuliaContext() do ctx
+        mod, meta = GPUCompiler.compile(:llvm, job)
+        entry_fn = meta.entry
+        entry_name = LLVM.name(entry_fn)
+
+        pre_pass_ir = string(mod)
+
+        push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
+        wrapper_name = push_info.wrapper_name
+        wrapper_fn = LLVM.functions(mod)[wrapper_name]
+
+        _run_llvm_passes!(mod, wrapper_fn)
+        post_pass_ir = string(mod)
+
+        spirv_bytes = _emit_spirv_from_llvm_rt(mod, wrapper_name, stage;
+                                                payload_type=payload_type)
+
+        write("/tmp/lava_last.spv", spirv_bytes)
+        write("/tmp/lava_last.ll", post_pass_ir)
+        if validate
+            _validate_spirv(spirv_bytes, post_pass_ir)
+        end
+
+        spirv_disasm = disassemble_spirv(spirv_bytes)
+
+        return CompilationResult(pre_pass_ir, post_pass_ir, spirv_bytes, spirv_disasm,
+                                 wrapper_name, stage, (1, 1, 1), push_info)
+    end
+end
+
+"""    disassemble(r::CompilationResult) -> String
+
+Return the SPIR-V disassembly text."""
+disassemble(r::CompilationResult) = r.spirv_disasm
+
+"""
+    optimize_spirv(spirv_bytes::Vector{UInt8}; passes="-O") -> Vector{UInt8}
+
+Run spirv-opt on SPIR-V binary. Returns optimized bytes.
+Validates output with spirv-val.
+"""
+function optimize_spirv(spirv_bytes::Vector{UInt8}; passes::String="-O")
+    spirv_opt = SPIRV_Tools_jll.spirv_opt()
+    spirv_val_cmd = SPIRV_Tools_jll.spirv_val()
+
+    in_path = tempname() * ".spv"
+    out_path = tempname() * ".spv"
+    try
+        write(in_path, spirv_bytes)
+        run(`$spirv_opt --target-env=vulkan1.3 --scalar-block-layout $passes $in_path -o $out_path`)
+        optimized = read(out_path)
+        # Validate optimized output
+        run(`$spirv_val_cmd --target-env vulkan1.3 --scalar-block-layout $out_path`)
+        return optimized
+    finally
+        rm(in_path; force=true)
+        rm(out_path; force=true)
+    end
+end
+
 # ── LLVM IR compilation (GPUCompiler → LLVM Module) ──
 
 """

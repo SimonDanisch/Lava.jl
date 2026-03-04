@@ -53,9 +53,10 @@ mutable struct SPIRVEmitterState
     # the original header as predecessor must reference the selection header instead.
     phi_block_redirects::Dict{Tuple{UInt32, UInt32}, UInt32}
     # Array element origin: when a value was produced by OpAccessChain indexing into an array,
-    # maps LLVM inst → (array_base_spirv_id, index_spirv_id, array_llvm_type)
+    # maps LLVM inst → (alloca_base_spirv_id, static_path_indices, dyn_index_spirv_id, array_llvm_type)
+    # The static_path contains the OpConstant IDs for struct field indices leading to the array.
     # Used to fold chained GEPs like array[a][b] → array[a+b] in Function storage class.
-    array_element_origin::Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.ArrayType}}
+    array_element_origin::Dict{LLVM.Value, Tuple{UInt32, Vector{UInt32}, UInt32, LLVM.ArrayType}}
     # SPIR-V element type of pointer values: LLVM Value (pointer) → SPIR-V type ID of element.
     # Used to detect when a load's expected result type differs from the pointer's declared
     # element type (e.g., same LLVM struct type used for ptr<i64> and ptr<i16> members).
@@ -85,7 +86,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{LLVM.BasicBlock, LLVM.BasicBlock}(),
         Dict{LLVM.Value, UInt32}(),
         Dict{Tuple{UInt32, UInt32}, UInt32}(),
-        Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.ArrayType}}(),
+        Dict{LLVM.Value, Tuple{UInt32, Vector{UInt32}, UInt32, LLVM.ArrayType}}(),
         Dict{LLVM.Value, UInt32}(),
         nothing, nothing, nothing, :none, nothing, false,
         nothing,  # gfx_io
@@ -1048,11 +1049,22 @@ function _get_struct_member_ptr_spirv_type(state::SPIRVEmitterState, pointee_ty:
     struct_ty === nothing && return nothing
 
     info = get(state.type_ctx.struct_ptr_members, (struct_ty, member_idx), nothing)
-    info === nothing && return nothing
+    if info !== nothing
+        declared_pointee, _as = info
+        declared_pointee_spirv = map_type!(state.type_ctx, declared_pointee)
+        return map_pointer_type!(state.type_ctx, declared_pointee_spirv, SC.PhysicalStorageBuffer)
+    end
 
-    declared_pointee, _as = info
-    declared_pointee_spirv = map_type!(state.type_ctx, declared_pointee)
-    return map_pointer_type!(state.type_ctx, declared_pointee_spirv, SC.PhysicalStorageBuffer)
+    # Fallback: struct_ptr_members has no entry, but the struct type was already mapped
+    # with an i8 fallback for ptr members (see _find_ptr_member_type_in_hierarchy).
+    # Match that fallback so the AccessChain result type agrees with the struct definition.
+    fallback_pointee = _find_ptr_member_type_in_hierarchy(state.type_ctx, struct_ty)
+    if fallback_pointee !== nothing
+        fallback_spirv = map_type!(state.type_ctx, fallback_pointee)
+        return map_pointer_type!(state.type_ctx, fallback_spirv, SC.PhysicalStorageBuffer)
+    end
+
+    return nothing
 end
 
 """
@@ -1105,6 +1117,49 @@ function _find_struct_member_path_recursive!(path::Vector{Int}, struct_ty::LLVM.
         running_offset += member_size
     end
     return false
+end
+
+"""
+Find array fields within a (possibly nested) struct that match a given element stride.
+Returns `(path, byte_offset, array_type)` or `nothing`.
+
+When `elem_stride > 0`, selects the array whose element size matches the stride.
+When `elem_stride == 0`, returns the first array found (fallback).
+
+Used for dynamic byte-offset GEPs on Function-SC struct allocas, where the dynamic index
+targets an array field within the struct (e.g., accessing dims in a LavaDeviceArray).
+"""
+function _find_array_field_in_struct(struct_ty::LLVM.StructType, elem_stride::Int=0)
+    candidates = Vector{Tuple{Vector{Int}, Int, LLVM.ArrayType}}()
+    _collect_array_fields!(candidates, Int[], struct_ty, 0)
+    isempty(candidates) && return nothing
+    # If stride hint given, find matching array
+    if elem_stride > 0
+        for (path, offset, arr_ty) in candidates
+            if _compute_type_size(LLVM.eltype(arr_ty)) == elem_stride
+                return (path, offset, arr_ty)
+            end
+        end
+    end
+    # Fallback: return first
+    path, offset, arr_ty = candidates[1]
+    return (path, offset, arr_ty)
+end
+
+function _collect_array_fields!(results::Vector{Tuple{Vector{Int}, Int, LLVM.ArrayType}},
+                                 path::Vector{Int}, struct_ty::LLVM.StructType, base_offset::Int)
+    member_types = LLVM.elements(struct_ty)
+    running_offset = 0
+    for (i, mt) in enumerate(member_types)
+        member_align = _compute_type_alignment(mt)
+        running_offset = (running_offset + member_align - 1) & ~(member_align - 1)
+        if mt isa LLVM.ArrayType
+            push!(results, (vcat(path, [i - 1]), base_offset + running_offset, mt))
+        elseif mt isa LLVM.StructType
+            _collect_array_fields!(results, vcat(path, [i - 1]), mt, base_offset + running_offset)
+        end
+        running_offset += _compute_type_size(mt)
+    end
 end
 
 """
@@ -1784,28 +1839,29 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
             ptm_ty = arr_elem_ty != source_ty ? arr_elem_ty : source_ty
             set_pointee_type!(state.type_ctx.ptm, inst, ptm_ty; priority=5)
             # Record array element origin for folding chained GEPs (e.g. array[a][b] → array[a+b])
-            state.array_element_origin[inst] = (base_id, idx_i32, base_pointee)
+            state.array_element_origin[inst] = (base_id, UInt32[], idx_i32, base_pointee)
         elseif (sc == SC.Function || sc == SC.Private) && haskey(state.array_element_origin, base_ptr)
             # Chained single-index GEP on a Function-SC array element:
             # base was from OpAccessChain into an array, fold by adding indices.
             # gep T, ptr (AccessChain array[a]), b  →  AccessChain array[a + b]
-            arr_base_id, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
+            arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
             new_idx_i32 = _ensure_index_i32!(state, ops[2])
             # Emit IAdd to combine indices
             u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
             combined_idx = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, combined_idx, prev_idx_id, new_idx_i32)
             result_id = fresh_id!(state.mod)
-            word_count = UInt32(5)
+            all_indices = vcat(static_path, [combined_idx])
+            word_count = UInt32(4 + length(all_indices))
             push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
             push!(state.mod.functions, result_ptr_ty)
             push!(state.mod.functions, result_id)
             push!(state.mod.functions, arr_base_id)
-            push!(state.mod.functions, combined_idx)
+            append!(state.mod.functions, all_indices)
             state.value_map[inst] = result_id
             set_pointee_type!(state.type_ctx.ptm, inst, source_ty; priority=5)
             # Propagate origin for further chaining
-            state.array_element_origin[inst] = (arr_base_id, combined_idx, arr_type)
+            state.array_element_origin[inst] = (arr_base_id, static_path, combined_idx, arr_type)
         else
             idx = get_value_id!(state, ops[2])
             if sc == SC.PhysicalStorageBuffer
@@ -2206,7 +2262,7 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
         set_pointee_type!(state.type_ctx.ptm, inst, elem_ty; priority=4)
         # Register array element origin so chained byte-offset GEPs can fold offsets.
         # E.g., gep i8, (gep i8, ptr @alloca, i64 %a), i64 %b  → AccessChain @alloca[a/sz + b/sz]
-        state.array_element_origin[inst] = (base_id, idx_i32, base_pointee)
+        state.array_element_origin[inst] = (base_id, UInt32[], idx_i32, base_pointee)
         return
     end
 
@@ -2245,6 +2301,67 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
                 return
             end
 
+            # Offset exceeds struct size or falls in padding.
+            # If the base came from a dynamic array element access (array_element_origin),
+            # the constant offset may span across multiple array elements.
+            # E.g., gep i8, (AccessChain arr[%dyn]), 32 where arr element is 16 bytes
+            # → the offset 32 means +2 elements from the dynamic index.
+            if (sc == SC.Function || sc == SC.Private) && haskey(state.array_element_origin, base_ptr)
+                arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
+                arr_elem_ty = LLVM.eltype(arr_type)
+                arr_elem_size = _compute_type_size(arr_elem_ty)
+                if arr_elem_size > 0
+                    arr_idx_adjust = offset ÷ arr_elem_size
+                    sub_offset = offset % arr_elem_size
+
+                    # Adjust the dynamic array index
+                    adj_id = emit_constant_u32!(state.mod, UInt32(arr_idx_adjust))
+                    u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+                    combined_idx = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, combined_idx, prev_idx_id, adj_id)
+
+                    if sub_offset == 0
+                        # Exact element boundary: result is pointer to array element
+                        arr_elem_spirv = map_type!(state.type_ctx, arr_elem_ty)
+                        result_ptr_ty = map_pointer_type!(state.type_ctx, arr_elem_spirv, sc)
+                        all_indices = vcat(static_path, [combined_idx])
+                        result_id = fresh_id!(state.mod)
+                        word_count = UInt32(4 + length(all_indices))
+                        push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                        push!(state.mod.functions, result_ptr_ty)
+                        push!(state.mod.functions, result_id)
+                        push!(state.mod.functions, arr_base_id)
+                        append!(state.mod.functions, all_indices)
+                        state.value_map[inst] = result_id
+                        set_pointee_type!(state.type_ctx.ptm, inst, arr_elem_ty; priority=4)
+                        state.array_element_origin[inst] = (arr_base_id, static_path, combined_idx, arr_type)
+                        return
+                    elseif arr_elem_ty isa LLVM.StructType
+                        # Sub-element offset: access array element then struct field
+                        sub_path, sub_leaf = _find_struct_member_path_by_offset(arr_elem_ty, sub_offset)
+                        if sub_path !== nothing
+                            sub_leaf_spirv = map_type!(state.type_ctx, sub_leaf)
+                            result_ptr_ty = map_pointer_type!(state.type_ctx, sub_leaf_spirv, sc)
+                            all_indices = copy(static_path)
+                            push!(all_indices, combined_idx)
+                            for idx_val in sub_path
+                                push!(all_indices, emit_constant_u32!(state.mod, UInt32(idx_val)))
+                            end
+                            result_id = fresh_id!(state.mod)
+                            word_count = UInt32(4 + length(all_indices))
+                            push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                            push!(state.mod.functions, result_ptr_ty)
+                            push!(state.mod.functions, result_id)
+                            push!(state.mod.functions, arr_base_id)
+                            append!(state.mod.functions, all_indices)
+                            state.value_map[inst] = result_id
+                            set_pointee_type!(state.type_ctx.ptm, inst, sub_leaf; priority=4)
+                            return
+                        end
+                    end
+                end
+            end
+
             # Offset falls in struct padding (no member at this offset).
             # For Function storage class, we can't use OpPtrAccessChain.
             # Use the base pointer directly — the load handler (_resolve_struct_field_load!)
@@ -2254,6 +2371,91 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
                 state.value_map[inst] = base_id
                 set_pointee_type!(state.type_ctx.ptm, inst, base_pointee; priority=4)
                 return
+            end
+        else
+            # Dynamic byte offset on struct (Function/Private SC):
+            # Find the array field within the struct and emit a dynamic AccessChain.
+            # Pattern: gep i8, ptr %struct_alloca, i64 %dynamic_offset
+            # where the struct contains an array field (e.g., { ptr, [N x i64] })
+            # and the dynamic offset targets elements within that array.
+            if sc == SC.Function || sc == SC.Private
+                # Extract stride hint from the byte offset expression:
+                # shl i64 %x, N → stride = 2^N
+                # mul i64 %x, N → stride = N
+                elem_stride = 0
+                byte_offset_val = ops[2]
+                if byte_offset_val isa LLVM.Instruction
+                    bo_opcode = LLVM.opcode(byte_offset_val)
+                    bo_ops = LLVM.operands(byte_offset_val)
+                    if bo_opcode == LLVM.API.LLVMShl && length(bo_ops) >= 2 && bo_ops[2] isa LLVM.ConstantInt
+                        shift = convert(Int64, bo_ops[2])
+                        elem_stride = 1 << shift
+                    elseif bo_opcode == LLVM.API.LLVMMul && length(bo_ops) >= 2
+                        if bo_ops[1] isa LLVM.ConstantInt
+                            elem_stride = convert(Int64, bo_ops[1])
+                        elseif bo_ops[2] isa LLVM.ConstantInt
+                            elem_stride = convert(Int64, bo_ops[2])
+                        end
+                    end
+                end
+                arr_info = _find_array_field_in_struct(base_pointee, elem_stride)
+                if arr_info !== nothing
+                    arr_path, arr_byte_offset, arr_ty = arr_info
+                    arr_elem_ty = LLVM.eltype(arr_ty)
+                    arr_elem_size = _compute_type_size(arr_elem_ty)
+                    if arr_elem_size > 0
+                        # Compute: element_idx = (byte_offset - arr_byte_offset) / arr_elem_size
+                        arr_elem_spirv = map_type!(state.type_ctx, arr_elem_ty)
+                        result_ptr_ty = map_pointer_type!(state.type_ctx, arr_elem_spirv, sc)
+
+                        # Subtract the array field's byte offset
+                        adjusted_id = byte_offset_id
+                        if arr_byte_offset > 0
+                            off_id = _emit_int_constant!(state, idx_ty, Int64(arr_byte_offset))
+                            adjusted_id = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpISub, idx_spirv_ty, adjusted_id, byte_offset_id, off_id)
+                        end
+
+                        # Divide by element size
+                        dyn_idx_id = adjusted_id
+                        if arr_elem_size > 1
+                            sz_id = _emit_int_constant!(state, idx_ty, Int64(arr_elem_size))
+                            dyn_idx_id = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpSDiv, idx_spirv_ty, dyn_idx_id, adjusted_id, sz_id)
+                        end
+
+                        # Convert to i32 for OpAccessChain
+                        dyn_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
+                            u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+                            conv_id = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, dyn_idx_id)
+                            conv_id
+                        else
+                            dyn_idx_id
+                        end
+
+                        # Build AccessChain: base, <static path to array>, dynamic_index
+                        all_indices = UInt32[]
+                        for idx_val in arr_path
+                            push!(all_indices, emit_constant_u32!(state.mod, UInt32(idx_val)))
+                        end
+                        push!(all_indices, dyn_idx_i32)
+
+                        result_id = fresh_id!(state.mod)
+                        word_count = UInt32(4 + length(all_indices))
+                        push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                        push!(state.mod.functions, result_ptr_ty)
+                        push!(state.mod.functions, result_id)
+                        push!(state.mod.functions, base_id)
+                        append!(state.mod.functions, all_indices)
+                        state.value_map[inst] = result_id
+                        set_pointee_type!(state.type_ctx.ptm, inst, arr_elem_ty; priority=4)
+                        # Store static path (indices BEFORE the dynamic index) for chained GEPs
+                        static_path = UInt32[emit_constant_u32!(state.mod, UInt32(idx_val)) for idx_val in arr_path]
+                        state.array_element_origin[inst] = (base_id, static_path, dyn_idx_i32, arr_ty)
+                        return
+                    end
+                end
             end
         end
     end
@@ -2313,7 +2515,7 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
             # Chained byte-offset GEP on a Function-SC array element pointer:
             # base was from OpAccessChain into an array, fold by adding the element index offset.
             # E.g., gep i8, ptr (AccessChain array[a]), -4  →  AccessChain array[a + (-4/elemsize)]
-            arr_base_id, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
+            arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
             # idx_id is already byte_offset / elem_size (computed above as SDiv)
             # Convert idx_id to i32 for OpAccessChain
             new_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
@@ -2328,14 +2530,15 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
             combined_idx = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, combined_idx, prev_idx_id, new_idx_i32)
             result_id = fresh_id!(state.mod)
-            word_count = UInt32(5)
+            all_indices = vcat(static_path, [combined_idx])
+            word_count = UInt32(4 + length(all_indices))
             push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
             push!(state.mod.functions, result_ptr_ty)
             push!(state.mod.functions, result_id)
             push!(state.mod.functions, arr_base_id)
-            push!(state.mod.functions, combined_idx)
+            append!(state.mod.functions, all_indices)
             # Propagate origin for further chaining
-            state.array_element_origin[inst] = (arr_base_id, combined_idx, arr_type)
+            state.array_element_origin[inst] = (arr_base_id, static_path, combined_idx, arr_type)
         else
             # Function: use base pointer directly, let load/store handlers resolve.
             result_id = base_id

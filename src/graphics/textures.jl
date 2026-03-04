@@ -78,7 +78,7 @@ function LavaTexture2D(data::Matrix{T}; filter=:linear, wrap=:repeat) where T
     phys = ctx.physical_device
 
     h, w = size(data)
-    format = _julia_to_vk_format(T)
+    format = julia_to_vk_format(T)
 
     image = Vulkan.Image(dev,
         Vulkan.IMAGE_TYPE_2D, format,
@@ -91,7 +91,7 @@ function LavaTexture2D(data::Matrix{T}; filter=:linear, wrap=:repeat) where T
         Vulkan.IMAGE_LAYOUT_UNDEFINED,
     )
 
-    memory = _alloc_image_memory(dev, phys, image)
+    memory = alloc_image_memory(dev, phys, image)
 
     view = Vulkan.ImageView(dev, image, Vulkan.IMAGE_VIEW_TYPE_2D, format,
         Vulkan.ComponentMapping(
@@ -103,13 +103,13 @@ function LavaTexture2D(data::Matrix{T}; filter=:linear, wrap=:repeat) where T
     tex = LavaTexture2D{T}(image, memory, view, w, h, format)
 
     # Upload data
-    _upload_texture_data!(tex, data)
+    upload_texture_data!(tex, data)
 
     return tex
 end
 
 """Upload pixel data to a texture via staging buffer."""
-function _upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}) where T
+function upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}) where T
     ctx = vk_context()
     dev = ctx.device
 
@@ -129,7 +129,7 @@ function _upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}) where T
         flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
 
     # Transition to TRANSFER_DST
-    _transition_image!(cmd, tex.image,
+    transition_image!(cmd, tex.image,
         Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         Vulkan.PIPELINE_STAGE_TOP_OF_PIPE_BIT, Vulkan.PIPELINE_STAGE_TRANSFER_BIT,
         Vulkan.AccessFlag(0), Vulkan.ACCESS_TRANSFER_WRITE_BIT)
@@ -146,7 +146,7 @@ function _upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}) where T
         Vulkan.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, [region])
 
     # Transition to SHADER_READ_ONLY
-    _transition_image!(cmd, tex.image,
+    transition_image!(cmd, tex.image,
         Vulkan.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, Vulkan.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         Vulkan.PIPELINE_STAGE_TRANSFER_BIT, Vulkan.PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
         Vulkan.ACCESS_TRANSFER_WRITE_BIT, Vulkan.ACCESS_SHADER_READ_BIT)
@@ -159,11 +159,13 @@ function _upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}) where T
     unwrap(Vulkan.reset_fences(dev, [ctx.fence]))
     ctx.recording = false
     ctx.dispatch_count = 0
+    empty!(INFLIGHT_DATA_REFS)
+    flush_deferred_frees!()
 end
 
 # ── Format Mapping ──
 
-function _julia_to_vk_format(::Type{T}) where T
+function julia_to_vk_format(::Type{T}) where T
     T == Float32      ? Vulkan.FORMAT_R32_SFLOAT :
     T == NTuple{4, Float32} ? Vulkan.FORMAT_R32G32B32A32_SFLOAT :
     T == NTuple{3, Float32} ? Vulkan.FORMAT_R32G32B32_SFLOAT :

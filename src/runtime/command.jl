@@ -3,11 +3,26 @@
 # Uses pre-allocated command buffer from VkContext.
 # Supports batched dispatches with automatic memory barriers.
 
-# Track in-flight argument buffers to prevent GC during GPU execution
-const _inflight_arg_bufs = VkManagedBuffer[]
+# Track in-flight data references to prevent GC from freeing GPU buffers
+# between dispatch recording and vk_flush!().
+#
+# When KA.argconvert converts LavaArray → LavaDeviceArray(Ptr{T}(...), dims),
+# the raw Ptr holds no reference to the backing VkManagedBuffer. If the caller
+# drops all LavaArray references before vk_flush!(), GC can call vk_free!()
+# on the backing buffer while the GPU command buffer still reads from it via BDA.
+# Under heavy GC pressure (e.g. thousands of test allocations), this causes
+# DEVICE_LOST (GPU page fault on freed memory).
+#
+# Solution: push the original args tuple here before dispatch. This keeps all
+# LavaArray objects (and Broadcasted objects containing them) alive until flush.
+#
+# This is Layer 1 (proactive) of our GC safety. Layer 2 (structural guard) is
+# DEFERRED_FREES in memory.jl — if a GC finalizer fires during recording despite
+# Layer 1, the actual Vulkan destroy is deferred until after vk_flush!().
+const INFLIGHT_DATA_REFS = Any[]
 
 # Flush counter for benchmarking (atomic for thread safety)
-const _flush_counter = Threads.Atomic{Int}(0)
+const FLUSH_COUNTER = Threads.Atomic{Int}(0)
 
 """
     vk_dispatch!(pipeline::LavaComputePipeline, push_data::Vector{UInt8},
@@ -75,7 +90,7 @@ Submit the batched command buffer and wait for GPU completion.
 function vk_flush!()
     ctx = vk_context()
     !ctx.recording && return
-    Threads.atomic_add!(_flush_counter, 1)
+    Threads.atomic_add!(FLUSH_COUNTER, 1)
 
     dev = ctx.device
 
@@ -87,13 +102,19 @@ function vk_flush!()
     unwrap(Vulkan.wait_for_fences(dev, [ctx.fence], true, typemax(UInt64)))
     unwrap(Vulkan.reset_fences(dev, [ctx.fence]))
 
-    # Reset state
+    # Reset state — recording must be set to false BEFORE flush_deferred_frees!
+    # so that any GC finalizers triggered during deferred free processing don't
+    # re-defer (we're idle now, safe to free immediately).
     ctx.recording = false
     ctx.dispatch_count = 0
     ctx.last_was_rt = false
-    empty!(_inflight_arg_bufs)
-    _reset_arg_buffer_pool!()
-    _reset_indirect_buffer_pool!()
+    empty!(INFLIGHT_DATA_REFS)
+
+    # Destroy buffers whose GC finalizer fired during recording/execution.
+    # GPU is idle (fence waited above), safe to destroy now.
+    flush_deferred_frees!()
+    reset_arg_buffer_pool!()
+    reset_indirect_buffer_pool!()
 end
 
 """
@@ -158,11 +179,14 @@ function vk_dispatch_indirect!(pipeline::LavaComputePipeline, push_data::Vector{
 end
 
 """
-    keep_alive!(buf::VkManagedBuffer)
+    keep_data_alive!(refs)
 
-Keep a buffer alive until the next `vk_flush!()` completes.
-Prevents GC from freeing argument buffers during GPU execution.
+Keep Julia objects alive until the next `vk_flush!()` completes.
+Prevents GC from freeing LavaArray backing buffers while the GPU is still
+reading from them via BDA addresses in the recorded command buffer.
+
+Typically called with the kernel args tuple before dispatch recording.
 """
-function keep_alive!(buf::VkManagedBuffer)
-    push!(_inflight_arg_bufs, buf)
+function keep_data_alive!(refs)
+    push!(INFLIGHT_DATA_REFS, refs)
 end

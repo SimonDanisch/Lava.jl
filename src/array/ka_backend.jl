@@ -103,6 +103,8 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     # GPU-resident ndrange → indirect dispatch (no CPU readback)
     if ndrange isa LavaArray
         converted_args = KA.argconvert.(Ref(obj), args)
+        # Keep original args alive — argconvert strips LavaArray → Ptr (no backing ref)
+        keep_data_alive!(args)
         _ka_launch_indirect!(obj, converted_args, ndrange, workgroupsize)
         return nothing
     end
@@ -123,6 +125,12 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     # We must include f in the args so BDA packing matches the layout.
     converted_args = KA.argconvert.(Ref(obj), args)
     all_args = (obj.f, ctx, converted_args...)
+
+    # Keep original args alive until vk_flush!() — argconvert converts
+    # LavaArray → LavaDeviceArray(Ptr{T}), losing the backing buffer reference.
+    # Without this, GC can free the VkManagedBuffer while the GPU command buffer
+    # still references it via BDA, causing DEVICE_LOST under GC pressure.
+    keep_data_alive!(args)
 
     # Launch via our compilation pipeline
     _ka_launch!(obj.f, all_args, nblocks, ws_3d)
@@ -160,7 +168,7 @@ function _ka_launch!(@nospecialize(f), all_args::Tuple, nblocks::Int, workgroup_
     total_size = compiled.push_info.arg_buffer_size + inline_extra
 
     # Get host-visible mapped arg buffer
-    arg_buf = _get_arg_buffer(total_size)
+    arg_buf = get_arg_buffer(total_size)
 
     # Pack args directly to mapped memory (zero intermediate allocations)
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
@@ -248,7 +256,7 @@ function _ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize)
     # Pack args directly to mapped memory
     inline_extra = _compute_inline_extra(typeof(all_args))
     total_size = compiled.push_info.arg_buffer_size + inline_extra
-    arg_buf = _get_arg_buffer(total_size)
+    arg_buf = get_arg_buffer(total_size)
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        compiled.push_info.arg_buffer_size, all_args)
     push_data = Vector{UInt8}(undef, 8)

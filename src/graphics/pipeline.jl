@@ -19,7 +19,7 @@ struct CompiledGraphicsPipeline
     has_depth::Bool
 end
 
-const _gfx_pipeline_cache = Dict{UInt64, CompiledGraphicsPipeline}()
+const GFX_PIPELINE_CACHE = Dict{UInt64, CompiledGraphicsPipeline}()
 
 """
     create_graphics_pipeline(vertex_spirv, fragment_spirv;
@@ -50,8 +50,8 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
     dev = ctx.device
 
     # Create shader modules
-    vert_mod = _create_gfx_shader_module(dev, vertex_spirv)
-    frag_mod = _create_gfx_shader_module(dev, fragment_spirv)
+    vert_mod = create_gfx_shader_module(dev, vertex_spirv)
+    frag_mod = create_gfx_shader_module(dev, fragment_spirv)
     modules = Vulkan.ShaderModule[vert_mod, frag_mod]
 
     stages = Vulkan.PipelineShaderStageCreateInfo[
@@ -63,7 +63,7 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
 
     # Optional: geometry shader
     if geometry_spirv !== nothing
-        geom_mod = _create_gfx_shader_module(dev, geometry_spirv)
+        geom_mod = create_gfx_shader_module(dev, geometry_spirv)
         push!(modules, geom_mod)
         push!(stages, Vulkan.PipelineShaderStageCreateInfo(
             Vulkan.SHADER_STAGE_GEOMETRY_BIT, geom_mod, "main"))
@@ -71,8 +71,8 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
 
     # Optional: tessellation shaders
     if tess_ctrl_spirv !== nothing && tess_eval_spirv !== nothing
-        tc_mod = _create_gfx_shader_module(dev, tess_ctrl_spirv)
-        te_mod = _create_gfx_shader_module(dev, tess_eval_spirv)
+        tc_mod = create_gfx_shader_module(dev, tess_ctrl_spirv)
+        te_mod = create_gfx_shader_module(dev, tess_eval_spirv)
         push!(modules, tc_mod, te_mod)
         push!(stages, Vulkan.PipelineShaderStageCreateInfo(
             Vulkan.SHADER_STAGE_TESSELLATION_CONTROL_BIT, tc_mod, "main"))
@@ -84,7 +84,7 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
     vertex_input = Vulkan.PipelineVertexInputStateCreateInfo([], [])
 
     # Input assembly
-    vk_topo = _vk_topology(topology)
+    vk_topo = vk_topology(topology)
     input_assembly = Vulkan.PipelineInputAssemblyStateCreateInfo(vk_topo, false)
 
     # Tessellation state (if applicable)
@@ -101,7 +101,7 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
         viewports=[dummy_viewport], scissors=[dummy_scissor])
 
     # Rasterization
-    cull_mode = _vk_cull(cull)
+    cull_mode = vk_cull(cull)
     rasterization = Vulkan.PipelineRasterizationStateCreateInfo(
         false, false,
         Vulkan.POLYGON_MODE_FILL,
@@ -117,7 +117,7 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
 
     # Depth/stencil
     has_depth = !(depth isa DepthOff)
-    depth_enable, depth_compare = _vk_depth(depth)
+    depth_enable, depth_compare = vk_depth(depth)
     depth_stencil = Vulkan.PipelineDepthStencilStateCreateInfo(
         depth_enable, depth_enable,
         depth_compare,
@@ -131,7 +131,7 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
     )
 
     # Color blend
-    blend_attachment = _vk_blend(blend)
+    blend_attachment = vk_blend(blend)
     color_blend = Vulkan.PipelineColorBlendStateCreateInfo(
         false, Vulkan.LOGIC_OP_COPY,
         [blend_attachment],
@@ -200,7 +200,7 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
     )
 end
 
-function _create_gfx_shader_module(dev::Vulkan.Device, spirv_bytes::Vector{UInt8})
+function create_gfx_shader_module(dev::Vulkan.Device, spirv_bytes::Vector{UInt8})
     @assert length(spirv_bytes) % 4 == 0 "SPIR-V binary must be 4-byte aligned"
     code_u32 = reinterpret(UInt32, spirv_bytes)
     Vulkan.ShaderModule(dev, length(spirv_bytes), code_u32)
@@ -208,34 +208,34 @@ end
 
 # ── Pipeline State Dispatch ──
 
-_vk_topology(::TriangleList)  = Vulkan.PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
-_vk_topology(::TriangleStrip) = Vulkan.PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
-_vk_topology(::LineList)      = Vulkan.PRIMITIVE_TOPOLOGY_LINE_LIST
-_vk_topology(::LineStrip)     = Vulkan.PRIMITIVE_TOPOLOGY_LINE_STRIP
-_vk_topology(::PointList)     = Vulkan.PRIMITIVE_TOPOLOGY_POINT_LIST
-_vk_topology(::PatchList)     = Vulkan.PRIMITIVE_TOPOLOGY_PATCH_LIST
+vk_topology(::TriangleList)  = Vulkan.PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+vk_topology(::TriangleStrip) = Vulkan.PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
+vk_topology(::LineList)      = Vulkan.PRIMITIVE_TOPOLOGY_LINE_LIST
+vk_topology(::LineStrip)     = Vulkan.PRIMITIVE_TOPOLOGY_LINE_STRIP
+vk_topology(::PointList)     = Vulkan.PRIMITIVE_TOPOLOGY_POINT_LIST
+vk_topology(::PatchList)     = Vulkan.PRIMITIVE_TOPOLOGY_PATCH_LIST
 
-_vk_cull(::NoCull)    = Vulkan.CULL_MODE_NONE
-_vk_cull(::CullBack)  = Vulkan.CULL_MODE_BACK_BIT
-_vk_cull(::CullFront) = Vulkan.CULL_MODE_FRONT_BIT
+vk_cull(::NoCull)    = Vulkan.CULL_MODE_NONE
+vk_cull(::CullBack)  = Vulkan.CULL_MODE_BACK_BIT
+vk_cull(::CullFront) = Vulkan.CULL_MODE_FRONT_BIT
 
-function _vk_depth(::DepthLess)
+function vk_depth(::DepthLess)
     (true, Vulkan.COMPARE_OP_LESS)
 end
-function _vk_depth(::DepthLessEq)
+function vk_depth(::DepthLessEq)
     (true, Vulkan.COMPARE_OP_LESS_OR_EQUAL)
 end
-function _vk_depth(::DepthGreater)
+function vk_depth(::DepthGreater)
     (true, Vulkan.COMPARE_OP_GREATER)
 end
-function _vk_depth(::DepthAlways)
+function vk_depth(::DepthAlways)
     (true, Vulkan.COMPARE_OP_ALWAYS)
 end
-function _vk_depth(::DepthOff)
+function vk_depth(::DepthOff)
     (false, Vulkan.COMPARE_OP_ALWAYS)
 end
 
-function _vk_blend(::Opaque)
+function vk_blend(::Opaque)
     Vulkan.PipelineColorBlendAttachmentState(
         false,
         Vulkan.BLEND_FACTOR_ONE, Vulkan.BLEND_FACTOR_ZERO, Vulkan.BLEND_OP_ADD,
@@ -245,7 +245,7 @@ function _vk_blend(::Opaque)
     )
 end
 
-function _vk_blend(::AlphaBlend)
+function vk_blend(::AlphaBlend)
     Vulkan.PipelineColorBlendAttachmentState(
         true,
         Vulkan.BLEND_FACTOR_SRC_ALPHA, Vulkan.BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, Vulkan.BLEND_OP_ADD,
@@ -255,7 +255,7 @@ function _vk_blend(::AlphaBlend)
     )
 end
 
-function _vk_blend(::Additive)
+function vk_blend(::Additive)
     Vulkan.PipelineColorBlendAttachmentState(
         true,
         Vulkan.BLEND_FACTOR_ONE, Vulkan.BLEND_FACTOR_ONE, Vulkan.BLEND_OP_ADD,
@@ -265,7 +265,7 @@ function _vk_blend(::Additive)
     )
 end
 
-function _vk_blend(::Premultiplied)
+function vk_blend(::Premultiplied)
     Vulkan.PipelineColorBlendAttachmentState(
         true,
         Vulkan.BLEND_FACTOR_ONE, Vulkan.BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, Vulkan.BLEND_OP_ADD,
@@ -322,7 +322,7 @@ function vk_draw!(pipeline::CompiledGraphicsPipeline,
     end
 
     # Transition color image to COLOR_ATTACHMENT_OPTIMAL
-    _transition_image!(cmd, color_image,
+    transition_image!(cmd, color_image,
         Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         Vulkan.PIPELINE_STAGE_TOP_OF_PIPE_BIT, Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
         Vulkan.AccessFlag(0), Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
@@ -411,7 +411,7 @@ function vk_draw!(pipeline::CompiledGraphicsPipeline,
 end
 
 """Transition an image layout using a pipeline barrier."""
-function _transition_image!(cmd, image::Vulkan.Image,
+function transition_image!(cmd, image::Vulkan.Image,
                               old_layout, new_layout,
                               src_stage, dst_stage,
                               src_access, dst_access)
@@ -453,7 +453,7 @@ function vk_begin_pass!(color_view::Vulkan.ImageView,
     end
 
     # Transition color image
-    _transition_image!(cmd, color_image,
+    transition_image!(cmd, color_image,
         Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         Vulkan.PIPELINE_STAGE_TOP_OF_PIPE_BIT, Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
         Vulkan.AccessFlag(0), Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT)

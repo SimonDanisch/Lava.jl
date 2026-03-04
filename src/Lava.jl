@@ -1,6 +1,7 @@
 module Lava
 
 export LavaArray, LavaBackend, LavaBuffer, LavaDeviceArray
+export CompilationResult, lava_compile, optimize_spirv
 
 # Graphics exports
 export GraphicsPipeline, Rasterizer, TrianglePipeline, LinePipeline
@@ -8,6 +9,7 @@ export RenderWindow, LavaFramebuffer, WindowTarget, OffscreenTarget
 export CompiledGraphicsPipeline, LavaGfxShader
 export draw!, blit!, present_frame!, acquire_next_image!, readback_framebuffer
 export vk_begin_pass!, vk_draw_in_pass!, vk_end_pass!
+export pack_gfx_args, ensure_compiled!, transition_image!
 export LavaTexture2D, LavaTexture1D, LavaSampler, SampledTexture, LavaTexture
 export TextureBindings, bind_textures
 # Graphics types
@@ -21,20 +23,20 @@ export TessSpacing, EqualSpacing, FractionalEvenSpacing, FractionalOddSpacing
 export TessWinding, WindingCW, WindingCCW
 export TessDomain, TessTriangles, TessQuads, TessIsolines
 # Graphics device intrinsics
-export _lava_gfx_vertex_index, _lava_gfx_instance_index
-export _lava_gfx_frag_coord, _lava_gfx_frag_coord_x, _lava_gfx_frag_coord_y
-export _lava_gfx_front_facing
-export _lava_gfx_set_position, _lava_gfx_set_point_size
-export _lava_gfx_output_f32, _lava_gfx_output_vec2, _lava_gfx_output_vec3, _lava_gfx_output_vec4
-export _lava_gfx_input_f32, _lava_gfx_input_vec2, _lava_gfx_input_vec3, _lava_gfx_input_vec4
-export _lava_gfx_emit_vertex, _lava_gfx_end_primitive
-export _lava_gfx_tess_coord, _lava_gfx_set_tess_level_outer, _lava_gfx_set_tess_level_inner
+export vertex_index, instance_index
+export frag_coord, frag_coord_x, frag_coord_y, frag_coord_xy
+export front_facing
+export set_position!, set_point_size!
+export gfx_output, gfx_input
+export emit_vertex!, end_primitive!, invocation_id, primitive_id_in
+export tess_coord, tess_coord_uvw, set_tess_level_outer!, set_tess_level_inner!
+export sample_texture_2d
 
 # Ray tracing exports
 export HardwareAccel, RTRay, RTHitResult
 export trace_closest_hits!, trace_closest_hits_indirect!, RayTracingPipeline, trace_rays!, trace_rays_indirect!
 export set_anyhit_pipeline!, trace_closest_hits_anyhit!, trace_closest_hits_anyhit_indirect!
-export _lava_rt_ignore_intersection, _lava_rt_terminate_ray
+export lava_rt_ignore_intersection, lava_rt_terminate_ray
 
 using Vulkan
 using GPUCompiler
@@ -47,6 +49,7 @@ using Adapt
 using Atomix
 using SPIRV_Tools_jll
 using LinearAlgebra
+using GeometryBasics
 import GLFW
 
 # ---- Graphics types (pure Julia, no Vulkan dependency) ----

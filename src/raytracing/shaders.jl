@@ -81,13 +81,16 @@ function trace_rays!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args...;
     inline_extra = _compute_inline_extra(typeof(all_args))
     total_size = raygen_compiled.push_info.arg_buffer_size + inline_extra
 
-    arg_buf = _get_arg_buffer(total_size)
+    arg_buf = get_arg_buffer(total_size)
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        raygen_compiled.push_info.arg_buffer_size, all_args)
 
     # Push constant = BDA of arg buffer
     push_data = Vector{UInt8}(undef, 8)
     unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
+
+    # Keep data buffer references alive until vk_flush!()
+    keep_data_alive!(args)
 
     # Dispatch (records into batched command buffer, no separate submit)
     rt_dispatch!(vk_pipeline, tlas, push_data, width, height; depth=depth)
@@ -119,7 +122,7 @@ function trace_rays_indirect!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args
     inline_extra = _compute_inline_extra(typeof(all_args))
     total_size = raygen_compiled.push_info.arg_buffer_size + inline_extra
 
-    arg_buf = _get_arg_buffer(total_size)
+    arg_buf = get_arg_buffer(total_size)
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        raygen_compiled.push_info.arg_buffer_size, all_args)
 
@@ -129,6 +132,9 @@ function trace_rays_indirect!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args
     # Prepare indirect RT buffer: kernel writes (n_rays, 1, 1) from GPU queue size
     indirect_buf = _get_indirect_buffer()
     _prepare_indirect_rt_dispatch!(indirect_buf, n_rays)
+
+    # Keep data buffer references alive until vk_flush!()
+    keep_data_alive!(args)
 
     # Indirect RT dispatch
     rt_dispatch_indirect!(vk_pipeline, tlas, push_data, indirect_buf)

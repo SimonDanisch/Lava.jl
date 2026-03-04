@@ -21,6 +21,12 @@ end
 # Strong references to keep Vulkan handles alive until explicit free
 const _live_buffers = Set{VkManagedBuffer}()
 
+# Deferred free list: buffers whose GC finalizer fired while a command buffer
+# was recording or executing. Destroying them immediately would free GPU memory
+# that the in-flight command buffer still references via BDA → DEVICE_LOST.
+# Processed after vk_flush!() completes (GPU is idle, safe to destroy).
+const DEFERRED_FREES = VkManagedBuffer[]
+
 """
     vk_alloc(nbytes::Integer) -> VkManagedBuffer
 
@@ -69,9 +75,32 @@ end
     vk_free!(buf::VkManagedBuffer)
 
 Free a managed buffer's Vulkan resources.
+
+If a command buffer is currently recording or executing (ctx.recording == true),
+the destruction is deferred until after vk_flush!() completes. This prevents
+DEVICE_LOST from GC finalizers freeing GPU memory that the in-flight command
+buffer still references via BDA addresses.
 """
 function vk_free!(buf::VkManagedBuffer)
+    buf.size == 0 && return  # Already freed
+
     delete!(_live_buffers, buf)
+
+    # Defer destruction while GPU may be using this buffer.
+    # GC finalizers can fire at any point — if a command buffer is recording,
+    # the buffer's BDA address may be embedded in a dispatch's arg buffer.
+    # Destroying it now would make the GPU read freed memory → page fault.
+    ctx = _vk_context[]
+    if ctx !== nothing && ctx.recording
+        push!(DEFERRED_FREES, buf)
+        return
+    end
+
+    _destroy_buffer!(buf)
+end
+
+"""Actually destroy a buffer's Vulkan resources. Called from vk_free! or flush_deferred_frees!."""
+function _destroy_buffer!(buf::VkManagedBuffer)
     # Unmap if this was a unified/BAR buffer
     if buf.mapped_ptr != Ptr{UInt8}(0)
         Vulkan.unmap_memory(vk_device(), buf.memory)
@@ -85,13 +114,27 @@ function vk_free!(buf::VkManagedBuffer)
     buf.size = 0
 end
 
+"""Process deferred buffer frees after GPU is idle. Called from vk_flush!()."""
+function flush_deferred_frees!()
+    isempty(DEFERRED_FREES) && return
+    n = length(DEFERRED_FREES)
+    # Debug warning: deferred frees indicate a GC finalizer fired during recording.
+    # This is safely handled (Layer 2), but frequent occurrences suggest Layer 1
+    # (keep_data_alive!) is missing on a dispatch path. Investigate if this fires often.
+    @debug "Lava: flushing $n deferred buffer frees (GC fired during recording)"
+    for buf in DEFERRED_FREES
+        _destroy_buffer!(buf)
+    end
+    empty!(DEFERRED_FREES)
+end
+
 # ── Staging buffer for CPU↔GPU transfers ──
 
-const _staging_buf = Ref{Union{Nothing, Tuple{Vulkan.Buffer, Vulkan.DeviceMemory, Ptr{Nothing}, Int}}}(nothing)
+const STAGING_BUF = Ref{Union{Nothing, Tuple{Vulkan.Buffer, Vulkan.DeviceMemory, Ptr{Nothing}, Int}}}(nothing)
 
 """Get or grow the staging buffer to at least `nbytes`."""
-function _get_staging(nbytes::Integer)
-    existing = _staging_buf[]
+function get_staging(nbytes::Integer)
+    existing = STAGING_BUF[]
     if existing !== nothing && existing[4] >= nbytes
         return existing
     end
@@ -129,7 +172,7 @@ function _get_staging(nbytes::Integer)
     mapped_ptr = unwrap(Vulkan.map_memory(dev, memory, 0, alloc_size))
 
     result = (buf, memory, mapped_ptr, Int(alloc_size))
-    _staging_buf[] = result
+    STAGING_BUF[] = result
     return result
 end
 
@@ -152,7 +195,7 @@ function upload!(dst::VkManagedBuffer, host_data::Vector{UInt8}; offset::Int=0)
         return
     end
 
-    staging_buf, _, mapped_ptr, _ = _get_staging(nbytes)
+    staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
     unsafe_copyto!(Ptr{UInt8}(mapped_ptr), pointer(host_data), nbytes)
 
     _one_shot_copy(staging_buf, 0, dst.buffer, offset, nbytes)
@@ -178,7 +221,7 @@ function download!(host_data::Vector{UInt8}, src::VkManagedBuffer; offset::Int=0
         return
     end
 
-    staging_buf, _, mapped_ptr, _ = _get_staging(nbytes)
+    staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
     _one_shot_copy(src.buffer, offset, staging_buf, 0, nbytes)
     unsafe_copyto!(pointer(host_data), Ptr{UInt8}(mapped_ptr), nbytes)
 end
@@ -348,7 +391,7 @@ function _get_indirect_buffer()
 end
 
 """Reset indirect buffer pool index after flush."""
-function _reset_indirect_buffer_pool!()
+function reset_indirect_buffer_pool!()
     _indirect_buffer_idx[] = 0
 end
 

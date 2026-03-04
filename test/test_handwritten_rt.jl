@@ -414,5 +414,21 @@ end
         @test n_hits > 0
         @test n_misses > 0
         println("RT test: $n_hits interior hits, $n_misses exterior misses, $n_edge edge cases out of $(W*H) rays")
+
+        # Explicit cleanup: ensure GPU is idle and destroy handles in correct order
+        # (children before parents) to prevent segfaults from GC finalizer ordering.
+        Vulkan.device_wait_idle(ctx.device)
+        finalize(pipeline.pipeline)
+        finalize(pipeline.pipeline_layout)
+        finalize(pipeline.descriptor_set_layout)
+        for sm in pipeline.shader_modules
+            finalize(sm)
+        end
+        finalize(tlas.accel)
+        finalize(tlas.buffer)
+        finalize(tlas.memory)
+        finalize(blas.accel)
+        finalize(blas.buffer)
+        finalize(blas.memory)
     end
 end

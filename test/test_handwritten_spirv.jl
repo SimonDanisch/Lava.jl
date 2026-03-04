@@ -310,20 +310,21 @@ end
         expected = input_data .* 2.0f0
         @test output_data == expected
 
-        # Cleanup
+        # Cleanup — use finalize() so GC finalizers don't double-free handles.
+        # Order: wait for GPU idle, then children before parents.
         device_wait_idle(device)
-        destroy_fence(device, fence)
-        destroy_command_pool(device, cmd_pool)
-        destroy_descriptor_pool(device, desc_pool)
-        destroy_pipeline(device, compute_pipeline)
-        destroy_pipeline_layout(device, pipeline_layout)
-        destroy_descriptor_set_layout(device, ds_layout)
-        destroy_shader_module(device, shader_module)
-        destroy_buffer(device, input_buf)
-        destroy_buffer(device, output_buf)
-        free_memory(device, input_mem)
-        free_memory(device, output_mem)
-        destroy_device(device)
-        destroy_instance(instance)
+        finalize(fence)
+        finalize(cmd_pool)
+        finalize(desc_pool)
+        finalize(compute_pipeline)
+        finalize(pipeline_layout)
+        finalize(ds_layout)
+        finalize(shader_module)
+        finalize(input_buf)
+        finalize(output_buf)
+        finalize(input_mem)
+        finalize(output_mem)
+        finalize(device)
+        finalize(instance)
     end
 end

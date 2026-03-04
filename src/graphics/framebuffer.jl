@@ -47,7 +47,7 @@ function LavaFramebuffer(width::Integer, height::Integer;
         Vulkan.SHARING_MODE_EXCLUSIVE, UInt32[],
         Vulkan.IMAGE_LAYOUT_UNDEFINED,
     )
-    color_memory = _alloc_image_memory(dev, phys, color_image)
+    color_memory = alloc_image_memory(dev, phys, color_image)
     color_view = Vulkan.ImageView(dev, color_image, Vulkan.IMAGE_VIEW_TYPE_2D, color_format,
         Vulkan.ComponentMapping(
             Vulkan.COMPONENT_SWIZZLE_IDENTITY, Vulkan.COMPONENT_SWIZZLE_IDENTITY,
@@ -73,7 +73,7 @@ function LavaFramebuffer(width::Integer, height::Integer;
             Vulkan.SHARING_MODE_EXCLUSIVE, UInt32[],
             Vulkan.IMAGE_LAYOUT_UNDEFINED,
         )
-        depth_mem = _alloc_image_memory(dev, phys, depth_img)
+        depth_mem = alloc_image_memory(dev, phys, depth_img)
         depth_vw = Vulkan.ImageView(dev, depth_img, Vulkan.IMAGE_VIEW_TYPE_2D, depth_format,
             Vulkan.ComponentMapping(
                 Vulkan.COMPONENT_SWIZZLE_IDENTITY, Vulkan.COMPONENT_SWIZZLE_IDENTITY,
@@ -90,11 +90,11 @@ function LavaFramebuffer(width::Integer, height::Integer;
 end
 
 """Allocate device-local memory for an image."""
-function _alloc_image_memory(dev::Vulkan.Device, phys::Vulkan.PhysicalDevice, image::Vulkan.Image)
+function alloc_image_memory(dev::Vulkan.Device, phys::Vulkan.PhysicalDevice, image::Vulkan.Image)
     mem_reqs = Vulkan.get_image_memory_requirements(dev, image)
     mem_props = Vulkan.get_physical_device_memory_properties(phys)
 
-    type_idx = _find_memory_type(mem_props, mem_reqs.memory_type_bits,
+    type_idx = find_memory_type(mem_props, mem_reqs.memory_type_bits,
                                   Vulkan.MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
 
     mem = Vulkan.DeviceMemory(dev, mem_reqs.size, type_idx)
@@ -103,7 +103,7 @@ function _alloc_image_memory(dev::Vulkan.Device, phys::Vulkan.PhysicalDevice, im
 end
 
 """Find a memory type index matching required bits and properties."""
-function _find_memory_type(mem_props, type_bits::UInt32, required_flags)
+function find_memory_type(mem_props, type_bits::UInt32, required_flags)
     for i in 0:Int(mem_props.memory_type_count) - 1
         if (type_bits & (1 << i)) != 0
             flags = mem_props.memory_types[i + 1].property_flags
@@ -134,13 +134,13 @@ function readback_framebuffer(fb::LavaFramebuffer)
     end
 
     nbytes = fb.width * fb.height * 4  # 4 bytes per pixel (B8G8R8A8)
-    staging_buf, _, mapped_ptr, _ = _get_staging(nbytes)
+    staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
 
     unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(;
         flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
 
     # Transition color image to transfer source
-    _transition_image!(cmd, fb.color_image,
+    transition_image!(cmd, fb.color_image,
         Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, Vulkan.PIPELINE_STAGE_TRANSFER_BIT,
         Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT, Vulkan.ACCESS_TRANSFER_READ_BIT)
@@ -164,6 +164,8 @@ function readback_framebuffer(fb::LavaFramebuffer)
     unwrap(Vulkan.reset_fences(dev, [ctx.fence]))
     ctx.recording = false
     ctx.dispatch_count = 0
+    empty!(INFLIGHT_DATA_REFS)
+    flush_deferred_frees!()
 
     # Read pixels from staging buffer
     # Shape (width, height) so pixels[x+1, y+1] = pixel at Vulkan position (x, y)

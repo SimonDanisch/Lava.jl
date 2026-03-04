@@ -65,16 +65,16 @@ function RenderWindow(width::Integer, height::Integer;
         UInt32(0), false,
     )
 
-    _create_swapchain!(win; vsync)
+    create_swapchain!(win; vsync)
     return win
 end
 
 """
-    _create_swapchain!(win::RenderWindow; vsync=true)
+    create_swapchain!(win::RenderWindow; vsync=true)
 
 Create or recreate the swapchain for the window.
 """
-function _create_swapchain!(win::RenderWindow; vsync::Bool=true)
+function create_swapchain!(win::RenderWindow; vsync::Bool=true)
     ctx = vk_context()
     dev = ctx.device
     phys = ctx.physical_device
@@ -215,7 +215,7 @@ Handle window resize by recreating the swapchain.
 function Base.resize!(win::RenderWindow)
     ctx = vk_context()
     Vulkan.device_wait_idle(ctx.device)
-    _create_swapchain!(win)
+    create_swapchain!(win)
 end
 
 function Base.isopen(win::RenderWindow)
