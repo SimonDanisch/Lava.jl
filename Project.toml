@@ -32,5 +32,9 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 [targets]
 test = ["Hikari", "JLD2", "Random", "Raycore", "SPIRV_LLVM_Backend_jll", "SparseArrays", "StaticArrays", "Statistics", "Test"]
 
+[sources]
+Hikari = {url = "https://github.com/JuliaGraphics/Hikari.jl", rev = "sd/vk-hw-accel"}
+Raycore = {url = "https://github.com/JuliaGeometry/Raycore.jl", rev = "sd/multitype-vec"}
+
 [compat]
-julia = "1.10"
+julia = "1.11"
