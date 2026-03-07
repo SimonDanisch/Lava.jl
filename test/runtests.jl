@@ -10,7 +10,7 @@ using Lava
 
 # Load test utilities once — individual files guard with @isdefined(SPIRVTestUtils)
 include(joinpath(@__DIR__, "spirv_test_utils.jl"))
-using .SPIRVTestUtils
+import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count, check_regex, normalize_spirv, compare_golden, compile_and_disasm, spirv_opt_roundtrip, check_vendor_safety, compile_with_llc
 
 # Print driver info for test logs (helps distinguish RADV vs lavapipe vs others)
 let ctx = Lava.vk_context()
@@ -45,3 +45,4 @@ end
         include(joinpath(@__DIR__, "test_gpuarrays.jl"))
     end
 end
+

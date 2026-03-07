@@ -5,18 +5,27 @@ version = "0.1.0"
 [deps]
 AcceleratedKernels = "6a4ca0a5-0e36-4168-a932-d9be78d558f1"
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
-GLFW = "f7f18e0c-5ee9-5ccd-a5bf-e8befd85ed98"
-GeometryBasics = "5c1252a2-5f33-56bf-86c9-59e7332b4326"
 Atomix = "a9b6321e-bd34-4604-b9c9-b65b8de01458"
+GLFW = "f7f18e0c-5ee9-5ccd-a5bf-e8befd85ed98"
 GPUArrays = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
 GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
 GPUCompiler = "61eb1bfa-7361-4325-ad38-22787b887f55"
+GeometryBasics = "5c1252a2-5f33-56bf-86c9-59e7332b4326"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 LLVM = "929cbde3-209d-540e-8aea-75f648917ca0"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+SPIRV_LLVM_Backend_jll = "4376b9bf-cff8-51b6-bb48-39421dff0d0c"
 SPIRV_Tools_jll = "6ac6d60f-d740-5983-97d7-a4482c0689f4"
 UnsafeAtomics = "013be700-e6cd-48c3-b4a1-df204f14c38f"
 Vulkan = "9f14b124-c50e-4008-a7d4-969b3a6cd68a"
+
+[sources]
+Hikari = {rev = "sd/vk-hw-accel", url = "https://github.com/JuliaGraphics/Hikari.jl"}
+Raycore = {rev = "sd/multitype-vec", url = "https://github.com/JuliaGeometry/Raycore.jl"}
+
+[compat]
+SPIRV_LLVM_Backend_jll = "21.1.4"
+julia = "1.11"
 
 [extras]
 Hikari = "afc56b53-c9a9-482a-a956-d1d800e05558"
@@ -31,10 +40,3 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
 test = ["Hikari", "JLD2", "Random", "Raycore", "SPIRV_LLVM_Backend_jll", "SparseArrays", "StaticArrays", "Statistics", "Test"]
-
-[sources]
-Hikari = {url = "https://github.com/JuliaGraphics/Hikari.jl", rev = "sd/vk-hw-accel"}
-Raycore = {url = "https://github.com/JuliaGeometry/Raycore.jl", rev = "sd/multitype-vec"}
-
-[compat]
-julia = "1.11"

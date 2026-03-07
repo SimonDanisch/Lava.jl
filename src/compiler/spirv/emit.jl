@@ -1905,6 +1905,30 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
         first_idx_val = first_idx isa LLVM.ConstantInt ? convert(Int64, first_idx) : nothing
 
         if first_idx_val !== nothing && first_idx_val == 0
+            # Degenerate GEP on a scalar base: LLVM may emit extra trailing zero
+            # indices (e.g. gep <scalar>, ptr %p, 0, 0). In SPIR-V this cannot be
+            # encoded as OpAccessChain on a non-composite pointer.
+            # Treat all-zero trailing indices as a no-op pointer projection.
+            base_pointee = get_pointee_type(state.type_ctx.ptm, base_ptr)
+            if base_pointee !== nothing &&
+               !(base_pointee isa LLVM.StructType) &&
+               !(base_pointee isa LLVM.ArrayType) &&
+               length(ops) > 3
+                trailing_all_zero = true
+                for i in 3:length(ops)
+                    idx_op = ops[i]
+                    if !(idx_op isa LLVM.ConstantInt) || convert(Int64, idx_op) != 0
+                        trailing_all_zero = false
+                        break
+                    end
+                end
+                if trailing_all_zero
+                    state.value_map[inst] = base_id
+                    set_pointee_type!(state.type_ctx.ptm, inst, base_pointee; priority=5)
+                    return
+                end
+            end
+
             # First index is 0 → use OpAccessChain with remaining indices
             index_ids = UInt32[]
 

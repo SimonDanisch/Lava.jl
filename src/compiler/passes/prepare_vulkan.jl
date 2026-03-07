@@ -2598,6 +2598,29 @@ function _trace_to_alloca(ptr::LLVM.Value)
     ptr isa LLVM.AllocaInst && return ptr
     if ptr isa LLVM.GetElementPtrInst
         return _trace_to_alloca(LLVM.operands(ptr)[1])
+    elseif ptr isa LLVM.BitCastInst || ptr isa LLVM.AddrSpaceCastInst
+        return _trace_to_alloca(LLVM.operands(ptr)[1])
+    end
+    return nothing
+end
+
+"""
+Try to resolve an LLVM value used as a GEP index to a compile-time integer.
+Handles literal constants and simple constant-expression instruction chains.
+"""
+function _resolve_const_gep_index(v::LLVM.Value)
+    if v isa LLVM.ConstantInt
+        return convert(Int, v)
+    elseif v isa LLVM.ZExtInst || v isa LLVM.SExtInst || v isa LLVM.TruncInst
+        return _resolve_const_gep_index(LLVM.operands(v)[1])
+    elseif v isa LLVM.AddInst
+        a = _resolve_const_gep_index(LLVM.operands(v)[1])
+        b = _resolve_const_gep_index(LLVM.operands(v)[2])
+        return (a === nothing || b === nothing) ? nothing : (a + b)
+    elseif v isa LLVM.SubInst
+        a = _resolve_const_gep_index(LLVM.operands(v)[1])
+        b = _resolve_const_gep_index(LLVM.operands(v)[2])
+        return (a === nothing || b === nothing) ? nothing : (a - b)
     end
     return nothing
 end
@@ -2681,7 +2704,14 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                 for inst in LLVM.instructions(bb)
                     inst isa LLVM.LoadInst || continue
                     load_ty = LLVM.value_type(inst)
-                    load_ty isa LLVM.IntegerType || continue
+                    is_int_load = load_ty isa LLVM.IntegerType
+                    is_float_load = (load_ty == LLVM.FloatType() ||
+                                     load_ty == LLVM.DoubleType() ||
+                                     load_ty == LLVM.HalfType())
+                    (is_int_load || is_float_load) || continue
+                    load_size = _llvm_type_size(load_ty)
+                    load_bits = load_size * 8
+                    load_int_ty = is_int_load ? load_ty : LLVM.IntType(load_bits)
 
                     ptr = LLVM.operands(inst)[1]
                     ptr isa LLVM.GetElementPtrInst || continue
@@ -2700,15 +2730,15 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                     indices = Int[]
                     for i in 2:length(ops)
                         op = ops[i]
-                        op isa LLVM.ConstantInt || @goto next_inst
-                        push!(indices, convert(Int, op))
+                        idx = _resolve_const_gep_index(op)
+                        idx === nothing && @goto next_inst
+                        push!(indices, idx)
                     end
 
                     elem_ty, gep_byte_off = _gep_element_type_and_offset(src_ty, indices)
                     elem_ty === nothing && continue
 
                     elem_size = _llvm_type_size(elem_ty)
-                    load_size = div(LLVM.width(load_ty), 8)
 
                     # Handle byte-GEPs into struct allocas (gep i8, ptr %struct_alloca, <offset>)
                     # These have src_ty=i8, elem_ty=i8, but the alloca is a struct.
@@ -2752,14 +2782,17 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                             result = if byte_within_field > 0
                                 shift = LLVM.ConstantInt(LLVM.value_type(int_val), byte_within_field * 8)
                                 shifted = LLVM.lshr!(builder, int_val, shift, "typepun_shr")
-                                LLVM.trunc!(builder, shifted, load_ty, "typepun_trunc")
-                            elseif field_bits > LLVM.width(load_ty)
-                                LLVM.trunc!(builder, int_val, load_ty, "typepun_trunc")
+                                LLVM.trunc!(builder, shifted, load_int_ty, "typepun_trunc")
+                            elseif field_bits > load_bits
+                                LLVM.trunc!(builder, int_val, load_int_ty, "typepun_trunc")
                             else
                                 int_val
                             end
 
-                            LLVM.replace_uses!(inst, result)
+                            typed_result = is_int_load ? result :
+                                LLVM.bitcast!(builder, result, load_ty, "typepun_bcast")
+
+                            LLVM.replace_uses!(inst, typed_result)
                             LLVM.erase!(inst)
                             changed = true
                             break
@@ -2808,15 +2841,15 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                                 end
 
                                 # Zero-extend to load width
-                                wide_val = if field_bits == LLVM.width(load_ty)
+                                wide_val = if field_bits == load_bits
                                     int_val
                                 else
-                                    LLVM.zext!(builder, int_val, load_ty, "typepun_zext")
+                                    LLVM.zext!(builder, int_val, load_int_ty, "typepun_zext")
                                 end
 
                                 # Shift left
                                 if bit_offset > 0
-                                    shift = LLVM.ConstantInt(load_ty, bit_offset)
+                                    shift = LLVM.ConstantInt(load_int_ty, bit_offset)
                                     wide_val = LLVM.shl!(builder, wide_val, shift, "typepun_shl")
                                 end
 
@@ -2825,7 +2858,9 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                             end
 
                             if combined !== nothing
-                                LLVM.replace_uses!(inst, combined)
+                                typed_result = is_int_load ? combined :
+                                    LLVM.bitcast!(builder, combined, load_ty, "typepun_bcast")
+                                LLVM.replace_uses!(inst, typed_result)
                                 LLVM.erase!(inst)
                                 changed = true
                                 break
@@ -2836,21 +2871,80 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                         # Narrower load: load the full field and truncate
                         LLVM.@dispose builder=LLVM.IRBuilder() begin
                             LLVM.position!(builder, inst)
-                            field_val = LLVM.load!(builder, elem_ty, ptr, "typepun_load")
+                            replaced = false
 
-                            field_bits = elem_size * 8
-                            int_val = if elem_ty isa LLVM.IntegerType
-                                field_val
-                            else
-                                LLVM.bitcast!(builder, field_val, LLVM.IntType(field_bits), "typepun_cast")
+                            # Avoid illegal i128/i256 bitcasts (unsupported in Vulkan SPIR-V):
+                            # for wide composite pointees, assemble only the needed low bytes
+                            # from scalar subfields.
+                            if (elem_ty isa LLVM.StructType || elem_ty isa LLVM.ArrayType) &&
+                               (elem_size * 8 > 64)
+                                subfields = _flatten_type_with_offsets(elem_ty)
+                                selected = filter(subfields) do (_, fty, foff)
+                                    fsz = _llvm_type_size(fty)
+                                    foff >= 0 && foff + fsz <= load_size
+                                end
+                                if !isempty(selected) &&
+                                   all(f -> _llvm_type_size(f[2]) in (1, 2, 4, 8), selected)
+                                    combined = nothing
+                                    for (gep_indices, field_ty, field_offset) in selected
+                                        field_bits = _llvm_type_size(field_ty) * 8
+                                        bit_offset = field_offset * 8
+
+                                        idx_values = LLVM.Value[LLVM.ConstantInt(LLVM.IntType(32), 0)]
+                                        for idx in gep_indices
+                                            push!(idx_values, LLVM.ConstantInt(LLVM.IntType(32), idx))
+                                        end
+                                        field_ptr = LLVM.gep!(builder, elem_ty, ptr, idx_values, "typepun_gep")
+                                        field_val = LLVM.load!(builder, field_ty, field_ptr, "typepun_load")
+
+                                        int_val = if field_ty isa LLVM.IntegerType
+                                            field_val
+                                        else
+                                            LLVM.bitcast!(builder, field_val, LLVM.IntType(field_bits), "typepun_cast")
+                                        end
+                                        wide_val = field_bits == load_bits ? int_val :
+                                            LLVM.zext!(builder, int_val, load_int_ty, "typepun_zext")
+                                        if bit_offset > 0
+                                            shift = LLVM.ConstantInt(load_int_ty, bit_offset)
+                                            wide_val = LLVM.shl!(builder, wide_val, shift, "typepun_shl")
+                                        end
+                                        combined = combined === nothing ? wide_val :
+                                            LLVM.or!(builder, combined, wide_val, "typepun_or")
+                                    end
+
+                                    if combined !== nothing
+                                        result = is_int_load ? combined :
+                                            LLVM.bitcast!(builder, combined, load_ty, "typepun_bcast")
+                                        LLVM.replace_uses!(inst, result)
+                                        LLVM.erase!(inst)
+                                        changed = true
+                                        replaced = true
+                                    end
+                                end
                             end
 
-                            result = LLVM.trunc!(builder, int_val, load_ty, "typepun_trunc")
+                            if !replaced
+                                field_bits = elem_size * 8
+                                if field_bits <= 64
+                                    field_val = LLVM.load!(builder, elem_ty, ptr, "typepun_load")
+                                    int_val = if elem_ty isa LLVM.IntegerType
+                                        field_val
+                                    else
+                                        LLVM.bitcast!(builder, field_val, LLVM.IntType(field_bits), "typepun_cast")
+                                    end
 
-                            LLVM.replace_uses!(inst, result)
-                            LLVM.erase!(inst)
-                            changed = true
-                            break
+                                    result_i = LLVM.trunc!(builder, int_val, load_int_ty, "typepun_trunc")
+                                    result = is_int_load ? result_i :
+                                        LLVM.bitcast!(builder, result_i, load_ty, "typepun_bcast")
+
+                                    LLVM.replace_uses!(inst, result)
+                                    LLVM.erase!(inst)
+                                    changed = true
+                                    replaced = true
+                                end
+                            end
+
+                            replaced && break
                         end
                     end
 
@@ -2890,8 +2984,9 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                     indices = Int[]
                     for i in 2:length(ops)
                         op = ops[i]
-                        op isa LLVM.ConstantInt || @goto next_store
-                        push!(indices, convert(Int, op))
+                        idx = _resolve_const_gep_index(op)
+                        idx === nothing && @goto next_store
+                        push!(indices, idx)
                     end
 
                     elem_ty, gep_byte_off = _gep_element_type_and_offset(src_ty, indices)

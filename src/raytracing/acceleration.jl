@@ -270,9 +270,18 @@ end
 function _create_scratch_buffer(nbytes)
     ctx = vk_context()
     dev = ctx.device
+    phys = ctx.physical_device
+
+    # Vulkan requires scratch device addresses to satisfy
+    # minAccelerationStructureScratchOffsetAlignment.
+    as_props2 = Vulkan.get_physical_device_properties_2(
+        phys, Vulkan.PhysicalDeviceAccelerationStructurePropertiesKHR)
+    scratch_align = UInt64(as_props2.next.min_acceleration_structure_scratch_offset_alignment)
+    scratch_align = max(scratch_align, UInt64(1))
+    aligned_size = max(UInt64(nbytes) + (scratch_align - UInt64(1)), scratch_align)
 
     buf = Vulkan.Buffer(
-        dev, max(nbytes, 256),
+        dev, aligned_size,
         Vulkan.BUFFER_USAGE_STORAGE_BUFFER_BIT |
         Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         Vulkan.SHARING_MODE_EXCLUSIVE,
@@ -290,7 +299,8 @@ function _create_scratch_buffer(nbytes)
     memory = Vulkan.DeviceMemory(dev, mem_reqs.size, mem_type_idx; next=alloc_flags)
     unwrap(Vulkan.bind_buffer_memory(dev, buf, memory, 0))
 
-    addr = Vulkan.get_buffer_device_address(dev, Vulkan.BufferDeviceAddressInfo(buf))
+    base_addr = Vulkan.get_buffer_device_address(dev, Vulkan.BufferDeviceAddressInfo(buf))
+    addr = ((base_addr + scratch_align - UInt64(1)) ÷ scratch_align) * scratch_align
 
     return buf, memory, addr
 end
@@ -472,6 +482,20 @@ function _build_as_on_gpu(ctx::VkContext, accel::Vulkan.AccelerationStructureKHR
         flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     )))
 
+    # Synchronize prior AS builds before this build command.
+    # Required when TLAS reads BLAS built in earlier submissions.
+    pre_barrier = Vulkan.MemoryBarrier(
+        C_NULL,
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+    )
+    Vulkan.cmd_pipeline_barrier(
+        cmd, [pre_barrier], [], [];
+        src_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        dst_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+    )
+
     GC.@preserve geo_buf bgi_buf c_range begin
         geo_ptr = pointer(geo_buf)
         dst_ptr = accel.vks
@@ -495,6 +519,20 @@ function _build_as_on_gpu(ctx::VkContext, accel::Vulkan.AccelerationStructureKHR
                 pp_ranges)
         end
     end
+
+    # Make AS writes visible to subsequent AS builds and RT shader reads.
+    post_barrier = Vulkan.MemoryBarrier(
+        C_NULL,
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+        Vulkan.ACCESS_SHADER_READ_BIT,
+    )
+    Vulkan.cmd_pipeline_barrier(
+        cmd, [post_barrier], [], [];
+        src_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        dst_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                       Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+    )
 
     unwrap(Vulkan.end_command_buffer(cmd))
 

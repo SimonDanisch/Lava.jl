@@ -4,8 +4,8 @@
 using Test
 if !@isdefined(SPIRVTestUtils)
     include(joinpath(@__DIR__, "..", "spirv_test_utils.jl"))
-    using .SPIRVTestUtils
 end
+import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count, check_regex, normalize_spirv, compare_golden, compile_and_disasm, spirv_opt_roundtrip, check_vendor_safety, compile_with_llc
 using GeometryBasics
 
 @testset "Cross-Platform Checks" begin
@@ -151,3 +151,5 @@ using GeometryBasics
         check_not(d, "LocalSize")
     end
 end
+
+
