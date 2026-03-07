@@ -28,20 +28,26 @@ const _live_buffers = Set{VkManagedBuffer}()
 const DEFERRED_FREES = VkManagedBuffer[]
 
 """
-    vk_alloc(nbytes::Integer) -> VkManagedBuffer
+    vk_alloc(nbytes::Integer; extra_usage=nothing) -> VkManagedBuffer
 
 Allocate a device-local buffer with BDA support.
+Optional `extra_usage` adds additional `VkBufferUsageFlags` (e.g. for SBT buffers).
 """
-function vk_alloc(nbytes::Integer)
+function vk_alloc(nbytes::Integer; extra_usage::Union{Nothing, Vulkan.BufferUsageFlag}=nothing)
     dev = vk_device()
     nbytes = max(nbytes, 16)  # Vulkan requires non-zero size
 
+    usage = Vulkan.BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+            Vulkan.BUFFER_USAGE_TRANSFER_SRC_BIT |
+            Vulkan.BUFFER_USAGE_TRANSFER_DST_BIT
+    if extra_usage !== nothing
+        usage |= extra_usage
+    end
+
     buf = Vulkan.Buffer(
         dev, nbytes,
-        Vulkan.BUFFER_USAGE_STORAGE_BUFFER_BIT |
-        Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-        Vulkan.BUFFER_USAGE_TRANSFER_SRC_BIT |
-        Vulkan.BUFFER_USAGE_TRANSFER_DST_BIT,
+        usage,
         Vulkan.SHARING_MODE_EXCLUSIVE,
         UInt32[]
     )

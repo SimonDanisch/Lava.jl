@@ -106,6 +106,7 @@ function lava_launch!(@nospecialize(f), args...;
     keep_data_alive!(args)
 
     # Dispatch (batched — call vk_flush!() to submit)
+    _last_dispatch_info[] = "compute f=$(nameof(typeof(f))) groups=$groups"
     vk_dispatch!(pipeline, push_data, groups)
 
     return nothing

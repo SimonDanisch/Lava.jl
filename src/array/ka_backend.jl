@@ -262,12 +262,31 @@ function _ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize)
     push_data = Vector{UInt8}(undef, 8)
     unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
 
-    # Prepare indirect: kernel writes ceil(ndrange_buf[1] / ws) to indirect buffer
-    indirect_buf = _get_indirect_buffer()
-    _prepare_indirect_dispatch!(indirect_buf, ndrange_buf, ws_prod)
+    max_groups = _max_groups_per_dispatch[]
+    if max_groups > 0
+        # Download work count from GPU to split large indirect dispatches.
+        # This adds a sync point but prevents NVIDIA TDR timeout (Xid 109).
+        vk_flush!()  # ensure ndrange_buf is up to date
+        n_items = Int(Array(ndrange_buf)[1])
+        n_groups = cld(n_items, ws_prod)
 
-    # Dispatch indirect
-    vk_dispatch_indirect!(pipeline, push_data, indirect_buf)
+        if n_groups <= 0
+            return nothing
+        end
+
+        _last_dispatch_info[] = "split_indirect f=$(nameof(typeof(obj.f))) groups=$n_groups"
+
+        # Dispatch directly, using split if needed (handled by vk_dispatch!)
+        keep_data_alive!(args)
+        vk_dispatch!(pipeline, push_data, (n_groups, 1, 1))
+    else
+        # No group limit — use true indirect dispatch
+        indirect_buf = _get_indirect_buffer()
+        _prepare_indirect_dispatch!(indirect_buf, ndrange_buf, ws_prod)
+
+        _last_dispatch_info[] = "indirect f=$(nameof(typeof(obj.f)))"
+        vk_dispatch_indirect!(pipeline, push_data, indirect_buf)
+    end
 
     return nothing
 end

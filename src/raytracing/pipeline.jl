@@ -56,8 +56,11 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
 
     # Create shader modules
     raygen_mod = _create_shader_module(dev, raygen_spirv)
+    check_validation_errors!("vkCreateShaderModule (raygen)")
     miss_mod = _create_shader_module(dev, miss_spirv)
+    check_validation_errors!("vkCreateShaderModule (miss)")
     chit_mod = _create_shader_module(dev, chit_spirv)
+    check_validation_errors!("vkCreateShaderModule (closest-hit)")
     shader_modules = [raygen_mod, miss_mod, chit_mod]
 
     has_anyhit = anyhit_spirv !== nothing
@@ -74,6 +77,7 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
 
     if has_anyhit
         anyhit_mod = _create_shader_module(dev, anyhit_spirv)
+        check_validation_errors!("vkCreateShaderModule (any-hit)")
         push!(stages, Vulkan.PipelineShaderStageCreateInfo(
             Vulkan.SHADER_STAGE_ANY_HIT_BIT_KHR, anyhit_mod, "main"))
         push!(shader_modules, anyhit_mod)
@@ -215,6 +219,7 @@ Compute→RT barriers are inserted automatically.
 function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
                       push_data::Vector{UInt8}, width::Integer, height::Integer;
                       depth::Integer=1)
+    _maybe_auto_flush!()
     ctx = vk_context()
     cmd = ctx.cmd_buf
 
@@ -272,6 +277,8 @@ function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
 
     ctx.dispatch_count += 1
     ctx.last_was_rt = true
+    Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, 1)
+    _last_dispatch_info[] = "rt_trace w=$width h=$height"
     return nothing
 end
 
@@ -287,6 +294,7 @@ The `indirect_buf` must contain a VkTraceRaysIndirectCommandKHR at the given off
 function rt_dispatch_indirect!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
                                push_data::Vector{UInt8}, indirect_buf;
                                indirect_offset::Integer=0)
+    _maybe_auto_flush!()
     ctx = vk_context()
     cmd = ctx.cmd_buf
 
@@ -298,7 +306,9 @@ function rt_dispatch_indirect!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
         ctx.recording = true
     end
 
-    # Barrier: previous dispatches → RT
+    # Barrier: previous dispatches → RT indirect
+    # Must include ACCESS_INDIRECT_COMMAND_READ_BIT for cmd_trace_rays_indirect_khr
+    # to correctly read dimensions written by the prepare-indirect kernel.
     if ctx.dispatch_count > 0
         src_stage = ctx.last_was_rt ?
             Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR :
@@ -307,12 +317,14 @@ function rt_dispatch_indirect!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
             C_NULL,
             Vulkan.ACCESS_SHADER_WRITE_BIT,
             Vulkan.ACCESS_SHADER_READ_BIT | Vulkan.ACCESS_SHADER_WRITE_BIT |
-            Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+            Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+            Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT
         )
         Vulkan.cmd_pipeline_barrier(
             cmd, [barrier], [], [];
             src_stage_mask=src_stage,
-            dst_stage_mask=Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+            dst_stage_mask=Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
+                           Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT
         )
     end
 
@@ -345,6 +357,8 @@ function rt_dispatch_indirect!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
 
     ctx.dispatch_count += 1
     ctx.last_was_rt = true
+    Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, 1)
+    _last_dispatch_info[] = "rt_indirect"
     return nothing
 end
 
@@ -387,7 +401,8 @@ function _build_sbt(dev, pipeline::Vulkan.Pipeline, rt_props::RTPipelineProperti
                      _align_up(miss_size, base_align) +
                      _align_up(hit_size, base_align)
 
-    sbt_buf = vk_alloc(total_sbt_size)
+    sbt_buf = vk_alloc(total_sbt_size;
+        extra_usage=Vulkan.BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR)
 
     # Upload SBT data via staging
     sbt_data = zeros(UInt8, total_sbt_size)

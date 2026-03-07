@@ -42,7 +42,13 @@ mutable struct VkContext
     last_was_rt::Bool   # Track last dispatch type for barriers
     # Ray tracing (nothing if not available)
     rt_pipeline_properties::Union{Nothing, RTPipelineProperties}
+    # Debug messenger (nothing if validation layers not available)
+    debug_messenger::Any  # Union{Nothing, Vulkan.DebugUtilsMessengerEXT}
 end
+
+# Ring buffer of recent validation messages for context on DEVICE_LOST
+const _validation_messages = String[]
+const _max_validation_messages = 50
 
 const _vk_context = Ref{Union{Nothing, VkContext}}(nothing)
 
@@ -85,11 +91,16 @@ function _init_vulkan!()
     inst_extensions = String[
         "VK_KHR_surface",
     ]
-    # Platform-specific surface extension
+    # Debug utils for validation message capture (works even without validation layers
+    # for driver-level error reporting)
+    available_ext = unwrap(Vulkan.enumerate_instance_extension_properties())
+    ext_names = Set(String(filter(!=('\0'), collect(e.extension_name))) for e in available_ext)
+    has_debug_utils = "VK_EXT_debug_utils" in ext_names
+    if has_debug_utils
+        push!(inst_extensions, "VK_EXT_debug_utils")
+    end
+    # Platform-specific surface extension (ext_names already computed above)
     if Sys.islinux()
-        # Try XCB first (most common on modern Linux), fall back to Xlib
-        available_ext = unwrap(Vulkan.enumerate_instance_extension_properties())
-        ext_names = Set(String(filter(!=('\0'), collect(e.extension_name))) for e in available_ext)
         if "VK_KHR_xcb_surface" in ext_names
             push!(inst_extensions, "VK_KHR_xcb_surface")
         elseif "VK_KHR_xlib_surface" in ext_names
@@ -109,6 +120,12 @@ function _init_vulkan!()
         inst_extensions;
         application_info=app_info
     )
+
+    # Set up debug messenger to capture validation/driver error messages
+    debug_messenger = nothing
+    if has_debug_utils
+        debug_messenger = _setup_debug_messenger(instance)
+    end
 
     # Pick physical device (prefer discrete GPU)
     phys_devs = unwrap(Vulkan.enumerate_physical_devices(instance))
@@ -142,21 +159,67 @@ function _init_vulkan!()
         ])
     end
 
-    # Chain required features
-    bda_features = Vulkan.PhysicalDeviceBufferDeviceAddressFeatures(
-        true,   # buffer_device_address
-        false,  # buffer_device_address_capture_replay
-        false   # buffer_device_address_multi_device
-    )
+    # Chain required features — all Vulkan 1.2 promoted features go in Vulkan12Features
+    # (can't mix Vulkan12Features with separate promoted structs like BDA/VariablePointers)
     var_ptr_features = Vulkan.PhysicalDeviceVariablePointersFeatures(
         true,   # variable_pointers_storage_buffer
-        true;   # variable_pointers
-        next=bda_features
+        true,   # variable_pointers
+    )
+    # Vulkan 1.2 features: BDA, VulkanMemoryModel, shaderInt8, scalarBlockLayout
+    vulkan12_features = Vulkan._PhysicalDeviceVulkan12Features(
+        false,  # sampler_mirror_clamp_to_edge
+        false,  # draw_indirect_count
+        false,  # storage_buffer_8_bit_access
+        false,  # uniform_and_storage_buffer_8_bit_access
+        false,  # storage_push_constant_8
+        false,  # shader_buffer_int_64_atomics
+        false,  # shader_shared_int_64_atomics
+        false,  # shader_float_16
+        true,   # shader_int_8  ← REQUIRED (i8 types in SPIR-V)
+        false,  # descriptor_indexing
+        false,  # shader_input_attachment_array_dynamic_indexing
+        false,  # shader_uniform_texel_buffer_array_dynamic_indexing
+        false,  # shader_storage_texel_buffer_array_dynamic_indexing
+        false,  # shader_uniform_buffer_array_non_uniform_indexing
+        false,  # shader_sampled_image_array_non_uniform_indexing
+        false,  # shader_storage_buffer_array_non_uniform_indexing
+        false,  # shader_storage_image_array_non_uniform_indexing
+        false,  # shader_input_attachment_array_non_uniform_indexing
+        false,  # shader_uniform_texel_buffer_array_non_uniform_indexing
+        false,  # shader_storage_texel_buffer_array_non_uniform_indexing
+        false,  # descriptor_binding_uniform_buffer_update_after_bind
+        false,  # descriptor_binding_sampled_image_update_after_bind
+        false,  # descriptor_binding_storage_image_update_after_bind
+        false,  # descriptor_binding_storage_buffer_update_after_bind
+        false,  # descriptor_binding_uniform_texel_buffer_update_after_bind
+        false,  # descriptor_binding_storage_texel_buffer_update_after_bind
+        false,  # descriptor_binding_update_unused_while_pending
+        false,  # descriptor_binding_partially_bound
+        false,  # descriptor_binding_variable_descriptor_count
+        false,  # runtime_descriptor_array
+        false,  # sampler_filter_minmax
+        true,   # scalar_block_layout  ← BDA struct layout
+        false,  # imageless_framebuffer
+        false,  # uniform_buffer_standard_layout
+        false,  # shader_subgroup_extended_types
+        false,  # separate_depth_stencil_layouts
+        false,  # host_query_reset
+        false,  # timeline_semaphore
+        true,   # buffer_device_address  ← REQUIRED (BDA)
+        false,  # buffer_device_address_capture_replay
+        false,  # buffer_device_address_multi_device
+        true,   # vulkan_memory_model  ← REQUIRED (QueueFamily scope)
+        false,  # vulkan_memory_model_device_scope
+        false,  # vulkan_memory_model_availability_visibility_chains
+        false,  # shader_output_viewport_index
+        false,  # shader_output_layer
+        false;  # subgroup_broadcast_dynamic_id
+        next=var_ptr_features
     )
     # Dynamic rendering (Vulkan 1.3 core) — no VkRenderPass/VkFramebuffer boilerplate
     dyn_rendering_features = Vulkan.PhysicalDeviceDynamicRenderingFeatures(
         true;   # dynamic_rendering
-        next=var_ptr_features
+        next=vulkan12_features
     )
 
     # Chain RT features if available
@@ -229,17 +292,22 @@ function _init_vulkan!()
 
     fence = Vulkan.Fence(device)
 
+    has_validation = !isempty(layers)
     if has_rt
-        @info "Lava: initialized Vulkan device with RT" device=dev_name queue_family=qf_idx handle_size=rt_props.shader_group_handle_size max_recursion=rt_props.max_ray_recursion_depth
+        @info "Lava: initialized Vulkan device with RT" device=dev_name queue_family=qf_idx handle_size=rt_props.shader_group_handle_size max_recursion=rt_props.max_ray_recursion_depth validation=has_validation debug_utils=has_debug_utils
     else
-        @info "Lava: initialized Vulkan device (no RT)" device=dev_name queue_family=qf_idx
+        @info "Lava: initialized Vulkan device (no RT)" device=dev_name queue_family=qf_idx validation=has_validation debug_utils=has_debug_utils
+    end
+    if !has_validation
+        @warn "Vulkan validation layers not found. Install vulkan-validationlayers for GPU error diagnostics."
     end
 
     return VkContext(
         instance, phys_dev, device, queue, qf_idx,
         cmd_pool, cmd_buf, fence, dev_name,
         false, 0, false,
-        rt_props
+        rt_props,
+        debug_messenger
     )
 end
 
@@ -286,4 +354,92 @@ function _has_rt_extensions(phys_dev)
     return "VK_KHR_acceleration_structure" in names &&
            "VK_KHR_ray_tracing_pipeline" in names &&
            "VK_KHR_deferred_host_operations" in names
+end
+
+# ── Validation layer debug messenger ──
+
+function _debug_callback(
+    severity,
+    type,
+    p_callback_data::Ptr{Vulkan.VkCore.VkDebugUtilsMessengerCallbackDataEXT},
+    p_user_data::Ptr{Cvoid},
+)
+    p_callback_data == C_NULL && return UInt32(0)
+    data = unsafe_load(p_callback_data)
+    msg_ptr = data.pMessage
+    message = msg_ptr == C_NULL ? "(no message)" : unsafe_string(msg_ptr)
+
+    # Store in ring buffer for context on DEVICE_LOST
+    if length(_validation_messages) >= _max_validation_messages
+        popfirst!(_validation_messages)
+    end
+    push!(_validation_messages, message)
+
+    # Print based on severity — errors are always printed immediately
+    is_error = (severity & Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0
+    is_warning = (severity & Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0
+    if is_error
+        @error "Vulkan validation error" message
+    elseif is_warning
+        @warn "Vulkan validation warning" message
+    end
+    # Return VK_FALSE — can't throw from @cfunction callback (would corrupt Vulkan state).
+    # Errors are collected in _validation_messages and checked after Vulkan calls.
+    return UInt32(0)
+end
+
+function _setup_debug_messenger(instance::Vulkan.Instance)
+    callback_ptr = @cfunction(
+        _debug_callback,
+        UInt32,
+        (Vulkan.DebugUtilsMessageSeverityFlagEXT,
+         Vulkan.DebugUtilsMessageTypeFlagEXT,
+         Ptr{Vulkan.VkCore.VkDebugUtilsMessengerCallbackDataEXT},
+         Ptr{Cvoid})
+    )
+
+    messenger = Vulkan.DebugUtilsMessengerEXT(
+        instance,
+        callback_ptr;
+        min_severity=Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
+    )
+    return messenger
+end
+
+"""
+    get_validation_messages() -> Vector{String}
+
+Return recent validation layer messages. Useful for diagnosing DEVICE_LOST errors.
+"""
+get_validation_messages() = copy(_validation_messages)
+
+"""
+    clear_validation_messages!()
+
+Clear the validation message buffer.
+"""
+clear_validation_messages!() = empty!(_validation_messages)
+
+"""
+    check_validation_errors!(context::String)
+
+Check if any validation errors were captured since the last check.
+Throws `LavaError` with the error messages if any errors are found.
+Call this after Vulkan operations that may trigger validation errors
+(shader module creation, pipeline creation, dispatch recording).
+"""
+function check_validation_errors!(context::String)
+    isempty(_validation_messages) && return
+    # Check for actual errors (not just warnings)
+    errors = filter(m -> !startswith(m, "(Warning"), _validation_messages)
+    isempty(errors) && return
+    n = min(length(errors), 5)
+    detail = join(["  [$i] $(first(errors[i], 300))" for i in 1:n], "\n")
+    # Clear after reporting to avoid re-triggering
+    empty!(_validation_messages)
+    throw(LavaError(
+        context,
+        "Vulkan validation error(s):\n$detail",
+        "Fix the validation errors above before proceeding."
+    ))
 end
