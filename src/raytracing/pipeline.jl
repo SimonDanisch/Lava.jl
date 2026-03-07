@@ -387,7 +387,8 @@ function _build_sbt(dev, pipeline::Vulkan.Pipeline, rt_props::RTPipelineProperti
                      _align_up(miss_size, base_align) +
                      _align_up(hit_size, base_align)
 
-    sbt_buf = vk_alloc(total_sbt_size)
+    sbt_buf = vk_alloc(total_sbt_size;
+        extra_usage=UInt32(Vulkan.BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR))
 
     # Upload SBT data via staging
     sbt_data = zeros(UInt8, total_sbt_size)

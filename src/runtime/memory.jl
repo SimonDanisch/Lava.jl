@@ -27,21 +27,66 @@ const _live_buffers = Set{VkManagedBuffer}()
 # Processed after vk_flush!() completes (GPU is idle, safe to destroy).
 const DEFERRED_FREES = VkManagedBuffer[]
 
+# ── GPU memory pressure tracking ──
+# Julia's GC doesn't know about GPU memory. LavaArray wrappers are ~50 bytes on
+# the CPU heap, but back 100+ MB of VRAM each. Without pressure signals, GC
+# never fires and dead GPU buffers accumulate until OOM.
+# Solution: track live GPU bytes and trigger GC.gc(false) proactively,
+# matching AMDGPU.jl's maybe_collect() pattern.
+const GPU_LIVE_BYTES = Threads.Atomic{Int}(0)
+const GPU_LAST_INCR_GC_TIME = Ref(0.0)
+const GPU_LAST_FULL_GC_TIME = Ref(0.0)
+
+"""
+    maybe_collect()
+
+Trigger GC if GPU memory pressure is high. Julia's GC doesn't know about
+VRAM — LavaArray wrappers are ~50 bytes on the CPU heap but back hundreds of
+MB of GPU memory. Without this, dead GPU buffers accumulate until OOM.
+
+Two tiers (with separate timers so incremental GC doesn't starve full GC):
+- >256 MiB tracked: incremental GC (rate-limited to every 100ms)
+- >512 MiB tracked: full GC (rate-limited to every 2s)
+
+Called from `vk_alloc` / `vk_alloc_unified` before each allocation.
+"""
+function maybe_collect()
+    live = GPU_LIVE_BYTES[]
+    live < 256 * 1024 * 1024 && return  # <256 MiB: no pressure
+    t = time()
+    # Full GC has its own timer — incremental GC must not starve it
+    if live > 512 * 1024 * 1024 && (t - GPU_LAST_FULL_GC_TIME[]) > 2.0
+        GPU_LAST_FULL_GC_TIME[] = t
+        GPU_LAST_INCR_GC_TIME[] = t
+        GC.gc(true)
+    elseif (t - GPU_LAST_INCR_GC_TIME[]) > 0.1
+        GPU_LAST_INCR_GC_TIME[] = t
+        GC.gc(false)
+    end
+    return
+end
+
 """
     vk_alloc(nbytes::Integer) -> VkManagedBuffer
 
 Allocate a device-local buffer with BDA support.
 """
-function vk_alloc(nbytes::Integer)
+function vk_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0))
+    maybe_collect()
     dev = vk_device()
     nbytes = max(nbytes, 16)  # Vulkan requires non-zero size
 
+    usage = Vulkan.BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+            Vulkan.BUFFER_USAGE_TRANSFER_SRC_BIT |
+            Vulkan.BUFFER_USAGE_TRANSFER_DST_BIT
+    if extra_usage != UInt32(0)
+        usage |= Vulkan.BufferUsageFlag(extra_usage)
+    end
+
     buf = Vulkan.Buffer(
         dev, nbytes,
-        Vulkan.BUFFER_USAGE_STORAGE_BUFFER_BIT |
-        Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-        Vulkan.BUFFER_USAGE_TRANSFER_SRC_BIT |
-        Vulkan.BUFFER_USAGE_TRANSFER_DST_BIT,
+        usage,
         Vulkan.SHARING_MODE_EXCLUSIVE,
         UInt32[]
     )
@@ -68,6 +113,7 @@ function vk_alloc(nbytes::Integer)
 
     result = VkManagedBuffer(buf, memory, address, Ptr{UInt8}(0), Int(nbytes))
     push!(_live_buffers, result)
+    Threads.atomic_add!(GPU_LIVE_BYTES, nbytes)
     return result
 end
 
@@ -111,6 +157,7 @@ function _destroy_buffer!(buf::VkManagedBuffer)
     # so the GC finalizer's second call will be a no-op (refcount underflows, iszero → false).
     buf.buffer.destructor()
     buf.memory.destructor()
+    Threads.atomic_sub!(GPU_LIVE_BYTES, buf.size)
     buf.size = 0
 end
 
@@ -354,10 +401,12 @@ Allocate a unified (BAR) buffer as VkManagedBuffer with `mapped_ptr` set.
 Used by `KA.allocate(; unified=true)` for host-readable GPU buffers.
 """
 function vk_alloc_unified(nbytes::Integer)
+    maybe_collect()
     mapped = vk_alloc_mapped(max(nbytes, 16))
     managed = VkManagedBuffer(mapped.buffer, mapped.memory, mapped.address,
                                mapped.mapped_ptr, Int(mapped.size))
     push!(_live_buffers, managed)
+    Threads.atomic_add!(GPU_LIVE_BYTES, managed.size)
     return managed
 end
 

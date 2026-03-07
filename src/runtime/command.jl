@@ -115,6 +115,10 @@ function vk_flush!()
     flush_deferred_frees!()
     reset_arg_buffer_pool!()
     reset_indirect_buffer_pool!()
+
+    # Check GPU memory pressure after flush — this is a natural boundary
+    # where previous render's objects may be garbage-collectible.
+    maybe_collect()
 end
 
 """
