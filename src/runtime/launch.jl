@@ -41,6 +41,8 @@ const _pipeline_by_kernel = Dict{UInt64, LavaComputePipeline}()
 # Cache arg layout offsets as Vector{Int} (Vector{Int} indexing is zero-alloc,
 # unlike Vector{Pair{Int,Int}} which boxes Pair on access)
 const _arg_offsets_cache = Dict{UInt64, Vector{Int}}()
+# Cache byval LLVM sizes — maps to same keys as _arg_offsets_cache
+const _byval_sizes_cache = Dict{UInt64, Vector{Int}}()
 
 """
     lava_launch!(f, args...; ndrange, workgroup_size=(64,1,1))
@@ -80,14 +82,20 @@ function lava_launch!(@nospecialize(f), args...;
     tt = Tuple{map(_arg_llvm_type, args)...}
 
     # Compile + pipeline (cached, single lookup — avoids re-hashing SPIR-V)
-    compiled, pipeline, offsets = _get_compiled_kernel_and_pipeline(f, tt, workgroup_size)
+    compiled, pipeline, offsets, byval_sizes = _get_compiled_kernel_and_pipeline(f, tt, workgroup_size)
 
     # Include f as first arg — GPUCompiler includes typeof(f) as the first LLVM parameter,
     # and wrap_entry_for_vulkan! creates a BDA slot for it (unless ghost-elided).
     all_args = (f, args...)
 
-    # Compute total size: base layout + inline struct data (compile-time constant)
-    inline_extra = _compute_inline_extra(typeof(all_args))
+    # Auto-flush BEFORE allocating arg buffer — if we flush after allocation,
+    # the pool reset lets the next dispatch overwrite our buffer before submission.
+    _maybe_auto_flush!()
+
+    # Compute total size: base layout + inline struct data
+    # Uses LLVM byval sizes (not Julia sizeof) to avoid size mismatch for types
+    # with zero-sized fields (e.g. Nothing) that LLVM represents differently.
+    inline_extra = _compute_inline_extra_from_byval(byval_sizes)
     total_size = compiled.push_info.arg_buffer_size + inline_extra
 
     # Get host-visible mapped arg buffer
@@ -95,7 +103,7 @@ function lava_launch!(@nospecialize(f), args...;
 
     # Pack args directly to mapped memory (zero intermediate allocations)
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
-                       compiled.push_info.arg_buffer_size, all_args)
+                       compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
     # Push constant = BDA of arg buffer
     push_data = Vector{UInt8}(undef, 8)
@@ -184,11 +192,31 @@ _is_bda_buffer(::Type{VkManagedBuffer}) = true
 _is_bda_buffer(::Type) = false
 
 """
+    _compute_inline_extra_from_byval(byval_sizes::Vector{Int})
+
+Compute the total bytes needed for inline struct data appended after the base
+arg layout. Uses LLVM byval sizes (which can be larger than Julia's sizeof for
+types with zero-sized fields like Nothing).
+"""
+function _compute_inline_extra_from_byval(byval_sizes::Vector{Int})
+    extra = 0
+    for sz in byval_sizes
+        sz > 0 || continue
+        extra = (extra + 7) & ~7  # align to 8
+        extra += sz
+    end
+    return extra
+end
+
+"""
     _compute_inline_extra(::Type{T}) where T <: Tuple
 
 Compute at compile time the total bytes needed for inline struct data appended
 after the base arg layout. Returns a constant. Buffer types (LavaBuffer, LavaArray,
 VkManagedBuffer) are passed as UInt64 BDA addresses, not inlined.
+
+NOTE: This uses Julia's sizeof which can underestimate for types with zero-sized
+fields. Prefer _compute_inline_extra_from_byval with LLVM sizes when available.
 """
 @generated function _compute_inline_extra(::Type{T}) where T <: Tuple
     types = T.parameters
@@ -221,6 +249,7 @@ Handles all argument types:
 """
 @generated function _pack_args_direct!(mapped_ptr::Ptr{UInt8}, arg_buf_bda::UInt64,
                                         offsets::Vector{Int}, base_size::Int,
+                                        byval_sizes::Vector{Int},
                                         all_args::T) where {T <: Tuple}
     types = T.parameters
     non_ghost = Int[]
@@ -245,13 +274,18 @@ Handles all argument types:
                                              all_args[$arg_i].address)))
             end
         elseif isbitstype(Ti) && !isprimitivetype(Ti)
+            # Inline struct: write Julia data, then use LLVM's byval size for offset
+            # increment. LLVM's struct layout can be larger than Julia's sizeof when
+            # the type contains zero-sized fields (Nothing, type parameters) that LLVM
+            # allocates space for. The extra bytes are unused by the kernel.
             push!(exprs, quote
                 let x = all_args[$arg_i]
                     inline_offset = (inline_offset + 7) & ~7
                     unsafe_store!(Ptr{$Ti}(mapped_ptr + inline_offset), x)
                     unsafe_store!(Ptr{UInt64}(mapped_ptr + @inbounds(offsets[$layout_i])),
                                   arg_buf_bda + UInt64(inline_offset))
-                    inline_offset += $(sizeof(Ti))
+                    # Use LLVM byval size (≥ Julia sizeof) to prevent overlap with next inline arg
+                    inline_offset += @inbounds(byval_sizes[$layout_i])
                 end
             end)
         elseif Ti === UInt64
@@ -323,6 +357,9 @@ function _get_compiled_kernel(@nospecialize(f), @nospecialize(tt), workgroup_siz
     return compiled
 end
 
+const _spirv_dump_dir = Ref("")
+const _spirv_dump_counter = Ref(0)
+
 function _get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), workgroup_size)
     key = hash((f, tt, workgroup_size))
 
@@ -330,6 +367,13 @@ function _get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), 
     if compiled === nothing
         compiled = lava_compile_gpu(f, tt; workgroup_size)
         _kernel_cache[key] = compiled
+        # Dump SPIR-V if dump dir is set
+        if !isempty(_spirv_dump_dir[])
+            _spirv_dump_counter[] += 1
+            fname = string(nameof(typeof(f)))
+            path = joinpath(_spirv_dump_dir[], "$(lpad(_spirv_dump_counter[], 3, '0'))_$(fname).spv")
+            write(path, compiled.spirv_bytes)
+        end
     end
 
     pipeline = get(_pipeline_by_kernel, key, nothing)
@@ -345,7 +389,13 @@ function _get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), 
         _arg_offsets_cache[key] = offsets
     end
 
-    return compiled, pipeline, offsets
+    byval_sizes = get(_byval_sizes_cache, key, nothing)
+    if byval_sizes === nothing
+        byval_sizes = compiled.push_info.byval_llvm_sizes
+        _byval_sizes_cache[key] = byval_sizes
+    end
+
+    return compiled, pipeline, offsets, byval_sizes
 end
 
 # Reusable arg buffer pool — host-visible mapped memory for zero-cost upload.

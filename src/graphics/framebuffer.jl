@@ -126,16 +126,18 @@ Returns a height x width matrix of BGRA bytes (matching FORMAT_B8G8R8A8_SRGB).
 function readback_framebuffer(fb::LavaFramebuffer)
     ctx = vk_context()
     dev = ctx.device
-    cmd = ctx.cmd_buf
 
     # Flush pending GPU work
-    if ctx.recording
+    if has_active_recording(ctx)
         vk_flush!()
     end
 
     nbytes = fb.width * fb.height * 4  # 4 bytes per pixel (B8G8R8A8)
     staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
 
+    # Use dedicated transfer command buffer for readback
+    cmd = ctx.xfer_cmd_buf
+    fence = ctx.xfer_fence
     unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(;
         flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
 
@@ -159,12 +161,9 @@ function readback_framebuffer(fb::LavaFramebuffer)
     unwrap(Vulkan.end_command_buffer(cmd))
 
     submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=ctx.fence))
-    unwrap(Vulkan.wait_for_fences(dev, [ctx.fence], true, typemax(UInt64)))
-    unwrap(Vulkan.reset_fences(dev, [ctx.fence]))
-    ctx.recording = false
-    ctx.dispatch_count = 0
-    empty!(INFLIGHT_DATA_REFS)
+    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=fence))
+    unwrap(Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64)))
+    unwrap(Vulkan.reset_fences(dev, [fence]))
     flush_deferred_frees!()
 
     # Read pixels from staging buffer

@@ -8,6 +8,21 @@ import Adapt
 
 export LavaBackend
 
+# ── Dispatch name helper ──
+# Extract a descriptive kernel name for dispatch logging.
+# For workqueue foreach dispatches, the KA kernel is always `_workqueue_map_kernel!`
+# but the actual inner function (e.g. `vp_trace_shadow_rays_kernel!`) is in args.
+# all_args layout: (kernel_func, ctx, inner_func, queue, extra_args...)
+function _dispatch_name(@nospecialize(f), @nospecialize(all_args))
+    fname = nameof(typeof(f))
+    # Check if this is a workqueue_map_kernel dispatch — inner func is arg 3
+    if length(all_args) >= 3 && occursin("workqueue_map_kernel", string(fname))
+        inner = all_args[3]
+        return "$(fname)[$(nameof(typeof(inner)))]"
+    end
+    return string(fname)
+end
+
 # ── Backend struct ──
 
 struct LavaBackend <: KA.GPU end
@@ -103,9 +118,11 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     # GPU-resident ndrange → indirect dispatch (no CPU readback)
     if ndrange isa LavaArray
         converted_args = KA.argconvert.(Ref(obj), args)
-        # Keep original args alive — argconvert strips LavaArray → Ptr (no backing ref)
+        # Keep original args alive — argconvert strips LavaArray → Ptr (no backing ref).
+        # Pass original_args so _ka_launch_indirect! can re-establish keepalive
+        # after internal vk_flush!() calls that clear batch data_refs.
         keep_data_alive!(args)
-        _ka_launch_indirect!(obj, converted_args, ndrange, workgroupsize)
+        _ka_launch_indirect!(obj, converted_args, ndrange, workgroupsize, args)
         return nothing
     end
 
@@ -156,15 +173,19 @@ end
 Internal launch function for KA kernels. Compiles and dispatches the GPU function.
 """
 function _ka_launch!(@nospecialize(f), all_args::Tuple, nblocks::Int, workgroup_size::NTuple{3,Int})
+    # Auto-flush BEFORE allocating arg buffer — if we flush after allocation,
+    # the pool reset lets the next dispatch overwrite our buffer before submission.
+    _maybe_auto_flush!()
+
     # Build type tuple for compilation (excludes f — GPUCompiler prepends typeof(f))
     # all_args[1] is f itself (included for BDA packing), rest are the actual args
     tt = Tuple{map(_ka_arg_llvm_type, Base.tail(all_args))...}
 
     # Compile + pipeline + offsets (cached, single lookup)
-    compiled, pipeline, offsets = _get_compiled_kernel_and_pipeline(f, tt, workgroup_size)
+    compiled, pipeline, offsets, byval_sizes = _get_compiled_kernel_and_pipeline(f, tt, workgroup_size)
 
-    # Compute total size: base layout + inline struct data (compile-time constant)
-    inline_extra = _compute_inline_extra(typeof(all_args))
+    # Compute total size: base layout + inline struct data
+    inline_extra = _compute_inline_extra_from_byval(byval_sizes)
     total_size = compiled.push_info.arg_buffer_size + inline_extra
 
     # Get host-visible mapped arg buffer
@@ -172,13 +193,14 @@ function _ka_launch!(@nospecialize(f), all_args::Tuple, nblocks::Int, workgroup_
 
     # Pack args directly to mapped memory (zero intermediate allocations)
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
-                       compiled.push_info.arg_buffer_size, all_args)
+                       compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
     # Push constant = BDA of arg buffer
     push_data = Vector{UInt8}(undef, 8)
     unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
 
     groups = (nblocks, 1, 1)
+    _last_dispatch_info[] = "ka f=$(_dispatch_name(f, all_args)) groups=$groups"
     vk_dispatch!(pipeline, push_data, groups)
 
     return nothing
@@ -222,7 +244,11 @@ Launch a KA kernel using indirect dispatch. `ndrange_buf` is a GPU array contain
 the work item count (1-element Int32 array). The prepare-indirect kernel writes
 group counts to an indirect buffer, then vk_dispatch_indirect! dispatches the main kernel.
 """
-function _ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize)
+function _ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, original_args=nothing)
+    # Auto-flush BEFORE allocating arg buffer — if we flush after allocation,
+    # the pool reset lets the next dispatch overwrite our buffer before submission.
+    _maybe_auto_flush!()
+
     # Respect static workgroup size from @kernel definition
     ws = if workgroupsize !== nothing
         workgroupsize isa Integer ? (workgroupsize,) : workgroupsize
@@ -251,16 +277,19 @@ function _ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize)
 
     # Build type tuple for compilation
     tt = Tuple{map(_ka_arg_llvm_type, Base.tail(all_args))...}
-    compiled, pipeline, offsets = _get_compiled_kernel_and_pipeline(obj.f, tt, ws_3d)
+    compiled, pipeline, offsets, byval_sizes = _get_compiled_kernel_and_pipeline(obj.f, tt, ws_3d)
 
-    # Pack args directly to mapped memory
-    inline_extra = _compute_inline_extra(typeof(all_args))
+    # Precompute arg buffer size (allocation deferred until after flush)
+    inline_extra = _compute_inline_extra_from_byval(byval_sizes)
     total_size = compiled.push_info.arg_buffer_size + inline_extra
-    arg_buf = get_arg_buffer(total_size)
-    _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
-                       compiled.push_info.arg_buffer_size, all_args)
-    push_data = Vector{UInt8}(undef, 8)
-    unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
+
+    # GC.@preserve ensures original_args (the pre-argconvert LavaArrays) stay alive
+    # throughout this function. This is critical because:
+    # - argconvert strips LavaArray → Ptr{T}, losing buffer references
+    # - vk_flush!() clears batch data_refs and calls maybe_collect()
+    # - Without @preserve, GC can free LavaArray buffers whose BDA pointers
+    #   are embedded in the arg buffer, causing DEVICE_LOST on NVIDIA
+    GC.@preserve original_args begin
 
     max_groups = _max_groups_per_dispatch[]
     if max_groups > 0
@@ -274,19 +303,44 @@ function _ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize)
             return nothing
         end
 
-        _last_dispatch_info[] = "split_indirect f=$(nameof(typeof(obj.f))) groups=$n_groups"
+        # Allocate arg buffer AFTER flush — vk_flush!() resets the arg buffer pool,
+        # so allocating before flush means the next call's flush would submit the
+        # previous dispatch with a recycled (overwritten) arg buffer.
+        arg_buf = get_arg_buffer(total_size)
+        _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
+                           compiled.push_info.arg_buffer_size, byval_sizes, all_args)
+        push_data = Vector{UInt8}(undef, 8)
+        unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
+
+        _last_dispatch_info[] = "split_indirect f=$(_dispatch_name(obj.f, all_args)) groups=$n_groups"
 
         # Dispatch directly, using split if needed (handled by vk_dispatch!)
         keep_data_alive!(args)
+        if original_args !== nothing
+            keep_data_alive!(original_args)
+        end
         vk_dispatch!(pipeline, push_data, (n_groups, 1, 1))
     else
         # No group limit — use true indirect dispatch
+        # Allocate arg buffer here too (no flush in this path, but keep consistent)
+        arg_buf = get_arg_buffer(total_size)
+        _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
+                           compiled.push_info.arg_buffer_size, byval_sizes, all_args)
+        push_data = Vector{UInt8}(undef, 8)
+        unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
+
         indirect_buf = _get_indirect_buffer()
         _prepare_indirect_dispatch!(indirect_buf, ndrange_buf, ws_prod)
 
-        _last_dispatch_info[] = "indirect f=$(nameof(typeof(obj.f)))"
+        _last_dispatch_info[] = "indirect f=$(_dispatch_name(obj.f, all_args))"
+        keep_data_alive!(args)
+        if original_args !== nothing
+            keep_data_alive!(original_args)
+        end
         vk_dispatch_indirect!(pipeline, push_data, indirect_buf)
     end
+
+    end # GC.@preserve
 
     return nothing
 end

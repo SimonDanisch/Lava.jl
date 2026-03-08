@@ -459,12 +459,14 @@ function _build_as_on_gpu(ctx::VkContext, accel::Vulkan.AccelerationStructureKHR
                           primitive_count::UInt32=UInt32(0),
                           kwargs...)
     dev = ctx.device
-    cmd = ctx.cmd_buf
 
-    # Flush any pending compute dispatches
-    if ctx.recording
+    # Flush any pending compute dispatches before AS build
+    if has_active_recording(ctx)
         vk_flush!()
     end
+
+    # Use dedicated AS command buffer + fence (never touches dispatch batches)
+    cmd = ctx.as_cmd_buf
 
     # Pack geometry (96 bytes, correct C layout)
     geo_buf = zeros(UInt8, _C_SIZEOF_AS_GEOMETRY_KHR)
@@ -537,9 +539,9 @@ function _build_as_on_gpu(ctx::VkContext, accel::Vulkan.AccelerationStructureKHR
     unwrap(Vulkan.end_command_buffer(cmd))
 
     submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=ctx.fence))
-    unwrap(Vulkan.wait_for_fences(dev, [ctx.fence], true, typemax(UInt64)))
-    unwrap(Vulkan.reset_fences(dev, [ctx.fence]))
+    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=ctx.as_fence))
+    unwrap(Vulkan.wait_for_fences(dev, [ctx.as_fence], true, typemax(UInt64)))
+    unwrap(Vulkan.reset_fences(dev, [ctx.as_fence]))
 end
 
 # ── Raycore-compatible bridge functions ──

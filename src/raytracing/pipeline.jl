@@ -221,19 +221,12 @@ function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
                       depth::Integer=1)
     _maybe_auto_flush!()
     ctx = vk_context()
-    cmd = ctx.cmd_buf
-
-    # Begin recording if not already
-    if !ctx.recording
-        unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
-            flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-        )))
-        ctx.recording = true
-    end
+    batch = ensure_active_batch!(ctx)
+    cmd = batch.cmd_buf
 
     # Barrier: previous dispatches → RT
-    if ctx.dispatch_count > 0
-        src_stage = ctx.last_was_rt ?
+    if batch.dispatch_count > 0
+        src_stage = batch.last_was_rt ?
             Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR :
             Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT
         barrier = Vulkan.MemoryBarrier(
@@ -275,10 +268,11 @@ function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
         UInt32(width), UInt32(height), UInt32(depth),
     )
 
-    ctx.dispatch_count += 1
-    ctx.last_was_rt = true
+    batch.dispatch_count += 1
+    batch.last_was_rt = true
     Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, 1)
     _last_dispatch_info[] = "rt_trace w=$width h=$height"
+    _log_dispatch!("$(TOTAL_DISPATCH_COUNTER[]) rt_trace w=$width h=$height")
     return nothing
 end
 
@@ -296,21 +290,14 @@ function rt_dispatch_indirect!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
                                indirect_offset::Integer=0)
     _maybe_auto_flush!()
     ctx = vk_context()
-    cmd = ctx.cmd_buf
-
-    # Begin recording if not already
-    if !ctx.recording
-        unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
-            flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-        )))
-        ctx.recording = true
-    end
+    batch = ensure_active_batch!(ctx)
+    cmd = batch.cmd_buf
 
     # Barrier: previous dispatches → RT indirect
     # Must include ACCESS_INDIRECT_COMMAND_READ_BIT for cmd_trace_rays_indirect_khr
     # to correctly read dimensions written by the prepare-indirect kernel.
-    if ctx.dispatch_count > 0
-        src_stage = ctx.last_was_rt ?
+    if batch.dispatch_count > 0
+        src_stage = batch.last_was_rt ?
             Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR :
             Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT
         barrier = Vulkan.MemoryBarrier(
@@ -355,8 +342,8 @@ function rt_dispatch_indirect!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
         UInt64(indirect_address + indirect_offset),
     )
 
-    ctx.dispatch_count += 1
-    ctx.last_was_rt = true
+    batch.dispatch_count += 1
+    batch.last_was_rt = true
     Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, 1)
     _last_dispatch_info[] = "rt_indirect"
     return nothing
@@ -402,7 +389,7 @@ function _build_sbt(dev, pipeline::Vulkan.Pipeline, rt_props::RTPipelineProperti
                      _align_up(hit_size, base_align)
 
     sbt_buf = vk_alloc(total_sbt_size;
-        extra_usage=Vulkan.BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR)
+        extra_usage=UInt32(Vulkan.BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR))
 
     # Upload SBT data via staging
     sbt_data = zeros(UInt8, total_sbt_size)

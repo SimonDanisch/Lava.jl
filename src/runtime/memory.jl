@@ -27,13 +27,53 @@ const _live_buffers = Set{VkManagedBuffer}()
 # Processed after vk_flush!() completes (GPU is idle, safe to destroy).
 const DEFERRED_FREES = VkManagedBuffer[]
 
+# ── GPU memory pressure tracking ──
+# Julia's GC doesn't know about GPU memory. LavaArray wrappers are ~50 bytes on
+# the CPU heap, but back 100+ MB of VRAM each. Without pressure signals, GC
+# never fires and dead GPU buffers accumulate until OOM.
+# Solution: track live GPU bytes and trigger GC.gc(false) proactively,
+# matching AMDGPU.jl's maybe_collect() pattern.
+const GPU_LIVE_BYTES = Threads.Atomic{Int}(0)
+const GPU_LAST_INCR_GC_TIME = Ref(0.0)
+const GPU_LAST_FULL_GC_TIME = Ref(0.0)
+
+"""
+    maybe_collect()
+
+Trigger GC if GPU memory pressure is high. Julia's GC doesn't know about
+VRAM — LavaArray wrappers are ~50 bytes on the CPU heap but back hundreds of
+MB of GPU memory. Without this, dead GPU buffers accumulate until OOM.
+
+Two tiers (with separate timers so incremental GC doesn't starve full GC):
+- >256 MiB tracked: incremental GC (rate-limited to every 100ms)
+- >512 MiB tracked: full GC (rate-limited to every 2s)
+
+Called from `vk_alloc` / `vk_alloc_unified` before each allocation.
+"""
+function maybe_collect()
+    live = GPU_LIVE_BYTES[]
+    live < 256 * 1024 * 1024 && return  # <256 MiB: no pressure
+    t = time()
+    # Full GC has its own timer — incremental GC must not starve it
+    if live > 512 * 1024 * 1024 && (t - GPU_LAST_FULL_GC_TIME[]) > 2.0
+        GPU_LAST_FULL_GC_TIME[] = t
+        GPU_LAST_INCR_GC_TIME[] = t
+        GC.gc(true)
+    elseif (t - GPU_LAST_INCR_GC_TIME[]) > 0.1
+        GPU_LAST_INCR_GC_TIME[] = t
+        GC.gc(false)
+    end
+    return
+end
+
 """
     vk_alloc(nbytes::Integer; extra_usage=nothing) -> VkManagedBuffer
 
 Allocate a device-local buffer with BDA support.
 Optional `extra_usage` adds additional `VkBufferUsageFlags` (e.g. for SBT buffers).
 """
-function vk_alloc(nbytes::Integer; extra_usage::Union{Nothing, Vulkan.BufferUsageFlag}=nothing)
+function vk_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0))
+    maybe_collect()
     dev = vk_device()
     nbytes = max(nbytes, 16)  # Vulkan requires non-zero size
 
@@ -41,8 +81,8 @@ function vk_alloc(nbytes::Integer; extra_usage::Union{Nothing, Vulkan.BufferUsag
             Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
             Vulkan.BUFFER_USAGE_TRANSFER_SRC_BIT |
             Vulkan.BUFFER_USAGE_TRANSFER_DST_BIT
-    if extra_usage !== nothing
-        usage |= extra_usage
+    if extra_usage != UInt32(0)
+        usage |= Vulkan.BufferUsageFlag(extra_usage)
     end
 
     buf = Vulkan.Buffer(
@@ -74,6 +114,7 @@ function vk_alloc(nbytes::Integer; extra_usage::Union{Nothing, Vulkan.BufferUsag
 
     result = VkManagedBuffer(buf, memory, address, Ptr{UInt8}(0), Int(nbytes))
     push!(_live_buffers, result)
+    Threads.atomic_add!(GPU_LIVE_BYTES, nbytes)
     return result
 end
 
@@ -82,10 +123,10 @@ end
 
 Free a managed buffer's Vulkan resources.
 
-If a command buffer is currently recording or executing (ctx.recording == true),
-the destruction is deferred until after vk_flush!() completes. This prevents
-DEVICE_LOST from GC finalizers freeing GPU memory that the in-flight command
-buffer still references via BDA addresses.
+If a command batch is currently recording or in-flight, the destruction is
+deferred until after all batches complete. This prevents DEVICE_LOST from GC
+finalizers freeing GPU memory that the in-flight command buffer still
+references via BDA addresses.
 """
 function vk_free!(buf::VkManagedBuffer)
     buf.size == 0 && return  # Already freed
@@ -97,9 +138,12 @@ function vk_free!(buf::VkManagedBuffer)
     # the buffer's BDA address may be embedded in a dispatch's arg buffer.
     # Destroying it now would make the GPU read freed memory → page fault.
     ctx = _vk_context[]
-    if ctx !== nothing && ctx.recording
-        push!(DEFERRED_FREES, buf)
-        return
+    if ctx !== nothing
+        batch = ctx.active_batch
+        if (batch !== nothing && batch.recording) || !isempty(ctx.in_flight)
+            push!(DEFERRED_FREES, buf)
+            return
+        end
     end
 
     _destroy_buffer!(buf)
@@ -107,6 +151,13 @@ end
 
 """Actually destroy a buffer's Vulkan resources. Called from vk_free! or flush_deferred_frees!."""
 function _destroy_buffer!(buf::VkManagedBuffer)
+    # After DEVICE_LOST, all Vulkan handles are invalid — skip destruction to avoid segfault.
+    if _device_lost[]
+        buf.mapped_ptr = Ptr{UInt8}(0)
+        Threads.atomic_sub!(GPU_LIVE_BYTES, buf.size)
+        buf.size = 0
+        return
+    end
     # Unmap if this was a unified/BAR buffer
     if buf.mapped_ptr != Ptr{UInt8}(0)
         Vulkan.unmap_memory(vk_device(), buf.memory)
@@ -117,6 +168,7 @@ function _destroy_buffer!(buf::VkManagedBuffer)
     # so the GC finalizer's second call will be a no-op (refcount underflows, iszero → false).
     buf.buffer.destructor()
     buf.memory.destructor()
+    Threads.atomic_sub!(GPU_LIVE_BYTES, buf.size)
     buf.size = 0
 end
 
@@ -194,7 +246,7 @@ function upload!(dst::VkManagedBuffer, host_data::Vector{UInt8}; offset::Int=0)
     # Fast path: if buffer is in BAR memory (mapped), write directly via mapped ptr.
     if dst.mapped_ptr != Ptr{UInt8}(0)
         ctx = vk_context()
-        if ctx.recording
+        if has_active_recording(ctx)
             vk_flush!()
         end
         unsafe_copyto!(dst.mapped_ptr + offset, pointer(host_data), nbytes)
@@ -220,7 +272,7 @@ function download!(host_data::Vector{UInt8}, src::VkManagedBuffer; offset::Int=0
     # Saves one fence wait by avoiding the staging copy command.
     if src.mapped_ptr != Ptr{UInt8}(0)
         ctx = vk_context()
-        if ctx.recording
+        if has_active_recording(ctx)
             vk_flush!()
         end
         unsafe_copyto!(pointer(host_data), src.mapped_ptr + offset, nbytes)
@@ -261,12 +313,17 @@ end
 function _one_shot_copy(src::Vulkan.Buffer, src_offset::Integer,
                         dst::Vulkan.Buffer, dst_offset::Integer,
                         nbytes::Integer)
+    _device_lost[] && error("Cannot copy: Vulkan device lost. Restart Julia session.")
     ctx = vk_context()
     dev = ctx.device
-    cmd = ctx.cmd_buf
 
-    # Auto-flush pending dispatches before memory transfer
-    if ctx.recording
+    # Use dedicated transfer command buffer + fence to avoid interfering with
+    # the dispatch command buffer state on NVIDIA.
+    cmd = ctx.xfer_cmd_buf
+    fence = ctx.xfer_fence
+
+    # Auto-flush pending dispatches before memory transfer to ensure data is written
+    if has_active_recording(ctx)
         vk_flush!()
     end
 
@@ -279,11 +336,19 @@ function _one_shot_copy(src::Vulkan.Buffer, src_offset::Integer,
 
     unwrap(Vulkan.end_command_buffer(cmd))
 
-    # Submit and wait using the context's reusable fence
+    # Submit and wait using the dedicated transfer fence
     submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=ctx.fence))
-    unwrap(Vulkan.wait_for_fences(dev, [ctx.fence], true, typemax(UInt64)))
-    unwrap(Vulkan.reset_fences(dev, [ctx.fence]))
+    submit_result = Vulkan.queue_submit(ctx.queue, [submit_info]; fence=fence)
+    if iserror(submit_result)
+        _device_lost[] = true
+        unwrap(submit_result)
+    end
+    fence_result = Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64))
+    if iserror(fence_result)
+        _device_lost[] = true
+        unwrap(fence_result)
+    end
+    unwrap(Vulkan.reset_fences(dev, [fence]))
 end
 
 """
@@ -360,10 +425,12 @@ Allocate a unified (BAR) buffer as VkManagedBuffer with `mapped_ptr` set.
 Used by `KA.allocate(; unified=true)` for host-readable GPU buffers.
 """
 function vk_alloc_unified(nbytes::Integer)
+    maybe_collect()
     mapped = vk_alloc_mapped(max(nbytes, 16))
     managed = VkManagedBuffer(mapped.buffer, mapped.memory, mapped.address,
                                mapped.mapped_ptr, Int(mapped.size))
     push!(_live_buffers, managed)
+    Threads.atomic_add!(GPU_LIVE_BYTES, managed.size)
     return managed
 end
 

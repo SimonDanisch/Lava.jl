@@ -6,6 +6,40 @@
 #   lava_compile_to_llvm()  — returns LLVM IR string (for debugging)
 #   lava_compile_to_spirv() — returns validated SPIR-V binary
 
+# Debug counter for unique kernel file naming
+const _KERNEL_DEBUG_COUNTER = Ref(0)
+
+# SPIR-V optimization: enabled automatically on NVIDIA to work around
+# driver bugs with large/complex shaders (Xid 31 MMU faults).
+const _spirv_opt_enabled = Ref(false)
+
+"""
+    _run_spirv_opt(spirv_bytes::Vector{UInt8}) -> Vector{UInt8}
+
+Run spirv-opt on the SPIR-V binary to optimize it. Uses SPIRV_Tools_jll.
+This can help NVIDIA's shader compiler handle complex shaders that would
+otherwise cause miscompilation (Xid 31 MMU faults with large kernels).
+"""
+function _run_spirv_opt(spirv_bytes::Vector{UInt8})
+    spirv_opt = SPIRV_Tools_jll.spirv_opt()
+    in_path = tempname() * ".spv"
+    out_path = tempname() * ".spv"
+    try
+        write(in_path, spirv_bytes)
+        p = run(pipeline(`$spirv_opt --target-env=vulkan1.3 -O $in_path -o $out_path`;
+                          stderr=devnull, stdout=devnull); wait=true)
+        if p.exitcode == 0 && isfile(out_path)
+            return read(out_path)
+        end
+    catch
+        # Fall through to return original bytes
+    finally
+        rm(in_path; force=true)
+        rm(out_path; force=true)
+    end
+    return spirv_bytes  # fallback: return unoptimized
+end
+
 # ── Compilation result types ──
 
 struct LavaLLVMResult
@@ -323,12 +357,22 @@ function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
         # Save IR for debugging (always available at /tmp/lava_last.ll)
         ir = string(mod)
         write("/tmp/lava_last.ll", ir)
+        # Also save with unique name for crash debugging
+        _KERNEL_DEBUG_COUNTER[] += 1
+        _kidx = _KERNEL_DEBUG_COUNTER[]
+        write("/tmp/lava_kernel_$(_kidx)_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).ll", ir)
 
         # ── Stage 2: Custom SPIR-V emission ──
         spirv_bytes = _emit_spirv_from_llvm(mod, wrapper_name, workgroup_size)
 
+        # ── Stage 2.5: SPIR-V optimization (optional, helps NVIDIA) ──
+        if _spirv_opt_enabled[]
+            spirv_bytes = _run_spirv_opt(spirv_bytes)
+        end
+
         # Save SPIR-V for debugging (always available at /tmp/lava_last.spv)
         write("/tmp/lava_last.spv", spirv_bytes)
+        write("/tmp/lava_kernel_$(_kidx)_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).spv", spirv_bytes)
 
         # ── Stage 3: Validation ──
         if validate
@@ -603,6 +647,14 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # Lower to proper element-level access with runtime index computation.
     _lower_chained_mismatched_geps!(mod)
 
+    # ── Convert typed GEPs on mismatched allocas to byte-offset GEPs ──
+    # When InstCombine (inside StructurizeCFG) creates typed GEPs like
+    #   gep i32, ptr %alloca_[8xi64], i64 %dynamic
+    # the emitter can't handle the type mismatch. Convert to byte GEPs:
+    #   gep i8, ptr %alloca, i64 (%dynamic * 4)
+    # so _lower_byte_gep_chain_on_allocas! can apply shift/mask extraction.
+    _convert_typepunned_geps_to_byte_geps!(mod)
+
     # ── Lower byte-offset GEP chains on MArray allocas ──
     # After InstCombine splits flattened byte-offset GEPs back into chains:
     #   %gep1 = gep i8, ptr %alloca_[16xi64], %dynamic
@@ -610,6 +662,14 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     #   store i32 %val, ptr %gep2
     # Lower to proper element-level access with shift/mask (no integer divide).
     _lower_byte_gep_chain_on_allocas!(mod)
+
+    # ── Lower PHI-chained typepunned loads on array allocas ──
+    # When byte-offset GEPs flow through PHI chains (from StructurizeCFG) before being
+    # loaded, _lower_byte_gep_chain_on_allocas! can't handle them (it requires direct
+    # GEP→load). This pass "lifts" the load to each leaf GEP site with shift/mask
+    # extraction and creates parallel value PHI chains.
+    # Critical for MVector{32,UInt32} stored as [16 x i64] in BVH stack traversal.
+    _lower_phi_typepunned_loads!(mod)
 
     # ── Lift byte-offset GEPs on workgroup globals ──
     # The decompose passes above may create byte-offset ConstantExpr GEPs like
@@ -1261,30 +1321,35 @@ function _lower_memcpy!(inst::LLVM.CallInst)
             val = LLVM.load!(builder, copy_type, src, "memcpy_val")
             LLVM.store!(builder, val, dst)
         else
-            # Fallback: byte-by-byte copy using i64 chunks
+            # Fallback: copy using i32 chunks (NOT i64 — avoids misaligned i64 stores
+            # on NVIDIA when the destination is a PSB pointer into a non-8-byte-aligned
+            # struct array, e.g. 12-byte or 52-byte structs where odd-indexed elements
+            # are only 4-aligned).
             len_val = ops[3]
             if !(len_val isa LLVM.ConstantInt)
                 error("Cannot lower memcpy with non-constant length: $inst")
             end
             nbytes = convert(Int, len_val)
+            T_i32 = LLVM.Int32Type()
             T_i64 = LLVM.Int64Type()
             T_i8 = LLVM.Int8Type()
             offset = 0
-            while offset + 8 <= nbytes
-                src_ptr = LLVM.gep!(builder, T_i8, src, [LLVM.ConstantInt(T_i64, offset)])
-                dst_ptr = LLVM.gep!(builder, T_i8, dst, [LLVM.ConstantInt(T_i64, offset)])
-                val = LLVM.load!(builder, T_i64, src_ptr)
-                LLVM.alignment!(val, 8)
-                st = LLVM.store!(builder, val, dst_ptr)
-                LLVM.alignment!(st, 8)
-                offset += 8
+            n_words = nbytes ÷ 4
+            for i in 0:(n_words-1)
+                off = i * 4
+                s_ptr = off == 0 ? src : LLVM.gep!(builder, T_i8, src, [LLVM.ConstantInt(T_i64, off)])
+                d_ptr = off == 0 ? dst : LLVM.gep!(builder, T_i8, dst, [LLVM.ConstantInt(T_i64, off)])
+                val = LLVM.load!(builder, T_i32, s_ptr)
+                LLVM.alignment!(val, 4)
+                st = LLVM.store!(builder, val, d_ptr)
+                LLVM.alignment!(st, 4)
             end
-            while offset < nbytes
-                src_ptr = LLVM.gep!(builder, T_i8, src, [LLVM.ConstantInt(T_i64, offset)])
-                dst_ptr = LLVM.gep!(builder, T_i8, dst, [LLVM.ConstantInt(T_i64, offset)])
-                val = LLVM.load!(builder, LLVM.Int8Type(), src_ptr)
+            # Handle tail bytes
+            for i in (n_words*4):(nbytes-1)
+                src_ptr = LLVM.gep!(builder, T_i8, src, [LLVM.ConstantInt(T_i64, i)])
+                dst_ptr = LLVM.gep!(builder, T_i8, dst, [LLVM.ConstantInt(T_i64, i)])
+                val = LLVM.load!(builder, T_i8, src_ptr)
                 LLVM.store!(builder, val, dst_ptr)
-                offset += 1
             end
         end
     end

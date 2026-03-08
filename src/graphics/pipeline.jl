@@ -298,18 +298,12 @@ function vk_draw!(pipeline::CompiledGraphicsPipeline,
                    indices_buffer::Union{Nothing, Vulkan.Buffer}=nothing,
                    index_count::Integer=0)
     ctx = vk_context()
-    cmd = ctx.cmd_buf
-
-    # Begin recording if not already
-    if !ctx.recording
-        unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(;
-            flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
-        ctx.recording = true
-    end
+    batch = ensure_active_batch!(ctx)
+    cmd = batch.cmd_buf
 
     # Memory barrier: compute/RT → graphics
-    if ctx.dispatch_count > 0
-        src_stage = ctx.last_was_rt ?
+    if batch.dispatch_count > 0
+        src_stage = batch.last_was_rt ?
             Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR :
             Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT
         barrier = Vulkan.MemoryBarrier(C_NULL,
@@ -406,8 +400,8 @@ function vk_draw!(pipeline::CompiledGraphicsPipeline,
 
     Vulkan.cmd_end_rendering(cmd)
 
-    ctx.dispatch_count += 1
-    ctx.last_was_rt = false
+    batch.dispatch_count += 1
+    batch.last_was_rt = false
 end
 
 """Transition an image layout using a pipeline barrier."""
@@ -444,13 +438,8 @@ function vk_begin_pass!(color_view::Vulkan.ImageView,
                          clear_color::NTuple{4, Float32}=(0f0, 0f0, 0f0, 1f0),
                          depth_view::Union{Nothing, Vulkan.ImageView}=nothing)
     ctx = vk_context()
-    cmd = ctx.cmd_buf
-
-    if !ctx.recording
-        unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(;
-            flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
-        ctx.recording = true
-    end
+    batch = ensure_active_batch!(ctx)
+    cmd = batch.cmd_buf
 
     # Transition color image
     transition_image!(cmd, color_image,
@@ -507,7 +496,9 @@ function vk_draw_in_pass!(pipeline::CompiledGraphicsPipeline,
                            viewport::Union{Nothing, Vulkan.Viewport}=nothing,
                            scissor::Union{Nothing, Vulkan.Rect2D}=nothing)
     ctx = vk_context()
-    cmd = ctx.cmd_buf
+    batch = ctx.active_batch
+    batch === nothing && error("vk_draw_in_pass! called without an active rendering pass")
+    cmd = batch.cmd_buf
 
     Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_GRAPHICS, pipeline.pipeline)
 
@@ -530,8 +521,8 @@ function vk_draw_in_pass!(pipeline::CompiledGraphicsPipeline,
     end
 
     Vulkan.cmd_draw(cmd, UInt32(vertex_count), UInt32(instances), UInt32(0), UInt32(0))
-    ctx.dispatch_count += 1
-    ctx.last_was_rt = false
+    batch.dispatch_count += 1
+    batch.last_was_rt = false
 end
 
 """
@@ -541,5 +532,7 @@ End the current dynamic rendering pass.
 """
 function vk_end_pass!()
     ctx = vk_context()
-    Vulkan.cmd_end_rendering(ctx.cmd_buf)
+    batch = ctx.active_batch
+    batch === nothing && error("vk_end_pass! called without an active rendering pass")
+    Vulkan.cmd_end_rendering(batch.cmd_buf)
 end

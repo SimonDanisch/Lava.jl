@@ -123,8 +123,10 @@ function upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}) where T
     # Flush pending commands first
     vk_flush!()
 
-    # One-shot command buffer for transfer
-    cmd = ctx.cmd_buf
+    # Use dedicated transfer command buffer for texture upload
+    # (don't interfere with dispatch batches)
+    cmd = ctx.xfer_cmd_buf
+    fence = ctx.xfer_fence
     unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(;
         flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
 
@@ -151,15 +153,12 @@ function upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}) where T
         Vulkan.PIPELINE_STAGE_TRANSFER_BIT, Vulkan.PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
         Vulkan.ACCESS_TRANSFER_WRITE_BIT, Vulkan.ACCESS_SHADER_READ_BIT)
 
-    # Submit
+    # Submit using dedicated transfer fence
     unwrap(Vulkan.end_command_buffer(cmd))
     submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=ctx.fence))
-    unwrap(Vulkan.wait_for_fences(dev, [ctx.fence], true, typemax(UInt64)))
-    unwrap(Vulkan.reset_fences(dev, [ctx.fence]))
-    ctx.recording = false
-    ctx.dispatch_count = 0
-    empty!(INFLIGHT_DATA_REFS)
+    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=fence))
+    unwrap(Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64)))
+    unwrap(Vulkan.reset_fences(dev, [fence]))
     flush_deferred_frees!()
 end
 

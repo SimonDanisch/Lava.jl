@@ -270,7 +270,9 @@ Submit recorded draw commands and present to screen.
 """
 function present_frame!(win::RenderWindow)
     ctx = vk_context()
-    cmd = ctx.cmd_buf
+    batch = ctx.active_batch
+    batch === nothing && error("present_frame! called without an active recording batch")
+    cmd = batch.cmd_buf
 
     # Transition swapchain image to PRESENT_SRC before presenting
     image = win.images[win.current_image_idx + 1]
@@ -282,7 +284,7 @@ function present_frame!(win::RenderWindow)
     # End command buffer
     unwrap(Vulkan.end_command_buffer(cmd))
 
-    # Submit with semaphore signaling
+    # Submit with semaphore signaling (using window's own fence, not batch fence)
     submit_info = Vulkan.SubmitInfo(
         [win.image_available],
         [Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT],
@@ -291,12 +293,16 @@ function present_frame!(win::RenderWindow)
     )
     unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=win.in_flight))
 
-    # Reset recording state (we handled submission ourselves)
-    # Note: recording must be false BEFORE flush_deferred_frees! so GC finalizers
+    # Reset batch state (we handled submission ourselves via window fence)
+    # Note: batch state must be reset BEFORE flush_deferred_frees! so GC finalizers
     # triggered during deferred free processing free immediately (GPU is idle).
-    ctx.recording = false
-    ctx.dispatch_count = 0
-    empty!(INFLIGHT_DATA_REFS)
+    batch.recording = false
+    batch.dispatch_count = 0
+    batch.last_was_rt = false
+    empty!(batch.data_refs)
+    ctx.active_batch = nothing
+    push!(ctx.free_batches, batch)
+
     flush_deferred_frees!()
     reset_arg_buffer_pool!()
 

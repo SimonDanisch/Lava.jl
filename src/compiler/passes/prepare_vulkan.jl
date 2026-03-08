@@ -3364,6 +3364,92 @@ function _fix_gep_alloca_type_mismatches!(mod::LLVM.Module)
 end
 
 """
+    _convert_typepunned_geps_to_byte_geps!(mod::LLVM.Module)
+
+Convert typed GEPs on array allocas where the GEP source element type differs from
+the alloca element type into equivalent byte-offset GEPs.
+
+Pattern (MVector{16,UInt32} stored as [8 x i64], accessed via i32-typed GEPs):
+    %alloca = alloca [8 x i64]
+    %10 = getelementptr i32, ptr %alloca, i64 %dynamic
+    %gep = getelementptr i32, ptr %10, i64 -1
+    %val = load i32, ptr %gep
+
+After conversion:
+    %10_byte = getelementptr i8, ptr %alloca, i64 (%dynamic * 4)
+    %gep_byte = getelementptr i8, ptr %10_byte, i64 -4
+    %val = load i32, ptr %gep_byte
+
+The resulting byte-offset GEPs are then handled by `_lower_byte_gep_chain_on_allocas!`
+which applies the correct shift/mask extraction for sub-element access.
+"""
+function _convert_typepunned_geps_to_byte_geps!(mod::LLVM.Module)
+    for fn in LLVM.functions(mod)
+        isempty(LLVM.blocks(fn)) && continue
+        changed = true
+        while changed
+            changed = false
+            for bb in LLVM.blocks(fn)
+                for inst in LLVM.instructions(bb)
+                    inst isa LLVM.GetElementPtrInst || continue
+
+                    # Only single-index GEPs
+                    ops = LLVM.operands(inst)
+                    length(ops) == 2 || continue
+
+                    src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inst))
+                    # Skip if already a byte GEP
+                    src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8 && continue
+
+                    src_size = _llvm_type_size(src_ty)
+                    src_size > 0 || continue
+
+                    # Trace back through GEP chain to find the alloca
+                    base = ops[1]
+                    while base isa LLVM.GetElementPtrInst
+                        base = LLVM.operands(base)[1]
+                    end
+                    base isa LLVM.AllocaInst || continue
+
+                    alloca_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(base))
+                    alloca_ty isa LLVM.ArrayType || continue
+
+                    alloca_elem_ty = LLVM.eltype(alloca_ty)
+                    elem_size = _llvm_type_size(alloca_elem_ty)
+                    elem_size > 0 || continue
+
+                    # Only convert when accessing with smaller type than alloca element
+                    src_size < elem_size || continue
+
+                    # Convert: gep T, ptr %base, i64 %idx → gep i8, ptr %base, i64 (%idx * sizeof(T))
+                    LLVM.@dispose builder=LLVM.IRBuilder() begin
+                        LLVM.position!(builder, inst)
+                        idx = ops[2]
+                        i64 = LLVM.Int64Type()
+                        i8 = LLVM.Int8Type()
+                        if LLVM.value_type(idx) != i64
+                            idx = LLVM.sext!(builder, idx, i64, "tpgep_sext")
+                        end
+                        byte_off = if idx isa LLVM.ConstantInt
+                            LLVM.ConstantInt(i64, convert(Int64, idx) * src_size)
+                        else
+                            scale = LLVM.ConstantInt(i64, src_size)
+                            LLVM.mul!(builder, idx, scale, "tpgep_mul")
+                        end
+                        new_gep = LLVM.gep!(builder, i8, ops[1], [byte_off], "tpgep_byte")
+                        LLVM.replace_uses!(inst, new_gep)
+                        LLVM.erase!(inst)
+                    end
+                    changed = true
+                    break  # restart iteration
+                end
+                changed && break
+            end
+        end
+    end
+end
+
+"""
     _lower_byte_gep_chain_on_allocas!(mod::LLVM.Module)
 
 Lower chained byte-offset GEPs on array allocas where the access type (from store/load)
@@ -3498,6 +3584,255 @@ function _lower_byte_gep_chain_on_allocas!(mod::LLVM.Module)
                 end
             end
         end
+    end
+end
+
+"""
+    _lower_phi_typepunned_loads!(mod::LLVM.Module)
+
+Lower loads of smaller types through PHI chains that originate from byte-offset GEPs
+on array allocas with larger element types.
+
+Pattern (MVector{32,UInt32} stored as [16 x i64], accessed via byte-offset GEPs):
+
+    %gep1 = getelementptr i8, ptr %alloca_[16 x i64], i64 %dynamic
+    %gep2 = getelementptr i8, ptr %gep1, i64 -4
+    ; ... flows through PHI chain (from StructurizeCFG Flow blocks) ...
+    %phi = phi ptr [ %gep2, %bb1 ], [ undef, %bb2 ]
+    %val = load i32, ptr %phi
+
+The emitter can't handle this: it divides each GEP's offset by elem_size independently
+((-4)/8 = 0, losing the offset), and OpBitcast always reads the lower 32 bits.
+
+Fix: "lift" the load to each leaf GEP site using shift/mask extraction, create parallel
+i32 PHI chains, and replace the original load with the final i32 PHI value.
+"""
+function _lower_phi_typepunned_loads!(mod::LLVM.Module)
+    for fn in LLVM.functions(mod)
+        isempty(LLVM.blocks(fn)) && continue
+        changed = true
+        while changed
+            changed = false
+            for bb in LLVM.blocks(fn)
+                for inst in LLVM.instructions(bb)
+                    inst isa LLVM.LoadInst || continue
+                    ptr = LLVM.operands(inst)[1]
+                    ptr isa LLVM.PHIInst || continue
+
+                    access_ty = LLVM.value_type(inst)
+                    access_size = _llvm_type_size(access_ty)
+                    access_size > 0 || continue
+
+                    # Trace PHI chain to verify all leaves are byte-GEPs on same alloca
+                    alloca_info = _trace_phi_chain_to_alloca(ptr)
+                    alloca_info === nothing && continue
+                    alloca, alloca_ty, elem_ty, elem_size = alloca_info
+
+                    access_size < elem_size || continue
+                    (elem_size & (elem_size - 1)) == 0 || continue  # power of 2
+
+                    # Create parallel value PHI chain
+                    phi_map = Dict{LLVM.PHIInst, LLVM.Value}()
+                    new_val = _create_value_phi_chain!(
+                        ptr, alloca, alloca_ty, elem_ty, elem_size, access_ty, phi_map)
+                    new_val === nothing && continue
+
+                    LLVM.replace_uses!(inst, new_val)
+                    LLVM.erase!(inst)
+                    changed = true
+                    break
+                end
+                changed && break
+            end
+        end
+    end
+end
+
+"""
+Trace a PHI chain to find whether all non-undef leaf values are byte-offset GEP chains
+on the same [N x integer] array alloca. Returns (alloca, alloca_ty, elem_ty, elem_size)
+or nothing if not eligible.
+"""
+function _trace_phi_chain_to_alloca(phi::LLVM.PHIInst,
+                                     visited::Set{LLVM.Value}=Set{LLVM.Value}())
+    phi in visited && return nothing  # cycle
+    push!(visited, phi)
+
+    alloca = nothing
+    for (val, _) in LLVM.incoming(phi)
+        if val isa LLVM.UndefValue
+            continue
+        elseif val isa LLVM.PHIInst
+            sub = _trace_phi_chain_to_alloca(val, visited)
+            sub === nothing && return nothing
+            if alloca === nothing
+                alloca = sub[1]
+            elseif alloca !== sub[1]
+                return nothing  # different allocas
+            end
+        elseif val isa LLVM.GetElementPtrInst
+            gep_alloca = _trace_gep_chain_to_array_alloca(val)
+            gep_alloca === nothing && return nothing
+            if alloca === nothing
+                alloca = gep_alloca
+            elseif alloca !== gep_alloca
+                return nothing
+            end
+        else
+            return nothing  # unknown value type
+        end
+    end
+
+    alloca === nothing && return nothing
+
+    alloca_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(alloca))
+    alloca_ty isa LLVM.ArrayType || return nothing
+    elem_ty = LLVM.eltype(alloca_ty)
+    elem_ty isa LLVM.IntegerType || return nothing
+    elem_size = _llvm_type_size(elem_ty)
+    elem_size > 0 || return nothing
+
+    return (alloca, alloca_ty, elem_ty, elem_size)
+end
+
+"""
+Trace a byte-offset GEP chain (all i8 source type) back to an alloca.
+Returns the alloca or nothing.
+"""
+function _trace_gep_chain_to_array_alloca(val::LLVM.Value)
+    current = val
+    while current isa LLVM.GetElementPtrInst
+        src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(current))
+        src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8 || return nothing
+        length(LLVM.operands(current)) == 2 || return nothing
+        current = LLVM.operands(current)[1]
+    end
+    current isa LLVM.AllocaInst || return nothing
+    return current
+end
+
+"""
+Recursively create a parallel value-typed PHI chain for a pointer PHI chain.
+At each leaf GEP, inserts shift/mask extraction code. Returns the new value
+(a PHI or extracted i32) or nothing on failure.
+"""
+function _create_value_phi_chain!(phi::LLVM.PHIInst, alloca, alloca_ty,
+                                   elem_ty, elem_size, access_ty,
+                                   phi_map::Dict{LLVM.PHIInst, LLVM.Value})
+    haskey(phi_map, phi) && return phi_map[phi]
+
+    phi_bb = LLVM.parent(phi)
+    i64 = LLVM.Int64Type()
+
+    # Create new PHI of access_ty positioned after existing PHIs
+    first_non_phi = nothing
+    for inst in LLVM.instructions(phi_bb)
+        if !(inst isa LLVM.PHIInst)
+            first_non_phi = inst
+            break
+        end
+    end
+
+    new_phi = LLVM.@dispose builder=LLVM.IRBuilder() begin
+        if first_non_phi !== nothing
+            LLVM.position!(builder, first_non_phi)
+        else
+            LLVM.position!(builder, phi_bb)
+        end
+        LLVM.phi!(builder, access_ty, "phi_extract")
+    end
+    phi_map[phi] = new_phi  # register before recursion (handles cycles)
+
+    # Process incoming values
+    for (val, bb) in LLVM.incoming(phi)
+        if val isa LLVM.UndefValue
+            push!(LLVM.incoming(new_phi), (LLVM.UndefValue(access_ty), bb))
+        elseif val isa LLVM.PHIInst
+            sub_val = _create_value_phi_chain!(val, alloca, alloca_ty,
+                                                elem_ty, elem_size, access_ty, phi_map)
+            sub_val === nothing && return nothing
+            push!(LLVM.incoming(new_phi), (sub_val, bb))
+        elseif val isa LLVM.GetElementPtrInst
+            extracted = _emit_gep_chain_extract!(val, alloca, alloca_ty,
+                                                  elem_ty, elem_size, access_ty)
+            extracted === nothing && return nothing
+            push!(LLVM.incoming(new_phi), (extracted, bb))
+        else
+            return nothing
+        end
+    end
+
+    return new_phi
+end
+
+"""
+At a leaf byte-offset GEP site, emit shift/mask extraction code to read a smaller
+type from a larger array element. Inserts code before the block's terminator.
+Returns the extracted value (e.g., i32 from i64 element).
+"""
+function _emit_gep_chain_extract!(gep_end::LLVM.GetElementPtrInst, alloca, alloca_ty,
+                                    elem_ty, elem_size, access_ty)
+    i64 = LLVM.Int64Type()
+
+    # Collect byte offsets from GEP chain
+    gep_chain = LLVM.GetElementPtrInst[gep_end]
+    current = LLVM.operands(gep_end)[1]
+    while current isa LLVM.GetElementPtrInst
+        src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(current))
+        src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8 || break
+        length(LLVM.operands(current)) == 2 || break
+        pushfirst!(gep_chain, current)
+        current = LLVM.operands(current)[1]
+    end
+    current === alloca || return nothing
+
+    # Insert extraction before the terminator of the GEP's block
+    gep_bb = LLVM.parent(gep_end)
+    term = LLVM.terminator(gep_bb)
+
+    LLVM.@dispose builder=LLVM.IRBuilder() begin
+        LLVM.position!(builder, term)
+
+        # Sum byte offsets from the GEP chain
+        total_off = nothing
+        for gep in gep_chain
+            gep_ops = LLVM.operands(gep)
+            off = gep_ops[2]
+            if LLVM.value_type(off) != i64
+                off = LLVM.sext!(builder, off, i64, "phi_bgc_sext")
+            end
+            if total_off === nothing
+                total_off = off
+            else
+                total_off = LLVM.add!(builder, total_off, off, "phi_bgc_add")
+            end
+        end
+
+        # elem_idx = total_off >> log2(elem_size)
+        elem_shift = Int(log2(elem_size))
+        elem_idx = LLVM.ashr!(builder, total_off, LLVM.ConstantInt(i64, elem_shift), "phi_eidx")
+
+        # inner = total_off & (elem_size - 1)
+        inner = LLVM.and!(builder, total_off, LLVM.ConstantInt(i64, elem_size - 1), "phi_inner")
+
+        # shift_bits = inner * 8
+        shift_bits = LLVM.shl!(builder, inner, LLVM.ConstantInt(i64, 3), "phi_shift")
+
+        # GEP to the array element
+        typed_gep = LLVM.gep!(builder, alloca_ty, alloca,
+                              [LLVM.ConstantInt(i64, 0), elem_idx], "phi_gep")
+
+        # Load full element
+        full = LLVM.load!(builder, elem_ty, typed_gep, "phi_full")
+
+        # Shift right by sub-element bit offset
+        shift_in_elem = LLVM.trunc!(builder, shift_bits, elem_ty, "phi_shift_t")
+        shifted = LLVM.lshr!(builder, full, shift_in_elem, "phi_shr")
+
+        # Truncate to target type
+        result = LLVM.trunc!(builder, shifted, access_ty, "phi_trunc")
+
+        return result
     end
 end
 

@@ -21,10 +21,27 @@ struct RTPipelineProperties
 end
 
 """
+    CommandBatch
+
+A single command buffer recording batch. Each batch owns its own command buffer,
+fence, and strong refs to buffers used during recording. Following clvk's pattern:
+one command buffer per batch, ONE_TIME_SUBMIT_BIT, never reused without reset.
+"""
+mutable struct CommandBatch
+    cmd_buf::Vulkan.CommandBuffer
+    fence::Vulkan.Fence
+    recording::Bool
+    dispatch_count::Int
+    last_was_rt::Bool
+    data_refs::Vector{Any}        # Replaces global INFLIGHT_DATA_REFS
+    dispatch_log::Vector{String}  # Per-batch debug log
+end
+
+"""
     VkContext
 
-Persistent Vulkan context holding device, queue, command pool, and reusable
-command buffer + fence for compute dispatch.
+Persistent Vulkan context holding device, queue, command pool, and batch-based
+command buffer management for compute/graphics/RT dispatch.
 """
 mutable struct VkContext
     instance::Vulkan.Instance
@@ -33,13 +50,21 @@ mutable struct VkContext
     queue::Vulkan.Queue
     queue_family_index::UInt32
     cmd_pool::Vulkan.CommandPool
-    cmd_buf::Vulkan.CommandBuffer
-    fence::Vulkan.Fence
     device_name::String
-    # Dispatch batching state
-    recording::Bool
-    dispatch_count::Int
-    last_was_rt::Bool   # Track last dispatch type for barriers
+    # Batch-based dispatch (replaces single cmd_buf/fence)
+    active_batch::Union{Nothing, CommandBatch}   # Currently recording
+    in_flight::Vector{CommandBatch}              # Submitted, not yet completed
+    free_batches::Vector{CommandBatch}           # Completed, reusable
+    # Dedicated transfer command buffer + fence (separate from dispatch recording)
+    # Prevents command buffer state corruption when _one_shot_copy runs between
+    # dispatch recording and flush (NVIDIA validation: "active VkCommandBuffer")
+    xfer_cmd_buf::Vulkan.CommandBuffer
+    xfer_fence::Vulkan.Fence
+    # Dedicated AS build command buffer + fence (separate from dispatch batches)
+    # Prevents vkBeginCommandBuffer on active cmd_buf and vkQueueSubmit with in-use fence
+    # when _build_as_on_gpu runs during dispatch recording.
+    as_cmd_buf::Vulkan.CommandBuffer
+    as_fence::Vulkan.Fence
     # Ray tracing (nothing if not available)
     rt_pipeline_properties::Union{Nothing, RTPipelineProperties}
     # Debug messenger (nothing if validation layers not available)
@@ -51,6 +76,9 @@ const _validation_messages = String[]
 const _max_validation_messages = 50
 
 const _vk_context = Ref{Union{Nothing, VkContext}}(nothing)
+
+# Set to true after DEVICE_LOST — prevents finalizers from calling Vulkan on invalid handles
+const _device_lost = Ref(false)
 
 """
     vk_context() -> VkContext
@@ -68,6 +96,12 @@ end
 
 vk_device() = vk_context().device
 vk_queue() = vk_context().queue
+
+"""Check if a recording is active (any batch is recording)."""
+function has_active_recording(ctx::VkContext)
+    batch = ctx.active_batch
+    return batch !== nothing && batch.recording
+end
 
 function _init_vulkan!()
     # Create instance
@@ -283,14 +317,28 @@ function _init_vulkan!()
         flags=Vulkan.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
     )
 
-    # Pre-allocate command buffer + fence
+    # Pre-allocate command buffers + fences:
+    # [1]: initial dispatch batch (compute/graphics/RT)
+    # [2]: transfer operations (_one_shot_copy staging downloads)
+    # [3]: dedicated AS builds (separate from dispatch batches — THE FIX)
+    # [4]: spare for free_batches pool
     alloc_info = Vulkan.CommandBufferAllocateInfo(
-        cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1
+        cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 4
     )
     cmd_bufs = unwrap(Vulkan.allocate_command_buffers(device, alloc_info))
-    cmd_buf = cmd_bufs[1]
+    initial_cmd_buf = cmd_bufs[1]
+    xfer_cmd_buf = cmd_bufs[2]
+    as_cmd_buf = cmd_bufs[3]
+    spare_cmd_buf = cmd_bufs[4]
 
-    fence = Vulkan.Fence(device)
+    initial_fence = Vulkan.Fence(device)
+    xfer_fence = Vulkan.Fence(device)
+    as_fence = Vulkan.Fence(device)
+    spare_fence = Vulkan.Fence(device)
+
+    # Create initial batch in free pool
+    initial_batch = CommandBatch(initial_cmd_buf, initial_fence, false, 0, false, Any[], String[])
+    spare_batch = CommandBatch(spare_cmd_buf, spare_fence, false, 0, false, Any[], String[])
 
     has_validation = !isempty(layers)
     if has_rt
@@ -302,10 +350,28 @@ function _init_vulkan!()
         @warn "Vulkan validation layers not found. Install vulkan-validationlayers for GPU error diagnostics."
     end
 
+    # NVIDIA TDR workaround: use split-indirect path (downloads group count, dispatches
+    # directly) instead of true vkCmdDispatchIndirect. Batching multiple heavy indirect
+    # dispatches in a single command buffer triggers Xid 109 CTX SWITCH TIMEOUT on NVIDIA.
+    # The split path adds a trivial sync per indirect dispatch (~4 bytes download) but
+    # prevents TDR by flushing between dispatches.
+    vendor_id = props.vendor_id
+    is_nvidia = vendor_id == 0x10DE
+    if is_nvidia
+        _auto_flush_threshold[] = 32
+        _max_groups_per_dispatch[] = 4096  # split very large dispatches to avoid TDR (Xid 109)
+        _spirv_opt_enabled[] = true
+        @debug "NVIDIA detected: spirv-opt=on, max_groups=4096, auto_flush=32"
+    end
+
     return VkContext(
         instance, phys_dev, device, queue, qf_idx,
-        cmd_pool, cmd_buf, fence, dev_name,
-        false, 0, false,
+        cmd_pool, dev_name,
+        nothing,  # active_batch
+        CommandBatch[],  # in_flight
+        CommandBatch[initial_batch, spare_batch],  # free_batches
+        xfer_cmd_buf, xfer_fence,
+        as_cmd_buf, as_fence,
         rt_props,
         debug_messenger
     )

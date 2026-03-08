@@ -896,8 +896,16 @@ function _emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
         # SPIR-V requires Aligned ≥ scalar_size for PSB (VUID 06314), so we can't
         # just lower alignment. Instead, decompose i64/double loads at non-8-aligned
         # addresses into two i32 loads with Aligned 4.
-        if _psb_needs_decomposition(state, ptr, actual_load)
+        llvm_align = UInt32(LLVM.alignment(inst))
+        if _psb_needs_decomposition(state, ptr, actual_load; llvm_align)
             load_id = _emit_psb_decomposed_load!(state, ptr_id, actual_load, spirv_load_ty)
+            # Decomposed load returns i64 integer. If original load was a pointer,
+            # convert the integer to a typed PSB pointer.
+            if actual_load isa LLVM.PointerType
+                int_id = load_id
+                load_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ty, load_id, int_id)
+            end
         else
             align_ty = needs_bitcast ? actual_load_ty : load_ty
             align = _get_alignment_for_type(align_ty)
@@ -1575,7 +1583,8 @@ function _emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
         # SPIR-V requires Aligned ≥ scalar_size for PSB (VUID 06314), so we can't
         # just lower alignment. Instead, decompose i64/double stores at non-8-aligned
         # addresses into two i32 stores with Aligned 4.
-        if _psb_needs_decomposition(state, ptr, store_ty)
+        llvm_align = UInt32(LLVM.alignment(inst))
+        if _psb_needs_decomposition(state, ptr, store_ty; llvm_align)
             _emit_psb_decomposed_store!(state, ptr_id, val_id, store_ty)
         else
             align = _get_alignment_for_type(store_ty)
@@ -1761,11 +1770,24 @@ end
 Trace a pointer value back to determine if it originates from an alloca.
 GEPs on allocas produce Function pointers; GEPs on parameters produce PSB pointers.
 """
-function _trace_to_non_alloca(ptr::LLVM.Value)
+function _trace_to_non_alloca(ptr::LLVM.Value, visited::Set{LLVM.Value}=Set{LLVM.Value}())
+    ptr in visited && return true  # Cycle → assume PSB (allocas don't form cycles, PSB loop ptrs do)
+    push!(visited, ptr)
     ptr isa LLVM.AllocaInst && return false
     if ptr isa LLVM.GetElementPtrInst
         base = LLVM.operands(ptr)[1]
-        return _trace_to_non_alloca(base)
+        return _trace_to_non_alloca(base, visited)
+    end
+    # PHI nodes: trace all incoming values. If ANY traces to an alloca,
+    # the pointer may be Function-space — return false (not PSB).
+    if ptr isa LLVM.PHIInst
+        for (val, _) in LLVM.incoming(ptr)
+            if !_trace_to_non_alloca(val, visited)
+                return false
+            end
+        end
+        # All incoming values are non-alloca → PSB
+        return true
     end
     # Function parameter, inttoptr, etc. → PSB
     return true
@@ -1809,9 +1831,19 @@ SPIR-V validation requires PSB Aligned ≥ scalar type size (VUID 06314),
 so we can't just lower alignment. Instead, callers must decompose wide accesses
 into narrower ones (e.g., i64 → two i32).
 """
-function _psb_needs_decomposition(state::SPIRVEmitterState, ptr::LLVM.Value, access_ty::LLVM.LLVMType)
+function _psb_needs_decomposition(state::SPIRVEmitterState, ptr::LLVM.Value, access_ty::LLVM.LLVMType;
+                                   llvm_align::UInt32=UInt32(0))
     access_align = _get_alignment_for_type(access_ty)
     access_align <= 4 && return false  # i32/float/i16/i8 never need decomposition
+
+    # Check 0 (universal): LLVM's own alignment on the load/store instruction.
+    # LLVM SROA produces `load i64, ptr %gep, align 1` when the byte GEP offset may not
+    # be naturally aligned. If LLVM says align < type's natural alignment, decompose.
+    # Only applies to GEP-based pointers — arg buffer loads (IntToPtrInst) always have
+    # proper alignment even when LLVM marks them `align 1` (conservative SROA).
+    if llvm_align > 0 && llvm_align < access_align && ptr isa LLVM.GetElementPtrInst
+        return true
+    end
 
     # Check 1: pointer's PTM pointee type has smaller alignment
     pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
@@ -1840,7 +1872,54 @@ function _psb_needs_decomposition(state::SPIRVEmitterState, ptr::LLVM.Value, acc
         return true
     end
 
+    # Check 4: inttoptr(add(..., const)) — LLVM optimization passes convert
+    # struct field GEPs to ptrtoint + add(constant_offset) + inttoptr chains.
+    # E.g., accessing field at byte offset 140 in a 288-byte struct becomes:
+    #   %addr = ptrtoint ptr %struct_ptr to i64
+    #   %field = add i64 %addr, 140
+    #   %ptr = inttoptr i64 %field to ptr
+    #   %val = load i64, ptr %ptr  ; offset 140 is only 4-aligned, NOT 8!
+    # The GEP-based alignment tracking (checks 2-3) misses this because there's no GEP.
+    if ptr isa LLVM.IntToPtrInst
+        src = LLVM.operands(ptr)[1]
+        const_offset = _extract_constant_offset_from_adds(src)
+        if const_offset != 0
+            addr_align = UInt32(1 << trailing_zeros(abs(const_offset)))
+            if addr_align < access_align
+                return true
+            end
+        end
+    end
+
     return false
+end
+
+"""
+Extract the sum of all constant terms from a chain of `add` instructions.
+Used to determine the constant byte offset in `ptrtoint + add(...) + inttoptr` patterns
+where LLVM has converted GEPs to integer arithmetic.
+
+E.g., `add(add(%base, 140), 8)` → returns 148.
+E.g., `add(%base, add(mul(%idx, 288), 140))` → returns 140.
+Non-add, non-constant operands contribute 0 (assumed dynamic/aligned).
+"""
+function _extract_constant_offset_from_adds(val::LLVM.Value)
+    if val isa LLVM.ConstantInt
+        return convert(Int64, val)
+    end
+    if !(val isa LLVM.Instruction) || LLVM.opcode(val) != LLVM.API.LLVMAdd
+        return Int64(0)
+    end
+    ops = LLVM.operands(val)
+    total = Int64(0)
+    for op in (ops[1], ops[2])
+        if op isa LLVM.ConstantInt
+            total += convert(Int64, op)
+        elseif op isa LLVM.Instruction && LLVM.opcode(op) == LLVM.API.LLVMAdd
+            total += _extract_constant_offset_from_adds(op)
+        end
+    end
+    return total
 end
 
 """
@@ -2285,6 +2364,13 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                 encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ptr_ty, result_id, elem_addr_id)
                 state.value_map[inst] = result_id
                 set_pointee_type!(state.type_ctx.ptm, inst, result_pointee; priority=3)
+                # Record byte offset for alignment checking in store/load.
+                # Without this, Check 2 in _psb_needs_decomposition can't detect
+                # misaligned i64 loads through type-punned GEPs (e.g., VPMaterialEvalWorkItem
+                # field at offset 140 in a 288-byte struct → 140 % 8 = 4, not 8-aligned).
+                if all_const && total_byte_offset > 0
+                    state.psb_known_byte_offsets[inst] = total_byte_offset
+                end
             else
             for i in 3:length(ops)
                 push!(index_ids, _ensure_index_i32!(state, ops[i]))
@@ -2850,6 +2936,14 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
         # When stride (composite size) isn't a multiple of 8, or base has tracked alignment,
         # record so _psb_needs_decomposition() can detect i64 stores needing decomposition.
         _track_psb_gep_alignment!(state, inst, base_ptr, base_pointee, ops[2])
+        # Record constant byte offset for alignment checking in store/load (Fix #8b).
+        byte_offset_val = ops[2]
+        if byte_offset_val isa LLVM.ConstantInt
+            const_bo = convert(Int64, byte_offset_val)
+            if const_bo != 0
+                state.psb_known_byte_offsets[inst] = const_bo
+            end
+        end
     elseif sc == SC.Function || sc == SC.Private
         # Function/Private storage class: OpPtrAccessChain is NOT valid (VUID-StandaloneSpirv-Base-07650).
         if sc == SC.Private
@@ -4267,27 +4361,95 @@ function _resolve_deferred_phis!(state::SPIRVEmitterState)
                     type_id  # If we can't determine the type, assume it matches
                 end
                 if val_spirv_ty != type_id
-                    # Need bitcast from val_spirv_ty to type_id
-                    bitcast_id = fresh_id!(state.mod)
-                    bitcast_words = UInt32[]
-                    push!(bitcast_words, (UInt32(4) << 16) | UInt32(Op.OpBitcast))
-                    push!(bitcast_words, type_id)
-                    push!(bitcast_words, bitcast_id)
-                    push!(bitcast_words, val_id)
-
-                    # Find the predecessor block ID for insertion
-                    from_id = get_block_id!(state, bb)
-                    redirect = get(state.trampolines, (from_id, block_label_id), nothing)
-                    if redirect === nothing
-                        redirect = get(state.phi_block_redirects, (from_id, block_label_id), nothing)
+                    # Check if this is a cross-storage-class mismatch by looking up
+                    # the storage classes. Cross-SC bitcasts are INVALID in SPIR-V.
+                    val_sc = nothing
+                    target_sc = nothing
+                    for ((sc, _pointee), ptr_ty) in state.type_ctx.pointer_types
+                        if ptr_ty == val_spirv_ty
+                            val_sc = sc
+                        end
+                        if ptr_ty == type_id
+                            target_sc = sc
+                        end
                     end
-                    pred_block_id = redirect !== nothing ? redirect : from_id
 
-                    if !haskey(pre_terminator_insertions, pred_block_id)
-                        pre_terminator_insertions[pred_block_id] = UInt32[]
+                    if val_sc !== nothing && target_sc !== nothing && val_sc != target_sc
+                        # Cross-storage-class mismatch in PHI.
+                        # OpConvertUToPtr only works for PhysicalStorageBuffer targets.
+                        # If target is Function, we can't convert — this indicates a bug
+                        # in _trace_to_non_alloca or type inference. Log warning and
+                        # use OpBitcast as fallback (may fail validation but won't crash).
+                        if target_sc != 5348 # StoragePhysicalStorageBuffer = 5348
+                            @warn "Cross-SC PHI: target SC=$target_sc is not PSB, cannot ConvertUToPtr. Using OpBitcast fallback."
+                            bitcast_id = fresh_id!(state.mod)
+                            bitcast_words = UInt32[]
+                            push!(bitcast_words, (UInt32(4) << 16) | UInt32(Op.OpBitcast))
+                            push!(bitcast_words, type_id)
+                            push!(bitcast_words, bitcast_id)
+                            push!(bitcast_words, val_id)
+
+                            from_id = get_block_id!(state, bb)
+                            redirect = get(state.trampolines, (from_id, block_label_id), nothing)
+                            if redirect === nothing
+                                redirect = get(state.phi_block_redirects, (from_id, block_label_id), nothing)
+                            end
+                            pred_block_id = redirect !== nothing ? redirect : from_id
+                            if !haskey(pre_terminator_insertions, pred_block_id)
+                                pre_terminator_insertions[pred_block_id] = UInt32[]
+                            end
+                            append!(pre_terminator_insertions[pred_block_id], bitcast_words)
+                            val_id = bitcast_id
+                        else
+                            # Target is PSB: safe to convert through integer (ConvertPtrToU → ConvertUToPtr)
+                            ulong_ty = map_type!(state.type_ctx, LLVM.Int64Type())
+                            ptr_to_u = fresh_id!(state.mod)
+                            u_to_ptr = fresh_id!(state.mod)
+                            conv_words = UInt32[]
+                            # OpConvertPtrToU
+                            push!(conv_words, (UInt32(4) << 16) | UInt32(Op.OpConvertPtrToU))
+                            push!(conv_words, ulong_ty)
+                            push!(conv_words, ptr_to_u)
+                            push!(conv_words, val_id)
+                            # OpConvertUToPtr
+                            push!(conv_words, (UInt32(4) << 16) | UInt32(Op.OpConvertUToPtr))
+                            push!(conv_words, type_id)
+                            push!(conv_words, u_to_ptr)
+                            push!(conv_words, ptr_to_u)
+
+                            from_id = get_block_id!(state, bb)
+                            redirect = get(state.trampolines, (from_id, block_label_id), nothing)
+                            if redirect === nothing
+                                redirect = get(state.phi_block_redirects, (from_id, block_label_id), nothing)
+                            end
+                            pred_block_id = redirect !== nothing ? redirect : from_id
+                            if !haskey(pre_terminator_insertions, pred_block_id)
+                                pre_terminator_insertions[pred_block_id] = UInt32[]
+                            end
+                            append!(pre_terminator_insertions[pred_block_id], conv_words)
+                            val_id = u_to_ptr
+                        end
+                    else
+                        # Same storage class: use OpBitcast (safe within same SC)
+                        bitcast_id = fresh_id!(state.mod)
+                        bitcast_words = UInt32[]
+                        push!(bitcast_words, (UInt32(4) << 16) | UInt32(Op.OpBitcast))
+                        push!(bitcast_words, type_id)
+                        push!(bitcast_words, bitcast_id)
+                        push!(bitcast_words, val_id)
+
+                        from_id = get_block_id!(state, bb)
+                        redirect = get(state.trampolines, (from_id, block_label_id), nothing)
+                        if redirect === nothing
+                            redirect = get(state.phi_block_redirects, (from_id, block_label_id), nothing)
+                        end
+                        pred_block_id = redirect !== nothing ? redirect : from_id
+                        if !haskey(pre_terminator_insertions, pred_block_id)
+                            pre_terminator_insertions[pred_block_id] = UInt32[]
+                        end
+                        append!(pre_terminator_insertions[pred_block_id], bitcast_words)
+                        val_id = bitcast_id
                     end
-                    append!(pre_terminator_insertions[pred_block_id], bitcast_words)
-                    val_id = bitcast_id
                 end
             end
 

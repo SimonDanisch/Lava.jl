@@ -27,6 +27,7 @@ struct PushConstantInfo
     push_size::Int              # Always 8 (single i64 BDA)
     arg_buffer_size::Int        # Total size of argument data
     arg_layout::Vector{Pair{Int,Int}}  # (offset, size) per argument
+    byval_llvm_sizes::Vector{Int}  # LLVM alloc size per arg (>0 only for byval struct args)
 end
 
 """
@@ -46,7 +47,7 @@ function wrap_entry_for_vulkan!(mod::LLVM.Module, entry::LLVM.Function;
 
     # No parameters → no wrapping needed
     if isempty(param_types)
-        return PushConstantInfo(entry_name, 0, 0, Pair{Int,Int}[])
+        return PushConstantInfo(entry_name, 0, 0, Pair{Int,Int}[], Int[])
     end
 
     # Mark original entry as internal + alwaysinline
@@ -66,6 +67,25 @@ function wrap_entry_for_vulkan!(mod::LLVM.Module, entry::LLVM.Function;
         offset += sz
     end
     arg_buffer_size = offset
+
+    # Extract byval type sizes using LLVM DataLayout for accurate struct sizes.
+    # _llvm_sizeof sums field sizes WITHOUT alignment padding, undercounting for
+    # structs with mixed-size fields (e.g., WorkQueue{T} has {DevArr, DevArr, i32}
+    # → _llvm_sizeof=36 but ABI size=40 due to trailing padding).
+    # Multiple byval args with padding gaps cause inline data overlap in the arg buffer.
+    dl = LLVM.datalayout(mod)
+    byval_kind_id = LLVM.API.LLVMGetEnumAttributeKindForName("byval", 5)
+    byval_llvm_sizes = zeros(Int, length(param_types))
+    for (i, pt) in enumerate(param_types)
+        pt isa LLVM.PointerType || continue
+        for attr in collect(LLVM.parameter_attributes(entry, i))
+            if attr isa LLVM.TypeAttribute && LLVM.kind(attr) == byval_kind_id
+                byval_type = LLVM.value(attr)
+                byval_llvm_sizes[i] = Int(LLVM.API.LLVMABISizeOfType(dl, byval_type))
+                break
+            end
+        end
+    end
 
     # Create push constant global: { i64 } in addrspace(2) → PushConstant storage class
     T_i64 = LLVM.Int64Type()
@@ -123,7 +143,7 @@ function wrap_entry_for_vulkan!(mod::LLVM.Module, entry::LLVM.Function;
         LLVM.ret!(builder)
     end
 
-    return PushConstantInfo(wrapper_name, 8, arg_buffer_size, arg_layout)
+    return PushConstantInfo(wrapper_name, 8, arg_buffer_size, arg_layout, byval_llvm_sizes)
 end
 
 """

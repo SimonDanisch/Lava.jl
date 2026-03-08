@@ -40,6 +40,11 @@ end
         include(joinpath(@__DIR__, "test_handwritten_rt.jl"))
     end
 
+    # ── Tier 3b: Struct Broadcast Regression Tests ──
+    @testset "Tier 3b: Struct Broadcast" begin
+        include(joinpath(@__DIR__, "test_struct_broadcast.jl"))
+    end
+
     # ── Tier 4: GPUArrays TestSuite ──
     @testset "Tier 4: GPUArrays TestSuite" begin
         include(joinpath(@__DIR__, "test_gpuarrays.jl"))
