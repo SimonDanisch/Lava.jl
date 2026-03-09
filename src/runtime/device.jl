@@ -358,10 +358,15 @@ function _init_vulkan!()
     vendor_id = props.vendor_id
     is_nvidia = vendor_id == 0x10DE
     if is_nvidia
-        _auto_flush_threshold[] = 32
-        _max_groups_per_dispatch[] = 4096  # split very large dispatches to avoid TDR (Xid 109)
         _spirv_opt_enabled[] = true
-        @debug "NVIDIA detected: spirv-opt=on, max_groups=4096, auto_flush=32"
+        # Auto-flush prevents TDR timeout during precompilation (480K+ dispatches
+        # run during `using Lava` which can trigger Xid 109 on NVIDIA).
+        # Hikari's volpath flushes explicitly every ~117 dispatches, so a threshold
+        # of 128 adds minimal extra flushes during rendering but protects precompilation.
+        if auto_flush_threshold[] == 0
+            set_auto_flush_threshold!(128)
+        end
+        @debug "NVIDIA detected: spirv-opt=on, auto-flush=128"
     end
 
     return VkContext(

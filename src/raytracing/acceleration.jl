@@ -79,20 +79,25 @@ function build_blas(vertices::Vector{NTuple{3,Float32}}, indices::Vector{UInt32}
     # Create scratch buffer
     scratch_buf, scratch_mem, scratch_addr = _create_scratch_buffer(sizes.build_scratch_size)
 
-    # Build on GPU
-    _build_as_on_gpu(ctx, accel, scratch_addr;
-        as_type=UInt32(1), build_flags,
-        geometry_type=:triangles,
-        vertex_format=vfmt, vertex_addr, vertex_stride=vstride,
-        max_vertex, index_type=itype, index_addr,
-        geo_flags, primitive_count=n_triangles)
+    # Build on GPU — input buffers must stay alive during the GPU build.
+    # In batched mode (_as_batching), stash refs so they survive until submit.
+    # In non-batched mode, GC.@preserve covers the synchronous submit+wait.
+    input_refs = (vertex_buf, vertex_mem, index_buf, index_mem, scratch_buf, scratch_mem)
+    if _as_batching[]
+        push!(_as_batch_preserves, input_refs)
+    end
+    GC.@preserve vertex_buf vertex_mem index_buf index_mem scratch_buf scratch_mem begin
+        _build_as_on_gpu(ctx, accel, scratch_addr;
+            as_type=UInt32(1), build_flags,
+            geometry_type=:triangles,
+            vertex_format=vfmt, vertex_addr, vertex_stride=vstride,
+            max_vertex, index_type=itype, index_addr,
+            geo_flags, primitive_count=n_triangles)
+    end
 
     # Get AS device address
     addr_info = Vulkan.AccelerationStructureDeviceAddressInfoKHR(accel)
     as_addr = Vulkan.get_acceleration_structure_device_address_khr(dev, addr_info)
-
-    # Temporary buffers (vertex, index, scratch) are GC-managed via Vulkan.jl finalizers.
-    # No manual destroy needed — they'll be freed when GC collects them.
 
     return LavaBLAS(accel, as_buf, as_mem, as_addr)
 end
@@ -144,14 +149,19 @@ function build_tlas(blas_list::Vector{LavaBLAS};
     # Scratch buffer
     scratch_buf, scratch_mem, scratch_addr = _create_scratch_buffer(sizes.build_scratch_size)
 
-    # Build on GPU
-    _build_as_on_gpu(ctx, accel, scratch_addr;
-        as_type=UInt32(0), build_flags,
-        geometry_type=:instances,
-        instance_addr=inst_addr,
-        primitive_count=UInt32(n_instances))
+    # Build on GPU — preserve buffers from GC during GPU build
+    input_refs_tlas = (inst_buf, inst_mem, scratch_buf, scratch_mem)
+    if _as_batching[]
+        push!(_as_batch_preserves, input_refs_tlas)
+    end
+    GC.@preserve inst_buf inst_mem scratch_buf scratch_mem begin
+        _build_as_on_gpu(ctx, accel, scratch_addr;
+            as_type=UInt32(0), build_flags,
+            geometry_type=:instances,
+            instance_addr=inst_addr,
+            primitive_count=UInt32(n_instances))
+    end
 
-    # Temporary buffers (instance, scratch) are GC-managed via Vulkan.jl finalizers.
     # Keep unique BLASes alive — TLAS references them by device address.
     unique_blas = unique(blas_list)
 
@@ -447,11 +457,97 @@ function _query_as_build_sizes(dev::Vulkan.Device; as_type::UInt32,
             build_scratch_size=build_scratch)
 end
 
+# ── Batched AS Build API ──
+
+# When true, _build_as_on_gpu records into an already-open command buffer
+# instead of managing begin/end/submit/wait itself.
+const _as_batching = Ref(false)
+
+# GC preservation list for batched builds — keeps input/scratch buffers alive
+# until the single submit+wait completes.
+const _as_batch_preserves = Any[]
+
+"""
+    as_build(f)
+
+Batch multiple acceleration structure builds into a single GPU submission.
+
+Without `as_build`, each `build_blas`/`build_tlas` call submits its own command
+buffer and waits for completion — N builds = N submit+wait roundtrips. With
+`as_build`, all builds share one command buffer with inter-build barriers,
+submitted once at the end.
+
+# Example
+```julia
+blases, tlas = as_build() do
+    bs = [build_blas(verts, idxs) for (verts, idxs) in meshes]
+    tlas = build_tlas(bs)
+    return (bs, tlas)
+end
+```
+
+BLAS device addresses are available immediately after `build_blas` returns
+(even before the GPU build executes), so `build_tlas` can reference them.
+"""
+function as_build(f)
+    _as_batching[] && error("as_build() cannot be nested")
+
+    ctx = vk_context()
+
+    # Flush any pending compute dispatches before AS builds
+    if has_active_recording(ctx)
+        vk_flush!()
+    end
+
+    cmd = ctx.as_cmd_buf
+    unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
+        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    )))
+
+    _as_batching[] = true
+    empty!(_as_batch_preserves)
+    result = try
+        f()
+    catch
+        _as_batching[] = false
+        empty!(_as_batch_preserves)
+        # Reset command buffer so it's reusable
+        unwrap(Vulkan.end_command_buffer(cmd))
+        rethrow()
+    end
+    _as_batching[] = false
+
+    # Final barrier: make all AS writes visible to RT shader reads
+    post_barrier = Vulkan.MemoryBarrier(
+        C_NULL,
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+        Vulkan.ACCESS_SHADER_READ_BIT,
+    )
+    Vulkan.cmd_pipeline_barrier(
+        cmd, [post_barrier], [], [];
+        src_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        dst_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                       Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+    )
+
+    unwrap(Vulkan.end_command_buffer(cmd))
+
+    submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
+    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=ctx.as_fence))
+    unwrap(Vulkan.wait_for_fences(ctx.device, [ctx.as_fence], true, typemax(UInt64)))
+    unwrap(Vulkan.reset_fences(ctx.device, [ctx.as_fence]))
+
+    empty!(_as_batch_preserves)
+    return result
+end
+
 """Build an acceleration structure on the GPU using correctly-packed C structs.
 
-Records vkCmdBuildAccelerationStructuresKHR into a one-shot command buffer and
-submits it, waiting for completion. All C structs are manually packed to work
-around VulkanCore.jl alignment bugs.
+Records vkCmdBuildAccelerationStructuresKHR into a command buffer. When called
+inside `as_build()`, records into the shared batch command buffer with only an
+inter-build barrier. Otherwise, manages its own command buffer lifecycle
+(begin → barrier → build → barrier → end → submit → wait).
 """
 function _build_as_on_gpu(ctx::VkContext, accel::Vulkan.AccelerationStructureKHR,
                           scratch_addr::UInt64;
@@ -459,10 +555,13 @@ function _build_as_on_gpu(ctx::VkContext, accel::Vulkan.AccelerationStructureKHR
                           primitive_count::UInt32=UInt32(0),
                           kwargs...)
     dev = ctx.device
+    batching = _as_batching[]
 
-    # Flush any pending compute dispatches before AS build
-    if has_active_recording(ctx)
-        vk_flush!()
+    if !batching
+        # Flush any pending compute dispatches before AS build
+        if has_active_recording(ctx)
+            vk_flush!()
+        end
     end
 
     # Use dedicated AS command buffer + fence (never touches dispatch batches)
@@ -480,12 +579,15 @@ function _build_as_on_gpu(ctx::VkContext, accel::Vulkan.AccelerationStructureKHR
 
     fptr = Vulkan.function_pointer(dev, "vkCmdBuildAccelerationStructuresKHR")
 
-    unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
-        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    )))
+    if !batching
+        unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
+            flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        )))
+    end
 
     # Synchronize prior AS builds before this build command.
-    # Required when TLAS reads BLAS built in earlier submissions.
+    # Required when TLAS reads BLAS built in earlier submissions,
+    # or between batched builds sharing one command buffer.
     pre_barrier = Vulkan.MemoryBarrier(
         C_NULL,
         Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
@@ -522,26 +624,31 @@ function _build_as_on_gpu(ctx::VkContext, accel::Vulkan.AccelerationStructureKHR
         end
     end
 
-    # Make AS writes visible to subsequent AS builds and RT shader reads.
-    post_barrier = Vulkan.MemoryBarrier(
-        C_NULL,
-        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
-        Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
-        Vulkan.ACCESS_SHADER_READ_BIT,
-    )
-    Vulkan.cmd_pipeline_barrier(
-        cmd, [post_barrier], [], [];
-        src_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-        dst_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
-                       Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-    )
+    if batching
+        # Keep buffers alive until as_build() submits
+        push!(_as_batch_preserves, (geo_buf, bgi_buf, c_range))
+    else
+        # Non-batched: finish and submit immediately
+        post_barrier = Vulkan.MemoryBarrier(
+            C_NULL,
+            Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+            Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+            Vulkan.ACCESS_SHADER_READ_BIT,
+        )
+        Vulkan.cmd_pipeline_barrier(
+            cmd, [post_barrier], [], [];
+            src_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            dst_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                           Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        )
 
-    unwrap(Vulkan.end_command_buffer(cmd))
+        unwrap(Vulkan.end_command_buffer(cmd))
 
-    submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=ctx.as_fence))
-    unwrap(Vulkan.wait_for_fences(dev, [ctx.as_fence], true, typemax(UInt64)))
-    unwrap(Vulkan.reset_fences(dev, [ctx.as_fence]))
+        submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
+        unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=ctx.as_fence))
+        unwrap(Vulkan.wait_for_fences(dev, [ctx.as_fence], true, typemax(UInt64)))
+        unwrap(Vulkan.reset_fences(dev, [ctx.as_fence]))
+    end
 end
 
 # ── Raycore-compatible bridge functions ──
@@ -606,44 +713,41 @@ function build_hw_accel_from_tlas(tlas)
     n_blas = length(blas_array)
     n_instances = length(instances)
 
-    # Build hardware BLAS for each unique BLAS + collect primitives
+    # Collect primitives and prepare CPU data before GPU work
     hw_blas_list = Vector{LavaBLAS}(undef, n_blas)
     blas_offsets = Vector{UInt32}(undef, n_blas)
     all_primitives = []
     offset = UInt32(0)
 
+    cpu_prims_list = Vector{Any}(undef, n_blas)
     for i in 1:n_blas
-        blas = blas_array[i]
-        cpu_prims = _to_cpu_vector(blas.primitives)
-
-        hw_blas_list[i] = build_blas_from_primitives(cpu_prims)
+        cpu_prims_list[i] = _to_cpu_vector(blas_array[i].primitives)
         blas_offsets[i] = offset
-
-        append!(all_primitives, cpu_prims)
-        offset += UInt32(length(cpu_prims))
+        offset += UInt32(length(cpu_prims_list[i]))
+        append!(all_primitives, cpu_prims_list[i])
     end
 
-    # Build instance list for TLAS
-    # Each Raycore instance → one Vulkan instance
-    hw_blas_refs = Vector{LavaBLAS}(undef, n_instances)
-    transforms = Vector{NTuple{12,Float32}}(undef, n_instances)
-    custom_indices = Vector{UInt32}(undef, n_instances)
+    # Batch all BLAS + TLAS builds into a single GPU submission
+    hw_tlas = as_build() do
+        for i in 1:n_blas
+            hw_blas_list[i] = build_blas_from_primitives(cpu_prims_list[i])
+        end
 
-    for i in 1:n_instances
-        inst = instances[i]
-        blas_idx = Int(inst.blas_index)
-        hw_blas_refs[i] = hw_blas_list[blas_idx]
+        # Build instance list for TLAS
+        hw_blas_refs = Vector{LavaBLAS}(undef, n_instances)
+        transforms = Vector{NTuple{12,Float32}}(undef, n_instances)
+        custom_indices = Vector{UInt32}(undef, n_instances)
 
-        # Extract 3×4 row-major transform from 4×4 column-major matrix
-        m = inst.transform
-        transforms[i] = _mat4_to_vk_transform(m)
+        for i in 1:n_instances
+            inst = instances[i]
+            blas_idx = Int(inst.blas_index)
+            hw_blas_refs[i] = hw_blas_list[blas_idx]
+            transforms[i] = _mat4_to_vk_transform(inst.transform)
+            custom_indices[i] = UInt32(blas_idx - 1)
+        end
 
-        # Store BLAS index (0-based) as instance custom index
-        custom_indices[i] = UInt32(blas_idx - 1)
+        return build_tlas(hw_blas_refs; transforms, custom_indices)
     end
-
-    # Build hardware TLAS
-    hw_tlas = build_tlas(hw_blas_refs; transforms, custom_indices)
 
     # Convert all_primitives to typed vector
     if !isempty(all_primitives)

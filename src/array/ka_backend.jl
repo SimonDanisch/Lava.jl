@@ -30,7 +30,11 @@ struct LavaBackend <: KA.GPU end
 # ── Backend queries ──
 
 KA.get_backend(::LavaArray) = LavaBackend()
-KA.synchronize(::LavaBackend) = vk_flush!()
+# KA.synchronize is a NO-OP: pipeline barriers between dispatches already
+# ensure GPU-side ordering. Any CPU readback (Array(), download!) flushes
+# automatically via has_active_recording(). This avoids the massive overhead
+# of 16k+ CPU-GPU fence roundtrips per render frame.
+KA.synchronize(::LavaBackend) = nothing
 KA.supports_unified(::LavaBackend) = true
 function KA.allocate(::LavaBackend, ::Type{T}, dims::Tuple; unified::Bool=false) where T
     nbytes = prod(dims) * sizeof(T)
@@ -175,7 +179,7 @@ Internal launch function for KA kernels. Compiles and dispatches the GPU functio
 function _ka_launch!(@nospecialize(f), all_args::Tuple, nblocks::Int, workgroup_size::NTuple{3,Int})
     # Auto-flush BEFORE allocating arg buffer — if we flush after allocation,
     # the pool reset lets the next dispatch overwrite our buffer before submission.
-    _maybe_auto_flush!()
+    maybe_auto_flush!()
 
     # Build type tuple for compilation (excludes f — GPUCompiler prepends typeof(f))
     # all_args[1] is f itself (included for BDA packing), rest are the actual args
@@ -200,7 +204,7 @@ function _ka_launch!(@nospecialize(f), all_args::Tuple, nblocks::Int, workgroup_
     unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
 
     groups = (nblocks, 1, 1)
-    _last_dispatch_info[] = "ka f=$(_dispatch_name(f, all_args)) groups=$groups"
+    last_dispatch_info[] = "ka f=$(_dispatch_name(f, all_args)) groups=$groups"
     vk_dispatch!(pipeline, push_data, groups)
 
     return nothing
@@ -247,7 +251,7 @@ group counts to an indirect buffer, then vk_dispatch_indirect! dispatches the ma
 function _ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, original_args=nothing)
     # Auto-flush BEFORE allocating arg buffer — if we flush after allocation,
     # the pool reset lets the next dispatch overwrite our buffer before submission.
-    _maybe_auto_flush!()
+    maybe_auto_flush!()
 
     # Respect static workgroup size from @kernel definition
     ws = if workgroupsize !== nothing
@@ -291,7 +295,7 @@ function _ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, 
     #   are embedded in the arg buffer, causing DEVICE_LOST on NVIDIA
     GC.@preserve original_args begin
 
-    max_groups = _max_groups_per_dispatch[]
+    max_groups = max_groups_per_dispatch[]
     if max_groups > 0
         # Download work count from GPU to split large indirect dispatches.
         # This adds a sync point but prevents NVIDIA TDR timeout (Xid 109).
@@ -312,7 +316,7 @@ function _ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, 
         push_data = Vector{UInt8}(undef, 8)
         unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
 
-        _last_dispatch_info[] = "split_indirect f=$(_dispatch_name(obj.f, all_args)) groups=$n_groups"
+        last_dispatch_info[] = "split_indirect f=$(_dispatch_name(obj.f, all_args)) groups=$n_groups"
 
         # Dispatch directly, using split if needed (handled by vk_dispatch!)
         keep_data_alive!(args)
@@ -332,7 +336,7 @@ function _ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, 
         indirect_buf = _get_indirect_buffer()
         _prepare_indirect_dispatch!(indirect_buf, ndrange_buf, ws_prod)
 
-        _last_dispatch_info[] = "indirect f=$(_dispatch_name(obj.f, all_args))"
+        last_dispatch_info[] = "indirect f=$(_dispatch_name(obj.f, all_args))"
         keep_data_alive!(args)
         if original_args !== nothing
             keep_data_alive!(original_args)

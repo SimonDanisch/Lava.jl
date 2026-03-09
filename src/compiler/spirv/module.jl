@@ -340,9 +340,11 @@ module MemSem
     const Acquire           = UInt32(0x2)
     const Release           = UInt32(0x4)
     const AcquireRelease    = UInt32(0x8)
-    const UniformMemory     = UInt32(0x40)     # SSBO/uniform buffer
+    const UniformMemory     = UInt32(0x40)     # SSBO/StorageBuffer/PhysicalStorageBuffer
     const WorkgroupMemory   = UInt32(0x100)    # Shared memory
     const ImageMemory       = UInt32(0x800)    # Image/texture
+    const MakeAvailableKHR  = UInt32(0x2000)   # Vulkan memory model: make writes available
+    const MakeVisibleKHR    = UInt32(0x4000)   # Vulkan memory model: make writes visible
 end
 
 # ---- Function Control ----

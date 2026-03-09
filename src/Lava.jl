@@ -126,4 +126,18 @@ include("raytracing/raycore_compat.jl") # HardwareAccel + trace_closest_hits!
 # Disable scalar indexing by default (GPU arrays should not be accessed element-by-element)
 GPUArraysCore.allowscalar(false)
 
+function __init__()
+    # Reset runtime counters that should not survive precompilation.
+    # These Ref values get serialized into the pkgimage — a device crash
+    # during precompilation would permanently poison all future sessions.
+    _device_lost[] = false
+    FLUSH_COUNTER[] = 0
+    TOTAL_DISPATCH_COUNTER[] = 0
+    auto_flush_threshold[] = 0
+    max_groups_per_dispatch[] = 0
+    last_dispatch_info[] = ""
+    prev_dispatch_info[] = ""
+    empty!(dispatch_log)
+end
+
 end # module Lava

@@ -45,6 +45,11 @@ end
         include(joinpath(@__DIR__, "test_struct_broadcast.jl"))
     end
 
+    # ── Tier 3c: Atomics & Batched Dispatch ──
+    @testset "Tier 3c: Atomics & Dispatch" begin
+        include(joinpath(@__DIR__, "test_atomics_and_dispatch.jl"))
+    end
+
     # ── Tier 4: GPUArrays TestSuite ──
     @testset "Tier 4: GPUArrays TestSuite" begin
         include(joinpath(@__DIR__, "test_gpuarrays.jl"))

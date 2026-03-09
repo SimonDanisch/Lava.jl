@@ -1,8 +1,7 @@
 # Command buffer recording and dispatch for Lava.jl
 #
 # Batch-based command buffer management: each CommandBatch owns its own
-# command buffer, fence, and strong refs to in-flight data. Replaces the
-# old single cmd_buf/fence + global INFLIGHT_DATA_REFS approach.
+# command buffer, fence, and strong refs to in-flight data.
 #
 # GC safety:
 # Layer 1 (proactive): batch.data_refs keeps LavaArray objects alive until flush.
@@ -16,49 +15,44 @@ const FLUSH_COUNTER = Threads.Atomic{Int}(0)
 const TOTAL_DISPATCH_COUNTER = Threads.Atomic{Int}(0)
 
 # Dispatch info for debugging DEVICE_LOST
-# _last_dispatch_info: the dispatch currently being recorded
-# _prev_dispatch_info: the dispatch in the batch being flushed (what actually crashed)
-const _last_dispatch_info = Ref{String}("")
-const _prev_dispatch_info = Ref{String}("")
+const last_dispatch_info = Ref{String}("")
+const prev_dispatch_info = Ref{String}("")
 
 # Ring buffer of last N dispatch names for crash debugging
-const _dispatch_log = String[]
-const _max_dispatch_log = 50
+const dispatch_log = String[]
+const MAX_DISPATCH_LOG = 50
 
-function _log_dispatch!(info::String)
-    if length(_dispatch_log) >= _max_dispatch_log
-        popfirst!(_dispatch_log)
+function log_dispatch!(info::String)
+    if length(dispatch_log) >= MAX_DISPATCH_LOG
+        popfirst!(dispatch_log)
     end
-    push!(_dispatch_log, info)
+    push!(dispatch_log, info)
 end
 
-# Auto-flush threshold: flush command buffer after this many dispatches to prevent
-# NVIDIA's GPU watchdog (Xid 109 = CTX SWITCH TIMEOUT) from killing long batches.
-# Set to 0 to disable auto-flush. Default tuned for NVIDIA mobile GPUs.
-const _auto_flush_threshold = Ref{Int}(16)
+# Auto-flush threshold: flush command buffer after this many dispatches.
+# Set to 0 to disable (default). Use set_auto_flush_threshold!(n) to enable.
+const auto_flush_threshold = Ref{Int}(0)
 
-# Max workgroups per single dispatch — prevents TDR timeout on NVIDIA GPUs.
-# Large dispatches (e.g., 18000 groups of complex material evaluation) are split
-# into multiple cmd_dispatch_base calls with flush between chunks.
-# 0 = no limit. Default 4096 = ~1M threads at wg256, safe for mobile NVIDIA.
-const _max_groups_per_dispatch = Ref{Int}(4096)
+# Max workgroups per single dispatch — splits large dispatches with flush.
+# 0 = no limit (default).
+const max_groups_per_dispatch = Ref{Int}(0)
 
 """
     set_max_groups_per_dispatch!(n::Integer)
 
 Set the maximum number of workgroups per single compute dispatch.
 Large dispatches are split into chunks using `vkCmdDispatchBase` to avoid
-NVIDIA GPU watchdog timeout (Xid 109). Set to 0 to disable. Default is 4096.
+NVIDIA GPU watchdog timeout (Xid 109). Set to 0 to disable.
 """
-set_max_groups_per_dispatch!(n::Integer) = (_max_groups_per_dispatch[] = Int(n))
+set_max_groups_per_dispatch!(n::Integer) = (max_groups_per_dispatch[] = Int(n))
 
 """
     set_auto_flush_threshold!(n::Integer)
 
 Set the maximum number of dispatches before an automatic `vk_flush!()`.
-Set to 0 to disable. Default is 16 (conservative for NVIDIA mobile GPUs).
+Set to 0 to disable.
 """
-set_auto_flush_threshold!(n::Integer) = (_auto_flush_threshold[] = Int(n))
+set_auto_flush_threshold!(n::Integer) = (auto_flush_threshold[] = Int(n))
 
 # ── Batch lifecycle ──
 
@@ -125,8 +119,8 @@ function reclaim_batch!(ctx::VkContext, batch::CommandBatch)
     end
 end
 
-function _maybe_auto_flush!()
-    threshold = _auto_flush_threshold[]
+function maybe_auto_flush!()
+    threshold = auto_flush_threshold[]
     threshold <= 0 && return
     ctx = vk_context()
     batch = ctx.active_batch
@@ -136,46 +130,33 @@ function _maybe_auto_flush!()
     end
 end
 
-# ── Dispatch Recording ──
+# ── Recording API ──
+#
+# All dispatch functions (compute, indirect, RT) use `record_dispatch!` to
+# handle the shared boilerplate: get batch, insert barrier, run user code,
+# update bookkeeping. The `do` block contains only the dispatch-specific
+# Vulkan commands.
 
 """
-    vk_dispatch!(pipeline::LavaComputePipeline, push_data::Vector{UInt8},
-                 groups::NTuple{3, Integer})
+    record_dispatch!(f, ctx; dst_stage, extra_dst_access=0, is_rt=false, info="")
 
-Record a compute dispatch into the batched command buffer.
-Call `vk_flush!()` to submit and wait for completion.
-"""
-function vk_dispatch!(pipeline::LavaComputePipeline, push_data::Vector{UInt8},
-                      groups::NTuple{3, Integer})
-    max_groups = _max_groups_per_dispatch[]
-    gx, gy, gz = Int(groups[1]), Int(groups[2]), Int(groups[3])
+Record a dispatch into the active command batch. Handles:
+1. Getting/creating the active batch
+2. Inserting a pipeline barrier if this isn't the first dispatch
+3. Calling `f(cmd)` with the command buffer
+4. Updating dispatch count, counter, and debug log
 
-    # Split large X-dimension dispatches to avoid GPU watchdog timeout (Xid 109).
-    # Uses vkCmdDispatchBase (Vulkan 1.1) which offsets GlobalInvocationID automatically.
-    if max_groups > 0 && gx > max_groups && gy == 1 && gz == 1
-        base = 0
-        while base < gx
-            chunk = min(max_groups, gx - base)
-            _vk_dispatch_base!(pipeline, push_data, base, 0, 0, chunk, 1, 1)
-            base += chunk
-            # Flush after each chunk to prevent TDR
-            vk_flush!()
-        end
-        return
+Example:
+    record_dispatch!(ctx; dst_stage=PIPELINE_STAGE_COMPUTE_SHADER_BIT, info="my_kernel") do cmd
+        Vulkan.cmd_bind_pipeline(cmd, ...)
+        Vulkan.cmd_dispatch(cmd, ...)
     end
-
-    _vk_dispatch_base!(pipeline, push_data, 0, 0, 0, gx, gy, gz)
-end
-
-"""Record a single compute dispatch with optional base group offset."""
-function _vk_dispatch_base!(pipeline::LavaComputePipeline, push_data::Vector{UInt8},
-                             base_x::Int, base_y::Int, base_z::Int,
-                             gx::Int, gy::Int, gz::Int)
-    # NOTE: _maybe_auto_flush!() is called by callers BEFORE get_arg_buffer(),
-    # not here. Flushing here would reset the arg buffer pool after the caller
-    # already allocated an arg buffer, causing the next dispatch to overwrite
-    # a still-pending dispatch's arg buffer data.
-    ctx = vk_context()
+"""
+function record_dispatch!(f, ctx::VkContext;
+                           dst_stage::Vulkan.PipelineStageFlag,
+                           extra_dst_access::Vulkan.AccessFlag=Vulkan.AccessFlag(0),
+                           is_rt::Bool=false,
+                           info::String="")
     batch = ensure_active_batch!(ctx)
     cmd = batch.cmd_buf
 
@@ -184,46 +165,114 @@ function _vk_dispatch_base!(pipeline::LavaComputePipeline, push_data::Vector{UIn
         src_stage = batch.last_was_rt ?
             Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR :
             Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT
-        barrier = Vulkan.MemoryBarrier(
-            C_NULL,
-            Vulkan.ACCESS_SHADER_WRITE_BIT,
-            Vulkan.ACCESS_SHADER_READ_BIT | Vulkan.ACCESS_SHADER_WRITE_BIT
-        )
-        Vulkan.cmd_pipeline_barrier(
-            cmd, [barrier], [], [];
-            src_stage_mask=src_stage,
-            dst_stage_mask=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT
-        )
+        dst_access = Vulkan.ACCESS_SHADER_READ_BIT | Vulkan.ACCESS_SHADER_WRITE_BIT | extra_dst_access
+        barrier = Vulkan.MemoryBarrier(C_NULL, Vulkan.ACCESS_SHADER_WRITE_BIT, dst_access)
+        Vulkan.cmd_pipeline_barrier(cmd, [barrier], [], [];
+            src_stage_mask=src_stage, dst_stage_mask=dst_stage)
     end
 
-    # Bind pipeline
-    Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline)
+    # Record the actual dispatch commands
+    f(cmd)
 
-    # Push constants (BDA pointer)
-    if !isempty(push_data)
-        GC.@preserve push_data begin
-            Vulkan.cmd_push_constants(
-                cmd, pipeline.pipeline_layout,
-                Vulkan.SHADER_STAGE_COMPUTE_BIT,
-                UInt32(0), UInt32(length(push_data)),
-                Ptr{Nothing}(pointer(push_data))
-            )
+    # Bookkeeping
+    batch.dispatch_count += 1
+    batch.last_was_rt = is_rt
+    Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, 1)
+    log_dispatch!("$(TOTAL_DISPATCH_COUNTER[]) $info")
+end
+
+"""
+    push_constants!(cmd, layout, stage_flags, push_data)
+
+Record push constant update. No-op if push_data is empty.
+"""
+function push_constants!(cmd::Vulkan.CommandBuffer, layout::Vulkan.PipelineLayout,
+                          stage_flags, push_data::Vector{UInt8})
+    isempty(push_data) && return
+    GC.@preserve push_data begin
+        Vulkan.cmd_push_constants(cmd, layout, stage_flags,
+            UInt32(0), UInt32(length(push_data)), Ptr{Nothing}(pointer(push_data)))
+    end
+end
+
+# ── Compute Dispatch ──
+
+"""
+    vk_dispatch!(pipeline, push_data, groups)
+
+Record a compute dispatch. Splits large dispatches if max_groups_per_dispatch is set.
+"""
+function vk_dispatch!(pipeline::LavaComputePipeline, push_data::Vector{UInt8},
+                      groups::NTuple{3, Integer})
+    limit = max_groups_per_dispatch[]
+    gx, gy, gz = Int(groups[1]), Int(groups[2]), Int(groups[3])
+
+    # Split large X-dimension dispatches if configured
+    if limit > 0 && gx > limit && gy == 1 && gz == 1
+        base = 0
+        while base < gx
+            chunk = min(limit, gx - base)
+            vk_dispatch_base!(pipeline, push_data, base, 0, 0, chunk, 1, 1)
+            base += chunk
+            vk_flush!()
+        end
+        return
+    end
+
+    vk_dispatch_base!(pipeline, push_data, 0, 0, 0, gx, gy, gz)
+end
+
+"""Record a single compute dispatch with optional base group offset."""
+function vk_dispatch_base!(pipeline::LavaComputePipeline, push_data::Vector{UInt8},
+                            base_x::Int, base_y::Int, base_z::Int,
+                            gx::Int, gy::Int, gz::Int)
+    # NOTE: maybe_auto_flush!() is called by callers BEFORE get_arg_buffer(),
+    # not here. Flushing here would reset the arg buffer pool after the caller
+    # already allocated an arg buffer.
+    ctx = vk_context()
+    info = last_dispatch_info[]
+
+    record_dispatch!(ctx;
+        dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        info="$info base=($base_x,$base_y,$base_z) g=($gx,$gy,$gz)"
+    ) do cmd
+        Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline)
+        push_constants!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_data)
+
+        if base_x == 0 && base_y == 0 && base_z == 0
+            Vulkan.cmd_dispatch(cmd, UInt32(gx), UInt32(gy), UInt32(gz))
+        else
+            Vulkan.cmd_dispatch_base(cmd,
+                UInt32(base_x), UInt32(base_y), UInt32(base_z),
+                UInt32(gx), UInt32(gy), UInt32(gz))
         end
     end
+end
 
-    # Dispatch with base offset (Vulkan 1.1 — offsets GlobalInvocationID)
-    if base_x == 0 && base_y == 0 && base_z == 0
-        Vulkan.cmd_dispatch(cmd, UInt32(gx), UInt32(gy), UInt32(gz))
-    else
-        Vulkan.cmd_dispatch_base(cmd,
-            UInt32(base_x), UInt32(base_y), UInt32(base_z),
-            UInt32(gx), UInt32(gy), UInt32(gz))
+# ── Indirect Dispatch ──
+
+"""
+    vk_dispatch_indirect!(pipeline, push_data, indirect_buf, indirect_offset=0)
+
+Record an indirect compute dispatch. The `indirect_buf` must contain a
+VkDispatchIndirectCommand (3×UInt32), written by a previous GPU kernel.
+"""
+function vk_dispatch_indirect!(pipeline::LavaComputePipeline, push_data::Vector{UInt8},
+                               indirect_buf, indirect_offset::Integer=0)
+    ctx = vk_context()
+    info = last_dispatch_info[]
+
+    record_dispatch!(ctx;
+        dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+        extra_dst_access=Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT,
+        info="$info (indirect)"
+    ) do cmd
+        Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline)
+        push_constants!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_data)
+
+        vk_buf = indirect_buf isa Vulkan.Buffer ? indirect_buf : indirect_buf.buffer
+        Vulkan.cmd_dispatch_indirect(cmd, vk_buf, UInt64(indirect_offset))
     end
-    batch.dispatch_count += 1
-    batch.last_was_rt = false
-    Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, 1)
-    info = _last_dispatch_info[]  # set by lava_launch!/ka_backend before calling vk_dispatch!
-    _log_dispatch!("$(TOTAL_DISPATCH_COUNTER[]) $info base=($base_x,$base_y,$base_z) g=($gx,$gy,$gz)")
 end
 
 # ── Flush ──
@@ -259,14 +308,14 @@ function vk_flush!()
     # Save dispatch info before any reset (for error reporting)
     saved_dispatch_count = batch.dispatch_count
     saved_last_was_rt = batch.last_was_rt
-    _prev_dispatch_info[] = _last_dispatch_info[]
+    prev_dispatch_info[] = last_dispatch_info[]
 
     submit_info = Vulkan.SubmitInfo([], [], [batch.cmd_buf], [])
     submit_result = Vulkan.queue_submit(ctx.queue, [submit_info]; fence=batch.fence)
     if iserror(submit_result)
         _device_lost[] = true
         reset_batch_on_error!()
-        _throw_with_validation_context("vkQueueSubmit", submit_result,
+        throw_with_validation_context("vkQueueSubmit", submit_result,
             saved_dispatch_count, saved_last_was_rt)
     end
 
@@ -274,82 +323,17 @@ function vk_flush!()
     if iserror(fence_result)
         _device_lost[] = true
         reset_batch_on_error!()
-        _throw_with_validation_context("vkWaitForFences", fence_result,
+        throw_with_validation_context("vkWaitForFences", fence_result,
             saved_dispatch_count, saved_last_was_rt)
     end
     unwrap(Vulkan.reset_fences(dev, [batch.fence]))
 
-    # Detach from context and reclaim — batch state reset happens inside reclaim_batch!
+    # Detach from context and reclaim
     ctx.active_batch = nothing
     reclaim_batch!(ctx, batch)
 
-    # Check GPU memory pressure after flush — this is a natural boundary
-    # where previous render's objects may be garbage-collectible.
+    # Check GPU memory pressure after flush
     maybe_collect()
-end
-
-# ── Indirect Dispatch ──
-
-"""
-    vk_dispatch_indirect!(pipeline::LavaComputePipeline, push_data::Vector{UInt8},
-                          indirect_buf::VkManagedBuffer, indirect_offset::Integer=0)
-
-Record an indirect compute dispatch into the batched command buffer.
-The `indirect_buf` must contain a VkDispatchIndirectCommand at the given offset
-(3×UInt32: groupCountX, groupCountY, groupCountZ), written by a previous GPU kernel.
-Call `vk_flush!()` to submit and wait for completion.
-"""
-function vk_dispatch_indirect!(pipeline::LavaComputePipeline, push_data::Vector{UInt8},
-                               indirect_buf, indirect_offset::Integer=0)
-    # NOTE: _maybe_auto_flush!() called by callers before get_arg_buffer()
-    ctx = vk_context()
-    batch = ensure_active_batch!(ctx)
-    cmd = batch.cmd_buf
-
-    # Memory barrier between dispatches (write→read synchronization)
-    # Must include ACCESS_INDIRECT_COMMAND_READ_BIT for vkCmdDispatchIndirect to
-    # correctly read group counts written by the prepare-indirect kernel.
-    if batch.dispatch_count > 0
-        src_stage = batch.last_was_rt ?
-            Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR :
-            Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT
-        barrier = Vulkan.MemoryBarrier(
-            C_NULL,
-            Vulkan.ACCESS_SHADER_WRITE_BIT,
-            Vulkan.ACCESS_SHADER_READ_BIT | Vulkan.ACCESS_SHADER_WRITE_BIT | Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT
-        )
-        Vulkan.cmd_pipeline_barrier(
-            cmd, [barrier], [], [];
-            src_stage_mask=src_stage,
-            dst_stage_mask=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT
-        )
-    end
-
-    # Bind pipeline
-    Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline)
-
-    # Push constants (BDA pointer)
-    if !isempty(push_data)
-        GC.@preserve push_data begin
-            Vulkan.cmd_push_constants(
-                cmd, pipeline.pipeline_layout,
-                Vulkan.SHADER_STAGE_COMPUTE_BIT,
-                UInt32(0), UInt32(length(push_data)),
-                Ptr{Nothing}(pointer(push_data))
-            )
-        end
-    end
-
-    # Indirect dispatch — reads group counts from GPU buffer
-    vk_buf = indirect_buf isa Vulkan.Buffer ? indirect_buf : indirect_buf.buffer
-    Vulkan.cmd_dispatch_indirect(cmd, vk_buf, UInt64(indirect_offset))
-    batch.dispatch_count += 1
-    batch.last_was_rt = false
-    Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, 1)
-    # Preserve caller's _last_dispatch_info (set before calling this function)
-    # and log the indirect dispatch with the kernel name
-    info = _last_dispatch_info[]
-    _log_dispatch!("$(TOTAL_DISPATCH_COUNTER[]) $info (indirect)")
 end
 
 # ── Data Lifetime ──
@@ -360,8 +344,6 @@ end
 Keep Julia objects alive until the next `vk_flush!()` completes.
 Prevents GC from freeing LavaArray backing buffers while the GPU is still
 reading from them via BDA addresses in the recorded command buffer.
-
-Typically called with the kernel args tuple before dispatch recording.
 """
 function keep_data_alive!(refs)
     ctx = vk_context()
@@ -373,13 +355,8 @@ end
 
 # ── Error Reporting ──
 
-"""
-    _throw_with_validation_context(call_name, err_result)
-
-Throw a LavaVulkanError enriched with recent validation layer messages.
-Called when vkQueueSubmit or vkWaitForFences returns an error (typically DEVICE_LOST).
-"""
-function _throw_with_validation_context(call_name::String, err_result,
+"""Throw a LavaError enriched with recent validation layer messages and dispatch log."""
+function throw_with_validation_context(call_name::String, err_result,
         dispatch_count::Int=0, last_was_rt::Bool=false)
     vk_err = unwrap_error(err_result)
     msgs = get_validation_messages()
@@ -390,17 +367,16 @@ function _throw_with_validation_context(call_name::String, err_result,
         "Last $n validation message(s):\n" * join(["  [$i] $(msgs[end-n+i])" for i in 1:n], "\n")
     end
 
-    # Include dispatch log for crash debugging
-    dispatch_detail = if isempty(_dispatch_log)
+    dispatch_detail = if isempty(dispatch_log)
         "No dispatches logged."
     else
-        "Recent dispatch log (last $(length(_dispatch_log))):\n" *
-        join(["  $d" for d in _dispatch_log], "\n")
+        "Recent dispatch log (last $(length(dispatch_log))):\n" *
+        join(["  $d" for d in dispatch_log], "\n")
     end
 
     total = TOTAL_DISPATCH_COUNTER[]
-    prev_info = _prev_dispatch_info[]
-    curr_info = _last_dispatch_info[]
+    prev_info = prev_dispatch_info[]
+    curr_info = last_dispatch_info[]
     throw(LavaError(
         call_name,
         """$vk_err after $dispatch_count dispatches in batch ($total total, last_was_rt=$last_was_rt)

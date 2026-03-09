@@ -7,16 +7,16 @@
 # Compilation is lazy — shaders are compiled on first use and cached.
 
 # Max rays per RT dispatch — prevents TDR timeout on NVIDIA GPUs.
-# RT indirect dispatches download the ray count and use direct dispatch.
-# 0 = no limit (use indirect dispatch). Default 0 (indirect is fine for most cases,
-# but set to e.g. 500000 if hitting TDR on NVIDIA laptop GPUs).
-const _max_rays_per_rt_dispatch = Ref{Int}(500_000)
+# Max rays per RT dispatch. When > 0, downloads ray count from GPU and dispatches
+# directly (adds CPU-GPU sync overhead). 0 = use indirect dispatch (no readback).
+# Default 0. Use set_max_rays_per_rt_dispatch!(n) if hitting TDR on specific scenes.
+const _max_rays_per_rt_dispatch = Ref{Int}(0)
 
 """
     set_max_rays_per_rt_dispatch!(n::Integer)
 
 Set the maximum number of rays per RT dispatch to avoid NVIDIA TDR timeout.
-Set to 0 to disable (use indirect dispatch). Default is 500000.
+Set to 0 to disable (use indirect dispatch, default).
 """
 set_max_rays_per_rt_dispatch!(n::Integer) = (_max_rays_per_rt_dispatch[] = Int(n))
 

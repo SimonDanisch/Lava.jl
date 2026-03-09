@@ -90,7 +90,7 @@ function lava_launch!(@nospecialize(f), args...;
 
     # Auto-flush BEFORE allocating arg buffer — if we flush after allocation,
     # the pool reset lets the next dispatch overwrite our buffer before submission.
-    _maybe_auto_flush!()
+    maybe_auto_flush!()
 
     # Compute total size: base layout + inline struct data
     # Uses LLVM byval sizes (not Julia sizeof) to avoid size mismatch for types
@@ -114,7 +114,7 @@ function lava_launch!(@nospecialize(f), args...;
     keep_data_alive!(args)
 
     # Dispatch (batched — call vk_flush!() to submit)
-    _last_dispatch_info[] = "compute f=$(nameof(typeof(f))) groups=$groups"
+    last_dispatch_info[] = "compute f=$(nameof(typeof(f))) groups=$groups"
     vk_dispatch!(pipeline, push_data, groups)
 
     return nothing

@@ -5075,8 +5075,58 @@ function _emit_insertelement!(state::SPIRVEmitterState, inst::LLVM.InsertElement
 end
 
 # ================================================================
-# Atomics (stubs — will be expanded)
+# Atomics
 # ================================================================
+
+"""
+Map LLVM atomic ordering + pointer storage class to SPIR-V memory semantics.
+
+With the Vulkan memory model (VulkanKHR), atomic operations need explicit
+MakeAvailableKHR/MakeVisibleKHR flags for writes to be visible across
+invocations. Without these, even seq_cst atomics provide only atomicity
+(correct counter values) but NOT memory visibility for non-atomic stores
+— which breaks cross-workgroup patterns like BVH refit where Thread A
+writes node data, atomics on a flag, and Thread B reads via the flag.
+"""
+function _atomic_mem_semantics(inst::LLVM.Instruction, ptr::LLVM.Value)::UInt32
+    ord = LLVM.ordering(inst)
+
+    # Determine storage class bit for the pointer's memory
+    sc = _get_pointer_storage_class(ptr)
+    sc_bit = if sc == SC.Workgroup
+        MemSem.WorkgroupMemory   # 0x100
+    else
+        # StorageBuffer, PhysicalStorageBuffer, Uniform all use UniformMemory
+        MemSem.UniformMemory     # 0x40
+    end
+
+    if ord == LLVM.API.LLVMAtomicOrderingMonotonic ||
+       ord == LLVM.API.LLVMAtomicOrderingUnordered
+        # Relaxed — just atomicity, no ordering
+        return MemSem.Relaxed
+    elseif ord == LLVM.API.LLVMAtomicOrderingAcquire
+        return MemSem.Acquire | sc_bit | MemSem.MakeVisibleKHR
+    elseif ord == LLVM.API.LLVMAtomicOrderingRelease
+        return MemSem.Release | sc_bit | MemSem.MakeAvailableKHR
+    else
+        # AcquireRelease or SequentiallyConsistent
+        # Vulkan memory model doesn't support SequentiallyConsistent;
+        # AcquireRelease + MakeAvailable + MakeVisible is the equivalent.
+        return MemSem.AcquireRelease | sc_bit | MemSem.MakeAvailableKHR | MemSem.MakeVisibleKHR
+    end
+end
+
+"""Acquire-only variant for cmpxchg failure path (no release, a failed CAS writes nothing)."""
+function _atomic_mem_semantics_acquire_only(inst::LLVM.Instruction, ptr::LLVM.Value)::UInt32
+    ord = LLVM.ordering(inst)
+    if ord == LLVM.API.LLVMAtomicOrderingMonotonic ||
+       ord == LLVM.API.LLVMAtomicOrderingUnordered
+        return MemSem.Relaxed
+    end
+    sc = _get_pointer_storage_class(ptr)
+    sc_bit = sc == SC.Workgroup ? MemSem.WorkgroupMemory : MemSem.UniformMemory
+    return MemSem.Acquire | sc_bit | MemSem.MakeVisibleKHR
+end
 
 function _emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
     ops = LLVM.operands(inst)
@@ -5095,9 +5145,8 @@ function _emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
     # and doesn't require VulkanMemoryModelDeviceScopeKHR capability
     scope_id = emit_constant_u32!(state.mod, Scope.QueueFamily)
 
-    # Memory semantics — use Relaxed for monotonic ordering
-    # For Vulkan storage buffers, no additional semantics flags needed for relaxed
-    mem_sem_id = emit_constant_u32!(state.mod, MemSem.Relaxed)
+    # Memory semantics — derived from LLVM ordering + pointer storage class
+    mem_sem_id = emit_constant_u32!(state.mod, _atomic_mem_semantics(inst, ptr))
 
     # Map LLVM atomicrmw operation to SPIR-V opcode
     binop = LLVM.API.LLVMGetAtomicRMWBinOp(inst)
@@ -5175,9 +5224,11 @@ function _emit_cmpxchg!(state::SPIRVEmitterState, inst::LLVM.AtomicCmpXchgInst)
 
     # Scope — QueueFamily (equivalent to Device for single-queue, no extra capability)
     scope_id = emit_constant_u32!(state.mod, Scope.QueueFamily)
-    # Memory semantics — Relaxed for monotonic
-    mem_sem_equal_id = emit_constant_u32!(state.mod, MemSem.Relaxed)
-    mem_sem_unequal_id = emit_constant_u32!(state.mod, MemSem.Relaxed)
+    # Memory semantics — derived from LLVM ordering + pointer storage class
+    mem_sem = _atomic_mem_semantics(inst, ptr)
+    mem_sem_equal_id = emit_constant_u32!(state.mod, mem_sem)
+    # Failure semantics: acquire-only (failed CAS doesn't release)
+    mem_sem_unequal_id = emit_constant_u32!(state.mod, _atomic_mem_semantics_acquire_only(inst, ptr))
 
     # Reinterpret pointer if pointee type doesn't match value type (byte-offset GEPs)
     ptr_pointee = get_pointee_type(state.type_ctx.ptm, ptr)
