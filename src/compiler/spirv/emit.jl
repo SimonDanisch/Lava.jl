@@ -3825,6 +3825,9 @@ function _emit_ret!(state::SPIRVEmitterState, inst::LLVM.RetInst)
 end
 
 function _emit_br!(state::SPIRVEmitterState, inst::LLVM.BrInst)
+    # Skip if block was already terminated by OpIgnoreIntersectionKHR/OpTerminateRayKHR
+    state.rt_block_terminated && return
+
     current_bb = LLVM.parent(inst)
 
     if LLVM.isconditional(inst)
