@@ -35,6 +35,16 @@ function log_dispatch!(info::String)
     push!(dispatch_log, info)
 end
 
+# Register cleanup callback for vk_reset_device!
+push!(_reset_callbacks, function()
+    FLUSH_COUNTER[] = 0
+    TOTAL_DISPATCH_COUNTER[] = 0
+    last_dispatch_info[] = ""
+    prev_dispatch_info[] = ""
+    empty!(dispatch_log)
+    dispatch_logging_enabled[] = false
+end)
+
 # Pre-allocated barrier buffer using raw VkMemoryBarrier (isbits).
 # Vulkan.jl's MemoryBarrier wrapper allocates ~1.2KB per cmd_pipeline_barrier call
 # due to high-level → low-level struct conversion. Using direct ccall with the raw
@@ -60,6 +70,14 @@ const _push_bda_ref = Ref{UInt64}(0)
 # Auto-flush threshold: flush command buffer after this many dispatches.
 # Set to 0 to disable (default). Use set_auto_flush_threshold!(n) to enable.
 const auto_flush_threshold = Ref{Int}(0)
+
+# CB split threshold: seal the current command buffer and start a new one after
+# this many dispatches per segment. All segments are submitted in a single
+# vkQueueSubmit. This avoids NVIDIA driver crashes from enormous command buffers
+# (30k+ dispatches) while maintaining single-submit efficiency.
+# Default 3000 ≈ 1 Hikari volpath sample (50 bounces × 60 dispatches/bounce).
+# Set to 0 to disable splitting.
+const cb_split_threshold = Ref{Int}(3000)
 
 # Max workgroups per single dispatch — splits large dispatches with flush.
 # 0 = no limit (default).
@@ -121,24 +139,35 @@ end
 
 """Allocate a new CommandBatch (new command buffer + fence from the pool)."""
 function allocate_batch(ctx::VkContext)
-    dev = ctx.device
+    cmd_buf = _alloc_cmd_buf(ctx)
+    fence = Vulkan.Fence(ctx.device)
+    data_refs = Any[]
+    sizehint!(data_refs, 128)  # Pre-size for typical batch (avoids Vector growth allocs)
+    return CommandBatch(cmd_buf, fence, false, 0, 0, false, data_refs, String[], Vulkan.CommandBuffer[])
+end
+
+"""Allocate a command buffer from the free pool, or create a new one."""
+function _alloc_cmd_buf(ctx::VkContext)
+    if !isempty(ctx.free_cmd_bufs)
+        return pop!(ctx.free_cmd_bufs)
+    end
     alloc_info = Vulkan.CommandBufferAllocateInfo(
         ctx.cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1
     )
-    cmd_bufs = unwrap(Vulkan.allocate_command_buffers(dev, alloc_info))
-    fence = Vulkan.Fence(dev)
-    data_refs = Any[]
-    sizehint!(data_refs, 128)  # Pre-size for typical batch (avoids Vector growth allocs)
-    return CommandBatch(cmd_bufs[1], fence, false, 0, false, data_refs, String[])
+    return unwrap(Vulkan.allocate_command_buffers(ctx.device, alloc_info))[1]
 end
 
 """Reclaim a completed batch: reset fence, clear data refs, return to free pool."""
 function reclaim_batch!(ctx::VkContext, batch::CommandBatch)
     batch.recording = false
     batch.dispatch_count = 0
+    batch.segment_dispatches = 0
     batch.last_was_rt = false
     empty!(batch.data_refs)
     empty!(batch.dispatch_log)
+    # Return sealed CB segments to the free pool for reuse
+    append!(ctx.free_cmd_bufs, batch.sealed_cmd_bufs)
+    empty!(batch.sealed_cmd_bufs)
     push!(ctx.free_batches, batch)
 
     # When ALL in-flight batches are done, safe to reset pools and flush deferred frees
@@ -158,6 +187,34 @@ function maybe_auto_flush!()
     if batch.recording && batch.dispatch_count >= threshold
         vk_flush!()
     end
+end
+
+"""
+    _maybe_split_cb!(batch, ctx)
+
+If the current CB segment has reached `cb_split_threshold` dispatches, seal it
+and start a fresh CB. The sealed CB is stored in `batch.sealed_cmd_bufs` and will
+be submitted alongside the active CB in `vk_flush!`.
+
+Barriers work across CB boundaries per Vulkan spec — submission order defines
+the scope of pipeline barriers, not command buffer boundaries.
+"""
+function _maybe_split_cb!(batch::CommandBatch, ctx::VkContext)
+    threshold = cb_split_threshold[]
+    threshold <= 0 && return
+    batch.segment_dispatches < threshold && return
+
+    # Seal current CB
+    unwrap(Vulkan.end_command_buffer(batch.cmd_buf))
+    push!(batch.sealed_cmd_bufs, batch.cmd_buf)
+
+    # Start fresh CB segment
+    batch.cmd_buf = _alloc_cmd_buf(ctx)
+    unwrap(Vulkan.begin_command_buffer(batch.cmd_buf, Vulkan.CommandBufferBeginInfo(
+        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    )))
+    batch.segment_dispatches = 0
+    # recording stays true; dispatch_count stays (for barrier logic + total tracking)
 end
 
 # ── Recording API ──
@@ -215,11 +272,15 @@ function record_dispatch!(f, ctx::VkContext;
 
     # Bookkeeping
     batch.dispatch_count += 1
+    batch.segment_dispatches += 1
     batch.last_was_rt = is_rt
     Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, 1)
     if dispatch_logging_enabled[]
         log_dispatch!("$(TOTAL_DISPATCH_COUNTER[]) $info")
     end
+
+    # Split to a new CB if this segment is full
+    _maybe_split_cb!(batch, ctx)
 end
 
 """
@@ -344,7 +405,8 @@ end
 Submit the active command batch and wait for GPU completion.
 """
 function vk_flush!()
-    _device_lost[] && error("Cannot flush: Vulkan device lost. Restart Julia session.")
+    _device_lost[] && throw(LavaError("command flush", "Vulkan device lost",
+        "Call Lava.vk_reset_device!() to reinitialize, or restart Julia session."))
     ctx = vk_context()
     batch = ctx.active_batch
     batch === nothing && return
@@ -358,20 +420,34 @@ function vk_flush!()
     function reset_batch_on_error!()
         batch.recording = false
         batch.dispatch_count = 0
+        batch.segment_dispatches = 0
         batch.last_was_rt = false
         empty!(batch.data_refs)
+        # Return sealed CBs to free pool even on error
+        append!(ctx.free_cmd_bufs, batch.sealed_cmd_bufs)
+        empty!(batch.sealed_cmd_bufs)
         ctx.active_batch = nothing
         push!(ctx.free_batches, batch)
     end
 
     unwrap(Vulkan.end_command_buffer(batch.cmd_buf))
 
+    # Collect all CB segments: sealed ones first (in order), then the active one.
+    # We build a temporary vector for submission — don't mutate sealed_cmd_bufs
+    # since reclaim_batch! will return those to the free pool separately.
+    n_sealed = length(batch.sealed_cmd_bufs)
+    all_cmd_bufs = Vector{Vulkan.CommandBuffer}(undef, n_sealed + 1)
+    for i in 1:n_sealed
+        all_cmd_bufs[i] = batch.sealed_cmd_bufs[i]
+    end
+    all_cmd_bufs[n_sealed + 1] = batch.cmd_buf
+
     # Save dispatch info before any reset (for error reporting)
     saved_dispatch_count = batch.dispatch_count
     saved_last_was_rt = batch.last_was_rt
     prev_dispatch_info[] = last_dispatch_info[]
 
-    submit_info = Vulkan.SubmitInfo([], [], [batch.cmd_buf], [])
+    submit_info = Vulkan.SubmitInfo([], [], all_cmd_bufs, [])
     submit_result = Vulkan.queue_submit(ctx.queue, [submit_info]; fence=batch.fence)
     if iserror(submit_result)
         _device_lost[] = true
@@ -488,6 +564,24 @@ Crashed batch dispatch: $prev_info
 Triggered by recording: $curr_info
 $validation_detail
 $dispatch_detail""",
-        "DEVICE_LOST usually means invalid SPIR-V, out-of-bounds BDA access, or GPU timeout (Xid 109). Check dispatch log above for the crashing kernel."
+        "DEVICE_LOST usually means invalid SPIR-V, out-of-bounds BDA access, or GPU timeout (Xid 109). Check dispatch log above for the crashing kernel. Call Lava.vk_reset_device!() to reinitialize."
     ))
 end
+
+# ── Debugging API ──
+
+"""
+    set_dispatch_logging!(enabled::Bool)
+
+Enable or disable dispatch name logging. When enabled, each dispatch records
+its kernel name and parameters for crash debugging. Disabled by default for
+zero-alloc performance. Auto-enabled on DEVICE_LOST.
+"""
+set_dispatch_logging!(enabled::Bool) = (dispatch_logging_enabled[] = enabled)
+
+"""
+    get_dispatch_log() -> Vector{String}
+
+Return a copy of the recent dispatch log (up to $MAX_DISPATCH_LOG entries).
+"""
+get_dispatch_log() = copy(dispatch_log)

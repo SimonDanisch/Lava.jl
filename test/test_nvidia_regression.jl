@@ -443,3 +443,119 @@ end
         end
     end
 end
+
+# ═══════════════════════════════════════════════════════════════════════
+# Fix 10: Multi-CB auto-split for large command buffers
+#
+# Symptom: DEVICE_LOST at vkQueueSubmit when a single command buffer
+# accumulated 30k+ dispatches (e.g. Hikari volpath 10spp: 50 bounces ×
+# 60 dispatches/bounce × 10 samples = 30,000). NVIDIA driver's internal
+# command buffer processing fails on very large CBs.
+#
+# Fix: Automatically seal the current CB and start a fresh one when
+# dispatches per segment reach cb_split_threshold. All segments are
+# submitted in a single vkQueueSubmit call, preserving barrier semantics.
+# ═══════════════════════════════════════════════════════════════════════
+
+@testset "Fix 10: Multi-CB auto-split" begin
+    @kernel function cb_split_inc!(a)
+        i = @index(Global)
+        @inbounds a[i] += 1.0f0
+    end
+
+    backend = Lava.LavaBackend()
+
+    # Test 1: Splitting occurs at threshold
+    @testset "Split at threshold" begin
+        old_threshold = Lava.cb_split_threshold[]
+        Lava.cb_split_threshold[] = 100  # Low threshold for fast test
+
+        a = Lava.LavaArray(zeros(Float32, 64))
+        kernel = cb_split_inc!(backend)
+        for _ in 1:350
+            kernel(a; ndrange=64)
+        end
+
+        ctx = Lava.vk_context()
+        batch = ctx.active_batch
+        @test batch !== nothing
+        @test batch.dispatch_count == 350
+        @test length(batch.sealed_cmd_bufs) == 3  # 100+100+100 sealed, 50 active
+        @test batch.segment_dispatches == 50
+
+        Lava.vk_flush!()
+        @test Array(a) == fill(350.0f0, 64)
+        # Sealed CBs returned to free pool
+        @test length(batch.sealed_cmd_bufs) == 0
+
+        Lava.cb_split_threshold[] = old_threshold
+    end
+
+    # Test 2: Splitting disabled (threshold=0)
+    @testset "Splitting disabled" begin
+        old_threshold = Lava.cb_split_threshold[]
+        Lava.cb_split_threshold[] = 0
+
+        a = Lava.LavaArray(zeros(Float32, 64))
+        kernel = cb_split_inc!(backend)
+        for _ in 1:500
+            kernel(a; ndrange=64)
+        end
+
+        ctx = Lava.vk_context()
+        batch = ctx.active_batch
+        @test batch.dispatch_count == 500
+        @test length(batch.sealed_cmd_bufs) == 0  # No splitting
+
+        Lava.vk_flush!()
+        @test Array(a) == fill(500.0f0, 64)
+
+        Lava.cb_split_threshold[] = old_threshold
+    end
+
+    # Test 3: Multiple flushes with splitting produce correct results
+    @testset "Multiple flushes with splitting" begin
+        old_threshold = Lava.cb_split_threshold[]
+        Lava.cb_split_threshold[] = 50
+
+        a = Lava.LavaArray(zeros(Float32, 64))
+        kernel = cb_split_inc!(backend)
+
+        # First pass: 200 dispatches → 3 sealed + 1 active
+        for _ in 1:200
+            kernel(a; ndrange=64)
+        end
+        Lava.vk_flush!()
+        @test Array(a) == fill(200.0f0, 64)
+
+        # Second pass: reuses CB pool, another 200 dispatches
+        for _ in 1:200
+            kernel(a; ndrange=64)
+        end
+        Lava.vk_flush!()
+        @test Array(a) == fill(400.0f0, 64)
+
+        Lava.cb_split_threshold[] = old_threshold
+    end
+
+    # Test 4: Large dispatch count (simulating Hikari-scale workload)
+    @testset "5000 dispatches" begin
+        a = Lava.LavaArray(zeros(Float32, 256))
+        kernel = cb_split_inc!(backend)
+        for _ in 1:5000
+            kernel(a; ndrange=256)
+        end
+
+        ctx = Lava.vk_context()
+        batch = ctx.active_batch
+        @test batch.dispatch_count == 5000
+        threshold = Lava.cb_split_threshold[]
+        if threshold > 0
+            expected_sealed = div(5000, threshold) - (5000 % threshold == 0 ? 1 : 0)
+            @test length(batch.sealed_cmd_bufs) >= 1
+        end
+
+        Lava.vk_flush!()
+        @test Array(a) == fill(5000.0f0, 256)
+    end
+end

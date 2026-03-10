@@ -16,6 +16,14 @@ struct LavaComputePipeline
 end
 
 const _pipeline_cache = Dict{UInt64, LavaComputePipeline}()
+const _pipeline_insertion_order = UInt64[]
+const _max_pipeline_cache_size = Ref(1024)
+
+# Register cleanup callback for vk_reset_device!
+push!(_reset_callbacks, function()
+    empty!(_pipeline_cache)
+    empty!(_pipeline_insertion_order)
+end)
 
 """
     get_compute_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String;
@@ -72,5 +80,11 @@ function get_compute_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String;
 
     result = LavaComputePipeline(shader_mod, layout, pipeline, UInt32(push_constant_size))
     _pipeline_cache[cache_key] = result
+    push!(_pipeline_insertion_order, cache_key)
+    # Evict oldest pipeline if cache is full
+    while length(_pipeline_insertion_order) > _max_pipeline_cache_size[]
+        old_key = popfirst!(_pipeline_insertion_order)
+        delete!(_pipeline_cache, old_key)
+    end
     return result
 end

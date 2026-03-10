@@ -28,6 +28,24 @@ const _live_buffers = Set{VkManagedBuffer}()
 # Processed after vk_flush!() completes (GPU is idle, safe to destroy).
 const DEFERRED_FREES = VkManagedBuffer[]
 
+# Deferred free warning threshold: warn if more than this many buffers
+# are deferred in a single flush cycle (suggests missing keep_data_alive! calls).
+const _deferred_free_warn_threshold = Ref(100)
+
+# Poison value for freed buffer addresses — enables use-after-free detection.
+const _BDA_POISON = 0xDEAD_DEAD_DEAD_DEAD
+
+# Register cleanup callback for vk_reset_device!
+push!(_reset_callbacks, function()
+    empty!(DEFERRED_FREES)
+    empty!(_live_buffers)
+    GPU_LIVE_BYTES[] = 0
+    GPU_BYTES_SINCE_LAST_GC[] = 0
+    STAGING_BUF[] = nothing
+    empty!(_indirect_buffers)
+    _indirect_buffer_idx[] = 0
+end)
+
 # ── GPU memory pressure tracking ──
 # Julia's GC doesn't know about GPU memory. LavaArray wrappers are ~50 bytes on
 # the CPU heap, but back 100+ MB of VRAM each. Without pressure signals, GC
@@ -81,6 +99,27 @@ Optional `extra_usage` adds additional `VkBufferUsageFlags` (e.g. for SBT buffer
 """
 function vk_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0))
     maybe_collect()
+    result = _try_vk_alloc(nbytes; extra_usage)
+    if result !== nothing
+        return result
+    end
+    # OOM — aggressive GC + flush deferred frees, then retry once
+    GC.gc(true)
+    flush_deferred_frees!()
+    result = _try_vk_alloc(nbytes; extra_usage)
+    if result !== nothing
+        @info "Lava: GPU allocation succeeded after GC retry" bytes=nbytes
+        return result
+    end
+    live_mb = GPU_LIVE_BYTES[] ÷ (1024 * 1024)
+    req_mb = nbytes ÷ (1024 * 1024)
+    throw(LavaError("memory allocation",
+        "Out of GPU memory. Requested $(req_mb) MiB ($(nbytes) bytes), currently $(live_mb) MiB live in $(length(_live_buffers)) buffers.",
+        "Free unused LavaArrays, reduce problem size, or check for memory leaks with Lava.gpu_memory_usage()."))
+end
+
+"""Attempt GPU buffer allocation, returning nothing on OOM."""
+function _try_vk_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0))
     dev = vk_device()
     nbytes = max(nbytes, 16)  # Vulkan requires non-zero size
 
@@ -92,28 +131,40 @@ function vk_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0))
         usage |= Vulkan.BufferUsageFlag(extra_usage)
     end
 
-    buf = Vulkan.Buffer(
-        dev, nbytes,
-        usage,
-        Vulkan.SHARING_MODE_EXCLUSIVE,
-        UInt32[]
-    )
+    local buf, memory
+    try
+        buf = Vulkan.Buffer(
+            dev, nbytes,
+            usage,
+            Vulkan.SHARING_MODE_EXCLUSIVE,
+            UInt32[]
+        )
 
-    mem_reqs = Vulkan.get_buffer_memory_requirements(dev, buf)
-    mem_type_idx = _find_memory_type(
-        mem_reqs.memory_type_bits,
-        Vulkan.MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-    )
+        mem_reqs = Vulkan.get_buffer_memory_requirements(dev, buf)
+        mem_type_idx = _find_memory_type(
+            mem_reqs.memory_type_bits,
+            Vulkan.MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+        )
 
-    alloc_flags = Vulkan.MemoryAllocateFlagsInfo(
-        UInt32(0);  # device_mask (0 = all devices)
-        flags=Vulkan.MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
-    )
-    memory = Vulkan.DeviceMemory(
-        dev, mem_reqs.size, mem_type_idx;
-        next=alloc_flags
-    )
-    unwrap(Vulkan.bind_buffer_memory(dev, buf, memory, 0))
+        alloc_flags = Vulkan.MemoryAllocateFlagsInfo(
+            UInt32(0);  # device_mask (0 = all devices)
+            flags=Vulkan.MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+        )
+        memory = Vulkan.DeviceMemory(
+            dev, mem_reqs.size, mem_type_idx;
+            next=alloc_flags
+        )
+        unwrap(Vulkan.bind_buffer_memory(dev, buf, memory, 0))
+    catch e
+        # Catch Vulkan OOM errors — let other errors propagate
+        if e isa Vulkan.VulkanError || (e isa LavaError && occursin("memory", e.operation))
+            # Drain validation messages from the failed allocation — they are expected
+            # and should not leak into the next check_validation_errors!() call.
+            empty!(_validation_messages)
+            return nothing
+        end
+        rethrow()
+    end
 
     # Query BDA
     addr_info = Vulkan.BufferDeviceAddressInfo(buf)
@@ -137,6 +188,10 @@ finalizers freeing GPU memory that the in-flight command buffer still
 references via BDA addresses.
 """
 function vk_free!(buf::VkManagedBuffer)
+    if buf.address == _BDA_POISON
+        @warn "Lava: double-free detected on VkManagedBuffer (address already poisoned)" maxlog=1
+        return
+    end
     buf.size == 0 && return  # Already freed
 
     delete!(_live_buffers, buf)
@@ -162,6 +217,7 @@ function _destroy_buffer!(buf::VkManagedBuffer)
     # After DEVICE_LOST, all Vulkan handles are invalid — skip destruction to avoid segfault.
     if _device_lost[]
         buf.mapped_ptr = Ptr{UInt8}(0)
+        buf.address = _BDA_POISON
         Threads.atomic_sub!(GPU_LIVE_BYTES, buf.size)
         buf.size = 0
         return
@@ -176,6 +232,7 @@ function _destroy_buffer!(buf::VkManagedBuffer)
     # so the GC finalizer's second call will be a no-op (refcount underflows, iszero → false).
     buf.buffer.destructor()
     buf.memory.destructor()
+    buf.address = _BDA_POISON  # Poison BDA so use-after-free is detectable
     Threads.atomic_sub!(GPU_LIVE_BYTES, buf.size)
     buf.size = 0
 end
@@ -184,10 +241,14 @@ end
 function flush_deferred_frees!()
     isempty(DEFERRED_FREES) && return
     n = length(DEFERRED_FREES)
-    # Debug warning: deferred frees indicate a GC finalizer fired during recording.
-    # This is safely handled (Layer 2), but frequent occurrences suggest Layer 1
-    # (keep_data_alive!) is missing on a dispatch path. Investigate if this fires often.
-    @debug "Lava: flushing $n deferred buffer frees (GC fired during recording)"
+    # Deferred frees mean GC finalizers fired during recording — safely handled (Layer 2),
+    # but many deferred frees suggest Layer 1 (keep_data_alive!) is missing on a dispatch path.
+    threshold = _deferred_free_warn_threshold[]
+    if n > threshold
+        @warn "Lava: flushing $n deferred buffer frees (threshold=$threshold) — frequent GC during recording may indicate missing keep_data_alive!() calls"
+    else
+        @debug "Lava: flushing $n deferred buffer frees"
+    end
     for buf in DEFERRED_FREES
         _destroy_buffer!(buf)
     end
@@ -342,7 +403,8 @@ end
 function _one_shot_copy(src::Vulkan.Buffer, src_offset::Integer,
                         dst::Vulkan.Buffer, dst_offset::Integer,
                         nbytes::Integer)
-    _device_lost[] && error("Cannot copy: Vulkan device lost. Restart Julia session.")
+    _device_lost[] && throw(LavaError("buffer copy", "Vulkan device lost",
+        "Call Lava.vk_reset_device!() to reinitialize, or restart Julia session."))
     ctx = vk_context()
     dev = ctx.device
 

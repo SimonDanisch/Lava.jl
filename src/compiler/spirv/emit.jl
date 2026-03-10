@@ -116,6 +116,83 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
     )
 end
 
+# ================================================================
+# Source Location Extraction
+# ================================================================
+
+"""
+    _extract_source_location(inst::LLVM.Instruction) -> Union{Nothing, Tuple{String, Int}}
+
+Extract the Julia source file and line number from an LLVM instruction's debug metadata.
+Walks the `inlined_at` chain to find the outermost user source location, since LLVM
+inlines everything and the leaf location is typically in Julia Base (e.g. pointer.jl).
+
+Returns `nothing` if no debug info is attached.
+"""
+function _extract_source_location(inst::LLVM.Instruction)
+    md = LLVM.metadata(inst)
+    haskey(md, LLVM.MD_dbg) || return nothing
+    dbg = md[LLVM.MD_dbg]
+    dbg isa LLVM.DILocation || return nothing
+    line = LLVM.line(dbg)
+    line == 0 && return nothing
+
+    # Walk the inlined_at chain to collect all locations from leaf to root.
+    # The root (outermost) is the user's kernel code. The leaf is the inlined
+    # Base function (pointer.jl, float.jl, etc.).
+    best_file = _diloc_file(dbg)
+    best_line = Int(line)
+
+    loc = dbg
+    while true
+        inlined = try LLVM.inlined_at(loc) catch; nothing end
+        (inlined === nothing || !(inlined isa LLVM.DILocation)) && break
+        il = LLVM.line(inlined)
+        il == 0 && break
+        f = _diloc_file(inlined)
+        if !isempty(f)
+            best_file = f
+            best_line = Int(il)
+        end
+        loc = inlined
+    end
+
+    isempty(best_file) && return nothing
+    return (best_file, best_line)
+end
+
+"""Extract file path from a DILocation's scope."""
+function _diloc_file(dbg::LLVM.DILocation)
+    try
+        scope = LLVM.scope(dbg)
+        f = LLVM.file(scope)
+        dir = LLVM.directory(f)
+        name = LLVM.filename(f)
+        if isempty(dir)
+            return string(name)
+        end
+        # Avoid double slashes: "./foo" with dir "." → "./foo", not ".//foo"
+        if startswith(name, "/")
+            return string(name)
+        end
+        return string(dir, "/", name)
+    catch
+        ""
+    end
+end
+
+"""
+    _record_source_location!(state, spirv_id, inst)
+
+Record the source location of `inst` for SPIR-V result ID `spirv_id`.
+Called after every `fresh_id!` during instruction emission.
+"""
+function _record_source_location!(state::SPIRVEmitterState, spirv_id::UInt32, inst::LLVM.Instruction)
+    loc = _extract_source_location(inst)
+    loc === nothing && return
+    state.mod.source_locations[spirv_id] = loc
+end
+
 """
     _emit_psb_ptr_reinterpret!(state, target_ptr_ty_id, source_id) -> UInt32
 
@@ -538,6 +615,9 @@ end
 # ================================================================
 
 function emit_instruction!(state::SPIRVEmitterState, inst::LLVM.Instruction)
+    # Track SPIR-V ID before/after to record source mapping
+    id_before = state.mod.next_id
+
     # Dispatch on instruction type
     if inst isa LLVM.RetInst
         _emit_ret!(state, inst)
@@ -659,6 +739,19 @@ function emit_instruction!(state::SPIRVEmitterState, inst::LLVM.Instruction)
         encode_instruction!(state.mod.functions, Op.OpReturn)
     else
         error("Unsupported LLVM instruction: $(typeof(inst)): $inst")
+    end
+
+    # Record source location for all SPIR-V IDs allocated during this instruction.
+    # Most instructions allocate 1 ID (the result), some allocate multiple (e.g. PSB
+    # decomposition). We map all of them to the same Julia source location.
+    id_after = state.mod.next_id
+    if id_after > id_before
+        loc = _extract_source_location(inst)
+        if loc !== nothing
+            for id in id_before:(id_after - UInt32(1))
+                state.mod.source_locations[id] = loc
+            end
+        end
     end
 end
 

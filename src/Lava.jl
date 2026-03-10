@@ -2,6 +2,9 @@ module Lava
 
 export LavaArray, LavaBackend, LavaBuffer, LavaDeviceArray
 export CompilationResult, lava_compile, optimize_spirv
+# Debugging & diagnostics
+export vk_reset_device!, dump_state, gpu_memory_usage
+export set_dispatch_logging!, get_dispatch_log
 
 # Graphics exports
 export GraphicsPipeline, Rasterizer, TrianglePipeline, LinePipeline
@@ -125,6 +128,52 @@ include("raytracing/raycore_compat.jl") # HardwareAccel + trace_closest_hits!
 # ---- Default settings ----
 # Disable scalar indexing by default (GPU arrays should not be accessed element-by-element)
 GPUArraysCore.allowscalar(false)
+
+# ---- Debugging & Diagnostics API ----
+
+"""
+    gpu_memory_usage() -> NamedTuple
+
+Return current GPU memory usage statistics.
+"""
+function gpu_memory_usage()
+    (live_bytes = GPU_LIVE_BYTES[],
+     live_buffers = length(_live_buffers),
+     deferred_frees = length(DEFERRED_FREES),
+     arg_buffers_pooled = length(_arg_buffers),
+     pipelines_cached = length(_pipeline_cache),
+     kernels_cached = length(_kernel_cache))
+end
+
+"""
+    dump_state(; io::IO=stdout)
+
+Print a comprehensive summary of Lava.jl runtime state for debugging.
+"""
+function dump_state(; io::IO=stdout)
+    ctx = _vk_context[]
+    println(io, "=== Lava.jl State ===")
+    println(io, "Device: ", ctx === nothing ? "not initialized" : ctx.device_name)
+    println(io, "Device lost: ", _device_lost[])
+    mem = gpu_memory_usage()
+    live_mb = mem.live_bytes ÷ (1024 * 1024)
+    println(io, "GPU memory: $(live_mb) MiB in $(mem.live_buffers) buffers ($(mem.deferred_frees) deferred)")
+    println(io, "Pipelines cached: $(mem.pipelines_cached) (max $(_max_pipeline_cache_size[]))")
+    println(io, "Kernels cached: $(mem.kernels_cached) (max $(_max_kernel_cache_size[]))")
+    println(io, "Arg buffers pooled: $(mem.arg_buffers_pooled) (idx=$(_arg_buffer_idx[]))")
+    if ctx !== nothing
+        println(io, "Free batches: $(length(ctx.free_batches))")
+        println(io, "Free cmd bufs: $(length(ctx.free_cmd_bufs))")
+        println(io, "CB split threshold: $(cb_split_threshold[])")
+    end
+    println(io, "Flushes: $(FLUSH_COUNTER[])")
+    println(io, "Total dispatches: $(TOTAL_DISPATCH_COUNTER[])")
+    println(io, "Dispatch logging: $(dispatch_logging_enabled[])")
+    if !isempty(dispatch_log)
+        println(io, "Last dispatch: ", last(dispatch_log))
+    end
+    return nothing
+end
 
 function __init__()
     # Reset runtime counters that should not survive precompilation.

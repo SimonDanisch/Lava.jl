@@ -176,7 +176,7 @@ function _emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
     # Struct layout decorations
     decorate_psb_struct_layouts!(type_ctx, llvm_mod)
 
-    return serialize(spirv_mod)
+    return serialize(spirv_mod), spirv_mod.source_locations
 end
 
 # ── Execution Modes ──

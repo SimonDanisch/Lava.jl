@@ -119,6 +119,7 @@ KA.argconvert(::KA.Kernel{LavaBackend}, arg) = Adapt.adapt(LavaAdaptor(), arg)
 # ── Kernel call (main entry point) ──
 
 function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=nothing)
+    _validate_launch_args(args)
     # GPU-resident ndrange → indirect dispatch (no CPU readback)
     if ndrange isa LavaArray
         converted_args = KA.argconvert.(Ref(obj), args)

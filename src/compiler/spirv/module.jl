@@ -404,6 +404,10 @@ mutable struct SPIRVModule
     # Capability tracking (avoid duplicates)
     declared_capabilities::Set{UInt32}
     declared_extensions::Set{String}
+
+    # Source mapping: SPIR-V result ID → (julia_file, julia_line)
+    # Populated during emission by _record_source_location!()
+    source_locations::Dict{UInt32, Tuple{String, Int}}
 end
 
 function SPIRVModule()
@@ -417,6 +421,7 @@ function SPIRVModule()
         UInt32(0),
         Set{UInt32}(),
         Set{String}(),
+        Dict{UInt32, Tuple{String, Int}}(),
     )
     return mod
 end

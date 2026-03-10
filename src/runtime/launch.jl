@@ -43,6 +43,71 @@ const _pipeline_by_kernel = Dict{UInt64, LavaComputePipeline}()
 const _arg_offsets_cache = Dict{UInt64, Vector{Int}}()
 # Cache byval LLVM sizes — maps to same keys as _arg_offsets_cache
 const _byval_sizes_cache = Dict{UInt64, Vector{Int}}()
+# Insertion order for kernel cache eviction (FIFO)
+const _kernel_insertion_order = UInt64[]
+const _max_kernel_cache_size = Ref(1024)
+
+# Register cleanup callback for vk_reset_device!
+push!(_reset_callbacks, function()
+    empty!(_kernel_cache)
+    empty!(_pipeline_by_kernel)
+    empty!(_arg_offsets_cache)
+    empty!(_byval_sizes_cache)
+    empty!(_kernel_insertion_order)
+    _arg_buffer_idx[] = 0
+    # Don't destroy _arg_buffers — they reference old device handles.
+    # Let GC handle them; new allocations will grow the pool.
+    empty!(_arg_buffers)
+    empty!(_arg_buffer_peak_window)
+end)
+
+# ── Launch argument validation ──
+
+"""
+    _validate_launch_args(args)
+
+Check that buffer arguments are valid (not freed, not poisoned).
+Runs by default; disable with `Lava._launch_arg_validation[] = false`.
+"""
+const _launch_arg_validation = Ref(true)
+
+function _validate_launch_args(@nospecialize(args))
+    _launch_arg_validation[] || return
+    for (i, arg) in enumerate(args)
+        if arg isa LavaArray
+            local buf
+            try
+                buf = arg.buf[]
+            catch e
+                # GPUArrays.DataRef throws ArgumentError on freed refs
+                throw(LavaError("kernel launch",
+                    "Argument $i: LavaArray{$(eltype(arg)),$(ndims(arg))} has been freed (DataRef released)",
+                    "Don't pass freed arrays to GPU kernels. Check array lifetime."))
+            end
+            if buf.size == 0
+                throw(LavaError("kernel launch",
+                    "Argument $i: LavaArray{$(eltype(arg)),$(ndims(arg))} has been freed (size=0)",
+                    "Don't pass freed arrays to GPU kernels. Check array lifetime."))
+            end
+            if buf.address == _BDA_POISON
+                throw(LavaError("kernel launch",
+                    "Argument $i: LavaArray{$(eltype(arg)),$(ndims(arg))} backing buffer was destroyed (poisoned BDA)",
+                    "This array was freed. Reallocate before use."))
+            end
+        elseif arg isa LavaBuffer
+            if arg.buf.size == 0
+                throw(LavaError("kernel launch",
+                    "Argument $i: LavaBuffer{$(eltype(arg))} has been freed (size=0)",
+                    "Don't pass freed buffers to GPU kernels."))
+            end
+            if arg.buf.address == _BDA_POISON
+                throw(LavaError("kernel launch",
+                    "Argument $i: LavaBuffer{$(eltype(arg))} backing buffer was destroyed (poisoned BDA)",
+                    "This buffer was freed. Reallocate before use."))
+            end
+        end
+    end
+end
 
 """
     lava_launch!(f, args...; ndrange, workgroup_size=(64,1,1))
@@ -64,6 +129,7 @@ Example:
 function lava_launch!(@nospecialize(f), args...;
                        ndrange::Union{Integer, NTuple{3,<:Integer}},
                        workgroup_size::NTuple{3,Int} = (64, 1, 1))
+    _validate_launch_args(args)
     # Normalize ndrange to 3D
     if ndrange isa Integer
         ndrange_3d = (Int(ndrange), 1, 1)
@@ -366,6 +432,9 @@ function _get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), 
     if compiled === nothing
         compiled = lava_compile_gpu(f, tt; workgroup_size)
         _kernel_cache[key] = compiled
+        # Track insertion order for cache eviction
+        push!(_kernel_insertion_order, key)
+        _evict_kernel_cache_if_full!()
         # Dump SPIR-V if dump dir is set
         if !isempty(_spirv_dump_dir[])
             _spirv_dump_counter[] += 1
@@ -397,12 +466,27 @@ function _get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), 
     return compiled, pipeline, offsets, byval_sizes
 end
 
+"""Evict oldest kernel cache entries when cache exceeds max size."""
+function _evict_kernel_cache_if_full!()
+    max_size = _max_kernel_cache_size[]
+    while length(_kernel_insertion_order) > max_size
+        old_key = popfirst!(_kernel_insertion_order)
+        delete!(_kernel_cache, old_key)
+        delete!(_pipeline_by_kernel, old_key)
+        delete!(_arg_offsets_cache, old_key)
+        delete!(_byval_sizes_cache, old_key)
+    end
+end
+
 # Reusable arg buffer pool — host-visible mapped memory for zero-cost upload.
 # Each in-flight dispatch needs its own arg buffer (GPU reads it asynchronously).
 # Pool grows dynamically when batched dispatches exceed current pool size.
 # Reset to start of pool on vk_flush!() (all dispatches complete).
 const _arg_buffers = VkMappedBuffer[]
 const _arg_buffer_idx = Ref(0)
+# Arg buffer pool shrinking: track peak usage per flush cycle to detect over-allocation.
+const _arg_buffer_peak_window = Int[]
+const _arg_buffer_shrink_window = 8  # number of flush cycles to consider
 
 function get_arg_buffer(nbytes::Integer)
     alloc_size = max(256, nextpow(2, nbytes))
@@ -426,7 +510,30 @@ function get_arg_buffer(nbytes::Integer)
     return buf
 end
 
-"""Reset arg buffer pool index after flush (all in-flight dispatches completed)."""
+"""Reset arg buffer pool index after flush (all in-flight dispatches completed).
+Shrinks pool if it's significantly larger than recent peak usage."""
 function reset_arg_buffer_pool!()
+    # Track peak usage per flush cycle
+    push!(_arg_buffer_peak_window, _arg_buffer_idx[])
+    if length(_arg_buffer_peak_window) > _arg_buffer_shrink_window
+        popfirst!(_arg_buffer_peak_window)
+    end
     _arg_buffer_idx[] = 0
+
+    # Shrink pool if it's > 2x recent peak for a full window of flush cycles
+    if length(_arg_buffer_peak_window) >= _arg_buffer_shrink_window
+        recent_max = maximum(_arg_buffer_peak_window)
+        target = max(recent_max * 2, 16)  # keep 2x headroom, minimum 16
+        if length(_arg_buffers) > target
+            # Destroy excess VkMappedBuffers (Vulkan.jl handles via destructors)
+            while length(_arg_buffers) > target
+                buf = pop!(_arg_buffers)
+                if !_device_lost[]
+                    Vulkan.unmap_memory(vk_device(), buf.memory)
+                    buf.buffer.destructor()
+                    buf.memory.destructor()
+                end
+            end
+        end
+    end
 end

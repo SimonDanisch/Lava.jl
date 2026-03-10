@@ -23,18 +23,24 @@ end
 """
     CommandBatch
 
-A single command buffer recording batch. Each batch owns its own command buffer,
-fence, and strong refs to buffers used during recording. Following clvk's pattern:
-one command buffer per batch, ONE_TIME_SUBMIT_BIT, never reused without reset.
+A single recording batch that may span multiple Vulkan command buffers.
+When the number of dispatches in the current CB segment exceeds `cb_split_threshold`,
+the CB is sealed and a fresh one is started. At flush time, all sealed CBs + the
+active CB are submitted in a single `vkQueueSubmit` call.
+
+This avoids NVIDIA driver crashes from enormous command buffers (30k+ dispatches)
+while keeping submission count minimal (single submit per flush).
 """
 mutable struct CommandBatch
-    cmd_buf::Vulkan.CommandBuffer
-    fence::Vulkan.Fence
+    cmd_buf::Vulkan.CommandBuffer       # Currently recording CB segment
+    fence::Vulkan.Fence                 # Single fence for the whole batch
     recording::Bool
-    dispatch_count::Int
+    dispatch_count::Int                 # Total dispatches across all segments (for barriers)
+    segment_dispatches::Int             # Dispatches in current CB segment (for split threshold)
     last_was_rt::Bool
-    data_refs::Vector{Any}        # Replaces global INFLIGHT_DATA_REFS
-    dispatch_log::Vector{String}  # Per-batch debug log
+    data_refs::Vector{Any}
+    dispatch_log::Vector{String}
+    sealed_cmd_bufs::Vector{Vulkan.CommandBuffer}  # Completed CB segments awaiting submit
 end
 
 """
@@ -55,6 +61,7 @@ mutable struct VkContext
     active_batch::Union{Nothing, CommandBatch}   # Currently recording
     in_flight::Vector{CommandBatch}              # Submitted, not yet completed
     free_batches::Vector{CommandBatch}           # Completed, reusable
+    free_cmd_bufs::Vector{Vulkan.CommandBuffer}  # Spare CBs for multi-CB splitting
     # Dedicated transfer command buffer + fence (separate from dispatch recording)
     # Prevents command buffer state corruption when _one_shot_copy runs between
     # dispatch recording and flush (NVIDIA validation: "active VkCommandBuffer")
@@ -80,6 +87,10 @@ const _vk_context = Ref{Union{Nothing, VkContext}}(nothing)
 # Set to true after DEVICE_LOST — prevents finalizers from calling Vulkan on invalid handles
 const _device_lost = Ref(false)
 
+# Callbacks for vk_reset_device! — registered by later-included files (pipeline.jl,
+# command.jl, launch.jl, memory.jl) to clear their module-level caches.
+const _reset_callbacks = Function[]
+
 """
     vk_context() -> VkContext
 
@@ -96,6 +107,37 @@ end
 
 vk_device() = vk_context().device
 vk_queue() = vk_context().queue
+
+"""
+    vk_reset_device!()
+
+Reinitialize the Vulkan device after DEVICE_LOST or other unrecoverable errors.
+Destroys the old context and creates a fresh one. Clears all caches (pipelines,
+kernels, arg buffers).
+
+**WARNING**: All existing `LavaArray`s become INVALID after reset — their backing
+GPU buffers no longer exist. You must reallocate all GPU data.
+"""
+function vk_reset_device!()
+    _device_lost[] = false
+    _vk_context[] = nothing
+    # Don't destroy old Vulkan handles — they're invalid after DEVICE_LOST.
+    # GC will eventually try to destroy them; _destroy_buffer! skips when
+    # _device_lost was true (and we set it false only after clearing context).
+    empty!(_validation_messages)
+    # Run cleanup callbacks registered by other modules
+    for cb in _reset_callbacks
+        try
+            cb()
+        catch e
+            @warn "Lava: reset callback failed" exception=e
+        end
+    end
+    # Re-initialize (lazy init on next vk_context() call)
+    ctx = vk_context()
+    @info "Lava: device reset complete" device=ctx.device_name
+    return nothing
+end
 
 """Check if a recording is active (any batch is recording)."""
 function has_active_recording(ctx::VkContext)
@@ -337,8 +379,8 @@ function _init_vulkan!()
     spare_fence = Vulkan.Fence(device)
 
     # Create initial batch in free pool
-    initial_batch = CommandBatch(initial_cmd_buf, initial_fence, false, 0, false, Any[], String[])
-    spare_batch = CommandBatch(spare_cmd_buf, spare_fence, false, 0, false, Any[], String[])
+    initial_batch = CommandBatch(initial_cmd_buf, initial_fence, false, 0, 0, false, Any[], String[], Vulkan.CommandBuffer[])
+    spare_batch = CommandBatch(spare_cmd_buf, spare_fence, false, 0, 0, false, Any[], String[], Vulkan.CommandBuffer[])
 
     has_validation = !isempty(layers)
     if has_rt
@@ -374,6 +416,7 @@ function _init_vulkan!()
         nothing,  # active_batch
         CommandBatch[],  # in_flight
         CommandBatch[initial_batch, spare_batch],  # free_batches
+        Vulkan.CommandBuffer[],  # free_cmd_bufs
         xfer_cmd_buf, xfer_fence,
         as_cmd_buf, as_fence,
         rt_props,

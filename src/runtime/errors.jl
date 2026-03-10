@@ -39,11 +39,13 @@ struct LavaCompilationError <: Exception
     spirv_id::Union{Nothing, UInt32}
     # Optional: raw spirv-val or driver error output
     raw_error::String
+    # Optional: deduplicated call chains through user code
+    call_chains::String
 end
 
 function LavaCompilationError(operation, message, suggestion;
-    julia_file="", julia_line=0, spirv_id=nothing, raw_error="")
-    LavaCompilationError(operation, message, suggestion, julia_file, julia_line, spirv_id, raw_error)
+    julia_file="", julia_line=0, spirv_id=nothing, raw_error="", call_chains="")
+    LavaCompilationError(operation, message, suggestion, julia_file, julia_line, spirv_id, raw_error, call_chains)
 end
 
 function Base.showerror(io::IO, e::LavaCompilationError)
@@ -55,11 +57,14 @@ function Base.showerror(io::IO, e::LavaCompilationError)
     if e.spirv_id !== nothing
         print(io, "  SPIR-V instruction ID: %", e.spirv_id, "\n")
     end
-    if !isempty(e.raw_error)
-        print(io, "  Raw error: ", e.raw_error, "\n")
+    if !isempty(e.call_chains)
+        print(io, "\n  ", e.call_chains, "\n")
     end
     if !isempty(e.suggestion)
-        print(io, "  Suggestion: ", e.suggestion)
+        print(io, "\n  Suggestion: ", e.suggestion, "\n")
+    end
+    if !isempty(e.raw_error)
+        print(io, "\n  Raw error (full GPUCompiler output):\n  ", e.raw_error)
     end
 end
 
@@ -82,6 +87,32 @@ function Base.showerror(io::IO, e::LavaVulkanError)
         print(io, "  Suggestion: ", e.suggestion)
     end
 end
+
+# ── Source Mapping ──
+
+"""
+    SourceMap
+
+Maps SPIR-V instruction IDs back to Julia source locations through LLVM IR.
+Populated during compilation by the SPIR-V emitter.
+"""
+struct SourceMap
+    spirv_to_julia::Dict{UInt32, Tuple{String, Int}}  # SPIR-V ID → (file, line)
+end
+
+SourceMap() = SourceMap(Dict{UInt32, Tuple{String, Int}}())
+
+"""Look up Julia source location for a SPIR-V instruction ID."""
+function lookup_source(sm::SourceMap, spirv_id::UInt32)
+    get(sm.spirv_to_julia, spirv_id, ("", 0))
+end
+
+"""Record a mapping from SPIR-V instruction ID to Julia source location."""
+function record_source!(sm::SourceMap, spirv_id::UInt32, file::String, line::Int)
+    sm.spirv_to_julia[spirv_id] = (file, line)
+end
+
+# ── SPIR-V Validation ──
 
 """
     validate_spirv(spirv_binary::Vector{UInt8}) -> Nothing
