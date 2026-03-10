@@ -3,6 +3,7 @@
 # Device-local buffers with BDA (Buffer Device Address) for kernel arguments.
 # Staging buffer for CPU↔GPU transfers.
 
+
 """
     VkManagedBuffer
 
@@ -34,33 +35,39 @@ const DEFERRED_FREES = VkManagedBuffer[]
 # Solution: track live GPU bytes and trigger GC.gc(false) proactively,
 # matching AMDGPU.jl's maybe_collect() pattern.
 const GPU_LIVE_BYTES = Threads.Atomic{Int}(0)
+const GPU_BYTES_SINCE_LAST_GC = Threads.Atomic{Int}(0)
 const GPU_LAST_INCR_GC_TIME = Ref(0.0)
 const GPU_LAST_FULL_GC_TIME = Ref(0.0)
 
 """
     maybe_collect()
 
-Trigger GC if GPU memory pressure is high. Julia's GC doesn't know about
+Trigger GC if GPU allocation pressure is high. Julia's GC doesn't know about
 VRAM — LavaArray wrappers are ~50 bytes on the CPU heap but back hundreds of
 MB of GPU memory. Without this, dead GPU buffers accumulate until OOM.
 
+Tracks bytes allocated since last GC (not total live bytes), so steady-state
+rendering with stable GPU memory doesn't trigger unnecessary GC cycles.
+
 Two tiers (with separate timers so incremental GC doesn't starve full GC):
-- >256 MiB tracked: incremental GC (rate-limited to every 100ms)
-- >512 MiB tracked: full GC (rate-limited to every 2s)
+- >256 MiB new allocs: incremental GC (rate-limited to every 100ms)
+- >512 MiB new allocs: full GC (rate-limited to every 2s)
 
 Called from `vk_alloc` / `vk_alloc_unified` before each allocation.
 """
 function maybe_collect()
-    live = GPU_LIVE_BYTES[]
-    live < 256 * 1024 * 1024 && return  # <256 MiB: no pressure
+    since_gc = GPU_BYTES_SINCE_LAST_GC[]
+    since_gc < 256 * 1024 * 1024 && return  # <256 MiB new allocs: no pressure
     t = time()
     # Full GC has its own timer — incremental GC must not starve it
-    if live > 512 * 1024 * 1024 && (t - GPU_LAST_FULL_GC_TIME[]) > 2.0
+    if since_gc > 512 * 1024 * 1024 && (t - GPU_LAST_FULL_GC_TIME[]) > 2.0
         GPU_LAST_FULL_GC_TIME[] = t
         GPU_LAST_INCR_GC_TIME[] = t
+        GPU_BYTES_SINCE_LAST_GC[] = 0
         GC.gc(true)
     elseif (t - GPU_LAST_INCR_GC_TIME[]) > 0.1
         GPU_LAST_INCR_GC_TIME[] = t
+        GPU_BYTES_SINCE_LAST_GC[] = 0
         GC.gc(false)
     end
     return
@@ -115,6 +122,7 @@ function vk_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0))
     result = VkManagedBuffer(buf, memory, address, Ptr{UInt8}(0), Int(nbytes))
     push!(_live_buffers, result)
     Threads.atomic_add!(GPU_LIVE_BYTES, nbytes)
+    Threads.atomic_add!(GPU_BYTES_SINCE_LAST_GC, nbytes)
     return result
 end
 
@@ -301,10 +309,31 @@ Download data from a device-local buffer into a typed array.
 """
 function download_typed!(data::AbstractVector{T}, src::VkManagedBuffer; offset::Int=0) where T
     nbytes = length(data) * sizeof(T)
-    bytes = Vector{UInt8}(undef, nbytes)
-    download!(bytes, src; offset)
-    GC.@preserve data bytes begin
-        unsafe_copyto!(Ptr{UInt8}(pointer(data)), Ptr{UInt8}(pointer(bytes)), nbytes)
+    nbytes == 0 && return
+
+    # Fast path: BAR memory — direct CPU read, no staging copy
+    if src.mapped_ptr != Ptr{UInt8}(0)
+        ctx = vk_context()
+        if has_active_recording(ctx)
+            vk_flush!()
+        end
+        GC.@preserve data begin
+            unsafe_copyto!(Ptr{UInt8}(pointer(data)), src.mapped_ptr + offset, nbytes)
+        end
+        return
+    end
+
+    # Device-local: append copy to active batch if possible (one fence wait instead of two)
+    staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
+    ctx = vk_context()
+    if has_active_recording(ctx)
+        # Defined in command.jl (included after memory.jl)
+        _append_copy_and_flush!(ctx, src.buffer, offset, staging_buf, nbytes)
+    else
+        _one_shot_copy(src.buffer, offset, staging_buf, 0, nbytes)
+    end
+    GC.@preserve data begin
+        unsafe_copyto!(Ptr{UInt8}(pointer(data)), Ptr{UInt8}(mapped_ptr), nbytes)
     end
 end
 
@@ -431,6 +460,7 @@ function vk_alloc_unified(nbytes::Integer)
                                mapped.mapped_ptr, Int(mapped.size))
     push!(_live_buffers, managed)
     Threads.atomic_add!(GPU_LIVE_BYTES, managed.size)
+    Threads.atomic_add!(GPU_BYTES_SINCE_LAST_GC, managed.size)
     return managed
 end
 

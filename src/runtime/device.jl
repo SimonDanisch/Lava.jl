@@ -359,15 +359,14 @@ function _init_vulkan!()
     is_nvidia = vendor_id == 0x10DE
     if is_nvidia
         _spirv_opt_enabled[] = true
-        # Auto-flush prevents TDR timeout during precompilation (480K+ dispatches
-        # run during `using Lava` which can trigger Xid 109 on NVIDIA).
-        # Hikari's volpath flushes explicitly every ~117 dispatches, so a threshold
-        # of 128 adds minimal extra flushes during rendering but protects precompilation.
-        if auto_flush_threshold[] == 0
-            set_auto_flush_threshold!(128)
-        end
-        @debug "NVIDIA detected: spirv-opt=on, auto-flush=128"
+        # Auto-flush was removed after Fix 9 (universal misaligned PSB detection).
+        # TDR timeout was caused by misaligned PSB loads, not command buffer size.
+        # auto_flush_threshold remains 0 (unlimited batching) for best performance.
+        @debug "NVIDIA detected: spirv-opt=on, auto-flush=$(auto_flush_threshold[])"
     end
+
+    # Initialize zero-alloc Vulkan function pointers for hot paths
+    _cmd_pipeline_barrier_fptr[] = Vulkan.function_pointer(device, "vkCmdPipelineBarrier")
 
     return VkContext(
         instance, phys_dev, device, queue, qf_idx,

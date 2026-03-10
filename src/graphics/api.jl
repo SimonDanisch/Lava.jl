@@ -172,8 +172,11 @@ function pack_gfx_args(args)
         end
     end
     # Push constant = BDA of arg buffer
+    # NOTE: Graphics uses its own allocated vector since push_data outlives the call
     push_data = Vector{UInt8}(undef, 8)
-    unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
+    GC.@preserve push_data begin
+        unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
+    end
     return push_data
 end
 
@@ -249,7 +252,9 @@ function blit!(target::RenderTarget, source::LavaArray;
     unsafe_store!(Ptr{Int32}(ptr + 12), Int32(h))
     # Push constant = BDA of arg buffer
     push_data = Vector{UInt8}(undef, 8)
-    unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
+    GC.@preserve push_data begin
+        unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
+    end
 
     compiled = ensure_compiled!(pipeline, Tuple{}, Tuple{Ptr{Vec4f}, Int32, Int32};
         color_format=win.format)

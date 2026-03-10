@@ -99,15 +99,11 @@ function trace_rays!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args...;
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        raygen_compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
-    # Push constant = BDA of arg buffer
-    push_data = Vector{UInt8}(undef, 8)
-    unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
-
     # Keep data buffer references alive until vk_flush!()
     keep_data_alive!(args)
 
-    # Dispatch (records into batched command buffer, no separate submit)
-    rt_dispatch!(vk_pipeline, tlas, push_data, width, height; depth=depth)
+    # Dispatch (push constant = BDA of arg buffer, passed as UInt64, zero-alloc)
+    rt_dispatch!(vk_pipeline, tlas, arg_buf.address, width, height; depth=depth)
 end
 
 """
@@ -140,11 +136,14 @@ function trace_rays_indirect!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        raygen_compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
-    push_data = Vector{UInt8}(undef, 8)
-    unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
-
     # Keep data buffer references alive until vk_flush!()
     keep_data_alive!(args)
+
+    # Push constant = BDA of arg buffer (passed as UInt64, zero-alloc).
+    # Safe with nested dispatches: _prepare_indirect_rt_dispatch! calls lava_launch!
+    # which uses its own push_bda, and push_constants_bda! sets+reads the module-level
+    # Ref synchronously in a single ccall.
+    push_bda = arg_buf.address
 
     max_rays = _max_rays_per_rt_dispatch[]
     if max_rays > 0
@@ -159,14 +158,7 @@ function trace_rays_indirect!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args
         offset = 0
         while offset < n
             chunk = min(max_rays, n - offset)
-            # RT dispatch uses (width, height, depth) — dispatch chunk rays starting at offset
-            # Since RT shaders use LaunchIDEXT.x as the ray index, we need to dispatch
-            # with width=chunk and have the shader add the offset.
-            # For now, dispatch all at once if under limit, otherwise split.
-            # TODO: RT splitting needs shader-level offset support.
-            # For now just dispatch the full count — individual dispatches are less likely to TDR
-            # than batched ones since we flush between them.
-            rt_dispatch!(vk_pipeline, tlas, push_data, n, 1; depth=1)
+            rt_dispatch!(vk_pipeline, tlas, push_bda, n, 1; depth=1)
             vk_flush!()
             break  # Can't split RT dispatches without shader offset support
         end
@@ -174,7 +166,7 @@ function trace_rays_indirect!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args
         # No limit — use true indirect dispatch
         indirect_buf = _get_indirect_buffer()
         _prepare_indirect_rt_dispatch!(indirect_buf, n_rays)
-        rt_dispatch_indirect!(vk_pipeline, tlas, push_data, indirect_buf)
+        rt_dispatch_indirect!(vk_pipeline, tlas, push_bda, indirect_buf)
     end
 end
 

@@ -50,6 +50,11 @@ end
         include(joinpath(@__DIR__, "test_atomics_and_dispatch.jl"))
     end
 
+    # ── Tier 3d: NVIDIA Regression & Stress Tests ──
+    @testset "Tier 3d: NVIDIA Regression & Stress" begin
+        include(joinpath(@__DIR__, "test_nvidia_regression.jl"))
+    end
+
     # ── Tier 4: GPUArrays TestSuite ──
     @testset "Tier 4: GPUArrays TestSuite" begin
         include(joinpath(@__DIR__, "test_gpuarrays.jl"))

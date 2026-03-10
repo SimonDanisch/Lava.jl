@@ -105,17 +105,16 @@ function lava_launch!(@nospecialize(f), args...;
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
-    # Push constant = BDA of arg buffer
-    push_data = Vector{UInt8}(undef, 8)
-    unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
-
     # Keep data buffer references alive until vk_flush!() — BDA addresses in the
     # arg buffer are raw pointers with no GC reference to the backing VkManagedBuffer.
     keep_data_alive!(args)
 
     # Dispatch (batched — call vk_flush!() to submit)
-    last_dispatch_info[] = "compute f=$(nameof(typeof(f))) groups=$groups"
-    vk_dispatch!(pipeline, push_data, groups)
+    # Push constant = BDA of arg buffer (passed as UInt64, zero-alloc)
+    if dispatch_logging_enabled[]
+        last_dispatch_info[] = "compute f=$(nameof(typeof(f))) groups=$groups"
+    end
+    vk_dispatch!(pipeline, arg_buf.address, groups)
 
     return nothing
 end

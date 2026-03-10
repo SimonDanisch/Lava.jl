@@ -20,14 +20,42 @@ const prev_dispatch_info = Ref{String}("")
 
 # Ring buffer of last N dispatch names for crash debugging
 const dispatch_log = String[]
-const MAX_DISPATCH_LOG = 50
+const MAX_DISPATCH_LOG = 2000
+
+# Toggle dispatch logging (disabled by default for zero-alloc dispatch path).
+# Enable with Lava.dispatch_logging_enabled[] = true for debugging.
+# On DEVICE_LOST, the error handler re-enables logging automatically.
+const dispatch_logging_enabled = Ref{Bool}(false)
 
 function log_dispatch!(info::String)
+    dispatch_logging_enabled[] || return
     if length(dispatch_log) >= MAX_DISPATCH_LOG
         popfirst!(dispatch_log)
     end
     push!(dispatch_log, info)
 end
+
+# Pre-allocated barrier buffer using raw VkMemoryBarrier (isbits).
+# Vulkan.jl's MemoryBarrier wrapper allocates ~1.2KB per cmd_pipeline_barrier call
+# due to high-level → low-level struct conversion. Using direct ccall with the raw
+# VkMemoryBarrier struct is zero-alloc. Saves ~16MB/render for 13k dispatches.
+import Vulkan.VkCore: VkMemoryBarrier, VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+    VkAccessFlags, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+    VK_ACCESS_TRANSFER_READ_BIT,
+    VkPipelineStageFlags, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+    VK_PIPELINE_STAGE_TRANSFER_BIT, VkDependencyFlags
+const _vk_barrier_ref = Ref(VkMemoryBarrier(
+    VK_STRUCTURE_TYPE_MEMORY_BARRIER, C_NULL,
+    VkAccessFlags(VK_ACCESS_SHADER_WRITE_BIT),
+    VkAccessFlags(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)))
+# Function pointer for vkCmdPipelineBarrier — initialized in _init_vulkan!
+const _cmd_pipeline_barrier_fptr = Ref{Ptr{Nothing}}(C_NULL)
+
+# Pre-allocated Ref for BDA push constants (zero-alloc path).
+# Used inside push_constants_bda! — set and read synchronously in a single ccall,
+# so no aliasing risk from nested dispatches (unlike a shared Vector{UInt8}).
+const _push_bda_ref = Ref{UInt64}(0)
 
 # Auto-flush threshold: flush command buffer after this many dispatches.
 # Set to 0 to disable (default). Use set_auto_flush_threshold!(n) to enable.
@@ -99,7 +127,9 @@ function allocate_batch(ctx::VkContext)
     )
     cmd_bufs = unwrap(Vulkan.allocate_command_buffers(dev, alloc_info))
     fence = Vulkan.Fence(dev)
-    return CommandBatch(cmd_bufs[1], fence, false, 0, false, Any[], String[])
+    data_refs = Any[]
+    sizehint!(data_refs, 128)  # Pre-size for typical batch (avoids Vector growth allocs)
+    return CommandBatch(cmd_bufs[1], fence, false, 0, false, data_refs, String[])
 end
 
 """Reclaim a completed batch: reset fence, clear data refs, return to free pool."""
@@ -160,15 +190,24 @@ function record_dispatch!(f, ctx::VkContext;
     batch = ensure_active_batch!(ctx)
     cmd = batch.cmd_buf
 
-    # Memory barrier between dispatches (write→read synchronization)
+    # Memory barrier between dispatches (write→read synchronization).
+    # Uses direct ccall to avoid Vulkan.jl wrapper allocations (~1.2KB/call).
     if batch.dispatch_count > 0
         src_stage = batch.last_was_rt ?
-            Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR :
-            Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT
-        dst_access = Vulkan.ACCESS_SHADER_READ_BIT | Vulkan.ACCESS_SHADER_WRITE_BIT | extra_dst_access
-        barrier = Vulkan.MemoryBarrier(C_NULL, Vulkan.ACCESS_SHADER_WRITE_BIT, dst_access)
-        Vulkan.cmd_pipeline_barrier(cmd, [barrier], [], [];
-            src_stage_mask=src_stage, dst_stage_mask=dst_stage)
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR :
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+        dst_access = VkAccessFlags(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT) | VkAccessFlags(extra_dst_access)
+        _vk_barrier_ref[] = VkMemoryBarrier(
+            VK_STRUCTURE_TYPE_MEMORY_BARRIER, C_NULL,
+            VkAccessFlags(VK_ACCESS_SHADER_WRITE_BIT), dst_access)
+        ccall(_cmd_pipeline_barrier_fptr[], Cvoid,
+              (Ptr{Nothing}, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
+               UInt32, Ptr{VkMemoryBarrier}, UInt32, Ptr{Nothing}, UInt32, Ptr{Nothing}),
+              cmd.vks,
+              VkPipelineStageFlags(src_stage), VkPipelineStageFlags(dst_stage), VkDependencyFlags(0),
+              UInt32(1), _vk_barrier_ref,
+              UInt32(0), C_NULL,
+              UInt32(0), C_NULL)
     end
 
     # Record the actual dispatch commands
@@ -178,7 +217,9 @@ function record_dispatch!(f, ctx::VkContext;
     batch.dispatch_count += 1
     batch.last_was_rt = is_rt
     Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, 1)
-    log_dispatch!("$(TOTAL_DISPATCH_COUNTER[]) $info")
+    if dispatch_logging_enabled[]
+        log_dispatch!("$(TOTAL_DISPATCH_COUNTER[]) $info")
+    end
 end
 
 """
@@ -195,14 +236,31 @@ function push_constants!(cmd::Vulkan.CommandBuffer, layout::Vulkan.PipelineLayou
     end
 end
 
+"""
+    push_constants_bda!(cmd, layout, stage_flags, bda)
+
+Record an 8-byte BDA push constant update. Zero-alloc: uses a module-level
+Ref{UInt64} that is set and consumed synchronously in a single Vulkan ccall.
+"""
+@inline function push_constants_bda!(cmd::Vulkan.CommandBuffer, layout::Vulkan.PipelineLayout,
+                                      stage_flags, bda::UInt64)
+    _push_bda_ref[] = bda
+    GC.@preserve _push_bda_ref begin
+        Vulkan.cmd_push_constants(cmd, layout, stage_flags,
+            UInt32(0), UInt32(8),
+            Ptr{Nothing}(Base.unsafe_convert(Ptr{UInt64}, _push_bda_ref)))
+    end
+end
+
 # ── Compute Dispatch ──
 
 """
-    vk_dispatch!(pipeline, push_data, groups)
+    vk_dispatch!(pipeline, push_bda, groups)
 
 Record a compute dispatch. Splits large dispatches if max_groups_per_dispatch is set.
+`push_bda` is the BDA address of the argument buffer (passed as 8-byte push constant).
 """
-function vk_dispatch!(pipeline::LavaComputePipeline, push_data::Vector{UInt8},
+function vk_dispatch!(pipeline::LavaComputePipeline, push_bda::UInt64,
                       groups::NTuple{3, Integer})
     limit = max_groups_per_dispatch[]
     gx, gy, gz = Int(groups[1]), Int(groups[2]), Int(groups[3])
@@ -212,18 +270,18 @@ function vk_dispatch!(pipeline::LavaComputePipeline, push_data::Vector{UInt8},
         base = 0
         while base < gx
             chunk = min(limit, gx - base)
-            vk_dispatch_base!(pipeline, push_data, base, 0, 0, chunk, 1, 1)
+            vk_dispatch_base!(pipeline, push_bda, base, 0, 0, chunk, 1, 1)
             base += chunk
             vk_flush!()
         end
         return
     end
 
-    vk_dispatch_base!(pipeline, push_data, 0, 0, 0, gx, gy, gz)
+    vk_dispatch_base!(pipeline, push_bda, 0, 0, 0, gx, gy, gz)
 end
 
 """Record a single compute dispatch with optional base group offset."""
-function vk_dispatch_base!(pipeline::LavaComputePipeline, push_data::Vector{UInt8},
+function vk_dispatch_base!(pipeline::LavaComputePipeline, push_bda::UInt64,
                             base_x::Int, base_y::Int, base_z::Int,
                             gx::Int, gy::Int, gz::Int)
     # NOTE: maybe_auto_flush!() is called by callers BEFORE get_arg_buffer(),
@@ -232,12 +290,14 @@ function vk_dispatch_base!(pipeline::LavaComputePipeline, push_data::Vector{UInt
     ctx = vk_context()
     info = last_dispatch_info[]
 
+    dispatch_info = dispatch_logging_enabled[] ?
+        "$info base=($base_x,$base_y,$base_z) g=($gx,$gy,$gz)" : ""
     record_dispatch!(ctx;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        info="$info base=($base_x,$base_y,$base_z) g=($gx,$gy,$gz)"
+        info=dispatch_info
     ) do cmd
         Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline)
-        push_constants!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_data)
+        push_constants_bda!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_bda)
 
         if base_x == 0 && base_y == 0 && base_z == 0
             Vulkan.cmd_dispatch(cmd, UInt32(gx), UInt32(gy), UInt32(gz))
@@ -252,23 +312,24 @@ end
 # ── Indirect Dispatch ──
 
 """
-    vk_dispatch_indirect!(pipeline, push_data, indirect_buf, indirect_offset=0)
+    vk_dispatch_indirect!(pipeline, push_bda, indirect_buf, indirect_offset=0)
 
 Record an indirect compute dispatch. The `indirect_buf` must contain a
 VkDispatchIndirectCommand (3×UInt32), written by a previous GPU kernel.
 """
-function vk_dispatch_indirect!(pipeline::LavaComputePipeline, push_data::Vector{UInt8},
+function vk_dispatch_indirect!(pipeline::LavaComputePipeline, push_bda::UInt64,
                                indirect_buf, indirect_offset::Integer=0)
     ctx = vk_context()
-    info = last_dispatch_info[]
+    dispatch_info = dispatch_logging_enabled[] ?
+        "$(last_dispatch_info[]) (indirect)" : ""
 
     record_dispatch!(ctx;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
         extra_dst_access=Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT,
-        info="$info (indirect)"
+        info=dispatch_info
     ) do cmd
         Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline)
-        push_constants!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_data)
+        push_constants_bda!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_bda)
 
         vk_buf = indirect_buf isa Vulkan.Buffer ? indirect_buf : indirect_buf.buffer
         Vulkan.cmd_dispatch_indirect(cmd, vk_buf, UInt64(indirect_offset))
@@ -331,9 +392,50 @@ function vk_flush!()
     # Detach from context and reclaim
     ctx.active_batch = nothing
     reclaim_batch!(ctx, batch)
+end
 
-    # Check GPU memory pressure after flush
-    maybe_collect()
+# ── Piggybacked Download ──
+
+"""
+    _append_copy_and_flush!(ctx, src_buffer, src_offset, dst_staging, nbytes)
+
+Append a GPU→staging buffer copy to the active command batch and flush.
+Saves one fence roundtrip compared to vk_flush!() + _one_shot_copy() by
+combining all dispatch commands and the copy into a single submission.
+
+The caller must ensure `has_active_recording(ctx)` is true.
+"""
+function _append_copy_and_flush!(ctx::VkContext, src_buffer::Vulkan.Buffer,
+                                  src_offset::Integer, dst_staging::Vulkan.Buffer,
+                                  nbytes::Integer)
+    batch = ctx.active_batch
+    cmd = batch.cmd_buf
+
+    # Barrier: shader writes → transfer read
+    src_stage = batch.last_was_rt ?
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR :
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+    _vk_barrier_ref[] = VkMemoryBarrier(
+        VK_STRUCTURE_TYPE_MEMORY_BARRIER, C_NULL,
+        VkAccessFlags(VK_ACCESS_SHADER_WRITE_BIT),
+        VkAccessFlags(VK_ACCESS_TRANSFER_READ_BIT))
+    ccall(_cmd_pipeline_barrier_fptr[], Cvoid,
+          (Ptr{Nothing}, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
+           UInt32, Ptr{VkMemoryBarrier}, UInt32, Ptr{Nothing}, UInt32, Ptr{Nothing}),
+          cmd.vks,
+          VkPipelineStageFlags(src_stage),
+          VkPipelineStageFlags(VK_PIPELINE_STAGE_TRANSFER_BIT),
+          VkDependencyFlags(0),
+          UInt32(1), _vk_barrier_ref,
+          UInt32(0), C_NULL,
+          UInt32(0), C_NULL)
+
+    # Append the copy command
+    region = Vulkan.BufferCopy(UInt64(src_offset), UInt64(0), UInt64(nbytes))
+    Vulkan.cmd_copy_buffer(cmd, src_buffer, dst_staging, [region])
+
+    # Flush the entire batch (dispatches + copy) in one submit
+    vk_flush!()
 end
 
 # ── Data Lifetime ──
@@ -358,6 +460,8 @@ end
 """Throw a LavaError enriched with recent validation layer messages and dispatch log."""
 function throw_with_validation_context(call_name::String, err_result,
         dispatch_count::Int=0, last_was_rt::Bool=false)
+    # Re-enable dispatch logging so the next run captures debug info
+    dispatch_logging_enabled[] = true
     vk_err = unwrap_error(err_result)
     msgs = get_validation_messages()
     validation_detail = if isempty(msgs)

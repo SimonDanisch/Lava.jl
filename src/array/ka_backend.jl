@@ -199,13 +199,12 @@ function _ka_launch!(@nospecialize(f), all_args::Tuple, nblocks::Int, workgroup_
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
-    # Push constant = BDA of arg buffer
-    push_data = Vector{UInt8}(undef, 8)
-    unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
-
+    # Dispatch (push constant = BDA of arg buffer, passed as UInt64, zero-alloc)
     groups = (nblocks, 1, 1)
-    last_dispatch_info[] = "ka f=$(_dispatch_name(f, all_args)) groups=$groups"
-    vk_dispatch!(pipeline, push_data, groups)
+    if dispatch_logging_enabled[]
+        last_dispatch_info[] = "ka f=$(_dispatch_name(f, all_args)) groups=$groups"
+    end
+    vk_dispatch!(pipeline, arg_buf.address, groups)
 
     return nothing
 end
@@ -313,35 +312,35 @@ function _ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, 
         arg_buf = get_arg_buffer(total_size)
         _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                            compiled.push_info.arg_buffer_size, byval_sizes, all_args)
-        push_data = Vector{UInt8}(undef, 8)
-        unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
 
-        last_dispatch_info[] = "split_indirect f=$(_dispatch_name(obj.f, all_args)) groups=$n_groups"
+        if dispatch_logging_enabled[]
+            last_dispatch_info[] = "split_indirect f=$(_dispatch_name(obj.f, all_args)) groups=$n_groups"
+        end
 
         # Dispatch directly, using split if needed (handled by vk_dispatch!)
         keep_data_alive!(args)
         if original_args !== nothing
             keep_data_alive!(original_args)
         end
-        vk_dispatch!(pipeline, push_data, (n_groups, 1, 1))
+        vk_dispatch!(pipeline, arg_buf.address, (n_groups, 1, 1))
     else
         # No group limit — use true indirect dispatch
         # Allocate arg buffer here too (no flush in this path, but keep consistent)
         arg_buf = get_arg_buffer(total_size)
         _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                            compiled.push_info.arg_buffer_size, byval_sizes, all_args)
-        push_data = Vector{UInt8}(undef, 8)
-        unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
 
         indirect_buf = _get_indirect_buffer()
         _prepare_indirect_dispatch!(indirect_buf, ndrange_buf, ws_prod)
 
-        last_dispatch_info[] = "indirect f=$(_dispatch_name(obj.f, all_args))"
+        if dispatch_logging_enabled[]
+            last_dispatch_info[] = "indirect f=$(_dispatch_name(obj.f, all_args))"
+        end
         keep_data_alive!(args)
         if original_args !== nothing
             keep_data_alive!(original_args)
         end
-        vk_dispatch_indirect!(pipeline, push_data, indirect_buf)
+        vk_dispatch_indirect!(pipeline, arg_buf.address, indirect_buf)
     end
 
     end # GC.@preserve

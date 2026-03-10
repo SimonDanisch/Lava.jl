@@ -209,12 +209,13 @@ function get_rt_descriptor_set(pipeline::LavaRTPipeline, tlas::LavaTLAS)
 end
 
 """
-    rt_dispatch!(pipeline, tlas, push_data, width, height; depth=1)
+    rt_dispatch!(pipeline, tlas, push_bda, width, height; depth=1)
 
 Record an RT trace dispatch into the batched command buffer.
+`push_bda` is the BDA address of the argument buffer.
 """
 function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
-                      push_data::Vector{UInt8}, width::Integer, height::Integer;
+                      push_bda::UInt64, width::Integer, height::Integer;
                       depth::Integer=1)
     maybe_auto_flush!()
     ctx = vk_context()
@@ -230,7 +231,7 @@ function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
         Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline.pipeline)
         Vulkan.cmd_bind_descriptor_sets(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR,
             pipeline.pipeline_layout, UInt32(0), [desc_set], UInt32[])
-        push_constants!(cmd, pipeline.pipeline_layout, pipeline.stage_flags, push_data)
+        push_constants_bda!(cmd, pipeline.pipeline_layout, pipeline.stage_flags, push_bda)
         Vulkan.cmd_trace_rays_khr(cmd,
             pipeline.raygen_region, pipeline.miss_region,
             pipeline.hit_region, pipeline.callable_region,
@@ -239,13 +240,13 @@ function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
 end
 
 """
-    rt_dispatch_indirect!(pipeline, tlas, push_data, indirect_buf; indirect_offset=0)
+    rt_dispatch_indirect!(pipeline, tlas, push_bda, indirect_buf; indirect_offset=0)
 
 Record an indirect RT trace dispatch. The `indirect_buf` must contain a
 VkTraceRaysIndirectCommandKHR (3×UInt32), written by a previous GPU kernel.
 """
 function rt_dispatch_indirect!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
-                               push_data::Vector{UInt8}, indirect_buf;
+                               push_bda::UInt64, indirect_buf;
                                indirect_offset::Integer=0)
     maybe_auto_flush!()
     ctx = vk_context()
@@ -261,7 +262,7 @@ function rt_dispatch_indirect!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
         Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline.pipeline)
         Vulkan.cmd_bind_descriptor_sets(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR,
             pipeline.pipeline_layout, UInt32(0), [desc_set], UInt32[])
-        push_constants!(cmd, pipeline.pipeline_layout, pipeline.stage_flags, push_data)
+        push_constants_bda!(cmd, pipeline.pipeline_layout, pipeline.stage_flags, push_bda)
 
         indirect_address = indirect_buf isa VkIndirectBuffer ? indirect_buf.address : indirect_buf.address
         Vulkan.cmd_trace_rays_indirect_khr(cmd,
