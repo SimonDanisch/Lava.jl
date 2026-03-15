@@ -17,6 +17,7 @@ mutable struct VkManagedBuffer
     address::UInt64     # BDA for PhysicalStorageBuffer access
     mapped_ptr::Ptr{UInt8}  # Non-null for unified/BAR memory
     size::Int
+    device_gen::UInt64  # Device generation at creation time (for safe finalizer cleanup)
 end
 
 # Strong references to keep Vulkan handles alive until explicit free
@@ -42,8 +43,9 @@ push!(_reset_callbacks, function()
     GPU_LIVE_BYTES[] = 0
     GPU_BYTES_SINCE_LAST_GC[] = 0
     STAGING_BUF[] = nothing
-    empty!(_indirect_buffers)
-    _indirect_buffer_idx[] = 0
+    empty!(_indirect_slabs)
+    _indirect_slab_idx[] = 1
+    _indirect_slab_offset[] = 0
 end)
 
 # ── GPU memory pressure tracking ──
@@ -170,7 +172,7 @@ function _try_vk_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0))
     addr_info = Vulkan.BufferDeviceAddressInfo(buf)
     address = Vulkan.get_buffer_device_address(dev, addr_info)
 
-    result = VkManagedBuffer(buf, memory, address, Ptr{UInt8}(0), Int(nbytes))
+    result = VkManagedBuffer(buf, memory, address, Ptr{UInt8}(0), Int(nbytes), _device_generation[])
     push!(_live_buffers, result)
     Threads.atomic_add!(GPU_LIVE_BYTES, nbytes)
     Threads.atomic_add!(GPU_BYTES_SINCE_LAST_GC, nbytes)
@@ -215,7 +217,8 @@ end
 """Actually destroy a buffer's Vulkan resources. Called from vk_free! or flush_deferred_frees!."""
 function _destroy_buffer!(buf::VkManagedBuffer)
     # After DEVICE_LOST, all Vulkan handles are invalid — skip destruction to avoid segfault.
-    if _device_lost[]
+    # Also skip if the buffer was created on an old device (before vk_reset_device!).
+    if _device_lost[] || buf.device_gen != _device_generation[]
         buf.mapped_ptr = Ptr{UInt8}(0)
         buf.address = _BDA_POISON
         Threads.atomic_sub!(GPU_LIVE_BYTES, buf.size)
@@ -519,7 +522,7 @@ function vk_alloc_unified(nbytes::Integer)
     maybe_collect()
     mapped = vk_alloc_mapped(max(nbytes, 16))
     managed = VkManagedBuffer(mapped.buffer, mapped.memory, mapped.address,
-                               mapped.mapped_ptr, Int(mapped.size))
+                               mapped.mapped_ptr, Int(mapped.size), _device_generation[])
     push!(_live_buffers, managed)
     Threads.atomic_add!(GPU_LIVE_BYTES, managed.size)
     Threads.atomic_add!(GPU_BYTES_SINCE_LAST_GC, managed.size)
@@ -529,40 +532,31 @@ end
 # ── Indirect dispatch buffer pool ──
 
 """
-    VkIndirectBuffer — A small mapped buffer for VkDispatchIndirectCommand (3×UInt32).
+    VkIndirectBuffer — A sub-allocation within an indirect buffer slab.
     Has INDIRECT_BUFFER_BIT + STORAGE_BUFFER_BIT + SHADER_DEVICE_ADDRESS_BIT.
 """
-mutable struct VkIndirectBuffer
-    buffer::Vulkan.Buffer
-    memory::Vulkan.DeviceMemory
-    address::UInt64
+struct VkIndirectBuffer
+    buffer::Vulkan.Buffer  # Parent slab's VkBuffer (for cmd_dispatch_indirect)
+    buffer_offset::UInt64  # Byte offset within parent slab
+    address::UInt64        # BDA of this sub-allocation
     mapped_ptr::Ptr{UInt8}
     size::Int
 end
 
+# Indirect buffer slab: similar to arg buffer slabs but with INDIRECT_BUFFER_BIT.
+# Each indirect dispatch needs 12 bytes (3×UInt32), aligned to 256 bytes.
+const INDIRECT_SLAB_SIZE = 256 * 1024  # 256KB — holds ~1000 indirect dispatches
+const _indirect_slabs = VkMappedBuffer[]  # Reuse VkMappedBuffer as slab backing
+const _indirect_slab_idx = Ref(1)
+const _indirect_slab_offset = Ref(0)
+
+# Legacy compat
 const _indirect_buffers = VkIndirectBuffer[]
 const _indirect_buffer_idx = Ref(0)
 
-"""Get or create an indirect dispatch buffer from the pool."""
-function _get_indirect_buffer()
-    _indirect_buffer_idx[] += 1
-    idx = _indirect_buffer_idx[]
-
-    while length(_indirect_buffers) < idx
-        push!(_indirect_buffers, _alloc_indirect_buffer())
-    end
-
-    return _indirect_buffers[idx]
-end
-
-"""Reset indirect buffer pool index after flush."""
-function reset_indirect_buffer_pool!()
-    _indirect_buffer_idx[] = 0
-end
-
-function _alloc_indirect_buffer()
+function _alloc_indirect_slab(min_size::Int=INDIRECT_SLAB_SIZE)
     dev = vk_device()
-    nbytes = 16  # 3×UInt32 = 12 bytes, round to 16
+    nbytes = max(min_size, INDIRECT_SLAB_SIZE)
 
     buf = Vulkan.Buffer(
         dev, nbytes,
@@ -576,7 +570,6 @@ function _alloc_indirect_buffer()
 
     mem_reqs = Vulkan.get_buffer_memory_requirements(dev, buf)
 
-    # Prefer device-local + host-visible (BAR), fall back to host-visible
     preferred = Vulkan.MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
                 Vulkan.MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT
@@ -596,7 +589,43 @@ function _alloc_indirect_buffer()
     address = Vulkan.get_buffer_device_address(dev, addr_info)
     mapped_ptr = Ptr{UInt8}(unwrap(Vulkan.map_memory(dev, memory, 0, nbytes)))
 
-    return VkIndirectBuffer(buf, memory, address, mapped_ptr, Int(nbytes))
+    return VkMappedBuffer(buf, memory, address, mapped_ptr, Int(nbytes))
+end
+
+"""Get or create an indirect dispatch buffer from the slab pool."""
+function _get_indirect_buffer()
+    alloc_size = 256  # 12 bytes needed, aligned to 256
+
+    # Ensure slab exists and has space
+    while length(_indirect_slabs) < _indirect_slab_idx[]
+        push!(_indirect_slabs, _alloc_indirect_slab())
+    end
+    slab = _indirect_slabs[_indirect_slab_idx[]]
+    if _indirect_slab_offset[] + alloc_size > slab.size
+        _indirect_slab_idx[] += 1
+        _indirect_slab_offset[] = 0
+        while length(_indirect_slabs) < _indirect_slab_idx[]
+            push!(_indirect_slabs, _alloc_indirect_slab())
+        end
+        slab = _indirect_slabs[_indirect_slab_idx[]]
+    end
+
+    offset = _indirect_slab_offset[]
+    _indirect_slab_offset[] = offset + alloc_size
+
+    return VkIndirectBuffer(
+        slab.buffer,
+        UInt64(offset),
+        slab.address + UInt64(offset),
+        slab.mapped_ptr + offset,
+        alloc_size
+    )
+end
+
+"""Reset indirect buffer slab allocator after flush."""
+function reset_indirect_buffer_pool!()
+    _indirect_slab_idx[] = 1
+    _indirect_slab_offset[] = 0
 end
 
 function _find_memory_type_optional(type_bits::UInt32, required_flags)

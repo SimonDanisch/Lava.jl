@@ -54,11 +54,14 @@ push!(_reset_callbacks, function()
     empty!(_arg_offsets_cache)
     empty!(_byval_sizes_cache)
     empty!(_kernel_insertion_order)
+    # Reset arg buffer slab allocator
+    empty!(_arg_slabs)
+    _arg_slab_idx[] = 1
+    _arg_slab_offset[] = 0
+    _arg_alloc_count[] = 0
+    # Legacy compat
     _arg_buffer_idx[] = 0
-    # Don't destroy _arg_buffers — they reference old device handles.
-    # Let GC handle them; new allocations will grow the pool.
     empty!(_arg_buffers)
-    empty!(_arg_buffer_peak_window)
 end)
 
 # ── Launch argument validation ──
@@ -71,42 +74,53 @@ Runs by default; disable with `Lava._launch_arg_validation[] = false`.
 """
 const _launch_arg_validation = Ref(true)
 
-function _validate_launch_args(@nospecialize(args))
-    _launch_arg_validation[] || return
-    for (i, arg) in enumerate(args)
-        if arg isa LavaArray
-            local buf
-            try
-                buf = arg.buf[]
-            catch e
-                # GPUArrays.DataRef throws ArgumentError on freed refs
-                throw(LavaError("kernel launch",
-                    "Argument $i: LavaArray{$(eltype(arg)),$(ndims(arg))} has been freed (DataRef released)",
-                    "Don't pass freed arrays to GPU kernels. Check array lifetime."))
-            end
-            if buf.size == 0
-                throw(LavaError("kernel launch",
-                    "Argument $i: LavaArray{$(eltype(arg)),$(ndims(arg))} has been freed (size=0)",
-                    "Don't pass freed arrays to GPU kernels. Check array lifetime."))
-            end
-            if buf.address == _BDA_POISON
-                throw(LavaError("kernel launch",
-                    "Argument $i: LavaArray{$(eltype(arg)),$(ndims(arg))} backing buffer was destroyed (poisoned BDA)",
-                    "This array was freed. Reallocate before use."))
-            end
-        elseif arg isa LavaBuffer
-            if arg.buf.size == 0
-                throw(LavaError("kernel launch",
-                    "Argument $i: LavaBuffer{$(eltype(arg))} has been freed (size=0)",
-                    "Don't pass freed buffers to GPU kernels."))
-            end
-            if arg.buf.address == _BDA_POISON
-                throw(LavaError("kernel launch",
-                    "Argument $i: LavaBuffer{$(eltype(arg))} backing buffer was destroyed (poisoned BDA)",
-                    "This buffer was freed. Reallocate before use."))
-            end
+@generated function _validate_launch_args(args::T) where T <: Tuple
+    exprs = Expr[]
+    push!(exprs, :((_launch_arg_validation[] || return)))
+    for i in 1:fieldcount(T)
+        Ti = fieldtype(T, i)
+        if Ti <: LavaArray
+            push!(exprs, quote
+                let arg = args[$i]
+                    local buf
+                    try
+                        buf = arg.buf[]
+                    catch e
+                        throw(LavaError("kernel launch",
+                            "Argument $($i): LavaArray has been freed (DataRef released)",
+                            "Don't pass freed arrays to GPU kernels. Check array lifetime."))
+                    end
+                    if buf.size == 0
+                        throw(LavaError("kernel launch",
+                            "Argument $($i): LavaArray has been freed (size=0)",
+                            "Don't pass freed arrays to GPU kernels. Check array lifetime."))
+                    end
+                    if buf.address == _BDA_POISON
+                        throw(LavaError("kernel launch",
+                            "Argument $($i): LavaArray backing buffer was destroyed (poisoned BDA)",
+                            "This array was freed. Reallocate before use."))
+                    end
+                end
+            end)
+        elseif Ti <: LavaBuffer
+            push!(exprs, quote
+                let arg = args[$i]
+                    if arg.buf.size == 0
+                        throw(LavaError("kernel launch",
+                            "Argument $($i): LavaBuffer has been freed (size=0)",
+                            "Don't pass freed buffers to GPU kernels."))
+                    end
+                    if arg.buf.address == _BDA_POISON
+                        throw(LavaError("kernel launch",
+                            "Argument $($i): LavaBuffer backing buffer was destroyed (poisoned BDA)",
+                            "This buffer was freed. Reallocate before use."))
+                    end
+                end
+            end)
         end
     end
+    push!(exprs, :(return nothing))
+    return Expr(:block, exprs...)
 end
 
 """
@@ -478,62 +492,73 @@ function _evict_kernel_cache_if_full!()
     end
 end
 
-# Reusable arg buffer pool — host-visible mapped memory for zero-cost upload.
-# Each in-flight dispatch needs its own arg buffer (GPU reads it asynchronously).
-# Pool grows dynamically when batched dispatches exceed current pool size.
-# Reset to start of pool on vk_flush!() (all dispatches complete).
-const _arg_buffers = VkMappedBuffer[]
-const _arg_buffer_idx = Ref(0)
-# Arg buffer pool shrinking: track peak usage per flush cycle to detect over-allocation.
-const _arg_buffer_peak_window = Int[]
-const _arg_buffer_shrink_window = 8  # number of flush cycles to consider
+# ── Arg buffer slab allocator ──
+#
+# Each GPU dispatch needs its own arg buffer region (GPU reads asynchronously from CB).
+# Instead of one VkDeviceMemory per dispatch (hits NVIDIA's ~4096 allocation limit),
+# we sub-allocate from a small number of large "slab" VkMappedBuffers.
+#
+# Design:
+#   - Each slab is a single VkDeviceMemory of ARG_SLAB_SIZE bytes (default 4MB)
+#   - Sub-allocations are bump-allocated with 256-byte alignment (BDA alignment requirement)
+#   - On vk_flush!(), the bump pointer resets to 0 (all dispatches complete, safe to reuse)
+#   - If a single allocation exceeds remaining slab space, allocate from next slab
+#   - Slabs grow on demand but rarely need more than 1-2 for typical workloads
 
-function get_arg_buffer(nbytes::Integer)
-    alloc_size = max(256, nextpow(2, nbytes))
+const ARG_SLAB_SIZE = 4 * 1024 * 1024  # 4MB per slab — holds ~16K dispatches at 256B each
+const ARG_SLAB_ALIGN = 256  # BDA alignment for arg buffer sub-allocations
 
-    _arg_buffer_idx[] += 1
-    idx = _arg_buffer_idx[]
-
-    # Grow pool if needed (more in-flight dispatches than current pool size)
-    while length(_arg_buffers) < idx
-        push!(_arg_buffers, vk_alloc_mapped(alloc_size))
-    end
-
-    buf = _arg_buffers[idx]
-
-    # Grow individual buffer if too small
-    if buf.size < nbytes
-        buf = vk_alloc_mapped(alloc_size)
-        _arg_buffers[idx] = buf
-    end
-
-    return buf
+"""A sub-allocation within an arg buffer slab."""
+struct ArgBufferAlloc
+    address::UInt64      # BDA of this sub-allocation
+    mapped_ptr::Ptr{UInt8}  # CPU-writable pointer
+    size::Int            # Allocated size
 end
 
-"""Reset arg buffer pool index after flush (all in-flight dispatches completed).
-Shrinks pool if it's significantly larger than recent peak usage."""
-function reset_arg_buffer_pool!()
-    # Track peak usage per flush cycle
-    push!(_arg_buffer_peak_window, _arg_buffer_idx[])
-    if length(_arg_buffer_peak_window) > _arg_buffer_shrink_window
-        popfirst!(_arg_buffer_peak_window)
-    end
-    _arg_buffer_idx[] = 0
+const _arg_slabs = VkMappedBuffer[]
+const _arg_slab_idx = Ref(1)     # Current slab index (1-based)
+const _arg_slab_offset = Ref(0)  # Byte offset within current slab
+const _arg_alloc_count = Ref(0)  # Total allocations this batch (for stats)
 
-    # Shrink pool if it's > 2x recent peak for a full window of flush cycles
-    if length(_arg_buffer_peak_window) >= _arg_buffer_shrink_window
-        recent_max = maximum(_arg_buffer_peak_window)
-        target = max(recent_max * 2, 16)  # keep 2x headroom, minimum 16
-        if length(_arg_buffers) > target
-            # Destroy excess VkMappedBuffers (Vulkan.jl handles via destructors)
-            while length(_arg_buffers) > target
-                buf = pop!(_arg_buffers)
-                if !_device_lost[]
-                    Vulkan.unmap_memory(vk_device(), buf.memory)
-                    buf.buffer.destructor()
-                    buf.memory.destructor()
-                end
-            end
+# Legacy compatibility
+const _arg_buffers = VkMappedBuffer[]  # unused, kept for gpu_memory_usage()
+const _arg_buffer_idx = Ref(0)
+
+function _ensure_arg_slab!(min_size::Int)
+    while length(_arg_slabs) < _arg_slab_idx[]
+        push!(_arg_slabs, vk_alloc_mapped(max(ARG_SLAB_SIZE, min_size)))
+    end
+    slab = _arg_slabs[_arg_slab_idx[]]
+    # If current slab is too small for the allocation, move to next slab
+    if _arg_slab_offset[] + min_size > slab.size
+        _arg_slab_idx[] += 1
+        _arg_slab_offset[] = 0
+        while length(_arg_slabs) < _arg_slab_idx[]
+            push!(_arg_slabs, vk_alloc_mapped(max(ARG_SLAB_SIZE, min_size)))
         end
     end
+end
+
+function get_arg_buffer(nbytes::Integer)
+    aligned_size = (max(Int(nbytes), 16) + ARG_SLAB_ALIGN - 1) & ~(ARG_SLAB_ALIGN - 1)
+
+    _ensure_arg_slab!(aligned_size)
+
+    slab = _arg_slabs[_arg_slab_idx[]]
+    offset = _arg_slab_offset[]
+    _arg_slab_offset[] = offset + aligned_size
+    _arg_alloc_count[] += 1
+
+    return ArgBufferAlloc(
+        slab.address + UInt64(offset),
+        slab.mapped_ptr + offset,
+        aligned_size
+    )
+end
+
+"""Reset arg buffer slab allocator after flush (all in-flight dispatches completed)."""
+function reset_arg_buffer_pool!()
+    _arg_slab_idx[] = 1
+    _arg_slab_offset[] = 0
+    _arg_alloc_count[] = 0
 end

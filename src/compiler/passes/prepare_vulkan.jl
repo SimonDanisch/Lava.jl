@@ -2594,6 +2594,21 @@ function _first_scalar_field(ty::LLVM.LLVMType)
 end
 
 """Trace a pointer through GEPs back to its alloca, if any."""
+# Check if a GEP chain from ptr to its alloca contains any GEP with dynamic indices.
+function _gep_chain_has_dynamic_indices(ptr::LLVM.Value)
+    current = ptr
+    while current isa LLVM.GetElementPtrInst
+        ops = LLVM.operands(current)
+        for i in 2:length(ops)
+            if _resolve_const_gep_index(ops[i]) === nothing
+                return true
+            end
+        end
+        current = ops[1]
+    end
+    return false
+end
+
 function _trace_to_alloca(ptr::LLVM.Value)
     ptr isa LLVM.AllocaInst && return ptr
     if ptr isa LLVM.GetElementPtrInst
@@ -2721,6 +2736,11 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
 
                     alloca = _trace_to_alloca(ptr)
                     alloca === nothing && continue
+
+                    # Skip if the GEP chain to the alloca passes through any GEP with
+                    # dynamic (non-constant) indices. We only decompose fully-constant
+                    # offset chains. Dynamic offsets must be handled by the SPIR-V emitter.
+                    _gep_chain_has_dynamic_indices(ptr) && continue
 
                     alloca_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(alloca))
 

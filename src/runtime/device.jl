@@ -87,6 +87,12 @@ const _vk_context = Ref{Union{Nothing, VkContext}}(nothing)
 # Set to true after DEVICE_LOST — prevents finalizers from calling Vulkan on invalid handles
 const _device_lost = Ref(false)
 
+# Device generation counter — incremented on each vk_reset_device!().
+# VkManagedBuffer records the generation at creation time. If a GC finalizer
+# fires after a device reset, the buffer's generation won't match the current
+# one and destruction is skipped (the old device cleaned up its own resources).
+const _device_generation = Ref{UInt64}(0)
+
 # Callbacks for vk_reset_device! — registered by later-included files (pipeline.jl,
 # command.jl, launch.jl, memory.jl) to clear their module-level caches.
 const _reset_callbacks = Function[]
@@ -119,6 +125,7 @@ kernels, arg buffers).
 GPU buffers no longer exist. You must reallocate all GPU data.
 """
 function vk_reset_device!()
+    _device_generation[] += 1  # Invalidate old VkManagedBuffer handles
     _device_lost[] = false
     _vk_context[] = nothing
     # Don't destroy old Vulkan handles — they're invalid after DEVICE_LOST.
@@ -392,19 +399,11 @@ function _init_vulkan!()
         @warn "Vulkan validation layers not found. Install vulkan-validationlayers for GPU error diagnostics."
     end
 
-    # NVIDIA TDR workaround: use split-indirect path (downloads group count, dispatches
-    # directly) instead of true vkCmdDispatchIndirect. Batching multiple heavy indirect
-    # dispatches in a single command buffer triggers Xid 109 CTX SWITCH TIMEOUT on NVIDIA.
-    # The split path adds a trivial sync per indirect dispatch (~4 bytes download) but
-    # prevents TDR by flushing between dispatches.
     vendor_id = props.vendor_id
     is_nvidia = vendor_id == 0x10DE
     if is_nvidia
         _spirv_opt_enabled[] = true
-        # Auto-flush was removed after Fix 9 (universal misaligned PSB detection).
-        # TDR timeout was caused by misaligned PSB loads, not command buffer size.
-        # auto_flush_threshold remains 0 (unlimited batching) for best performance.
-        @debug "NVIDIA detected: spirv-opt=on, auto-flush=$(auto_flush_threshold[])"
+        @debug "NVIDIA detected: spirv-opt=on"
     end
 
     # Initialize zero-alloc Vulkan function pointers for hot paths

@@ -239,7 +239,7 @@ Example:
         Vulkan.cmd_dispatch(cmd, ...)
     end
 """
-function record_dispatch!(f, ctx::VkContext;
+@inline function record_dispatch!(f, ctx::VkContext;
                            dst_stage::Vulkan.PipelineStageFlag,
                            extra_dst_access::Vulkan.AccessFlag=Vulkan.AccessFlag(0),
                            is_rt::Bool=false,
@@ -274,8 +274,8 @@ function record_dispatch!(f, ctx::VkContext;
     batch.dispatch_count += 1
     batch.segment_dispatches += 1
     batch.last_was_rt = is_rt
-    Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, 1)
     if dispatch_logging_enabled[]
+        Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, 1)
         log_dispatch!("$(TOTAL_DISPATCH_COUNTER[]) $info")
     end
 
@@ -342,17 +342,17 @@ function vk_dispatch!(pipeline::LavaComputePipeline, push_bda::UInt64,
 end
 
 """Record a single compute dispatch with optional base group offset."""
-function vk_dispatch_base!(pipeline::LavaComputePipeline, push_bda::UInt64,
+@inline function vk_dispatch_base!(pipeline::LavaComputePipeline, push_bda::UInt64,
                             base_x::Int, base_y::Int, base_z::Int,
                             gx::Int, gy::Int, gz::Int)
-    # NOTE: maybe_auto_flush!() is called by callers BEFORE get_arg_buffer(),
-    # not here. Flushing here would reset the arg buffer pool after the caller
-    # already allocated an arg buffer.
     ctx = vk_context()
-    info = last_dispatch_info[]
 
-    dispatch_info = dispatch_logging_enabled[] ?
-        "$info base=($base_x,$base_y,$base_z) g=($gx,$gy,$gz)" : ""
+    dispatch_info = if dispatch_logging_enabled[]
+        info = last_dispatch_info[]
+        "$info base=($base_x,$base_y,$base_z) g=($gx,$gy,$gz)"
+    else
+        ""
+    end
     record_dispatch!(ctx;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         info=dispatch_info
@@ -378,7 +378,7 @@ end
 Record an indirect compute dispatch. The `indirect_buf` must contain a
 VkDispatchIndirectCommand (3×UInt32), written by a previous GPU kernel.
 """
-function vk_dispatch_indirect!(pipeline::LavaComputePipeline, push_bda::UInt64,
+@inline function vk_dispatch_indirect!(pipeline::LavaComputePipeline, push_bda::UInt64,
                                indirect_buf, indirect_offset::Integer=0)
     ctx = vk_context()
     dispatch_info = dispatch_logging_enabled[] ?
@@ -393,7 +393,8 @@ function vk_dispatch_indirect!(pipeline::LavaComputePipeline, push_bda::UInt64,
         push_constants_bda!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_bda)
 
         vk_buf = indirect_buf isa Vulkan.Buffer ? indirect_buf : indirect_buf.buffer
-        Vulkan.cmd_dispatch_indirect(cmd, vk_buf, UInt64(indirect_offset))
+        buf_offset = indirect_buf isa VkIndirectBuffer ? indirect_buf.buffer_offset : UInt64(0)
+        Vulkan.cmd_dispatch_indirect(cmd, vk_buf, buf_offset + UInt64(indirect_offset))
     end
 end
 

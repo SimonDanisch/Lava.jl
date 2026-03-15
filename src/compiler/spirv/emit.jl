@@ -2321,8 +2321,25 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     idx_llvm_ty=LLVM.value_type(ops[2]))
             elseif sc == SC.Function
                 # Function storage class: OpPtrAccessChain is NOT valid.
-                # Use base pointer directly; load/store handlers resolve type mismatches.
-                result_id = base_id
+                base_pointee = get_pointee_type(state.type_ctx.ptm, base_ptr)
+                leaf_count = base_pointee !== nothing ? _count_scalar_elements(base_pointee, source_ty) : 0
+                if leaf_count > 1
+                    # Flat indexing into a composite alloca (e.g. gep float, ptr %alloca_of_{[2x[8xfloat]]}, i64 %idx).
+                    # Decompose the flat index into OpAccessChain indices using div/mod.
+                    flat_idx_i32 = _ensure_index_i32!(state, ops[2])
+                    ac_indices = _decompose_flat_index_for_composite!(state, base_pointee, source_ty, flat_idx_i32)
+                    result_id = fresh_id!(state.mod)
+                    word_count = UInt32(4 + length(ac_indices))
+                    push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                    push!(state.mod.functions, result_ptr_ty)
+                    push!(state.mod.functions, result_id)
+                    push!(state.mod.functions, base_id)
+                    append!(state.mod.functions, ac_indices)
+                else
+                    # Simple scalar or no decomposition possible: use base pointer directly;
+                    # load/store handlers resolve type mismatches.
+                    result_id = base_id
+                end
             elseif sc == SC.Private
                 # Private storage class: OpPtrAccessChain is NOT valid.
                 # Use OpAccessChain with element index for Private array globals.
@@ -2924,7 +2941,61 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
                     arr_elem_ty = LLVM.eltype(arr_ty)
                     arr_elem_size = _compute_type_size(arr_elem_ty)
                     if arr_elem_size > 0
-                        # Compute: element_idx = (byte_offset - arr_byte_offset) / arr_elem_size
+                        # When the array element is itself composite (nested arrays/structs),
+                        # compute a flat scalar index and decompose through the full hierarchy.
+                        # E.g., {[2 x [8 x float]]} with byte offset (idx*4+32):
+                        #   flat_idx = byte_offset / 4, then decompose into [outer, inner] indices.
+                        leaf_ty = arr_elem_ty
+                        while leaf_ty isa LLVM.ArrayType
+                            leaf_ty = LLVM.eltype(leaf_ty)
+                        end
+                        leaf_size = _compute_type_size(leaf_ty)
+                        if leaf_size > 0 && (arr_elem_ty isa LLVM.ArrayType || arr_elem_ty isa LLVM.StructType)
+                            # Nested composite: decompose byte offset into flat scalar index
+                            # flat_idx = (byte_offset - arr_byte_offset) / leaf_size
+                            adjusted_id = byte_offset_id
+                            if arr_byte_offset > 0
+                                off_id = _emit_int_constant!(state, idx_ty, Int64(arr_byte_offset))
+                                adjusted_id = fresh_id!(state.mod)
+                                encode_instruction!(state.mod.functions, Op.OpISub, idx_spirv_ty, adjusted_id, byte_offset_id, off_id)
+                            end
+                            flat_idx_id = adjusted_id
+                            if leaf_size > 1
+                                sz_id = _emit_int_constant!(state, idx_ty, Int64(leaf_size))
+                                flat_idx_id = fresh_id!(state.mod)
+                                encode_instruction!(state.mod.functions, Op.OpSDiv, idx_spirv_ty, flat_idx_id, adjusted_id, sz_id)
+                            end
+                            # Convert to i32 for OpAccessChain
+                            flat_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
+                                u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+                                conv_id = fresh_id!(state.mod)
+                                encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, flat_idx_id)
+                                conv_id
+                            else
+                                flat_idx_id
+                            end
+                            # Decompose flat index through the array hierarchy
+                            decomposed = _decompose_flat_index_for_composite!(state, arr_ty, leaf_ty, flat_idx_i32)
+                            leaf_spirv = map_type!(state.type_ctx, leaf_ty)
+                            result_ptr_ty = map_pointer_type!(state.type_ctx, leaf_spirv, sc)
+                            all_indices = UInt32[]
+                            for idx_val in arr_path
+                                push!(all_indices, emit_constant_u32!(state.mod, UInt32(idx_val)))
+                            end
+                            append!(all_indices, decomposed)
+                            result_id = fresh_id!(state.mod)
+                            word_count = UInt32(4 + length(all_indices))
+                            push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                            push!(state.mod.functions, result_ptr_ty)
+                            push!(state.mod.functions, result_id)
+                            push!(state.mod.functions, base_id)
+                            append!(state.mod.functions, all_indices)
+                            state.value_map[inst] = result_id
+                            set_pointee_type!(state.type_ctx.ptm, inst, leaf_ty; priority=4)
+                            return
+                        end
+
+                        # Simple (non-nested) array element: divide byte offset by element size
                         arr_elem_spirv = map_type!(state.type_ctx, arr_elem_ty)
                         result_ptr_ty = map_pointer_type!(state.type_ctx, arr_elem_spirv, sc)
 
@@ -3658,6 +3729,98 @@ function _compute_type_alignment(ty::LLVM.LLVMType)
     else
         return 4
     end
+end
+
+# Count how many leaf elements of type `leaf_ty` exist in a composite type.
+# Returns 0 if the type does not contain `leaf_ty` at the leaves.
+function _count_scalar_elements(ty::LLVM.LLVMType, leaf_ty::LLVM.LLVMType)
+    if ty == leaf_ty
+        return 1
+    elseif _types_same_size(ty, leaf_ty) && !(ty isa LLVM.StructType) && !(ty isa LLVM.ArrayType)
+        return 1  # same-sized scalar (e.g. i32 vs float)
+    elseif ty isa LLVM.StructType
+        total = 0
+        for field in LLVM.elements(ty)
+            total += _count_scalar_elements(field, leaf_ty)
+        end
+        return total
+    elseif ty isa LLVM.ArrayType
+        return Int(LLVM.length(ty)) * _count_scalar_elements(LLVM.eltype(ty), leaf_ty)
+    else
+        return 0
+    end
+end
+
+# Decompose a flat scalar index into OpAccessChain indices for a composite type.
+# E.g., for {[2 x [8 x float]]} with leaf=float, flat_idx 10 → indices [0, 1, 2]
+# meaning struct field 0, outer array index 1 (10÷8), inner array index 2 (10%8).
+# Emits SPIR-V UDiv/UMod arithmetic for dynamic indices.
+function _decompose_flat_index_for_composite!(state::SPIRVEmitterState,
+        composite_ty::LLVM.LLVMType, leaf_ty::LLVM.LLVMType, flat_idx_i32::UInt32)
+    indices = UInt32[]
+    current_ty = composite_ty
+    remaining = flat_idx_i32
+    u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+
+    while current_ty != leaf_ty && !(_types_same_size(current_ty, leaf_ty) &&
+            !(current_ty isa LLVM.StructType) && !(current_ty isa LLVM.ArrayType))
+        if current_ty isa LLVM.StructType
+            fields = LLVM.elements(current_ty)
+            if length(fields) == 1
+                # Single-field struct: always index 0, descend into the field
+                push!(indices, emit_constant_u32!(state.mod, UInt32(0)))
+                current_ty = fields[1]
+            else
+                # Multi-field struct: find which field the index falls into.
+                # Compute cumulative element counts to determine the field.
+                field_counts = [_count_scalar_elements(f, leaf_ty) for f in fields]
+                cumulative = 0
+                found = false
+                for (fi, fc) in enumerate(field_counts)
+                    if fi == length(fields)
+                        # Last field: must be this one
+                        push!(indices, emit_constant_u32!(state.mod, UInt32(fi - 1)))
+                        if cumulative > 0
+                            offset_const = emit_constant_u32!(state.mod, UInt32(cumulative))
+                            new_rem = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpISub, u32_ty, new_rem, remaining, offset_const)
+                            remaining = new_rem
+                        end
+                        current_ty = fields[fi]
+                        found = true
+                        break
+                    end
+                    cumulative += fc
+                end
+                if !found
+                    error("Could not decompose flat index into multi-field struct")
+                end
+            end
+        elseif current_ty isa LLVM.ArrayType
+            elem_ty = LLVM.eltype(current_ty)
+            elem_count = _count_scalar_elements(elem_ty, leaf_ty)
+            if elem_count == 1
+                # Leaf array: index directly
+                push!(indices, remaining)
+                return indices
+            else
+                # Divide to get this level's index, mod for remaining
+                divisor = emit_constant_u32!(state.mod, UInt32(elem_count))
+                this_idx = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpUDiv, u32_ty, this_idx, remaining, divisor)
+                push!(indices, this_idx)
+
+                new_remaining = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpUMod, u32_ty, new_remaining, remaining, divisor)
+                remaining = new_remaining
+
+                current_ty = elem_ty
+            end
+        else
+            break
+        end
+    end
+    return indices
 end
 
 function _compute_type_size(ty::LLVM.LLVMType)

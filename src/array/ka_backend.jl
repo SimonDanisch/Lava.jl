@@ -218,6 +218,70 @@ _ka_arg_llvm_type(x) = typeof(x)  # Everything passes through as-is
 
 # ── Indirect dispatch support ──
 
+function _prepare_indirect_kernel(indirect::Ptr{UInt32}, ndrange_buf::Ptr{Int32}, ws::UInt32)
+    n = UInt32(unsafe_load(ndrange_buf, 1))
+    groups = (n + ws - UInt32(1)) ÷ ws
+    unsafe_store!(indirect, groups, 1)    # groupCountX
+    unsafe_store!(indirect, UInt32(1), 2)  # groupCountY
+    unsafe_store!(indirect, UInt32(1), 3)  # groupCountZ
+    return nothing
+end
+
+# ── Fast prepare-indirect path ──
+# Bypasses full lava_launch! to avoid per-dispatch ceremony overhead.
+# The prepare-indirect kernel is always the same function with the same types,
+# so we compile once and cache everything. Saves ~30K lava_launch! calls per render
+# (hash lookups, validation, auto-flush, keep_alive, etc.).
+
+const _prepare_indirect_pipeline_ref = Ref{Union{Nothing, LavaComputePipeline}}(nothing)
+const _prepare_indirect_offsets_ref = Ref{Union{Nothing, Vector{Int}}}(nothing)
+const _prepare_indirect_byval_ref = Ref{Union{Nothing, Vector{Int}}}(nothing)
+const _prepare_indirect_arg_buf_size_ref = Ref{Int}(0)
+
+# Register cleanup callback for vk_reset_device!
+push!(_reset_callbacks, function()
+    _prepare_indirect_pipeline_ref[] = nothing
+    _prepare_indirect_offsets_ref[] = nothing
+    _prepare_indirect_byval_ref[] = nothing
+    _prepare_indirect_arg_buf_size_ref[] = 0
+end)
+
+function _init_prepare_indirect_pipeline!()
+    _prepare_indirect_pipeline_ref[] !== nothing && return
+    tt = Tuple{Ptr{UInt32}, Ptr{Int32}, UInt32}
+    ws = (1, 1, 1)
+    compiled, pipeline, offsets, byval_sizes = _get_compiled_kernel_and_pipeline(
+        _prepare_indirect_kernel, tt, ws)
+    _prepare_indirect_pipeline_ref[] = pipeline
+    _prepare_indirect_offsets_ref[] = offsets
+    _prepare_indirect_byval_ref[] = byval_sizes
+    _prepare_indirect_arg_buf_size_ref[] = compiled.push_info.arg_buffer_size
+end
+
+"""
+    _fast_prepare_indirect!(indirect_buf, ndrange_buf, workgroup_size)
+
+Fast path for prepare-indirect dispatch. Bypasses lava_launch! entirely:
+no validation, no auto-flush check, no keep_data_alive!, no logging overhead.
+Records a single-thread direct dispatch to compute ceil(n/ws) group counts.
+"""
+function _fast_prepare_indirect!(indirect_buf::VkIndirectBuffer, ndrange_buf::LavaArray{<:Integer}, workgroup_size::Integer)
+    _init_prepare_indirect_pipeline!()
+
+    pipeline = _prepare_indirect_pipeline_ref[]
+    offsets = _prepare_indirect_offsets_ref[]
+    byval_sizes = _prepare_indirect_byval_ref[]
+    arg_size = _prepare_indirect_arg_buf_size_ref[]
+
+    # Pack args: f (ghost, skipped), Ptr{UInt32} (BDA), LavaArray (BDA), UInt32 (direct)
+    all_args = (_prepare_indirect_kernel, Ptr{UInt32}(indirect_buf.address), ndrange_buf, UInt32(workgroup_size))
+    arg_buf = get_arg_buffer(arg_size)
+    _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets, arg_size, byval_sizes, all_args)
+
+    # Record dispatch directly — single workgroup of 1 thread
+    vk_dispatch_base!(pipeline, arg_buf.address, 0, 0, 0, 1, 1, 1)
+end
+
 """
     _prepare_indirect_dispatch!(indirect_buf, ndrange_buf, workgroup_size)
 
@@ -230,15 +294,6 @@ function _prepare_indirect_dispatch!(indirect_buf::VkIndirectBuffer, ndrange_buf
     lava_launch!(_prepare_indirect_kernel,
                  Ptr{UInt32}(indirect_buf.address), ndrange_buf, UInt32(workgroup_size);
                  ndrange=1, workgroup_size=(1, 1, 1))
-end
-
-function _prepare_indirect_kernel(indirect::Ptr{UInt32}, ndrange_buf::Ptr{Int32}, ws::UInt32)
-    n = UInt32(unsafe_load(ndrange_buf, 1))
-    groups = (n + ws - UInt32(1)) ÷ ws
-    unsafe_store!(indirect, groups, 1)    # groupCountX
-    unsafe_store!(indirect, UInt32(1), 2)  # groupCountY
-    unsafe_store!(indirect, UInt32(1), 3)  # groupCountZ
-    return nothing
 end
 
 """
@@ -332,7 +387,7 @@ function _ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, 
                            compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
         indirect_buf = _get_indirect_buffer()
-        _prepare_indirect_dispatch!(indirect_buf, ndrange_buf, ws_prod)
+        _fast_prepare_indirect!(indirect_buf, ndrange_buf, ws_prod)
 
         if dispatch_logging_enabled[]
             last_dispatch_info[] = "indirect f=$(_dispatch_name(obj.f, all_args))"

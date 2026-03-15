@@ -55,6 +55,16 @@ end
         include(joinpath(@__DIR__, "test_nvidia_regression.jl"))
     end
 
+    # ── Tier 3e: GPU Memory Safety ──
+    @testset "Tier 3e: GPU Memory Safety" begin
+        include(joinpath(@__DIR__, "test_gpu_memory_safety.jl"))
+    end
+
+    # ── Tier 3f: Caching & Allocations ──
+    @testset "Tier 3f: Caching & Allocations" begin
+        include(joinpath(@__DIR__, "test_caching_and_allocations.jl"))
+    end
+
     # ── Tier 4: GPUArrays TestSuite ──
     @testset "Tier 4: GPUArrays TestSuite" begin
         include(joinpath(@__DIR__, "test_gpuarrays.jl"))

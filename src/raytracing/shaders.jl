@@ -6,19 +6,6 @@
 #
 # Compilation is lazy — shaders are compiled on first use and cached.
 
-# Max rays per RT dispatch — prevents TDR timeout on NVIDIA GPUs.
-# Max rays per RT dispatch. When > 0, downloads ray count from GPU and dispatches
-# directly (adds CPU-GPU sync overhead). 0 = use indirect dispatch (no readback).
-# Default 0. Use set_max_rays_per_rt_dispatch!(n) if hitting TDR on specific scenes.
-const _max_rays_per_rt_dispatch = Ref{Int}(0)
-
-"""
-    set_max_rays_per_rt_dispatch!(n::Integer)
-
-Set the maximum number of rays per RT dispatch to avoid NVIDIA TDR timeout.
-Set to 0 to disable (use indirect dispatch, default).
-"""
-set_max_rays_per_rt_dispatch!(n::Integer) = (_max_rays_per_rt_dispatch[] = Int(n))
 
 """
     RayTracingPipeline
@@ -59,11 +46,22 @@ mutable struct RayTracingPipeline
     # Compiled state (lazy)
     _compiled::Union{Nothing, NamedTuple}
     _pipeline_cache::Dict{UInt64, Tuple{LavaRTPipeline, LavaRTShader, Vector{Int}, Vector{Int}}}
+    _cache_device_gen::UInt64  # device generation when cache was populated
 end
 
 function RayTracingPipeline(; raygen, closest_hit, miss, any_hit=nothing, payload_type::Symbol=:f32)
     RayTracingPipeline(raygen, closest_hit, miss, any_hit, payload_type, nothing,
-                        Dict{UInt64, Tuple{LavaRTPipeline, LavaRTShader, Vector{Int}, Vector{Int}}}())
+                        Dict{UInt64, Tuple{LavaRTPipeline, LavaRTShader, Vector{Int}, Vector{Int}}}(),
+                        _device_generation[])
+end
+
+"""Invalidate RT pipeline cache if the Vulkan device was reset since last use."""
+function _invalidate_stale_rt_cache!(pipeline::RayTracingPipeline)
+    if pipeline._cache_device_gen != _device_generation[]
+        empty!(pipeline._pipeline_cache)
+        pipeline._compiled = nothing
+        pipeline._cache_device_gen = _device_generation[]
+    end
 end
 
 """
@@ -82,6 +80,9 @@ function trace_rays!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args...;
     tt = Tuple{map(_rt_arg_llvm_type, args)...}
     cache_key = hash((tt,))
 
+    # Invalidate cache if device was reset (pipelines reference old VkDevice)
+    _invalidate_stale_rt_cache!(pipeline)
+
     # Get or compile pipeline for this argument signature
     cached = get(pipeline._pipeline_cache, cache_key, nothing)
     if cached === nothing
@@ -94,6 +95,10 @@ function trace_rays!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args...;
     all_args = (pipeline.raygen_func, args...)
     inline_extra = _compute_inline_extra_from_byval(byval_sizes)
     total_size = raygen_compiled.push_info.arg_buffer_size + inline_extra
+
+    # Auto-flush BEFORE allocating arg buffer — same pattern as lava_launch!.
+    # Flushing after allocation would reset the slab and invalidate our buffer.
+    maybe_auto_flush!()
 
     arg_buf = get_arg_buffer(total_size)
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
@@ -119,6 +124,9 @@ function trace_rays_indirect!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args
     tt = Tuple{map(_rt_arg_llvm_type, args)...}
     cache_key = hash((tt,))
 
+    # Invalidate cache if device was reset (pipelines reference old VkDevice)
+    _invalidate_stale_rt_cache!(pipeline)
+
     # Get or compile pipeline for this argument signature
     cached = get(pipeline._pipeline_cache, cache_key, nothing)
     if cached === nothing
@@ -127,7 +135,14 @@ function trace_rays_indirect!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args
     end
     vk_pipeline, raygen_compiled, offsets, byval_sizes = cached
 
-    # Pack args directly to mapped memory (unified path with compute)
+    # Prepare the indirect buffer FIRST, before allocating the RT arg buffer.
+    # _prepare_indirect_rt_dispatch! → lava_launch! may trigger auto-flush which
+    # resets slab pools. If we allocated the RT arg buffer first, the flush would
+    # invalidate it (DEVICE_LOST from stale BDA).
+    indirect_buf = _get_indirect_buffer()
+    _prepare_indirect_rt_dispatch!(indirect_buf, n_rays)
+
+    # Now allocate and pack RT args (safe — any auto-flush already happened)
     all_args = (pipeline.raygen_func, args...)
     inline_extra = _compute_inline_extra_from_byval(byval_sizes)
     total_size = raygen_compiled.push_info.arg_buffer_size + inline_extra
@@ -135,39 +150,10 @@ function trace_rays_indirect!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args
     arg_buf = get_arg_buffer(total_size)
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        raygen_compiled.push_info.arg_buffer_size, byval_sizes, all_args)
-
-    # Keep data buffer references alive until vk_flush!()
     keep_data_alive!(args)
-
-    # Push constant = BDA of arg buffer (passed as UInt64, zero-alloc).
-    # Safe with nested dispatches: _prepare_indirect_rt_dispatch! calls lava_launch!
-    # which uses its own push_bda, and push_constants_bda! sets+reads the module-level
-    # Ref synchronously in a single ccall.
     push_bda = arg_buf.address
 
-    max_rays = _max_rays_per_rt_dispatch[]
-    if max_rays > 0
-        # Download ray count from GPU and dispatch directly in chunks.
-        # Adds a sync point but prevents NVIDIA TDR timeout (Xid 109).
-        vk_flush!()
-        n = Int(Array(n_rays)[1])
-        if n <= 0
-            return
-        end
-        # Split into chunks to avoid TDR
-        offset = 0
-        while offset < n
-            chunk = min(max_rays, n - offset)
-            rt_dispatch!(vk_pipeline, tlas, push_bda, n, 1; depth=1)
-            vk_flush!()
-            break  # Can't split RT dispatches without shader offset support
-        end
-    else
-        # No limit — use true indirect dispatch
-        indirect_buf = _get_indirect_buffer()
-        _prepare_indirect_rt_dispatch!(indirect_buf, n_rays)
-        rt_dispatch_indirect!(vk_pipeline, tlas, push_bda, indirect_buf)
-    end
+    rt_dispatch_indirect!(vk_pipeline, tlas, push_bda, indirect_buf)
 end
 
 """Prepare indirect RT dispatch buffer: writes (n_rays, 1, 1) from a GPU-resident count."""

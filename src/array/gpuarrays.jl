@@ -136,9 +136,13 @@ function Base.resize!(a::LavaArray{T,1}, n::Integer) where T
     new_ref = GPUArrays.DataRef(new_buf) do buf
         vk_free!(buf)
     end
+    old_ref = a.buf
     a.buf = new_ref
     a.dims = (Int(n),)
     a.offset = 0
+    # Free old buffer — DataRef uses explicit refcounting, not GC finalizers,
+    # so we must release the old ref to avoid leaking VkDeviceMemory.
+    GPUArrays.unsafe_free!(old_ref)
     return a
 end
 

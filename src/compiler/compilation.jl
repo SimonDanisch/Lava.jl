@@ -842,6 +842,13 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # reads crossing struct field boundaries. Decompose into per-field loads + pack.
     _decompose_typepun_gep_loads!(mod, dl)
 
+    # Re-combine chained byte-offset GEPs that were left undecomposed above
+    # (because the chain contains dynamic indices). E.g.:
+    #   gep i8, (gep i8, %alloca, %dynamic), 224  →  gep i8, %alloca, add(%dynamic, 224)
+    # The emitter can then decompose the combined dynamic byte offset into proper
+    # OpAccessChain indices via _decompose_flat_index_for_composite!.
+    _combine_chained_geps!(mod)
+
     # LLVM may create loads where the type differs from the alloca type
     # (e.g., `load i16` from `alloca { [2 x i8] }`). SPIR-V requires strict
     # type matching, so rewrite these to byte-by-byte extraction.

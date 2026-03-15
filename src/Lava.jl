@@ -140,7 +140,7 @@ function gpu_memory_usage()
     (live_bytes = GPU_LIVE_BYTES[],
      live_buffers = length(_live_buffers),
      deferred_frees = length(DEFERRED_FREES),
-     arg_buffers_pooled = length(_arg_buffers),
+     arg_slabs = length(_arg_slabs),
      pipelines_cached = length(_pipeline_cache),
      kernels_cached = length(_kernel_cache))
 end
@@ -160,7 +160,7 @@ function dump_state(; io::IO=stdout)
     println(io, "GPU memory: $(live_mb) MiB in $(mem.live_buffers) buffers ($(mem.deferred_frees) deferred)")
     println(io, "Pipelines cached: $(mem.pipelines_cached) (max $(_max_pipeline_cache_size[]))")
     println(io, "Kernels cached: $(mem.kernels_cached) (max $(_max_kernel_cache_size[]))")
-    println(io, "Arg buffers pooled: $(mem.arg_buffers_pooled) (idx=$(_arg_buffer_idx[]))")
+    println(io, "Arg slabs: $(mem.arg_slabs) (slab_idx=$(_arg_slab_idx[]), offset=$(_arg_slab_offset[]))")
     if ctx !== nothing
         println(io, "Free batches: $(length(ctx.free_batches))")
         println(io, "Free cmd bufs: $(length(ctx.free_cmd_bufs))")
