@@ -821,6 +821,13 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # SPIR-V requires structured CF. Run the full structurize pipeline.
     run_structurize_cfg_pipeline!(mod)
 
+    # ── Flatten nested workgroup array globals ──
+    # Replace [32 x [2 x float]] → [64 x float] in addrspace(3).
+    # Without VK_KHR_workgroup_memory_explicit_layout, SPIR-V Workgroup arrays
+    # cannot have ArrayStride decorations, and NVIDIA miscomputes the stride
+    # for nested arrays. Flattening to scalar arrays avoids this.
+    _flatten_nested_workgroup_arrays!(mod)
+
     # ── Lift byte-offset GEPs on workgroup globals ──
     # Convert `gep i8, @shared, <offset>` ConstantExpr to typed struct-member GEPs.
     # Must run before decompose passes so the emitter sees proper typed access patterns.

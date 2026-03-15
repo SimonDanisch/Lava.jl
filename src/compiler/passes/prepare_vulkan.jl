@@ -1189,6 +1189,273 @@ function _gep_path_to_first_scalar(ty::LLVM.LLVMType)
 end
 
 # ============================================================================
+# Sub-pass: Flatten nested workgroup array globals
+# ============================================================================
+
+"""
+    _flatten_nested_workgroup_arrays!(mod::LLVM.Module)
+
+Replace addrspace(3) globals with nested array types (e.g. `[32 x [2 x float]]`)
+by flat scalar arrays (`[64 x float]`). SPIR-V Workgroup variables without explicit
+layout (VK_KHR_workgroup_memory_explicit_layout) cannot have nested array types —
+NVIDIA drivers miscompute the stride, causing only part of the array to be accessible.
+
+Creates a new flat global and rewrites GEP instructions to use flat indices.
+ConstantExpr GEPs (from reduce_group!-style constant-index accesses) are handled
+by replacing the global pointer and letting _fix_shared_geps! clean them up.
+"""
+function _flatten_nested_workgroup_arrays!(mod::LLVM.Module)
+    T_i64 = LLVM.Int64Type()
+
+    for gv in collect(LLVM.globals(mod))
+        pointee_ty = LLVM.global_value_type(gv)
+        ptr_ty = LLVM.value_type(gv)
+        ptr_ty isa LLVM.PointerType || continue
+        LLVM.addrspace(ptr_ty) == 3 || continue
+        pointee_ty isa LLVM.ArrayType || continue
+
+        # Check if this is a nested array (element is also an array)
+        leaf_ty = LLVM.eltype(pointee_ty)
+        leaf_ty isa LLVM.ArrayType || continue  # only fix nested arrays — structs handled elsewhere
+
+        # Compute leaf scalar type and total count
+        total_count = LLVM.length(pointee_ty)
+        cur = leaf_ty
+        while cur isa LLVM.ArrayType
+            total_count *= LLVM.length(cur)
+            cur = LLVM.eltype(cur)
+        end
+        scalar_ty = cur  # e.g. float
+        inner_count = total_count ÷ LLVM.length(pointee_ty)
+
+        # Create new flat global: [total_count x scalar_ty]
+        flat_arr_ty = LLVM.ArrayType(scalar_ty, total_count)
+        old_name = LLVM.name(gv)
+        new_gv = LLVM.GlobalVariable(mod, flat_arr_ty, old_name * "_flat", 3)
+        LLVM.linkage!(new_gv, LLVM.API.LLVMExternalLinkage)
+        LLVM.unnamed_addr!(new_gv, true)
+
+        # Rewrite all uses of the old global to use the flat global
+        _rewrite_all_wg_uses_to_flat!(gv, new_gv, flat_arr_ty, inner_count, T_i64)
+
+        # Any remaining uses (dead ConstantExprs) — RAUW to new_gv so we can erase.
+        # With opaque pointers both are `ptr addrspace(3)` so this is type-safe.
+        if !isempty(collect(LLVM.uses(gv)))
+            LLVM.replace_uses!(gv, new_gv)
+        end
+        LLVM.erase!(gv)
+    end
+end
+
+"""Rewrite all users of a workgroup global to use flat array indexing."""
+function _rewrite_all_wg_uses_to_flat!(old_gv, new_gv, flat_arr_ty, inner_count, T_i64)
+    # Iteratively process uses until none remain.
+    # ConstantExpr users persist as LLVM constants even after their instruction-level
+    # users are removed — track them to avoid infinite loops.
+    processed_ces = Set{UInt}()
+
+    for _iter in 1:100  # safety bound
+        uses = Tuple{LLVM.Value, Symbol}[]
+        for use in LLVM.uses(old_gv)
+            user = LLVM.user(use)
+            if user isa LLVM.GetElementPtrInst
+                push!(uses, (user, :gep))
+            elseif user isa LLVM.ConstantExpr
+                ce_id = UInt(user.ref)
+                ce_id in processed_ces && continue
+                push!(uses, (user, :constexpr))
+            elseif user isa LLVM.LoadInst
+                push!(uses, (user, :load))
+            elseif user isa LLVM.StoreInst
+                push!(uses, (user, :store))
+            end
+        end
+        isempty(uses) && break
+
+        for (user, kind) in uses
+            if kind == :gep
+                _rewrite_one_wg_gep!(user, old_gv, new_gv, flat_arr_ty, inner_count, T_i64)
+            elseif kind == :constexpr
+                _eliminate_wg_constexpr!(user, old_gv, new_gv, flat_arr_ty, inner_count, T_i64)
+                push!(processed_ces, UInt(user.ref))
+            elseif kind == :load
+                # Bare load from global: load from [0]
+                LLVM.@dispose builder=LLVM.IRBuilder() begin
+                    LLVM.position!(builder, user)
+                    zero = LLVM.ConstantInt(T_i64, 0)
+                    ptr = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                                   LLVM.Value[zero, zero], "wg_flat_ptr")
+                    loaded_ty = LLVM.value_type(user)
+                    new_load = LLVM.load!(builder, loaded_ty, ptr, "wg_flat_load")
+                    LLVM.alignment!(new_load, max(1, Int(LLVM.alignment(user))))
+                    LLVM.replace_uses!(user, new_load)
+                end
+                LLVM.erase!(user)
+            elseif kind == :store
+                # Bare store to global: store to [0]
+                LLVM.@dispose builder=LLVM.IRBuilder() begin
+                    LLVM.position!(builder, user)
+                    zero = LLVM.ConstantInt(T_i64, 0)
+                    ptr = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                                   LLVM.Value[zero, zero], "wg_flat_ptr")
+                    val = LLVM.operands(user)[1]
+                    new_store = LLVM.store!(builder, val, ptr)
+                    LLVM.alignment!(new_store, max(1, Int(LLVM.alignment(user))))
+                end
+                LLVM.erase!(user)
+            end
+        end
+    end
+end
+
+"""Total number of scalar elements in an LLVM type (recursing through arrays)."""
+function _total_scalar_count(ty::LLVM.LLVMType)
+    ty isa LLVM.ArrayType || return 1
+    return LLVM.length(ty) * _total_scalar_count(LLVM.eltype(ty))
+end
+
+"""Rewrite one GetElementPtrInst on a workgroup global to use flat indexing.
+
+Uses `LLVMGetGEPSourceElementType` to determine the stride for each index level:
+- First GEP index does pointer arithmetic (stride = total scalars in source type)
+- Each subsequent index descends one array level (stride = total scalars in element type)
+"""
+function _rewrite_one_wg_gep!(gep::LLVM.GetElementPtrInst, old_gv, new_gv,
+                                flat_arr_ty, inner_count, T_i64)
+    ops = LLVM.operands(gep)
+    length(ops) >= 2 || return  # need at least base + 1 index
+
+    # Get the GEP source element type
+    src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
+
+    LLVM.@dispose builder=LLVM.IRBuilder() begin
+        LLVM.position!(builder, gep)
+        zero = LLVM.ConstantInt(T_i64, 0)
+        flat_idx = zero  # accumulate flat scalar index
+
+        cur_ty = src_ty  # type at current level
+        for i in 2:length(ops)
+            idx = ops[i]
+            if LLVM.value_type(idx) != T_i64
+                idx = LLVM.sext!(builder, idx, T_i64, "wg_flat_idx64")
+            end
+
+            # Stride = total scalar elements in cur_ty
+            stride = _total_scalar_count(cur_ty)
+
+            if stride != 1
+                scaled = LLVM.mul!(builder, idx, LLVM.ConstantInt(T_i64, stride), "wg_flat_scale")
+            else
+                scaled = idx
+            end
+            flat_idx = LLVM.add!(builder, flat_idx, scaled, "wg_flat_acc")
+
+            # Descend into the element type for the next index
+            if cur_ty isa LLVM.ArrayType
+                cur_ty = LLVM.eltype(cur_ty)
+            end
+        end
+
+        new_gep = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                           LLVM.Value[zero, flat_idx], "wg_flat_gep")
+        LLVM.replace_uses!(gep, new_gep)
+        LLVM.erase!(gep)
+    end
+end
+
+"""Replace ConstantExpr GEP users with instruction-level GEPs on the flat global."""
+function _eliminate_wg_constexpr!(ce::LLVM.ConstantExpr, old_gv, new_gv,
+                                    flat_arr_ty, inner_count, T_i64)
+    # Compute the flat offset from the ConstantExpr's constant indices.
+    # Walk the global's pointee type structure to compute strides at each level.
+    # CEs on workgroup globals always use the outer array type as source.
+    ce_ops = LLVM.operands(ce)
+    pointee_ty = LLVM.global_value_type(old_gv)
+    flat_offset = 0
+    cur_ty = pointee_ty
+    for i in 2:length(ce_ops)
+        idx = ce_ops[i]
+        idx isa LLVM.ConstantInt || continue
+        val = convert(Int, idx)
+        stride = _total_scalar_count(cur_ty)
+        flat_offset += val * stride
+        if cur_ty isa LLVM.ArrayType
+            cur_ty = LLVM.eltype(cur_ty)
+        end
+    end
+
+    # Replace each instruction user of this ConstantExpr with a flat GEP
+    ce_inst_users = LLVM.Value[]
+    for use in LLVM.uses(ce)
+        push!(ce_inst_users, LLVM.user(use))
+    end
+
+    for inst in ce_inst_users
+        if inst isa LLVM.LoadInst
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                LLVM.position!(builder, inst)
+                zero = LLVM.ConstantInt(T_i64, 0)
+                off = LLVM.ConstantInt(T_i64, flat_offset)
+                ptr = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                               LLVM.Value[zero, off], "wg_flat_ce_ptr")
+                loaded_ty = LLVM.value_type(inst)
+                new_load = LLVM.load!(builder, loaded_ty, ptr, "wg_flat_ce_load")
+                LLVM.alignment!(new_load, max(1, Int(LLVM.alignment(inst))))
+                LLVM.replace_uses!(inst, new_load)
+            end
+            LLVM.erase!(inst)
+        elseif inst isa LLVM.StoreInst
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                LLVM.position!(builder, inst)
+                zero = LLVM.ConstantInt(T_i64, 0)
+                off = LLVM.ConstantInt(T_i64, flat_offset)
+                ptr = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                               LLVM.Value[zero, off], "wg_flat_ce_ptr")
+                val = LLVM.operands(inst)[1]
+                new_store = LLVM.store!(builder, val, ptr)
+                LLVM.alignment!(new_store, max(1, Int(LLVM.alignment(inst))))
+            end
+            LLVM.erase!(inst)
+        elseif inst isa LLVM.GetElementPtrInst
+            # GEP on ConstantExpr result: CE provides base offset, GEP adds dynamic index.
+            # Common pattern: gep [M x T], %ce, i64 0, i64 %inner_idx (3 ops)
+            # or:             gep [M x T], %ce, i64 %ptr_idx           (2 ops)
+            ops = LLVM.operands(inst)
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                LLVM.position!(builder, inst)
+                zero = LLVM.ConstantInt(T_i64, 0)
+                dynamic_inner = zero  # default: no dynamic offset
+                if length(ops) >= 4
+                    # ops = [base, 0, inner_idx, ...]
+                    idx = ops[4]
+                    if LLVM.value_type(idx) != T_i64
+                        idx = LLVM.sext!(builder, idx, T_i64, "wg_flat_ce_idx64")
+                    end
+                    dynamic_inner = idx
+                elseif length(ops) >= 3
+                    # ops = [base, 0, inner_idx]
+                    idx = ops[3]
+                    if LLVM.value_type(idx) != T_i64
+                        idx = LLVM.sext!(builder, idx, T_i64, "wg_flat_ce_idx64")
+                    end
+                    dynamic_inner = idx
+                end
+                adj_idx = if flat_offset != 0
+                    LLVM.add!(builder, dynamic_inner, LLVM.ConstantInt(T_i64, flat_offset), "wg_flat_ce_adj")
+                else
+                    dynamic_inner
+                end
+                new_gep = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                                   LLVM.Value[zero, adj_idx], "wg_flat_ce_gep")
+                LLVM.replace_uses!(inst, new_gep)
+            end
+            LLVM.erase!(inst)
+        end
+    end
+    # Note: the ConstantExpr itself will be cleaned up when it has no more uses
+end
+
+# ============================================================================
 # Sub-pass: Fix shared memory GEPs
 # ============================================================================
 
@@ -1769,7 +2036,7 @@ function _prepare_module_for_vulkan!(mod::LLVM.Module, entry_name::String;
         end
     end
 
-    # 3. Fix flat GEPs on addrspace(3) array globals
+    # 3b. Fix flat GEPs on addrspace(3) array globals
     _fix_shared_geps!(mod)
 
     # 4. Flatten array-typed GEPs in addrspace(1) (BDA / PhysicalStorageBuffer)
