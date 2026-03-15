@@ -1319,6 +1319,9 @@ end
 Uses `LLVMGetGEPSourceElementType` to determine the stride for each index level:
 - First GEP index does pointer arithmetic (stride = total scalars in source type)
 - Each subsequent index descends one array level (stride = total scalars in element type)
+
+If the GEP doesn't fully resolve to scalar level (e.g., only indexes the outer dimension
+of `[N x [6 x float]]`), chained GEP users are recursively folded into a single flat index.
 """
 function _rewrite_one_wg_gep!(gep::LLVM.GetElementPtrInst, old_gv, new_gv,
                                 flat_arr_ty, inner_count, T_i64)
@@ -1356,9 +1359,101 @@ function _rewrite_one_wg_gep!(gep::LLVM.GetElementPtrInst, old_gv, new_gv,
             end
         end
 
-        new_gep = LLVM.gep!(builder, flat_arr_ty, new_gv,
-                           LLVM.Value[zero, flat_idx], "wg_flat_gep")
-        LLVM.replace_uses!(gep, new_gep)
+        if !(cur_ty isa LLVM.ArrayType)
+            # Fully resolved to scalar — simple replacement
+            new_gep = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                               LLVM.Value[zero, flat_idx], "wg_flat_gep")
+            LLVM.replace_uses!(gep, new_gep)
+            LLVM.erase!(gep)
+        else
+            # GEP didn't reach scalar level — fold chained users into flat index
+            _rewrite_partial_wg_gep_users!(gep, new_gv, flat_arr_ty, flat_idx, cur_ty, T_i64)
+        end
+    end
+end
+
+"""Rewrite users of a partially-resolved workgroup GEP by folding their indices into the flat index.
+
+Called when a GEP on a flattened workgroup global doesn't descend to scalar level
+(e.g., `gep [N x [6 x float]], @shared, 0, %outer` reaches `[6 x float]`, not `float`).
+Chained GEP users have their indices folded into the base flat_idx to produce fully-resolved
+scalar GEPs on the new flat global.
+"""
+function _rewrite_partial_wg_gep_users!(gep, new_gv, flat_arr_ty, base_flat_idx,
+                                          remaining_ty, T_i64)
+    zero = LLVM.ConstantInt(T_i64, 0)
+
+    # Collect users before mutation
+    users = LLVM.Value[]
+    for use in LLVM.uses(gep)
+        push!(users, LLVM.user(use))
+    end
+
+    for user in users
+        if user isa LLVM.GetElementPtrInst
+            # Fold this chained GEP's indices into base_flat_idx
+            chained_ops = LLVM.operands(user)
+            chained_src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(user))
+
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                LLVM.position!(builder, user)
+                flat_idx = base_flat_idx
+                cur_ty = chained_src_ty
+
+                for i in 2:length(chained_ops)
+                    idx = chained_ops[i]
+                    if LLVM.value_type(idx) != T_i64
+                        idx = LLVM.sext!(builder, idx, T_i64, "wg_chain_idx64")
+                    end
+                    stride = _total_scalar_count(cur_ty)
+                    if stride != 1
+                        scaled = LLVM.mul!(builder, idx, LLVM.ConstantInt(T_i64, stride), "wg_chain_scale")
+                    else
+                        scaled = idx
+                    end
+                    flat_idx = LLVM.add!(builder, flat_idx, scaled, "wg_chain_acc")
+                    if cur_ty isa LLVM.ArrayType
+                        cur_ty = LLVM.eltype(cur_ty)
+                    end
+                end
+
+                if !(cur_ty isa LLVM.ArrayType)
+                    # Fully resolved — create scalar GEP
+                    new_gep_val = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                                       LLVM.Value[zero, flat_idx], "wg_flat_chain_gep")
+                    LLVM.replace_uses!(user, new_gep_val)
+                    LLVM.erase!(user)
+                else
+                    # Still not fully resolved — recurse
+                    _rewrite_partial_wg_gep_users!(user, new_gv, flat_arr_ty,
+                                                     flat_idx, cur_ty, T_i64)
+                end
+            end
+        elseif user isa LLVM.LoadInst
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                LLVM.position!(builder, user)
+                ptr = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                               LLVM.Value[zero, base_flat_idx], "wg_flat_ptr")
+                new_load = LLVM.load!(builder, LLVM.value_type(user), ptr, "wg_flat_load")
+                LLVM.alignment!(new_load, max(1, Int(LLVM.alignment(user))))
+                LLVM.replace_uses!(user, new_load)
+            end
+            LLVM.erase!(user)
+        elseif user isa LLVM.StoreInst
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                LLVM.position!(builder, user)
+                ptr = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                               LLVM.Value[zero, base_flat_idx], "wg_flat_ptr")
+                val = LLVM.operands(user)[1]
+                new_store = LLVM.store!(builder, val, ptr)
+                LLVM.alignment!(new_store, max(1, Int(LLVM.alignment(user))))
+            end
+            LLVM.erase!(user)
+        end
+    end
+
+    # Erase old GEP if no remaining uses
+    if isempty(collect(LLVM.uses(gep)))
         LLVM.erase!(gep)
     end
 end
