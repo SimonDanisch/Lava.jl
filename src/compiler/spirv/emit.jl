@@ -1317,15 +1317,38 @@ function _find_array_field_in_struct(struct_ty::LLVM.StructType, elem_stride::In
     candidates = Vector{Tuple{Vector{Int}, Int, LLVM.ArrayType}}()
     _collect_array_fields!(candidates, Int[], struct_ty, 0)
     isempty(candidates) && return nothing
-    # If stride hint given, find matching array
+    # If stride hint given, find matching array by leaf element size
     if elem_stride > 0
+        matches = Tuple{Vector{Int}, Int, LLVM.ArrayType}[]
         for (path, offset, arr_ty) in candidates
-            if _compute_type_size(LLVM.eltype(arr_ty)) == elem_stride
-                return (path, offset, arr_ty)
+            # Check immediate element size
+            elem_ty = LLVM.eltype(arr_ty)
+            if _compute_type_size(elem_ty) == elem_stride
+                push!(matches, (path, offset, arr_ty))
+            else
+                # Check leaf element size for nested arrays (e.g., [1 x [8 x double]])
+                leaf = elem_ty
+                while leaf isa LLVM.ArrayType
+                    leaf = LLVM.eltype(leaf)
+                end
+                if _compute_type_size(leaf) == elem_stride
+                    push!(matches, (path, offset, arr_ty))
+                end
             end
         end
+        if length(matches) == 1
+            return matches[1]
+        elseif length(matches) > 1
+            # Multiple arrays match stride — prefer the largest (most elements)
+            best = argmax(i -> _compute_type_size(matches[i][3]), eachindex(matches))
+            return matches[best]
+        end
     end
-    # Fallback: return first
+    # Fallback: return largest array
+    if length(candidates) > 1
+        best = argmax(i -> _compute_type_size(candidates[i][3]), eachindex(candidates))
+        return candidates[best]
+    end
     path, offset, arr_ty = candidates[1]
     return (path, offset, arr_ty)
 end
@@ -3825,21 +3848,34 @@ function _decompose_flat_index_for_composite!(state::SPIRVEmitterState,
                 field_counts = [_count_scalar_elements(f, leaf_ty) for f in fields]
                 cumulative = 0
                 found = false
-                for (fi, fc) in enumerate(field_counts)
-                    if fi == length(fields)
-                        # Last field: must be this one
-                        push!(indices, emit_constant_u32!(state.mod, UInt32(fi - 1)))
-                        if cumulative > 0
-                            offset_const = emit_constant_u32!(state.mod, UInt32(cumulative))
-                            new_rem = fresh_id!(state.mod)
-                            encode_instruction!(state.mod.functions, Op.OpISub, u32_ty, new_rem, remaining, offset_const)
-                            remaining = new_rem
-                        end
-                        current_ty = fields[fi]
-                        found = true
-                        break
+                # If only one field has nonzero count, pick it directly (no runtime check needed).
+                # Otherwise pick the field with the largest count (covers NTuple + metadata pattern).
+                nonzero_fields = [(i, c) for (i, c) in enumerate(field_counts) if c > 0]
+                if length(nonzero_fields) == 1
+                    # Unambiguous: only one field contains leaf-type elements
+                    fi = nonzero_fields[1][1]
+                    push!(indices, emit_constant_u32!(state.mod, UInt32(fi - 1)))
+                    if cumulative > 0
+                        # Shouldn't happen for single nonzero field
                     end
-                    cumulative += fc
+                    current_ty = fields[fi]
+                    found = true
+                else
+                    # Multiple fields contain leaf-type elements. Pick by cumulative offset.
+                    # The dynamic index should fall within the first field whose cumulative
+                    # range covers it. Since we can't branch at SPIR-V compile time, pick
+                    # the field with the largest count (the main data, not metadata).
+                    max_idx = argmax(field_counts)
+                    pre_cumulative = sum(field_counts[1:max_idx-1])
+                    push!(indices, emit_constant_u32!(state.mod, UInt32(max_idx - 1)))
+                    if pre_cumulative > 0
+                        offset_const = emit_constant_u32!(state.mod, UInt32(pre_cumulative))
+                        new_rem = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, Op.OpISub, u32_ty, new_rem, remaining, offset_const)
+                        remaining = new_rem
+                    end
+                    current_ty = fields[max_idx]
+                    found = true
                 end
                 if !found
                     error("Could not decompose flat index into multi-field struct")

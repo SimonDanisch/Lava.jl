@@ -2760,12 +2760,12 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
 
                     elem_size = _llvm_type_size(elem_ty)
 
-                    # Handle byte-GEPs into struct allocas (gep i8, ptr %struct_alloca, <offset>)
-                    # These have src_ty=i8, elem_ty=i8, but the alloca is a struct.
-                    # Resolve byte offset to the containing struct field.
+                    # Handle byte-GEPs into struct/array allocas (gep i8, ptr %alloca, <offset>)
+                    # These have src_ty=i8, elem_ty=i8, but the alloca is a struct/array.
+                    # Resolve byte offset to the containing field, load it, and extract
+                    # the relevant bits via bitcast+shift+trunc.
                     if src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8 &&
-                       (alloca_ty isa LLVM.StructType || alloca_ty isa LLVM.ArrayType) &&
-                       elem_size == load_size
+                       (alloca_ty isa LLVM.StructType || alloca_ty isa LLVM.ArrayType)
                         all_fields = _flatten_type_with_offsets(alloca_ty)
                         # Find the scalar field that contains this byte offset
                         containing = nothing
@@ -3432,14 +3432,24 @@ function _convert_typepunned_geps_to_byte_geps!(mod::LLVM.Module)
                     base isa LLVM.AllocaInst || continue
 
                     alloca_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(base))
-                    alloca_ty isa LLVM.ArrayType || continue
 
-                    alloca_elem_ty = LLVM.eltype(alloca_ty)
-                    elem_size = _llvm_type_size(alloca_elem_ty)
-                    elem_size > 0 || continue
-
-                    # Only convert when accessing with smaller type than alloca element
-                    src_size < elem_size || continue
+                    # Only process composite alloca types where the GEP source type
+                    # differs from the alloca's element type (type-punned access)
+                    if alloca_ty isa LLVM.ArrayType
+                        alloca_elem_ty = LLVM.eltype(alloca_ty)
+                        elem_size = _llvm_type_size(alloca_elem_ty)
+                        elem_size > 0 || continue
+                        # Only convert when accessing with smaller type than alloca element
+                        src_size < elem_size || continue
+                    elseif alloca_ty isa LLVM.StructType
+                        # Struct alloca: GEP treats struct as flat array of src_ty.
+                        # Convert to byte GEP so downstream passes can decompose properly.
+                        alloca_size = _llvm_type_size(alloca_ty)
+                        alloca_size > 0 || continue
+                        src_ty != alloca_ty || continue
+                    else
+                        continue
+                    end
 
                     # Convert: gep T, ptr %base, i64 %idx → gep i8, ptr %base, i64 (%idx * sizeof(T))
                     LLVM.@dispose builder=LLVM.IRBuilder() begin
