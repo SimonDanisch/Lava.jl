@@ -196,29 +196,24 @@ end
     end
 
     @testset "dispatch counter increments" begin
+        Lava.dispatch_logging_enabled[] = true
         before = Lava.TOTAL_DISPATCH_COUNTER[]
         a = Lava.LavaArray(Float32[1, 2, 3])
         _ = a .+ Float32(1)
         Lava.vk_flush!()
         @test Lava.TOTAL_DISPATCH_COUNTER[] > before
+        Lava.dispatch_logging_enabled[] = false
     end
 
-    @testset "auto-flush threshold" begin
-        old = Lava.auto_flush_threshold[]
-        try
-            Lava.set_auto_flush_threshold!(2)
-            a = Lava.LavaArray(ones(Float32, 64))
-            before = Lava.FLUSH_COUNTER[]
-            b = a .+ Float32(1)  # dispatch 1
-            c = b .+ Float32(1)  # dispatch 2 → auto-flush
-            d = c .+ Float32(1)  # dispatch 3
-            Lava.vk_flush!()
-            # At least 2 flushes: 1 auto + 1 manual
-            @test Lava.FLUSH_COUNTER[] - before >= 2
-            @test Array(d) == fill(Float32(4), 64)
-        finally
-            Lava.set_auto_flush_threshold!(old)
-        end
+    @testset "KA.synchronize flushes GPU work" begin
+        a = Lava.LavaArray(ones(Float32, 64))
+        before = Lava.FLUSH_COUNTER[]
+        b = a .+ Float32(1)
+        c = b .+ Float32(1)
+        KernelAbstractions.synchronize(Lava.LavaBackend())
+        # synchronize triggers a flush
+        @test Lava.FLUSH_COUNTER[] - before >= 1
+        @test Array(c) == fill(Float32(3), 64)
     end
 
     @testset "empty flush is no-op" begin
@@ -262,11 +257,13 @@ end
     end
 
     @testset "dispatch log records entries" begin
+        Lava.dispatch_logging_enabled[] = true
         empty!(Lava.dispatch_log)
         a = Lava.LavaArray(Float32[1, 2, 3])
         _ = a .+ Float32(1)
         Lava.vk_flush!()
         @test !isempty(Lava.dispatch_log)
+        Lava.dispatch_logging_enabled[] = false
     end
 end
 
@@ -292,17 +289,11 @@ end
         @test sum(b) ≈ 72.0f0
     end
 
-    @testset "large dispatch split" begin
-        old = Lava.max_groups_per_dispatch[]
-        try
-            Lava.set_max_groups_per_dispatch!(128)
-            N = 128 * 256 * 2
-            a = Lava.LavaArray(ones(Float32, N))
-            b = a .+ Float32(1)
-            Lava.vk_flush!()
-            @test all(Array(b) .== 2.0f0)
-        finally
-            Lava.set_max_groups_per_dispatch!(old)
-        end
+    @testset "large dispatch without splitting" begin
+        N = 128 * 256 * 2
+        a = Lava.LavaArray(ones(Float32, N))
+        b = a .+ Float32(1)
+        KernelAbstractions.synchronize(Lava.LavaBackend())
+        @test all(Array(b) .== 2.0f0)
     end
 end

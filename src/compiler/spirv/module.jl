@@ -181,6 +181,7 @@ module Cap
     const Tessellation              = UInt32(9)
     const InputAttachment           = UInt32(40)
     const RayTracingKHR             = UInt32(4479)
+    const WorkgroupMemoryExplicitLayoutKHR = UInt32(4428)
 end
 
 # ---- Storage Classes ----

@@ -96,10 +96,6 @@ function trace_rays!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args...;
     inline_extra = _compute_inline_extra_from_byval(byval_sizes)
     total_size = raygen_compiled.push_info.arg_buffer_size + inline_extra
 
-    # Auto-flush BEFORE allocating arg buffer — same pattern as lava_launch!.
-    # Flushing after allocation would reset the slab and invalidate our buffer.
-    maybe_auto_flush!()
-
     arg_buf = get_arg_buffer(total_size)
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        raygen_compiled.push_info.arg_buffer_size, byval_sizes, all_args)

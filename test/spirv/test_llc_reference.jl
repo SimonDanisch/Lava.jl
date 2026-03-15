@@ -14,6 +14,10 @@ end
 import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count, check_regex, normalize_spirv, compare_golden, compile_and_disasm, spirv_opt_roundtrip, check_vendor_safety, compile_with_llc
 
 @testset "llc Reference Comparison" begin
+    if !SPIRVTestUtils.HAS_LLC
+        @info "Skipping llc reference tests — SPIRV_LLVM_Backend_jll not available"
+        @test_broken false  # mark as skipped
+    else
 
     # Helper: compile with our emitter, then compare structurally against llc
     function compare_against_llc(f, tt; workgroup_size=(64, 1, 1))
@@ -173,6 +177,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         check(cmp.llc_disasm, "OpEntryPoint")
     end
 
+    end # if HAS_LLC
 end
 
 

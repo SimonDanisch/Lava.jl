@@ -182,8 +182,6 @@ function __init__()
     _device_lost[] = false
     FLUSH_COUNTER[] = 0
     TOTAL_DISPATCH_COUNTER[] = 0
-    auto_flush_threshold[] = 0
-    max_groups_per_dispatch[] = 0
     last_dispatch_info[] = ""
     prev_dispatch_info[] = ""
     empty!(dispatch_log)

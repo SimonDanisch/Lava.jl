@@ -30,11 +30,12 @@ struct LavaBackend <: KA.GPU end
 # ── Backend queries ──
 
 KA.get_backend(::LavaArray) = LavaBackend()
-# KA.synchronize is a NO-OP: pipeline barriers between dispatches already
-# ensure GPU-side ordering. Any CPU readback (Array(), download!) flushes
-# automatically via has_active_recording(). This avoids the massive overhead
-# of 16k+ CPU-GPU fence roundtrips per render frame.
-KA.synchronize(::LavaBackend) = nothing
+# KA.synchronize submits all recorded dispatches and waits for GPU completion.
+# This matches CUDA/AMDGPU semantics: after synchronize(), the CPU can safely
+# read GPU results. GPU-side ordering between dispatches is handled by pipeline
+# barriers in record_dispatch!, so synchronize() is only needed when the CPU
+# must observe GPU results (or at natural batch boundaries like end-of-sample).
+KA.synchronize(::LavaBackend) = vk_flush!()
 KA.supports_unified(::LavaBackend) = true
 function KA.allocate(::LavaBackend, ::Type{T}, dims::Tuple; unified::Bool=false) where T
     nbytes = prod(dims) * sizeof(T)
@@ -178,10 +179,6 @@ end
 Internal launch function for KA kernels. Compiles and dispatches the GPU function.
 """
 function _ka_launch!(@nospecialize(f), all_args::Tuple, nblocks::Int, workgroup_size::NTuple{3,Int})
-    # Auto-flush BEFORE allocating arg buffer — if we flush after allocation,
-    # the pool reset lets the next dispatch overwrite our buffer before submission.
-    maybe_auto_flush!()
-
     # Build type tuple for compilation (excludes f — GPUCompiler prepends typeof(f))
     # all_args[1] is f itself (included for BDA packing), rest are the actual args
     tt = Tuple{map(_ka_arg_llvm_type, Base.tail(all_args))...}
@@ -304,10 +301,6 @@ the work item count (1-element Int32 array). The prepare-indirect kernel writes
 group counts to an indirect buffer, then vk_dispatch_indirect! dispatches the main kernel.
 """
 function _ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, original_args=nothing)
-    # Auto-flush BEFORE allocating arg buffer — if we flush after allocation,
-    # the pool reset lets the next dispatch overwrite our buffer before submission.
-    maybe_auto_flush!()
-
     # Respect static workgroup size from @kernel definition
     ws = if workgroupsize !== nothing
         workgroupsize isa Integer ? (workgroupsize,) : workgroupsize
@@ -350,54 +343,21 @@ function _ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, 
     #   are embedded in the arg buffer, causing DEVICE_LOST on NVIDIA
     GC.@preserve original_args begin
 
-    max_groups = max_groups_per_dispatch[]
-    if max_groups > 0
-        # Download work count from GPU to split large indirect dispatches.
-        # This adds a sync point but prevents NVIDIA TDR timeout (Xid 109).
-        vk_flush!()  # ensure ndrange_buf is up to date
-        n_items = Int(Array(ndrange_buf)[1])
-        n_groups = cld(n_items, ws_prod)
+    arg_buf = get_arg_buffer(total_size)
+    _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
+                       compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
-        if n_groups <= 0
-            return nothing
-        end
+    indirect_buf = _get_indirect_buffer()
+    _fast_prepare_indirect!(indirect_buf, ndrange_buf, ws_prod)
 
-        # Allocate arg buffer AFTER flush — vk_flush!() resets the arg buffer pool,
-        # so allocating before flush means the next call's flush would submit the
-        # previous dispatch with a recycled (overwritten) arg buffer.
-        arg_buf = get_arg_buffer(total_size)
-        _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
-                           compiled.push_info.arg_buffer_size, byval_sizes, all_args)
-
-        if dispatch_logging_enabled[]
-            last_dispatch_info[] = "split_indirect f=$(_dispatch_name(obj.f, all_args)) groups=$n_groups"
-        end
-
-        # Dispatch directly, using split if needed (handled by vk_dispatch!)
-        keep_data_alive!(args)
-        if original_args !== nothing
-            keep_data_alive!(original_args)
-        end
-        vk_dispatch!(pipeline, arg_buf.address, (n_groups, 1, 1))
-    else
-        # No group limit — use true indirect dispatch
-        # Allocate arg buffer here too (no flush in this path, but keep consistent)
-        arg_buf = get_arg_buffer(total_size)
-        _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
-                           compiled.push_info.arg_buffer_size, byval_sizes, all_args)
-
-        indirect_buf = _get_indirect_buffer()
-        _fast_prepare_indirect!(indirect_buf, ndrange_buf, ws_prod)
-
-        if dispatch_logging_enabled[]
-            last_dispatch_info[] = "indirect f=$(_dispatch_name(obj.f, all_args))"
-        end
-        keep_data_alive!(args)
-        if original_args !== nothing
-            keep_data_alive!(original_args)
-        end
-        vk_dispatch_indirect!(pipeline, arg_buf.address, indirect_buf)
+    if dispatch_logging_enabled[]
+        last_dispatch_info[] = "indirect f=$(_dispatch_name(obj.f, all_args))"
     end
+    keep_data_alive!(args)
+    if original_args !== nothing
+        keep_data_alive!(original_args)
+    end
+    vk_dispatch_indirect!(pipeline, arg_buf.address, indirect_buf)
 
     end # GC.@preserve
 

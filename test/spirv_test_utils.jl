@@ -10,7 +10,12 @@ module SPIRVTestUtils
 using Test
 using Lava
 using SPIRV_Tools_jll
-using SPIRV_LLVM_Backend_jll
+const HAS_LLC = try
+    using SPIRV_LLVM_Backend_jll
+    true
+catch
+    false
+end
 
 export check, check_not, check_dag, check_sequence, check_count, check_regex,
        normalize_spirv, compare_golden, compile_and_disasm,
@@ -271,6 +276,7 @@ hlsl.shader attributes. The OpenCL output is structurally comparable:
 same types, same arithmetic ops, same entry point pattern.
 """
 function compile_with_llc(llvm_ir::String)
+    HAS_LLC || return (false, "SPIRV_LLVM_Backend_jll not available")
     llc_cmd = SPIRV_LLVM_Backend_jll.llc()
     spirv_dis_cmd = SPIRV_Tools_jll.spirv_dis()
 

@@ -168,10 +168,6 @@ function lava_launch!(@nospecialize(f), args...;
     # and wrap_entry_for_vulkan! creates a BDA slot for it (unless ghost-elided).
     all_args = (f, args...)
 
-    # Auto-flush BEFORE allocating arg buffer — if we flush after allocation,
-    # the pool reset lets the next dispatch overwrite our buffer before submission.
-    maybe_auto_flush!()
-
     # Compute total size: base layout + inline struct data
     # Uses LLVM byval sizes (not Julia sizeof) to avoid size mismatch for types
     # with zero-sized fields (e.g. Nothing) that LLVM represents differently.

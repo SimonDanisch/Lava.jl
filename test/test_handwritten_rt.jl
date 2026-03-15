@@ -371,11 +371,10 @@ end
             push_constant_size=8)
 
         # Push constant: BDA of output buffer
-        push_data = Vector{UInt8}(undef, 8)
-        unsafe_store!(Ptr{UInt64}(pointer(push_data)), output_buf.address)
+        push_bda = output_buf.address
 
         # Dispatch
-        Lava.rt_dispatch!(pipeline, tlas, push_data, W, H)
+        Lava.rt_dispatch!(pipeline, tlas, push_bda, W, H)
 
         # Read back results
         result_bytes = Vector{UInt8}(undef, W * H * sizeof(Float32))

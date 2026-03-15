@@ -230,6 +230,9 @@ function _init_vulkan!()
     # Check for RT extension support
     has_rt = _has_rt_extensions(phys_dev)
 
+    # Check for workgroup memory explicit layout (needed for mixed-type shared memory structs)
+    has_wg_explicit = _has_extension(phys_dev, "VK_KHR_workgroup_memory_explicit_layout")
+
     # Device extensions
     extensions = String[
         "VK_KHR_swapchain",
@@ -240,6 +243,9 @@ function _init_vulkan!()
             "VK_KHR_ray_tracing_pipeline",
             "VK_KHR_deferred_host_operations",
         ])
+    end
+    if has_wg_explicit
+        push!(extensions, "VK_KHR_workgroup_memory_explicit_layout")
     end
 
     # Chain required features — all Vulkan 1.2 promoted features go in Vulkan12Features
@@ -257,7 +263,7 @@ function _init_vulkan!()
         false,  # storage_push_constant_8
         false,  # shader_buffer_int_64_atomics
         false,  # shader_shared_int_64_atomics
-        false,  # shader_float_16
+        true,   # shader_float_16  ← REQUIRED (Float16 types in SPIR-V)
         true,   # shader_int_8  ← REQUIRED (i8 types in SPIR-V)
         false,  # descriptor_indexing
         false,  # shader_input_attachment_array_dynamic_indexing
@@ -305,8 +311,20 @@ function _init_vulkan!()
         next=vulkan12_features
     )
 
-    # Chain RT features if available
+    # Chain workgroup explicit layout if available
     feature_chain = dyn_rendering_features
+    if has_wg_explicit
+        wg_explicit_features = Vulkan.PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR(
+            true,   # workgroup_memory_explicit_layout
+            false,  # workgroup_memory_explicit_layout_8_bit_access
+            false,  # workgroup_memory_explicit_layout_16_bit_access
+            true;   # workgroup_memory_explicit_layout_scalar_block_layout
+            next=feature_chain
+        )
+        feature_chain = wg_explicit_features
+    end
+
+    # Chain RT features if available
     if has_rt
         as_features = Vulkan.PhysicalDeviceAccelerationStructureFeaturesKHR(
             true,   # acceleration_structure
@@ -330,6 +348,7 @@ function _init_vulkan!()
     # Enable shader int64, float64, geometry/tessellation shaders, wide lines
     core_features = Vulkan.PhysicalDeviceFeatures(
         :shader_int_64, :shader_float_64,
+        :shader_int_16,
         :geometry_shader, :tessellation_shader,
         :fill_mode_non_solid, :wide_lines, :large_points,
     )
@@ -457,6 +476,15 @@ function _find_graphics_compute_queue_family(phys_dev)
 end
 
 """Check if the physical device supports the RT extensions we need."""
+function _has_extension(phys_dev, ext_name::String)
+    available = unwrap(Vulkan.enumerate_device_extension_properties(phys_dev))
+    for ext in available
+        name = String(filter(!=('\0'), collect(ext.extension_name)))
+        name == ext_name && return true
+    end
+    return false
+end
+
 function _has_rt_extensions(phys_dev)
     available = unwrap(Vulkan.enumerate_device_extension_properties(phys_dev))
     names = Set{String}()

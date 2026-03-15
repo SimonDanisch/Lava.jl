@@ -657,6 +657,16 @@ function _emit_workgroup_type!(ctx::SPIRVTypeContext, ty::LLVM.ArrayType)
     len_id = emit_constant_u32!(ctx.mod, UInt32(n))
     id = fresh_id!(ctx.mod)
     encode_instruction!(ctx.mod.types_constants, Op.OpTypeArray, id, elem_spirv, len_id)
+
+    # When the element type is a struct, add ArrayStride decoration for explicit layout.
+    # This is required by VK_KHR_workgroup_memory_explicit_layout when the array
+    # is inside a Block-decorated struct.
+    elem_llvm = eltype(ty)
+    if elem_llvm isa LLVM.StructType
+        stride = UInt32(_wg_compute_type_size(elem_llvm))
+        emit_decorate!(ctx.mod, id, Dec.ArrayStride, stride)
+    end
+
     return id
 end
 
@@ -673,7 +683,73 @@ function _emit_workgroup_type!(ctx::SPIRVTypeContext, ty::LLVM.StructType)
     push!(ctx.mod.types_constants, (word_count << 16) | UInt32(Op.OpTypeStruct))
     push!(ctx.mod.types_constants, id)
     append!(ctx.mod.types_constants, member_spirv_ids)
+
+    # Add MemberOffset decorations for explicit layout (VK_KHR_workgroup_memory_explicit_layout).
+    # Compute offsets matching LLVM's struct layout (with alignment padding).
+    running_offset = UInt32(0)
+    for (i, mt) in enumerate(member_types)
+        member_align = UInt32(_wg_compute_type_alignment(mt))
+        running_offset = (running_offset + member_align - UInt32(1)) & ~(member_align - UInt32(1))
+        emit_member_decorate!(ctx.mod, id, UInt32(i - 1), Dec.Offset, UInt32(running_offset))
+        running_offset += _wg_compute_type_size(mt)
+    end
+
     return id
+end
+
+# Size/alignment helpers for workgroup explicit layout decorations.
+# Mirror _compute_type_size/_compute_type_alignment from emit.jl but available in types.jl.
+function _wg_compute_type_size(ty::LLVM.LLVMType)
+    if ty isa LLVM.LLVMFloat
+        return UInt32(4)
+    elseif ty isa LLVM.LLVMDouble
+        return UInt32(8)
+    elseif ty isa LLVM.LLVMHalf
+        return UInt32(2)
+    elseif ty isa LLVM.IntegerType
+        return UInt32(max(1, LLVM.width(ty) ÷ 8))
+    elseif ty isa LLVM.StructType
+        total = UInt32(0)
+        struct_align = UInt32(1)
+        for elem in LLVM.elements(ty)
+            elem_align = UInt32(_wg_compute_type_alignment(elem))
+            struct_align = max(struct_align, elem_align)
+            total = (total + elem_align - 1) & ~(elem_align - 1)
+            total += _wg_compute_type_size(elem)
+        end
+        total = (total + struct_align - 1) & ~(struct_align - 1)
+        return total
+    elseif ty isa LLVM.ArrayType
+        return UInt32(length(ty)) * _wg_compute_type_size(eltype(ty))
+    elseif ty isa LLVM.PointerType
+        return UInt32(8)
+    else
+        return UInt32(4)
+    end
+end
+
+function _wg_compute_type_alignment(ty::LLVM.LLVMType)
+    if ty isa LLVM.LLVMFloat
+        return 4
+    elseif ty isa LLVM.LLVMDouble
+        return 8
+    elseif ty isa LLVM.LLVMHalf
+        return 2
+    elseif ty isa LLVM.IntegerType
+        return max(1, LLVM.width(ty) ÷ 8)
+    elseif ty isa LLVM.StructType
+        max_align = 1
+        for elem in LLVM.elements(ty)
+            max_align = max(max_align, _wg_compute_type_alignment(elem))
+        end
+        return max_align
+    elseif ty isa LLVM.ArrayType
+        return _wg_compute_type_alignment(eltype(ty))
+    elseif ty isa LLVM.PointerType
+        return 8
+    else
+        return 4
+    end
 end
 
 function _emit_llvm_type!(ctx::SPIRVTypeContext, ty::LLVM.VoidType)

@@ -92,6 +92,11 @@ mutable struct SPIRVEmitterState
     # GEP chains. Used by _psb_needs_decomposition() to detect i64 stores that need
     # decomposition into two i32 stores.
     psb_ptr_alignment::Dict{LLVM.Value, UInt32}
+    # Workgroup variables wrapped in Block structs for explicit layout.
+    # Maps LLVM global → (wrapped_var_spirv_id, inner_type_spirv_id, inner_llvm_type).
+    # The function preamble emits unwrapping OpAccessChains to drill through the Block
+    # wrapper and stores the unwrapped pointer IDs in value_map.
+    wg_wrapped_vars::Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.LLVMType}}
 end
 
 function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
@@ -113,6 +118,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{Tuple{UInt32, UInt32}, UInt32}(), UInt32(0),
         Dict{LLVM.Value, Int64}(),
         Dict{LLVM.Value, UInt32}(),
+        Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.LLVMType}}(),
     )
 end
 
@@ -509,12 +515,24 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
     end
     # Emit allocas to a temporary buffer (not state.mod.functions)
     preamble_words = UInt32[]
-    if !isempty(all_allocas)
+    if !isempty(all_allocas) || !isempty(state.wg_wrapped_vars)
         # Temporarily swap functions buffer to capture preamble
         real_buf = state.mod.functions
         state.mod.functions = preamble_words
         for alloca_inst in all_allocas
             _emit_alloca!(state, alloca_inst)
+        end
+        # Emit unwrapping AccessChains for Block-wrapped workgroup variables.
+        # Each wrapped variable is a pointer to a Block struct containing the inner type.
+        # We emit OpAccessChain with index 0 to get a pointer to the inner type,
+        # then store that in value_map so all existing GEP handlers work unchanged.
+        for (gv, (wrapped_var_id, inner_type_spirv_id, inner_llvm_ty)) in state.wg_wrapped_vars
+            inner_ptr_ty = map_pointer_type!(state.type_ctx, inner_type_spirv_id, SC.Workgroup)
+            unwrapped_id = fresh_id!(state.mod)
+            zero_id = emit_constant_u32!(state.mod, UInt32(0))
+            encode_instruction!(state.mod.functions, Op.OpAccessChain,
+                                inner_ptr_ty, unwrapped_id, wrapped_var_id, zero_id)
+            state.value_map[gv] = unwrapped_id
         end
         state.mod.functions = real_buf
     end
@@ -1041,6 +1059,7 @@ function _emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
         end
     else
         sc = _get_pointer_storage_class(ptr)
+        load_as_int_then_convert_to_ptr = false
         if sc == SC.Workgroup || sc == SC.Function
             # For Workgroup/Function loads: if load type doesn't match pointer's pointee type,
             # bitcast the POINTER to match the load type. This happens when:
@@ -1049,7 +1068,12 @@ function _emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
             pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
             if pointee_ty !== nothing
                 eff_load_ty = needs_bitcast ? actual_load_ty : load_ty
-                if eff_load_ty != pointee_ty && eff_load_ty isa LLVM.IntegerType && pointee_ty isa LLVM.IntegerType
+                if eff_load_ty isa LLVM.PointerType && pointee_ty isa LLVM.IntegerType && LLVM.width(pointee_ty) == 64
+                    # Loading a PSB pointer from a local variable typed as i64.
+                    # Must load as i64 first, then OpConvertUToPtr.
+                    load_as_int_then_convert_to_ptr = true
+                    spirv_load_ty = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+                elseif eff_load_ty != pointee_ty && eff_load_ty isa LLVM.IntegerType && pointee_ty isa LLVM.IntegerType
                     val_spirv_ty = map_type!(state.type_ctx, eff_load_ty)
                     new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
                     cast_id = fresh_id!(state.mod)
@@ -1058,19 +1082,27 @@ function _emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                 end
             end
         end
-        # For pointer loads: check if the pointer's declared SPIR-V element type differs
-        # from what we want to load. This happens when the same LLVM struct type is used
-        # for pointer members with different element types (e.g., ptr<i64> for indices and
-        # ptr<i16> for values share the same `{ ptr, [1 x i64] }` struct).
-        if load_ty isa LLVM.PointerType
-            declared_elem_ty = get(state.spirv_ptr_element_type, ptr, UInt32(0))
-            if declared_elem_ty != UInt32(0) && declared_elem_ty != spirv_load_ty
-                # Load as the declared type, then bitcast the result
-                spirv_load_ty = declared_elem_ty
-                needs_ptr_bitcast = true
+        if !load_as_int_then_convert_to_ptr
+            # For pointer loads: check if the pointer's declared SPIR-V element type differs
+            # from what we want to load. This happens when the same LLVM struct type is used
+            # for pointer members with different element types (e.g., ptr<i64> for indices and
+            # ptr<i16> for values share the same `{ ptr, [1 x i64] }` struct).
+            if load_ty isa LLVM.PointerType
+                declared_elem_ty = get(state.spirv_ptr_element_type, ptr, UInt32(0))
+                if declared_elem_ty != UInt32(0) && declared_elem_ty != spirv_load_ty
+                    # Load as the declared type, then bitcast the result
+                    spirv_load_ty = declared_elem_ty
+                    needs_ptr_bitcast = true
+                end
             end
         end
         encode_instruction!(state.mod.functions, Op.OpLoad, spirv_load_ty, load_id, ptr_id)
+        if load_as_int_then_convert_to_ptr
+            # Convert loaded i64 to the typed PSB pointer
+            int_id = load_id
+            load_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ty, load_id, int_id)
+        end
     end
 
     if needs_ptr_bitcast
@@ -1701,7 +1733,14 @@ function _emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
             pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
             if pointee_ty !== nothing
                 val_ty = LLVM.value_type(value)
-                if val_ty != pointee_ty && val_ty isa LLVM.IntegerType && pointee_ty isa LLVM.IntegerType
+                if val_ty isa LLVM.PointerType && pointee_ty isa LLVM.IntegerType && LLVM.width(pointee_ty) == 64
+                    # Storing a PSB pointer into a local variable typed as i64.
+                    # Must OpConvertPtrToU first.
+                    i64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+                    int_id = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, i64_spirv, int_id, val_id)
+                    val_id = int_id
+                elseif val_ty != pointee_ty && val_ty isa LLVM.IntegerType && pointee_ty isa LLVM.IntegerType
                     # Bitcast pointer to match value type
                     val_spirv_ty = map_type!(state.type_ctx, val_ty)
                     new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
@@ -1934,8 +1973,18 @@ function _psb_needs_decomposition(state::SPIRVEmitterState, ptr::LLVM.Value, acc
     # be naturally aligned. If LLVM says align < type's natural alignment, decompose.
     # Only applies to GEP-based pointers — arg buffer loads (IntToPtrInst) always have
     # proper alignment even when LLVM marks them `align 1` (conservative SROA).
+    # EXCEPTION: typed GEPs (e.g., `gep i64, ptr, i64 %idx`) step in multiples of the
+    # source element size, so if the source element's alignment >= access_align, the
+    # result is always naturally aligned (assuming the base pointer is aligned, which
+    # holds for BDA-loaded pointers). Only byte GEPs (`gep i8, ...`) can break alignment.
     if llvm_align > 0 && llvm_align < access_align && ptr isa LLVM.GetElementPtrInst
-        return true
+        gep_src_ty_ref = LLVM.API.LLVMGetGEPSourceElementType(ptr)
+        gep_src_ty = LLVM.LLVMType(gep_src_ty_ref)
+        gep_src_align = _get_alignment_for_type(gep_src_ty)
+        if gep_src_align < access_align
+            return true
+        end
+        # typed GEP with source element >= access alignment — preserves alignment, skip
     end
 
     # Check 1: pointer's PTM pointee type has smaller alignment

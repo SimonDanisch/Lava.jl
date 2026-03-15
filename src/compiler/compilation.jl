@@ -739,6 +739,8 @@ end
 function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # ── CFG cleanup ──
     # Remove constructs that SPIR-V can't handle
+    # Replace freeze before optimization: GPU kernel arguments are never undef,
+    # so freeze is unnecessary. Removing it early lets LLVM produce simpler IR.
     _replace_freeze!(mod)
     _strip_assume!(mod)
 
@@ -753,17 +755,18 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # entry function. After inlining, the error paths become dead code.
     _force_inline_all!(mod, entry_fn)
 
+    if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
+        write("/tmp/lava_ir_1_postinline.ll", string(mod))
+    end
+
     # ── Post-inlining optimization ──
-    # After force-inlining, newly visible optimization opportunities appear:
-    # - The BDA wrapper stores args into individual allocas, then the inlined
-    #   kernel body constructs tuples from them. Without SROA, the tuple
-    #   construction creates GEPs that read across alloca boundaries (using the
-    #   full original struct type on a decomposed alloca). This is valid with
-    #   opaque pointers on CPU but invalid in SPIR-V where allocas are separate.
-    # - SROA decomposes these intermediate allocas, eliminating the cross-alloca reads.
     LLVM.run!(LLVM.InstCombinePass(), mod)
     LLVM.run!(LLVM.SROAPass(), mod)
     LLVM.run!(LLVM.InstCombinePass(), mod)
+
+    if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
+        write("/tmp/lava_ir_2_postsroa.ll", string(mod))
+    end
 
     # ── Fix inttoptr address spaces after SROA ──
     # SROA eliminates allocas and creates `inttoptr i64 %bda_val to ptr` (addrspace 0)
@@ -1149,22 +1152,60 @@ function _emit_workgroup_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariab
     mod = state.mod
     gv_value_ty = LLVM.global_value_type(gv)
 
-    # Create FRESH type IDs for workgroup usage (no layout decorations).
-    # This is critical when the same LLVM type (e.g. [3 x float]) is used in both
-    # PSB (needs ArrayStride) and Workgroup (must NOT have ArrayStride).
+    # Check if this workgroup type contains a struct (needs explicit layout).
+    # Without explicit layout, NVIDIA drivers may use incorrect memory layout
+    # for struct types in workgroup storage, corrupting mixed-type tuple data.
+    needs_explicit_layout = _wg_type_contains_struct(gv_value_ty)
+
+    # Create FRESH type IDs for workgroup usage.
+    # map_workgroup_type! now adds MemberOffset/ArrayStride decorations when
+    # the type contains structs (for VK_KHR_workgroup_memory_explicit_layout).
     pointee_spirv = map_workgroup_type!(state.type_ctx, gv_value_ty)
 
-    # Create pointer type: OpTypePointer Workgroup %fresh_type
-    ptr_ty = map_pointer_type!(state.type_ctx, pointee_spirv, SC.Workgroup)
+    if needs_explicit_layout
+        # Wrap in a Block-decorated outer struct for explicit layout.
+        # SPIR-V requires: Block on outermost struct, Offset on its members,
+        # ArrayStride on arrays of structs, MemberOffset on inner structs.
+        #
+        # Structure: %outer_block = OpTypeStruct %pointee_type
+        #   with Block decoration and member 0 at Offset 0
+        block_struct_id = fresh_id!(mod)
+        word_count = UInt32(3)  # OpTypeStruct + result + 1 member
+        push!(mod.types_constants, (word_count << 16) | UInt32(Op.OpTypeStruct))
+        push!(mod.types_constants, block_struct_id)
+        push!(mod.types_constants, pointee_spirv)
 
-    # Create OpVariable with Workgroup storage class
-    var_id = fresh_id!(mod)
-    encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Workgroup)
+        emit_decorate!(mod, block_struct_id, Dec.Block)
+        emit_member_decorate!(mod, block_struct_id, UInt32(0), Dec.Offset, UInt32(0))
 
-    # Register in value_map so references can find it
-    state.value_map[gv] = var_id
+        # Create pointer type for the Block wrapper
+        ptr_ty = map_pointer_type!(state.type_ctx, block_struct_id, SC.Workgroup)
+
+        # Require the extension and capability
+        require_capability!(mod, Cap.WorkgroupMemoryExplicitLayoutKHR)
+        require_extension!(mod, "SPV_KHR_workgroup_memory_explicit_layout")
+
+        # Create OpVariable
+        var_id = fresh_id!(mod)
+        encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Workgroup)
+
+        # Register the wrapping so the function preamble can emit unwrapping AccessChains.
+        # The unwrapping AccessChain will drill through the Block struct to get a pointer
+        # to the inner array/type, which all existing GEP handlers expect.
+        state.wg_wrapped_vars[gv] = (var_id, pointee_spirv, gv_value_ty)
+    else
+        # No struct types — use simple undecorated workgroup variable (original path)
+        ptr_ty = map_pointer_type!(state.type_ctx, pointee_spirv, SC.Workgroup)
+
+        var_id = fresh_id!(mod)
+        encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Workgroup)
+
+        # Register directly in value_map
+        state.value_map[gv] = var_id
+    end
 
     # Register pointee type in PTM for downstream GEP/load/store resolution
+    # (always the ORIGINAL type, not the Block wrapper)
     set_pointee_type!(state.type_ctx.ptm, gv, gv_value_ty; priority=5)
 
     # Debug name
@@ -1174,6 +1215,17 @@ function _emit_workgroup_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariab
     end
 
     return var_id
+end
+
+"""Check if an LLVM type contains a struct at any nesting level."""
+function _wg_type_contains_struct(ty::LLVM.LLVMType)
+    if ty isa LLVM.StructType
+        return true
+    elseif ty isa LLVM.ArrayType
+        return _wg_type_contains_struct(eltype(ty))
+    else
+        return false
+    end
 end
 
 # ── Builtin name → SPIR-V BuiltIn decoration mapping ──

@@ -217,9 +217,6 @@ Record an RT trace dispatch into the batched command buffer.
 function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
                       push_bda::UInt64, width::Integer, height::Integer;
                       depth::Integer=1)
-    # NOTE: no maybe_auto_flush!() here — callers (trace_rays!, trace_rays_indirect!)
-    # already allocated arg buffers from the slab. Flushing here would reset the slab
-    # and invalidate those buffers, causing DEVICE_LOST from stale BDA addresses.
     ctx = vk_context()
     last_dispatch_info[] = "rt_trace w=$width h=$height"
 
@@ -250,7 +247,6 @@ VkTraceRaysIndirectCommandKHR (3×UInt32), written by a previous GPU kernel.
 function rt_dispatch_indirect!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
                                push_bda::UInt64, indirect_buf;
                                indirect_offset::Integer=0)
-    # NOTE: no maybe_auto_flush!() here — see rt_dispatch! comment above.
     ctx = vk_context()
     last_dispatch_info[] = "rt_indirect"
 

@@ -67,10 +67,6 @@ const _cmd_pipeline_barrier_fptr = Ref{Ptr{Nothing}}(C_NULL)
 # so no aliasing risk from nested dispatches (unlike a shared Vector{UInt8}).
 const _push_bda_ref = Ref{UInt64}(0)
 
-# Auto-flush threshold: flush command buffer after this many dispatches.
-# Set to 0 to disable (default). Use set_auto_flush_threshold!(n) to enable.
-const auto_flush_threshold = Ref{Int}(0)
-
 # CB split threshold: seal the current command buffer and start a new one after
 # this many dispatches per segment. All segments are submitted in a single
 # vkQueueSubmit. This avoids NVIDIA driver crashes from enormous command buffers
@@ -79,26 +75,6 @@ const auto_flush_threshold = Ref{Int}(0)
 # Set to 0 to disable splitting.
 const cb_split_threshold = Ref{Int}(3000)
 
-# Max workgroups per single dispatch — splits large dispatches with flush.
-# 0 = no limit (default).
-const max_groups_per_dispatch = Ref{Int}(0)
-
-"""
-    set_max_groups_per_dispatch!(n::Integer)
-
-Set the maximum number of workgroups per single compute dispatch.
-Large dispatches are split into chunks using `vkCmdDispatchBase` to avoid
-NVIDIA GPU watchdog timeout (Xid 109). Set to 0 to disable.
-"""
-set_max_groups_per_dispatch!(n::Integer) = (max_groups_per_dispatch[] = Int(n))
-
-"""
-    set_auto_flush_threshold!(n::Integer)
-
-Set the maximum number of dispatches before an automatic `vk_flush!()`.
-Set to 0 to disable.
-"""
-set_auto_flush_threshold!(n::Integer) = (auto_flush_threshold[] = Int(n))
 
 # ── Batch lifecycle ──
 
@@ -178,16 +154,6 @@ function reclaim_batch!(ctx::VkContext, batch::CommandBatch)
     end
 end
 
-function maybe_auto_flush!()
-    threshold = auto_flush_threshold[]
-    threshold <= 0 && return
-    ctx = vk_context()
-    batch = ctx.active_batch
-    batch === nothing && return
-    if batch.recording && batch.dispatch_count >= threshold
-        vk_flush!()
-    end
-end
 
 """
     _maybe_split_cb!(batch, ctx)
@@ -318,27 +284,12 @@ end
 """
     vk_dispatch!(pipeline, push_bda, groups)
 
-Record a compute dispatch. Splits large dispatches if max_groups_per_dispatch is set.
+Record a compute dispatch.
 `push_bda` is the BDA address of the argument buffer (passed as 8-byte push constant).
 """
 function vk_dispatch!(pipeline::LavaComputePipeline, push_bda::UInt64,
                       groups::NTuple{3, Integer})
-    limit = max_groups_per_dispatch[]
-    gx, gy, gz = Int(groups[1]), Int(groups[2]), Int(groups[3])
-
-    # Split large X-dimension dispatches if configured
-    if limit > 0 && gx > limit && gy == 1 && gz == 1
-        base = 0
-        while base < gx
-            chunk = min(limit, gx - base)
-            vk_dispatch_base!(pipeline, push_bda, base, 0, 0, chunk, 1, 1)
-            base += chunk
-            vk_flush!()
-        end
-        return
-    end
-
-    vk_dispatch_base!(pipeline, push_bda, 0, 0, 0, gx, gy, gz)
+    vk_dispatch_base!(pipeline, push_bda, 0, 0, 0, Int(groups[1]), Int(groups[2]), Int(groups[3]))
 end
 
 """Record a single compute dispatch with optional base group offset."""

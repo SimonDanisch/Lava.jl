@@ -80,13 +80,20 @@ end
     @inbounds CartesianIndex(f[1] + i - 1)
 end
 
+# Use unchecked unsigned div/rem to avoid division safety checks (switch instructions).
+# Julia's checked_sdiv_int / checked_srem_int generate div-by-zero and INT_MIN/-1 guards
+# that produce complex SPIR-V control flow patterns NVIDIA's shader compiler miscompiles.
+# All values here are non-negative for valid CartesianIndices, so unsigned ops are correct.
+_gpu_urem(a::Int, b::Int) = Base.bitcast(Int, Base.urem_int(Base.bitcast(UInt, a), Base.bitcast(UInt, b)))
+_gpu_udiv(a::Int, b::Int) = Base.bitcast(Int, Base.udiv_int(Base.bitcast(UInt, a), Base.bitcast(UInt, b)))
+
 @inline function _gpu_ind2sub(iter::CartesianIndices{2}, i::Int)
     f = first(iter)
     s = size(iter)
     i0 = i - 1
     d1 = s[1]
-    j1 = i0 % d1
-    j2 = i0 ÷ d1
+    j1 = _gpu_urem(i0, d1)
+    j2 = _gpu_udiv(i0, d1)
     @inbounds CartesianIndex(f[1] + j1, f[2] + j2)
 end
 
@@ -96,9 +103,9 @@ end
     i0 = i - 1
     d1 = s[1]
     d12 = d1 * s[2]
-    j1 = i0 % d1
-    j2 = (i0 % d12) ÷ d1
-    j3 = i0 ÷ d12
+    j1 = _gpu_urem(i0, d1)
+    j2 = _gpu_udiv(_gpu_urem(i0, d12), d1)
+    j3 = _gpu_udiv(i0, d12)
     @inbounds CartesianIndex(f[1] + j1, f[2] + j2, f[3] + j3)
 end
 
@@ -110,10 +117,10 @@ end
     d1 = s[1]
     d12 = d1 * s[2]
     d123 = d12 * s[3]
-    j1 = i0 % d1
-    j2 = (i0 % d12) ÷ d1
-    j3 = (i0 % d123) ÷ d12
-    j4 = i0 ÷ d123
+    j1 = _gpu_urem(i0, d1)
+    j2 = _gpu_udiv(_gpu_urem(i0, d12), d1)
+    j3 = _gpu_udiv(_gpu_urem(i0, d123), d12)
+    j4 = _gpu_udiv(i0, d123)
     @inbounds CartesianIndex(f[1] + j1, f[2] + j2, f[3] + j3, f[4] + j4)
 end
 
@@ -122,13 +129,13 @@ end
     f = first(iter)
     s = size(iter)
     i0 = i - 1
-    # Compute indices via repeated div/mod
+    # Compute indices via repeated div/mod (unchecked unsigned ops)
     inds = ntuple(Val(N)) do d
         stride = 1
         for k in 1:(d-1)
             stride *= s[k]
         end
-        f[d] + (i0 ÷ stride) % s[d]
+        f[d] + _gpu_urem(_gpu_udiv(i0, stride), s[d])
     end
     @inbounds CartesianIndex(inds)
 end
