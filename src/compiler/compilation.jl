@@ -792,23 +792,17 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # lift_byte_geps pass can properly convert them using the alloca's type.
     _fix_gep_alloca_type_mismatches!(mod)
 
-    # ── Lift byte-offset GEPs to typed GEPs ──
-    # Julia accesses struct fields via `getelementptr i8, ptr %p, i64 <offset>`.
-    # SPIR-V needs typed GEPs into the struct. Run BEFORE flatten so that constant
-    # byte GEPs (e.g., gep i8, %alloca, 48) are lifted to typed GEPs first.
-    # Otherwise, flatten would combine them with dynamic indices into unresolvable
-    # dynamic byte offsets (e.g., gep i8, %alloca, %dyn*16+48).
-    _lift_byte_geps_on_allocas!(mod)
-    LLVM.run!(LLVM.InstCombinePass(), mod)
-    _lift_byte_geps_on_allocas!(mod)
-
     # ── Flatten chained GEPs on allocas ──
     # Pattern: gep i8 alloca -4 → gep i32 result %idx  →  gep i8 alloca (-4 + idx*4)
     # This handles Julia's 1-based MArray indexing where the base is shifted.
-    # Runs after lift_byte_geps so that constant byte GEPs are already typed.
     _flatten_chained_geps_on_allocas!(mod)
 
-    # One more lift pass to catch any new byte GEPs created by flatten/InstCombine
+    # ── Lift byte-offset GEPs to typed GEPs ──
+    # Julia accesses struct fields via `getelementptr i8, ptr %p, i64 <offset>`.
+    # SPIR-V needs typed GEPs into the struct. Run 3x as later passes may create more.
+    _lift_byte_geps_on_allocas!(mod)
+    LLVM.run!(LLVM.InstCombinePass(), mod)
+    _lift_byte_geps_on_allocas!(mod)
     LLVM.run!(LLVM.InstCombinePass(), mod)
     _lift_byte_geps_on_allocas!(mod)
 

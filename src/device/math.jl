@@ -156,14 +156,80 @@ end
 @_lava_glsl_binary Base.atan "_lava_glsl_atan2_f32" Float32 "float"
 
 # ══════════════════════════════════════════════════════════════════════
-# Tier 3: Float64 transcendentals — downcast to Float32, compute, upcast
+# Tier 3: Float64 transcendentals
 # GLSL.std.450 does not support f64 for these operations.
-# This provides ~7 decimal digits of precision (Float32 mantissa).
-# For higher precision, add polynomial implementations later.
+# sin/cos: minimax polynomial with Cody-Waite range reduction (~1 ULP).
+# Others: f64→f32 downcast → f32 GLSL.std.450 → upcast (~7 digits).
 # ══════════════════════════════════════════════════════════════════════
 
-@lava_device_override @inline Base.sin(x::Float64)  = Float64(sin(Float32(x)))
-@lava_device_override @inline Base.cos(x::Float64)  = Float64(cos(Float32(x)))
+# --- sin/cos: fdlibm minimax polynomials + Cody-Waite range reduction ---
+
+# sin kernel coefficients: sin(x) ≈ x + S1*x³ + S2*x⁵ + ... for |x| <= π/4
+const _SIN_S1 = -1.66666666666666324348e-01
+const _SIN_S2 =  8.33333333332248946124e-03
+const _SIN_S3 = -1.98412698298579493134e-04
+const _SIN_S4 =  2.75573137070700676789e-06
+const _SIN_S5 = -2.50507602534068634195e-08
+const _SIN_S6 =  1.58969099521155010221e-10
+
+# cos kernel coefficients: cos(x) ≈ 1 - x²/2 + C1*x⁴ + ... for |x| <= π/4
+const _COS_C1 =  4.16666666666666019037e-02
+const _COS_C2 = -1.38888888888741095749e-03
+const _COS_C3 =  2.48015872894767294178e-05
+const _COS_C4 = -2.75573143513906633035e-07
+const _COS_C5 =  2.08757232129817482790e-09
+const _COS_C6 = -1.13596475577881948265e-11
+
+# Cody-Waite range reduction constants
+const _INV_PIO2 = 6.36619772367581382433e-01  # 2/π
+const _PIO2_1   = 1.57079632673412561417e+00   # first 33 bits of π/2
+const _PIO2_1T  = 6.07710050650619224932e-11   # π/2 - PIO2_1
+
+@inline function _sinpoly(x::Float64)
+    x2 = x * x
+    p = muladd(x2, _SIN_S6, _SIN_S5)
+    p = muladd(x2, p, _SIN_S4)
+    p = muladd(x2, p, _SIN_S3)
+    p = muladd(x2, p, _SIN_S2)
+    p = muladd(x2, p, _SIN_S1)
+    muladd(x2 * x, p, x)
+end
+
+@inline function _cospoly(x::Float64)
+    x2 = x * x
+    p = muladd(x2, _COS_C6, _COS_C5)
+    p = muladd(x2, p, _COS_C4)
+    p = muladd(x2, p, _COS_C3)
+    p = muladd(x2, p, _COS_C2)
+    p = muladd(x2, p, _COS_C1)
+    x4 = x2 * x2
+    muladd(x4, p, muladd(-0.5, x2, 1.0))
+end
+
+@lava_device_override @inline function Base.sin(x::Float64)
+    ax = abs(x)
+    sign_x = x < 0.0
+    fn = round(ax * _INV_PIO2)
+    n = unsafe_trunc(Int32, fn)
+    r = ax - fn * _PIO2_1 - fn * _PIO2_1T
+    quad = n & Int32(3)
+    use_cos = (quad == Int32(1)) | (quad == Int32(3))
+    s = ifelse(use_cos, _cospoly(r), _sinpoly(r))
+    negate = ((quad >= Int32(2)) ⊻ sign_x)
+    ifelse(negate, -s, s)
+end
+
+@lava_device_override @inline function Base.cos(x::Float64)
+    ax = abs(x)
+    fn = round(ax * _INV_PIO2)
+    n = unsafe_trunc(Int32, fn)
+    r = ax - fn * _PIO2_1 - fn * _PIO2_1T
+    quad = n & Int32(3)
+    use_sin = (quad == Int32(1)) | (quad == Int32(3))
+    c = ifelse(use_sin, _sinpoly(r), _cospoly(r))
+    negate = (quad == Int32(1)) | (quad == Int32(2))
+    ifelse(negate, -c, c)
+end
 @lava_device_override @inline Base.tan(x::Float64)  = Float64(tan(Float32(x)))
 @lava_device_override @inline Base.exp(x::Float64)  = Float64(exp(Float32(x)))
 @lava_device_override @inline Base.exp2(x::Float64) = Float64(exp2(Float32(x)))
