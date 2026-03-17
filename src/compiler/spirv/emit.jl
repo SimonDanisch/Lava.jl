@@ -2982,7 +2982,64 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
                 return
             end
         else
-            # Dynamic byte offset on struct (Function/Private SC):
+            # Dynamic byte offset on struct (Function/Private SC).
+
+            # First check: if the base is an array element (from a previous dynamic GEP),
+            # the dynamic offset may be advancing to another array element, not accessing
+            # a field within the struct. This happens with chained dynamic byte-GEPs:
+            #   gep1 = gep i8, ptr %alloca, i64 (48 + %a*16)  → arr[%a]
+            #   gep2 = gep i8, ptr %gep1, i64 (%b*16)         → arr[%a + %b]
+            # Without this check, gep2 would try to access a field within struct_28 at
+            # offset %b*16, which is wrong when %b selects another array element.
+            if (sc == SC.Function || sc == SC.Private) && haskey(state.array_element_origin, base_ptr)
+                arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
+                arr_elem_ty = LLVM.eltype(arr_type)
+                arr_elem_size = _compute_type_size(arr_elem_ty)
+                if arr_elem_size > 0
+                    # Compute the dynamic additional index: byte_offset / elem_size
+                    sz_id = _emit_int_constant!(state, idx_ty, Int64(arr_elem_size))
+                    dyn_idx_id = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpSDiv, idx_spirv_ty, dyn_idx_id, byte_offset_id, sz_id)
+
+                    # Combined index = previous dynamic index + new dynamic index
+                    u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+                    dyn_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
+                        conv_id = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, dyn_idx_id)
+                        conv_id
+                    else
+                        dyn_idx_id
+                    end
+                    combined_idx = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, combined_idx, prev_idx_id, dyn_idx_i32)
+
+                    # Check for sub-element offset (byte_offset % elem_size != 0)
+                    # When non-zero, we need to access a field within the target element.
+                    # For now, handle the simple case (exact element boundary) and
+                    # the sub-element case (struct field within the element).
+                    arr_elem_spirv = if sc == SC.Workgroup
+                        map_workgroup_type!(state.type_ctx, arr_elem_ty)
+                    else
+                        map_type!(state.type_ctx, arr_elem_ty)
+                    end
+                    result_ptr_ty = map_pointer_type!(state.type_ctx, arr_elem_spirv, sc)
+                    all_indices = copy(static_path)
+                    push!(all_indices, combined_idx)
+
+                    result_id = fresh_id!(state.mod)
+                    word_count = UInt32(4 + length(all_indices))
+                    push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                    push!(state.mod.functions, result_ptr_ty)
+                    push!(state.mod.functions, result_id)
+                    push!(state.mod.functions, arr_base_id)
+                    append!(state.mod.functions, all_indices)
+                    state.value_map[inst] = result_id
+                    set_pointee_type!(state.type_ctx.ptm, inst, arr_elem_ty; priority=4)
+                    state.array_element_origin[inst] = (arr_base_id, static_path, combined_idx, arr_type)
+                    return
+                end
+            end
+
             # Find the array field within the struct and emit a dynamic AccessChain.
             # Pattern: gep i8, ptr %struct_alloca, i64 %dynamic_offset
             # where the struct contains an array field (e.g., { ptr, [N x i64] })
@@ -3022,7 +3079,7 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
                             leaf_ty = LLVM.eltype(leaf_ty)
                         end
                         leaf_size = _compute_type_size(leaf_ty)
-                        if leaf_size > 0 && (arr_elem_ty isa LLVM.ArrayType || arr_elem_ty isa LLVM.StructType)
+                        if leaf_size > 0 && arr_elem_ty isa LLVM.ArrayType
                             # Nested composite: decompose byte offset into flat scalar index
                             # flat_idx = (byte_offset - arr_byte_offset) / leaf_size
                             adjusted_id = byte_offset_id

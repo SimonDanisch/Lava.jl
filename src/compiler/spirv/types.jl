@@ -876,6 +876,86 @@ function build_struct_ptr_member_types!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Mo
             end
         end
     end
+
+    # Second pass: resolve struct ptr members that couldn't be traced through
+    # static GEP patterns (e.g., Tuple elements accessed via dynamic byte-GEPs).
+    # Uses PTM entries for alloca-reloaded pointers to infer struct member types.
+    _resolve_unresolved_struct_ptr_members!(ctx, llvm_mod)
+end
+
+"""
+Resolve struct pointer members that weren't found by the GEP/load scanning passes.
+
+When structs containing pointers are stored into allocas and later accessed via
+dynamic byte-offset GEPs (common for Tuple element indexing), the standard scanning
+can't trace the pointer's type back to the struct member. But PTM *does* know the
+type of the reloaded pointer (from its eventual `load float, ptr %reloaded` usage).
+
+This pass finds such loads, walks the GEP chain to the alloca, identifies which
+struct types with unresolved ptr members exist in the alloca's type, and resolves them.
+"""
+function _resolve_unresolved_struct_ptr_members!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Module)
+    for fn in LLVM.functions(llvm_mod)
+        for bb in LLVM.blocks(fn)
+            for inst in LLVM.instructions(bb)
+                inst isa LLVM.LoadInst || continue
+                LLVM.value_type(inst) isa LLVM.PointerType || continue
+
+                # Does PTM know this loaded pointer's pointee type?
+                pointee = get_pointee_type(ctx.ptm, inst)
+                pointee === nothing && continue
+                # Skip i8 (the default fallback — not a real resolved type)
+                pointee isa LLVM.IntegerType && LLVM.width(pointee) == 8 && continue
+
+                # Walk GEP chain to find the base alloca
+                alloca = _find_alloca_base(LLVM.operands(inst)[1])
+                alloca === nothing && continue
+
+                alloca_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(alloca))
+                _resolve_array_struct_ptr_members!(ctx, alloca_ty, pointee)
+            end
+        end
+    end
+end
+
+"""Walk a GEP chain (including byte-offset GEPs) to find the base AllocaInst."""
+function _find_alloca_base(ptr::LLVM.Value)
+    current = ptr
+    for _ in 1:20
+        if current isa LLVM.AllocaInst
+            return current
+        elseif current isa LLVM.GetElementPtrInst
+            current = LLVM.operands(current)[1]
+        else
+            return nothing
+        end
+    end
+    return nothing
+end
+
+"""
+Resolve unresolved struct ptr members within array contexts of a type hierarchy.
+
+Only resolves ptr members in structs that appear inside arrays (e.g., `[3 x {ptr, ...}]`),
+because dynamic byte-GEPs are generated specifically for array element access. Structs
+accessed via static GEPs should already be resolved by the main scan.
+"""
+function _resolve_array_struct_ptr_members!(ctx::SPIRVTypeContext, ty::LLVM.LLVMType, pointee::LLVM.LLVMType;
+                                             in_array::Bool=false)
+    if ty isa LLVM.StructType
+        for (i, field_ty) in enumerate(LLVM.elements(ty))
+            if field_ty isa LLVM.PointerType && in_array
+                key = (ty, i - 1)
+                if !haskey(ctx.struct_ptr_members, key)
+                    ctx.struct_ptr_members[key] = (pointee, 0)
+                end
+            elseif field_ty isa LLVM.StructType || field_ty isa LLVM.ArrayType
+                _resolve_array_struct_ptr_members!(ctx, field_ty, pointee; in_array)
+            end
+        end
+    elseif ty isa LLVM.ArrayType
+        _resolve_array_struct_ptr_members!(ctx, LLVM.eltype(ty), pointee; in_array=true)
+    end
 end
 
 """
@@ -894,7 +974,7 @@ function _scan_load_from_struct_base!(ctx::SPIRVTypeContext, load_inst::LLVM.Loa
     src_ptr = LLVM.operands(load_inst)[1]
     src_pointee = get_pointee_type(ctx.ptm, src_ptr)
     src_pointee === nothing && return
-    src_pointee isa LLVM.StructType || return
+    (src_pointee isa LLVM.StructType || src_pointee isa LLVM.ArrayType) || return
 
     # Walk struct layout following member 0 until we find a pointer field
     struct_ty, member_idx = _find_offset0_ptr_member(src_pointee)
