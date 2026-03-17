@@ -24,6 +24,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xorg-dev mesa-utils xvfb libgl1 libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev
       - uses: julia-actions/julia-buildpkg@v1
-      - name: Run CI tests under xvfb
+      - name: Run tests under xvfb
         run: |
-          DISPLAY=:0 xvfb-run -s '-screen 0 1024x768x24' julia --color=yes --project test/test_ci.jl
+          DISPLAY=:0 xvfb-run -s '-screen 0 1024x768x24' julia --color=yes --project -e 'using Pkg; Pkg.test()'
