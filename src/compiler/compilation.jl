@@ -652,7 +652,7 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
         spirv_bytes, source_map = _emit_spirv_from_llvm_rt(mod, wrapper_name, stage;
                                                 payload_type=payload_type)
 
-        write("/tmp/lava_last_rt.spv", spirv_bytes)
+        write("/tmp/lava_last.spv", spirv_bytes)
 
         if validate
             _validate_spirv(spirv_bytes, ir, source_map)

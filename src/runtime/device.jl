@@ -571,7 +571,8 @@ Call this after Vulkan operations that may trigger validation errors
 function check_validation_errors!(context::String)
     isempty(_validation_messages) && return
     # Check for actual errors (not just warnings)
-    errors = filter(m -> !startswith(m, "(Warning"), _validation_messages)
+    # Validation messages containing "WARNING" are just warnings, not errors.
+    errors = filter(m -> !contains(m, "WARNING"), _validation_messages)
     isempty(errors) && return
     n = min(length(errors), 5)
     detail = join(["  [$i] $(first(errors[i], 300))" for i in 1:n], "\n")
