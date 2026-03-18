@@ -316,8 +316,8 @@ function _init_vulkan!()
     if has_wg_explicit
         wg_explicit_features = Vulkan.PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR(
             true,   # workgroup_memory_explicit_layout
-            false,  # workgroup_memory_explicit_layout_8_bit_access
-            false,  # workgroup_memory_explicit_layout_16_bit_access
+            true,   # workgroup_memory_explicit_layout_8_bit_access
+            true,   # workgroup_memory_explicit_layout_16_bit_access
             true;   # workgroup_memory_explicit_layout_scalar_block_layout
             next=feature_chain
         )

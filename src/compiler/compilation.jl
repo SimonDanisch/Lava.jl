@@ -1198,6 +1198,14 @@ function _emit_workgroup_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariab
         require_capability!(mod, Cap.WorkgroupMemoryExplicitLayoutKHR)
         require_extension!(mod, "SPV_KHR_workgroup_memory_explicit_layout")
 
+        # Require 8-bit/16-bit access capabilities if the type contains such elements
+        if _wg_type_contains_width(gv_value_ty, 8)
+            require_capability!(mod, Cap.WorkgroupMemoryExplicitLayout8BitAccessKHR)
+        end
+        if _wg_type_contains_width(gv_value_ty, 16)
+            require_capability!(mod, Cap.WorkgroupMemoryExplicitLayout16BitAccessKHR)
+        end
+
         # Create OpVariable
         var_id = fresh_id!(mod)
         encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Workgroup)
@@ -1228,6 +1236,19 @@ function _emit_workgroup_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariab
     end
 
     return var_id
+end
+
+"""Check if an LLVM type contains an integer element of the given bit width."""
+function _wg_type_contains_width(ty::LLVM.LLVMType, bits::Int)
+    if ty isa LLVM.IntegerType
+        return LLVM.width(ty) == bits
+    elseif ty isa LLVM.StructType
+        return any(mt -> _wg_type_contains_width(mt, bits), LLVM.elements(ty))
+    elseif ty isa LLVM.ArrayType
+        return _wg_type_contains_width(LLVM.eltype(ty), bits)
+    else
+        return false
+    end
 end
 
 """Check if an LLVM type contains a struct at any nesting level."""
