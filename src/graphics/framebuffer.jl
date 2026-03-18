@@ -1,0 +1,188 @@
+# Offscreen framebuffer and render targets for Lava.jl
+#
+# Uses VK_KHR_dynamic_rendering — no VkRenderPass/VkFramebuffer needed.
+# Just images + views as render targets.
+
+"""
+    LavaFramebuffer
+
+Offscreen render target with color and optional depth images.
+Used for render-to-texture or offscreen rendering.
+"""
+mutable struct LavaFramebuffer
+    width::Int
+    height::Int
+    # Color attachment
+    color_image::Vulkan.Image
+    color_memory::Vulkan.DeviceMemory
+    color_view::Vulkan.ImageView
+    color_format::Vulkan.Format
+    # Depth attachment (optional)
+    depth_image::Union{Nothing, Vulkan.Image}
+    depth_memory::Union{Nothing, Vulkan.DeviceMemory}
+    depth_view::Union{Nothing, Vulkan.ImageView}
+    depth_format::Vulkan.Format
+end
+
+"""
+    LavaFramebuffer(width, height; depth=true, color_format=Vulkan.FORMAT_B8G8R8A8_SRGB)
+
+Create an offscreen framebuffer with color and optional depth attachments.
+"""
+function LavaFramebuffer(width::Integer, height::Integer;
+                          depth::Bool=true,
+                          color_format::Vulkan.Format=Vulkan.FORMAT_B8G8R8A8_SRGB)
+    ctx = vk_context()
+    dev = ctx.device
+    phys = ctx.physical_device
+
+    # Create color image
+    color_image = Vulkan.Image(dev,
+        Vulkan.IMAGE_TYPE_2D, color_format,
+        Vulkan.Extent3D(UInt32(width), UInt32(height), UInt32(1)),
+        UInt32(1), UInt32(1),
+        Vulkan.SAMPLE_COUNT_1_BIT,
+        Vulkan.IMAGE_TILING_OPTIMAL,
+        Vulkan.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | Vulkan.IMAGE_USAGE_TRANSFER_SRC_BIT | Vulkan.IMAGE_USAGE_SAMPLED_BIT,
+        Vulkan.SHARING_MODE_EXCLUSIVE, UInt32[],
+        Vulkan.IMAGE_LAYOUT_UNDEFINED,
+    )
+    color_memory = alloc_image_memory(dev, phys, color_image)
+    color_view = Vulkan.ImageView(dev, color_image, Vulkan.IMAGE_VIEW_TYPE_2D, color_format,
+        Vulkan.ComponentMapping(
+            Vulkan.COMPONENT_SWIZZLE_IDENTITY, Vulkan.COMPONENT_SWIZZLE_IDENTITY,
+            Vulkan.COMPONENT_SWIZZLE_IDENTITY, Vulkan.COMPONENT_SWIZZLE_IDENTITY,
+        ),
+        Vulkan.ImageSubresourceRange(Vulkan.IMAGE_ASPECT_COLOR_BIT,
+            UInt32(0), UInt32(1), UInt32(0), UInt32(1)),
+    )
+
+    # Create depth image (optional)
+    depth_format = Vulkan.FORMAT_D32_SFLOAT
+    depth_img = nothing
+    depth_mem = nothing
+    depth_vw = nothing
+    if depth
+        depth_img = Vulkan.Image(dev,
+            Vulkan.IMAGE_TYPE_2D, depth_format,
+            Vulkan.Extent3D(UInt32(width), UInt32(height), UInt32(1)),
+            UInt32(1), UInt32(1),
+            Vulkan.SAMPLE_COUNT_1_BIT,
+            Vulkan.IMAGE_TILING_OPTIMAL,
+            Vulkan.IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+            Vulkan.SHARING_MODE_EXCLUSIVE, UInt32[],
+            Vulkan.IMAGE_LAYOUT_UNDEFINED,
+        )
+        depth_mem = alloc_image_memory(dev, phys, depth_img)
+        depth_vw = Vulkan.ImageView(dev, depth_img, Vulkan.IMAGE_VIEW_TYPE_2D, depth_format,
+            Vulkan.ComponentMapping(
+                Vulkan.COMPONENT_SWIZZLE_IDENTITY, Vulkan.COMPONENT_SWIZZLE_IDENTITY,
+                Vulkan.COMPONENT_SWIZZLE_IDENTITY, Vulkan.COMPONENT_SWIZZLE_IDENTITY,
+            ),
+            Vulkan.ImageSubresourceRange(Vulkan.IMAGE_ASPECT_DEPTH_BIT,
+                UInt32(0), UInt32(1), UInt32(0), UInt32(1)),
+        )
+    end
+
+    LavaFramebuffer(Int(width), Int(height),
+        color_image, color_memory, color_view, color_format,
+        depth_img, depth_mem, depth_vw, depth_format)
+end
+
+"""Allocate device-local memory for an image."""
+function alloc_image_memory(dev::Vulkan.Device, phys::Vulkan.PhysicalDevice, image::Vulkan.Image)
+    mem_reqs = Vulkan.get_image_memory_requirements(dev, image)
+    mem_props = Vulkan.get_physical_device_memory_properties(phys)
+
+    type_idx = find_memory_type(mem_props, mem_reqs.memory_type_bits,
+                                  Vulkan.MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+
+    mem = Vulkan.DeviceMemory(dev, mem_reqs.size, type_idx)
+    unwrap(Vulkan.bind_image_memory(dev, image, mem, UInt64(0)))
+    return mem
+end
+
+"""Find a memory type index matching required bits and properties."""
+function find_memory_type(mem_props, type_bits::UInt32, required_flags)
+    for i in 0:Int(mem_props.memory_type_count) - 1
+        if (type_bits & (1 << i)) != 0
+            flags = mem_props.memory_types[i + 1].property_flags
+            if (flags & required_flags) == required_flags
+                return UInt32(i)
+            end
+        end
+    end
+    error("No suitable memory type found for image allocation")
+end
+
+Base.size(fb::LavaFramebuffer) = (fb.width, fb.height)
+
+"""
+    readback_framebuffer(fb::LavaFramebuffer) -> Matrix{NTuple{4, UInt8}}
+
+Read back the color attachment pixels to CPU memory.
+Returns a height x width matrix of BGRA bytes (matching FORMAT_B8G8R8A8_SRGB).
+"""
+function readback_framebuffer(fb::LavaFramebuffer)
+    ctx = vk_context()
+    dev = ctx.device
+
+    # Flush pending GPU work
+    if has_active_recording(ctx)
+        vk_flush!()
+    end
+
+    nbytes = fb.width * fb.height * 4  # 4 bytes per pixel (B8G8R8A8)
+    staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
+
+    # Use dedicated transfer command buffer for readback
+    cmd = ctx.xfer_cmd_buf
+    fence = ctx.xfer_fence
+    unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(;
+        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
+
+    # Transition color image to transfer source
+    transition_image!(cmd, fb.color_image,
+        Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, Vulkan.PIPELINE_STAGE_TRANSFER_BIT,
+        Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT, Vulkan.ACCESS_TRANSFER_READ_BIT)
+
+    # Copy image to staging buffer
+    region = Vulkan.BufferImageCopy(
+        UInt64(0), UInt32(0), UInt32(0),
+        Vulkan.ImageSubresourceLayers(Vulkan.IMAGE_ASPECT_COLOR_BIT,
+            UInt32(0), UInt32(0), UInt32(1)),
+        Vulkan.Offset3D(0, 0, 0),
+        Vulkan.Extent3D(UInt32(fb.width), UInt32(fb.height), UInt32(1)),
+    )
+    Vulkan.cmd_copy_image_to_buffer(cmd, fb.color_image,
+        Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_buf, [region])
+
+    unwrap(Vulkan.end_command_buffer(cmd))
+
+    submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
+    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=fence))
+    unwrap(Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64)))
+    unwrap(Vulkan.reset_fences(dev, [fence]))
+    flush_deferred_frees!()
+
+    # Read pixels from staging buffer
+    # Shape (width, height) so pixels[x+1, y+1] = pixel at Vulkan position (x, y)
+    # (Vulkan writes row-major; Julia column-major with dim1=width gives correct indexing)
+    pixels = Matrix{NTuple{4, UInt8}}(undef, fb.width, fb.height)
+    unsafe_copyto!(Ptr{UInt8}(pointer(pixels)),
+                   Ptr{UInt8}(mapped_ptr), nbytes)
+    return pixels
+end
+
+# ── Render Target Subtypes ──
+
+"""Render to a swapchain window image."""
+struct WindowTarget <: RenderTarget
+    window::RenderWindow
+end
+
+"""Render to an offscreen framebuffer."""
+struct OffscreenTarget <: RenderTarget
+    fb::LavaFramebuffer
+end

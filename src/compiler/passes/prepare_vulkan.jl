@@ -1189,6 +1189,368 @@ function _gep_path_to_first_scalar(ty::LLVM.LLVMType)
 end
 
 # ============================================================================
+# Sub-pass: Flatten nested workgroup array globals
+# ============================================================================
+
+"""
+    _flatten_nested_workgroup_arrays!(mod::LLVM.Module)
+
+Replace addrspace(3) globals with nested array types (e.g. `[32 x [2 x float]]`)
+by flat scalar arrays (`[64 x float]`). SPIR-V Workgroup variables without explicit
+layout (VK_KHR_workgroup_memory_explicit_layout) cannot have nested array types —
+NVIDIA drivers miscompute the stride, causing only part of the array to be accessible.
+
+Creates a new flat global and rewrites GEP instructions to use flat indices.
+ConstantExpr GEPs (from reduce_group!-style constant-index accesses) are handled
+by replacing the global pointer and letting _fix_shared_geps! clean them up.
+"""
+function _flatten_nested_workgroup_arrays!(mod::LLVM.Module)
+    T_i64 = LLVM.Int64Type()
+
+    for gv in collect(LLVM.globals(mod))
+        pointee_ty = LLVM.global_value_type(gv)
+        ptr_ty = LLVM.value_type(gv)
+        ptr_ty isa LLVM.PointerType || continue
+        LLVM.addrspace(ptr_ty) == 3 || continue
+        pointee_ty isa LLVM.ArrayType || continue
+
+        # Check if this is a nested array (element is also an array)
+        leaf_ty = LLVM.eltype(pointee_ty)
+        leaf_ty isa LLVM.ArrayType || continue  # only fix nested arrays — structs handled elsewhere
+
+        # Compute leaf scalar type and total count
+        total_count = LLVM.length(pointee_ty)
+        cur = leaf_ty
+        while cur isa LLVM.ArrayType
+            total_count *= LLVM.length(cur)
+            cur = LLVM.eltype(cur)
+        end
+        scalar_ty = cur  # e.g. float
+        inner_count = total_count ÷ LLVM.length(pointee_ty)
+
+        # Create new flat global: [total_count x scalar_ty]
+        flat_arr_ty = LLVM.ArrayType(scalar_ty, total_count)
+        old_name = LLVM.name(gv)
+        new_gv = LLVM.GlobalVariable(mod, flat_arr_ty, old_name * "_flat", 3)
+        LLVM.linkage!(new_gv, LLVM.API.LLVMExternalLinkage)
+        LLVM.unnamed_addr!(new_gv, true)
+
+        # Rewrite all uses of the old global to use the flat global
+        _rewrite_all_wg_uses_to_flat!(gv, new_gv, flat_arr_ty, inner_count, T_i64)
+
+        # Any remaining uses (dead ConstantExprs) — RAUW to new_gv so we can erase.
+        # With opaque pointers both are `ptr addrspace(3)` so this is type-safe.
+        if !isempty(collect(LLVM.uses(gv)))
+            LLVM.replace_uses!(gv, new_gv)
+        end
+        LLVM.erase!(gv)
+    end
+end
+
+"""Rewrite all users of a workgroup global to use flat array indexing."""
+function _rewrite_all_wg_uses_to_flat!(old_gv, new_gv, flat_arr_ty, inner_count, T_i64)
+    # Iteratively process uses until none remain.
+    # ConstantExpr users persist as LLVM constants even after their instruction-level
+    # users are removed — track them to avoid infinite loops.
+    processed_ces = Set{UInt}()
+
+    for _iter in 1:100  # safety bound
+        uses = Tuple{LLVM.Value, Symbol}[]
+        for use in LLVM.uses(old_gv)
+            user = LLVM.user(use)
+            if user isa LLVM.GetElementPtrInst
+                push!(uses, (user, :gep))
+            elseif user isa LLVM.ConstantExpr
+                ce_id = UInt(user.ref)
+                ce_id in processed_ces && continue
+                push!(uses, (user, :constexpr))
+            elseif user isa LLVM.LoadInst
+                push!(uses, (user, :load))
+            elseif user isa LLVM.StoreInst
+                push!(uses, (user, :store))
+            end
+        end
+        isempty(uses) && break
+
+        for (user, kind) in uses
+            if kind == :gep
+                _rewrite_one_wg_gep!(user, old_gv, new_gv, flat_arr_ty, inner_count, T_i64)
+            elseif kind == :constexpr
+                _eliminate_wg_constexpr!(user, old_gv, new_gv, flat_arr_ty, inner_count, T_i64)
+                push!(processed_ces, UInt(user.ref))
+            elseif kind == :load
+                # Bare load from global: load from [0]
+                LLVM.@dispose builder=LLVM.IRBuilder() begin
+                    LLVM.position!(builder, user)
+                    zero = LLVM.ConstantInt(T_i64, 0)
+                    ptr = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                                   LLVM.Value[zero, zero], "wg_flat_ptr")
+                    loaded_ty = LLVM.value_type(user)
+                    new_load = LLVM.load!(builder, loaded_ty, ptr, "wg_flat_load")
+                    LLVM.alignment!(new_load, max(1, Int(LLVM.alignment(user))))
+                    LLVM.replace_uses!(user, new_load)
+                end
+                LLVM.erase!(user)
+            elseif kind == :store
+                # Bare store to global: store to [0]
+                LLVM.@dispose builder=LLVM.IRBuilder() begin
+                    LLVM.position!(builder, user)
+                    zero = LLVM.ConstantInt(T_i64, 0)
+                    ptr = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                                   LLVM.Value[zero, zero], "wg_flat_ptr")
+                    val = LLVM.operands(user)[1]
+                    new_store = LLVM.store!(builder, val, ptr)
+                    LLVM.alignment!(new_store, max(1, Int(LLVM.alignment(user))))
+                end
+                LLVM.erase!(user)
+            end
+        end
+    end
+end
+
+"""Total number of scalar elements in an LLVM type (recursing through arrays)."""
+function _total_scalar_count(ty::LLVM.LLVMType)
+    ty isa LLVM.ArrayType || return 1
+    return LLVM.length(ty) * _total_scalar_count(LLVM.eltype(ty))
+end
+
+"""Rewrite one GetElementPtrInst on a workgroup global to use flat indexing.
+
+Uses `LLVMGetGEPSourceElementType` to determine the stride for each index level:
+- First GEP index does pointer arithmetic (stride = total scalars in source type)
+- Each subsequent index descends one array level (stride = total scalars in element type)
+
+If the GEP doesn't fully resolve to scalar level (e.g., only indexes the outer dimension
+of `[N x [6 x float]]`), chained GEP users are recursively folded into a single flat index.
+"""
+function _rewrite_one_wg_gep!(gep::LLVM.GetElementPtrInst, old_gv, new_gv,
+                                flat_arr_ty, inner_count, T_i64)
+    ops = LLVM.operands(gep)
+    length(ops) >= 2 || return  # need at least base + 1 index
+
+    # Get the GEP source element type
+    src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
+
+    LLVM.@dispose builder=LLVM.IRBuilder() begin
+        LLVM.position!(builder, gep)
+        zero = LLVM.ConstantInt(T_i64, 0)
+        flat_idx = zero  # accumulate flat scalar index
+
+        cur_ty = src_ty  # type at current level
+        for i in 2:length(ops)
+            idx = ops[i]
+            if LLVM.value_type(idx) != T_i64
+                idx = LLVM.sext!(builder, idx, T_i64, "wg_flat_idx64")
+            end
+
+            # Stride = total scalar elements in cur_ty
+            stride = _total_scalar_count(cur_ty)
+
+            if stride != 1
+                scaled = LLVM.mul!(builder, idx, LLVM.ConstantInt(T_i64, stride), "wg_flat_scale")
+            else
+                scaled = idx
+            end
+            flat_idx = LLVM.add!(builder, flat_idx, scaled, "wg_flat_acc")
+
+            # Descend into the element type for the next index
+            if cur_ty isa LLVM.ArrayType
+                cur_ty = LLVM.eltype(cur_ty)
+            end
+        end
+
+        if !(cur_ty isa LLVM.ArrayType)
+            # Fully resolved to scalar — simple replacement
+            new_gep = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                               LLVM.Value[zero, flat_idx], "wg_flat_gep")
+            LLVM.replace_uses!(gep, new_gep)
+            LLVM.erase!(gep)
+        else
+            # GEP didn't reach scalar level — fold chained users into flat index
+            _rewrite_partial_wg_gep_users!(gep, new_gv, flat_arr_ty, flat_idx, cur_ty, T_i64)
+        end
+    end
+end
+
+"""Rewrite users of a partially-resolved workgroup GEP by folding their indices into the flat index.
+
+Called when a GEP on a flattened workgroup global doesn't descend to scalar level
+(e.g., `gep [N x [6 x float]], @shared, 0, %outer` reaches `[6 x float]`, not `float`).
+Chained GEP users have their indices folded into the base flat_idx to produce fully-resolved
+scalar GEPs on the new flat global.
+"""
+function _rewrite_partial_wg_gep_users!(gep, new_gv, flat_arr_ty, base_flat_idx,
+                                          remaining_ty, T_i64)
+    zero = LLVM.ConstantInt(T_i64, 0)
+
+    # Collect users before mutation
+    users = LLVM.Value[]
+    for use in LLVM.uses(gep)
+        push!(users, LLVM.user(use))
+    end
+
+    for user in users
+        if user isa LLVM.GetElementPtrInst
+            # Fold this chained GEP's indices into base_flat_idx
+            chained_ops = LLVM.operands(user)
+            chained_src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(user))
+
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                LLVM.position!(builder, user)
+                flat_idx = base_flat_idx
+                cur_ty = chained_src_ty
+
+                for i in 2:length(chained_ops)
+                    idx = chained_ops[i]
+                    if LLVM.value_type(idx) != T_i64
+                        idx = LLVM.sext!(builder, idx, T_i64, "wg_chain_idx64")
+                    end
+                    stride = _total_scalar_count(cur_ty)
+                    if stride != 1
+                        scaled = LLVM.mul!(builder, idx, LLVM.ConstantInt(T_i64, stride), "wg_chain_scale")
+                    else
+                        scaled = idx
+                    end
+                    flat_idx = LLVM.add!(builder, flat_idx, scaled, "wg_chain_acc")
+                    if cur_ty isa LLVM.ArrayType
+                        cur_ty = LLVM.eltype(cur_ty)
+                    end
+                end
+
+                if !(cur_ty isa LLVM.ArrayType)
+                    # Fully resolved — create scalar GEP
+                    new_gep_val = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                                       LLVM.Value[zero, flat_idx], "wg_flat_chain_gep")
+                    LLVM.replace_uses!(user, new_gep_val)
+                    LLVM.erase!(user)
+                else
+                    # Still not fully resolved — recurse
+                    _rewrite_partial_wg_gep_users!(user, new_gv, flat_arr_ty,
+                                                     flat_idx, cur_ty, T_i64)
+                end
+            end
+        elseif user isa LLVM.LoadInst
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                LLVM.position!(builder, user)
+                ptr = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                               LLVM.Value[zero, base_flat_idx], "wg_flat_ptr")
+                new_load = LLVM.load!(builder, LLVM.value_type(user), ptr, "wg_flat_load")
+                LLVM.alignment!(new_load, max(1, Int(LLVM.alignment(user))))
+                LLVM.replace_uses!(user, new_load)
+            end
+            LLVM.erase!(user)
+        elseif user isa LLVM.StoreInst
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                LLVM.position!(builder, user)
+                ptr = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                               LLVM.Value[zero, base_flat_idx], "wg_flat_ptr")
+                val = LLVM.operands(user)[1]
+                new_store = LLVM.store!(builder, val, ptr)
+                LLVM.alignment!(new_store, max(1, Int(LLVM.alignment(user))))
+            end
+            LLVM.erase!(user)
+        end
+    end
+
+    # Erase old GEP if no remaining uses
+    if isempty(collect(LLVM.uses(gep)))
+        LLVM.erase!(gep)
+    end
+end
+
+"""Replace ConstantExpr GEP users with instruction-level GEPs on the flat global."""
+function _eliminate_wg_constexpr!(ce::LLVM.ConstantExpr, old_gv, new_gv,
+                                    flat_arr_ty, inner_count, T_i64)
+    # Compute the flat offset from the ConstantExpr's constant indices.
+    # Walk the global's pointee type structure to compute strides at each level.
+    # CEs on workgroup globals always use the outer array type as source.
+    ce_ops = LLVM.operands(ce)
+    pointee_ty = LLVM.global_value_type(old_gv)
+    flat_offset = 0
+    cur_ty = pointee_ty
+    for i in 2:length(ce_ops)
+        idx = ce_ops[i]
+        idx isa LLVM.ConstantInt || continue
+        val = convert(Int, idx)
+        stride = _total_scalar_count(cur_ty)
+        flat_offset += val * stride
+        if cur_ty isa LLVM.ArrayType
+            cur_ty = LLVM.eltype(cur_ty)
+        end
+    end
+
+    # Replace each instruction user of this ConstantExpr with a flat GEP
+    ce_inst_users = LLVM.Value[]
+    for use in LLVM.uses(ce)
+        push!(ce_inst_users, LLVM.user(use))
+    end
+
+    for inst in ce_inst_users
+        if inst isa LLVM.LoadInst
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                LLVM.position!(builder, inst)
+                zero = LLVM.ConstantInt(T_i64, 0)
+                off = LLVM.ConstantInt(T_i64, flat_offset)
+                ptr = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                               LLVM.Value[zero, off], "wg_flat_ce_ptr")
+                loaded_ty = LLVM.value_type(inst)
+                new_load = LLVM.load!(builder, loaded_ty, ptr, "wg_flat_ce_load")
+                LLVM.alignment!(new_load, max(1, Int(LLVM.alignment(inst))))
+                LLVM.replace_uses!(inst, new_load)
+            end
+            LLVM.erase!(inst)
+        elseif inst isa LLVM.StoreInst
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                LLVM.position!(builder, inst)
+                zero = LLVM.ConstantInt(T_i64, 0)
+                off = LLVM.ConstantInt(T_i64, flat_offset)
+                ptr = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                               LLVM.Value[zero, off], "wg_flat_ce_ptr")
+                val = LLVM.operands(inst)[1]
+                new_store = LLVM.store!(builder, val, ptr)
+                LLVM.alignment!(new_store, max(1, Int(LLVM.alignment(inst))))
+            end
+            LLVM.erase!(inst)
+        elseif inst isa LLVM.GetElementPtrInst
+            # GEP on ConstantExpr result: CE provides base offset, GEP adds dynamic index.
+            # Common pattern: gep [M x T], %ce, i64 0, i64 %inner_idx (3 ops)
+            # or:             gep [M x T], %ce, i64 %ptr_idx           (2 ops)
+            ops = LLVM.operands(inst)
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                LLVM.position!(builder, inst)
+                zero = LLVM.ConstantInt(T_i64, 0)
+                dynamic_inner = zero  # default: no dynamic offset
+                if length(ops) >= 4
+                    # ops = [base, 0, inner_idx, ...]
+                    idx = ops[4]
+                    if LLVM.value_type(idx) != T_i64
+                        idx = LLVM.sext!(builder, idx, T_i64, "wg_flat_ce_idx64")
+                    end
+                    dynamic_inner = idx
+                elseif length(ops) >= 3
+                    # ops = [base, 0, inner_idx]
+                    idx = ops[3]
+                    if LLVM.value_type(idx) != T_i64
+                        idx = LLVM.sext!(builder, idx, T_i64, "wg_flat_ce_idx64")
+                    end
+                    dynamic_inner = idx
+                end
+                adj_idx = if flat_offset != 0
+                    LLVM.add!(builder, dynamic_inner, LLVM.ConstantInt(T_i64, flat_offset), "wg_flat_ce_adj")
+                else
+                    dynamic_inner
+                end
+                new_gep = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                                   LLVM.Value[zero, adj_idx], "wg_flat_ce_gep")
+                LLVM.replace_uses!(inst, new_gep)
+            end
+            LLVM.erase!(inst)
+        end
+    end
+    # Note: the ConstantExpr itself will be cleaned up when it has no more uses
+end
+
+# ============================================================================
 # Sub-pass: Fix shared memory GEPs
 # ============================================================================
 
@@ -1769,7 +2131,7 @@ function _prepare_module_for_vulkan!(mod::LLVM.Module, entry_name::String;
         end
     end
 
-    # 3. Fix flat GEPs on addrspace(3) array globals
+    # 3b. Fix flat GEPs on addrspace(3) array globals
     _fix_shared_geps!(mod)
 
     # 4. Flatten array-typed GEPs in addrspace(1) (BDA / PhysicalStorageBuffer)
@@ -2594,10 +2956,48 @@ function _first_scalar_field(ty::LLVM.LLVMType)
 end
 
 """Trace a pointer through GEPs back to its alloca, if any."""
+# Check if a GEP chain from ptr to its alloca contains any GEP with dynamic indices.
+function _gep_chain_has_dynamic_indices(ptr::LLVM.Value)
+    current = ptr
+    while current isa LLVM.GetElementPtrInst
+        ops = LLVM.operands(current)
+        for i in 2:length(ops)
+            if _resolve_const_gep_index(ops[i]) === nothing
+                return true
+            end
+        end
+        current = ops[1]
+    end
+    return false
+end
+
 function _trace_to_alloca(ptr::LLVM.Value)
     ptr isa LLVM.AllocaInst && return ptr
     if ptr isa LLVM.GetElementPtrInst
         return _trace_to_alloca(LLVM.operands(ptr)[1])
+    elseif ptr isa LLVM.BitCastInst || ptr isa LLVM.AddrSpaceCastInst
+        return _trace_to_alloca(LLVM.operands(ptr)[1])
+    end
+    return nothing
+end
+
+"""
+Try to resolve an LLVM value used as a GEP index to a compile-time integer.
+Handles literal constants and simple constant-expression instruction chains.
+"""
+function _resolve_const_gep_index(v::LLVM.Value)
+    if v isa LLVM.ConstantInt
+        return convert(Int, v)
+    elseif v isa LLVM.ZExtInst || v isa LLVM.SExtInst || v isa LLVM.TruncInst
+        return _resolve_const_gep_index(LLVM.operands(v)[1])
+    elseif v isa LLVM.AddInst
+        a = _resolve_const_gep_index(LLVM.operands(v)[1])
+        b = _resolve_const_gep_index(LLVM.operands(v)[2])
+        return (a === nothing || b === nothing) ? nothing : (a + b)
+    elseif v isa LLVM.SubInst
+        a = _resolve_const_gep_index(LLVM.operands(v)[1])
+        b = _resolve_const_gep_index(LLVM.operands(v)[2])
+        return (a === nothing || b === nothing) ? nothing : (a - b)
     end
     return nothing
 end
@@ -2681,7 +3081,14 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                 for inst in LLVM.instructions(bb)
                     inst isa LLVM.LoadInst || continue
                     load_ty = LLVM.value_type(inst)
-                    load_ty isa LLVM.IntegerType || continue
+                    is_int_load = load_ty isa LLVM.IntegerType
+                    is_float_load = (load_ty == LLVM.FloatType() ||
+                                     load_ty == LLVM.DoubleType() ||
+                                     load_ty == LLVM.HalfType())
+                    (is_int_load || is_float_load) || continue
+                    load_size = _llvm_type_size(load_ty)
+                    load_bits = load_size * 8
+                    load_int_ty = is_int_load ? load_ty : LLVM.IntType(load_bits)
 
                     ptr = LLVM.operands(inst)[1]
                     ptr isa LLVM.GetElementPtrInst || continue
@@ -2692,6 +3099,11 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                     alloca = _trace_to_alloca(ptr)
                     alloca === nothing && continue
 
+                    # Skip if the GEP chain to the alloca passes through any GEP with
+                    # dynamic (non-constant) indices. We only decompose fully-constant
+                    # offset chains. Dynamic offsets must be handled by the SPIR-V emitter.
+                    _gep_chain_has_dynamic_indices(ptr) && continue
+
                     alloca_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(alloca))
 
                     # Get GEP source element type, indices, and compute destination type + offset
@@ -2700,22 +3112,22 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                     indices = Int[]
                     for i in 2:length(ops)
                         op = ops[i]
-                        op isa LLVM.ConstantInt || @goto next_inst
-                        push!(indices, convert(Int, op))
+                        idx = _resolve_const_gep_index(op)
+                        idx === nothing && @goto next_inst
+                        push!(indices, idx)
                     end
 
                     elem_ty, gep_byte_off = _gep_element_type_and_offset(src_ty, indices)
                     elem_ty === nothing && continue
 
                     elem_size = _llvm_type_size(elem_ty)
-                    load_size = div(LLVM.width(load_ty), 8)
 
-                    # Handle byte-GEPs into struct allocas (gep i8, ptr %struct_alloca, <offset>)
-                    # These have src_ty=i8, elem_ty=i8, but the alloca is a struct.
-                    # Resolve byte offset to the containing struct field.
+                    # Handle byte-GEPs into struct/array allocas (gep i8, ptr %alloca, <offset>)
+                    # These have src_ty=i8, elem_ty=i8, but the alloca is a struct/array.
+                    # Resolve byte offset to the containing field, load it, and extract
+                    # the relevant bits via bitcast+shift+trunc.
                     if src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8 &&
-                       (alloca_ty isa LLVM.StructType || alloca_ty isa LLVM.ArrayType) &&
-                       elem_size == load_size
+                       (alloca_ty isa LLVM.StructType || alloca_ty isa LLVM.ArrayType)
                         all_fields = _flatten_type_with_offsets(alloca_ty)
                         # Find the scalar field that contains this byte offset
                         containing = nothing
@@ -2752,14 +3164,17 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                             result = if byte_within_field > 0
                                 shift = LLVM.ConstantInt(LLVM.value_type(int_val), byte_within_field * 8)
                                 shifted = LLVM.lshr!(builder, int_val, shift, "typepun_shr")
-                                LLVM.trunc!(builder, shifted, load_ty, "typepun_trunc")
-                            elseif field_bits > LLVM.width(load_ty)
-                                LLVM.trunc!(builder, int_val, load_ty, "typepun_trunc")
+                                LLVM.trunc!(builder, shifted, load_int_ty, "typepun_trunc")
+                            elseif field_bits > load_bits
+                                LLVM.trunc!(builder, int_val, load_int_ty, "typepun_trunc")
                             else
                                 int_val
                             end
 
-                            LLVM.replace_uses!(inst, result)
+                            typed_result = is_int_load ? result :
+                                LLVM.bitcast!(builder, result, load_ty, "typepun_bcast")
+
+                            LLVM.replace_uses!(inst, typed_result)
                             LLVM.erase!(inst)
                             changed = true
                             break
@@ -2808,15 +3223,15 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                                 end
 
                                 # Zero-extend to load width
-                                wide_val = if field_bits == LLVM.width(load_ty)
+                                wide_val = if field_bits == load_bits
                                     int_val
                                 else
-                                    LLVM.zext!(builder, int_val, load_ty, "typepun_zext")
+                                    LLVM.zext!(builder, int_val, load_int_ty, "typepun_zext")
                                 end
 
                                 # Shift left
                                 if bit_offset > 0
-                                    shift = LLVM.ConstantInt(load_ty, bit_offset)
+                                    shift = LLVM.ConstantInt(load_int_ty, bit_offset)
                                     wide_val = LLVM.shl!(builder, wide_val, shift, "typepun_shl")
                                 end
 
@@ -2825,7 +3240,9 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                             end
 
                             if combined !== nothing
-                                LLVM.replace_uses!(inst, combined)
+                                typed_result = is_int_load ? combined :
+                                    LLVM.bitcast!(builder, combined, load_ty, "typepun_bcast")
+                                LLVM.replace_uses!(inst, typed_result)
                                 LLVM.erase!(inst)
                                 changed = true
                                 break
@@ -2836,21 +3253,80 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                         # Narrower load: load the full field and truncate
                         LLVM.@dispose builder=LLVM.IRBuilder() begin
                             LLVM.position!(builder, inst)
-                            field_val = LLVM.load!(builder, elem_ty, ptr, "typepun_load")
+                            replaced = false
 
-                            field_bits = elem_size * 8
-                            int_val = if elem_ty isa LLVM.IntegerType
-                                field_val
-                            else
-                                LLVM.bitcast!(builder, field_val, LLVM.IntType(field_bits), "typepun_cast")
+                            # Avoid illegal i128/i256 bitcasts (unsupported in Vulkan SPIR-V):
+                            # for wide composite pointees, assemble only the needed low bytes
+                            # from scalar subfields.
+                            if (elem_ty isa LLVM.StructType || elem_ty isa LLVM.ArrayType) &&
+                               (elem_size * 8 > 64)
+                                subfields = _flatten_type_with_offsets(elem_ty)
+                                selected = filter(subfields) do (_, fty, foff)
+                                    fsz = _llvm_type_size(fty)
+                                    foff >= 0 && foff + fsz <= load_size
+                                end
+                                if !isempty(selected) &&
+                                   all(f -> _llvm_type_size(f[2]) in (1, 2, 4, 8), selected)
+                                    combined = nothing
+                                    for (gep_indices, field_ty, field_offset) in selected
+                                        field_bits = _llvm_type_size(field_ty) * 8
+                                        bit_offset = field_offset * 8
+
+                                        idx_values = LLVM.Value[LLVM.ConstantInt(LLVM.IntType(32), 0)]
+                                        for idx in gep_indices
+                                            push!(idx_values, LLVM.ConstantInt(LLVM.IntType(32), idx))
+                                        end
+                                        field_ptr = LLVM.gep!(builder, elem_ty, ptr, idx_values, "typepun_gep")
+                                        field_val = LLVM.load!(builder, field_ty, field_ptr, "typepun_load")
+
+                                        int_val = if field_ty isa LLVM.IntegerType
+                                            field_val
+                                        else
+                                            LLVM.bitcast!(builder, field_val, LLVM.IntType(field_bits), "typepun_cast")
+                                        end
+                                        wide_val = field_bits == load_bits ? int_val :
+                                            LLVM.zext!(builder, int_val, load_int_ty, "typepun_zext")
+                                        if bit_offset > 0
+                                            shift = LLVM.ConstantInt(load_int_ty, bit_offset)
+                                            wide_val = LLVM.shl!(builder, wide_val, shift, "typepun_shl")
+                                        end
+                                        combined = combined === nothing ? wide_val :
+                                            LLVM.or!(builder, combined, wide_val, "typepun_or")
+                                    end
+
+                                    if combined !== nothing
+                                        result = is_int_load ? combined :
+                                            LLVM.bitcast!(builder, combined, load_ty, "typepun_bcast")
+                                        LLVM.replace_uses!(inst, result)
+                                        LLVM.erase!(inst)
+                                        changed = true
+                                        replaced = true
+                                    end
+                                end
                             end
 
-                            result = LLVM.trunc!(builder, int_val, load_ty, "typepun_trunc")
+                            if !replaced
+                                field_bits = elem_size * 8
+                                if field_bits <= 64
+                                    field_val = LLVM.load!(builder, elem_ty, ptr, "typepun_load")
+                                    int_val = if elem_ty isa LLVM.IntegerType
+                                        field_val
+                                    else
+                                        LLVM.bitcast!(builder, field_val, LLVM.IntType(field_bits), "typepun_cast")
+                                    end
 
-                            LLVM.replace_uses!(inst, result)
-                            LLVM.erase!(inst)
-                            changed = true
-                            break
+                                    result_i = LLVM.trunc!(builder, int_val, load_int_ty, "typepun_trunc")
+                                    result = is_int_load ? result_i :
+                                        LLVM.bitcast!(builder, result_i, load_ty, "typepun_bcast")
+
+                                    LLVM.replace_uses!(inst, result)
+                                    LLVM.erase!(inst)
+                                    changed = true
+                                    replaced = true
+                                end
+                            end
+
+                            replaced && break
                         end
                     end
 
@@ -2890,8 +3366,9 @@ function _decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                     indices = Int[]
                     for i in 2:length(ops)
                         op = ops[i]
-                        op isa LLVM.ConstantInt || @goto next_store
-                        push!(indices, convert(Int, op))
+                        idx = _resolve_const_gep_index(op)
+                        idx === nothing && @goto next_store
+                        push!(indices, idx)
                     end
 
                     elem_ty, gep_byte_off = _gep_element_type_and_offset(src_ty, indices)
@@ -3269,6 +3746,102 @@ function _fix_gep_alloca_type_mismatches!(mod::LLVM.Module)
 end
 
 """
+    _convert_typepunned_geps_to_byte_geps!(mod::LLVM.Module)
+
+Convert typed GEPs on array allocas where the GEP source element type differs from
+the alloca element type into equivalent byte-offset GEPs.
+
+Pattern (MVector{16,UInt32} stored as [8 x i64], accessed via i32-typed GEPs):
+    %alloca = alloca [8 x i64]
+    %10 = getelementptr i32, ptr %alloca, i64 %dynamic
+    %gep = getelementptr i32, ptr %10, i64 -1
+    %val = load i32, ptr %gep
+
+After conversion:
+    %10_byte = getelementptr i8, ptr %alloca, i64 (%dynamic * 4)
+    %gep_byte = getelementptr i8, ptr %10_byte, i64 -4
+    %val = load i32, ptr %gep_byte
+
+The resulting byte-offset GEPs are then handled by `_lower_byte_gep_chain_on_allocas!`
+which applies the correct shift/mask extraction for sub-element access.
+"""
+function _convert_typepunned_geps_to_byte_geps!(mod::LLVM.Module)
+    for fn in LLVM.functions(mod)
+        isempty(LLVM.blocks(fn)) && continue
+        changed = true
+        while changed
+            changed = false
+            for bb in LLVM.blocks(fn)
+                for inst in LLVM.instructions(bb)
+                    inst isa LLVM.GetElementPtrInst || continue
+
+                    # Only single-index GEPs
+                    ops = LLVM.operands(inst)
+                    length(ops) == 2 || continue
+
+                    src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inst))
+                    # Skip if already a byte GEP
+                    src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8 && continue
+
+                    src_size = _llvm_type_size(src_ty)
+                    src_size > 0 || continue
+
+                    # Trace back through GEP chain to find the alloca
+                    base = ops[1]
+                    while base isa LLVM.GetElementPtrInst
+                        base = LLVM.operands(base)[1]
+                    end
+                    base isa LLVM.AllocaInst || continue
+
+                    alloca_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(base))
+
+                    # Only process composite alloca types where the GEP source type
+                    # differs from the alloca's element type (type-punned access)
+                    if alloca_ty isa LLVM.ArrayType
+                        alloca_elem_ty = LLVM.eltype(alloca_ty)
+                        elem_size = _llvm_type_size(alloca_elem_ty)
+                        elem_size > 0 || continue
+                        # Only convert when accessing with smaller type than alloca element
+                        src_size < elem_size || continue
+                    elseif alloca_ty isa LLVM.StructType
+                        # Struct alloca: GEP treats struct as flat array of src_ty.
+                        # Convert to byte GEP so downstream passes can decompose properly.
+                        alloca_size = _llvm_type_size(alloca_ty)
+                        alloca_size > 0 || continue
+                        src_ty != alloca_ty || continue
+                    else
+                        continue
+                    end
+
+                    # Convert: gep T, ptr %base, i64 %idx → gep i8, ptr %base, i64 (%idx * sizeof(T))
+                    LLVM.@dispose builder=LLVM.IRBuilder() begin
+                        LLVM.position!(builder, inst)
+                        idx = ops[2]
+                        i64 = LLVM.Int64Type()
+                        i8 = LLVM.Int8Type()
+                        if LLVM.value_type(idx) != i64
+                            idx = LLVM.sext!(builder, idx, i64, "tpgep_sext")
+                        end
+                        byte_off = if idx isa LLVM.ConstantInt
+                            LLVM.ConstantInt(i64, convert(Int64, idx) * src_size)
+                        else
+                            scale = LLVM.ConstantInt(i64, src_size)
+                            LLVM.mul!(builder, idx, scale, "tpgep_mul")
+                        end
+                        new_gep = LLVM.gep!(builder, i8, ops[1], [byte_off], "tpgep_byte")
+                        LLVM.replace_uses!(inst, new_gep)
+                        LLVM.erase!(inst)
+                    end
+                    changed = true
+                    break  # restart iteration
+                end
+                changed && break
+            end
+        end
+    end
+end
+
+"""
     _lower_byte_gep_chain_on_allocas!(mod::LLVM.Module)
 
 Lower chained byte-offset GEPs on array allocas where the access type (from store/load)
@@ -3403,6 +3976,255 @@ function _lower_byte_gep_chain_on_allocas!(mod::LLVM.Module)
                 end
             end
         end
+    end
+end
+
+"""
+    _lower_phi_typepunned_loads!(mod::LLVM.Module)
+
+Lower loads of smaller types through PHI chains that originate from byte-offset GEPs
+on array allocas with larger element types.
+
+Pattern (MVector{32,UInt32} stored as [16 x i64], accessed via byte-offset GEPs):
+
+    %gep1 = getelementptr i8, ptr %alloca_[16 x i64], i64 %dynamic
+    %gep2 = getelementptr i8, ptr %gep1, i64 -4
+    ; ... flows through PHI chain (from StructurizeCFG Flow blocks) ...
+    %phi = phi ptr [ %gep2, %bb1 ], [ undef, %bb2 ]
+    %val = load i32, ptr %phi
+
+The emitter can't handle this: it divides each GEP's offset by elem_size independently
+((-4)/8 = 0, losing the offset), and OpBitcast always reads the lower 32 bits.
+
+Fix: "lift" the load to each leaf GEP site using shift/mask extraction, create parallel
+i32 PHI chains, and replace the original load with the final i32 PHI value.
+"""
+function _lower_phi_typepunned_loads!(mod::LLVM.Module)
+    for fn in LLVM.functions(mod)
+        isempty(LLVM.blocks(fn)) && continue
+        changed = true
+        while changed
+            changed = false
+            for bb in LLVM.blocks(fn)
+                for inst in LLVM.instructions(bb)
+                    inst isa LLVM.LoadInst || continue
+                    ptr = LLVM.operands(inst)[1]
+                    ptr isa LLVM.PHIInst || continue
+
+                    access_ty = LLVM.value_type(inst)
+                    access_size = _llvm_type_size(access_ty)
+                    access_size > 0 || continue
+
+                    # Trace PHI chain to verify all leaves are byte-GEPs on same alloca
+                    alloca_info = _trace_phi_chain_to_alloca(ptr)
+                    alloca_info === nothing && continue
+                    alloca, alloca_ty, elem_ty, elem_size = alloca_info
+
+                    access_size < elem_size || continue
+                    (elem_size & (elem_size - 1)) == 0 || continue  # power of 2
+
+                    # Create parallel value PHI chain
+                    phi_map = Dict{LLVM.PHIInst, LLVM.Value}()
+                    new_val = _create_value_phi_chain!(
+                        ptr, alloca, alloca_ty, elem_ty, elem_size, access_ty, phi_map)
+                    new_val === nothing && continue
+
+                    LLVM.replace_uses!(inst, new_val)
+                    LLVM.erase!(inst)
+                    changed = true
+                    break
+                end
+                changed && break
+            end
+        end
+    end
+end
+
+"""
+Trace a PHI chain to find whether all non-undef leaf values are byte-offset GEP chains
+on the same [N x integer] array alloca. Returns (alloca, alloca_ty, elem_ty, elem_size)
+or nothing if not eligible.
+"""
+function _trace_phi_chain_to_alloca(phi::LLVM.PHIInst,
+                                     visited::Set{LLVM.Value}=Set{LLVM.Value}())
+    phi in visited && return nothing  # cycle
+    push!(visited, phi)
+
+    alloca = nothing
+    for (val, _) in LLVM.incoming(phi)
+        if val isa LLVM.UndefValue
+            continue
+        elseif val isa LLVM.PHIInst
+            sub = _trace_phi_chain_to_alloca(val, visited)
+            sub === nothing && return nothing
+            if alloca === nothing
+                alloca = sub[1]
+            elseif alloca !== sub[1]
+                return nothing  # different allocas
+            end
+        elseif val isa LLVM.GetElementPtrInst
+            gep_alloca = _trace_gep_chain_to_array_alloca(val)
+            gep_alloca === nothing && return nothing
+            if alloca === nothing
+                alloca = gep_alloca
+            elseif alloca !== gep_alloca
+                return nothing
+            end
+        else
+            return nothing  # unknown value type
+        end
+    end
+
+    alloca === nothing && return nothing
+
+    alloca_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(alloca))
+    alloca_ty isa LLVM.ArrayType || return nothing
+    elem_ty = LLVM.eltype(alloca_ty)
+    elem_ty isa LLVM.IntegerType || return nothing
+    elem_size = _llvm_type_size(elem_ty)
+    elem_size > 0 || return nothing
+
+    return (alloca, alloca_ty, elem_ty, elem_size)
+end
+
+"""
+Trace a byte-offset GEP chain (all i8 source type) back to an alloca.
+Returns the alloca or nothing.
+"""
+function _trace_gep_chain_to_array_alloca(val::LLVM.Value)
+    current = val
+    while current isa LLVM.GetElementPtrInst
+        src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(current))
+        src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8 || return nothing
+        length(LLVM.operands(current)) == 2 || return nothing
+        current = LLVM.operands(current)[1]
+    end
+    current isa LLVM.AllocaInst || return nothing
+    return current
+end
+
+"""
+Recursively create a parallel value-typed PHI chain for a pointer PHI chain.
+At each leaf GEP, inserts shift/mask extraction code. Returns the new value
+(a PHI or extracted i32) or nothing on failure.
+"""
+function _create_value_phi_chain!(phi::LLVM.PHIInst, alloca, alloca_ty,
+                                   elem_ty, elem_size, access_ty,
+                                   phi_map::Dict{LLVM.PHIInst, LLVM.Value})
+    haskey(phi_map, phi) && return phi_map[phi]
+
+    phi_bb = LLVM.parent(phi)
+    i64 = LLVM.Int64Type()
+
+    # Create new PHI of access_ty positioned after existing PHIs
+    first_non_phi = nothing
+    for inst in LLVM.instructions(phi_bb)
+        if !(inst isa LLVM.PHIInst)
+            first_non_phi = inst
+            break
+        end
+    end
+
+    new_phi = LLVM.@dispose builder=LLVM.IRBuilder() begin
+        if first_non_phi !== nothing
+            LLVM.position!(builder, first_non_phi)
+        else
+            LLVM.position!(builder, phi_bb)
+        end
+        LLVM.phi!(builder, access_ty, "phi_extract")
+    end
+    phi_map[phi] = new_phi  # register before recursion (handles cycles)
+
+    # Process incoming values
+    for (val, bb) in LLVM.incoming(phi)
+        if val isa LLVM.UndefValue
+            push!(LLVM.incoming(new_phi), (LLVM.UndefValue(access_ty), bb))
+        elseif val isa LLVM.PHIInst
+            sub_val = _create_value_phi_chain!(val, alloca, alloca_ty,
+                                                elem_ty, elem_size, access_ty, phi_map)
+            sub_val === nothing && return nothing
+            push!(LLVM.incoming(new_phi), (sub_val, bb))
+        elseif val isa LLVM.GetElementPtrInst
+            extracted = _emit_gep_chain_extract!(val, alloca, alloca_ty,
+                                                  elem_ty, elem_size, access_ty)
+            extracted === nothing && return nothing
+            push!(LLVM.incoming(new_phi), (extracted, bb))
+        else
+            return nothing
+        end
+    end
+
+    return new_phi
+end
+
+"""
+At a leaf byte-offset GEP site, emit shift/mask extraction code to read a smaller
+type from a larger array element. Inserts code before the block's terminator.
+Returns the extracted value (e.g., i32 from i64 element).
+"""
+function _emit_gep_chain_extract!(gep_end::LLVM.GetElementPtrInst, alloca, alloca_ty,
+                                    elem_ty, elem_size, access_ty)
+    i64 = LLVM.Int64Type()
+
+    # Collect byte offsets from GEP chain
+    gep_chain = LLVM.GetElementPtrInst[gep_end]
+    current = LLVM.operands(gep_end)[1]
+    while current isa LLVM.GetElementPtrInst
+        src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(current))
+        src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8 || break
+        length(LLVM.operands(current)) == 2 || break
+        pushfirst!(gep_chain, current)
+        current = LLVM.operands(current)[1]
+    end
+    current === alloca || return nothing
+
+    # Insert extraction before the terminator of the GEP's block
+    gep_bb = LLVM.parent(gep_end)
+    term = LLVM.terminator(gep_bb)
+
+    LLVM.@dispose builder=LLVM.IRBuilder() begin
+        LLVM.position!(builder, term)
+
+        # Sum byte offsets from the GEP chain
+        total_off = nothing
+        for gep in gep_chain
+            gep_ops = LLVM.operands(gep)
+            off = gep_ops[2]
+            if LLVM.value_type(off) != i64
+                off = LLVM.sext!(builder, off, i64, "phi_bgc_sext")
+            end
+            if total_off === nothing
+                total_off = off
+            else
+                total_off = LLVM.add!(builder, total_off, off, "phi_bgc_add")
+            end
+        end
+
+        # elem_idx = total_off >> log2(elem_size)
+        elem_shift = Int(log2(elem_size))
+        elem_idx = LLVM.ashr!(builder, total_off, LLVM.ConstantInt(i64, elem_shift), "phi_eidx")
+
+        # inner = total_off & (elem_size - 1)
+        inner = LLVM.and!(builder, total_off, LLVM.ConstantInt(i64, elem_size - 1), "phi_inner")
+
+        # shift_bits = inner * 8
+        shift_bits = LLVM.shl!(builder, inner, LLVM.ConstantInt(i64, 3), "phi_shift")
+
+        # GEP to the array element
+        typed_gep = LLVM.gep!(builder, alloca_ty, alloca,
+                              [LLVM.ConstantInt(i64, 0), elem_idx], "phi_gep")
+
+        # Load full element
+        full = LLVM.load!(builder, elem_ty, typed_gep, "phi_full")
+
+        # Shift right by sub-element bit offset
+        shift_in_elem = LLVM.trunc!(builder, shift_bits, elem_ty, "phi_shift_t")
+        shifted = LLVM.lshr!(builder, full, shift_in_elem, "phi_shr")
+
+        # Truncate to target type
+        result = LLVM.trunc!(builder, shifted, access_ty, "phi_trunc")
+
+        return result
     end
 end
 

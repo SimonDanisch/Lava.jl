@@ -136,9 +136,13 @@ function Base.resize!(a::LavaArray{T,1}, n::Integer) where T
     new_ref = GPUArrays.DataRef(new_buf) do buf
         vk_free!(buf)
     end
+    old_ref = a.buf
     a.buf = new_ref
     a.dims = (Int(n),)
     a.offset = 0
+    # Free old buffer — DataRef uses explicit refcounting, not GC finalizers,
+    # so we must release the old ref to avoid leaking VkDeviceMemory.
+    GPUArrays.unsafe_free!(old_ref)
     return a
 end
 
@@ -199,6 +203,10 @@ function LinearAlgebra.norm(v::LavaArray{T}, p::Real=2) where T
     p == 0 && return convert(RT, count(!iszero, v))
     p == Inf && return convert(RT, maximum(abs, v))
     p == -Inf && return convert(RT, minimum(abs, v))
+    # Non-trivial p-norms rely on transcendental math in the reduction path.
+    # These are currently not numerically stable across Vulkan drivers (e.g. RDNA3.5),
+    # so use CPU fallback for correctness/portability.
+    (p != 1 && p != 2) && return convert(RT, LinearAlgebra.norm(Array(v), p))
 
     # Float16/Float32/ComplexF16/ComplexF32: accumulate in Float64 (no overflow possible)
     if RT === Float32 || RT === Float16

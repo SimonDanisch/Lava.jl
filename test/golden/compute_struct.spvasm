@@ -1,0 +1,98 @@
+; SPIR-V
+; Version: 1.4
+; Generator: Khronos; 0
+; Bound: 74
+; Schema: 0
+               OpCapability VulkanMemoryModel
+               OpCapability PhysicalStorageBufferAddresses
+               OpCapability Shader
+               OpCapability VariablePointers
+               OpCapability Int64
+               OpExtension "SPV_KHR_vulkan_memory_model"
+               OpExtension "SPV_KHR_physical_storage_buffer"
+               OpExtension "SPV_KHR_variable_pointers"
+               OpMemoryModel PhysicalStorageBuffer64 Vulkan
+               OpEntryPoint GLCompute %main "main" %__spirv_BuiltInGlobalInvocationId %10
+               OpExecutionMode %main LocalSize 64 1 1
+               OpName %__spirv_BuiltInGlobalInvocationId "__spirv_BuiltInGlobalInvocationId"
+               OpName %main "main"
+               OpDecorate %__spirv_BuiltInGlobalInvocationId BuiltIn GlobalInvocationId
+               OpDecorate %_struct_8 Block
+               OpMemberDecorate %_struct_8 0 Offset 0
+               OpDecorate %_arr_float_uint_3 ArrayStride 4
+       %void = OpTypeVoid
+      %ulong = OpTypeInt 64 0
+       %uint = OpTypeInt 32 0
+     %v3uint = OpTypeVector %uint 3
+      %float = OpTypeFloat 32
+%_ptr_Input_v3uint = OpTypePointer Input %v3uint
+  %_struct_8 = OpTypeStruct %ulong
+%_ptr_PushConstant__struct_8 = OpTypePointer PushConstant %_struct_8
+         %11 = OpTypeFunction %void
+%_ptr_PushConstant_ulong = OpTypePointer PushConstant %ulong
+     %uint_0 = OpConstant %uint 0
+%_ptr_PhysicalStorageBuffer_ulong = OpTypePointer PhysicalStorageBuffer %ulong
+     %uint_3 = OpConstant %uint 3
+%_arr_float_uint_3 = OpTypeArray %float %uint_3
+%_ptr_PhysicalStorageBuffer__arr_float_uint_3 = OpTypePointer PhysicalStorageBuffer %_arr_float_uint_3
+%_ptr_PhysicalStorageBuffer__ptr_PhysicalStorageBuffer__arr_float_uint_3 = OpTypePointer PhysicalStorageBuffer %_ptr_PhysicalStorageBuffer__arr_float_uint_3
+    %ulong_8 = OpConstant %ulong 8
+%_ptr_PhysicalStorageBuffer_float = OpTypePointer PhysicalStorageBuffer %float
+%_ptr_PhysicalStorageBuffer__ptr_PhysicalStorageBuffer_float = OpTypePointer PhysicalStorageBuffer %_ptr_PhysicalStorageBuffer_float
+   %ulong_12 = OpConstant %ulong 12
+%ulong_18446744073709551615 = OpConstant %ulong 18446744073709551615
+    %ulong_1 = OpConstant %ulong 1
+    %ulong_2 = OpConstant %ulong 2
+    %ulong_4 = OpConstant %ulong 4
+%__spirv_BuiltInGlobalInvocationId = OpVariable %_ptr_Input_v3uint Input
+         %10 = OpVariable %_ptr_PushConstant__struct_8 PushConstant
+       %main = OpFunction %void None %11
+         %13 = OpLabel
+         %16 = OpAccessChain %_ptr_PushConstant_ulong %10 %uint_0
+         %17 = OpLoad %ulong %16
+         %19 = OpConvertUToPtr %_ptr_PhysicalStorageBuffer_ulong %17
+         %20 = OpLoad %ulong %19 Aligned 8
+         %25 = OpConvertUToPtr %_ptr_PhysicalStorageBuffer__ptr_PhysicalStorageBuffer__arr_float_uint_3 %20
+         %27 = OpIAdd %ulong %17 %ulong_8
+         %28 = OpConvertUToPtr %_ptr_PhysicalStorageBuffer_ulong %27
+         %29 = OpLoad %ulong %28 Aligned 8
+         %32 = OpConvertUToPtr %_ptr_PhysicalStorageBuffer__ptr_PhysicalStorageBuffer_float %29
+         %33 = OpLoad %_ptr_PhysicalStorageBuffer_float %32 Aligned 8
+         %34 = OpLoad %_ptr_PhysicalStorageBuffer__arr_float_uint_3 %25 Aligned 8
+         %35 = OpLoad %v3uint %__spirv_BuiltInGlobalInvocationId
+         %36 = OpCompositeExtract %uint %35 0
+         %37 = OpUConvert %ulong %36
+         %38 = OpConvertPtrToU %ulong %34
+         %40 = OpIMul %ulong %37 %ulong_12
+         %41 = OpIAdd %ulong %38 %40
+         %42 = OpConvertUToPtr %_ptr_PhysicalStorageBuffer__arr_float_uint_3 %41
+         %44 = OpConvertPtrToU %ulong %42
+         %45 = OpIMul %ulong %ulong_18446744073709551615 %ulong_12
+         %46 = OpIAdd %ulong %44 %45
+         %47 = OpConvertUToPtr %_ptr_PhysicalStorageBuffer__arr_float_uint_3 %46
+         %48 = OpAccessChain %_ptr_PhysicalStorageBuffer_float %47 %uint_0
+         %50 = OpConvertPtrToU %ulong %48
+         %51 = OpConvertUToPtr %_ptr_PhysicalStorageBuffer_float %50
+         %49 = OpLoad %float %51 Aligned 4
+         %52 = OpIMul %ulong %ulong_18446744073709551615 %ulong_12
+         %53 = OpIAdd %ulong %44 %52
+         %54 = OpConvertUToPtr %_ptr_PhysicalStorageBuffer__arr_float_uint_3 %53
+         %56 = OpUConvert %uint %ulong_1
+         %57 = OpAccessChain %_ptr_PhysicalStorageBuffer_float %54 %56
+         %58 = OpLoad %float %57 Aligned 4
+         %59 = OpIMul %ulong %ulong_18446744073709551615 %ulong_12
+         %60 = OpIAdd %ulong %44 %59
+         %61 = OpConvertUToPtr %_ptr_PhysicalStorageBuffer__arr_float_uint_3 %60
+         %63 = OpUConvert %uint %ulong_2
+         %64 = OpAccessChain %_ptr_PhysicalStorageBuffer_float %61 %63
+         %65 = OpLoad %float %64 Aligned 4
+         %66 = OpFAdd %float %49 %58
+         %67 = OpFAdd %float %66 %65
+         %68 = OpIAdd %ulong %37 %ulong_18446744073709551615
+         %69 = OpConvertPtrToU %ulong %33
+         %71 = OpIMul %ulong %68 %ulong_4
+         %72 = OpIAdd %ulong %69 %71
+         %73 = OpConvertUToPtr %_ptr_PhysicalStorageBuffer_float %72
+               OpStore %73 %67 Aligned 4
+               OpReturn
+               OpFunctionEnd

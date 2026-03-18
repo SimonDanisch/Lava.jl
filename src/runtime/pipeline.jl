@@ -16,6 +16,14 @@ struct LavaComputePipeline
 end
 
 const _pipeline_cache = Dict{UInt64, LavaComputePipeline}()
+const _pipeline_insertion_order = UInt64[]
+const _max_pipeline_cache_size = Ref(1024)
+
+# Register cleanup callback for vk_reset_device!
+push!(_reset_callbacks, function()
+    empty!(_pipeline_cache)
+    empty!(_pipeline_insertion_order)
+end)
 
 """
     get_compute_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String;
@@ -39,6 +47,7 @@ function get_compute_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String;
     @assert length(spirv_bytes) % 4 == 0 "SPIR-V binary must be 4-byte aligned"
     code_u32 = reinterpret(UInt32, spirv_bytes)
     shader_mod = Vulkan.ShaderModule(dev, length(spirv_bytes), code_u32)
+    check_validation_errors!("vkCreateShaderModule (compute)")
 
     # Pipeline layout with push constant range
     push_ranges = if push_constant_size > 0
@@ -63,11 +72,19 @@ function get_compute_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String;
         shader_mod,
         entry_name
     )
-    ci = Vulkan.ComputePipelineCreateInfo(stage, layout, -1)
+    # DISPATCH_BASE flag enables vkCmdDispatchBase for split large dispatches
+    ci = Vulkan.ComputePipelineCreateInfo(stage, layout, -1;
+        flags=Vulkan.PIPELINE_CREATE_DISPATCH_BASE_BIT)
     pipelines, _ = unwrap(Vulkan.create_compute_pipelines(dev, [ci]))
     pipeline = pipelines[1]
 
     result = LavaComputePipeline(shader_mod, layout, pipeline, UInt32(push_constant_size))
     _pipeline_cache[cache_key] = result
+    push!(_pipeline_insertion_order, cache_key)
+    # Evict oldest pipeline if cache is full
+    while length(_pipeline_insertion_order) > _max_pipeline_cache_size[]
+        old_key = popfirst!(_pipeline_insertion_order)
+        delete!(_pipeline_cache, old_key)
+    end
     return result
 end

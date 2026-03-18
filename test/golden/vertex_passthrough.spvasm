@@ -1,0 +1,48 @@
+; SPIR-V
+; Version: 1.4
+; Generator: Khronos; 0
+; Bound: 27
+; Schema: 0
+               OpCapability VulkanMemoryModel
+               OpCapability PhysicalStorageBufferAddresses
+               OpCapability Shader
+               OpCapability VariablePointers
+               OpExtension "SPV_KHR_vulkan_memory_model"
+               OpExtension "SPV_KHR_physical_storage_buffer"
+               OpExtension "SPV_KHR_variable_pointers"
+               OpMemoryModel PhysicalStorageBuffer64 Vulkan
+               OpEntryPoint Vertex %_Z7vert_pt "main" %__spirv_BuiltInVertexIndex %gl_Position
+               OpName %__spirv_BuiltInVertexIndex "__spirv_BuiltInVertexIndex"
+               OpName %gl_Position "gl_Position"
+               OpName %_Z7vert_pt "_Z7vert_pt"
+               OpDecorate %__spirv_BuiltInVertexIndex BuiltIn VertexIndex
+               OpDecorate %gl_Position BuiltIn Position
+       %void = OpTypeVoid
+       %uint = OpTypeInt 32 0
+       %bool = OpTypeBool
+      %float = OpTypeFloat 32
+%_ptr_Input_uint = OpTypePointer Input %uint
+    %v4float = OpTypeVector %float 4
+%_ptr_Output_v4float = OpTypePointer Output %v4float
+         %10 = OpTypeFunction %void
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+    %float_1 = OpConstant %float 1
+    %float_0 = OpConstant %float 0
+   %float_n1 = OpConstant %float -1
+     %uint_2 = OpConstant %uint 2
+%__spirv_BuiltInVertexIndex = OpVariable %_ptr_Input_uint Input
+%gl_Position = OpVariable %_ptr_Output_v4float Output
+ %_Z7vert_pt = OpFunction %void None %10
+         %12 = OpLabel
+         %13 = OpLoad %uint %__spirv_BuiltInVertexIndex
+         %15 = OpIEqual %bool %13 %uint_0
+         %17 = OpIEqual %bool %13 %uint_1
+         %20 = OpSelect %float %17 %float_1 %float_0
+         %22 = OpSelect %float %15 %float_n1 %20
+         %24 = OpULessThan %bool %13 %uint_2
+         %25 = OpSelect %float %24 %float_n1 %float_1
+         %26 = OpCompositeConstruct %v4float %22 %25 %float_0 %float_1
+               OpStore %gl_Position %26
+               OpReturn
+               OpFunctionEnd

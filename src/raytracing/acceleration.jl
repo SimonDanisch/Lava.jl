@@ -79,20 +79,33 @@ function build_blas(vertices::Vector{NTuple{3,Float32}}, indices::Vector{UInt32}
     # Create scratch buffer
     scratch_buf, scratch_mem, scratch_addr = _create_scratch_buffer(sizes.build_scratch_size)
 
-    # Build on GPU
-    _build_as_on_gpu(ctx, accel, scratch_addr;
-        as_type=UInt32(1), build_flags,
-        geometry_type=:triangles,
-        vertex_format=vfmt, vertex_addr, vertex_stride=vstride,
-        max_vertex, index_type=itype, index_addr,
-        geo_flags, primitive_count=n_triangles)
+    # Build on GPU — input buffers must stay alive during the GPU build.
+    # In batched mode (_as_batching), stash refs so they survive until submit.
+    # In non-batched mode, GC.@preserve covers the synchronous submit+wait.
+    input_refs = (vertex_buf, vertex_mem, index_buf, index_mem, scratch_buf, scratch_mem)
+    if _as_batching[]
+        push!(_as_batch_preserves, input_refs)
+    end
+    GC.@preserve vertex_buf vertex_mem index_buf index_mem scratch_buf scratch_mem begin
+        _build_as_on_gpu(ctx, accel, scratch_addr;
+            as_type=UInt32(1), build_flags,
+            geometry_type=:triangles,
+            vertex_format=vfmt, vertex_addr, vertex_stride=vstride,
+            max_vertex, index_type=itype, index_addr,
+            geo_flags, primitive_count=n_triangles)
+    end
+
+    # Eagerly free temporary buffers to reclaim VRAM — but only when NOT inside
+    # as_build() batching, where the command buffer hasn't been submitted yet.
+    if !_as_batching[]
+        finalize(scratch_buf); finalize(scratch_mem)
+        finalize(index_buf); finalize(index_mem)
+        finalize(vertex_buf); finalize(vertex_mem)
+    end
 
     # Get AS device address
     addr_info = Vulkan.AccelerationStructureDeviceAddressInfoKHR(accel)
     as_addr = Vulkan.get_acceleration_structure_device_address_khr(dev, addr_info)
-
-    # Temporary buffers (vertex, index, scratch) are GC-managed via Vulkan.jl finalizers.
-    # No manual destroy needed — they'll be freed when GC collects them.
 
     return LavaBLAS(accel, as_buf, as_mem, as_addr)
 end
@@ -144,14 +157,26 @@ function build_tlas(blas_list::Vector{LavaBLAS};
     # Scratch buffer
     scratch_buf, scratch_mem, scratch_addr = _create_scratch_buffer(sizes.build_scratch_size)
 
-    # Build on GPU
-    _build_as_on_gpu(ctx, accel, scratch_addr;
-        as_type=UInt32(0), build_flags,
-        geometry_type=:instances,
-        instance_addr=inst_addr,
-        primitive_count=UInt32(n_instances))
+    # Build on GPU — preserve buffers from GC during GPU build
+    input_refs_tlas = (inst_buf, inst_mem, scratch_buf, scratch_mem)
+    if _as_batching[]
+        push!(_as_batch_preserves, input_refs_tlas)
+    end
+    GC.@preserve inst_buf inst_mem scratch_buf scratch_mem begin
+        _build_as_on_gpu(ctx, accel, scratch_addr;
+            as_type=UInt32(0), build_flags,
+            geometry_type=:instances,
+            instance_addr=inst_addr,
+            primitive_count=UInt32(n_instances))
+    end
 
-    # Temporary buffers (instance, scratch) are GC-managed via Vulkan.jl finalizers.
+    # Eagerly free temporary buffers to reclaim VRAM — but only when NOT inside
+    # as_build() batching, where the command buffer hasn't been submitted yet.
+    if !_as_batching[]
+        finalize(scratch_buf); finalize(scratch_mem)
+        finalize(inst_buf); finalize(inst_mem)
+    end
+
     # Keep unique BLASes alive — TLAS references them by device address.
     unique_blas = unique(blas_list)
 
@@ -199,6 +224,41 @@ function _pack_as_instance!(buf::Vector{UInt8}, offset::Int, blas_addr::UInt64;
     unsafe_store!(Ptr{UInt64}(pointer(buf, offset + 57)), blas_addr)
 
     return nothing
+end
+
+"""Create a HOST_VISIBLE buffer pool for AS input data (vertices/indices).
+
+Unlike `_create_as_input_buffer` which uploads specific data, this allocates
+an empty mappable buffer of `nbytes` for the caller to fill via map/memcpy/unmap.
+Returns (buffer, memory, base_device_address).
+"""
+function _create_as_input_pool(nbytes::UInt64)
+    ctx = vk_context()
+    dev = ctx.device
+
+    buf = Vulkan.Buffer(
+        dev, max(nbytes, 16),
+        Vulkan.BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        Vulkan.SHARING_MODE_EXCLUSIVE,
+        UInt32[],
+    )
+
+    mem_reqs = Vulkan.get_buffer_memory_requirements(dev, buf)
+    mem_type_idx = _find_memory_type(
+        mem_reqs.memory_type_bits,
+        Vulkan.MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT,
+    )
+
+    alloc_flags = Vulkan.MemoryAllocateFlagsInfo(UInt32(0);
+        flags=Vulkan.MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT)
+    memory = Vulkan.DeviceMemory(dev, mem_reqs.size, mem_type_idx; next=alloc_flags)
+    unwrap(Vulkan.bind_buffer_memory(dev, buf, memory, 0))
+
+    addr = Vulkan.get_buffer_device_address(dev, Vulkan.BufferDeviceAddressInfo(buf))
+
+    return buf, memory, addr
 end
 
 """Create a device-local buffer for AS input (vertex/index/instance data)."""
@@ -270,9 +330,18 @@ end
 function _create_scratch_buffer(nbytes)
     ctx = vk_context()
     dev = ctx.device
+    phys = ctx.physical_device
+
+    # Vulkan requires scratch device addresses to satisfy
+    # minAccelerationStructureScratchOffsetAlignment.
+    as_props2 = Vulkan.get_physical_device_properties_2(
+        phys, Vulkan.PhysicalDeviceAccelerationStructurePropertiesKHR)
+    scratch_align = UInt64(as_props2.next.min_acceleration_structure_scratch_offset_alignment)
+    scratch_align = max(scratch_align, UInt64(1))
+    aligned_size = max(UInt64(nbytes) + (scratch_align - UInt64(1)), scratch_align)
 
     buf = Vulkan.Buffer(
-        dev, max(nbytes, 256),
+        dev, aligned_size,
         Vulkan.BUFFER_USAGE_STORAGE_BUFFER_BIT |
         Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         Vulkan.SHARING_MODE_EXCLUSIVE,
@@ -290,7 +359,8 @@ function _create_scratch_buffer(nbytes)
     memory = Vulkan.DeviceMemory(dev, mem_reqs.size, mem_type_idx; next=alloc_flags)
     unwrap(Vulkan.bind_buffer_memory(dev, buf, memory, 0))
 
-    addr = Vulkan.get_buffer_device_address(dev, Vulkan.BufferDeviceAddressInfo(buf))
+    base_addr = Vulkan.get_buffer_device_address(dev, Vulkan.BufferDeviceAddressInfo(buf))
+    addr = ((base_addr + scratch_align - UInt64(1)) ÷ scratch_align) * scratch_align
 
     return buf, memory, addr
 end
@@ -437,11 +507,97 @@ function _query_as_build_sizes(dev::Vulkan.Device; as_type::UInt32,
             build_scratch_size=build_scratch)
 end
 
+# ── Batched AS Build API ──
+
+# When true, _build_as_on_gpu records into an already-open command buffer
+# instead of managing begin/end/submit/wait itself.
+const _as_batching = Ref(false)
+
+# GC preservation list for batched builds — keeps input/scratch buffers alive
+# until the single submit+wait completes.
+const _as_batch_preserves = Any[]
+
+"""
+    as_build(f)
+
+Batch multiple acceleration structure builds into a single GPU submission.
+
+Without `as_build`, each `build_blas`/`build_tlas` call submits its own command
+buffer and waits for completion — N builds = N submit+wait roundtrips. With
+`as_build`, all builds share one command buffer with inter-build barriers,
+submitted once at the end.
+
+# Example
+```julia
+blases, tlas = as_build() do
+    bs = [build_blas(verts, idxs) for (verts, idxs) in meshes]
+    tlas = build_tlas(bs)
+    return (bs, tlas)
+end
+```
+
+BLAS device addresses are available immediately after `build_blas` returns
+(even before the GPU build executes), so `build_tlas` can reference them.
+"""
+function as_build(f)
+    _as_batching[] && error("as_build() cannot be nested")
+
+    ctx = vk_context()
+
+    # Flush any pending compute dispatches before AS builds
+    if has_active_recording(ctx)
+        vk_flush!()
+    end
+
+    cmd = ctx.as_cmd_buf
+    unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
+        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    )))
+
+    _as_batching[] = true
+    empty!(_as_batch_preserves)
+    result = try
+        f()
+    catch
+        _as_batching[] = false
+        empty!(_as_batch_preserves)
+        # Reset command buffer so it's reusable
+        unwrap(Vulkan.end_command_buffer(cmd))
+        rethrow()
+    end
+    _as_batching[] = false
+
+    # Final barrier: make all AS writes visible to RT shader reads
+    post_barrier = Vulkan.MemoryBarrier(
+        C_NULL,
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+        Vulkan.ACCESS_SHADER_READ_BIT,
+    )
+    Vulkan.cmd_pipeline_barrier(
+        cmd, [post_barrier], [], [];
+        src_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        dst_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                       Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+    )
+
+    unwrap(Vulkan.end_command_buffer(cmd))
+
+    submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
+    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=ctx.as_fence))
+    unwrap(Vulkan.wait_for_fences(ctx.device, [ctx.as_fence], true, typemax(UInt64)))
+    unwrap(Vulkan.reset_fences(ctx.device, [ctx.as_fence]))
+
+    empty!(_as_batch_preserves)
+    return result
+end
+
 """Build an acceleration structure on the GPU using correctly-packed C structs.
 
-Records vkCmdBuildAccelerationStructuresKHR into a one-shot command buffer and
-submits it, waiting for completion. All C structs are manually packed to work
-around VulkanCore.jl alignment bugs.
+Records vkCmdBuildAccelerationStructuresKHR into a command buffer. When called
+inside `as_build()`, records into the shared batch command buffer with only an
+inter-build barrier. Otherwise, manages its own command buffer lifecycle
+(begin → barrier → build → barrier → end → submit → wait).
 """
 function _build_as_on_gpu(ctx::VkContext, accel::Vulkan.AccelerationStructureKHR,
                           scratch_addr::UInt64;
@@ -449,12 +605,17 @@ function _build_as_on_gpu(ctx::VkContext, accel::Vulkan.AccelerationStructureKHR
                           primitive_count::UInt32=UInt32(0),
                           kwargs...)
     dev = ctx.device
-    cmd = ctx.cmd_buf
+    batching = _as_batching[]
 
-    # Flush any pending compute dispatches
-    if ctx.recording
-        vk_flush!()
+    if !batching
+        # Flush any pending compute dispatches before AS build
+        if has_active_recording(ctx)
+            vk_flush!()
+        end
     end
+
+    # Use dedicated AS command buffer + fence (never touches dispatch batches)
+    cmd = ctx.as_cmd_buf
 
     # Pack geometry (96 bytes, correct C layout)
     geo_buf = zeros(UInt8, _C_SIZEOF_AS_GEOMETRY_KHR)
@@ -468,9 +629,26 @@ function _build_as_on_gpu(ctx::VkContext, accel::Vulkan.AccelerationStructureKHR
 
     fptr = Vulkan.function_pointer(dev, "vkCmdBuildAccelerationStructuresKHR")
 
-    unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
-        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    )))
+    if !batching
+        unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
+            flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        )))
+    end
+
+    # Synchronize prior AS builds before this build command.
+    # Required when TLAS reads BLAS built in earlier submissions,
+    # or between batched builds sharing one command buffer.
+    pre_barrier = Vulkan.MemoryBarrier(
+        C_NULL,
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+    )
+    Vulkan.cmd_pipeline_barrier(
+        cmd, [pre_barrier], [], [];
+        src_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        dst_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+    )
 
     GC.@preserve geo_buf bgi_buf c_range begin
         geo_ptr = pointer(geo_buf)
@@ -496,12 +674,172 @@ function _build_as_on_gpu(ctx::VkContext, accel::Vulkan.AccelerationStructureKHR
         end
     end
 
-    unwrap(Vulkan.end_command_buffer(cmd))
+    if batching
+        # Keep buffers alive until as_build() submits
+        push!(_as_batch_preserves, (geo_buf, bgi_buf, c_range))
+    else
+        # Non-batched: finish and submit immediately
+        post_barrier = Vulkan.MemoryBarrier(
+            C_NULL,
+            Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+            Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+            Vulkan.ACCESS_SHADER_READ_BIT,
+        )
+        Vulkan.cmd_pipeline_barrier(
+            cmd, [post_barrier], [], [];
+            src_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            dst_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                           Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        )
 
-    submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=ctx.fence))
-    unwrap(Vulkan.wait_for_fences(dev, [ctx.fence], true, typemax(UInt64)))
-    unwrap(Vulkan.reset_fences(dev, [ctx.fence]))
+        unwrap(Vulkan.end_command_buffer(cmd))
+
+        submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
+        unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=ctx.as_fence))
+        unwrap(Vulkan.wait_for_fences(dev, [ctx.as_fence], true, typemax(UInt64)))
+        unwrap(Vulkan.reset_fences(dev, [ctx.as_fence]))
+    end
+end
+
+"""
+    build_blas_pooled(all_vertices, all_indices) -> Vector{LavaBLAS}
+
+Build multiple BLASes using pooled memory allocation. All vertex/index data
+goes into a single HOST_VISIBLE buffer, all AS storage into a single
+DEVICE_LOCAL buffer, and one scratch buffer is reused. This reduces thousands
+of Vulkan allocations to ~6 regardless of mesh count.
+
+`all_vertices[i]::Vector{NTuple{3,Float32}}` and `all_indices[i]::Vector{UInt32}`
+provide per-BLAS geometry. Returns one `LavaBLAS` per input.
+"""
+function build_blas_pooled(all_vertices::Vector{Vector{NTuple{3,Float32}}},
+                           all_indices::Vector{Vector{UInt32}})
+    n_blas = length(all_vertices)
+    n_blas == 0 && return LavaBLAS[]
+    @assert length(all_indices) == n_blas
+
+    ctx = vk_context()
+    dev = ctx.device
+
+    vfmt = UInt32(Vulkan.FORMAT_R32G32B32_SFLOAT)
+    vstride = UInt64(sizeof(NTuple{3,Float32}))
+    itype = UInt32(Vulkan.INDEX_TYPE_UINT32)
+    build_flags = UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
+    geo_flags = UInt32(Vulkan.GEOMETRY_OPAQUE_BIT_KHR)
+
+    # Pass 1: Query build sizes and compute pool layout
+    vertex_offsets = Vector{UInt64}(undef, n_blas)
+    index_offsets = Vector{UInt64}(undef, n_blas)
+    as_offsets = Vector{UInt64}(undef, n_blas)
+    as_sizes_list = Vector{UInt64}(undef, n_blas)
+    max_scratch_size = UInt64(0)
+    input_cursor = UInt64(0)
+    as_cursor = UInt64(0)
+
+    for i in 1:n_blas
+        n_tris = UInt32(length(all_indices[i]) ÷ 3)
+        max_vertex = UInt32(length(all_vertices[i]) - 1)
+
+        sizes = _query_as_build_sizes(dev;
+            as_type=UInt32(1), build_flags,
+            geometry_type=:triangles,
+            vertex_format=vfmt, vertex_addr=UInt64(0), vertex_stride=vstride,
+            max_vertex, index_type=itype, index_addr=UInt64(0),
+            geo_flags, max_primitive_count=n_tris)
+
+        vertex_offsets[i] = input_cursor
+        vbytes = UInt64(length(all_vertices[i]) * sizeof(NTuple{3,Float32}))
+        input_cursor += (vbytes + 15) & ~UInt64(15)
+
+        index_offsets[i] = input_cursor
+        ibytes = UInt64(length(all_indices[i]) * sizeof(UInt32))
+        input_cursor += (ibytes + 15) & ~UInt64(15)
+
+        as_offsets[i] = as_cursor
+        as_sizes_list[i] = sizes.acceleration_structure_size
+        as_cursor += (sizes.acceleration_structure_size + 255) & ~UInt64(255)
+
+        max_scratch_size = max(max_scratch_size, sizes.build_scratch_size)
+    end
+
+    total_input_bytes = input_cursor
+    total_as_bytes = as_cursor
+
+    # Pass 2: Allocate pooled buffers (3 allocations total)
+    input_buf, input_mem, input_base_addr = _create_as_input_pool(max(total_input_bytes, 16))
+    as_pool_buf, as_pool_mem = _create_as_storage_buffer(max(total_as_bytes, 16))
+    scratch_buf, scratch_mem, scratch_addr = _create_scratch_buffer(max(max_scratch_size, 16))
+
+    # Pass 3: Upload all vertex/index data into the input pool
+    mapped_ptr = unwrap(Vulkan.map_memory(dev, input_mem, 0, total_input_bytes))
+    for i in 1:n_blas
+        vdata = all_vertices[i]
+        vbytes = length(vdata) * sizeof(NTuple{3,Float32})
+        unsafe_copyto!(Ptr{UInt8}(mapped_ptr + vertex_offsets[i]),
+                       Ptr{UInt8}(pointer(vdata)), vbytes)
+        idata = all_indices[i]
+        ibytes = length(idata) * sizeof(UInt32)
+        unsafe_copyto!(Ptr{UInt8}(mapped_ptr + index_offsets[i]),
+                       Ptr{UInt8}(pointer(idata)), ibytes)
+    end
+    Vulkan.unmap_memory(dev, input_mem)
+
+    # Pass 4: Create AS objects and build all BLASes
+    hw_blas_list = Vector{LavaBLAS}(undef, n_blas)
+    for i in 1:n_blas
+        as_ci = Vulkan.AccelerationStructureCreateInfoKHR(
+            as_pool_buf, as_offsets[i], as_sizes_list[i],
+            Vulkan.ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+        )
+        accel = Vulkan.AccelerationStructureKHR(dev, as_ci)
+        addr_info = Vulkan.AccelerationStructureDeviceAddressInfoKHR(accel)
+        as_addr = Vulkan.get_acceleration_structure_device_address_khr(dev, addr_info)
+        hw_blas_list[i] = LavaBLAS(accel, as_pool_buf, as_pool_mem, as_addr)
+    end
+
+    GC.@preserve input_buf input_mem scratch_buf scratch_mem as_pool_buf as_pool_mem begin
+        as_build() do
+            cmd = ctx.as_cmd_buf
+            for i in 1:n_blas
+                n_tris = UInt32(length(all_indices[i]) ÷ 3)
+                max_vertex = UInt32(length(all_vertices[i]) - 1)
+                _build_as_on_gpu(ctx, hw_blas_list[i].accel, scratch_addr;
+                    as_type=UInt32(1), build_flags,
+                    geometry_type=:triangles,
+                    vertex_format=vfmt,
+                    vertex_addr=input_base_addr + vertex_offsets[i],
+                    vertex_stride=vstride,
+                    max_vertex, index_type=itype,
+                    index_addr=input_base_addr + index_offsets[i],
+                    geo_flags, primitive_count=n_tris)
+                # Barrier between builds: shared scratch buffer must be drained before reuse.
+                # Without this, concurrent AS builds corrupt each other's scratch data.
+                if i < n_blas
+                    scratch_barrier = Vulkan.MemoryBarrier(
+                        C_NULL,
+                        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+                        Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+                        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+                        Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+                    )
+                    Vulkan.cmd_pipeline_barrier(
+                        cmd, [scratch_barrier], [], [];
+                        src_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                        dst_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                    )
+                end
+            end
+        end
+    end
+
+    # Eagerly free temporary buffers to reclaim VRAM immediately.
+    # The AS build is complete (as_build waits for GPU), so these are no longer needed.
+    # Without explicit cleanup, they linger until GC runs, wasting hundreds of MB on
+    # large scenes (e.g., crown scene: ~170MB input + ~50MB scratch).
+    finalize(scratch_buf); finalize(scratch_mem)
+    finalize(input_buf); finalize(input_mem)
+
+    return hw_blas_list
 end
 
 # ── Raycore-compatible bridge functions ──
@@ -543,6 +881,11 @@ end
 
 Build hardware acceleration structures from a Raycore-compatible TLAS.
 
+Uses pooled memory allocation: all vertex/index data goes into a single
+HOST_VISIBLE buffer, all BLAS AS storage into a single DEVICE_LOCAL buffer,
+and one scratch buffer is reused across all builds. This reduces ~3000+
+individual Vulkan allocations to ~6 regardless of mesh count.
+
 The TLAS must have:
 - `.blas_array`: indexable collection of BLAS objects, each with `.primitives`
 - `.instances`: array of instance descriptors with `.blas_index` (1-based),
@@ -565,45 +908,187 @@ function build_hw_accel_from_tlas(tlas)
 
     n_blas = length(blas_array)
     n_instances = length(instances)
+    ctx = vk_context()
+    dev = ctx.device
 
-    # Build hardware BLAS for each unique BLAS + collect primitives
-    hw_blas_list = Vector{LavaBLAS}(undef, n_blas)
+    # ── Pass 1: Collect all geometry on CPU ──
+    cpu_prims_list = Vector{Any}(undef, n_blas)
     blas_offsets = Vector{UInt32}(undef, n_blas)
     all_primitives = []
-    offset = UInt32(0)
+    prim_offset = UInt32(0)
+
+    # Per-BLAS vertex/index arrays
+    all_vertices = Vector{Vector{NTuple{3,Float32}}}(undef, n_blas)
+    all_indices = Vector{Vector{UInt32}}(undef, n_blas)
 
     for i in 1:n_blas
-        blas = blas_array[i]
-        cpu_prims = _to_cpu_vector(blas.primitives)
+        cpu_prims_list[i] = _to_cpu_vector(blas_array[i].primitives)
+        blas_offsets[i] = prim_offset
+        prim_offset += UInt32(length(cpu_prims_list[i]))
+        append!(all_primitives, cpu_prims_list[i])
 
-        hw_blas_list[i] = build_blas_from_primitives(cpu_prims)
-        blas_offsets[i] = offset
-
-        append!(all_primitives, cpu_prims)
-        offset += UInt32(length(cpu_prims))
+        # Extract vertices/indices for this BLAS
+        n_tris = length(cpu_prims_list[i])
+        verts = Vector{NTuple{3,Float32}}(undef, n_tris * 3)
+        idxs = Vector{UInt32}(undef, n_tris * 3)
+        for j in 1:n_tris
+            vs = cpu_prims_list[i][j].vertices
+            for k in 1:3
+                v = vs[k]
+                verts[(j-1)*3 + k] = (Float32(v[1]), Float32(v[2]), Float32(v[3]))
+                idxs[(j-1)*3 + k] = UInt32((j-1)*3 + k - 1)
+            end
+        end
+        all_vertices[i] = verts
+        all_indices[i] = idxs
     end
 
-    # Build instance list for TLAS
-    # Each Raycore instance → one Vulkan instance
-    hw_blas_refs = Vector{LavaBLAS}(undef, n_instances)
-    transforms = Vector{NTuple{12,Float32}}(undef, n_instances)
-    custom_indices = Vector{UInt32}(undef, n_instances)
+    # ── Pass 2: Query build sizes and compute pool layout ──
+    vfmt = UInt32(Vulkan.FORMAT_R32G32B32_SFLOAT)
+    vstride = UInt64(sizeof(NTuple{3,Float32}))
+    itype = UInt32(Vulkan.INDEX_TYPE_UINT32)
+    build_flags = UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
+    geo_flags = UInt32(Vulkan.GEOMETRY_OPAQUE_BIT_KHR)
 
-    for i in 1:n_instances
-        inst = instances[i]
-        blas_idx = Int(inst.blas_index)
-        hw_blas_refs[i] = hw_blas_list[blas_idx]
+    # Layout tracking
+    vertex_offsets = Vector{UInt64}(undef, n_blas)  # byte offset into input pool
+    index_offsets = Vector{UInt64}(undef, n_blas)
+    as_offsets = Vector{UInt64}(undef, n_blas)       # byte offset into AS storage pool
+    as_sizes_list = Vector{UInt64}(undef, n_blas)
+    max_scratch_size = UInt64(0)
 
-        # Extract 3×4 row-major transform from 4×4 column-major matrix
-        m = inst.transform
-        transforms[i] = _mat4_to_vk_transform(m)
+    input_cursor = UInt64(0)  # cursor into input pool (vertex then index, interleaved per BLAS)
+    as_cursor = UInt64(0)     # cursor into AS storage pool (256-byte aligned)
 
-        # Store BLAS index (0-based) as instance custom index
-        custom_indices[i] = UInt32(blas_idx - 1)
+    for i in 1:n_blas
+        n_tris = UInt32(length(all_indices[i]) ÷ 3)
+        max_vertex = UInt32(length(all_vertices[i]) - 1)
+
+        # Query sizes — addresses don't matter for size queries
+        sizes = _query_as_build_sizes(dev;
+            as_type=UInt32(1), build_flags,
+            geometry_type=:triangles,
+            vertex_format=vfmt, vertex_addr=UInt64(0), vertex_stride=vstride,
+            max_vertex, index_type=itype, index_addr=UInt64(0),
+            geo_flags, max_primitive_count=n_tris)
+
+        # Input pool layout: vertex data then index data, 16-byte aligned
+        vertex_offsets[i] = input_cursor
+        vbytes = UInt64(length(all_vertices[i]) * sizeof(NTuple{3,Float32}))
+        input_cursor += (vbytes + 15) & ~UInt64(15)  # 16-byte align
+
+        index_offsets[i] = input_cursor
+        ibytes = UInt64(length(all_indices[i]) * sizeof(UInt32))
+        input_cursor += (ibytes + 15) & ~UInt64(15)  # 16-byte align
+
+        # AS storage pool layout: 256-byte aligned
+        as_offsets[i] = as_cursor
+        as_sizes_list[i] = sizes.acceleration_structure_size
+        as_cursor += (sizes.acceleration_structure_size + 255) & ~UInt64(255)
+
+        max_scratch_size = max(max_scratch_size, sizes.build_scratch_size)
     end
 
-    # Build hardware TLAS
-    hw_tlas = build_tlas(hw_blas_refs; transforms, custom_indices)
+    total_input_bytes = input_cursor
+    total_as_bytes = as_cursor
+
+    # ── Pass 3: Allocate pooled buffers ──
+    # Input pool: HOST_VISIBLE for direct upload
+    input_buf, input_mem, input_base_addr = _create_as_input_pool(max(total_input_bytes, 16))
+
+    # AS storage pool: DEVICE_LOCAL
+    as_pool_buf, as_pool_mem = _create_as_storage_buffer(max(total_as_bytes, 16))
+
+    # Scratch buffer: single allocation, reused for all builds
+    scratch_buf, scratch_mem, scratch_addr = _create_scratch_buffer(max(max_scratch_size, 16))
+
+    # ── Pass 4: Upload vertex/index data into input pool ──
+    mapped_ptr = unwrap(Vulkan.map_memory(dev, input_mem, 0, total_input_bytes))
+    for i in 1:n_blas
+        # Copy vertex data
+        vdata = all_vertices[i]
+        vbytes = length(vdata) * sizeof(NTuple{3,Float32})
+        unsafe_copyto!(Ptr{UInt8}(mapped_ptr + vertex_offsets[i]),
+                       Ptr{UInt8}(pointer(vdata)), vbytes)
+        # Copy index data
+        idata = all_indices[i]
+        ibytes = length(idata) * sizeof(UInt32)
+        unsafe_copyto!(Ptr{UInt8}(mapped_ptr + index_offsets[i]),
+                       Ptr{UInt8}(pointer(idata)), ibytes)
+    end
+    Vulkan.unmap_memory(dev, input_mem)
+
+    # ── Pass 5: Create AS objects and build all BLASes ──
+    hw_blas_list = Vector{LavaBLAS}(undef, n_blas)
+
+    # Create AccelerationStructureKHR objects (one per BLAS, all referencing the pool)
+    for i in 1:n_blas
+        as_ci = Vulkan.AccelerationStructureCreateInfoKHR(
+            as_pool_buf, as_offsets[i], as_sizes_list[i],
+            Vulkan.ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+        )
+        accel = Vulkan.AccelerationStructureKHR(dev, as_ci)
+        addr_info = Vulkan.AccelerationStructureDeviceAddressInfoKHR(accel)
+        as_addr = Vulkan.get_acceleration_structure_device_address_khr(dev, addr_info)
+        hw_blas_list[i] = LavaBLAS(accel, as_pool_buf, as_pool_mem, as_addr)
+    end
+
+    # Batch all BLAS + TLAS builds into a single GPU submission
+    hw_tlas = GC.@preserve input_buf input_mem scratch_buf scratch_mem as_pool_buf as_pool_mem begin
+        as_build() do
+            cmd = ctx.as_cmd_buf
+            for i in 1:n_blas
+                n_tris = UInt32(length(all_indices[i]) ÷ 3)
+                max_vertex = UInt32(length(all_vertices[i]) - 1)
+
+                _build_as_on_gpu(ctx, hw_blas_list[i].accel, scratch_addr;
+                    as_type=UInt32(1), build_flags,
+                    geometry_type=:triangles,
+                    vertex_format=vfmt,
+                    vertex_addr=input_base_addr + vertex_offsets[i],
+                    vertex_stride=vstride,
+                    max_vertex, index_type=itype,
+                    index_addr=input_base_addr + index_offsets[i],
+                    geo_flags, primitive_count=n_tris)
+                # Barrier between builds: shared scratch buffer must be drained before reuse.
+                if i < n_blas
+                    scratch_barrier = Vulkan.MemoryBarrier(
+                        C_NULL,
+                        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+                        Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+                        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+                        Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+                    )
+                    Vulkan.cmd_pipeline_barrier(
+                        cmd, [scratch_barrier], [], [];
+                        src_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                        dst_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                    )
+                end
+            end
+
+            # Build instance list for TLAS
+            hw_blas_refs = Vector{LavaBLAS}(undef, n_instances)
+            transforms = Vector{NTuple{12,Float32}}(undef, n_instances)
+            custom_indices = Vector{UInt32}(undef, n_instances)
+
+            for i in 1:n_instances
+                inst = instances[i]
+                blas_idx = Int(inst.blas_index)
+                hw_blas_refs[i] = hw_blas_list[blas_idx]
+                transforms[i] = _mat4_to_vk_transform(inst.transform)
+                custom_indices[i] = UInt32(blas_idx - 1)
+            end
+
+            return build_tlas(hw_blas_refs; transforms, custom_indices)
+        end
+    end
+
+    # Eagerly free temporary buffers to reclaim VRAM immediately.
+    # GPU build is complete (as_build waits for fences). AS storage pool
+    # stays alive via LavaBLAS.buffer references.
+    finalize(scratch_buf); finalize(scratch_mem)
+    finalize(input_buf); finalize(input_mem)
 
     # Convert all_primitives to typed vector
     if !isempty(all_primitives)

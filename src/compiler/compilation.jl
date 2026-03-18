@@ -6,6 +6,212 @@
 #   lava_compile_to_llvm()  — returns LLVM IR string (for debugging)
 #   lava_compile_to_spirv() — returns validated SPIR-V binary
 
+# Debug counter for unique kernel file naming
+const _KERNEL_DEBUG_COUNTER = Ref(0)
+
+"""
+Wrap GPUCompiler.InvalidIRError with Lava-specific context and actionable suggestions.
+Called from compilation entry points to provide better user-facing errors.
+"""
+function _wrap_gpu_compiler_error(@nospecialize(e), @nospecialize(f), @nospecialize(tt))
+    e isa GPUCompiler.InvalidIRError || rethrow(e)
+
+    fname = try string(nameof(typeof(f))) catch; string(f) end
+    err_str = sprint(showerror, e)
+    suggestions = String[]
+
+    if occursin("dynamic function invocation", err_str) || occursin("runtime call", err_str)
+        push!(suggestions, "Type instability: the function contains dynamic dispatch. Ensure all types are inferrable — use @code_warntype to check.")
+    end
+    if occursin("jl_f_throw_methoderror", err_str) || occursin("jl_f__apply_iterate", err_str)
+        push!(suggestions, "Method lookup at runtime: an operation doesn't have a concrete method for the given types. Check that all operations are GPU-compatible.")
+    end
+    if occursin("gc_pool_alloc", err_str) || occursin("jl_gc", err_str) || occursin("jl_alloc", err_str) || occursin("get_pgcstack", err_str)
+        push!(suggestions, "Heap allocation: GPU kernels cannot allocate memory. Avoid Arrays, Strings, or mutable containers. Use NTuple or StaticArrays instead.")
+    end
+    if occursin("undefined name", err_str) || occursin("jl_f_getglobal", err_str)
+        push!(suggestions, "Global variable access: GPU kernels cannot access non-const globals. Pass data as arguments or use `const`.")
+    end
+    if occursin("jl_f_tuple", err_str)
+        push!(suggestions, "Dynamic tuple construction from type instability. Check for type instabilities in the call chain.")
+    end
+
+    suggestion = isempty(suggestions) ?
+        "Check the stacktrace in the raw error below. Use @code_typed to inspect type inference." :
+        join(suggestions, "\n  ")
+
+    # Extract deduplicated call chains showing which user functions are problematic
+    call_chain_summary = _extract_call_chains(err_str)
+
+    throw(LavaCompilationError(
+        "kernel compilation",
+        "Cannot compile $fname($(join(tt.parameters, ", "))) to GPU code",
+        suggestion;
+        raw_error=err_str,
+        call_chains=call_chain_summary
+    ))
+end
+
+"""
+    _extract_call_chains(err_str) -> String
+
+Parse GPUCompiler's InvalidIRError output to extract unique call chains through user code.
+Deduplicates the repeated stacktraces (GPUCompiler emits one per illegal call, but many
+share the same user-code path). Returns a compact summary showing:
+- Each unique user-code call chain (deepest user function → kernel entry)
+- The reason the deepest function is GPU-incompatible
+"""
+function _extract_call_chains(err_str::String)
+    # Parse each "Reason: ...\nStacktrace:\n [1] ...\n [2] ..." block
+    blocks = _parse_error_blocks(err_str)
+    isempty(blocks) && return ""
+
+    # For each block, extract the chain of user functions (skip Base/stdlib internals)
+    seen_chains = Set{String}()
+    unique_chains = Vector{Tuple{String, Vector{String}}}()  # (reason, [user_funcs...])
+
+    for (reason, stack_entries) in blocks
+        user_funcs = String[]
+        for entry in stack_entries
+            # Skip Base/stdlib internals — keep user code and Lava code
+            is_internal = _is_base_internal(entry)
+            if !is_internal
+                push!(user_funcs, entry)
+            end
+        end
+        isempty(user_funcs) && continue
+
+        # Deduplicate by the user function chain
+        chain_key = join(user_funcs, " → ")
+        if chain_key ∉ seen_chains
+            push!(seen_chains, chain_key)
+            push!(unique_chains, (reason, user_funcs))
+        end
+    end
+
+    isempty(unique_chains) && return ""
+
+    # Format: show each unique chain compactly
+    lines = String[]
+    push!(lines, "Call chain(s) with GPU-incompatible code:")
+    for (i, (reason, funcs)) in enumerate(unique_chains)
+        # Show as: kernel! → helper1 → helper2 → [problem] (reason)
+        short_reason = _shorten_reason(reason)
+        chain = join(reverse(funcs), " → ")
+        push!(lines, "  $i. $chain")
+        push!(lines, "     Problem: $short_reason")
+    end
+
+    return join(lines, "\n")
+end
+
+function _parse_error_blocks(err_str::String)
+    blocks = Vector{Tuple{String, Vector{String}}}()
+    # Split by "Reason:" — each is one error
+    parts = split(err_str, "Reason: ")
+    for part in parts[2:end]  # skip the header before first Reason
+        lines = split(part, '\n')
+        reason = strip(String(lines[1]))
+
+        # Parse stacktrace entries: " [N] func_name\n   @ file:line"
+        stack_entries = String[]
+        i = 1
+        while i <= length(lines)
+            m = match(r"^\s*\[(\d+)\]\s+(.+)$", lines[i])
+            if m !== nothing
+                func_name = strip(String(m.captures[2]))
+                # Next line has location
+                loc = ""
+                if i + 1 <= length(lines)
+                    lm = match(r"^\s+@ (.+)$", lines[i+1])
+                    if lm !== nothing
+                        loc = strip(String(lm.captures[1]))
+                        i += 1
+                    end
+                end
+                entry = isempty(loc) ? func_name : "$func_name @ $loc"
+                push!(stack_entries, entry)
+            end
+            i += 1
+        end
+        push!(blocks, (reason, stack_entries))
+    end
+    return blocks
+end
+
+# Base/stdlib paths to filter out of call chains
+const _BASE_INTERNAL_PATTERNS = [
+    "/share/julia/", "boot.jl", "Base.jl", "array.jl", "strings/",
+    "ryu/", "iobuffer.jl", "pointer.jl", "float.jl", "int.jl",
+    "abstractarray.jl", "essentials.jl", "promotion.jl", "math.jl",
+    "number.jl", "operators.jl", "reduce.jl", "dict.jl", "set.jl",
+    "range.jl", "simdloop.jl", "refvalue.jl", "iterators.jl",
+]
+
+function _is_base_internal(entry::String)
+    for pat in _BASE_INTERNAL_PATTERNS
+        occursin(pat, entry) && return true
+    end
+    return false
+end
+
+function _shorten_reason(reason::String)
+    if occursin("gc_pool_alloc", reason) || occursin("get_pgcstack", reason) ||
+       occursin("new_gc_frame", reason) || occursin("push_gc_frame", reason) ||
+       occursin("pop_gc_frame", reason) || occursin("gc_frame_slot", reason)
+        return "heap allocation (GC)"
+    elseif occursin("jl_alloc", reason) || occursin("ijl_alloc", reason)
+        return "heap allocation"
+    elseif occursin("ijl_pchar_to_string", reason) || occursin("jl_string", reason) ||
+           occursin("genericmemory_to_string", reason) || occursin("string_to_generic", reason)
+        return "String allocation"
+    elseif occursin("dynamic function invocation", reason)
+        return "dynamic dispatch (type instability)"
+    elseif occursin("runtime call", reason)
+        return "runtime function call"
+    elseif occursin("jl_f_getglobal", reason) || occursin("undefined name", reason)
+        return "global variable access"
+    elseif occursin("jl_argument_error", reason)
+        return "argument validation (allocates)"
+    elseif occursin("jl_f_throw_methoderror", reason)
+        return "method lookup failure"
+    else
+        # Return first ~80 chars
+        return length(reason) > 80 ? reason[1:80] * "..." : reason
+    end
+end
+
+# SPIR-V optimization: enabled automatically on NVIDIA to work around
+# driver bugs with large/complex shaders (Xid 31 MMU faults).
+const _spirv_opt_enabled = Ref(false)
+
+"""
+    _run_spirv_opt(spirv_bytes::Vector{UInt8}) -> Vector{UInt8}
+
+Run spirv-opt on the SPIR-V binary to optimize it. Uses SPIRV_Tools_jll.
+This can help NVIDIA's shader compiler handle complex shaders that would
+otherwise cause miscompilation (Xid 31 MMU faults with large kernels).
+"""
+function _run_spirv_opt(spirv_bytes::Vector{UInt8})
+    spirv_opt = SPIRV_Tools_jll.spirv_opt()
+    in_path = tempname() * ".spv"
+    out_path = tempname() * ".spv"
+    try
+        write(in_path, spirv_bytes)
+        p = run(pipeline(`$spirv_opt --target-env=vulkan1.3 -O $in_path -o $out_path`;
+                          stderr=devnull, stdout=devnull); wait=true)
+        if p.exitcode == 0 && isfile(out_path)
+            return read(out_path)
+        end
+    catch
+        # Fall through to return original bytes
+    finally
+        rm(in_path; force=true)
+        rm(out_path; force=true)
+    end
+    return spirv_bytes  # fallback: return unoptimized
+end
+
 # ── Compilation result types ──
 
 struct LavaLLVMResult
@@ -32,6 +238,219 @@ struct LavaGPUKernel
     ir::String
 end
 
+# ── Unified introspection result ──
+
+"""
+    CompilationResult
+
+Unified compilation result capturing every pipeline stage for introspection
+and cross-platform validation. Returned by `lava_compile()`.
+"""
+struct CompilationResult
+    pre_pass_ir::String           # Raw GPUCompiler LLVM IR (before our passes)
+    post_pass_ir::String          # LLVM IR after all passes (what the emitter sees)
+    spirv_bytes::Vector{UInt8}    # Raw SPIR-V binary
+    spirv_disasm::String          # spirv-dis output
+    entry_name::String
+    stage::Symbol                 # :compute, :vertex, :fragment, :raygen, etc.
+    workgroup_size::NTuple{3,Int}
+    push_info::Union{Nothing, PushConstantInfo}
+    source_map::Dict{UInt32, Tuple{String, Int}}  # SPIR-V ID → (julia_file, julia_line)
+end
+
+"""
+    lava_compile(f, tt; stage=:compute, workgroup_size=(64,1,1),
+                 config=nothing, payload_type=:f32, validate=true) -> CompilationResult
+
+Compile a Julia function through the full Lava pipeline, returning a `CompilationResult`
+with IR at every stage for introspection and validation.
+
+Supports all shader stages: `:compute`, `:vertex`, `:fragment`, `:geometry`,
+`:tess_control`, `:tess_eval`, `:raygen`, `:closesthit`, `:miss`, `:anyhit`,
+`:intersection`, `:callable`.
+"""
+function lava_compile(@nospecialize(f), @nospecialize(tt);
+                      stage::Symbol=:compute,
+                      workgroup_size::NTuple{3,Int}=(64, 1, 1),
+                      config=nothing,
+                      payload_type::Symbol=:f32,
+                      validate::Bool=true)
+    if stage == :compute
+        result = _lava_compile_full(f, tt; workgroup_size, validate)
+        return result
+    elseif stage in (:vertex, :fragment, :geometry, :tess_control, :tess_eval)
+        return _lava_compile_gfx_full(f, tt; stage, config, validate)
+    elseif stage in (:raygen, :closesthit, :miss, :anyhit, :intersection, :callable)
+        return _lava_compile_rt_full(f, tt; stage, payload_type, validate)
+    else
+        error("Unknown stage: $stage")
+    end
+end
+
+"""Compile compute kernel, capturing pre/post IR."""
+function _lava_compile_full(@nospecialize(f), @nospecialize(tt);
+                            workgroup_size::NTuple{3,Int}=(64, 1, 1),
+                            validate::Bool=true)
+    config = lava_compiler_config(; workgroup_size)
+    source = GPUCompiler.methodinstance(typeof(f), tt)
+    job = GPUCompiler.CompilerJob(source, config)
+
+    GPUCompiler.JuliaContext() do ctx
+        local mod, meta
+        try
+            mod, meta = GPUCompiler.compile(:llvm, job)
+        catch e
+            _wrap_gpu_compiler_error(e, f, tt)
+        end
+        entry_fn = meta.entry
+        entry_name = LLVM.name(entry_fn)
+
+        # Capture pre-pass IR
+        pre_pass_ir = string(mod)
+
+        # BDA entry wrapper
+        push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size)
+        wrapper_name = push_info.wrapper_name
+        wrapper_fn = LLVM.functions(mod)[wrapper_name]
+
+        # LLVM passes
+        _run_llvm_passes!(mod, wrapper_fn)
+        post_pass_ir = string(mod)
+
+        # SPIR-V emission
+        spirv_bytes, source_map = _emit_spirv_from_llvm(mod, wrapper_name, workgroup_size)
+
+        # Validation
+        write("/tmp/lava_last.spv", spirv_bytes)
+        write("/tmp/lava_last.ll", post_pass_ir)
+        if validate
+            _validate_spirv(spirv_bytes, post_pass_ir, source_map)
+        end
+
+        spirv_disasm = disassemble_spirv(spirv_bytes)
+
+        return CompilationResult(pre_pass_ir, post_pass_ir, spirv_bytes, spirv_disasm,
+                                 wrapper_name, :compute, workgroup_size, push_info, source_map)
+    end
+end
+
+"""Compile graphics shader, capturing pre/post IR."""
+function _lava_compile_gfx_full(@nospecialize(f), @nospecialize(tt);
+                                 stage::Symbol=:vertex,
+                                 config=nothing,
+                                 validate::Bool=true)
+    config_wg = lava_compiler_config(; workgroup_size=(1, 1, 1))
+    source = GPUCompiler.methodinstance(typeof(f), tt)
+    job = GPUCompiler.CompilerJob(source, config_wg)
+
+    GPUCompiler.JuliaContext() do ctx
+        local mod, meta
+        try
+            mod, meta = GPUCompiler.compile(:llvm, job)
+        catch e
+            _wrap_gpu_compiler_error(e, f, tt)
+        end
+        entry_fn = meta.entry
+        entry_name = LLVM.name(entry_fn)
+
+        pre_pass_ir = string(mod)
+
+        push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
+        wrapper_name = push_info.wrapper_name
+        wrapper_fn = LLVM.functions(mod)[wrapper_name]
+
+        _run_llvm_passes!(mod, wrapper_fn)
+        post_pass_ir = string(mod)
+
+        spirv_bytes, source_map = _emit_spirv_from_llvm_gfx(mod, wrapper_name, stage; config=config)
+
+        write("/tmp/lava_last.spv", spirv_bytes)
+        write("/tmp/lava_last.ll", post_pass_ir)
+        if validate
+            _validate_spirv(spirv_bytes, post_pass_ir, source_map)
+        end
+
+        spirv_disasm = disassemble_spirv(spirv_bytes)
+
+        return CompilationResult(pre_pass_ir, post_pass_ir, spirv_bytes, spirv_disasm,
+                                 wrapper_name, stage, (1, 1, 1), push_info, source_map)
+    end
+end
+
+"""Compile RT shader, capturing pre/post IR."""
+function _lava_compile_rt_full(@nospecialize(f), @nospecialize(tt);
+                                stage::Symbol=:raygen,
+                                payload_type::Symbol=:f32,
+                                validate::Bool=true)
+    config = lava_compiler_config(; workgroup_size=(1, 1, 1))
+    source = GPUCompiler.methodinstance(typeof(f), tt)
+    job = GPUCompiler.CompilerJob(source, config)
+
+    GPUCompiler.JuliaContext() do ctx
+        local mod, meta
+        try
+            mod, meta = GPUCompiler.compile(:llvm, job)
+        catch e
+            _wrap_gpu_compiler_error(e, f, tt)
+        end
+        entry_fn = meta.entry
+        entry_name = LLVM.name(entry_fn)
+
+        pre_pass_ir = string(mod)
+
+        push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
+        wrapper_name = push_info.wrapper_name
+        wrapper_fn = LLVM.functions(mod)[wrapper_name]
+
+        _run_llvm_passes!(mod, wrapper_fn)
+        post_pass_ir = string(mod)
+
+        spirv_bytes, source_map = _emit_spirv_from_llvm_rt(mod, wrapper_name, stage;
+                                                payload_type=payload_type)
+
+        write("/tmp/lava_last.spv", spirv_bytes)
+        write("/tmp/lava_last.ll", post_pass_ir)
+        if validate
+            _validate_spirv(spirv_bytes, post_pass_ir, source_map)
+        end
+
+        spirv_disasm = disassemble_spirv(spirv_bytes)
+
+        return CompilationResult(pre_pass_ir, post_pass_ir, spirv_bytes, spirv_disasm,
+                                 wrapper_name, stage, (1, 1, 1), push_info, source_map)
+    end
+end
+
+"""    disassemble(r::CompilationResult) -> String
+
+Return the SPIR-V disassembly text."""
+disassemble(r::CompilationResult) = r.spirv_disasm
+
+"""
+    optimize_spirv(spirv_bytes::Vector{UInt8}; passes="-O") -> Vector{UInt8}
+
+Run spirv-opt on SPIR-V binary. Returns optimized bytes.
+Validates output with spirv-val.
+"""
+function optimize_spirv(spirv_bytes::Vector{UInt8}; passes::String="-O")
+    spirv_opt = SPIRV_Tools_jll.spirv_opt()
+    spirv_val_cmd = SPIRV_Tools_jll.spirv_val()
+
+    in_path = tempname() * ".spv"
+    out_path = tempname() * ".spv"
+    try
+        write(in_path, spirv_bytes)
+        run(`$spirv_opt --target-env=vulkan1.3 --scalar-block-layout $passes $in_path -o $out_path`)
+        optimized = read(out_path)
+        # Validate optimized output
+        run(`$spirv_val_cmd --target-env vulkan1.3 --scalar-block-layout $out_path`)
+        return optimized
+    finally
+        rm(in_path; force=true)
+        rm(out_path; force=true)
+    end
+end
+
 # ── LLVM IR compilation (GPUCompiler → LLVM Module) ──
 
 """
@@ -46,7 +465,12 @@ function lava_compile_to_llvm(@nospecialize(f), @nospecialize(tt);
     job = GPUCompiler.CompilerJob(source, config)
 
     GPUCompiler.JuliaContext() do ctx
-        mod, meta = GPUCompiler.compile(:llvm, job)
+        local mod, meta
+        try
+            mod, meta = GPUCompiler.compile(:llvm, job)
+        catch e
+            _wrap_gpu_compiler_error(e, f, tt)
+        end
         entry_name = LLVM.name(meta.entry)
         ir = string(mod)
         return LavaLLVMResult(ir, entry_name, workgroup_size)
@@ -70,7 +494,12 @@ function lava_compile_to_spirv(@nospecialize(f), @nospecialize(tt);
     job = GPUCompiler.CompilerJob(source, config)
 
     GPUCompiler.JuliaContext() do ctx
-        mod, meta = GPUCompiler.compile(:llvm, job)
+        local mod, meta
+        try
+            mod, meta = GPUCompiler.compile(:llvm, job)
+        catch e
+            _wrap_gpu_compiler_error(e, f, tt)
+        end
         entry_fn = meta.entry
         entry_name = LLVM.name(entry_fn)
 
@@ -81,11 +510,11 @@ function lava_compile_to_spirv(@nospecialize(f), @nospecialize(tt);
         ir = string(mod)
 
         # ── Stage 2: Custom SPIR-V emission ──
-        spirv_bytes = _emit_spirv_from_llvm(mod, entry_name, workgroup_size)
+        spirv_bytes, source_map = _emit_spirv_from_llvm(mod, entry_name, workgroup_size)
 
         # ── Stage 3: Validation ──
         if validate
-            _validate_spirv(spirv_bytes)
+            _validate_spirv(spirv_bytes, "", source_map)
         end
 
         return LavaSPIRVResult(spirv_bytes, entry_name, workgroup_size, ir)
@@ -108,7 +537,12 @@ function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
     job = GPUCompiler.CompilerJob(source, config)
 
     GPUCompiler.JuliaContext() do ctx
-        mod, meta = GPUCompiler.compile(:llvm, job)
+        local mod, meta
+        try
+            mod, meta = GPUCompiler.compile(:llvm, job)
+        catch e
+            _wrap_gpu_compiler_error(e, f, tt)
+        end
         entry_fn = meta.entry
         entry_name = LLVM.name(entry_fn)
 
@@ -126,16 +560,26 @@ function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
         # Save IR for debugging (always available at /tmp/lava_last.ll)
         ir = string(mod)
         write("/tmp/lava_last.ll", ir)
+        # Also save with unique name for crash debugging
+        _KERNEL_DEBUG_COUNTER[] += 1
+        _kidx = _KERNEL_DEBUG_COUNTER[]
+        write("/tmp/lava_kernel_$(_kidx)_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).ll", ir)
 
         # ── Stage 2: Custom SPIR-V emission ──
-        spirv_bytes = _emit_spirv_from_llvm(mod, wrapper_name, workgroup_size)
+        spirv_bytes, source_map = _emit_spirv_from_llvm(mod, wrapper_name, workgroup_size)
+
+        # ── Stage 2.5: SPIR-V optimization (optional, helps NVIDIA) ──
+        if _spirv_opt_enabled[]
+            spirv_bytes = _run_spirv_opt(spirv_bytes)
+        end
 
         # Save SPIR-V for debugging (always available at /tmp/lava_last.spv)
         write("/tmp/lava_last.spv", spirv_bytes)
+        write("/tmp/lava_kernel_$(_kidx)_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).spv", spirv_bytes)
 
         # ── Stage 3: Validation ──
         if validate
-            _validate_spirv(spirv_bytes, ir)
+            _validate_spirv(spirv_bytes, ir, source_map)
         end
 
         return LavaGPUKernel(spirv_bytes, wrapper_name, workgroup_size, push_info, ir)
@@ -184,7 +628,12 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
     job = GPUCompiler.CompilerJob(source, config)
 
     GPUCompiler.JuliaContext() do ctx
-        mod, meta = GPUCompiler.compile(:llvm, job)
+        local mod, meta
+        try
+            mod, meta = GPUCompiler.compile(:llvm, job)
+        catch e
+            _wrap_gpu_compiler_error(e, f, tt)
+        end
         entry_fn = meta.entry
         entry_name = LLVM.name(entry_fn)
 
@@ -200,16 +649,88 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
         write("/tmp/lava_last_rt.ll", ir)
 
         # RT-specific SPIR-V emission
-        spirv_bytes = _emit_spirv_from_llvm_rt(mod, wrapper_name, stage;
+        spirv_bytes, source_map = _emit_spirv_from_llvm_rt(mod, wrapper_name, stage;
                                                 payload_type=payload_type)
 
-        write("/tmp/lava_last_rt.spv", spirv_bytes)
+        write("/tmp/lava_last.spv", spirv_bytes)
 
         if validate
-            _validate_spirv(spirv_bytes, ir)
+            _validate_spirv(spirv_bytes, ir, source_map)
         end
 
         return LavaRTShader(spirv_bytes, stage, push_info, ir)
+    end
+end
+
+# ── Graphics Shader Compilation ──
+
+"""
+    LavaGfxShader
+
+Compilation result for a graphics shader stage.
+"""
+struct LavaGfxShader
+    spirv_bytes::Vector{UInt8}
+    stage::Symbol
+    push_info::PushConstantInfo
+    ir::String
+end
+
+"""
+    lava_compile_gfx_shader(f, tt; stage=:vertex, config=nothing, validate=true) -> LavaGfxShader
+
+Compile a Julia function to a graphics shader stage (vertex, fragment, geometry,
+tess_control, tess_eval).
+
+The function receives its arguments via a BDA push constant buffer (same as compute/RT).
+Graphics-specific builtins and I/O variables are handled automatically by the emitter.
+
+# Stages
+- `:vertex` — Vertex shader. Can use `_lava_gfx_vertex_index()`, `_lava_gfx_set_position()`.
+- `:fragment` — Fragment shader. Can use `_lava_gfx_frag_coord()`, `_lava_gfx_output_vec4()`.
+- `:geometry` — Geometry shader. Requires `config::GeometryConfig`.
+- `:tess_control` — Tessellation control shader. Requires `config::TessConfig`.
+- `:tess_eval` — Tessellation evaluation shader. Requires `config::TessConfig`.
+"""
+function lava_compile_gfx_shader(@nospecialize(f), @nospecialize(tt);
+                                   stage::Symbol=:vertex,
+                                   config=nothing,
+                                   validate::Bool=true)
+    config_wg = lava_compiler_config(; workgroup_size=(1, 1, 1))
+    source = GPUCompiler.methodinstance(typeof(f), tt)
+    job = GPUCompiler.CompilerJob(source, config_wg)
+
+    GPUCompiler.JuliaContext() do ctx
+        local mod, meta
+        try
+            mod, meta = GPUCompiler.compile(:llvm, job)
+        catch e
+            _wrap_gpu_compiler_error(e, f, tt)
+        end
+        entry_fn = meta.entry
+        entry_name = LLVM.name(entry_fn)
+
+        # BDA entry wrapper (same as compute — args via push constant buffer)
+        push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
+        wrapper_name = push_info.wrapper_name
+        wrapper_fn = LLVM.functions(mod)[wrapper_name]
+
+        # LLVM passes (same as compute)
+        _run_llvm_passes!(mod, wrapper_fn)
+
+        ir = string(mod)
+        write("/tmp/lava_last_gfx_$(stage).ll", ir)
+
+        # Graphics-specific SPIR-V emission
+        spirv_bytes, source_map = _emit_spirv_from_llvm_gfx(mod, wrapper_name, stage; config=config)
+
+        write("/tmp/lava_last_gfx_$(stage).spv", spirv_bytes)
+
+        if validate
+            _validate_spirv(spirv_bytes, ir, source_map)
+        end
+
+        return LavaGfxShader(spirv_bytes, stage, push_info, ir)
     end
 end
 
@@ -218,6 +739,8 @@ end
 function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # ── CFG cleanup ──
     # Remove constructs that SPIR-V can't handle
+    # Replace freeze before optimization: GPU kernel arguments are never undef,
+    # so freeze is unnecessary. Removing it early lets LLVM produce simpler IR.
     _replace_freeze!(mod)
     _strip_assume!(mod)
 
@@ -232,17 +755,18 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # entry function. After inlining, the error paths become dead code.
     _force_inline_all!(mod, entry_fn)
 
+    if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
+        write("/tmp/lava_ir_1_postinline.ll", string(mod))
+    end
+
     # ── Post-inlining optimization ──
-    # After force-inlining, newly visible optimization opportunities appear:
-    # - The BDA wrapper stores args into individual allocas, then the inlined
-    #   kernel body constructs tuples from them. Without SROA, the tuple
-    #   construction creates GEPs that read across alloca boundaries (using the
-    #   full original struct type on a decomposed alloca). This is valid with
-    #   opaque pointers on CPU but invalid in SPIR-V where allocas are separate.
-    # - SROA decomposes these intermediate allocas, eliminating the cross-alloca reads.
     LLVM.run!(LLVM.InstCombinePass(), mod)
     LLVM.run!(LLVM.SROAPass(), mod)
     LLVM.run!(LLVM.InstCombinePass(), mod)
+
+    if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
+        write("/tmp/lava_ir_2_postsroa.ll", string(mod))
+    end
 
     # ── Fix inttoptr address spaces after SROA ──
     # SROA eliminates allocas and creates `inttoptr i64 %bda_val to ptr` (addrspace 0)
@@ -291,6 +815,13 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # SPIR-V requires structured CF. Run the full structurize pipeline.
     run_structurize_cfg_pipeline!(mod)
 
+    # ── Flatten nested workgroup array globals ──
+    # Replace [32 x [2 x float]] → [64 x float] in addrspace(3).
+    # Without VK_KHR_workgroup_memory_explicit_layout, SPIR-V Workgroup arrays
+    # cannot have ArrayStride decorations, and NVIDIA miscomputes the stride
+    # for nested arrays. Flattening to scalar arrays avoids this.
+    _flatten_nested_workgroup_arrays!(mod)
+
     # ── Lift byte-offset GEPs on workgroup globals ──
     # Convert `gep i8, @shared, <offset>` ConstantExpr to typed struct-member GEPs.
     # Must run before decompose passes so the emitter sees proper typed access patterns.
@@ -321,6 +852,13 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # reads crossing struct field boundaries. Decompose into per-field loads + pack.
     _decompose_typepun_gep_loads!(mod, dl)
 
+    # Re-combine chained byte-offset GEPs that were left undecomposed above
+    # (because the chain contains dynamic indices). E.g.:
+    #   gep i8, (gep i8, %alloca, %dynamic), 224  →  gep i8, %alloca, add(%dynamic, 224)
+    # The emitter can then decompose the combined dynamic byte offset into proper
+    # OpAccessChain indices via _decompose_flat_index_for_composite!.
+    _combine_chained_geps!(mod)
+
     # LLVM may create loads where the type differs from the alloca type
     # (e.g., `load i16` from `alloca { [2 x i8] }`). SPIR-V requires strict
     # type matching, so rewrite these to byte-by-byte extraction.
@@ -339,6 +877,14 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # Lower to proper element-level access with runtime index computation.
     _lower_chained_mismatched_geps!(mod)
 
+    # ── Convert typed GEPs on mismatched allocas to byte-offset GEPs ──
+    # When InstCombine (inside StructurizeCFG) creates typed GEPs like
+    #   gep i32, ptr %alloca_[8xi64], i64 %dynamic
+    # the emitter can't handle the type mismatch. Convert to byte GEPs:
+    #   gep i8, ptr %alloca, i64 (%dynamic * 4)
+    # so _lower_byte_gep_chain_on_allocas! can apply shift/mask extraction.
+    _convert_typepunned_geps_to_byte_geps!(mod)
+
     # ── Lower byte-offset GEP chains on MArray allocas ──
     # After InstCombine splits flattened byte-offset GEPs back into chains:
     #   %gep1 = gep i8, ptr %alloca_[16xi64], %dynamic
@@ -346,6 +892,14 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     #   store i32 %val, ptr %gep2
     # Lower to proper element-level access with shift/mask (no integer divide).
     _lower_byte_gep_chain_on_allocas!(mod)
+
+    # ── Lower PHI-chained typepunned loads on array allocas ──
+    # When byte-offset GEPs flow through PHI chains (from StructurizeCFG) before being
+    # loaded, _lower_byte_gep_chain_on_allocas! can't handle them (it requires direct
+    # GEP→load). This pass "lifts" the load to each leaf GEP site with shift/mask
+    # extraction and creates parallel value PHI chains.
+    # Critical for MVector{32,UInt32} stored as [16 x i64] in BVH stack traversal.
+    _lower_phi_typepunned_loads!(mod)
 
     # ── Lift byte-offset GEPs on workgroup globals ──
     # The decompose passes above may create byte-offset ConstantExpr GEPs like
@@ -359,6 +913,12 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # GEPs followed by the lift pass to normalize types.
     _fix_gep_alloca_type_mismatches!(mod)
     _lift_byte_geps_on_allocas!(mod)
+
+    # The final _lift_byte_geps_on_allocas! may convert byte GEPs (gep i8, alloca, <off>)
+    # to typed GEPs (gep [2 x double], alloca, 0, 0), but the load users still have the
+    # wrong type (e.g., load i32 from a double*). Run the typepun GEP load decomposition
+    # one more time to fix these.
+    _decompose_typepun_gep_loads!(mod, dl)
 
     return nothing
 end
@@ -457,8 +1017,8 @@ function _emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
     # Add Block + MemberOffset decorations for PSB-pointed struct types
     decorate_psb_struct_layouts!(type_ctx, llvm_mod)
 
-    # Serialize to binary
-    return serialize(spirv_mod)
+    # Serialize to binary, return bytes + source map
+    return serialize(spirv_mod), spirv_mod.source_locations
 end
 
 """
@@ -605,22 +1165,68 @@ function _emit_workgroup_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariab
     mod = state.mod
     gv_value_ty = LLVM.global_value_type(gv)
 
-    # Create FRESH type IDs for workgroup usage (no layout decorations).
-    # This is critical when the same LLVM type (e.g. [3 x float]) is used in both
-    # PSB (needs ArrayStride) and Workgroup (must NOT have ArrayStride).
+    # Check if this workgroup type contains a struct (needs explicit layout).
+    # Without explicit layout, NVIDIA drivers may use incorrect memory layout
+    # for struct types in workgroup storage, corrupting mixed-type tuple data.
+    needs_explicit_layout = _wg_type_contains_struct(gv_value_ty)
+
+    # Create FRESH type IDs for workgroup usage.
+    # map_workgroup_type! now adds MemberOffset/ArrayStride decorations when
+    # the type contains structs (for VK_KHR_workgroup_memory_explicit_layout).
     pointee_spirv = map_workgroup_type!(state.type_ctx, gv_value_ty)
 
-    # Create pointer type: OpTypePointer Workgroup %fresh_type
-    ptr_ty = map_pointer_type!(state.type_ctx, pointee_spirv, SC.Workgroup)
+    if needs_explicit_layout
+        # Wrap in a Block-decorated outer struct for explicit layout.
+        # SPIR-V requires: Block on outermost struct, Offset on its members,
+        # ArrayStride on arrays of structs, MemberOffset on inner structs.
+        #
+        # Structure: %outer_block = OpTypeStruct %pointee_type
+        #   with Block decoration and member 0 at Offset 0
+        block_struct_id = fresh_id!(mod)
+        word_count = UInt32(3)  # OpTypeStruct + result + 1 member
+        push!(mod.types_constants, (word_count << 16) | UInt32(Op.OpTypeStruct))
+        push!(mod.types_constants, block_struct_id)
+        push!(mod.types_constants, pointee_spirv)
 
-    # Create OpVariable with Workgroup storage class
-    var_id = fresh_id!(mod)
-    encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Workgroup)
+        emit_decorate!(mod, block_struct_id, Dec.Block)
+        emit_member_decorate!(mod, block_struct_id, UInt32(0), Dec.Offset, UInt32(0))
 
-    # Register in value_map so references can find it
-    state.value_map[gv] = var_id
+        # Create pointer type for the Block wrapper
+        ptr_ty = map_pointer_type!(state.type_ctx, block_struct_id, SC.Workgroup)
+
+        # Require the extension and capability
+        require_capability!(mod, Cap.WorkgroupMemoryExplicitLayoutKHR)
+        require_extension!(mod, "SPV_KHR_workgroup_memory_explicit_layout")
+
+        # Require 8-bit/16-bit access capabilities if the type contains such elements
+        if _wg_type_contains_width(gv_value_ty, 8)
+            require_capability!(mod, Cap.WorkgroupMemoryExplicitLayout8BitAccessKHR)
+        end
+        if _wg_type_contains_width(gv_value_ty, 16)
+            require_capability!(mod, Cap.WorkgroupMemoryExplicitLayout16BitAccessKHR)
+        end
+
+        # Create OpVariable
+        var_id = fresh_id!(mod)
+        encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Workgroup)
+
+        # Register the wrapping so the function preamble can emit unwrapping AccessChains.
+        # The unwrapping AccessChain will drill through the Block struct to get a pointer
+        # to the inner array/type, which all existing GEP handlers expect.
+        state.wg_wrapped_vars[gv] = (var_id, pointee_spirv, gv_value_ty)
+    else
+        # No struct types — use simple undecorated workgroup variable (original path)
+        ptr_ty = map_pointer_type!(state.type_ctx, pointee_spirv, SC.Workgroup)
+
+        var_id = fresh_id!(mod)
+        encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Workgroup)
+
+        # Register directly in value_map
+        state.value_map[gv] = var_id
+    end
 
     # Register pointee type in PTM for downstream GEP/load/store resolution
+    # (always the ORIGINAL type, not the Block wrapper)
     set_pointee_type!(state.type_ctx.ptm, gv, gv_value_ty; priority=5)
 
     # Debug name
@@ -630,6 +1236,30 @@ function _emit_workgroup_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariab
     end
 
     return var_id
+end
+
+"""Check if an LLVM type contains an integer element of the given bit width."""
+function _wg_type_contains_width(ty::LLVM.LLVMType, bits::Int)
+    if ty isa LLVM.IntegerType
+        return LLVM.width(ty) == bits
+    elseif ty isa LLVM.StructType
+        return any(mt -> _wg_type_contains_width(mt, bits), LLVM.elements(ty))
+    elseif ty isa LLVM.ArrayType
+        return _wg_type_contains_width(LLVM.eltype(ty), bits)
+    else
+        return false
+    end
+end
+
+"""Check if an LLVM type contains a struct at any nesting level."""
+function _wg_type_contains_struct(ty::LLVM.LLVMType)
+    if ty isa LLVM.StructType
+        return true
+    elseif ty isa LLVM.ArrayType
+        return _wg_type_contains_struct(eltype(ty))
+    else
+        return false
+    end
 end
 
 # ── Builtin name → SPIR-V BuiltIn decoration mapping ──
@@ -848,7 +1478,8 @@ end
 Validate SPIR-V binary using spirv-val. On failure, writes debug artifacts
 to /tmp/lava_last.{spv,dis,ll} and throws with a focused error excerpt.
 """
-function _validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="")
+function _validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
+                          source_map::Dict{UInt32, Tuple{String, Int}}=Dict{UInt32, Tuple{String, Int}}())
     spirv_val = SPIRV_Tools_jll.spirv_val()
     spirv_dis_cmd = SPIRV_Tools_jll.spirv_dis()
     spv_path = "/tmp/lava_last.spv"
@@ -874,44 +1505,132 @@ function _validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="")
         write("/tmp/lava_last.dis", dis)
     end
 
-    # Extract the error line numbers and show context from disassembly
-    excerpt = ""
-    if !isempty(dis)
-        dis_lines = split(dis, '\n')
-        error_line_nums = Int[]
-        for m in eachmatch(r"line (\d+):", val_errors)
-            push!(error_line_nums, parse(Int, m.captures[1]))
-        end
-        unique!(error_line_nums)
+    io = IOBuffer()
 
-        if !isempty(error_line_nums)
-            io = IOBuffer()
-            for lnum in error_line_nums[1:min(3, end)]  # at most 3 error sites
-                lo = max(1, lnum - 8)
-                hi = min(length(dis_lines), lnum + 5)
-                println(io, "  ┌─ SPIR-V around line $lnum:")
-                for j in lo:hi
-                    marker = j == lnum ? " >> " : "    "
-                    println(io, "  │$marker$j: ", dis_lines[j])
-                end
-                println(io, "  └───")
-            end
-            excerpt = String(take!(io))
+    # ── Extract SPIR-V IDs from error messages and map to Julia source ──
+    # spirv-val errors reference IDs as %<num>, e.g. "error: ... %42 ..."
+    error_ids = UInt32[]
+    for m in eachmatch(r"%(\d+)", val_errors)
+        push!(error_ids, parse(UInt32, m.captures[1]))
+    end
+    unique!(error_ids)
+
+    # Build a reverse map: disassembly line → SPIR-V ID (for context display)
+    # spirv-dis output has lines like "  %42 = OpFAdd %float %40 %41"
+    dis_lines = isempty(dis) ? String[] : split(dis, '\n')
+    id_to_dis_line = Dict{UInt32, Int}()
+    for (i, line) in enumerate(dis_lines)
+        m = match(r"^\s*%(\d+)\b", line)
+        if m !== nothing
+            id_to_dis_line[parse(UInt32, m.captures[1])] = i
         end
     end
+
+    # ── Julia source locations for error IDs ──
+    julia_locations = Tuple{UInt32, String, Int}[]  # (spirv_id, file, line)
+    for id in error_ids
+        loc = get(source_map, id, nothing)
+        if loc !== nothing
+            push!(julia_locations, (id, loc[1], loc[2]))
+        end
+    end
+
+    if !isempty(julia_locations)
+        println(io, "\n  Julia source locations for problematic SPIR-V instructions:")
+        seen_files = Set{Tuple{String, Int}}()
+        for (id, file, line) in julia_locations
+            key = (file, line)
+            key in seen_files && continue
+            push!(seen_files, key)
+            # Shorten path for readability
+            short_file = _shorten_path(file)
+            println(io, "    %$id → $short_file:$line")
+            # Try to show the Julia source line
+            _print_julia_source_context(io, file, line)
+        end
+    end
+
+    # ── SPIR-V disassembly context around error sites ──
+    error_line_nums = Int[]
+    for m in eachmatch(r"line (\d+):", val_errors)
+        push!(error_line_nums, parse(Int, m.captures[1]))
+    end
+    # Also add lines for error IDs found in disassembly
+    for id in error_ids[1:min(5, end)]
+        lnum = get(id_to_dis_line, id, 0)
+        lnum > 0 && push!(error_line_nums, lnum)
+    end
+    unique!(error_line_nums)
+
+    if !isempty(error_line_nums) && !isempty(dis_lines)
+        for lnum in error_line_nums[1:min(3, end)]
+            lo = max(1, lnum - 5)
+            hi = min(length(dis_lines), lnum + 3)
+            println(io, "  ┌─ SPIR-V around line $lnum:")
+            for j in lo:hi
+                marker = j == lnum ? " >> " : "    "
+                # Annotate with Julia source if this line has a mapped ID
+                m = match(r"^\s*%(\d+)\b", dis_lines[j])
+                annotation = ""
+                if m !== nothing
+                    id = parse(UInt32, m.captures[1])
+                    loc = get(source_map, id, nothing)
+                    if loc !== nothing
+                        annotation = "  ← $(_shorten_path(loc[1])):$(loc[2])"
+                    end
+                end
+                println(io, "  │$marker$j: ", dis_lines[j], annotation)
+            end
+            println(io, "  └───")
+        end
+    end
+
+    excerpt = String(take!(io))
 
     error("""
     SPIR-V validation failed!
 
     spirv-val:
     $(strip(val_errors))
-
-    $(isempty(excerpt) ? "" : excerpt)
+    $excerpt
     Debug files:
       LLVM IR:     /tmp/lava_last.ll
       SPIR-V bin:  /tmp/lava_last.spv
       SPIR-V dis:  /tmp/lava_last.dis
     """)
+end
+
+"""Shorten a file path for error display."""
+function _shorten_path(path::String)
+    # Try to make paths relative to common prefixes
+    for prefix in ("/home/sim/programmieren/VulkanDev/dev/",
+                    "/home/sim/.julia/packages/")
+        if startswith(path, prefix)
+            return path[length(prefix)+1:end]
+        end
+    end
+    # For Julia stdlib, show just the filename
+    m = match(r"/share/julia/stdlib/[^/]+/(.+)$", path)
+    m !== nothing && return "julia/" * m.captures[1]
+    # For boot/base files
+    m = match(r"([^/]+\.jl)$", path)
+    m !== nothing && return m.captures[1]
+    return path
+end
+
+"""Print Julia source context around a line for error messages."""
+function _print_julia_source_context(io::IO, file::String, line::Int)
+    isfile(file) || return
+    try
+        src_lines = readlines(file)
+        lo = max(1, line - 1)
+        hi = min(length(src_lines), line + 1)
+        for j in lo:hi
+            marker = j == line ? " >> " : "    "
+            println(io, "      │$marker$j: ", src_lines[j])
+        end
+    catch
+    end
 end
 
 """
@@ -997,30 +1716,35 @@ function _lower_memcpy!(inst::LLVM.CallInst)
             val = LLVM.load!(builder, copy_type, src, "memcpy_val")
             LLVM.store!(builder, val, dst)
         else
-            # Fallback: byte-by-byte copy using i64 chunks
+            # Fallback: copy using i32 chunks (NOT i64 — avoids misaligned i64 stores
+            # on NVIDIA when the destination is a PSB pointer into a non-8-byte-aligned
+            # struct array, e.g. 12-byte or 52-byte structs where odd-indexed elements
+            # are only 4-aligned).
             len_val = ops[3]
             if !(len_val isa LLVM.ConstantInt)
                 error("Cannot lower memcpy with non-constant length: $inst")
             end
             nbytes = convert(Int, len_val)
+            T_i32 = LLVM.Int32Type()
             T_i64 = LLVM.Int64Type()
             T_i8 = LLVM.Int8Type()
             offset = 0
-            while offset + 8 <= nbytes
-                src_ptr = LLVM.gep!(builder, T_i8, src, [LLVM.ConstantInt(T_i64, offset)])
-                dst_ptr = LLVM.gep!(builder, T_i8, dst, [LLVM.ConstantInt(T_i64, offset)])
-                val = LLVM.load!(builder, T_i64, src_ptr)
-                LLVM.alignment!(val, 8)
-                st = LLVM.store!(builder, val, dst_ptr)
-                LLVM.alignment!(st, 8)
-                offset += 8
+            n_words = nbytes ÷ 4
+            for i in 0:(n_words-1)
+                off = i * 4
+                s_ptr = off == 0 ? src : LLVM.gep!(builder, T_i8, src, [LLVM.ConstantInt(T_i64, off)])
+                d_ptr = off == 0 ? dst : LLVM.gep!(builder, T_i8, dst, [LLVM.ConstantInt(T_i64, off)])
+                val = LLVM.load!(builder, T_i32, s_ptr)
+                LLVM.alignment!(val, 4)
+                st = LLVM.store!(builder, val, d_ptr)
+                LLVM.alignment!(st, 4)
             end
-            while offset < nbytes
-                src_ptr = LLVM.gep!(builder, T_i8, src, [LLVM.ConstantInt(T_i64, offset)])
-                dst_ptr = LLVM.gep!(builder, T_i8, dst, [LLVM.ConstantInt(T_i64, offset)])
-                val = LLVM.load!(builder, LLVM.Int8Type(), src_ptr)
+            # Handle tail bytes
+            for i in (n_words*4):(nbytes-1)
+                src_ptr = LLVM.gep!(builder, T_i8, src, [LLVM.ConstantInt(T_i64, i)])
+                dst_ptr = LLVM.gep!(builder, T_i8, dst, [LLVM.ConstantInt(T_i64, i)])
+                val = LLVM.load!(builder, T_i8, src_ptr)
                 LLVM.store!(builder, val, dst_ptr)
-                offset += 1
             end
         end
     end

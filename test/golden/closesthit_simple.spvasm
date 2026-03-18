@@ -1,0 +1,38 @@
+; SPIR-V
+; Version: 1.4
+; Generator: Khronos; 0
+; Bound: 14
+; Schema: 0
+               OpCapability VulkanMemoryModel
+               OpCapability PhysicalStorageBufferAddresses
+               OpCapability Shader
+               OpCapability VariablePointers
+               OpCapability RayTracingKHR
+               OpExtension "SPV_KHR_vulkan_memory_model"
+               OpExtension "SPV_KHR_physical_storage_buffer"
+               OpExtension "SPV_KHR_variable_pointers"
+               OpExtension "SPV_KHR_ray_tracing"
+               OpMemoryModel PhysicalStorageBuffer64 Vulkan
+               OpEntryPoint ClosestHitKHR %_Z11chit_simple "main" %__spirv_BuiltInRayTmaxKHR %incoming_payload %hit_attrib
+               OpName %__spirv_BuiltInRayTmaxKHR "__spirv_BuiltInRayTmaxKHR"
+               OpName %incoming_payload "incoming_payload"
+               OpName %hit_attrib "hit_attrib"
+               OpName %_Z11chit_simple "_Z11chit_simple"
+               OpDecorate %__spirv_BuiltInRayTmaxKHR BuiltIn RayTmaxKHR
+               OpDecorate %incoming_payload Location 0
+       %void = OpTypeVoid
+      %float = OpTypeFloat 32
+%_ptr_Input_float = OpTypePointer Input %float
+%_ptr_IncomingRayPayloadKHR_float = OpTypePointer IncomingRayPayloadKHR %float
+    %v2float = OpTypeVector %float 2
+%_ptr_HitAttributeKHR_v2float = OpTypePointer HitAttributeKHR %v2float
+         %10 = OpTypeFunction %void
+%__spirv_BuiltInRayTmaxKHR = OpVariable %_ptr_Input_float Input
+%incoming_payload = OpVariable %_ptr_IncomingRayPayloadKHR_float IncomingRayPayloadKHR
+ %hit_attrib = OpVariable %_ptr_HitAttributeKHR_v2float HitAttributeKHR
+%_Z11chit_simple = OpFunction %void None %10
+         %12 = OpLabel
+         %13 = OpLoad %float %__spirv_BuiltInRayTmaxKHR
+               OpStore %incoming_payload %13
+               OpReturn
+               OpFunctionEnd

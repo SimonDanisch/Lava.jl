@@ -53,9 +53,10 @@ mutable struct SPIRVEmitterState
     # the original header as predecessor must reference the selection header instead.
     phi_block_redirects::Dict{Tuple{UInt32, UInt32}, UInt32}
     # Array element origin: when a value was produced by OpAccessChain indexing into an array,
-    # maps LLVM inst → (array_base_spirv_id, index_spirv_id, array_llvm_type)
+    # maps LLVM inst → (alloca_base_spirv_id, static_path_indices, dyn_index_spirv_id, array_llvm_type)
+    # The static_path contains the OpConstant IDs for struct field indices leading to the array.
     # Used to fold chained GEPs like array[a][b] → array[a+b] in Function storage class.
-    array_element_origin::Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.ArrayType}}
+    array_element_origin::Dict{LLVM.Value, Tuple{UInt32, Vector{UInt32}, UInt32, LLVM.ArrayType}}
     # SPIR-V element type of pointer values: LLVM Value (pointer) → SPIR-V type ID of element.
     # Used to detect when a load's expected result type differs from the pointer's declared
     # element type (e.g., same LLVM struct type used for ptr<i64> and ptr<i16> members).
@@ -69,6 +70,33 @@ mutable struct SPIRVEmitterState
     # Set true when OpIgnoreIntersectionKHR/OpTerminateRayKHR is emitted (block terminators).
     # Suppresses the redundant OpReturn from the trailing `ret void`.
     rt_block_terminated::Bool
+    # ── Graphics shader state (set by _emit_spirv_from_llvm_gfx, unused for compute/RT) ──
+    gfx_io::Any  # GfxIOState or nothing
+    # ── PSB conversion cache ──
+    # Block-local cache: (base_ptr_spirv_id, block_label_id) → u64_spirv_id
+    # Avoids emitting redundant OpConvertPtrToU for repeated accesses to the same
+    # PSB base pointer within a block. Keyed by block to prevent dominance errors.
+    psb_ptr_to_u64::Dict{Tuple{UInt32, UInt32}, UInt32}
+    # Current block label ID (updated when emitting each block)
+    current_block_label::UInt32
+    # PSB pointer byte offsets: maps LLVM pointer values to their known constant byte offset
+    # from the base PSB address. Used to compute correct alignment for loads/stores when
+    # SROA generates i64 accesses at non-8-aligned offsets (e.g., byte 12 from integer
+    # arithmetic GEP path). Without this, we'd declare Aligned 8 for i64 at byte 12,
+    # and NVIDIA GPUs round down to byte 8, corrupting data.
+    psb_known_byte_offsets::Dict{LLVM.Value, Int64}
+    # PSB pointer guaranteed alignment: maps LLVM pointer values to their minimum
+    # guaranteed alignment (in bytes). Populated when runtime-indexed byte GEPs on
+    # composite types (structs/arrays) have a stride that's not a multiple of 8
+    # (e.g., 60-byte struct → 4-byte alignment). Propagated through constant-offset
+    # GEP chains. Used by _psb_needs_decomposition() to detect i64 stores that need
+    # decomposition into two i32 stores.
+    psb_ptr_alignment::Dict{LLVM.Value, UInt32}
+    # Workgroup variables wrapped in Block structs for explicit layout.
+    # Maps LLVM global → (wrapped_var_spirv_id, inner_type_spirv_id, inner_llvm_type).
+    # The function preamble emits unwrapping OpAccessChains to drill through the Block
+    # wrapper and stores the unwrapped pointer IDs in value_map.
+    wg_wrapped_vars::Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.LLVMType}}
 end
 
 function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
@@ -83,10 +111,113 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{LLVM.BasicBlock, LLVM.BasicBlock}(),
         Dict{LLVM.Value, UInt32}(),
         Dict{Tuple{UInt32, UInt32}, UInt32}(),
-        Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.ArrayType}}(),
+        Dict{LLVM.Value, Tuple{UInt32, Vector{UInt32}, UInt32, LLVM.ArrayType}}(),
         Dict{LLVM.Value, UInt32}(),
         nothing, nothing, nothing, :none, nothing, false,
+        nothing,  # gfx_io
+        Dict{Tuple{UInt32, UInt32}, UInt32}(), UInt32(0),
+        Dict{LLVM.Value, Int64}(),
+        Dict{LLVM.Value, UInt32}(),
+        Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.LLVMType}}(),
     )
+end
+
+# ================================================================
+# Source Location Extraction
+# ================================================================
+
+"""
+    _extract_source_location(inst::LLVM.Instruction) -> Union{Nothing, Tuple{String, Int}}
+
+Extract the Julia source file and line number from an LLVM instruction's debug metadata.
+Walks the `inlined_at` chain to find the outermost user source location, since LLVM
+inlines everything and the leaf location is typically in Julia Base (e.g. pointer.jl).
+
+Returns `nothing` if no debug info is attached.
+"""
+function _extract_source_location(inst::LLVM.Instruction)
+    md = LLVM.metadata(inst)
+    haskey(md, LLVM.MD_dbg) || return nothing
+    dbg = md[LLVM.MD_dbg]
+    dbg isa LLVM.DILocation || return nothing
+    line = LLVM.line(dbg)
+    line == 0 && return nothing
+
+    # Walk the inlined_at chain to collect all locations from leaf to root.
+    # The root (outermost) is the user's kernel code. The leaf is the inlined
+    # Base function (pointer.jl, float.jl, etc.).
+    best_file = _diloc_file(dbg)
+    best_line = Int(line)
+
+    loc = dbg
+    while true
+        inlined = try LLVM.inlined_at(loc) catch; nothing end
+        (inlined === nothing || !(inlined isa LLVM.DILocation)) && break
+        il = LLVM.line(inlined)
+        il == 0 && break
+        f = _diloc_file(inlined)
+        if !isempty(f)
+            best_file = f
+            best_line = Int(il)
+        end
+        loc = inlined
+    end
+
+    isempty(best_file) && return nothing
+    return (best_file, best_line)
+end
+
+"""Extract file path from a DILocation's scope."""
+function _diloc_file(dbg::LLVM.DILocation)
+    try
+        scope = LLVM.scope(dbg)
+        f = LLVM.file(scope)
+        dir = LLVM.directory(f)
+        name = LLVM.filename(f)
+        if isempty(dir)
+            return string(name)
+        end
+        # Avoid double slashes: "./foo" with dir "." → "./foo", not ".//foo"
+        if startswith(name, "/")
+            return string(name)
+        end
+        return string(dir, "/", name)
+    catch
+        ""
+    end
+end
+
+"""
+    _record_source_location!(state, spirv_id, inst)
+
+Record the source location of `inst` for SPIR-V result ID `spirv_id`.
+Called after every `fresh_id!` during instruction emission.
+"""
+function _record_source_location!(state::SPIRVEmitterState, spirv_id::UInt32, inst::LLVM.Instruction)
+    loc = _extract_source_location(inst)
+    loc === nothing && return
+    state.mod.source_locations[spirv_id] = loc
+end
+
+"""
+    _emit_psb_ptr_reinterpret!(state, target_ptr_ty_id, source_id) -> UInt32
+
+Reinterpret a PhysicalStorageBuffer pointer to a different SPIR-V pointer type.
+
+NVIDIA's RT shader compiler crashes on `OpBitcast` between PSB pointer types
+(driver bug in libnvidia-glvkspirv.so). This function uses the equivalent
+`OpConvertPtrToU` + `OpConvertUToPtr` roundtrip instead, which works on all vendors.
+
+Returns `source_id` unchanged if the target type already matches (no-op).
+"""
+function _emit_psb_ptr_reinterpret!(state::SPIRVEmitterState, target_ptr_ty_id::UInt32,
+                                     source_id::UInt32)
+    u64_ty = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+    tmp_id = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_ty, tmp_id, source_id)
+    result_id = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, target_ptr_ty_id, result_id, tmp_id)
+    return result_id
 end
 
 """
@@ -384,12 +515,24 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
     end
     # Emit allocas to a temporary buffer (not state.mod.functions)
     preamble_words = UInt32[]
-    if !isempty(all_allocas)
+    if !isempty(all_allocas) || !isempty(state.wg_wrapped_vars)
         # Temporarily swap functions buffer to capture preamble
         real_buf = state.mod.functions
         state.mod.functions = preamble_words
         for alloca_inst in all_allocas
             _emit_alloca!(state, alloca_inst)
+        end
+        # Emit unwrapping AccessChains for Block-wrapped workgroup variables.
+        # Each wrapped variable is a pointer to a Block struct containing the inner type.
+        # We emit OpAccessChain with index 0 to get a pointer to the inner type,
+        # then store that in value_map so all existing GEP handlers work unchanged.
+        for (gv, (wrapped_var_id, inner_type_spirv_id, inner_llvm_ty)) in state.wg_wrapped_vars
+            inner_ptr_ty = map_pointer_type!(state.type_ctx, inner_type_spirv_id, SC.Workgroup)
+            unwrapped_id = fresh_id!(state.mod)
+            zero_id = emit_constant_u32!(state.mod, UInt32(0))
+            encode_instruction!(state.mod.functions, Op.OpAccessChain,
+                                inner_ptr_ty, unwrapped_id, wrapped_var_id, zero_id)
+            state.value_map[gv] = unwrapped_id
         end
         state.mod.functions = real_buf
     end
@@ -452,6 +595,9 @@ function emit_block!(state::SPIRVEmitterState, bb::LLVM.BasicBlock)
 
     encode_instruction!(state.mod.functions, Op.OpLabel, label_id)
 
+    # Track current block for PSB conversion cache
+    state.current_block_label = label_id
+
     # Reset RT block termination flag for this block
     state.rt_block_terminated = false
 
@@ -487,6 +633,9 @@ end
 # ================================================================
 
 function emit_instruction!(state::SPIRVEmitterState, inst::LLVM.Instruction)
+    # Track SPIR-V ID before/after to record source mapping
+    id_before = state.mod.next_id
+
     # Dispatch on instruction type
     if inst isa LLVM.RetInst
         _emit_ret!(state, inst)
@@ -608,6 +757,19 @@ function emit_instruction!(state::SPIRVEmitterState, inst::LLVM.Instruction)
         encode_instruction!(state.mod.functions, Op.OpReturn)
     else
         error("Unsupported LLVM instruction: $(typeof(inst)): $inst")
+    end
+
+    # Record source location for all SPIR-V IDs allocated during this instruction.
+    # Most instructions allocate 1 ID (the result), some allocate multiple (e.g. PSB
+    # decomposition). We map all of them to the same Julia source location.
+    id_after = state.mod.next_id
+    if id_after > id_before
+        loc = _extract_source_location(inst)
+        if loc !== nothing
+            for id in id_before:(id_after - UInt32(1))
+                state.mod.source_locations[id] = loc
+            end
+        end
     end
 end
 
@@ -838,53 +1000,66 @@ function _emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
 
     # PhysicalStorageBuffer loads MUST have Aligned memory operand
     if _is_psb_pointer(ptr)
-        align_ty = needs_bitcast ? actual_load_ty : load_ty
-        align = _get_alignment_for_type(align_ty)
-        # If the PSB pointer's pointee type doesn't match what we're loading,
-        # bitcast the pointer to match. This handles type puns (e.g., loading i32
-        # from ptr<[2 x half]> for ComplexF16, or loading i64 from ptr<[2 x float]>).
         actual_load = needs_bitcast ? actual_load_ty : load_ty
         pointee_ty_ld = get_pointee_type(state.type_ctx.ptm, ptr)
 
-        # Special case: loading ptr from PSB where pointee was mapped to i64
-        # (from _emit_psb_byte_offset_with_user_type!). Load i64, then ConvertUToPtr.
-        psb_ptr_as_i64 = false
-        if actual_load isa LLVM.PointerType && pointee_ty_ld !== nothing &&
-           pointee_ty_ld isa LLVM.IntegerType && LLVM.width(pointee_ty_ld) == 64
-            psb_ptr_as_i64 = true
-            align = UInt32(8)
-        elseif pointee_ty_ld !== nothing && actual_load != pointee_ty_ld &&
-           !(actual_load isa LLVM.PointerType) && !(pointee_ty_ld isa LLVM.PointerType)
-            ld_spirv_ty = map_type!(state.type_ctx, actual_load)
-            ld_ptr_ty = map_pointer_type!(state.type_ctx, ld_spirv_ty, SC.PhysicalStorageBuffer)
-            new_ptr_id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.functions, Op.OpBitcast, ld_ptr_ty, new_ptr_id, ptr_id)
-            ptr_id = new_ptr_id
-        end
-
-        if psb_ptr_as_i64
-            # Load as i64, then convert to typed pointer
-            i64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
-            raw_load_id = fresh_id!(state.mod)
-            push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
-            push!(state.mod.functions, i64_spirv)
-            push!(state.mod.functions, raw_load_id)
-            push!(state.mod.functions, ptr_id)
-            push!(state.mod.functions, UInt32(0x02))  # Aligned
-            push!(state.mod.functions, align)
-            # Convert i64 → typed PSB pointer
-            encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ty, load_id, raw_load_id)
+        # Check if this wide load needs decomposition due to misaligned PSB address.
+        # SPIR-V requires Aligned ≥ scalar_size for PSB (VUID 06314), so we can't
+        # just lower alignment. Instead, decompose i64/double loads at non-8-aligned
+        # addresses into two i32 loads with Aligned 4.
+        llvm_align = UInt32(LLVM.alignment(inst))
+        if _psb_needs_decomposition(state, ptr, actual_load; llvm_align)
+            load_id = _emit_psb_decomposed_load!(state, ptr_id, actual_load, spirv_load_ty)
+            # Decomposed load returns i64 integer. If original load was a pointer,
+            # convert the integer to a typed PSB pointer.
+            if actual_load isa LLVM.PointerType
+                int_id = load_id
+                load_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ty, load_id, int_id)
+            end
         else
-            # OpLoad: result_type, result_id, ptr, memory_operand, alignment
-            push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
-            push!(state.mod.functions, spirv_load_ty)
-            push!(state.mod.functions, load_id)
-            push!(state.mod.functions, ptr_id)
-            push!(state.mod.functions, UInt32(0x02))  # Aligned
-            push!(state.mod.functions, align)
+            align_ty = needs_bitcast ? actual_load_ty : load_ty
+            align = _get_alignment_for_type(align_ty)
+
+            # Special case: loading ptr from PSB where pointee was mapped to i64
+            # (from _emit_psb_byte_offset_with_user_type!). Load i64, then ConvertUToPtr.
+            psb_ptr_as_i64 = false
+            if actual_load isa LLVM.PointerType && pointee_ty_ld !== nothing &&
+               pointee_ty_ld isa LLVM.IntegerType && LLVM.width(pointee_ty_ld) == 64
+                psb_ptr_as_i64 = true
+                align = UInt32(8)
+            elseif pointee_ty_ld !== nothing && actual_load != pointee_ty_ld &&
+               !(actual_load isa LLVM.PointerType) && !(pointee_ty_ld isa LLVM.PointerType)
+                ld_spirv_ty = map_type!(state.type_ctx, actual_load)
+                ld_ptr_ty = map_pointer_type!(state.type_ctx, ld_spirv_ty, SC.PhysicalStorageBuffer)
+                ptr_id = _emit_psb_ptr_reinterpret!(state, ld_ptr_ty, ptr_id)
+            end
+
+            if psb_ptr_as_i64
+                # Load as i64, then convert to typed pointer
+                i64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+                raw_load_id = fresh_id!(state.mod)
+                push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
+                push!(state.mod.functions, i64_spirv)
+                push!(state.mod.functions, raw_load_id)
+                push!(state.mod.functions, ptr_id)
+                push!(state.mod.functions, UInt32(0x02))  # Aligned
+                push!(state.mod.functions, align)
+                # Convert i64 → typed PSB pointer
+                encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ty, load_id, raw_load_id)
+            else
+                # OpLoad: result_type, result_id, ptr, memory_operand, alignment
+                push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
+                push!(state.mod.functions, spirv_load_ty)
+                push!(state.mod.functions, load_id)
+                push!(state.mod.functions, ptr_id)
+                push!(state.mod.functions, UInt32(0x02))  # Aligned
+                push!(state.mod.functions, align)
+            end
         end
     else
         sc = _get_pointer_storage_class(ptr)
+        load_as_int_then_convert_to_ptr = false
         if sc == SC.Workgroup || sc == SC.Function
             # For Workgroup/Function loads: if load type doesn't match pointer's pointee type,
             # bitcast the POINTER to match the load type. This happens when:
@@ -893,7 +1068,12 @@ function _emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
             pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
             if pointee_ty !== nothing
                 eff_load_ty = needs_bitcast ? actual_load_ty : load_ty
-                if eff_load_ty != pointee_ty && eff_load_ty isa LLVM.IntegerType && pointee_ty isa LLVM.IntegerType
+                if eff_load_ty isa LLVM.PointerType && pointee_ty isa LLVM.IntegerType && LLVM.width(pointee_ty) == 64
+                    # Loading a PSB pointer from a local variable typed as i64.
+                    # Must load as i64 first, then OpConvertUToPtr.
+                    load_as_int_then_convert_to_ptr = true
+                    spirv_load_ty = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+                elseif eff_load_ty != pointee_ty && eff_load_ty isa LLVM.IntegerType && pointee_ty isa LLVM.IntegerType
                     val_spirv_ty = map_type!(state.type_ctx, eff_load_ty)
                     new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
                     cast_id = fresh_id!(state.mod)
@@ -902,19 +1082,27 @@ function _emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                 end
             end
         end
-        # For pointer loads: check if the pointer's declared SPIR-V element type differs
-        # from what we want to load. This happens when the same LLVM struct type is used
-        # for pointer members with different element types (e.g., ptr<i64> for indices and
-        # ptr<i16> for values share the same `{ ptr, [1 x i64] }` struct).
-        if load_ty isa LLVM.PointerType
-            declared_elem_ty = get(state.spirv_ptr_element_type, ptr, UInt32(0))
-            if declared_elem_ty != UInt32(0) && declared_elem_ty != spirv_load_ty
-                # Load as the declared type, then bitcast the result
-                spirv_load_ty = declared_elem_ty
-                needs_ptr_bitcast = true
+        if !load_as_int_then_convert_to_ptr
+            # For pointer loads: check if the pointer's declared SPIR-V element type differs
+            # from what we want to load. This happens when the same LLVM struct type is used
+            # for pointer members with different element types (e.g., ptr<i64> for indices and
+            # ptr<i16> for values share the same `{ ptr, [1 x i64] }` struct).
+            if load_ty isa LLVM.PointerType
+                declared_elem_ty = get(state.spirv_ptr_element_type, ptr, UInt32(0))
+                if declared_elem_ty != UInt32(0) && declared_elem_ty != spirv_load_ty
+                    # Load as the declared type, then bitcast the result
+                    spirv_load_ty = declared_elem_ty
+                    needs_ptr_bitcast = true
+                end
             end
         end
         encode_instruction!(state.mod.functions, Op.OpLoad, spirv_load_ty, load_id, ptr_id)
+        if load_as_int_then_convert_to_ptr
+            # Convert loaded i64 to the typed PSB pointer
+            int_id = load_id
+            load_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ty, load_id, int_id)
+        end
     end
 
     if needs_ptr_bitcast
@@ -1045,11 +1233,22 @@ function _get_struct_member_ptr_spirv_type(state::SPIRVEmitterState, pointee_ty:
     struct_ty === nothing && return nothing
 
     info = get(state.type_ctx.struct_ptr_members, (struct_ty, member_idx), nothing)
-    info === nothing && return nothing
+    if info !== nothing
+        declared_pointee, _as = info
+        declared_pointee_spirv = map_type!(state.type_ctx, declared_pointee)
+        return map_pointer_type!(state.type_ctx, declared_pointee_spirv, SC.PhysicalStorageBuffer)
+    end
 
-    declared_pointee, _as = info
-    declared_pointee_spirv = map_type!(state.type_ctx, declared_pointee)
-    return map_pointer_type!(state.type_ctx, declared_pointee_spirv, SC.PhysicalStorageBuffer)
+    # Fallback: struct_ptr_members has no entry, but the struct type was already mapped
+    # with an i8 fallback for ptr members (see _find_ptr_member_type_in_hierarchy).
+    # Match that fallback so the AccessChain result type agrees with the struct definition.
+    fallback_pointee = _find_ptr_member_type_in_hierarchy(state.type_ctx, struct_ty)
+    if fallback_pointee !== nothing
+        fallback_spirv = map_type!(state.type_ctx, fallback_pointee)
+        return map_pointer_type!(state.type_ctx, fallback_spirv, SC.PhysicalStorageBuffer)
+    end
+
+    return nothing
 end
 
 """
@@ -1102,6 +1301,72 @@ function _find_struct_member_path_recursive!(path::Vector{Int}, struct_ty::LLVM.
         running_offset += member_size
     end
     return false
+end
+
+"""
+Find array fields within a (possibly nested) struct that match a given element stride.
+Returns `(path, byte_offset, array_type)` or `nothing`.
+
+When `elem_stride > 0`, selects the array whose element size matches the stride.
+When `elem_stride == 0`, returns the first array found (fallback).
+
+Used for dynamic byte-offset GEPs on Function-SC struct allocas, where the dynamic index
+targets an array field within the struct (e.g., accessing dims in a LavaDeviceArray).
+"""
+function _find_array_field_in_struct(struct_ty::LLVM.StructType, elem_stride::Int=0)
+    candidates = Vector{Tuple{Vector{Int}, Int, LLVM.ArrayType}}()
+    _collect_array_fields!(candidates, Int[], struct_ty, 0)
+    isempty(candidates) && return nothing
+    # If stride hint given, find matching array by leaf element size
+    if elem_stride > 0
+        matches = Tuple{Vector{Int}, Int, LLVM.ArrayType}[]
+        for (path, offset, arr_ty) in candidates
+            # Check immediate element size
+            elem_ty = LLVM.eltype(arr_ty)
+            if _compute_type_size(elem_ty) == elem_stride
+                push!(matches, (path, offset, arr_ty))
+            else
+                # Check leaf element size for nested arrays (e.g., [1 x [8 x double]])
+                leaf = elem_ty
+                while leaf isa LLVM.ArrayType
+                    leaf = LLVM.eltype(leaf)
+                end
+                if _compute_type_size(leaf) == elem_stride
+                    push!(matches, (path, offset, arr_ty))
+                end
+            end
+        end
+        if length(matches) == 1
+            return matches[1]
+        elseif length(matches) > 1
+            # Multiple arrays match stride — prefer the largest (most elements)
+            best = argmax(i -> _compute_type_size(matches[i][3]), eachindex(matches))
+            return matches[best]
+        end
+    end
+    # Fallback: return largest array
+    if length(candidates) > 1
+        best = argmax(i -> _compute_type_size(candidates[i][3]), eachindex(candidates))
+        return candidates[best]
+    end
+    path, offset, arr_ty = candidates[1]
+    return (path, offset, arr_ty)
+end
+
+function _collect_array_fields!(results::Vector{Tuple{Vector{Int}, Int, LLVM.ArrayType}},
+                                 path::Vector{Int}, struct_ty::LLVM.StructType, base_offset::Int)
+    member_types = LLVM.elements(struct_ty)
+    running_offset = 0
+    for (i, mt) in enumerate(member_types)
+        member_align = _compute_type_alignment(mt)
+        running_offset = (running_offset + member_align - 1) & ~(member_align - 1)
+        if mt isa LLVM.ArrayType
+            push!(results, (vcat(path, [i - 1]), base_offset + running_offset, mt))
+        elseif mt isa LLVM.StructType
+            _collect_array_fields!(results, vcat(path, [i - 1]), mt, base_offset + running_offset)
+        end
+        running_offset += _compute_type_size(mt)
+    end
 end
 
 """
@@ -1461,14 +1726,24 @@ function _emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
 
     # PhysicalStorageBuffer stores MUST have Aligned memory operand
     if is_psb
-        align = _get_alignment_for_type(LLVM.value_type(value))
-        ptr_id = _fix_psb_ptr_type_for_store!(state, ptr, ptr_id, value)
-        word_count = UInt32(5)  # opcode + ptr + val + mem_operand + alignment
-        push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpStore))
-        push!(state.mod.functions, ptr_id)
-        push!(state.mod.functions, val_id)
-        push!(state.mod.functions, UInt32(0x02))  # Aligned
-        push!(state.mod.functions, align)
+        store_ty = LLVM.value_type(value)
+        # Check if this wide store needs decomposition due to misaligned PSB address.
+        # SPIR-V requires Aligned ≥ scalar_size for PSB (VUID 06314), so we can't
+        # just lower alignment. Instead, decompose i64/double stores at non-8-aligned
+        # addresses into two i32 stores with Aligned 4.
+        llvm_align = UInt32(LLVM.alignment(inst))
+        if _psb_needs_decomposition(state, ptr, store_ty; llvm_align)
+            _emit_psb_decomposed_store!(state, ptr_id, val_id, store_ty)
+        else
+            align = _get_alignment_for_type(store_ty)
+            ptr_id = _fix_psb_ptr_type_for_store!(state, ptr, ptr_id, value)
+            word_count = UInt32(5)  # opcode + ptr + val + mem_operand + alignment
+            push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpStore))
+            push!(state.mod.functions, ptr_id)
+            push!(state.mod.functions, val_id)
+            push!(state.mod.functions, UInt32(0x02))  # Aligned
+            push!(state.mod.functions, align)
+        end
     else
         # For Workgroup/Function stores: if value type doesn't match pointer's pointee type,
         # bitcast the POINTER to match the value type. This happens when:
@@ -1481,7 +1756,14 @@ function _emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
             pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
             if pointee_ty !== nothing
                 val_ty = LLVM.value_type(value)
-                if val_ty != pointee_ty && val_ty isa LLVM.IntegerType && pointee_ty isa LLVM.IntegerType
+                if val_ty isa LLVM.PointerType && pointee_ty isa LLVM.IntegerType && LLVM.width(pointee_ty) == 64
+                    # Storing a PSB pointer into a local variable typed as i64.
+                    # Must OpConvertPtrToU first.
+                    i64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+                    int_id = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, i64_spirv, int_id, val_id)
+                    val_id = int_id
+                elseif val_ty != pointee_ty && val_ty isa LLVM.IntegerType && pointee_ty isa LLVM.IntegerType
                     # Bitcast pointer to match value type
                     val_spirv_ty = map_type!(state.type_ctx, val_ty)
                     new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
@@ -1571,9 +1853,7 @@ function _fix_psb_ptr_type_for_store!(state::SPIRVEmitterState, ptr::LLVM.Value,
     # i32 stored to ptr<[2 x half]> for ComplexF16)
     val_spirv_ty = map_type!(state.type_ctx, val_ty)
     val_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, SC.PhysicalStorageBuffer)
-    new_ptr_id = fresh_id!(state.mod)
-    encode_instruction!(state.mod.functions, Op.OpBitcast, val_ptr_ty, new_ptr_id, ptr_id)
-    return new_ptr_id
+    return _emit_psb_ptr_reinterpret!(state, val_ptr_ty, ptr_id)
 end
 
 # Determine the SPIR-V storage class for a pointer value.
@@ -1645,11 +1925,24 @@ end
 Trace a pointer value back to determine if it originates from an alloca.
 GEPs on allocas produce Function pointers; GEPs on parameters produce PSB pointers.
 """
-function _trace_to_non_alloca(ptr::LLVM.Value)
+function _trace_to_non_alloca(ptr::LLVM.Value, visited::Set{LLVM.Value}=Set{LLVM.Value}())
+    ptr in visited && return true  # Cycle → assume PSB (allocas don't form cycles, PSB loop ptrs do)
+    push!(visited, ptr)
     ptr isa LLVM.AllocaInst && return false
     if ptr isa LLVM.GetElementPtrInst
         base = LLVM.operands(ptr)[1]
-        return _trace_to_non_alloca(base)
+        return _trace_to_non_alloca(base, visited)
+    end
+    # PHI nodes: trace all incoming values. If ANY traces to an alloca,
+    # the pointer may be Function-space — return false (not PSB).
+    if ptr isa LLVM.PHIInst
+        for (val, _) in LLVM.incoming(ptr)
+            if !_trace_to_non_alloca(val, visited)
+                return false
+            end
+        end
+        # All incoming values are non-alloca → PSB
+        return true
     end
     # Function parameter, inttoptr, etc. → PSB
     return true
@@ -1680,6 +1973,293 @@ function _get_alignment_for_type(ty::LLVM.LLVMType)
     else
         return UInt32(4)  # Default alignment
     end
+end
+
+"""
+Check if a PSB pointer is potentially misaligned for a given access type.
+Returns true when the pointer's declared pointee type has smaller alignment than
+the type being loaded/stored. This happens when SROA packs pairs of i32 into i64
+stores through a ptr<i32> that was obtained by GEP into an i32 array — the address
+is only 4-aligned, but i64 requires `Aligned 8`.
+
+SPIR-V validation requires PSB Aligned ≥ scalar type size (VUID 06314),
+so we can't just lower alignment. Instead, callers must decompose wide accesses
+into narrower ones (e.g., i64 → two i32).
+"""
+function _psb_needs_decomposition(state::SPIRVEmitterState, ptr::LLVM.Value, access_ty::LLVM.LLVMType;
+                                   llvm_align::UInt32=UInt32(0))
+    access_align = _get_alignment_for_type(access_ty)
+    access_align <= 4 && return false  # i32/float/i16/i8 never need decomposition
+
+    # Check 0 (universal): LLVM's own alignment on the load/store instruction.
+    # LLVM SROA produces `load i64, ptr %gep, align 1` when the byte GEP offset may not
+    # be naturally aligned. If LLVM says align < type's natural alignment, decompose.
+    # Only applies to GEP-based pointers — arg buffer loads (IntToPtrInst) always have
+    # proper alignment even when LLVM marks them `align 1` (conservative SROA).
+    # EXCEPTION: typed GEPs (e.g., `gep i64, ptr, i64 %idx`) step in multiples of the
+    # source element size, so if the source element's alignment >= access_align, the
+    # result is always naturally aligned (assuming the base pointer is aligned, which
+    # holds for BDA-loaded pointers). Only byte GEPs (`gep i8, ...`) can break alignment.
+    if llvm_align > 0 && llvm_align < access_align && ptr isa LLVM.GetElementPtrInst
+        gep_src_ty_ref = LLVM.API.LLVMGetGEPSourceElementType(ptr)
+        gep_src_ty = LLVM.LLVMType(gep_src_ty_ref)
+        gep_src_align = _get_alignment_for_type(gep_src_ty)
+        if gep_src_align < access_align
+            return true
+        end
+        # typed GEP with source element >= access alignment — preserves alignment, skip
+    end
+
+    # Check 1: pointer's PTM pointee type has smaller alignment
+    pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
+    if pointee_ty !== nothing && !(pointee_ty isa LLVM.PointerType)
+        pointee_align = _get_alignment_for_type(pointee_ty)
+        if pointee_align < access_align
+            return true
+        end
+    end
+
+    # Check 2: known byte offset from integer-arithmetic GEP path
+    offset = get(state.psb_known_byte_offsets, ptr, Int64(-1))
+    if offset > 0
+        addr_align = UInt32(1 << trailing_zeros(offset))
+        if addr_align < access_align
+            return true
+        end
+    end
+
+    # Check 3: tracked pointer alignment from runtime-indexed GEP on composite types.
+    # When a byte GEP has a non-constant offset with a stride not a multiple of 8
+    # (e.g., 60-byte struct array), the result pointer is only stride-aligned.
+    # This alignment is propagated through subsequent constant-offset GEP chains.
+    ptr_align = get(state.psb_ptr_alignment, ptr, UInt32(0))
+    if ptr_align > 0 && ptr_align < access_align
+        return true
+    end
+
+    # Check 4: inttoptr(add(..., const)) — LLVM optimization passes convert
+    # struct field GEPs to ptrtoint + add(constant_offset) + inttoptr chains.
+    # E.g., accessing field at byte offset 140 in a 288-byte struct becomes:
+    #   %addr = ptrtoint ptr %struct_ptr to i64
+    #   %field = add i64 %addr, 140
+    #   %ptr = inttoptr i64 %field to ptr
+    #   %val = load i64, ptr %ptr  ; offset 140 is only 4-aligned, NOT 8!
+    # The GEP-based alignment tracking (checks 2-3) misses this because there's no GEP.
+    if ptr isa LLVM.IntToPtrInst
+        src = LLVM.operands(ptr)[1]
+        const_offset = _extract_constant_offset_from_adds(src)
+        if const_offset != 0
+            addr_align = UInt32(1 << trailing_zeros(abs(const_offset)))
+            if addr_align < access_align
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+"""
+Extract the sum of all constant terms from a chain of `add` instructions.
+Used to determine the constant byte offset in `ptrtoint + add(...) + inttoptr` patterns
+where LLVM has converted GEPs to integer arithmetic.
+
+E.g., `add(add(%base, 140), 8)` → returns 148.
+E.g., `add(%base, add(mul(%idx, 288), 140))` → returns 140.
+Non-add, non-constant operands contribute 0 (assumed dynamic/aligned).
+"""
+function _extract_constant_offset_from_adds(val::LLVM.Value)
+    if val isa LLVM.ConstantInt
+        return convert(Int64, val)
+    end
+    if !(val isa LLVM.Instruction) || LLVM.opcode(val) != LLVM.API.LLVMAdd
+        return Int64(0)
+    end
+    ops = LLVM.operands(val)
+    total = Int64(0)
+    for op in (ops[1], ops[2])
+        if op isa LLVM.ConstantInt
+            total += convert(Int64, op)
+        elseif op isa LLVM.Instruction && LLVM.opcode(op) == LLVM.API.LLVMAdd
+            total += _extract_constant_offset_from_adds(op)
+        end
+    end
+    return total
+end
+
+"""
+Compute and record the minimum guaranteed alignment of a PSB pointer resulting from
+a byte-offset GEP. Two sources of alignment info:
+
+1. **Stride alignment**: when the base is a composite type (struct/array) and the byte
+   offset is non-constant, the stride is the composite size. If stride % 8 != 0,
+   the result pointer may not be 8-aligned for some indices.
+   E.g., 60-byte struct → stride_align = 4, so odd-indexed elements are only 4-aligned.
+
+2. **Base propagation**: if the base pointer already has tracked alignment (from a
+   previous GEP in the chain), propagate it through constant offsets via gcd.
+   E.g., base has align 4, constant offset 8 → gcd(4,8) = 4.
+
+Only records alignment < 8, since 8+ is always sufficient for i64/double stores.
+"""
+function _track_psb_gep_alignment!(state::SPIRVEmitterState, inst::LLVM.Value,
+                                    base_ptr::LLVM.Value, base_pointee::LLVM.LLVMType,
+                                    byte_offset_val::LLVM.Value)
+    # Source 1: stride-based alignment for non-constant offsets on composite types
+    stride_align = UInt32(0)
+    if !(byte_offset_val isa LLVM.ConstantInt) &&
+       (base_pointee isa LLVM.StructType || base_pointee isa LLVM.ArrayType)
+        composite_size = _compute_type_size(base_pointee)
+        if composite_size > 0 && composite_size % 8 != 0
+            stride_align = UInt32(1 << trailing_zeros(composite_size))
+        end
+    end
+
+    # Source 2: base pointer's tracked alignment
+    base_align = get(state.psb_ptr_alignment, base_ptr, UInt32(0))
+
+    # Combine sources
+    result_align = UInt32(0)
+    if stride_align > 0 && base_align > 0
+        result_align = min(stride_align, base_align)
+    elseif stride_align > 0
+        result_align = stride_align
+    elseif base_align > 0
+        if byte_offset_val isa LLVM.ConstantInt
+            offset = convert(Int64, byte_offset_val)
+            if offset != 0
+                offset_align = UInt32(1 << trailing_zeros(abs(offset)))
+                result_align = min(base_align, offset_align)
+            else
+                result_align = base_align
+            end
+        else
+            # Non-constant offset on non-composite base: conservatively keep base alignment
+            result_align = base_align
+        end
+    end
+
+    if result_align > 0 && result_align < 8
+        state.psb_ptr_alignment[inst] = result_align
+    end
+end
+
+"""
+Emit a decomposed PSB store: split a wide store (i64/double) into two i32 stores.
+Used when the PSB pointer isn't aligned to the full type width.
+Uses ConvertPtrToU/ConvertUToPtr for both halves (avoids OpBitcast between PSB
+pointer types which can crash NVIDIA's SPIR-V compiler).
+"""
+function _emit_psb_decomposed_store!(state::SPIRVEmitterState, ptr_id::UInt32, val_id::UInt32,
+                                      val_ty::LLVM.LLVMType)
+    u32_spirv = emit_type_int!(state.mod, UInt32(32), UInt32(0))
+    u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+    u32_ptr_ty = map_pointer_type!(state.type_ctx, u32_spirv, SC.PhysicalStorageBuffer)
+
+    # Convert value to i64 if it's a double
+    raw_val = val_id
+    if val_ty isa LLVM.LLVMDouble
+        raw_val = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpBitcast, u64_spirv, raw_val, val_id)
+    end
+
+    # Extract low 32 bits: OpUConvert i64 → i32
+    lo_id = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpUConvert, u32_spirv, lo_id, raw_val)
+
+    # Extract high 32 bits: shift right by 32, then truncate
+    const_32 = emit_constant_u64!(state.mod, UInt64(32))
+    shifted = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpShiftRightLogical, u64_spirv, shifted, raw_val, const_32)
+    hi_id = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpUConvert, u32_spirv, hi_id, shifted)
+
+    # Get base address as integer
+    base_u64 = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, ptr_id)
+
+    # Low store: ptr → ptr<u32,PSB>, store low 32 bits
+    lo_ptr = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, u32_ptr_ty, lo_ptr, base_u64)
+    push!(state.mod.functions, (UInt32(5) << 16) | UInt32(Op.OpStore))
+    push!(state.mod.functions, lo_ptr)
+    push!(state.mod.functions, lo_id)
+    push!(state.mod.functions, UInt32(0x02))  # Aligned
+    push!(state.mod.functions, UInt32(4))
+
+    # High store: (ptr + 4) → ptr<u32,PSB>, store high 32 bits
+    const_4 = emit_constant_u64!(state.mod, UInt64(4))
+    hi_addr = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpIAdd, u64_spirv, hi_addr, base_u64, const_4)
+    hi_ptr = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, u32_ptr_ty, hi_ptr, hi_addr)
+    push!(state.mod.functions, (UInt32(5) << 16) | UInt32(Op.OpStore))
+    push!(state.mod.functions, hi_ptr)
+    push!(state.mod.functions, hi_id)
+    push!(state.mod.functions, UInt32(0x02))  # Aligned
+    push!(state.mod.functions, UInt32(4))
+end
+
+"""
+Emit a decomposed PSB load: split a wide load (i64/double) into two i32 loads.
+Used when the PSB pointer isn't aligned to the full type width.
+Uses ConvertPtrToU/ConvertUToPtr for both halves (avoids OpBitcast between PSB
+pointer types which can crash NVIDIA's SPIR-V compiler).
+Returns the SPIR-V result ID of the combined value.
+"""
+function _emit_psb_decomposed_load!(state::SPIRVEmitterState, ptr_id::UInt32,
+                                     load_ty::LLVM.LLVMType, result_spirv_ty::UInt32)
+    u32_spirv = emit_type_int!(state.mod, UInt32(32), UInt32(0))
+    u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+    u32_ptr_ty = map_pointer_type!(state.type_ctx, u32_spirv, SC.PhysicalStorageBuffer)
+
+    # Get base address as integer
+    base_u64 = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, ptr_id)
+
+    # Low load: ptr → ptr<u32,PSB>, load low 32 bits
+    lo_ptr = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, u32_ptr_ty, lo_ptr, base_u64)
+    lo_id = fresh_id!(state.mod)
+    push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
+    push!(state.mod.functions, u32_spirv)
+    push!(state.mod.functions, lo_id)
+    push!(state.mod.functions, lo_ptr)
+    push!(state.mod.functions, UInt32(0x02))  # Aligned
+    push!(state.mod.functions, UInt32(4))
+
+    # High load: (ptr + 4) → ptr<u32,PSB>, load high 32 bits
+    const_4 = emit_constant_u64!(state.mod, UInt64(4))
+    hi_addr = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpIAdd, u64_spirv, hi_addr, base_u64, const_4)
+    hi_ptr = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, u32_ptr_ty, hi_ptr, hi_addr)
+    hi_id = fresh_id!(state.mod)
+    push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
+    push!(state.mod.functions, u32_spirv)
+    push!(state.mod.functions, hi_id)
+    push!(state.mod.functions, hi_ptr)
+    push!(state.mod.functions, UInt32(0x02))  # Aligned
+    push!(state.mod.functions, UInt32(4))
+
+    # Combine: lo | (hi << 32)
+    lo_u64 = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpUConvert, u64_spirv, lo_u64, lo_id)
+    hi_u64 = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpUConvert, u64_spirv, hi_u64, hi_id)
+    const_32 = emit_constant_u64!(state.mod, UInt64(32))
+    hi_shifted = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpShiftLeftLogical, u64_spirv, hi_shifted, hi_u64, const_32)
+    combined = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpBitwiseOr, u64_spirv, combined, lo_u64, hi_shifted)
+
+    # If the result should be double, bitcast i64 → double
+    if load_ty isa LLVM.LLVMDouble
+        result_id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpBitcast, result_spirv_ty, result_id, combined)
+        return result_id
+    end
+    return combined
 end
 
 function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
@@ -1781,28 +2361,29 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
             ptm_ty = arr_elem_ty != source_ty ? arr_elem_ty : source_ty
             set_pointee_type!(state.type_ctx.ptm, inst, ptm_ty; priority=5)
             # Record array element origin for folding chained GEPs (e.g. array[a][b] → array[a+b])
-            state.array_element_origin[inst] = (base_id, idx_i32, base_pointee)
+            state.array_element_origin[inst] = (base_id, UInt32[], idx_i32, base_pointee)
         elseif (sc == SC.Function || sc == SC.Private) && haskey(state.array_element_origin, base_ptr)
             # Chained single-index GEP on a Function-SC array element:
             # base was from OpAccessChain into an array, fold by adding indices.
             # gep T, ptr (AccessChain array[a]), b  →  AccessChain array[a + b]
-            arr_base_id, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
+            arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
             new_idx_i32 = _ensure_index_i32!(state, ops[2])
             # Emit IAdd to combine indices
             u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
             combined_idx = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, combined_idx, prev_idx_id, new_idx_i32)
             result_id = fresh_id!(state.mod)
-            word_count = UInt32(5)
+            all_indices = vcat(static_path, [combined_idx])
+            word_count = UInt32(4 + length(all_indices))
             push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
             push!(state.mod.functions, result_ptr_ty)
             push!(state.mod.functions, result_id)
             push!(state.mod.functions, arr_base_id)
-            push!(state.mod.functions, combined_idx)
+            append!(state.mod.functions, all_indices)
             state.value_map[inst] = result_id
             set_pointee_type!(state.type_ctx.ptm, inst, source_ty; priority=5)
             # Propagate origin for further chaining
-            state.array_element_origin[inst] = (arr_base_id, combined_idx, arr_type)
+            state.array_element_origin[inst] = (arr_base_id, static_path, combined_idx, arr_type)
         else
             idx = get_value_id!(state, ops[2])
             if sc == SC.PhysicalStorageBuffer
@@ -1812,8 +2393,25 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     idx_llvm_ty=LLVM.value_type(ops[2]))
             elseif sc == SC.Function
                 # Function storage class: OpPtrAccessChain is NOT valid.
-                # Use base pointer directly; load/store handlers resolve type mismatches.
-                result_id = base_id
+                base_pointee = get_pointee_type(state.type_ctx.ptm, base_ptr)
+                leaf_count = base_pointee !== nothing ? _count_scalar_elements(base_pointee, source_ty) : 0
+                if leaf_count > 1
+                    # Flat indexing into a composite alloca (e.g. gep float, ptr %alloca_of_{[2x[8xfloat]]}, i64 %idx).
+                    # Decompose the flat index into OpAccessChain indices using div/mod.
+                    flat_idx_i32 = _ensure_index_i32!(state, ops[2])
+                    ac_indices = _decompose_flat_index_for_composite!(state, base_pointee, source_ty, flat_idx_i32)
+                    result_id = fresh_id!(state.mod)
+                    word_count = UInt32(4 + length(ac_indices))
+                    push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                    push!(state.mod.functions, result_ptr_ty)
+                    push!(state.mod.functions, result_id)
+                    push!(state.mod.functions, base_id)
+                    append!(state.mod.functions, ac_indices)
+                else
+                    # Simple scalar or no decomposition possible: use base pointer directly;
+                    # load/store handlers resolve type mismatches.
+                    result_id = base_id
+                end
             elseif sc == SC.Private
                 # Private storage class: OpPtrAccessChain is NOT valid.
                 # Use OpAccessChain with element index for Private array globals.
@@ -1835,6 +2433,30 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
         first_idx_val = first_idx isa LLVM.ConstantInt ? convert(Int64, first_idx) : nothing
 
         if first_idx_val !== nothing && first_idx_val == 0
+            # Degenerate GEP on a scalar base: LLVM may emit extra trailing zero
+            # indices (e.g. gep <scalar>, ptr %p, 0, 0). In SPIR-V this cannot be
+            # encoded as OpAccessChain on a non-composite pointer.
+            # Treat all-zero trailing indices as a no-op pointer projection.
+            base_pointee = get_pointee_type(state.type_ctx.ptm, base_ptr)
+            if base_pointee !== nothing &&
+               !(base_pointee isa LLVM.StructType) &&
+               !(base_pointee isa LLVM.ArrayType) &&
+               length(ops) > 3
+                trailing_all_zero = true
+                for i in 3:length(ops)
+                    idx_op = ops[i]
+                    if !(idx_op isa LLVM.ConstantInt) || convert(Int64, idx_op) != 0
+                        trailing_all_zero = false
+                        break
+                    end
+                end
+                if trailing_all_zero
+                    state.value_map[inst] = base_id
+                    set_pointee_type!(state.type_ctx.ptm, inst, base_pointee; priority=5)
+                    return
+                end
+            end
+
             # First index is 0 → use OpAccessChain with remaining indices
             index_ids = UInt32[]
 
@@ -1917,14 +2539,20 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                 end
 
                 # base_addr + byte_offset → result pointer
-                base_u64 = fresh_id!(state.mod)
-                encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, base_id)
+                base_u64 = _cached_psb_ptr_to_u64!(state, base_id)
                 elem_addr_id = fresh_id!(state.mod)
                 encode_instruction!(state.mod.functions, Op.OpIAdd, u64_spirv, elem_addr_id, base_u64, byte_offset_id)
                 result_id = fresh_id!(state.mod)
                 encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ptr_ty, result_id, elem_addr_id)
                 state.value_map[inst] = result_id
                 set_pointee_type!(state.type_ctx.ptm, inst, result_pointee; priority=3)
+                # Record byte offset for alignment checking in store/load.
+                # Without this, Check 2 in _psb_needs_decomposition can't detect
+                # misaligned i64 loads through type-punned GEPs (e.g., VPMaterialEvalWorkItem
+                # field at offset 140 in a 288-byte struct → 140 % 8 = 4, not 8-aligned).
+                if all_const && total_byte_offset > 0
+                    state.psb_known_byte_offsets[inst] = total_byte_offset
+                end
             else
             for i in 3:length(ops)
                 push!(index_ids, _ensure_index_i32!(state, ops[i]))
@@ -2135,31 +2763,71 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
         if byte_offset_val isa LLVM.ConstantInt && elem_size > 0
             const_offset = convert(Int64, byte_offset_val)
             remainder = const_offset % elem_size
-            if remainder != 0 && (elem_ty isa LLVM.ArrayType || elem_ty isa LLVM.StructType)
-                # Sub-element access: decompose recursively through nested types
-                index_path, leaf_ty = _find_array_nested_path(base_pointee, const_offset)
-                if index_path !== nothing
-                    leaf_spirv = if sc == SC.Workgroup
-                        map_workgroup_type!(state.type_ctx, leaf_ty)
+            if remainder != 0
+                if sc == SC.PhysicalStorageBuffer
+                    # PSB non-aligned byte offset: use direct integer arithmetic.
+                    # OpAccessChain(byte_offset / elem_size) truncates sub-element offsets
+                    # (e.g., byte 21 into [12 x i32] → 21/4=5 → byte 20, losing +1).
+                    # Instead, use ConvertPtrToU + IAdd(byte_offset) + ConvertUToPtr.
+                    result_pointee = _infer_type_from_gep_users(inst)
+                    if result_pointee === nothing
+                        result_pointee = LLVM.IntType(8)  # default to byte
+                    end
+                    effective_pointee = if result_pointee isa LLVM.PointerType
+                        LLVM.IntType(64)
                     else
-                        map_type!(state.type_ctx, leaf_ty)
+                        result_pointee
                     end
-                    result_ptr_ty = map_pointer_type!(state.type_ctx, leaf_spirv, sc)
-                    u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
-                    idx_ids = UInt32[]
-                    for idx_val in index_path
-                        push!(idx_ids, _emit_int_constant!(state, LLVM.IntType(32), Int64(idx_val)))
+                    pointee_spirv = map_type!(state.type_ctx, effective_pointee)
+                    result_ptr_ty = map_pointer_type!(state.type_ctx, pointee_spirv, SC.PhysicalStorageBuffer)
+
+                    u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+                    base_u64 = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, base_id)
+
+                    bo_u64 = byte_offset_id
+                    if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) < 64
+                        bo_u64 = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, Op.OpSConvert, u64_spirv, bo_u64, byte_offset_id)
                     end
+
+                    elem_addr = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpIAdd, u64_spirv, elem_addr, base_u64, bo_u64)
+
                     result_id = fresh_id!(state.mod)
-                    word_count = UInt32(4 + length(idx_ids))
-                    push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
-                    push!(state.mod.functions, result_ptr_ty)
-                    push!(state.mod.functions, result_id)
-                    push!(state.mod.functions, base_id)
-                    append!(state.mod.functions, idx_ids)
+                    encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ptr_ty, result_id, elem_addr)
+
                     state.value_map[inst] = result_id
-                    set_pointee_type!(state.type_ctx.ptm, inst, leaf_ty; priority=4)
+                    set_pointee_type!(state.type_ctx.ptm, inst, effective_pointee; priority=4)
+                    # Record byte offset for alignment computation in store/load
+                    state.psb_known_byte_offsets[inst] = const_offset
                     return
+                elseif elem_ty isa LLVM.ArrayType || elem_ty isa LLVM.StructType
+                    # Sub-element access: decompose recursively through nested types
+                    index_path, leaf_ty = _find_array_nested_path(base_pointee, const_offset)
+                    if index_path !== nothing
+                        leaf_spirv = if sc == SC.Workgroup
+                            map_workgroup_type!(state.type_ctx, leaf_ty)
+                        else
+                            map_type!(state.type_ctx, leaf_ty)
+                        end
+                        result_ptr_ty = map_pointer_type!(state.type_ctx, leaf_spirv, sc)
+                        u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+                        idx_ids = UInt32[]
+                        for idx_val in index_path
+                            push!(idx_ids, _emit_int_constant!(state, LLVM.IntType(32), Int64(idx_val)))
+                        end
+                        result_id = fresh_id!(state.mod)
+                        word_count = UInt32(4 + length(idx_ids))
+                        push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                        push!(state.mod.functions, result_ptr_ty)
+                        push!(state.mod.functions, result_id)
+                        push!(state.mod.functions, base_id)
+                        append!(state.mod.functions, idx_ids)
+                        state.value_map[inst] = result_id
+                        set_pointee_type!(state.type_ctx.ptm, inst, leaf_ty; priority=4)
+                        return
+                    end
                 end
             end
         end
@@ -2203,7 +2871,7 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
         set_pointee_type!(state.type_ctx.ptm, inst, elem_ty; priority=4)
         # Register array element origin so chained byte-offset GEPs can fold offsets.
         # E.g., gep i8, (gep i8, ptr @alloca, i64 %a), i64 %b  → AccessChain @alloca[a/sz + b/sz]
-        state.array_element_origin[inst] = (base_id, idx_i32, base_pointee)
+        state.array_element_origin[inst] = (base_id, UInt32[], idx_i32, base_pointee)
         return
     end
 
@@ -2242,6 +2910,67 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
                 return
             end
 
+            # Offset exceeds struct size or falls in padding.
+            # If the base came from a dynamic array element access (array_element_origin),
+            # the constant offset may span across multiple array elements.
+            # E.g., gep i8, (AccessChain arr[%dyn]), 32 where arr element is 16 bytes
+            # → the offset 32 means +2 elements from the dynamic index.
+            if (sc == SC.Function || sc == SC.Private) && haskey(state.array_element_origin, base_ptr)
+                arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
+                arr_elem_ty = LLVM.eltype(arr_type)
+                arr_elem_size = _compute_type_size(arr_elem_ty)
+                if arr_elem_size > 0
+                    arr_idx_adjust = offset ÷ arr_elem_size
+                    sub_offset = offset % arr_elem_size
+
+                    # Adjust the dynamic array index
+                    adj_id = emit_constant_u32!(state.mod, UInt32(arr_idx_adjust))
+                    u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+                    combined_idx = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, combined_idx, prev_idx_id, adj_id)
+
+                    if sub_offset == 0
+                        # Exact element boundary: result is pointer to array element
+                        arr_elem_spirv = map_type!(state.type_ctx, arr_elem_ty)
+                        result_ptr_ty = map_pointer_type!(state.type_ctx, arr_elem_spirv, sc)
+                        all_indices = vcat(static_path, [combined_idx])
+                        result_id = fresh_id!(state.mod)
+                        word_count = UInt32(4 + length(all_indices))
+                        push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                        push!(state.mod.functions, result_ptr_ty)
+                        push!(state.mod.functions, result_id)
+                        push!(state.mod.functions, arr_base_id)
+                        append!(state.mod.functions, all_indices)
+                        state.value_map[inst] = result_id
+                        set_pointee_type!(state.type_ctx.ptm, inst, arr_elem_ty; priority=4)
+                        state.array_element_origin[inst] = (arr_base_id, static_path, combined_idx, arr_type)
+                        return
+                    elseif arr_elem_ty isa LLVM.StructType
+                        # Sub-element offset: access array element then struct field
+                        sub_path, sub_leaf = _find_struct_member_path_by_offset(arr_elem_ty, sub_offset)
+                        if sub_path !== nothing
+                            sub_leaf_spirv = map_type!(state.type_ctx, sub_leaf)
+                            result_ptr_ty = map_pointer_type!(state.type_ctx, sub_leaf_spirv, sc)
+                            all_indices = copy(static_path)
+                            push!(all_indices, combined_idx)
+                            for idx_val in sub_path
+                                push!(all_indices, emit_constant_u32!(state.mod, UInt32(idx_val)))
+                            end
+                            result_id = fresh_id!(state.mod)
+                            word_count = UInt32(4 + length(all_indices))
+                            push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                            push!(state.mod.functions, result_ptr_ty)
+                            push!(state.mod.functions, result_id)
+                            push!(state.mod.functions, arr_base_id)
+                            append!(state.mod.functions, all_indices)
+                            state.value_map[inst] = result_id
+                            set_pointee_type!(state.type_ctx.ptm, inst, sub_leaf; priority=4)
+                            return
+                        end
+                    end
+                end
+            end
+
             # Offset falls in struct padding (no member at this offset).
             # For Function storage class, we can't use OpPtrAccessChain.
             # Use the base pointer directly — the load handler (_resolve_struct_field_load!)
@@ -2251,6 +2980,202 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
                 state.value_map[inst] = base_id
                 set_pointee_type!(state.type_ctx.ptm, inst, base_pointee; priority=4)
                 return
+            end
+        else
+            # Dynamic byte offset on struct (Function/Private SC).
+
+            # First check: if the base is an array element (from a previous dynamic GEP),
+            # the dynamic offset may be advancing to another array element, not accessing
+            # a field within the struct. This happens with chained dynamic byte-GEPs:
+            #   gep1 = gep i8, ptr %alloca, i64 (48 + %a*16)  → arr[%a]
+            #   gep2 = gep i8, ptr %gep1, i64 (%b*16)         → arr[%a + %b]
+            # Without this check, gep2 would try to access a field within struct_28 at
+            # offset %b*16, which is wrong when %b selects another array element.
+            if (sc == SC.Function || sc == SC.Private) && haskey(state.array_element_origin, base_ptr)
+                arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
+                arr_elem_ty = LLVM.eltype(arr_type)
+                arr_elem_size = _compute_type_size(arr_elem_ty)
+                if arr_elem_size > 0
+                    # Compute the dynamic additional index: byte_offset / elem_size
+                    sz_id = _emit_int_constant!(state, idx_ty, Int64(arr_elem_size))
+                    dyn_idx_id = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpSDiv, idx_spirv_ty, dyn_idx_id, byte_offset_id, sz_id)
+
+                    # Combined index = previous dynamic index + new dynamic index
+                    u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+                    dyn_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
+                        conv_id = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, dyn_idx_id)
+                        conv_id
+                    else
+                        dyn_idx_id
+                    end
+                    combined_idx = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, combined_idx, prev_idx_id, dyn_idx_i32)
+
+                    # Check for sub-element offset (byte_offset % elem_size != 0)
+                    # When non-zero, we need to access a field within the target element.
+                    # For now, handle the simple case (exact element boundary) and
+                    # the sub-element case (struct field within the element).
+                    arr_elem_spirv = if sc == SC.Workgroup
+                        map_workgroup_type!(state.type_ctx, arr_elem_ty)
+                    else
+                        map_type!(state.type_ctx, arr_elem_ty)
+                    end
+                    result_ptr_ty = map_pointer_type!(state.type_ctx, arr_elem_spirv, sc)
+                    all_indices = copy(static_path)
+                    push!(all_indices, combined_idx)
+
+                    result_id = fresh_id!(state.mod)
+                    word_count = UInt32(4 + length(all_indices))
+                    push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                    push!(state.mod.functions, result_ptr_ty)
+                    push!(state.mod.functions, result_id)
+                    push!(state.mod.functions, arr_base_id)
+                    append!(state.mod.functions, all_indices)
+                    state.value_map[inst] = result_id
+                    set_pointee_type!(state.type_ctx.ptm, inst, arr_elem_ty; priority=4)
+                    state.array_element_origin[inst] = (arr_base_id, static_path, combined_idx, arr_type)
+                    return
+                end
+            end
+
+            # Find the array field within the struct and emit a dynamic AccessChain.
+            # Pattern: gep i8, ptr %struct_alloca, i64 %dynamic_offset
+            # where the struct contains an array field (e.g., { ptr, [N x i64] })
+            # and the dynamic offset targets elements within that array.
+            if sc == SC.Function || sc == SC.Private
+                # Extract stride hint from the byte offset expression:
+                # shl i64 %x, N → stride = 2^N
+                # mul i64 %x, N → stride = N
+                elem_stride = 0
+                byte_offset_val = ops[2]
+                if byte_offset_val isa LLVM.Instruction
+                    bo_opcode = LLVM.opcode(byte_offset_val)
+                    bo_ops = LLVM.operands(byte_offset_val)
+                    if bo_opcode == LLVM.API.LLVMShl && length(bo_ops) >= 2 && bo_ops[2] isa LLVM.ConstantInt
+                        shift = convert(Int64, bo_ops[2])
+                        elem_stride = 1 << shift
+                    elseif bo_opcode == LLVM.API.LLVMMul && length(bo_ops) >= 2
+                        if bo_ops[1] isa LLVM.ConstantInt
+                            elem_stride = convert(Int64, bo_ops[1])
+                        elseif bo_ops[2] isa LLVM.ConstantInt
+                            elem_stride = convert(Int64, bo_ops[2])
+                        end
+                    end
+                end
+                arr_info = _find_array_field_in_struct(base_pointee, elem_stride)
+                if arr_info !== nothing
+                    arr_path, arr_byte_offset, arr_ty = arr_info
+                    arr_elem_ty = LLVM.eltype(arr_ty)
+                    arr_elem_size = _compute_type_size(arr_elem_ty)
+                    if arr_elem_size > 0
+                        # When the array element is itself composite (nested arrays/structs),
+                        # compute a flat scalar index and decompose through the full hierarchy.
+                        # E.g., {[2 x [8 x float]]} with byte offset (idx*4+32):
+                        #   flat_idx = byte_offset / 4, then decompose into [outer, inner] indices.
+                        leaf_ty = arr_elem_ty
+                        while leaf_ty isa LLVM.ArrayType
+                            leaf_ty = LLVM.eltype(leaf_ty)
+                        end
+                        leaf_size = _compute_type_size(leaf_ty)
+                        if leaf_size > 0 && arr_elem_ty isa LLVM.ArrayType
+                            # Nested composite: decompose byte offset into flat scalar index
+                            # flat_idx = (byte_offset - arr_byte_offset) / leaf_size
+                            adjusted_id = byte_offset_id
+                            if arr_byte_offset > 0
+                                off_id = _emit_int_constant!(state, idx_ty, Int64(arr_byte_offset))
+                                adjusted_id = fresh_id!(state.mod)
+                                encode_instruction!(state.mod.functions, Op.OpISub, idx_spirv_ty, adjusted_id, byte_offset_id, off_id)
+                            end
+                            flat_idx_id = adjusted_id
+                            if leaf_size > 1
+                                sz_id = _emit_int_constant!(state, idx_ty, Int64(leaf_size))
+                                flat_idx_id = fresh_id!(state.mod)
+                                encode_instruction!(state.mod.functions, Op.OpSDiv, idx_spirv_ty, flat_idx_id, adjusted_id, sz_id)
+                            end
+                            # Convert to i32 for OpAccessChain
+                            flat_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
+                                u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+                                conv_id = fresh_id!(state.mod)
+                                encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, flat_idx_id)
+                                conv_id
+                            else
+                                flat_idx_id
+                            end
+                            # Decompose flat index through the array hierarchy
+                            decomposed = _decompose_flat_index_for_composite!(state, arr_ty, leaf_ty, flat_idx_i32)
+                            leaf_spirv = map_type!(state.type_ctx, leaf_ty)
+                            result_ptr_ty = map_pointer_type!(state.type_ctx, leaf_spirv, sc)
+                            all_indices = UInt32[]
+                            for idx_val in arr_path
+                                push!(all_indices, emit_constant_u32!(state.mod, UInt32(idx_val)))
+                            end
+                            append!(all_indices, decomposed)
+                            result_id = fresh_id!(state.mod)
+                            word_count = UInt32(4 + length(all_indices))
+                            push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                            push!(state.mod.functions, result_ptr_ty)
+                            push!(state.mod.functions, result_id)
+                            push!(state.mod.functions, base_id)
+                            append!(state.mod.functions, all_indices)
+                            state.value_map[inst] = result_id
+                            set_pointee_type!(state.type_ctx.ptm, inst, leaf_ty; priority=4)
+                            return
+                        end
+
+                        # Simple (non-nested) array element: divide byte offset by element size
+                        arr_elem_spirv = map_type!(state.type_ctx, arr_elem_ty)
+                        result_ptr_ty = map_pointer_type!(state.type_ctx, arr_elem_spirv, sc)
+
+                        # Subtract the array field's byte offset
+                        adjusted_id = byte_offset_id
+                        if arr_byte_offset > 0
+                            off_id = _emit_int_constant!(state, idx_ty, Int64(arr_byte_offset))
+                            adjusted_id = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpISub, idx_spirv_ty, adjusted_id, byte_offset_id, off_id)
+                        end
+
+                        # Divide by element size
+                        dyn_idx_id = adjusted_id
+                        if arr_elem_size > 1
+                            sz_id = _emit_int_constant!(state, idx_ty, Int64(arr_elem_size))
+                            dyn_idx_id = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpSDiv, idx_spirv_ty, dyn_idx_id, adjusted_id, sz_id)
+                        end
+
+                        # Convert to i32 for OpAccessChain
+                        dyn_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
+                            u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+                            conv_id = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, dyn_idx_id)
+                            conv_id
+                        else
+                            dyn_idx_id
+                        end
+
+                        # Build AccessChain: base, <static path to array>, dynamic_index
+                        all_indices = UInt32[]
+                        for idx_val in arr_path
+                            push!(all_indices, emit_constant_u32!(state.mod, UInt32(idx_val)))
+                        end
+                        push!(all_indices, dyn_idx_i32)
+
+                        result_id = fresh_id!(state.mod)
+                        word_count = UInt32(4 + length(all_indices))
+                        push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                        push!(state.mod.functions, result_ptr_ty)
+                        push!(state.mod.functions, result_id)
+                        push!(state.mod.functions, base_id)
+                        append!(state.mod.functions, all_indices)
+                        state.value_map[inst] = result_id
+                        set_pointee_type!(state.type_ctx.ptm, inst, arr_elem_ty; priority=4)
+                        # Store static path (indices BEFORE the dynamic index) for chained GEPs
+                        static_path = UInt32[emit_constant_u32!(state.mod, UInt32(idx_val)) for idx_val in arr_path]
+                        state.array_element_origin[inst] = (base_id, static_path, dyn_idx_i32, arr_ty)
+                        return
+                    end
+                end
             end
         end
     end
@@ -2289,8 +3214,7 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
         # PSB: use manual byte-offset arithmetic (OpPtrAccessChain broken on AMD RADV)
         # byte_offset_id is already the byte offset, just add it directly
         u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
-        base_u64 = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, base_id)
+        base_u64 = _cached_psb_ptr_to_u64!(state, base_id)
         # Widen byte offset to u64 if needed
         bo_u64 = byte_offset_id
         if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) < 64
@@ -2301,6 +3225,18 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
         encode_instruction!(state.mod.functions, Op.OpIAdd, u64_spirv, elem_addr, base_u64, bo_u64)
         result_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ptr_ty, result_id, elem_addr)
+        # Track alignment for PSB misalignment detection (Fix #5).
+        # When stride (composite size) isn't a multiple of 8, or base has tracked alignment,
+        # record so _psb_needs_decomposition() can detect i64 stores needing decomposition.
+        _track_psb_gep_alignment!(state, inst, base_ptr, base_pointee, ops[2])
+        # Record constant byte offset for alignment checking in store/load (Fix #8b).
+        byte_offset_val = ops[2]
+        if byte_offset_val isa LLVM.ConstantInt
+            const_bo = convert(Int64, byte_offset_val)
+            if const_bo != 0
+                state.psb_known_byte_offsets[inst] = const_bo
+            end
+        end
     elseif sc == SC.Function || sc == SC.Private
         # Function/Private storage class: OpPtrAccessChain is NOT valid (VUID-StandaloneSpirv-Base-07650).
         if sc == SC.Private
@@ -2310,7 +3246,7 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
             # Chained byte-offset GEP on a Function-SC array element pointer:
             # base was from OpAccessChain into an array, fold by adding the element index offset.
             # E.g., gep i8, ptr (AccessChain array[a]), -4  →  AccessChain array[a + (-4/elemsize)]
-            arr_base_id, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
+            arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
             # idx_id is already byte_offset / elem_size (computed above as SDiv)
             # Convert idx_id to i32 for OpAccessChain
             new_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
@@ -2325,14 +3261,15 @@ function _emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementP
             combined_idx = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, combined_idx, prev_idx_id, new_idx_i32)
             result_id = fresh_id!(state.mod)
-            word_count = UInt32(5)
+            all_indices = vcat(static_path, [combined_idx])
+            word_count = UInt32(4 + length(all_indices))
             push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
             push!(state.mod.functions, result_ptr_ty)
             push!(state.mod.functions, result_id)
             push!(state.mod.functions, arr_base_id)
-            push!(state.mod.functions, combined_idx)
+            append!(state.mod.functions, all_indices)
             # Propagate origin for further chaining
-            state.array_element_origin[inst] = (arr_base_id, combined_idx, arr_type)
+            state.array_element_origin[inst] = (arr_base_id, static_path, combined_idx, arr_type)
         else
             # Function: use base pointer directly, let load/store handlers resolve.
             result_id = base_id
@@ -2370,6 +3307,26 @@ function _emit_int_constant!(state::SPIRVEmitterState, ty::LLVM.LLVMType, value:
 end
 
 """
+    _cached_psb_ptr_to_u64!(state, base_id) -> UInt32
+
+Emit OpConvertPtrToU for a PSB pointer, with block-local caching.
+If the same `base_id` was already converted in the current block,
+returns the cached u64 result ID instead of emitting a new instruction.
+This eliminates redundant ptr→u64 conversions when the same PSB pointer
+is accessed multiple times in one block (common in struct field accesses).
+"""
+function _cached_psb_ptr_to_u64!(state::SPIRVEmitterState, base_id::UInt32)
+    key = (base_id, state.current_block_label)
+    cached = get(state.psb_ptr_to_u64, key, nothing)
+    cached !== nothing && return cached
+    u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+    base_u64 = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, base_id)
+    state.psb_ptr_to_u64[key] = base_u64
+    return base_u64
+end
+
+"""
 Emit a PSB byte-offset GEP when the base pointee is an opaque PointerType.
 This happens after SROA decomposes BDA argument struct loads into individual
 field accesses via byte-offset GEPs. We infer the actual access type from
@@ -2402,8 +3359,7 @@ function _emit_psb_byte_offset_with_user_type!(state::SPIRVEmitterState,
 
     # PSB byte arithmetic: ptr→u64, add byte_offset, u64→ptr
     u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
-    base_u64 = fresh_id!(state.mod)
-    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, base_id)
+    base_u64 = _cached_psb_ptr_to_u64!(state, base_id)
 
     bo_u64 = byte_offset_id
     if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) < 64
@@ -2485,9 +3441,8 @@ function _emit_psb_ptr_arithmetic!(state::SPIRVEmitterState, base_id::UInt32,
     stride = UInt64(_compute_type_size(element_ty))
     u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
 
-    # OpConvertPtrToU: base_ptr → u64
-    base_u64 = fresh_id!(state.mod)
-    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, base_id)
+    # OpConvertPtrToU: base_ptr → u64 (cached per block)
+    base_u64 = _cached_psb_ptr_to_u64!(state, base_id)
 
     # Ensure index is u64 — widen i32 indices to i64
     idx_u64 = idx_id
@@ -2527,6 +3482,106 @@ function _emit_u64_constant!(mod::SPIRVModule, value::UInt64)
 end
 
 """
+    _emit_function_ptr_word!(state, llvm_val, word_idx, ptr_ty) -> UInt32
+
+Get a SPIR-V pointer to word `word_idx` (0-based) within a Function-class alloca.
+Walks the LLVM IR operand chain to find the base alloca and compute the total word
+offset from GEPs, then uses OpAccessChain to index into the alloca's array type.
+
+OpConvertPtrToU is invalid for Function storage class pointers (SPIR-V spec requires
+Physical storage class). Using integer arithmetic on Function pointers produces
+data corruption on NVIDIA (wrong values read/written in loops).
+"""
+function _emit_function_ptr_word!(state::SPIRVEmitterState, llvm_val::LLVM.Value,
+                                   word_idx::Int, ptr_ty::UInt32)
+    # Walk LLVM IR operand chain to find the alloca base and total byte offset
+    current = llvm_val
+    total_byte_offset = 0
+    while true
+        if current isa LLVM.AllocaInst
+            break
+        elseif current isa LLVM.GetElementPtrInst
+            # Compute byte offset from this GEP's indices
+            gep_ops = LLVM.operands(current)
+            source_ty_gep = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(current))
+            byte_offset = _compute_gep_constant_byte_offset(source_ty_gep, gep_ops)
+            total_byte_offset += byte_offset
+            current = gep_ops[1]  # walk up to base pointer
+        elseif current isa LLVM.BitCastInst
+            current = LLVM.operands(current)[1]
+        else
+            # Fallback: use array_element_origin if available
+            if haskey(state.array_element_origin, llvm_val)
+                arr_base_id, base_idx_id, _ = state.array_element_origin[llvm_val]
+                u32_ty = emit_type_int!(state.mod, UInt32(32), UInt32(0))
+                word_const = emit_constant_u32!(state.mod, UInt32(word_idx))
+                if word_idx == 0
+                    result_id = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpAccessChain, ptr_ty,
+                                        result_id, arr_base_id, base_idx_id)
+                    return result_id
+                else
+                    combined_idx = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty,
+                                        combined_idx, base_idx_id, word_const)
+                    result_id = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpAccessChain, ptr_ty,
+                                        result_id, arr_base_id, combined_idx)
+                    return result_id
+                end
+            end
+            error("Cannot resolve Function-class pointer to alloca for memcpy/memset: $(typeof(current)) = $current")
+        end
+    end
+
+    # current is now the AllocaInst; compute the total word index
+    alloca_id = get_value_id!(state, current)
+    total_word_idx = total_byte_offset ÷ 4 + word_idx
+    word_const = emit_constant_u32!(state.mod, UInt32(total_word_idx))
+    result_id = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpAccessChain, ptr_ty,
+                        result_id, alloca_id, word_const)
+    return result_id
+end
+
+"""
+Compute the constant byte offset of a GEP from its source type and operands.
+Used by `_emit_function_ptr_word!` to resolve alloca offsets through GEP chains.
+"""
+function _compute_gep_constant_byte_offset(source_ty::LLVM.LLVMType, ops)
+    total = 0
+    # First index (ops[2]) is the base element offset: offset = idx * sizeof(source_ty)
+    first_idx = ops[2]
+    if first_idx isa LLVM.ConstantInt
+        idx_val = convert(Int64, first_idx)
+        if idx_val != 0
+            total += idx_val * _compute_type_size(source_ty)
+        end
+    end
+
+    # Remaining indices drill into the type hierarchy
+    current_ty = source_ty
+    for i in 3:length(ops)
+        idx_op = ops[i]
+        idx_val = idx_op isa LLVM.ConstantInt ? convert(Int64, idx_op) : 0
+        if current_ty isa LLVM.StructType
+            elems = LLVM.elements(current_ty)
+            for j in 0:(idx_val - 1)
+                total += _compute_type_size(elems[j + 1])
+            end
+            current_ty = elems[idx_val + 1]
+        elseif current_ty isa LLVM.ArrayType
+            elem_ty = LLVM.eltype(current_ty)
+            total += idx_val * _compute_type_size(elem_ty)
+            current_ty = elem_ty
+        else
+            total += idx_val * _compute_type_size(current_ty)
+        end
+    end
+    return total
+end
+
+"""
 Emit memset as scalar store pairs via PSB pointer arithmetic.
 LLVM uses memset for zeroing structs (e.g., zero(ComplexF64) → memset 0, 16 bytes).
 """
@@ -2553,6 +3608,7 @@ function _emit_memset!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     dest_id = get_value_id!(state, dest_ptr)
     dest_sc = _get_pointer_storage_class(dest_ptr)
     is_dest_psb = dest_sc == SC.PhysicalStorageBuffer
+    is_dest_function = dest_sc == SC.Function
 
     u32_ty = emit_type_int!(state.mod, UInt32(32), UInt32(0))
     u64_ty = emit_type_int!(state.mod, UInt32(64), UInt32(0))
@@ -2567,28 +3623,37 @@ function _emit_memset!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     end
     fill_const = map_constant!(state.type_ctx, LLVM.ConstantInt(LLVM.IntType(32), fill_word))
 
-    dest_u64 = fresh_id!(state.mod)
-    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_ty, dest_u64, dest_id)
-
     nwords = nbytes ÷ 4
-    for i in 0:(nwords - 1)
-        offset = UInt64(i * 4)
-        elem_id = if offset == 0
-            bc_id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.functions, Op.OpBitcast, dest_ptr_ty, bc_id, dest_id)
-            bc_id
-        else
-            offset_const = _emit_u64_constant!(state.mod, offset)
-            addr_id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.functions, Op.OpIAdd, u64_ty, addr_id, dest_u64, offset_const)
-            ptr_id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, dest_ptr_ty, ptr_id, addr_id)
-            ptr_id
-        end
-        if is_dest_psb
-            encode_instruction!(state.mod.functions, Op.OpStore, elem_id, fill_const, UInt32(0x02), UInt32(4))
-        else
+
+    if is_dest_function
+        # Function storage class: use OpAccessChain instead of integer arithmetic
+        # (OpConvertPtrToU is invalid for Function pointers)
+        for i in 0:(nwords - 1)
+            elem_id = _emit_function_ptr_word!(state, dest_ptr, i, dest_ptr_ty)
             encode_instruction!(state.mod.functions, Op.OpStore, elem_id, fill_const)
+        end
+    else
+        # PSB or other storage class: use integer arithmetic
+        dest_u64 = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_ty, dest_u64, dest_id)
+
+        for i in 0:(nwords - 1)
+            offset = UInt64(i * 4)
+            addr_u64 = if offset == 0
+                dest_u64
+            else
+                offset_const = _emit_u64_constant!(state.mod, offset)
+                addr_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpIAdd, u64_ty, addr_id, dest_u64, offset_const)
+                addr_id
+            end
+            elem_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, dest_ptr_ty, elem_id, addr_u64)
+            if is_dest_psb
+                encode_instruction!(state.mod.functions, Op.OpStore, elem_id, fill_const, UInt32(0x02), UInt32(4))
+            else
+                encode_instruction!(state.mod.functions, Op.OpStore, elem_id, fill_const)
+            end
         end
     end
 end
@@ -2631,12 +3696,25 @@ function _emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     # Memory operands for aligned access
     is_src_psb = src_sc == SC.PhysicalStorageBuffer
     is_dest_psb = dest_sc == SC.PhysicalStorageBuffer
+    is_src_function = src_sc == SC.Function
+    is_dest_function = dest_sc == SC.Function
 
-    # Convert source and dest base pointers to u64 for arithmetic
-    src_u64 = fresh_id!(state.mod)
-    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_ty, src_u64, src_id)
-    dest_u64 = fresh_id!(state.mod)
-    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_ty, dest_u64, dest_id)
+    # Only compute u64 addresses for non-Function pointers
+    # (OpConvertPtrToU is invalid for Function storage class)
+    src_u64 = if !is_src_function
+        id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_ty, id, src_id)
+        id
+    else
+        UInt32(0)  # unused
+    end
+    dest_u64 = if !is_dest_function
+        id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_ty, id, dest_id)
+        id
+    else
+        UInt32(0)  # unused
+    end
 
     # Copy 4 bytes at a time (i32)
     nwords = nbytes ÷ 4
@@ -2645,44 +3723,51 @@ function _emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     for i in 0:(nwords - 1)
         offset = UInt64(i * 4)
 
-        # Source pointer: base + offset
-        src_elem_id = if offset == 0
-            # Bitcast base pointer to i32*
-            bc_id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.functions, Op.OpBitcast, src_ptr_ty, bc_id, src_id)
-            bc_id
+        # Source pointer for this word
+        src_elem_id = if is_src_function
+            # Function storage class: use OpAccessChain from alloca base
+            _emit_function_ptr_word!(state, src_ptr, i, src_ptr_ty)
         else
-            # Compute address: src_u64 + offset → ptr
-            offset_const = _emit_u64_constant!(state.mod, offset)
-            addr_id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.functions, Op.OpIAdd, u64_ty, addr_id, src_u64, offset_const)
-            ptr_id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, src_ptr_ty, ptr_id, addr_id)
-            ptr_id
+            # PSB or other: use integer arithmetic
+            src_addr_u64 = if offset == 0
+                src_u64
+            else
+                offset_const = _emit_u64_constant!(state.mod, offset)
+                addr_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpIAdd, u64_ty, addr_id, src_u64, offset_const)
+                addr_id
+            end
+            id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, src_ptr_ty, id, src_addr_u64)
+            id
         end
 
         # Load i32 from source
         load_id = fresh_id!(state.mod)
         if is_src_psb
-            # PSB requires Aligned memory operand
             encode_instruction!(state.mod.functions, Op.OpLoad, u32_ty, load_id, src_elem_id,
                                 UInt32(0x02), UInt32(4))  # Aligned 4
         else
             encode_instruction!(state.mod.functions, Op.OpLoad, u32_ty, load_id, src_elem_id)
         end
 
-        # Dest pointer: base + offset
-        dest_elem_id = if offset == 0
-            bc_id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.functions, Op.OpBitcast, dest_ptr_ty, bc_id, dest_id)
-            bc_id
+        # Dest pointer for this word
+        dest_elem_id = if is_dest_function
+            # Function storage class: use OpAccessChain from alloca base
+            _emit_function_ptr_word!(state, dest_ptr, i, dest_ptr_ty)
         else
-            offset_const = _emit_u64_constant!(state.mod, offset)
-            addr_id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.functions, Op.OpIAdd, u64_ty, addr_id, dest_u64, offset_const)
-            ptr_id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, dest_ptr_ty, ptr_id, addr_id)
-            ptr_id
+            # PSB or other: use integer arithmetic
+            dest_addr_u64 = if offset == 0
+                dest_u64
+            else
+                offset_const = _emit_u64_constant!(state.mod, offset)
+                addr_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpIAdd, u64_ty, addr_id, dest_u64, offset_const)
+                addr_id
+            end
+            id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, dest_ptr_ty, id, dest_addr_u64)
+            id
         end
 
         # Store i32 to dest
@@ -2695,6 +3780,8 @@ function _emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     end
 
     # Handle remaining bytes (< 4) with i8 copies
+    # NOTE: Function-class remainder is unlikely (LLVM aligns allocas to 4 bytes)
+    # but handled for correctness
     if remainder > 0
         u8_ty = emit_type_int!(state.mod, UInt32(8), UInt32(0))
         src_u8_ptr_ty = map_pointer_type!(state.type_ctx, u8_ty, src_sc)
@@ -2771,6 +3858,111 @@ function _compute_type_alignment(ty::LLVM.LLVMType)
     else
         return 4
     end
+end
+
+# Count how many leaf elements of type `leaf_ty` exist in a composite type.
+# Returns 0 if the type does not contain `leaf_ty` at the leaves.
+function _count_scalar_elements(ty::LLVM.LLVMType, leaf_ty::LLVM.LLVMType)
+    if ty == leaf_ty
+        return 1
+    elseif _types_same_size(ty, leaf_ty) && !(ty isa LLVM.StructType) && !(ty isa LLVM.ArrayType)
+        return 1  # same-sized scalar (e.g. i32 vs float)
+    elseif ty isa LLVM.StructType
+        total = 0
+        for field in LLVM.elements(ty)
+            total += _count_scalar_elements(field, leaf_ty)
+        end
+        return total
+    elseif ty isa LLVM.ArrayType
+        return Int(LLVM.length(ty)) * _count_scalar_elements(LLVM.eltype(ty), leaf_ty)
+    else
+        return 0
+    end
+end
+
+# Decompose a flat scalar index into OpAccessChain indices for a composite type.
+# E.g., for {[2 x [8 x float]]} with leaf=float, flat_idx 10 → indices [0, 1, 2]
+# meaning struct field 0, outer array index 1 (10÷8), inner array index 2 (10%8).
+# Emits SPIR-V UDiv/UMod arithmetic for dynamic indices.
+function _decompose_flat_index_for_composite!(state::SPIRVEmitterState,
+        composite_ty::LLVM.LLVMType, leaf_ty::LLVM.LLVMType, flat_idx_i32::UInt32)
+    indices = UInt32[]
+    current_ty = composite_ty
+    remaining = flat_idx_i32
+    u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+
+    while current_ty != leaf_ty && !(_types_same_size(current_ty, leaf_ty) &&
+            !(current_ty isa LLVM.StructType) && !(current_ty isa LLVM.ArrayType))
+        if current_ty isa LLVM.StructType
+            fields = LLVM.elements(current_ty)
+            if length(fields) == 1
+                # Single-field struct: always index 0, descend into the field
+                push!(indices, emit_constant_u32!(state.mod, UInt32(0)))
+                current_ty = fields[1]
+            else
+                # Multi-field struct: find which field the index falls into.
+                # Compute cumulative element counts to determine the field.
+                field_counts = [_count_scalar_elements(f, leaf_ty) for f in fields]
+                cumulative = 0
+                found = false
+                # If only one field has nonzero count, pick it directly (no runtime check needed).
+                # Otherwise pick the field with the largest count (covers NTuple + metadata pattern).
+                nonzero_fields = [(i, c) for (i, c) in enumerate(field_counts) if c > 0]
+                if length(nonzero_fields) == 1
+                    # Unambiguous: only one field contains leaf-type elements
+                    fi = nonzero_fields[1][1]
+                    push!(indices, emit_constant_u32!(state.mod, UInt32(fi - 1)))
+                    if cumulative > 0
+                        # Shouldn't happen for single nonzero field
+                    end
+                    current_ty = fields[fi]
+                    found = true
+                else
+                    # Multiple fields contain leaf-type elements. Pick by cumulative offset.
+                    # The dynamic index should fall within the first field whose cumulative
+                    # range covers it. Since we can't branch at SPIR-V compile time, pick
+                    # the field with the largest count (the main data, not metadata).
+                    max_idx = argmax(field_counts)
+                    pre_cumulative = sum(field_counts[1:max_idx-1])
+                    push!(indices, emit_constant_u32!(state.mod, UInt32(max_idx - 1)))
+                    if pre_cumulative > 0
+                        offset_const = emit_constant_u32!(state.mod, UInt32(pre_cumulative))
+                        new_rem = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, Op.OpISub, u32_ty, new_rem, remaining, offset_const)
+                        remaining = new_rem
+                    end
+                    current_ty = fields[max_idx]
+                    found = true
+                end
+                if !found
+                    error("Could not decompose flat index into multi-field struct")
+                end
+            end
+        elseif current_ty isa LLVM.ArrayType
+            elem_ty = LLVM.eltype(current_ty)
+            elem_count = _count_scalar_elements(elem_ty, leaf_ty)
+            if elem_count == 1
+                # Leaf array: index directly
+                push!(indices, remaining)
+                return indices
+            else
+                # Divide to get this level's index, mod for remaining
+                divisor = emit_constant_u32!(state.mod, UInt32(elem_count))
+                this_idx = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpUDiv, u32_ty, this_idx, remaining, divisor)
+                push!(indices, this_idx)
+
+                new_remaining = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpUMod, u32_ty, new_remaining, remaining, divisor)
+                remaining = new_remaining
+
+                current_ty = elem_ty
+            end
+        else
+            break
+        end
+    end
+    return indices
 end
 
 function _compute_type_size(ty::LLVM.LLVMType)
@@ -3031,6 +4223,9 @@ function _emit_ret!(state::SPIRVEmitterState, inst::LLVM.RetInst)
 end
 
 function _emit_br!(state::SPIRVEmitterState, inst::LLVM.BrInst)
+    # Skip if block was already terminated by OpIgnoreIntersectionKHR/OpTerminateRayKHR
+    state.rt_block_terminated && return
+
     current_bb = LLVM.parent(inst)
 
     if LLVM.isconditional(inst)
@@ -3567,27 +4762,95 @@ function _resolve_deferred_phis!(state::SPIRVEmitterState)
                     type_id  # If we can't determine the type, assume it matches
                 end
                 if val_spirv_ty != type_id
-                    # Need bitcast from val_spirv_ty to type_id
-                    bitcast_id = fresh_id!(state.mod)
-                    bitcast_words = UInt32[]
-                    push!(bitcast_words, (UInt32(4) << 16) | UInt32(Op.OpBitcast))
-                    push!(bitcast_words, type_id)
-                    push!(bitcast_words, bitcast_id)
-                    push!(bitcast_words, val_id)
-
-                    # Find the predecessor block ID for insertion
-                    from_id = get_block_id!(state, bb)
-                    redirect = get(state.trampolines, (from_id, block_label_id), nothing)
-                    if redirect === nothing
-                        redirect = get(state.phi_block_redirects, (from_id, block_label_id), nothing)
+                    # Check if this is a cross-storage-class mismatch by looking up
+                    # the storage classes. Cross-SC bitcasts are INVALID in SPIR-V.
+                    val_sc = nothing
+                    target_sc = nothing
+                    for ((sc, _pointee), ptr_ty) in state.type_ctx.pointer_types
+                        if ptr_ty == val_spirv_ty
+                            val_sc = sc
+                        end
+                        if ptr_ty == type_id
+                            target_sc = sc
+                        end
                     end
-                    pred_block_id = redirect !== nothing ? redirect : from_id
 
-                    if !haskey(pre_terminator_insertions, pred_block_id)
-                        pre_terminator_insertions[pred_block_id] = UInt32[]
+                    if val_sc !== nothing && target_sc !== nothing && val_sc != target_sc
+                        # Cross-storage-class mismatch in PHI.
+                        # OpConvertUToPtr only works for PhysicalStorageBuffer targets.
+                        # If target is Function, we can't convert — this indicates a bug
+                        # in _trace_to_non_alloca or type inference. Log warning and
+                        # use OpBitcast as fallback (may fail validation but won't crash).
+                        if target_sc != 5348 # StoragePhysicalStorageBuffer = 5348
+                            @warn "Cross-SC PHI: target SC=$target_sc is not PSB, cannot ConvertUToPtr. Using OpBitcast fallback."
+                            bitcast_id = fresh_id!(state.mod)
+                            bitcast_words = UInt32[]
+                            push!(bitcast_words, (UInt32(4) << 16) | UInt32(Op.OpBitcast))
+                            push!(bitcast_words, type_id)
+                            push!(bitcast_words, bitcast_id)
+                            push!(bitcast_words, val_id)
+
+                            from_id = get_block_id!(state, bb)
+                            redirect = get(state.trampolines, (from_id, block_label_id), nothing)
+                            if redirect === nothing
+                                redirect = get(state.phi_block_redirects, (from_id, block_label_id), nothing)
+                            end
+                            pred_block_id = redirect !== nothing ? redirect : from_id
+                            if !haskey(pre_terminator_insertions, pred_block_id)
+                                pre_terminator_insertions[pred_block_id] = UInt32[]
+                            end
+                            append!(pre_terminator_insertions[pred_block_id], bitcast_words)
+                            val_id = bitcast_id
+                        else
+                            # Target is PSB: safe to convert through integer (ConvertPtrToU → ConvertUToPtr)
+                            ulong_ty = map_type!(state.type_ctx, LLVM.Int64Type())
+                            ptr_to_u = fresh_id!(state.mod)
+                            u_to_ptr = fresh_id!(state.mod)
+                            conv_words = UInt32[]
+                            # OpConvertPtrToU
+                            push!(conv_words, (UInt32(4) << 16) | UInt32(Op.OpConvertPtrToU))
+                            push!(conv_words, ulong_ty)
+                            push!(conv_words, ptr_to_u)
+                            push!(conv_words, val_id)
+                            # OpConvertUToPtr
+                            push!(conv_words, (UInt32(4) << 16) | UInt32(Op.OpConvertUToPtr))
+                            push!(conv_words, type_id)
+                            push!(conv_words, u_to_ptr)
+                            push!(conv_words, ptr_to_u)
+
+                            from_id = get_block_id!(state, bb)
+                            redirect = get(state.trampolines, (from_id, block_label_id), nothing)
+                            if redirect === nothing
+                                redirect = get(state.phi_block_redirects, (from_id, block_label_id), nothing)
+                            end
+                            pred_block_id = redirect !== nothing ? redirect : from_id
+                            if !haskey(pre_terminator_insertions, pred_block_id)
+                                pre_terminator_insertions[pred_block_id] = UInt32[]
+                            end
+                            append!(pre_terminator_insertions[pred_block_id], conv_words)
+                            val_id = u_to_ptr
+                        end
+                    else
+                        # Same storage class: use OpBitcast (safe within same SC)
+                        bitcast_id = fresh_id!(state.mod)
+                        bitcast_words = UInt32[]
+                        push!(bitcast_words, (UInt32(4) << 16) | UInt32(Op.OpBitcast))
+                        push!(bitcast_words, type_id)
+                        push!(bitcast_words, bitcast_id)
+                        push!(bitcast_words, val_id)
+
+                        from_id = get_block_id!(state, bb)
+                        redirect = get(state.trampolines, (from_id, block_label_id), nothing)
+                        if redirect === nothing
+                            redirect = get(state.phi_block_redirects, (from_id, block_label_id), nothing)
+                        end
+                        pred_block_id = redirect !== nothing ? redirect : from_id
+                        if !haskey(pre_terminator_insertions, pred_block_id)
+                            pre_terminator_insertions[pred_block_id] = UInt32[]
+                        end
+                        append!(pre_terminator_insertions[pred_block_id], bitcast_words)
+                        val_id = bitcast_id
                     end
-                    append!(pre_terminator_insertions[pred_block_id], bitcast_words)
-                    val_id = bitcast_id
                 end
             end
 
@@ -3755,6 +5018,39 @@ function _emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return _emit_rt_ignore_intersection!(state, inst)
         elseif fn_name == "_lava_rt_terminate_ray"
             return _emit_rt_terminate_ray!(state, inst)
+        end
+
+        # Check for graphics intrinsics → I/O stores/loads, emit_vertex, etc.
+        if fn_name == "_lava_gfx_set_position"
+            return _emit_gfx_set_position!(state, inst)
+        elseif fn_name == "_lava_gfx_set_point_size"
+            return _emit_gfx_set_point_size!(state, inst)
+        elseif fn_name == "_lava_gfx_output_vec4"
+            return _emit_gfx_output_vec4!(state, inst)
+        elseif fn_name == "_lava_gfx_output_vec3"
+            return _emit_gfx_output_vec3!(state, inst)
+        elseif fn_name == "_lava_gfx_output_vec2"
+            return _emit_gfx_output_vec2!(state, inst)
+        elseif fn_name == "_lava_gfx_output_f32"
+            return _emit_gfx_output_f32!(state, inst)
+        elseif fn_name == "_lava_gfx_input_vec4"
+            return _emit_gfx_input!(state, inst, :vec4)
+        elseif fn_name == "_lava_gfx_input_vec3"
+            return _emit_gfx_input!(state, inst, :vec3)
+        elseif fn_name == "_lava_gfx_input_vec2"
+            return _emit_gfx_input!(state, inst, :vec2)
+        elseif fn_name == "_lava_gfx_input_f32"
+            return _emit_gfx_input!(state, inst, :f32)
+        elseif fn_name == "_lava_gfx_emit_vertex"
+            return _emit_gfx_emit_vertex!(state, inst)
+        elseif fn_name == "_lava_gfx_end_primitive"
+            return _emit_gfx_end_primitive!(state, inst)
+        elseif fn_name == "_lava_gfx_set_tess_level_outer"
+            return _emit_gfx_set_tess_level!(state, inst, true)
+        elseif fn_name == "_lava_gfx_set_tess_level_inner"
+            return _emit_gfx_set_tess_level!(state, inst, false)
+        elseif fn_name == "_lava_gfx_sample_2d"
+            return _emit_gfx_sample_2d!(state, inst)
         end
 
         # Regular function call
@@ -4180,8 +5476,58 @@ function _emit_insertelement!(state::SPIRVEmitterState, inst::LLVM.InsertElement
 end
 
 # ================================================================
-# Atomics (stubs — will be expanded)
+# Atomics
 # ================================================================
+
+"""
+Map LLVM atomic ordering + pointer storage class to SPIR-V memory semantics.
+
+With the Vulkan memory model (VulkanKHR), atomic operations need explicit
+MakeAvailableKHR/MakeVisibleKHR flags for writes to be visible across
+invocations. Without these, even seq_cst atomics provide only atomicity
+(correct counter values) but NOT memory visibility for non-atomic stores
+— which breaks cross-workgroup patterns like BVH refit where Thread A
+writes node data, atomics on a flag, and Thread B reads via the flag.
+"""
+function _atomic_mem_semantics(inst::LLVM.Instruction, ptr::LLVM.Value)::UInt32
+    ord = LLVM.ordering(inst)
+
+    # Determine storage class bit for the pointer's memory
+    sc = _get_pointer_storage_class(ptr)
+    sc_bit = if sc == SC.Workgroup
+        MemSem.WorkgroupMemory   # 0x100
+    else
+        # StorageBuffer, PhysicalStorageBuffer, Uniform all use UniformMemory
+        MemSem.UniformMemory     # 0x40
+    end
+
+    if ord == LLVM.API.LLVMAtomicOrderingMonotonic ||
+       ord == LLVM.API.LLVMAtomicOrderingUnordered
+        # Relaxed — just atomicity, no ordering
+        return MemSem.Relaxed
+    elseif ord == LLVM.API.LLVMAtomicOrderingAcquire
+        return MemSem.Acquire | sc_bit | MemSem.MakeVisibleKHR
+    elseif ord == LLVM.API.LLVMAtomicOrderingRelease
+        return MemSem.Release | sc_bit | MemSem.MakeAvailableKHR
+    else
+        # AcquireRelease or SequentiallyConsistent
+        # Vulkan memory model doesn't support SequentiallyConsistent;
+        # AcquireRelease + MakeAvailable + MakeVisible is the equivalent.
+        return MemSem.AcquireRelease | sc_bit | MemSem.MakeAvailableKHR | MemSem.MakeVisibleKHR
+    end
+end
+
+"""Acquire-only variant for cmpxchg failure path (no release, a failed CAS writes nothing)."""
+function _atomic_mem_semantics_acquire_only(inst::LLVM.Instruction, ptr::LLVM.Value)::UInt32
+    ord = LLVM.ordering(inst)
+    if ord == LLVM.API.LLVMAtomicOrderingMonotonic ||
+       ord == LLVM.API.LLVMAtomicOrderingUnordered
+        return MemSem.Relaxed
+    end
+    sc = _get_pointer_storage_class(ptr)
+    sc_bit = sc == SC.Workgroup ? MemSem.WorkgroupMemory : MemSem.UniformMemory
+    return MemSem.Acquire | sc_bit | MemSem.MakeVisibleKHR
+end
 
 function _emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
     ops = LLVM.operands(inst)
@@ -4200,9 +5546,8 @@ function _emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
     # and doesn't require VulkanMemoryModelDeviceScopeKHR capability
     scope_id = emit_constant_u32!(state.mod, Scope.QueueFamily)
 
-    # Memory semantics — use Relaxed for monotonic ordering
-    # For Vulkan storage buffers, no additional semantics flags needed for relaxed
-    mem_sem_id = emit_constant_u32!(state.mod, MemSem.Relaxed)
+    # Memory semantics — derived from LLVM ordering + pointer storage class
+    mem_sem_id = emit_constant_u32!(state.mod, _atomic_mem_semantics(inst, ptr))
 
     # Map LLVM atomicrmw operation to SPIR-V opcode
     binop = LLVM.API.LLVMGetAtomicRMWBinOp(inst)
@@ -4237,13 +5582,17 @@ function _emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
     # a pointer to the actual value type (e.g., i32). Bitcast if needed.
     ptr_pointee = get_pointee_type(state.type_ctx.ptm, ptr)
     if ptr_pointee !== nothing && ptr_pointee != result_llvm_ty
-        # Need to bitcast pointer to correct type
+        # Need to reinterpret pointer to correct type
         sc = _get_pointer_storage_class(ptr)
         correct_ptr_ty = map_pointer_type!(state.type_ctx, result_ty, sc)
-        bitcast_id = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpBitcast,
-            correct_ptr_ty, bitcast_id, ptr_id)
-        ptr_id = bitcast_id
+        if sc == SC.PhysicalStorageBuffer
+            ptr_id = _emit_psb_ptr_reinterpret!(state, correct_ptr_ty, ptr_id)
+        else
+            bitcast_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpBitcast,
+                correct_ptr_ty, bitcast_id, ptr_id)
+            ptr_id = bitcast_id
+        end
     end
 
     # Format: OpAtomic* result_type result_id pointer scope mem_semantics value
@@ -4276,19 +5625,25 @@ function _emit_cmpxchg!(state::SPIRVEmitterState, inst::LLVM.AtomicCmpXchgInst)
 
     # Scope — QueueFamily (equivalent to Device for single-queue, no extra capability)
     scope_id = emit_constant_u32!(state.mod, Scope.QueueFamily)
-    # Memory semantics — Relaxed for monotonic
-    mem_sem_equal_id = emit_constant_u32!(state.mod, MemSem.Relaxed)
-    mem_sem_unequal_id = emit_constant_u32!(state.mod, MemSem.Relaxed)
+    # Memory semantics — derived from LLVM ordering + pointer storage class
+    mem_sem = _atomic_mem_semantics(inst, ptr)
+    mem_sem_equal_id = emit_constant_u32!(state.mod, mem_sem)
+    # Failure semantics: acquire-only (failed CAS doesn't release)
+    mem_sem_unequal_id = emit_constant_u32!(state.mod, _atomic_mem_semantics_acquire_only(inst, ptr))
 
-    # Bitcast pointer if pointee type doesn't match value type (byte-offset GEPs)
+    # Reinterpret pointer if pointee type doesn't match value type (byte-offset GEPs)
     ptr_pointee = get_pointee_type(state.type_ctx.ptm, ptr)
     if ptr_pointee !== nothing && ptr_pointee != val_llvm_ty
         sc = _get_pointer_storage_class(ptr)
         correct_ptr_ty = map_pointer_type!(state.type_ctx, val_ty, sc)
-        bitcast_id = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpBitcast,
-            correct_ptr_ty, bitcast_id, ptr_id)
-        ptr_id = bitcast_id
+        if sc == SC.PhysicalStorageBuffer
+            ptr_id = _emit_psb_ptr_reinterpret!(state, correct_ptr_ty, ptr_id)
+        else
+            bitcast_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpBitcast,
+                correct_ptr_ty, bitcast_id, ptr_id)
+            ptr_id = bitcast_id
+        end
     end
 
     # OpAtomicCompareExchange returns just the old value (not a struct like LLVM)

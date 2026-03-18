@@ -6,6 +6,7 @@
 #
 # Compilation is lazy — shaders are compiled on first use and cached.
 
+
 """
     RayTracingPipeline
 
@@ -44,12 +45,23 @@ mutable struct RayTracingPipeline
     payload_type::Symbol
     # Compiled state (lazy)
     _compiled::Union{Nothing, NamedTuple}
-    _pipeline_cache::Dict{UInt64, Tuple{LavaRTPipeline, LavaRTShader, Vector{Int}}}
+    _pipeline_cache::Dict{UInt64, Tuple{LavaRTPipeline, LavaRTShader, Vector{Int}, Vector{Int}}}
+    _cache_device_gen::UInt64  # device generation when cache was populated
 end
 
 function RayTracingPipeline(; raygen, closest_hit, miss, any_hit=nothing, payload_type::Symbol=:f32)
     RayTracingPipeline(raygen, closest_hit, miss, any_hit, payload_type, nothing,
-                        Dict{UInt64, Tuple{LavaRTPipeline, LavaRTShader, Vector{Int}}}())
+                        Dict{UInt64, Tuple{LavaRTPipeline, LavaRTShader, Vector{Int}, Vector{Int}}}(),
+                        _device_generation[])
+end
+
+"""Invalidate RT pipeline cache if the Vulkan device was reset since last use."""
+function _invalidate_stale_rt_cache!(pipeline::RayTracingPipeline)
+    if pipeline._cache_device_gen != _device_generation[]
+        empty!(pipeline._pipeline_cache)
+        pipeline._compiled = nothing
+        pipeline._cache_device_gen = _device_generation[]
+    end
 end
 
 """
@@ -68,29 +80,31 @@ function trace_rays!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args...;
     tt = Tuple{map(_rt_arg_llvm_type, args)...}
     cache_key = hash((tt,))
 
+    # Invalidate cache if device was reset (pipelines reference old VkDevice)
+    _invalidate_stale_rt_cache!(pipeline)
+
     # Get or compile pipeline for this argument signature
     cached = get(pipeline._pipeline_cache, cache_key, nothing)
     if cached === nothing
         cached = _compile_rt_pipeline(pipeline, tt)
         pipeline._pipeline_cache[cache_key] = cached
     end
-    vk_pipeline, raygen_compiled, offsets = cached
+    vk_pipeline, raygen_compiled, offsets, byval_sizes = cached
 
     # Pack args directly to mapped memory (unified path with compute)
     all_args = (pipeline.raygen_func, args...)
-    inline_extra = _compute_inline_extra(typeof(all_args))
+    inline_extra = _compute_inline_extra_from_byval(byval_sizes)
     total_size = raygen_compiled.push_info.arg_buffer_size + inline_extra
 
-    arg_buf = _get_arg_buffer(total_size)
+    arg_buf = get_arg_buffer(total_size)
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
-                       raygen_compiled.push_info.arg_buffer_size, all_args)
+                       raygen_compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
-    # Push constant = BDA of arg buffer
-    push_data = Vector{UInt8}(undef, 8)
-    unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
+    # Keep data buffer references alive until vk_flush!()
+    keep_data_alive!(args)
 
-    # Dispatch (records into batched command buffer, no separate submit)
-    rt_dispatch!(vk_pipeline, tlas, push_data, width, height; depth=depth)
+    # Dispatch (push constant = BDA of arg buffer, passed as UInt64, zero-alloc)
+    rt_dispatch!(vk_pipeline, tlas, arg_buf.address, width, height; depth=depth)
 end
 
 """
@@ -106,32 +120,36 @@ function trace_rays_indirect!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args
     tt = Tuple{map(_rt_arg_llvm_type, args)...}
     cache_key = hash((tt,))
 
+    # Invalidate cache if device was reset (pipelines reference old VkDevice)
+    _invalidate_stale_rt_cache!(pipeline)
+
     # Get or compile pipeline for this argument signature
     cached = get(pipeline._pipeline_cache, cache_key, nothing)
     if cached === nothing
         cached = _compile_rt_pipeline(pipeline, tt)
         pipeline._pipeline_cache[cache_key] = cached
     end
-    vk_pipeline, raygen_compiled, offsets = cached
+    vk_pipeline, raygen_compiled, offsets, byval_sizes = cached
 
-    # Pack args directly to mapped memory (unified path with compute)
-    all_args = (pipeline.raygen_func, args...)
-    inline_extra = _compute_inline_extra(typeof(all_args))
-    total_size = raygen_compiled.push_info.arg_buffer_size + inline_extra
-
-    arg_buf = _get_arg_buffer(total_size)
-    _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
-                       raygen_compiled.push_info.arg_buffer_size, all_args)
-
-    push_data = Vector{UInt8}(undef, 8)
-    unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
-
-    # Prepare indirect RT buffer: kernel writes (n_rays, 1, 1) from GPU queue size
+    # Prepare the indirect buffer FIRST, before allocating the RT arg buffer.
+    # _prepare_indirect_rt_dispatch! → lava_launch! may trigger auto-flush which
+    # resets slab pools. If we allocated the RT arg buffer first, the flush would
+    # invalidate it (DEVICE_LOST from stale BDA).
     indirect_buf = _get_indirect_buffer()
     _prepare_indirect_rt_dispatch!(indirect_buf, n_rays)
 
-    # Indirect RT dispatch
-    rt_dispatch_indirect!(vk_pipeline, tlas, push_data, indirect_buf)
+    # Now allocate and pack RT args (safe — any auto-flush already happened)
+    all_args = (pipeline.raygen_func, args...)
+    inline_extra = _compute_inline_extra_from_byval(byval_sizes)
+    total_size = raygen_compiled.push_info.arg_buffer_size + inline_extra
+
+    arg_buf = get_arg_buffer(total_size)
+    _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
+                       raygen_compiled.push_info.arg_buffer_size, byval_sizes, all_args)
+    keep_data_alive!(args)
+    push_bda = arg_buf.address
+
+    rt_dispatch_indirect!(vk_pipeline, tlas, push_bda, indirect_buf)
 end
 
 """Prepare indirect RT dispatch buffer: writes (n_rays, 1, 1) from a GPU-resident count."""
@@ -185,10 +203,11 @@ function _compile_rt_pipeline(pipeline::RayTracingPipeline, raygen_tt)
         anyhit_spirv=anyhit_spirv,
         push_constant_size=8)
 
-    # Cache arg layout offsets as Vector{Int} for zero-alloc packing
+    # Cache arg layout offsets and byval sizes for zero-alloc packing
     offsets = Int[p.first for p in raygen_compiled.push_info.arg_layout]
+    byval_sizes = raygen_compiled.push_info.byval_llvm_sizes
 
-    return (vk_pipeline, raygen_compiled, offsets)
+    return (vk_pipeline, raygen_compiled, offsets, byval_sizes)
 end
 
 # ── RT Argument Type Mapping ──

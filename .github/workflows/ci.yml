@@ -1,0 +1,29 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Julia ${{ matrix.julia-version }} - Lavapipe
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        julia-version: ['1']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: serenity4/julia-lavapipe@v1
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia-version }}
+      - uses: julia-actions/cache@v2
+      - name: Install X11 dependencies for GLFW
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorg-dev mesa-utils xvfb libgl1 libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev
+      - uses: julia-actions/julia-buildpkg@v1
+      - name: Run tests under xvfb
+        run: |
+          DISPLAY=:0 xvfb-run -s '-screen 0 1024x768x24' julia --color=yes --project -e 'using Pkg; Pkg.test()'

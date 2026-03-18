@@ -16,7 +16,7 @@ mutable struct LavaArray{T,N} <: AbstractGPUArray{T,N}
 
     function LavaArray{T,N}(buf::GPUArrays.DataRef{VkManagedBuffer}, dims::NTuple{N,Int};
                             offset::Integer=0) where {T,N}
-        new{T,N}(buf, dims, offset)
+        return finalizer(unsafe_free!, new{T,N}(buf, dims, offset))
     end
 end
 

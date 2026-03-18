@@ -657,6 +657,16 @@ function _emit_workgroup_type!(ctx::SPIRVTypeContext, ty::LLVM.ArrayType)
     len_id = emit_constant_u32!(ctx.mod, UInt32(n))
     id = fresh_id!(ctx.mod)
     encode_instruction!(ctx.mod.types_constants, Op.OpTypeArray, id, elem_spirv, len_id)
+
+    # When the element type is a struct, add ArrayStride decoration for explicit layout.
+    # This is required by VK_KHR_workgroup_memory_explicit_layout when the array
+    # is inside a Block-decorated struct.
+    elem_llvm = eltype(ty)
+    if elem_llvm isa LLVM.StructType
+        stride = UInt32(_wg_compute_type_size(elem_llvm))
+        emit_decorate!(ctx.mod, id, Dec.ArrayStride, stride)
+    end
+
     return id
 end
 
@@ -673,7 +683,73 @@ function _emit_workgroup_type!(ctx::SPIRVTypeContext, ty::LLVM.StructType)
     push!(ctx.mod.types_constants, (word_count << 16) | UInt32(Op.OpTypeStruct))
     push!(ctx.mod.types_constants, id)
     append!(ctx.mod.types_constants, member_spirv_ids)
+
+    # Add MemberOffset decorations for explicit layout (VK_KHR_workgroup_memory_explicit_layout).
+    # Compute offsets matching LLVM's struct layout (with alignment padding).
+    running_offset = UInt32(0)
+    for (i, mt) in enumerate(member_types)
+        member_align = UInt32(_wg_compute_type_alignment(mt))
+        running_offset = (running_offset + member_align - UInt32(1)) & ~(member_align - UInt32(1))
+        emit_member_decorate!(ctx.mod, id, UInt32(i - 1), Dec.Offset, UInt32(running_offset))
+        running_offset += _wg_compute_type_size(mt)
+    end
+
     return id
+end
+
+# Size/alignment helpers for workgroup explicit layout decorations.
+# Mirror _compute_type_size/_compute_type_alignment from emit.jl but available in types.jl.
+function _wg_compute_type_size(ty::LLVM.LLVMType)
+    if ty isa LLVM.LLVMFloat
+        return UInt32(4)
+    elseif ty isa LLVM.LLVMDouble
+        return UInt32(8)
+    elseif ty isa LLVM.LLVMHalf
+        return UInt32(2)
+    elseif ty isa LLVM.IntegerType
+        return UInt32(max(1, LLVM.width(ty) ÷ 8))
+    elseif ty isa LLVM.StructType
+        total = UInt32(0)
+        struct_align = UInt32(1)
+        for elem in LLVM.elements(ty)
+            elem_align = UInt32(_wg_compute_type_alignment(elem))
+            struct_align = max(struct_align, elem_align)
+            total = (total + elem_align - 1) & ~(elem_align - 1)
+            total += _wg_compute_type_size(elem)
+        end
+        total = (total + struct_align - 1) & ~(struct_align - 1)
+        return total
+    elseif ty isa LLVM.ArrayType
+        return UInt32(length(ty)) * _wg_compute_type_size(eltype(ty))
+    elseif ty isa LLVM.PointerType
+        return UInt32(8)
+    else
+        return UInt32(4)
+    end
+end
+
+function _wg_compute_type_alignment(ty::LLVM.LLVMType)
+    if ty isa LLVM.LLVMFloat
+        return 4
+    elseif ty isa LLVM.LLVMDouble
+        return 8
+    elseif ty isa LLVM.LLVMHalf
+        return 2
+    elseif ty isa LLVM.IntegerType
+        return max(1, LLVM.width(ty) ÷ 8)
+    elseif ty isa LLVM.StructType
+        max_align = 1
+        for elem in LLVM.elements(ty)
+            max_align = max(max_align, _wg_compute_type_alignment(elem))
+        end
+        return max_align
+    elseif ty isa LLVM.ArrayType
+        return _wg_compute_type_alignment(eltype(ty))
+    elseif ty isa LLVM.PointerType
+        return 8
+    else
+        return 4
+    end
 end
 
 function _emit_llvm_type!(ctx::SPIRVTypeContext, ty::LLVM.VoidType)
@@ -800,6 +876,86 @@ function build_struct_ptr_member_types!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Mo
             end
         end
     end
+
+    # Second pass: resolve struct ptr members that couldn't be traced through
+    # static GEP patterns (e.g., Tuple elements accessed via dynamic byte-GEPs).
+    # Uses PTM entries for alloca-reloaded pointers to infer struct member types.
+    _resolve_unresolved_struct_ptr_members!(ctx, llvm_mod)
+end
+
+"""
+Resolve struct pointer members that weren't found by the GEP/load scanning passes.
+
+When structs containing pointers are stored into allocas and later accessed via
+dynamic byte-offset GEPs (common for Tuple element indexing), the standard scanning
+can't trace the pointer's type back to the struct member. But PTM *does* know the
+type of the reloaded pointer (from its eventual `load float, ptr %reloaded` usage).
+
+This pass finds such loads, walks the GEP chain to the alloca, identifies which
+struct types with unresolved ptr members exist in the alloca's type, and resolves them.
+"""
+function _resolve_unresolved_struct_ptr_members!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Module)
+    for fn in LLVM.functions(llvm_mod)
+        for bb in LLVM.blocks(fn)
+            for inst in LLVM.instructions(bb)
+                inst isa LLVM.LoadInst || continue
+                LLVM.value_type(inst) isa LLVM.PointerType || continue
+
+                # Does PTM know this loaded pointer's pointee type?
+                pointee = get_pointee_type(ctx.ptm, inst)
+                pointee === nothing && continue
+                # Skip i8 (the default fallback — not a real resolved type)
+                pointee isa LLVM.IntegerType && LLVM.width(pointee) == 8 && continue
+
+                # Walk GEP chain to find the base alloca
+                alloca = _find_alloca_base(LLVM.operands(inst)[1])
+                alloca === nothing && continue
+
+                alloca_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(alloca))
+                _resolve_array_struct_ptr_members!(ctx, alloca_ty, pointee)
+            end
+        end
+    end
+end
+
+"""Walk a GEP chain (including byte-offset GEPs) to find the base AllocaInst."""
+function _find_alloca_base(ptr::LLVM.Value)
+    current = ptr
+    for _ in 1:20
+        if current isa LLVM.AllocaInst
+            return current
+        elseif current isa LLVM.GetElementPtrInst
+            current = LLVM.operands(current)[1]
+        else
+            return nothing
+        end
+    end
+    return nothing
+end
+
+"""
+Resolve unresolved struct ptr members within array contexts of a type hierarchy.
+
+Only resolves ptr members in structs that appear inside arrays (e.g., `[3 x {ptr, ...}]`),
+because dynamic byte-GEPs are generated specifically for array element access. Structs
+accessed via static GEPs should already be resolved by the main scan.
+"""
+function _resolve_array_struct_ptr_members!(ctx::SPIRVTypeContext, ty::LLVM.LLVMType, pointee::LLVM.LLVMType;
+                                             in_array::Bool=false)
+    if ty isa LLVM.StructType
+        for (i, field_ty) in enumerate(LLVM.elements(ty))
+            if field_ty isa LLVM.PointerType && in_array
+                key = (ty, i - 1)
+                if !haskey(ctx.struct_ptr_members, key)
+                    ctx.struct_ptr_members[key] = (pointee, 0)
+                end
+            elseif field_ty isa LLVM.StructType || field_ty isa LLVM.ArrayType
+                _resolve_array_struct_ptr_members!(ctx, field_ty, pointee; in_array)
+            end
+        end
+    elseif ty isa LLVM.ArrayType
+        _resolve_array_struct_ptr_members!(ctx, LLVM.eltype(ty), pointee; in_array=true)
+    end
 end
 
 """
@@ -818,7 +974,7 @@ function _scan_load_from_struct_base!(ctx::SPIRVTypeContext, load_inst::LLVM.Loa
     src_ptr = LLVM.operands(load_inst)[1]
     src_pointee = get_pointee_type(ctx.ptm, src_ptr)
     src_pointee === nothing && return
-    src_pointee isa LLVM.StructType || return
+    (src_pointee isa LLVM.StructType || src_pointee isa LLVM.ArrayType) || return
 
     # Walk struct layout following member 0 until we find a pointer field
     struct_ty, member_idx = _find_offset0_ptr_member(src_pointee)
