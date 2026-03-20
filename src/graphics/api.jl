@@ -50,6 +50,14 @@ LinePipeline(; vertex, fragment, kw...) = GraphicsPipeline(; vertex, fragment, t
 
 const GFX_SHADER_CACHE = Dict{UInt64, LavaGfxShader}()
 
+"""Return (vert_shader::LavaGfxShader, compiled::CompiledGraphicsPipeline)."""
+function _ensure_compiled_with_shader!(pipeline::GraphicsPipeline, tt_vertex, tt_fragment;
+                              color_format=Vulkan.FORMAT_B8G8R8A8_SRGB)
+    vert = get_or_compile_gfx(pipeline.vertex, tt_vertex, :vertex)
+    compiled = ensure_compiled!(pipeline, tt_vertex, tt_fragment; color_format)
+    return vert, compiled
+end
+
 function ensure_compiled!(pipeline::GraphicsPipeline, tt_vertex, tt_fragment;
                               color_format=Vulkan.FORMAT_B8G8R8A8_SRGB)
     if pipeline._compiled[] !== nothing
@@ -123,14 +131,13 @@ function draw!(pipeline::GraphicsPipeline, target::WindowTarget, vertex_count::I
                tt_vertex::Type=Tuple{}, tt_fragment::Type=Tuple{},
                clear_color::Union{Nothing, NTuple{4, Float32}}=(0.0f0, 0.0f0, 0.0f0, 1.0f0))
     win = target.window
-    compiled = ensure_compiled!(pipeline, tt_vertex, tt_fragment;
+    vert_shader, compiled = _ensure_compiled_with_shader!(pipeline, tt_vertex, tt_fragment;
         color_format=win.format)
 
     view = win.views[win.current_image_idx + 1]
     image = win.images[win.current_image_idx + 1]
 
-    # Pack args if any
-    push_data = pack_gfx_args(args)
+    push_data = isempty(args) ? UInt8[] : pack_gfx_args(args, vert_shader.push_info)
 
     vk_draw!(compiled, view, image, win.extent, vertex_count;
         push_data, instances, clear_color)
@@ -141,43 +148,61 @@ function draw!(pipeline::GraphicsPipeline, target::OffscreenTarget, vertex_count
                tt_vertex::Type=Tuple{}, tt_fragment::Type=Tuple{},
                clear_color::Union{Nothing, NTuple{4, Float32}}=(0.0f0, 0.0f0, 0.0f0, 1.0f0))
     fb = target.fb
-    compiled = ensure_compiled!(pipeline, tt_vertex, tt_fragment;
+    vert_shader, compiled = _ensure_compiled_with_shader!(pipeline, tt_vertex, tt_fragment;
         color_format=fb.color_format)
 
-    push_data = pack_gfx_args(args)
+    push_data = isempty(args) ? UInt8[] : pack_gfx_args(args, vert_shader.push_info)
 
     vk_draw!(compiled, fb.color_view, fb.color_image,
         Vulkan.Extent2D(UInt32(fb.width), UInt32(fb.height)),
         vertex_count;
         push_data, instances,
         depth_view=fb.depth_view,
+        depth_image=fb.depth_image,
         clear_color)
 end
 
-function pack_gfx_args(args)
+function pack_gfx_args(args, push_info::PushConstantInfo)
+    push_info.push_size == 0 && return UInt8[]
     isempty(args) && return UInt8[]
-    # Graphics shader entry wrappers use the same BDA arg buffer pattern as compute:
-    # Push constant = BDA of arg buffer; arg buffer contains actual arg BDAs/values.
-    # Each arg gets 8 bytes in the arg buffer (BDA pointer).
-    arg_buf_size = 8 * length(args)
-    arg_buf = get_arg_buffer(arg_buf_size)
-    ptr = arg_buf.mapped_ptr
-    for (i, arg) in enumerate(args)
+
+    # Convert LavaArray -> LavaDeviceArray (same as KA's Adapt path)
+    # so the byval struct {ptr, dims} gets inlined correctly into the arg buffer.
+    converted = map(args) do arg
         if arg isa LavaArray
-            managed = arg.buf[]
-            addr = managed.address + UInt64(arg.offset)
-            unsafe_store!(Ptr{UInt64}(ptr + (i-1)*8), addr)
+            return LavaDeviceArray(arg)
         else
-            error("Unsupported graphics arg type: $(typeof(arg)). Expected LavaArray.")
+            return arg
         end
     end
+
+    # Use the same arg buffer packing as compute: inline byval structs into
+    # the arg buffer with self-referencing BDA pointers.
+    offsets = [p.first for p in push_info.arg_layout]
+    byval_sizes = push_info.byval_llvm_sizes
+
+    inline_extra = _compute_inline_extra_from_byval(byval_sizes)
+    total_size = push_info.arg_buffer_size + inline_extra
+
+    arg_buf = get_arg_buffer(total_size)
+    _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
+                       push_info.arg_buffer_size, byval_sizes, converted)
+
+    # Keep data buffer references alive until vk_flush!()
+    keep_data_alive!(args)
+
     # Push constant = BDA of arg buffer
-    # NOTE: Graphics uses its own allocated vector since push_data outlives the call
     push_data = Vector{UInt8}(undef, 8)
     GC.@preserve push_data begin
         unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
     end
     return push_data
+end
+
+# Backwards compat for no-args case
+function pack_gfx_args(args)
+    isempty(args) && return UInt8[]
+    error("pack_gfx_args requires push_info for non-empty args. Use pack_gfx_args(args, push_info).")
 end
 
 # ── Blit: Fullscreen Display of GPU Buffer ──
@@ -289,14 +314,15 @@ function present_frame!(win::RenderWindow)
     # End command buffer
     unwrap(Vulkan.end_command_buffer(cmd))
 
-    # Submit with semaphore signaling (using window's own fence, not batch fence)
+    # Submit with per-frame semaphores (using window's own fence, not batch fence)
+    fi = win.current_frame
     submit_info = Vulkan.SubmitInfo(
-        [win.image_available],
+        [win.image_available[fi]],
         [Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT],
         [cmd],
-        [win.render_finished],
+        [win.render_finished[fi]],
     )
-    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=win.in_flight))
+    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=win.in_flight[fi]))
 
     # Reset batch state (we handled submission ourselves via window fence)
     # Note: batch state must be reset BEFORE flush_deferred_frees! so GC finalizers

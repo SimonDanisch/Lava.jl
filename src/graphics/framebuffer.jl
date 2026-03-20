@@ -117,37 +117,60 @@ end
 
 Base.size(fb::LavaFramebuffer) = (fb.width, fb.height)
 
+"""Bytes per pixel for a Vulkan format."""
+function format_pixel_size(fmt::Vulkan.Format)
+    fmt == Vulkan.FORMAT_B8G8R8A8_SRGB    && return 4
+    fmt == Vulkan.FORMAT_B8G8R8A8_UNORM   && return 4
+    fmt == Vulkan.FORMAT_R8G8B8A8_SRGB    && return 4
+    fmt == Vulkan.FORMAT_R8G8B8A8_UNORM   && return 4
+    fmt == Vulkan.FORMAT_R32G32B32A32_SFLOAT && return 16
+    fmt == Vulkan.FORMAT_R16G16B16A16_SFLOAT && return 8
+    error("Unknown pixel size for format $fmt")
+end
+
+"""Julia element type for readback of a Vulkan format."""
+function format_element_type(fmt::Vulkan.Format)
+    fmt == Vulkan.FORMAT_B8G8R8A8_SRGB      && return NTuple{4, UInt8}
+    fmt == Vulkan.FORMAT_B8G8R8A8_UNORM     && return NTuple{4, UInt8}
+    fmt == Vulkan.FORMAT_R8G8B8A8_SRGB      && return NTuple{4, UInt8}
+    fmt == Vulkan.FORMAT_R8G8B8A8_UNORM     && return NTuple{4, UInt8}
+    fmt == Vulkan.FORMAT_R32G32B32A32_SFLOAT && return NTuple{4, Float32}
+    fmt == Vulkan.FORMAT_R16G16B16A16_SFLOAT && return NTuple{4, Float16}
+    error("Unknown element type for format $fmt")
+end
+
 """
-    readback_framebuffer(fb::LavaFramebuffer) -> Matrix{NTuple{4, UInt8}}
+    readback_framebuffer(fb::LavaFramebuffer) -> Matrix
 
 Read back the color attachment pixels to CPU memory.
-Returns a height x width matrix of BGRA bytes (matching FORMAT_B8G8R8A8_SRGB).
+Returns a width x height matrix with element type matching the framebuffer format:
+- `FORMAT_B8G8R8A8_SRGB` / `_UNORM`: `NTuple{4, UInt8}` (BGRA bytes)
+- `FORMAT_R32G32B32A32_SFLOAT`: `NTuple{4, Float32}` (RGBA float)
+- `FORMAT_R16G16B16A16_SFLOAT`: `NTuple{4, Float16}` (RGBA half)
 """
 function readback_framebuffer(fb::LavaFramebuffer)
     ctx = vk_context()
     dev = ctx.device
 
-    # Flush pending GPU work
     if has_active_recording(ctx)
         vk_flush!()
     end
 
-    nbytes = fb.width * fb.height * 4  # 4 bytes per pixel (B8G8R8A8)
+    bpp = format_pixel_size(fb.color_format)
+    T = format_element_type(fb.color_format)
+    nbytes = fb.width * fb.height * bpp
     staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
 
-    # Use dedicated transfer command buffer for readback
     cmd = ctx.xfer_cmd_buf
     fence = ctx.xfer_fence
     unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(;
         flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
 
-    # Transition color image to transfer source
     transition_image!(cmd, fb.color_image,
         Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, Vulkan.PIPELINE_STAGE_TRANSFER_BIT,
         Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT, Vulkan.ACCESS_TRANSFER_READ_BIT)
 
-    # Copy image to staging buffer
     region = Vulkan.BufferImageCopy(
         UInt64(0), UInt32(0), UInt32(0),
         Vulkan.ImageSubresourceLayers(Vulkan.IMAGE_ASPECT_COLOR_BIT,
@@ -166,12 +189,8 @@ function readback_framebuffer(fb::LavaFramebuffer)
     unwrap(Vulkan.reset_fences(dev, [fence]))
     flush_deferred_frees!()
 
-    # Read pixels from staging buffer
-    # Shape (width, height) so pixels[x+1, y+1] = pixel at Vulkan position (x, y)
-    # (Vulkan writes row-major; Julia column-major with dim1=width gives correct indexing)
-    pixels = Matrix{NTuple{4, UInt8}}(undef, fb.width, fb.height)
-    unsafe_copyto!(Ptr{UInt8}(pointer(pixels)),
-                   Ptr{UInt8}(mapped_ptr), nbytes)
+    pixels = Matrix{T}(undef, fb.width, fb.height)
+    unsafe_copyto!(Ptr{UInt8}(pointer(pixels)), Ptr{UInt8}(mapped_ptr), nbytes)
     return pixels
 end
 

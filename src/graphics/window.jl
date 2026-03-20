@@ -19,10 +19,11 @@ mutable struct RenderWindow
     views::Vector{Vulkan.ImageView}
     format::Vulkan.Format
     extent::Vulkan.Extent2D
-    # Sync primitives
-    image_available::Vulkan.Semaphore
-    render_finished::Vulkan.Semaphore
-    in_flight::Vulkan.Fence
+    # Per-frame-in-flight sync (rotating ring buffer)
+    image_available::Vector{Vulkan.Semaphore}
+    render_finished::Vector{Vulkan.Semaphore}
+    in_flight::Vector{Vulkan.Fence}
+    current_frame::Int  # index into sync arrays (1-based, wraps)
     # Current frame state
     current_image_idx::UInt32
     acquired::Bool
@@ -50,18 +51,13 @@ function RenderWindow(width::Integer, height::Integer;
                                 "Ensure Vulkan drivers support window surfaces"))
     surface = Vulkan.SurfaceKHR(surface_ptr, ctx.instance, ctx.instance.refcount)
 
-    # Create sync primitives
-    dev = ctx.device
-    image_available = Vulkan.Semaphore(dev)
-    render_finished = Vulkan.Semaphore(dev)
-    in_flight = Vulkan.Fence(dev; flags=Vulkan.FENCE_CREATE_SIGNALED_BIT)
-
     win = RenderWindow(
         handle, surface, nothing,
         Vulkan.Image[], Vulkan.ImageView[],
         Vulkan.FORMAT_B8G8R8A8_SRGB,
         Vulkan.Extent2D(width, height),
-        image_available, render_finished, in_flight,
+        Vulkan.Semaphore[], Vulkan.Semaphore[], Vulkan.Fence[],
+        1,  # current_frame
         UInt32(0), false,
     )
 
@@ -164,6 +160,13 @@ function create_swapchain!(win::RenderWindow; vsync::Bool=true)
         )
         push!(win.views, view)
     end
+
+    # Create per-frame sync primitives (one set per swapchain image)
+    n = length(win.images)
+    win.image_available = [Vulkan.Semaphore(dev) for _ in 1:n]
+    win.render_finished = [Vulkan.Semaphore(dev) for _ in 1:n]
+    win.in_flight = [Vulkan.Fence(dev; flags=Vulkan.FENCE_CREATE_SIGNALED_BIT) for _ in 1:n]
+    win.current_frame = 1
 end
 
 """
@@ -175,12 +178,13 @@ Must be called before recording rendering commands.
 function acquire_next_image!(win::RenderWindow)
     ctx = vk_context()
     dev = ctx.device
+    fi = win.current_frame
 
-    unwrap(Vulkan.wait_for_fences(dev, [win.in_flight], true, typemax(UInt64)))
-    unwrap(Vulkan.reset_fences(dev, [win.in_flight]))
+    unwrap(Vulkan.wait_for_fences(dev, [win.in_flight[fi]], true, typemax(UInt64)))
+    unwrap(Vulkan.reset_fences(dev, [win.in_flight[fi]]))
 
     idx, result = unwrap(Vulkan.acquire_next_image_khr(dev, win.swapchain,
-        typemax(UInt64); semaphore=win.image_available))
+        typemax(UInt64); semaphore=win.image_available[fi]))
 
     win.current_image_idx = idx
     win.acquired = true
@@ -197,14 +201,17 @@ function present!(win::RenderWindow)
     ctx = vk_context()
     win.acquired || error("Cannot present: no image acquired (call acquire_next_image! first)")
 
+    fi = win.current_frame
     present_info = Vulkan.PresentInfoKHR(
-        [win.render_finished],
+        [win.render_finished[fi]],
         [win.swapchain],
         [win.current_image_idx],
     )
     unwrap(Vulkan.queue_present_khr(ctx.queue, present_info))
 
     win.acquired = false
+    # Advance to next frame-in-flight slot
+    win.current_frame = mod1(fi + 1, length(win.in_flight))
 end
 
 """

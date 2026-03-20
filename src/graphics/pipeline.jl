@@ -294,6 +294,7 @@ function vk_draw!(pipeline::CompiledGraphicsPipeline,
                    push_data::Vector{UInt8}=UInt8[],
                    instances::Integer=1,
                    depth_view::Union{Nothing, Vulkan.ImageView}=nothing,
+                   depth_image::Union{Nothing, Vulkan.Image}=nothing,
                    clear_color::Union{Nothing, NTuple{4, Float32}}=nothing,
                    indices_buffer::Union{Nothing, Vulkan.Buffer}=nothing,
                    index_count::Integer=0)
@@ -320,6 +321,22 @@ function vk_draw!(pipeline::CompiledGraphicsPipeline,
         Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         Vulkan.PIPELINE_STAGE_TOP_OF_PIPE_BIT, Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
         Vulkan.AccessFlag(0), Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+
+    # Transition depth image to DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+    if depth_image !== nothing
+        depth_barrier = Vulkan.ImageMemoryBarrier(
+            Vulkan.AccessFlag(0),
+            Vulkan.ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | Vulkan.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            Vulkan.QUEUE_FAMILY_IGNORED, Vulkan.QUEUE_FAMILY_IGNORED,
+            depth_image,
+            Vulkan.ImageSubresourceRange(Vulkan.IMAGE_ASPECT_DEPTH_BIT,
+                UInt32(0), UInt32(1), UInt32(0), UInt32(1)),
+        )
+        Vulkan.cmd_pipeline_barrier(cmd, [], [], [depth_barrier];
+            src_stage_mask=Vulkan.PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            dst_stage_mask=Vulkan.PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT)
+    end
 
     # Color attachment for dynamic rendering
     clear_val = if clear_color !== nothing

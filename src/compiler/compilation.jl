@@ -1484,6 +1484,9 @@ function _validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
     spirv_dis_cmd = SPIRV_Tools_jll.spirv_dis()
     spv_path = "/tmp/lava_last.spv"
 
+    # Write SPIR-V binary so spirv-val can read it
+    write(spv_path, spirv_bytes)
+
     # Validate — capture stderr via temp file (spirv-val writes errors to stderr)
     val_err_file = tempname()
     p = run(pipeline(`$spirv_val --target-env vulkan1.3 --scalar-block-layout $spv_path`;
