@@ -216,6 +216,34 @@ get_dispatch_log()
 vk_reset_device!()
 ```
 
+## Benchmarks
+
+Render benchmarks on AMD RX 7900 XTX / Ryzen 9 7900X, using [Hikari](https://github.com/SimonDanisch/Hikari.jl) wavefront volume path tracer via [RayMakie](https://github.com/SimonDanisch/RayMakie.jl). Full benchmark suite in [RayDemo/benchmark/](https://github.com/SimonDanisch/RayDemo/tree/sd/benchmarks/benchmark).
+
+### Render Time (seconds, lower is better)
+
+| Scene | Lava HW RT | Lava SW | AMDGPU | pbrt-v4 CPU |
+|-------|-----------|---------|--------|-------------|
+| Crown (500x700, 16spp) | **0.39** | 0.75 | 1.08 | 12.5 |
+| Bunny Cloud (960x540, 8spp) | **1.74** | 1.78 | 2.25 | 10.2 |
+| Killeroo Gold (684x513, 32spp) | **0.33** | 0.37 | 0.76 | 7.5 |
+| Materials (1200x900, 10spp) | **0.65** | 0.76 | 1.53 | 3.5 |
+| Black Hole (800x450, 32spp) | 1.64 | **1.68** | 4.25 | — |
+
+Lava SW is **1.4-2.1x faster than AMDGPU** across all scenes. Hardware RT adds another **1.1-2.3x** on geometry-heavy scenes (Crown, Killeroo Gold). Compared to pbrt-v4 on 24 CPU threads: **5-22x faster**.
+
+### AcceleratedKernels (10M elements, ms, lower is better)
+
+| Operation | Lava | AMDGPU | CPU (24 threads) |
+|-----------|------|--------|-----------------|
+| sort/UInt32 | 11.7 | **8.4** | 47.4 |
+| reduce/Float32 | 0.32 | **0.17** | 0.48 |
+| accumulate/Float32 | **0.69** | 0.71 | 16.3 |
+| map/sin | **0.20** | 1.87 | 3.76 |
+| sortperm/UInt32 | **21.1** | 24.6 | 143.2 |
+
+Lava and AMDGPU trade wins depending on the operation. Both are 4-20x faster than multithreaded CPU.
+
 ## Status
 
 Compute (GPUArrays + KernelAbstractions) works and is well tested. Graphics shaders and hardware ray tracing are functional. Multi-vendor CI, docs, and further performance work are ongoing.
