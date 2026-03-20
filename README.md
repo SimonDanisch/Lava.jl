@@ -54,6 +54,27 @@ hw = HardwareAccel(scene.accel)
 trace_closest_hits!(hits, rays, hw)
 ```
 
+## Benchmarks — AMD RX 7900 XTX
+
+Render benchmarks using [Hikari](https://github.com/SimonDanisch/Hikari.jl) wavefront volume path tracer via [RayMakie](https://github.com/SimonDanisch/RayMakie.jl), and [AcceleratedKernels.jl](https://github.com/JuliaGPU/AcceleratedKernels.jl) compute benchmarks. AMD RX 7900 XTX / Ryzen 9 7900X. Full benchmark suite in [RayDemo](https://github.com/SimonDanisch/RayDemo).
+
+### Ray Tracing (Hikari scenes)
+
+![RayDemo Benchmarks on 7900 XTX](benchmarks/7900xtx.png)
+
+Lava SW is **1.4-2.5x faster than AMDGPU** across all scenes. Hardware RT adds another **1.0-2.3x** on geometry-heavy scenes (Crown, Killeroo Gold). Compared to pbrt-v4 on 24 CPU threads: **5-32x faster**.
+
+### AcceleratedKernels — 100M elements
+
+![AK Benchmarks 100M](benchmarks/ak_benchmarks_100m.png)
+
+### AcceleratedKernels — 10M elements
+
+![AK Benchmarks 10M](benchmarks/ak_benchmarks_10m.png)
+
+Lava wins on compute-bound and dispatch-sensitive operations (up to **23x faster** on map/sin at 10M). AMDGPU wins on memory-bound operations (sort, sortperm) where its native HIP driver has an edge.
+
+
 ## Architecture
 
 Lava.jl uses a **custom LLVM IR to SPIR-V emitter written in Julia** (~6,000 lines). This is not a wrapper around `llc` or the SPIRV-LLVM-Translator. It reads the LLVM module via LLVM.jl and emits SPIR-V directly, giving full control over all shader stages and Vulkan extensions.
@@ -216,44 +237,7 @@ get_dispatch_log()
 vk_reset_device!()
 ```
 
-## Benchmarks
 
-Render benchmarks on AMD RX 7900 XTX / Ryzen 9 7900X, using [Hikari](https://github.com/SimonDanisch/Hikari.jl) wavefront volume path tracer via [RayMakie](https://github.com/SimonDanisch/RayMakie.jl). Full benchmark suite in [RayDemo/benchmark/](https://github.com/SimonDanisch/RayDemo/tree/sd/benchmarks/benchmark).
-
-### Render Time (seconds, lower is better)
-
-| Scene | Lava HW RT | Lava SW | AMDGPU | pbrt-v4 CPU |
-|-------|-----------|---------|--------|-------------|
-| Crown (500x700, 16spp) | **0.39** | 0.75 | 1.08 | 12.5 |
-| Bunny Cloud (960x540, 8spp) | **1.74** | 1.78 | 2.25 | 10.2 |
-| Killeroo Gold (684x513, 32spp) | **0.33** | 0.37 | 0.76 | 7.5 |
-| Materials (1200x900, 10spp) | **0.65** | 0.76 | 1.53 | 3.5 |
-| Black Hole (800x450, 32spp) | 1.64 | **1.68** | 4.25 | — |
-
-Lava SW is **1.4-2.1x faster than AMDGPU** across all scenes. Hardware RT adds another **1.1-2.3x** on geometry-heavy scenes (Crown, Killeroo Gold). Compared to pbrt-v4 on 24 CPU threads: **5-22x faster**.
-
-### AcceleratedKernels (ms, lower is better)
-
-**100M elements** (compute-bound, Lava's strength):
-
-| Operation | Lava | AMDGPU | CPU (24t) |
-|-----------|------|--------|-----------|
-| reduce/Float32 | **0.92** | 1.08 | 8.4 |
-| map/Float32 (sin) | **1.36** | 3.99 | 31.2 |
-| mapreduce/Float32 (sin) | **1.06** | 1.53 | 33.4 |
-| accumulate/Float32 | 7.52 | **6.78** | 230.4 |
-| sort/Float32 | 148.2 | **120.9** | 479.1 |
-
-**10M elements** (dispatch-sensitive):
-
-| Operation | Lava | AMDGPU | CPU (24t) |
-|-----------|------|--------|-----------|
-| map/Float32 (sin) | **0.17** | 3.97 | 3.76 |
-| accumulate/Float32 | **0.64** | 4.02 | 16.3 |
-| reduce/Float32 | 0.27 | **0.16** | 0.48 |
-| sortperm/UInt32 | 20.9 | **20.7** | 143.2 |
-
-Lava wins on compute-bound operations (up to **23x** on map/sin at 10M). AMDGPU wins on memory-bound operations (sort, sortperm) where its native HIP driver has an edge.
 
 ## Status
 
