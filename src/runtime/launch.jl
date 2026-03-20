@@ -435,36 +435,17 @@ end
 const _spirv_dump_dir = Ref("")
 const _spirv_dump_counter = Ref(0)
 
-"""
-Flush pending GPU work before cold-compiling a new kernel, but only if there
-are enough pending dispatches that the GPU might hit NVIDIA's TDR timeout (~5s)
-while waiting for compilation. Each cold compilation takes ~50-500ms on CPU;
-if 100+ dispatches are pending, the GPU could have been executing for seconds
-already. Flushing here prevents the GPU from timing out.
-"""
-function _flush_before_compile()
-    ctx = vk_context()
-    batch = ctx.active_batch
-    batch === nothing && return
-    # Only flush if there's meaningful pending work. A low threshold (100)
-    # ensures we flush before TDR but avoids excessive flushing during
-    # scene construction (which creates many small kernels).
-    (batch.dispatch_count >= 100 || !isempty(batch.sealed_cmd_bufs)) || return
-    vk_flush!()
-end
-
 function _get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), workgroup_size)
     key = hash((f, tt, workgroup_size))
 
     compiled = get(_kernel_cache, key, nothing)
     if compiled === nothing
-        # Flush pending GPU work before cold-compiling a new kernel.
-        # SPIR-V emission + pipeline creation can take 50-500ms on first use.
-        # Without flushing, the GPU sits idle in a submitted command buffer
-        # while the CPU compiles, and NVIDIA's TDR kills the GPU after ~5s.
-        # On warm paths (cache hit) this branch is never taken, so no overhead.
-        _flush_before_compile()
+        _fname = try string(nameof(typeof(f))) catch; "?" end
+        println("[LAVA COMPILE] $_fname  tt=$(length(tt.parameters)) params")
+        flush(stdout)
         compiled = lava_compile_gpu(f, tt; workgroup_size)
+        println("[LAVA COMPILE DONE] $_fname  $(length(compiled.spirv_bytes)) bytes")
+        flush(stdout)
         _kernel_cache[key] = compiled
         # Track insertion order for cache eviction
         push!(_kernel_insertion_order, key)
@@ -480,8 +461,12 @@ function _get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), 
 
     pipeline = get(_pipeline_by_kernel, key, nothing)
     if pipeline === nothing
+        println("[LAVA PIPELINE] Creating pipeline for $_fname ($(length(compiled.spirv_bytes)) bytes SPIR-V)...")
+        flush(stdout)
         pipeline = get_compute_pipeline(compiled.spirv_bytes, compiled.entry_name;
                                         push_constant_size=compiled.push_info.push_size)
+        println("[LAVA PIPELINE DONE] $_fname")
+        flush(stdout)
         _pipeline_by_kernel[key] = pipeline
     end
 

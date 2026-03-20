@@ -254,13 +254,28 @@ end
 """
 Internal launch function for KA kernels. Compiles and dispatches the GPU function.
 """
+const _DBG_LAUNCH_COUNT = Ref(0)
+
 function ka_launch!(@nospecialize(f), all_args::Tuple, block_dims::NTuple{3,Int}, workgroup_size::NTuple{3,Int})
+    _DBG_LAUNCH_COUNT[] += 1
+    _n = _DBG_LAUNCH_COUNT[]
     # Build type tuple for compilation (excludes f — GPUCompiler prepends typeof(f))
     # all_args[1] is f itself (included for BDA packing), rest are the actual args
     tt = Tuple{map(ka_arg_llvm_type, Base.tail(all_args))...}
 
     # Compile + pipeline + offsets (cached, single lookup)
+    key = hash((f, tt, workgroup_size))
+    is_new = !haskey(_kernel_cache, key)
+    if is_new
+        fname = try string(nameof(typeof(f))) catch; "?" end
+        println("  [COMPILE #$_n] $fname")
+        flush(stdout)
+    end
     compiled, pipeline, offsets, byval_sizes = _get_compiled_kernel_and_pipeline(f, tt, workgroup_size)
+    if is_new
+        println("  [COMPILE #$_n DONE] $(length(compiled.spirv_bytes)) bytes SPIR-V")
+        flush(stdout)
+    end
 
     # Compute total size: base layout + inline struct data
     inline_extra = _compute_inline_extra_from_byval(byval_sizes)

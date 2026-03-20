@@ -185,6 +185,7 @@ function __init__()
     last_dispatch_info[] = ""
     prev_dispatch_info[] = ""
     empty!(dispatch_log)
+    _init_pipeline_thread!()
 end
 
 end # module Lava

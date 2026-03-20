@@ -182,8 +182,9 @@ function _shorten_reason(reason::String)
 end
 
 # SPIR-V optimization: enabled automatically on NVIDIA to work around
-# driver bugs with large/complex shaders (Xid 31 MMU faults).
-const _spirv_opt_enabled = Ref(false)
+# Always run spirv-opt: produces cleaner SPIR-V, helps with driver bugs
+# (NVIDIA Xid 31 MMU faults, AMD Windows shader compiler hangs).
+const _spirv_opt_enabled = Ref(true)
 
 """
     _run_spirv_opt(spirv_bytes::Vector{UInt8}) -> Vector{UInt8}
@@ -557,13 +558,13 @@ function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
         # ── Stage 1: LLVM passes ──
         _run_llvm_passes!(mod, wrapper_fn)
 
-        # Save IR for debugging (always available at /tmp/lava_last.ll)
+        # Save IR for debugging
         ir = string(mod)
-        write("/tmp/lava_last.ll", ir)
-        # Also save with unique name for crash debugging
         _KERNEL_DEBUG_COUNTER[] += 1
         _kidx = _KERNEL_DEBUG_COUNTER[]
-        write("/tmp/lava_kernel_$(_kidx)_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).ll", ir)
+        _dbg_dir = joinpath(@__DIR__, "..", "..", "..", "tmp_kernels")
+        mkpath(_dbg_dir)
+        write(joinpath(_dbg_dir, "kernel_$(_kidx)_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).ll"), ir)
 
         # ── Stage 2: Custom SPIR-V emission ──
         spirv_bytes, source_map = _emit_spirv_from_llvm(mod, wrapper_name, workgroup_size)
@@ -573,9 +574,8 @@ function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
             spirv_bytes = _run_spirv_opt(spirv_bytes)
         end
 
-        # Save SPIR-V for debugging (always available at /tmp/lava_last.spv)
-        write("/tmp/lava_last.spv", spirv_bytes)
-        write("/tmp/lava_kernel_$(_kidx)_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).spv", spirv_bytes)
+        # Save SPIR-V for debugging
+        write(joinpath(_dbg_dir, "kernel_$(_kidx)_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).spv"), spirv_bytes)
 
         # ── Stage 3: Validation ──
         if validate
