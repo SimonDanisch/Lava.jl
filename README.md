@@ -232,21 +232,28 @@ Render benchmarks on AMD RX 7900 XTX / Ryzen 9 7900X, using [Hikari](https://git
 
 Lava SW is **1.4-2.1x faster than AMDGPU** across all scenes. Hardware RT adds another **1.1-2.3x** on geometry-heavy scenes (Crown, Killeroo Gold). Compared to pbrt-v4 on 24 CPU threads: **5-22x faster**.
 
-### AcceleratedKernels (100M elements, ms, lower is better)
+### AcceleratedKernels (ms, lower is better)
 
-| Operation | Lava | AMDGPU |
-|-----------|------|--------|
-| sort/UInt32 | 138.0 | **106.7** |
-| sort/Float32 | 148.2 | **120.9** |
-| reduce/UInt32 | **0.92** | 1.22 |
-| reduce/Float32 | **0.92** | 1.08 |
-| accumulate/Float32 | 7.52 | **6.78** |
-| map/Float32 (2x) | **1.36** | 1.61 |
-| map/Float32 (sin) | **1.36** | 3.99 |
-| mapreduce/Float32 (sin) | **1.06** | 1.53 |
-| sortperm/UInt32 | 309.7 | **226.7** |
+**100M elements** (compute-bound, Lava's strength):
 
-Lava wins on compute-bound operations (reduce, map, mapreduce — up to **2.9x** on map/sin). AMDGPU wins on memory-bound operations (sort, sortperm) where its native HIP driver has an edge.
+| Operation | Lava | AMDGPU | CPU (24t) |
+|-----------|------|--------|-----------|
+| reduce/Float32 | **0.92** | 1.08 | 8.4 |
+| map/Float32 (sin) | **1.36** | 3.99 | 31.2 |
+| mapreduce/Float32 (sin) | **1.06** | 1.53 | 33.4 |
+| accumulate/Float32 | 7.52 | **6.78** | 230.4 |
+| sort/Float32 | 148.2 | **120.9** | 479.1 |
+
+**10M elements** (dispatch-sensitive):
+
+| Operation | Lava | AMDGPU | CPU (24t) |
+|-----------|------|--------|-----------|
+| map/Float32 (sin) | **0.17** | 3.97 | 3.76 |
+| accumulate/Float32 | **0.64** | 4.02 | 16.3 |
+| reduce/Float32 | 0.27 | **0.16** | 0.48 |
+| sortperm/UInt32 | 20.9 | **20.7** | 143.2 |
+
+Lava wins on compute-bound operations (up to **23x** on map/sin at 10M). AMDGPU wins on memory-bound operations (sort, sortperm) where its native HIP driver has an edge.
 
 ## Status
 
