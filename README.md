@@ -232,17 +232,21 @@ Render benchmarks on AMD RX 7900 XTX / Ryzen 9 7900X, using [Hikari](https://git
 
 Lava SW is **1.4-2.1x faster than AMDGPU** across all scenes. Hardware RT adds another **1.1-2.3x** on geometry-heavy scenes (Crown, Killeroo Gold). Compared to pbrt-v4 on 24 CPU threads: **5-22x faster**.
 
-### AcceleratedKernels (10M elements, ms, lower is better)
+### AcceleratedKernels (100M elements, ms, lower is better)
 
-| Operation | Lava | AMDGPU | CPU (24 threads) |
-|-----------|------|--------|-----------------|
-| sort/UInt32 | 11.7 | **8.4** | 47.4 |
-| reduce/Float32 | 0.32 | **0.17** | 0.48 |
-| accumulate/Float32 | **0.69** | 0.71 | 16.3 |
-| map/sin | **0.20** | 1.87 | 3.76 |
-| sortperm/UInt32 | **21.1** | 24.6 | 143.2 |
+| Operation | Lava | AMDGPU |
+|-----------|------|--------|
+| sort/UInt32 | 138.0 | **106.7** |
+| sort/Float32 | 148.2 | **120.9** |
+| reduce/UInt32 | **0.92** | 1.22 |
+| reduce/Float32 | **0.92** | 1.08 |
+| accumulate/Float32 | 7.52 | **6.78** |
+| map/Float32 (2x) | **1.36** | 1.61 |
+| map/Float32 (sin) | **1.36** | 3.99 |
+| mapreduce/Float32 (sin) | **1.06** | 1.53 |
+| sortperm/UInt32 | 309.7 | **226.7** |
 
-Lava and AMDGPU trade wins depending on the operation. Both are 4-20x faster than multithreaded CPU.
+Lava wins on compute-bound operations (reduce, map, mapreduce — up to **2.9x** on map/sin). AMDGPU wins on memory-bound operations (sort, sortperm) where its native HIP driver has an edge.
 
 ## Status
 
