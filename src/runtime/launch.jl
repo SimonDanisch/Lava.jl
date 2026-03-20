@@ -435,11 +435,35 @@ end
 const _spirv_dump_dir = Ref("")
 const _spirv_dump_counter = Ref(0)
 
+"""
+Flush pending GPU work before cold-compiling a new kernel, but only if there
+are enough pending dispatches that the GPU might hit NVIDIA's TDR timeout (~5s)
+while waiting for compilation. Each cold compilation takes ~50-500ms on CPU;
+if 100+ dispatches are pending, the GPU could have been executing for seconds
+already. Flushing here prevents the GPU from timing out.
+"""
+function _flush_before_compile()
+    ctx = vk_context()
+    batch = ctx.active_batch
+    batch === nothing && return
+    # Only flush if there's meaningful pending work. A low threshold (100)
+    # ensures we flush before TDR but avoids excessive flushing during
+    # scene construction (which creates many small kernels).
+    (batch.dispatch_count >= 100 || !isempty(batch.sealed_cmd_bufs)) || return
+    vk_flush!()
+end
+
 function _get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), workgroup_size)
     key = hash((f, tt, workgroup_size))
 
     compiled = get(_kernel_cache, key, nothing)
     if compiled === nothing
+        # Flush pending GPU work before cold-compiling a new kernel.
+        # SPIR-V emission + pipeline creation can take 50-500ms on first use.
+        # Without flushing, the GPU sits idle in a submitted command buffer
+        # while the CPU compiles, and NVIDIA's TDR kills the GPU after ~5s.
+        # On warm paths (cache hit) this branch is never taken, so no overhead.
+        _flush_before_compile()
         compiled = lava_compile_gpu(f, tt; workgroup_size)
         _kernel_cache[key] = compiled
         # Track insertion order for cache eviction
