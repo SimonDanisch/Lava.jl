@@ -56,14 +56,19 @@ end
 @inline frag_coord_xy() = Vec2f(frag_coord(1), frag_coord(2))
 
 @inline function front_facing()
-    Base.llvmcall(("""
+    # Return UInt8 (not Bool/i1) to match Julia's ABI convention.
+    # Julia passes Bool as i8 at call sites, so returning i1 creates a type
+    # mismatch that prevents LLVM's AlwaysInliner from inlining this helper.
+    raw = Base.llvmcall(("""
         @__spirv_BuiltInFrontFacing = external addrspace(7) global i1
-        define i1 @entry() #0 {
+        define i8 @entry() #0 {
             %val = load i1, ptr addrspace(7) @__spirv_BuiltInFrontFacing, align 1
-            ret i1 %val
+            %ext = zext i1 %val to i8
+            ret i8 %ext
         }
         attributes #0 = { alwaysinline }
-    """, "entry"), Bool, Tuple{})
+    """, "entry"), UInt8, Tuple{})
+    raw != 0x00
 end
 
 # ── Output Builtins (Vertex/Geometry/TessEval) ──
