@@ -440,12 +440,7 @@ function _get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), 
 
     compiled = get(_kernel_cache, key, nothing)
     if compiled === nothing
-        _fname = try string(nameof(typeof(f))) catch; "?" end
-        println("[LAVA COMPILE] $_fname  tt=$(length(tt.parameters)) params")
-        flush(stdout)
         compiled = lava_compile_gpu(f, tt; workgroup_size)
-        println("[LAVA COMPILE DONE] $_fname  $(length(compiled.spirv_bytes)) bytes")
-        flush(stdout)
         _kernel_cache[key] = compiled
         # Track insertion order for cache eviction
         push!(_kernel_insertion_order, key)
@@ -461,12 +456,8 @@ function _get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), 
 
     pipeline = get(_pipeline_by_kernel, key, nothing)
     if pipeline === nothing
-        println("[LAVA PIPELINE] Creating pipeline for $_fname ($(length(compiled.spirv_bytes)) bytes SPIR-V)...")
-        flush(stdout)
         pipeline = get_compute_pipeline(compiled.spirv_bytes, compiled.entry_name;
                                         push_constant_size=compiled.push_info.push_size)
-        println("[LAVA PIPELINE DONE] $_fname")
-        flush(stdout)
         _pipeline_by_kernel[key] = pipeline
     end
 

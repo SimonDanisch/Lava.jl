@@ -264,18 +264,7 @@ function ka_launch!(@nospecialize(f), all_args::Tuple, block_dims::NTuple{3,Int}
     tt = Tuple{map(ka_arg_llvm_type, Base.tail(all_args))...}
 
     # Compile + pipeline + offsets (cached, single lookup)
-    key = hash((f, tt, workgroup_size))
-    is_new = !haskey(_kernel_cache, key)
-    if is_new
-        fname = try string(nameof(typeof(f))) catch; "?" end
-        println("  [COMPILE #$_n] $fname")
-        flush(stdout)
-    end
     compiled, pipeline, offsets, byval_sizes = _get_compiled_kernel_and_pipeline(f, tt, workgroup_size)
-    if is_new
-        println("  [COMPILE #$_n DONE] $(length(compiled.spirv_bytes)) bytes SPIR-V")
-        flush(stdout)
-    end
 
     # Compute total size: base layout + inline struct data
     inline_extra = _compute_inline_extra_from_byval(byval_sizes)
