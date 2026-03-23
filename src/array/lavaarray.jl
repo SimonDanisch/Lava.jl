@@ -160,6 +160,9 @@ struct LavaDeviceArray{T,N} <: GPUArrays.AbstractDeviceArray{T,N}
 end
 
 Base.size(a::LavaDeviceArray) = a.dims
+Base.pointer(a::LavaDeviceArray{T}) where {T} = a.ptr
+Base.pointer(a::LavaDeviceArray{T}, i::Integer) where {T} = a.ptr + (i - 1) * sizeof(T)
+Base.unsafe_convert(::Type{Ptr{T}}, a::LavaDeviceArray{T}) where {T} = a.ptr
 
 # Convert LavaArray → LavaDeviceArray for kernel arguments
 function LavaDeviceArray(a::LavaArray{T,N}) where {T,N}

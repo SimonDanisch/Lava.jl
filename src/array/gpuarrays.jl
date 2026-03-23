@@ -101,10 +101,11 @@ end
 function Base.copyto!(dest::LavaArray{T}, doffs::Integer,
                       src::LavaArray{T}, soffs::Integer, n::Integer) where T
     n == 0 && return dest
-    # GPU→GPU copy via staging
-    temp = Vector{T}(undef, n)
-    copyto!(temp, 1, src, soffs, n)
-    copyto!(dest, doffs, temp, 1, n)
+    # Direct GPU→GPU copy via vkCmdCopyBuffer (no CPU staging roundtrip)
+    src_offset = (src.offset + Int(soffs) - 1) * sizeof(T)
+    dst_offset = (dest.offset + Int(doffs) - 1) * sizeof(T)
+    nbytes = n * sizeof(T)
+    _one_shot_copy(src.buf[].buffer, src_offset, dest.buf[].buffer, dst_offset, nbytes)
     return dest
 end
 

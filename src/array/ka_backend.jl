@@ -167,25 +167,80 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
 end
 
 # Vulkan dispatch is max 3D. pad_to_3d maps the N-D block grid to a 3D dispatch,
-# splitting large dimensions across Y/Z when needed to stay within the Vulkan spec
-# minimum of 65535 per dimension (lavapipe enforces this strictly).
-const _MAX_WG_DIM = 65535
+# splitting large dimensions across Y/Z when needed to stay within device limits.
+# Uses actual device maxComputeWorkGroupCount (queried once, cached).
+#
+# CRITICAL: pad_to_3d must NEVER over-dispatch (produce more workgroups than requested).
+# Kernels like AK._accumulate_block! write to auxiliary arrays indexed by workgroup ID
+# without bounds checks — phantom workgroups cause out-of-bounds GPU memory writes.
+
+# Cached per-dimension workgroup count limits (filled on first use from device properties)
+const _MAX_WG_DIMS = Ref((65535, 65535, 65535))  # conservative defaults
+const _MAX_WG_DIMS_INITIALIZED = Ref(false)
+
+function _init_max_wg_dims!()
+    _MAX_WG_DIMS_INITIALIZED[] && return
+    ctx = vk_context()
+    props = Vulkan.get_physical_device_properties(ctx.physical_device)
+    wgc = props.limits.max_compute_work_group_count
+    _MAX_WG_DIMS[] = (Int(wgc[1]), Int(wgc[2]), Int(wgc[3]))
+    _MAX_WG_DIMS_INITIALIZED[] = true
+end
+
+push!(_reset_callbacks, function()
+    _MAX_WG_DIMS_INITIALIZED[] = false
+end)
+
+# Find exact factor of n that is ≤ max_dim, for splitting workgroup counts.
+# Returns the largest factor ≤ max_dim, or max_dim if none found (over-dispatch).
+function _find_split_factor(n::Int, max_dim::Int)
+    # Try exact division first (fast path for powers of 2, multiples of common factors)
+    for d in (max_dim, max_dim-1, max_dim-2, max_dim-3)
+        d > 0 && n % d == 0 && return d
+    end
+    # Try small factors of n that would make the other dimension ≤ max_dim
+    # We need X such that X ≤ max_dim and n/X ≤ max_dim (for 2D split)
+    # So X ≥ cld(n, max_dim)
+    lo = cld(n, max_dim)
+    for x in lo:min(n, max_dim)
+        n % x == 0 && return x
+    end
+    # No exact factor found — find tightest over-approximation
+    # This should be extremely rare (requires n > max_dim^2 with no factors in range)
+    return max_dim
+end
 
 function pad_to_3d(t::NTuple{1,<:Integer})
+    _init_max_wg_dims!()
     n = Int(t[1])
-    n <= _MAX_WG_DIM && return (n, 1, 1)
-    # Split into X * Y * Z ≥ n, each ≤ 65535
-    ny = cld(n, _MAX_WG_DIM)
-    ny <= _MAX_WG_DIM && return (_MAX_WG_DIM, ny, 1)
-    # Need all 3 dimensions
-    return (_MAX_WG_DIM, _MAX_WG_DIM, cld(n, _MAX_WG_DIM * _MAX_WG_DIM))
-end
-function pad_to_3d(t::NTuple{2,<:Integer})
-    x, y = Int(t[1]), Int(t[2])
-    if x <= _MAX_WG_DIM && y <= _MAX_WG_DIM
+    max_x, max_y, max_z = _MAX_WG_DIMS[]
+    n <= max_x && return (n, 1, 1)
+    # Need to split into X * Y (or X * Y * Z)
+    # Find X such that X divides n exactly and X ≤ max_x
+    x = _find_split_factor(n, max_x)
+    y = cld(n, x)
+    if x * y == n && y <= max_y
         return (x, y, 1)
     end
-    # Flatten and re-split (rare: individual dims > 65535)
+    # 2D split didn't work exactly, try 3D
+    if y > max_y
+        # Flatten into 3D
+        xy = x * min(y, max_y)
+        z = cld(n, xy)
+        return (x, min(y, max_y), z)
+    end
+    # Over-dispatch (y > exact). This is dangerous for kernels without bounds checks.
+    @warn "pad_to_3d: over-dispatching $n as ($x, $y, 1) = $(x*y) workgroups" maxlog=1
+    return (x, y, 1)
+end
+function pad_to_3d(t::NTuple{2,<:Integer})
+    _init_max_wg_dims!()
+    x, y = Int(t[1]), Int(t[2])
+    max_x, max_y, _ = _MAX_WG_DIMS[]
+    if x <= max_x && y <= max_y
+        return (x, y, 1)
+    end
+    # Flatten and re-split
     return pad_to_3d((x * y,))
 end
 function pad_to_3d(t::NTuple{3,<:Integer})
@@ -199,7 +254,11 @@ end
 """
 Internal launch function for KA kernels. Compiles and dispatches the GPU function.
 """
+const _DBG_LAUNCH_COUNT = Ref(0)
+
 function ka_launch!(@nospecialize(f), all_args::Tuple, block_dims::NTuple{3,Int}, workgroup_size::NTuple{3,Int})
+    _DBG_LAUNCH_COUNT[] += 1
+    _n = _DBG_LAUNCH_COUNT[]
     # Build type tuple for compilation (excludes f — GPUCompiler prepends typeof(f))
     # all_args[1] is f itself (included for BDA packing), rest are the actual args
     tt = Tuple{map(ka_arg_llvm_type, Base.tail(all_args))...}

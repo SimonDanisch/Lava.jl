@@ -393,6 +393,7 @@ function _gfx_ensure_tess_outer_var!(state::SPIRVEmitterState, gfx_io::GfxIOStat
     var_id = fresh_id!(mod)
     encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Output)
     emit_decorate!(mod, var_id, Dec.BuiltIn, BuiltIn.TessLevelOuter)
+    emit_decorate!(mod, var_id, Dec.Patch)
     emit_name!(mod, var_id, "gl_TessLevelOuter")
     gfx_io.tess_outer_var_id = var_id
 end
@@ -408,6 +409,7 @@ function _gfx_ensure_tess_inner_var!(state::SPIRVEmitterState, gfx_io::GfxIOStat
     var_id = fresh_id!(mod)
     encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Output)
     emit_decorate!(mod, var_id, Dec.BuiltIn, BuiltIn.TessLevelInner)
+    emit_decorate!(mod, var_id, Dec.Patch)
     emit_name!(mod, var_id, "gl_TessLevelInner")
     gfx_io.tess_inner_var_id = var_id
 end

@@ -418,13 +418,6 @@ function _init_vulkan!()
         @warn "Vulkan validation layers not found. Install vulkan-validationlayers for GPU error diagnostics."
     end
 
-    vendor_id = props.vendor_id
-    is_nvidia = vendor_id == 0x10DE
-    if is_nvidia
-        _spirv_opt_enabled[] = true
-        @debug "NVIDIA detected: spirv-opt=on"
-    end
-
     # Initialize zero-alloc Vulkan function pointers for hot paths
     _cmd_pipeline_barrier_fptr[] = Vulkan.function_pointer(device, "vkCmdPipelineBarrier")
 
