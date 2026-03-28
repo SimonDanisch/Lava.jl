@@ -34,6 +34,18 @@ LavaArray{T,N}(::UndefInitializer, dims::Int...) where {T,N} = LavaArray{T,N}(un
 LavaArray{T,N}(::UndefInitializer, dims::Integer...) where {T,N} = LavaArray{T,N}(undef, Int.(dims))
 LavaArray{T,N}(::UndefInitializer, dims::NTuple{N,Integer}) where {T,N} = LavaArray{T,N}(undef, Int.(dims))
 
+"""Allocate a LavaArray with INDEX_BUFFER_BIT for use as Vulkan index buffer."""
+function alloc_index_buffer(data::AbstractVector{UInt32})
+    nbytes = max(length(data) * sizeof(UInt32), 16)
+    managed_buf = vk_alloc(nbytes; extra_usage=UInt32(Vulkan.BUFFER_USAGE_INDEX_BUFFER_BIT))
+    ref = GPUArrays.DataRef(managed_buf) do buf
+        vk_free!(buf)
+    end
+    arr = LavaArray{UInt32,1}(ref, (length(data),))
+    upload!(arr, data)
+    return arr
+end
+
 # Empty vector constructor (matches Array{T,1}() behavior)
 LavaArray{T,1}() where {T} = LavaArray{T,1}(undef, (0,))
 
@@ -118,7 +130,7 @@ end
 
 # ── Transfers ──
 
-"""Upload host data to GPU array."""
+"""Upload host data to GPU array (must have matching length)."""
 function upload!(dst::LavaArray{T}, data::AbstractArray{T}) where T
     @assert length(data) == length(dst) "Size mismatch: $(length(data)) vs $(length(dst))"
     src = vec(collect(data))
@@ -129,6 +141,35 @@ function upload!(dst::LavaArray{T}, data::AbstractArray{T}) where T
     end
     upload!(dst.buf[], bytes; offset=dst.offset * sizeof(T))
 end
+
+"""
+    update!(dst::LavaArray, data::AbstractArray)
+
+Update a GPU array with new host data. Resizes if needed — frees the old
+buffer immediately (no GC pressure) and allocates a new one.
+If sizes match, uploads in-place with no allocation.
+"""
+function update!(dst::LavaArray{T,N}, data::AbstractArray{T,N}) where {T,N}
+    if size(dst) == size(data)
+        upload!(dst, data)
+    else
+        # Free old buffer immediately (not deferred)
+        old_ref = dst.buf
+        GPUArrays.unsafe_free!(old_ref)
+        # Allocate new
+        new_nbytes = max(length(data) * sizeof(T), 16)
+        new_buf = vk_alloc(new_nbytes)
+        new_ref = GPUArrays.DataRef(new_buf) do buf
+            vk_free!(buf)
+        end
+        dst.buf = new_ref
+        dst.dims = size(data)
+        dst.offset = 0
+        upload!(dst, data)
+    end
+    return dst
+end
+update!(dst::LavaArray{T}, data::AbstractArray{S}) where {T,S} = update!(dst, convert(AbstractArray{T}, data))
 
 """Download GPU array to host."""
 function Base.Array(src::LavaArray{T,N}) where {T,N}

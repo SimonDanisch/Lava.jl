@@ -24,6 +24,8 @@ mutable struct RenderWindow
     render_finished::Vector{Vulkan.Semaphore}
     in_flight::Vector{Vulkan.Fence}
     current_frame::Int  # index into sync arrays (1-based, wraps)
+    # Per-frame batch: reclaimed after fence wait in acquire_next_image!
+    frame_batches::Vector{Union{Nothing, CommandBatch}}
     # Current frame state
     current_image_idx::UInt32
     acquired::Bool
@@ -58,6 +60,7 @@ function RenderWindow(width::Integer, height::Integer;
         Vulkan.Extent2D(width, height),
         Vulkan.Semaphore[], Vulkan.Semaphore[], Vulkan.Fence[],
         1,  # current_frame
+        Union{Nothing, CommandBatch}[],  # frame_batches
         UInt32(0), false,
     )
 
@@ -166,6 +169,7 @@ function create_swapchain!(win::RenderWindow; vsync::Bool=true)
     win.image_available = [Vulkan.Semaphore(dev) for _ in 1:n]
     win.render_finished = [Vulkan.Semaphore(dev) for _ in 1:n]
     win.in_flight = [Vulkan.Fence(dev; flags=Vulkan.FENCE_CREATE_SIGNALED_BIT) for _ in 1:n]
+    win.frame_batches = Union{Nothing, CommandBatch}[nothing for _ in 1:n]
     win.current_frame = 1
 end
 
@@ -182,6 +186,17 @@ function acquire_next_image!(win::RenderWindow)
 
     unwrap(Vulkan.wait_for_fences(dev, [win.in_flight[fi]], true, typemax(UInt64)))
     unwrap(Vulkan.reset_fences(dev, [win.in_flight[fi]]))
+
+    # Reclaim batch from previous frame in this slot — GPU is done (fence waited above)
+    old_batch = win.frame_batches[fi]
+    if old_batch !== nothing
+        old_batch.recording = false
+        old_batch.dispatch_count = 0
+        old_batch.last_was_rt = false
+        empty!(old_batch.data_refs)
+        push!(ctx.free_batches, old_batch)
+        win.frame_batches[fi] = nothing
+    end
 
     idx, result = unwrap(Vulkan.acquire_next_image_khr(dev, win.swapchain,
         typemax(UInt64); semaphore=win.image_available[fi]))
@@ -222,17 +237,44 @@ Handle window resize by recreating the swapchain.
 function Base.resize!(win::RenderWindow)
     ctx = vk_context()
     Vulkan.device_wait_idle(ctx.device)
+    # Reclaim in-flight frame batches before recreating swapchain
+    for i in eachindex(win.frame_batches)
+        batch = win.frame_batches[i]
+        if batch !== nothing
+            batch.recording = false
+            batch.dispatch_count = 0
+            batch.last_was_rt = false
+            empty!(batch.data_refs)
+            push!(ctx.free_batches, batch)
+            win.frame_batches[i] = nothing
+        end
+    end
     create_swapchain!(win)
 end
 
 function Base.isopen(win::RenderWindow)
-    !GLFW.WindowShouldClose(win.handle)
+    win.handle.handle != C_NULL && !GLFW.WindowShouldClose(win.handle)
 end
 
 function Base.close(win::RenderWindow)
+    # Idempotent — safe to call multiple times
+    win.handle.handle == C_NULL && return
     ctx = vk_context()
     Vulkan.device_wait_idle(ctx.device)
+    # Reclaim any in-flight frame batches (GPU is idle after device_wait_idle)
+    for i in eachindex(win.frame_batches)
+        batch = win.frame_batches[i]
+        if batch !== nothing
+            batch.recording = false
+            batch.dispatch_count = 0
+            batch.last_was_rt = false
+            empty!(batch.data_refs)
+            push!(ctx.free_batches, batch)
+            win.frame_batches[i] = nothing
+        end
+    end
     GLFW.DestroyWindow(win.handle)
+    win.handle = GLFW.Window(C_NULL)
 end
 
 Base.size(win::RenderWindow) = (Int(win.extent.width), Int(win.extent.height))

@@ -44,38 +44,96 @@ mutable struct CommandBatch
 end
 
 """
+    BatchQueue
+
+An independent command submission channel owning a Vulkan queue, command pool,
+and batch state. Multiple `BatchQueue`s can record and submit independently
+(e.g., primary queue for graphics/present, compute queue for async RT).
+
+Create with `BatchQueue(device, queue, queue_family_index)`.
+"""
+mutable struct BatchQueue
+    queue::Vulkan.Queue
+    cmd_pool::Vulkan.CommandPool
+    active_batch::Union{Nothing, CommandBatch}
+    in_flight::Vector{CommandBatch}
+    free_batches::Vector{CommandBatch}
+    free_cmd_bufs::Vector{Vulkan.CommandBuffer}
+    # Dedicated transfer command buffer + fence (per-queue, thread-safe)
+    xfer_cmd_buf::Vulkan.CommandBuffer
+    xfer_fence::Vulkan.Fence
+end
+
+function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32;
+                    n_initial_batches::Int=2)
+    cmd_pool = Vulkan.CommandPool(device, qf_idx;
+        flags=Vulkan.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
+    batches = CommandBatch[]
+    for _ in 1:n_initial_batches
+        alloc_info = Vulkan.CommandBufferAllocateInfo(cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1)
+        cb = unwrap(Vulkan.allocate_command_buffers(device, alloc_info))[1]
+        fence = Vulkan.Fence(device)
+        data_refs = Any[]
+        sizehint!(data_refs, 128)
+        push!(batches, CommandBatch(cb, fence, false, 0, 0, false, data_refs, String[], Vulkan.CommandBuffer[]))
+    end
+    # Dedicated transfer command buffer + fence
+    xfer_alloc = Vulkan.CommandBufferAllocateInfo(cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1)
+    xfer_cmd_buf = unwrap(Vulkan.allocate_command_buffers(device, xfer_alloc))[1]
+    xfer_fence = Vulkan.Fence(device)
+    return BatchQueue(queue, cmd_pool, nothing, CommandBatch[], batches, Vulkan.CommandBuffer[],
+                      xfer_cmd_buf, xfer_fence)
+end
+
+"""
     VkContext
 
-Persistent Vulkan context holding device, queue, command pool, and batch-based
-command buffer management for compute/graphics/RT dispatch.
+Persistent Vulkan context. Batch-based command recording goes through
+`default_bq::BatchQueue` (the primary queue). Use `BatchQueue(...)` to
+create additional independent queues (e.g., for async compute/RT).
 """
 mutable struct VkContext
     instance::Vulkan.Instance
     physical_device::Vulkan.PhysicalDevice
     device::Vulkan.Device
-    queue::Vulkan.Queue
     queue_family_index::UInt32
-    cmd_pool::Vulkan.CommandPool
     device_name::String
-    # Batch-based dispatch (replaces single cmd_buf/fence)
-    active_batch::Union{Nothing, CommandBatch}   # Currently recording
-    in_flight::Vector{CommandBatch}              # Submitted, not yet completed
-    free_batches::Vector{CommandBatch}           # Completed, reusable
-    free_cmd_bufs::Vector{Vulkan.CommandBuffer}  # Spare CBs for multi-CB splitting
-    # Dedicated transfer command buffer + fence (separate from dispatch recording)
-    # Prevents command buffer state corruption when _one_shot_copy runs between
-    # dispatch recording and flush (NVIDIA validation: "active VkCommandBuffer")
-    xfer_cmd_buf::Vulkan.CommandBuffer
-    xfer_fence::Vulkan.Fence
-    # Dedicated AS build command buffer + fence (separate from dispatch batches)
-    # Prevents vkBeginCommandBuffer on active cmd_buf and vkQueueSubmit with in-use fence
-    # when _build_as_on_gpu runs during dispatch recording.
+    # Primary batch queue — all global API functions delegate here
+    default_bq::BatchQueue
+    # Secondary compute queue (async RT) — same family, separate queue object
+    compute_queue::Vulkan.Queue
+    # Dedicated AS build command buffer + fence (always on primary queue)
     as_cmd_buf::Vulkan.CommandBuffer
     as_fence::Vulkan.Fence
     # Ray tracing (nothing if not available)
     rt_pipeline_properties::Union{Nothing, RTPipelineProperties}
     # Debug messenger (nothing if validation layers not available)
-    debug_messenger::Any  # Union{Nothing, Vulkan.DebugUtilsMessengerEXT}
+    debug_messenger::Any
+    # Queue allocation: next available index + total requested from device
+    next_queue_index::Int
+    max_queue_count::Int
+end
+
+# Convenience accessors — keep existing code working with minimal changes.
+# Batch-related fields and transfer resources delegate to default_bq.
+Base.getproperty(ctx::VkContext, s::Symbol) = begin
+    bq = getfield(ctx, :default_bq)
+    if s === :queue; return bq.queue
+    elseif s === :cmd_pool; return bq.cmd_pool
+    elseif s === :active_batch; return bq.active_batch
+    elseif s === :in_flight; return bq.in_flight
+    elseif s === :free_batches; return bq.free_batches
+    elseif s === :free_cmd_bufs; return bq.free_cmd_bufs
+    elseif s === :xfer_cmd_buf; return bq.xfer_cmd_buf
+    elseif s === :xfer_fence; return bq.xfer_fence
+    else; return getfield(ctx, s)
+    end
+end
+
+Base.setproperty!(ctx::VkContext, s::Symbol, v) = begin
+    if s === :active_batch; getfield(ctx, :default_bq).active_batch = v
+    else; setfield!(ctx, s, v)
+    end
 end
 
 # Ring buffer of recent validation messages for context on DEVICE_LOST
@@ -113,6 +171,7 @@ end
 
 vk_device() = vk_context().device
 vk_queue() = vk_context().queue
+vk_compute_queue() = vk_context().compute_queue
 
 """
     vk_reset_device!()
@@ -225,7 +284,12 @@ function _init_vulkan!()
     qf_idx = _find_graphics_compute_queue_family(phys_dev)
 
     # Create logical device with required features
-    queue_ci = [Vulkan.DeviceQueueCreateInfo(qf_idx, [1.0f0])]
+    # Request up to 4 queues: primary, async compute, + 2 for per-screen graphics
+    qf_props = Vulkan.get_physical_device_queue_family_properties(phys_dev)
+    max_queues = qf_props[qf_idx + 1].queue_count
+    n_queues = min(4, Int(max_queues))
+    queue_priorities = ones(Float32, n_queues)
+    queue_ci = [Vulkan.DeviceQueueCreateInfo(qf_idx, queue_priorities)]
 
     # Check for RT extension support
     has_rt = _has_rt_extensions(phys_dev)
@@ -363,6 +427,9 @@ function _init_vulkan!()
     )
 
     queue = Vulkan.get_device_queue(device, qf_idx, 0)
+    # Second queue for async compute/RT (falls back to same queue if only 1 available)
+    compute_queue = n_queues >= 2 ?
+        Vulkan.get_device_queue(device, qf_idx, 1) : queue
 
     # Query RT pipeline properties
     rt_props = nothing
@@ -379,34 +446,13 @@ function _init_vulkan!()
         )
     end
 
-    # Command pool (resettable command buffers)
-    cmd_pool = Vulkan.CommandPool(
-        device, qf_idx;
-        flags=Vulkan.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
-    )
+    # Default batch queue on the primary queue (includes transfer cmd buf/fence)
+    default_bq = BatchQueue(device, queue, qf_idx)
 
-    # Pre-allocate command buffers + fences:
-    # [1]: initial dispatch batch (compute/graphics/RT)
-    # [2]: transfer operations (_one_shot_copy staging downloads)
-    # [3]: dedicated AS builds (separate from dispatch batches — THE FIX)
-    # [4]: spare for free_batches pool
-    alloc_info = Vulkan.CommandBufferAllocateInfo(
-        cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 4
-    )
-    cmd_bufs = unwrap(Vulkan.allocate_command_buffers(device, alloc_info))
-    initial_cmd_buf = cmd_bufs[1]
-    xfer_cmd_buf = cmd_bufs[2]
-    as_cmd_buf = cmd_bufs[3]
-    spare_cmd_buf = cmd_bufs[4]
-
-    initial_fence = Vulkan.Fence(device)
-    xfer_fence = Vulkan.Fence(device)
+    # Dedicated AS build command buffer + fence (separate from batch system, always primary queue)
+    as_alloc = Vulkan.CommandBufferAllocateInfo(default_bq.cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1)
+    as_cmd_buf = unwrap(Vulkan.allocate_command_buffers(device, as_alloc))[1]
     as_fence = Vulkan.Fence(device)
-    spare_fence = Vulkan.Fence(device)
-
-    # Create initial batch in free pool
-    initial_batch = CommandBatch(initial_cmd_buf, initial_fence, false, 0, 0, false, Any[], String[], Vulkan.CommandBuffer[])
-    spare_batch = CommandBatch(spare_cmd_buf, spare_fence, false, 0, 0, false, Any[], String[], Vulkan.CommandBuffer[])
 
     has_validation = !isempty(layers)
     if has_rt
@@ -422,17 +468,33 @@ function _init_vulkan!()
     _cmd_pipeline_barrier_fptr[] = Vulkan.function_pointer(device, "vkCmdPipelineBarrier")
 
     return VkContext(
-        instance, phys_dev, device, queue, qf_idx,
-        cmd_pool, dev_name,
-        nothing,  # active_batch
-        CommandBatch[],  # in_flight
-        CommandBatch[initial_batch, spare_batch],  # free_batches
-        Vulkan.CommandBuffer[],  # free_cmd_bufs
-        xfer_cmd_buf, xfer_fence,
+        instance, phys_dev, device, qf_idx, dev_name,
+        default_bq, compute_queue,
         as_cmd_buf, as_fence,
         rt_props,
-        debug_messenger
+        debug_messenger,
+        2, n_queues  # next_queue_index=2 (0=primary, 1=compute), max=n_queues
     )
+end
+
+"""
+    allocate_batch_queue!() -> BatchQueue
+
+Create a new independent BatchQueue on a separate Vulkan queue (if available).
+Falls back to a separate command pool on the primary queue if all queues are taken.
+Used by Screen for isolated graphics rendering.
+"""
+function allocate_batch_queue!()
+    ctx = vk_context()
+    idx = ctx.next_queue_index
+    if idx < ctx.max_queue_count
+        queue = Vulkan.get_device_queue(ctx.device, ctx.queue_family_index, UInt32(idx))
+        ctx.next_queue_index += 1
+    else
+        # All hardware queues taken — reuse primary queue with separate command pool
+        queue = ctx.default_bq.queue
+    end
+    return BatchQueue(ctx.device, queue, ctx.queue_family_index)
 end
 
 function _pick_physical_device(devs)

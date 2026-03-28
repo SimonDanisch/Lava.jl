@@ -79,13 +79,13 @@ const cb_split_threshold = Ref{Int}(3000)
 # ── Batch lifecycle ──
 
 """
-    ensure_active_batch!(ctx) -> CommandBatch
+    ensure_active_batch!(bq::BatchQueue) -> CommandBatch
 
 Get the active batch, allocating one from the free pool if needed.
 Begins command buffer recording if not already started.
 """
-function ensure_active_batch!(ctx::VkContext)
-    batch = ctx.active_batch
+function ensure_active_batch!(bq::BatchQueue)
+    batch = bq.active_batch
     if batch !== nothing
         if !batch.recording
             unwrap(Vulkan.begin_command_buffer(batch.cmd_buf, Vulkan.CommandBufferBeginInfo(
@@ -96,16 +96,14 @@ function ensure_active_batch!(ctx::VkContext)
         return batch
     end
 
-    # Pop from free pool or allocate new
-    if !isempty(ctx.free_batches)
-        batch = pop!(ctx.free_batches)
+    if !isempty(bq.free_batches)
+        batch = pop!(bq.free_batches)
     else
-        batch = allocate_batch(ctx)
+        batch = allocate_batch(bq)
     end
 
-    ctx.active_batch = batch
+    bq.active_batch = batch
 
-    # Begin recording
     unwrap(Vulkan.begin_command_buffer(batch.cmd_buf, Vulkan.CommandBufferBeginInfo(
         flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
     )))
@@ -113,41 +111,86 @@ function ensure_active_batch!(ctx::VkContext)
     return batch
 end
 
+# Task-local BatchQueue override: when set, all batch operations on VkContext
+# redirect to this BatchQueue instead of default_bq. Used by the RT thread.
+const TASK_BATCH_QUEUE_KEY = :lava_batch_queue
+
+"""
+    with_batch_queue(f, bq::BatchQueue)
+
+Run `f()` with all batch operations redirected to `bq` instead of the default queue.
+The RT thread uses this so kernel dispatches and flushes go to the compute queue.
+
+    with_batch_queue(rt_bq) do
+        render!(screen)
+        flush!(rt_bq, device)
+    end
+"""
+function with_batch_queue(f, bq::BatchQueue)
+    task = current_task()
+    if task.storage === nothing
+        task.storage = IdDict()
+    end
+    old = get(task.storage, TASK_BATCH_QUEUE_KEY, nothing)
+    task.storage[TASK_BATCH_QUEUE_KEY] = bq
+    try
+        f()
+    finally
+        if old === nothing
+            delete!(task.storage, TASK_BATCH_QUEUE_KEY)
+        else
+            task.storage[TASK_BATCH_QUEUE_KEY] = old
+        end
+    end
+end
+
+"""Get the active BatchQueue for the current task (or nothing for default)."""
+function current_batch_queue()
+    task = current_task()
+    task.storage === nothing && return nothing
+    return get(task.storage, TASK_BATCH_QUEUE_KEY, nothing)
+end
+
+# VkContext delegates to task-local override or default_bq
+function ensure_active_batch!(ctx::VkContext)
+    bq = something(current_batch_queue(), ctx.default_bq)
+    return ensure_active_batch!(bq)
+end
+
 """Allocate a new CommandBatch (new command buffer + fence from the pool)."""
-function allocate_batch(ctx::VkContext)
-    cmd_buf = _alloc_cmd_buf(ctx)
-    fence = Vulkan.Fence(ctx.device)
+function allocate_batch(bq::BatchQueue)
+    cmd_buf = _alloc_cmd_buf(bq)
+    fence = Vulkan.Fence(vk_context().device)
     data_refs = Any[]
-    sizehint!(data_refs, 128)  # Pre-size for typical batch (avoids Vector growth allocs)
+    sizehint!(data_refs, 128)
     return CommandBatch(cmd_buf, fence, false, 0, 0, false, data_refs, String[], Vulkan.CommandBuffer[])
 end
 
 """Allocate a command buffer from the free pool, or create a new one."""
-function _alloc_cmd_buf(ctx::VkContext)
-    if !isempty(ctx.free_cmd_bufs)
-        return pop!(ctx.free_cmd_bufs)
+function _alloc_cmd_buf(bq::BatchQueue)
+    if !isempty(bq.free_cmd_bufs)
+        return pop!(bq.free_cmd_bufs)
     end
     alloc_info = Vulkan.CommandBufferAllocateInfo(
-        ctx.cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1
+        bq.cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1
     )
-    return unwrap(Vulkan.allocate_command_buffers(ctx.device, alloc_info))[1]
+    return unwrap(Vulkan.allocate_command_buffers(vk_context().device, alloc_info))[1]
 end
 
 """Reclaim a completed batch: reset fence, clear data refs, return to free pool."""
-function reclaim_batch!(ctx::VkContext, batch::CommandBatch)
+function reclaim_batch!(bq::BatchQueue, batch::CommandBatch)
     batch.recording = false
     batch.dispatch_count = 0
     batch.segment_dispatches = 0
     batch.last_was_rt = false
     empty!(batch.data_refs)
     empty!(batch.dispatch_log)
-    # Return sealed CB segments to the free pool for reuse
-    append!(ctx.free_cmd_bufs, batch.sealed_cmd_bufs)
+    append!(bq.free_cmd_bufs, batch.sealed_cmd_bufs)
     empty!(batch.sealed_cmd_bufs)
-    push!(ctx.free_batches, batch)
+    push!(bq.free_batches, batch)
 
     # When ALL in-flight batches are done, safe to reset pools and flush deferred frees
-    if isempty(ctx.in_flight)
+    if isempty(bq.in_flight)
         flush_deferred_frees!()
         reset_arg_buffer_pool!()
         reset_indirect_buffer_pool!()
@@ -165,7 +208,7 @@ be submitted alongside the active CB in `vk_flush!`.
 Barriers work across CB boundaries per Vulkan spec — submission order defines
 the scope of pipeline barriers, not command buffer boundaries.
 """
-function _maybe_split_cb!(batch::CommandBatch, ctx::VkContext)
+function _maybe_split_cb!(batch::CommandBatch, bq::BatchQueue)
     threshold = cb_split_threshold[]
     threshold <= 0 && return
     batch.segment_dispatches < threshold && return
@@ -175,7 +218,7 @@ function _maybe_split_cb!(batch::CommandBatch, ctx::VkContext)
     push!(batch.sealed_cmd_bufs, batch.cmd_buf)
 
     # Start fresh CB segment
-    batch.cmd_buf = _alloc_cmd_buf(ctx)
+    batch.cmd_buf = _alloc_cmd_buf(bq)
     unwrap(Vulkan.begin_command_buffer(batch.cmd_buf, Vulkan.CommandBufferBeginInfo(
         flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
     )))
@@ -205,12 +248,12 @@ Example:
         Vulkan.cmd_dispatch(cmd, ...)
     end
 """
-@inline function record_dispatch!(f, ctx::VkContext;
+@inline function record_dispatch!(f, bq::BatchQueue;
                            dst_stage::Vulkan.PipelineStageFlag,
                            extra_dst_access::Vulkan.AccessFlag=Vulkan.AccessFlag(0),
                            is_rt::Bool=false,
                            info::String="")
-    batch = ensure_active_batch!(ctx)
+    batch = ensure_active_batch!(bq)
     cmd = batch.cmd_buf
 
     # Memory barrier between dispatches (write→read synchronization).
@@ -246,7 +289,7 @@ Example:
     end
 
     # Split to a new CB if this segment is full
-    _maybe_split_cb!(batch, ctx)
+    _maybe_split_cb!(batch, bq)
 end
 
 """
@@ -287,24 +330,22 @@ end
 Record a compute dispatch.
 `push_bda` is the BDA address of the argument buffer (passed as 8-byte push constant).
 """
-function vk_dispatch!(pipeline::LavaComputePipeline, push_bda::UInt64,
+function vk_dispatch!(bq::BatchQueue, pipeline::LavaComputePipeline, push_bda::UInt64,
                       groups::NTuple{3, Integer})
-    vk_dispatch_base!(pipeline, push_bda, 0, 0, 0, Int(groups[1]), Int(groups[2]), Int(groups[3]))
+    vk_dispatch_base!(bq, pipeline, push_bda, 0, 0, 0, Int(groups[1]), Int(groups[2]), Int(groups[3]))
 end
 
 """Record a single compute dispatch with optional base group offset."""
-@inline function vk_dispatch_base!(pipeline::LavaComputePipeline, push_bda::UInt64,
+@inline function vk_dispatch_base!(bq::BatchQueue, pipeline::LavaComputePipeline, push_bda::UInt64,
                             base_x::Int, base_y::Int, base_z::Int,
                             gx::Int, gy::Int, gz::Int)
-    ctx = vk_context()
-
     dispatch_info = if dispatch_logging_enabled[]
         info = last_dispatch_info[]
         "$info base=($base_x,$base_y,$base_z) g=($gx,$gy,$gz)"
     else
         ""
     end
-    record_dispatch!(ctx;
+    record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         info=dispatch_info
     ) do cmd
@@ -319,6 +360,9 @@ end
                 UInt32(gx), UInt32(gy), UInt32(gz))
         end
     end
+    if bq.active_batch !== nothing
+        push!(bq.active_batch.data_refs, pipeline)
+    end
 end
 
 # ── Indirect Dispatch ──
@@ -329,13 +373,12 @@ end
 Record an indirect compute dispatch. The `indirect_buf` must contain a
 VkDispatchIndirectCommand (3×UInt32), written by a previous GPU kernel.
 """
-@inline function vk_dispatch_indirect!(pipeline::LavaComputePipeline, push_bda::UInt64,
+@inline function vk_dispatch_indirect!(bq::BatchQueue, pipeline::LavaComputePipeline, push_bda::UInt64,
                                indirect_buf, indirect_offset::Integer=0)
-    ctx = vk_context()
     dispatch_info = dispatch_logging_enabled[] ?
         "$(last_dispatch_info[]) (indirect)" : ""
 
-    record_dispatch!(ctx;
+    record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
         extra_dst_access=Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT,
         info=dispatch_info
@@ -347,46 +390,39 @@ VkDispatchIndirectCommand (3×UInt32), written by a previous GPU kernel.
         buf_offset = indirect_buf isa VkIndirectBuffer ? indirect_buf.buffer_offset : UInt64(0)
         Vulkan.cmd_dispatch_indirect(cmd, vk_buf, buf_offset + UInt64(indirect_offset))
     end
+    if bq.active_batch !== nothing
+        push!(bq.active_batch.data_refs, pipeline)
+    end
 end
 
 # ── Flush ──
 
 """
-    vk_flush!()
+    flush!(bq::BatchQueue, device::Vulkan.Device)
 
-Submit the active command batch and wait for GPU completion.
+Submit the active batch on `bq`'s queue and wait for GPU completion.
+This is the core flush implementation — `vk_flush!()` delegates here.
 """
-function vk_flush!()
-    _device_lost[] && throw(LavaError("command flush", "Vulkan device lost",
-        "Call Lava.vk_reset_device!() to reinitialize, or restart Julia session."))
-    ctx = vk_context()
-    batch = ctx.active_batch
+function flush!(bq::BatchQueue, device::Vulkan.Device)
+    batch = bq.active_batch
     batch === nothing && return
     !batch.recording && return
     Threads.atomic_add!(FLUSH_COUNTER, 1)
 
-    dev = ctx.device
-
-    # Helper to reset batch state on error so subsequent operations don't
-    # try to reuse a command buffer in an invalid state.
     function reset_batch_on_error!()
         batch.recording = false
         batch.dispatch_count = 0
         batch.segment_dispatches = 0
         batch.last_was_rt = false
         empty!(batch.data_refs)
-        # Return sealed CBs to free pool even on error
-        append!(ctx.free_cmd_bufs, batch.sealed_cmd_bufs)
+        append!(bq.free_cmd_bufs, batch.sealed_cmd_bufs)
         empty!(batch.sealed_cmd_bufs)
-        ctx.active_batch = nothing
-        push!(ctx.free_batches, batch)
+        bq.active_batch = nothing
+        push!(bq.free_batches, batch)
     end
 
     unwrap(Vulkan.end_command_buffer(batch.cmd_buf))
 
-    # Collect all CB segments: sealed ones first (in order), then the active one.
-    # We build a temporary vector for submission — don't mutate sealed_cmd_bufs
-    # since reclaim_batch! will return those to the free pool separately.
     n_sealed = length(batch.sealed_cmd_bufs)
     all_cmd_bufs = Vector{Vulkan.CommandBuffer}(undef, n_sealed + 1)
     for i in 1:n_sealed
@@ -394,13 +430,12 @@ function vk_flush!()
     end
     all_cmd_bufs[n_sealed + 1] = batch.cmd_buf
 
-    # Save dispatch info before any reset (for error reporting)
     saved_dispatch_count = batch.dispatch_count
     saved_last_was_rt = batch.last_was_rt
     prev_dispatch_info[] = last_dispatch_info[]
 
     submit_info = Vulkan.SubmitInfo([], [], all_cmd_bufs, [])
-    submit_result = Vulkan.queue_submit(ctx.queue, [submit_info]; fence=batch.fence)
+    submit_result = Vulkan.queue_submit(bq.queue, [submit_info]; fence=batch.fence)
     if iserror(submit_result)
         _device_lost[] = true
         reset_batch_on_error!()
@@ -408,18 +443,42 @@ function vk_flush!()
             saved_dispatch_count, saved_last_was_rt)
     end
 
-    fence_result = Vulkan.wait_for_fences(dev, [batch.fence], true, typemax(UInt64))
+    fence_result = Vulkan.wait_for_fences(device, [batch.fence], true, typemax(UInt64))
     if iserror(fence_result)
         _device_lost[] = true
         reset_batch_on_error!()
         throw_with_validation_context("vkWaitForFences", fence_result,
             saved_dispatch_count, saved_last_was_rt)
     end
-    unwrap(Vulkan.reset_fences(dev, [batch.fence]))
+    unwrap(Vulkan.reset_fences(device, [batch.fence]))
 
-    # Detach from context and reclaim
-    ctx.active_batch = nothing
-    reclaim_batch!(ctx, batch)
+    last_dispatch_info[] = "$(batch.dispatch_count) dispatches ($(batch.last_was_rt ? "RT" : "compute"))"
+    Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, batch.dispatch_count)
+    if dispatch_logging_enabled[]
+        append!(dispatch_log, batch.dispatch_log)
+    end
+
+    reclaim_batch!(bq, batch)
+    bq.active_batch = nothing
+    check_validation_errors!("vk_flush!")
+    flush_deferred_frees!()
+    return
+end
+
+"""
+    vk_flush!()
+
+Submit the active command batch and wait for GPU completion.
+Respects `with_batch_queue` — if called inside a `with_batch_queue(bq)` block,
+flushes `bq` instead of the default queue.
+"""
+function vk_flush!()
+    _device_lost[] && throw(LavaError("command flush", "Vulkan device lost",
+        "Call Lava.vk_reset_device!() to reinitialize, or restart Julia session."))
+    ctx = vk_context()
+    bq = something(current_batch_queue(), ctx.default_bq)
+    flush!(bq, ctx.device)
+    return
 end
 
 # ── Piggybacked Download ──

@@ -265,9 +265,8 @@ function _fixup_continue_merge_conflicts!(f::LLVM.Function)
 
     # Fix 1: For each conditional branch inside a loop, check if both branches
     # converge at a continue target. If so, insert a trampoline.
-    changed = true
-    while changed
-        changed = false
+    for _iter1 in 1:100  # Safety limit to prevent infinite loops
+        found = false
         for bb in collect(LLVM.blocks(f))
             term = LLVM.terminator(bb)
             term isa LLVM.BrInst || continue
@@ -286,10 +285,11 @@ function _fixup_continue_merge_conflicts!(f::LLVM.Function)
 
             if merge_bb in continue_targets
                 _insert_cfg_trampoline!(f, bb, merge_bb)
-                changed = true
+                found = true
                 break  # Restart since CFG changed
             end
         end
+        found || break
     end
 
     # Fix 2: For each inner loop whose merge block IS a continue target of an
@@ -324,22 +324,20 @@ function _fixup_continue_merge_conflicts!(f::LLVM.Function)
         push!(continue_targets, latch)
     end
 
-    changed = true
-    while changed
-        changed = false
+    for _iter2 in 1:100  # Safety limit to prevent infinite loops
+        found2 = false
         for (header, (merge_bb, latch)) in loops
             if merge_bb in continue_targets
-                # This loop's merge is a continue target of an outer loop.
-                # The loop header's conditional branch exits to merge_bb.
-                # Insert a trampoline between the loop and merge_bb.
                 _insert_cfg_trampoline!(f, header, merge_bb)
-                changed = true
-                # Need to recompute loops
+                found2 = true
                 break
             end
         end
 
-        if changed
+        found2 || break
+
+        # Recompute since CFG changed
+        begin
             # Recompute RPO and loops
             rpo = _compute_rpo(f)
             rpo_pos = Dict{LLVM.BasicBlock, Int}()

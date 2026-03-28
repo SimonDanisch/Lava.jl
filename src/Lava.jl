@@ -1,17 +1,18 @@
 module Lava
 
-export LavaArray, LavaBackend, LavaBuffer, LavaDeviceArray
+export LavaArray, LavaBackend, LavaBuffer, LavaDeviceArray, alloc_index_buffer
+export BatchQueue
 export CompilationResult, lava_compile, optimize_spirv
 # Debugging & diagnostics
-export vk_reset_device!, dump_state, gpu_memory_usage
+export vk_reset_device!, dump_state, gpu_memory_usage, allocate_batch_queue!
 export set_dispatch_logging!, get_dispatch_log
 
 # Graphics exports
 export GraphicsPipeline, Rasterizer, TrianglePipeline, LinePipeline
 export RenderWindow, LavaFramebuffer, WindowTarget, OffscreenTarget
 export CompiledGraphicsPipeline, LavaGfxShader
-export draw!, blit!, present_frame!, acquire_next_image!, readback_framebuffer
-export vk_begin_pass!, vk_draw_in_pass!, vk_end_pass!
+export draw!, blit!, present_frame!, acquire_next_image!, readback_framebuffer, readback_window
+export vk_begin_pass!, vk_draw_in_pass!, vk_draw_indexed_in_pass!, vk_end_pass!
 export pack_gfx_args, ensure_compiled!, transition_image!
 export LavaTexture2D, LavaTexture1D, LavaSampler, SampledTexture, LavaTexture
 export TextureBindings, bind_textures
@@ -19,7 +20,7 @@ export TextureBindings, bind_textures
 export ShaderStage, VertexStage, FragmentStage, GeometryStage, TessControlStage, TessEvalStage
 export BlendMode, Opaque, AlphaBlend, Additive, Premultiplied
 export CullFace, NoCull, CullBack, CullFront
-export Topology, TriangleList, TriangleStrip, LineList, LineStrip, PointList, PatchList
+export Topology, TriangleList, TriangleStrip, LineList, LineStrip, PointList, PatchList, LineListAdjacency
 export DepthMode, DepthLess, DepthLessEq, DepthGreater, DepthAlways, DepthOff
 export GeometryConfig, TessConfig
 export TessSpacing, EqualSpacing, FractionalEvenSpacing, FractionalOddSpacing
@@ -28,12 +29,14 @@ export TessDomain, TessTriangles, TessQuads, TessIsolines
 # Graphics device intrinsics
 export vertex_index, instance_index
 export frag_coord, frag_coord_x, frag_coord_y, frag_coord_xy
+export dFdx, dFdy
 export front_facing
 export set_position!, set_point_size!
-export gfx_output, gfx_input
+export gfx_output, gfx_input, gfx_output_flat, gfx_input_flat
 export emit_vertex!, end_primitive!, invocation_id, primitive_id_in
+export geom_input, geom_input_position
 export tess_coord, tess_coord_uvw, set_tess_level_outer!, set_tess_level_inner!
-export sample_texture_2d
+export sample_texture_2d, GfxTexture2D
 
 # Ray tracing exports
 export HardwareAccel, RTRay, RTHitResult
@@ -186,6 +189,14 @@ function __init__()
     prev_dispatch_info[] = ""
     empty!(dispatch_log)
     _init_pipeline_thread!()
+
+    # Mark device as lost during shutdown so GC finalizers don't call into
+    # the Vulkan driver after it's been torn down. The atexit hook runs
+    # before Julia's global finalizer sweep.
+    atexit() do
+        _device_lost[] = true
+        _vk_context[] = nothing
+    end
 end
 
 end # module Lava

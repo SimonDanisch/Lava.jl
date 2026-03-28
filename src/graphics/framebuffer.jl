@@ -194,6 +194,68 @@ function readback_framebuffer(fb::LavaFramebuffer)
     return pixels
 end
 
+"""
+    readback_window(win::RenderWindow) -> Matrix{NTuple{4, UInt8}}
+
+Read back the current swapchain image to CPU memory.
+Must be called after rendering but BEFORE present_frame!.
+Returns a width x height matrix of BGRA byte tuples.
+"""
+function readback_window(win::RenderWindow)
+    ctx = vk_context()
+    dev = ctx.device
+
+    if has_active_recording(ctx)
+        vk_flush!()
+    end
+
+    w, h = size(win)
+    bpp = format_pixel_size(win.format)
+    T = format_element_type(win.format)
+    nbytes = w * h * bpp
+    staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
+
+    image = win.images[win.current_image_idx + 1]
+
+    cmd = ctx.xfer_cmd_buf
+    fence = ctx.xfer_fence
+    unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(;
+        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
+
+    transition_image!(cmd, image,
+        Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, Vulkan.PIPELINE_STAGE_TRANSFER_BIT,
+        Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT, Vulkan.ACCESS_TRANSFER_READ_BIT)
+
+    region = Vulkan.BufferImageCopy(
+        UInt64(0), UInt32(0), UInt32(0),
+        Vulkan.ImageSubresourceLayers(Vulkan.IMAGE_ASPECT_COLOR_BIT,
+            UInt32(0), UInt32(0), UInt32(1)),
+        Vulkan.Offset3D(0, 0, 0),
+        Vulkan.Extent3D(UInt32(w), UInt32(h), UInt32(1)),
+    )
+    Vulkan.cmd_copy_image_to_buffer(cmd, image,
+        Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_buf, [region])
+
+    # Transition back to COLOR_ATTACHMENT_OPTIMAL so present_frame! can transition to PRESENT_SRC
+    transition_image!(cmd, image,
+        Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        Vulkan.PIPELINE_STAGE_TRANSFER_BIT, Vulkan.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        Vulkan.ACCESS_TRANSFER_READ_BIT, Vulkan.AccessFlag(0))
+
+    unwrap(Vulkan.end_command_buffer(cmd))
+
+    submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
+    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=fence))
+    unwrap(Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64)))
+    unwrap(Vulkan.reset_fences(dev, [fence]))
+    flush_deferred_frees!()
+
+    pixels = Matrix{T}(undef, w, h)
+    unsafe_copyto!(Ptr{UInt8}(pointer(pixels)), Ptr{UInt8}(mapped_ptr), nbytes)
+    return pixels
+end
+
 # ── Render Target Subtypes ──
 
 """Render to a swapchain window image."""

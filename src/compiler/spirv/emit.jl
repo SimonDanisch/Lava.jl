@@ -232,7 +232,8 @@ function get_value_id!(state::SPIRVEmitterState, val::LLVM.Value)
     # Auto-create constants
     if val isa LLVM.ConstantInt || val isa LLVM.ConstantFP ||
        val isa LLVM.UndefValue || val isa LLVM.PoisonValue ||
-       val isa LLVM.ConstantAggregateZero
+       val isa LLVM.ConstantAggregateZero || val isa LLVM.ConstantArray ||
+       val isa LLVM.ConstantDataArray
         id = map_constant!(state.type_ctx, val)
         state.value_map[val] = id
         return id
@@ -5025,22 +5026,26 @@ function _emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return _emit_gfx_set_position!(state, inst)
         elseif fn_name == "_lava_gfx_set_point_size"
             return _emit_gfx_set_point_size!(state, inst)
-        elseif fn_name == "_lava_gfx_output_vec4"
+        elseif fn_name == "_lava_gfx_output_vec4" || fn_name == "_lava_gfx_output_flat_vec4"
             return _emit_gfx_output_vec4!(state, inst)
-        elseif fn_name == "_lava_gfx_output_vec3"
+        elseif fn_name == "_lava_gfx_output_vec3" || fn_name == "_lava_gfx_output_flat_vec3"
             return _emit_gfx_output_vec3!(state, inst)
-        elseif fn_name == "_lava_gfx_output_vec2"
+        elseif fn_name == "_lava_gfx_output_vec2" || fn_name == "_lava_gfx_output_flat_vec2"
             return _emit_gfx_output_vec2!(state, inst)
-        elseif fn_name == "_lava_gfx_output_f32"
+        elseif fn_name == "_lava_gfx_output_f32" || fn_name == "_lava_gfx_output_flat_f32"
             return _emit_gfx_output_f32!(state, inst)
-        elseif fn_name == "_lava_gfx_input_vec4"
+        elseif fn_name == "_lava_gfx_input_vec4" || fn_name == "_lava_gfx_input_flat_vec4"
             return _emit_gfx_input!(state, inst, :vec4)
-        elseif fn_name == "_lava_gfx_input_vec3"
+        elseif fn_name == "_lava_gfx_input_vec3" || fn_name == "_lava_gfx_input_flat_vec3"
             return _emit_gfx_input!(state, inst, :vec3)
-        elseif fn_name == "_lava_gfx_input_vec2"
+        elseif fn_name == "_lava_gfx_input_vec2" || fn_name == "_lava_gfx_input_flat_vec2"
             return _emit_gfx_input!(state, inst, :vec2)
-        elseif fn_name == "_lava_gfx_input_f32"
+        elseif fn_name == "_lava_gfx_input_f32" || fn_name == "_lava_gfx_input_flat_f32"
             return _emit_gfx_input!(state, inst, :f32)
+        elseif fn_name == "_lava_gfx_dFdx_f32"
+            return _emit_gfx_derivative!(state, inst, Op.OpDPdx)
+        elseif fn_name == "_lava_gfx_dFdy_f32"
+            return _emit_gfx_derivative!(state, inst, Op.OpDPdy)
         elseif fn_name == "_lava_gfx_emit_vertex"
             return _emit_gfx_emit_vertex!(state, inst)
         elseif fn_name == "_lava_gfx_end_primitive"
@@ -5051,6 +5056,19 @@ function _emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return _emit_gfx_set_tess_level!(state, inst, false)
         elseif fn_name == "_lava_gfx_sample_2d"
             return _emit_gfx_sample_2d!(state, inst)
+        # Geometry shader arrayed inputs
+        elseif fn_name == "_lava_geom_input_position"
+            return _emit_geom_input_position!(state, inst)
+        elseif fn_name == "_lava_geom_input_vec4"
+            return _emit_geom_input!(state, inst, :vec4)
+        elseif fn_name == "_lava_geom_input_vec3"
+            return _emit_geom_input!(state, inst, :vec3)
+        elseif fn_name == "_lava_geom_input_vec2"
+            return _emit_geom_input!(state, inst, :vec2)
+        elseif fn_name == "_lava_geom_input_f32"
+            return _emit_geom_input!(state, inst, :f32)
+        elseif fn_name == "_lava_geom_input_i32"
+            return _emit_geom_input!(state, inst, :i32)
         end
 
         # Regular function call

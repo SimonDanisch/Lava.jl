@@ -1334,6 +1334,8 @@ function map_constant!(ctx::SPIRVTypeContext, val::LLVM.Constant)
         return _map_undef!(ctx, ty)
     elseif val isa LLVM.ConstantAggregateZero
         return _map_null_constant!(ctx, ty)
+    elseif val isa LLVM.ConstantArray || val isa LLVM.ConstantDataArray
+        return _map_constant_array!(ctx, val, ty)
     else
         error("Unsupported constant type: $(typeof(val))")
     end
@@ -1434,6 +1436,35 @@ function _map_null_constant!(ctx::SPIRVTypeContext, ty::LLVM.LLVMType)
         encode_instruction!(ctx.mod.types_constants, UInt16(46), type_id, id)
         id
     end
+end
+
+function _map_constant_array!(ctx::SPIRVTypeContext, val::Union{LLVM.ConstantArray, LLVM.ConstantDataArray}, ty::LLVM.LLVMType)
+    type_id = map_type!(ctx, ty)
+    elem_ty = LLVM.eltype(ty)
+    n = length(ty)
+    elem_ids = UInt32[]
+
+    if val isa LLVM.ConstantDataArray
+        # ConstantDataArray stores data as packed scalars — extract element-by-element
+        for i in 0:(n-1)
+            # Use LLVM API to get element at index
+            elem_val = LLVM.API.LLVMGetElementAsConstant(val, Cuint(i))
+            elem = LLVM.Value(elem_val)
+            elem_id = map_constant!(ctx, elem)
+            push!(elem_ids, elem_id)
+        end
+    else
+        # ConstantArray stores elements as operands
+        for i in 0:(n-1)
+            elem = LLVM.operands(val)[i + 1]
+            elem_id = map_constant!(ctx, elem)
+            push!(elem_ids, elem_id)
+        end
+    end
+
+    id = fresh_id!(ctx.mod)
+    encode_instruction!(ctx.mod.types_constants, Op.OpConstantComposite, type_id, id, elem_ids...)
+    return id
 end
 
 # ================================================================

@@ -214,13 +214,12 @@ end
 Record an RT trace dispatch into the batched command buffer.
 `push_bda` is the BDA address of the argument buffer.
 """
-function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
+function rt_dispatch!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::LavaTLAS,
                       push_bda::UInt64, width::Integer, height::Integer;
                       depth::Integer=1)
-    ctx = vk_context()
     last_dispatch_info[] = "rt_trace w=$width h=$height"
 
-    record_dispatch!(ctx;
+    record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         extra_dst_access=Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
         is_rt=true,
@@ -236,6 +235,9 @@ function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
             pipeline.hit_region, pipeline.callable_region,
             UInt32(width), UInt32(height), UInt32(depth))
     end
+    if bq.active_batch !== nothing
+        push!(bq.active_batch.data_refs, pipeline)
+    end
 end
 
 """
@@ -244,13 +246,12 @@ end
 Record an indirect RT trace dispatch. The `indirect_buf` must contain a
 VkTraceRaysIndirectCommandKHR (3×UInt32), written by a previous GPU kernel.
 """
-function rt_dispatch_indirect!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
+function rt_dispatch_indirect!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::LavaTLAS,
                                push_bda::UInt64, indirect_buf;
                                indirect_offset::Integer=0)
-    ctx = vk_context()
     last_dispatch_info[] = "rt_indirect"
 
-    record_dispatch!(ctx;
+    record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
         extra_dst_access=Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT,
         is_rt=true,
@@ -267,6 +268,9 @@ function rt_dispatch_indirect!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
             pipeline.raygen_region, pipeline.miss_region,
             pipeline.hit_region, pipeline.callable_region,
             UInt64(indirect_address + indirect_offset))
+    end
+    if bq.active_batch !== nothing
+        push!(bq.active_batch.data_refs, pipeline)
     end
 end
 

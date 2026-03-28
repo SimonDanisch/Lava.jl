@@ -374,7 +374,7 @@ end
         push_bda = output_buf.address
 
         # Dispatch
-        Lava.rt_dispatch!(pipeline, tlas, push_bda, W, H)
+        Lava.rt_dispatch!(Lava.vk_context().default_bq, pipeline, tlas, push_bda, W, H)
 
         # Read back results
         result_bytes = Vector{UInt8}(undef, W * H * sizeof(Float32))

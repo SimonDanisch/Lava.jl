@@ -16,7 +16,7 @@ Compiles lazily on first use and caches the result.
 - `tess_control`, `tess_eval`: Optional tessellation stages
 - `blend`, `cull`, `topology`, `depth`: Pipeline state types
 """
-struct GraphicsPipeline{V, F, G, TC, TE, B<:BlendMode, C<:CullFace, T<:Topology, D<:DepthMode}
+struct GraphicsPipeline{V, F, G, TC, TE, B<:BlendMode, C<:CullFace, T<:Topology, D<:DepthMode, VY}
     vertex::V
     fragment::F
     geometry::G       # Nothing or (func, GeometryConfig)
@@ -26,7 +26,7 @@ struct GraphicsPipeline{V, F, G, TC, TE, B<:BlendMode, C<:CullFace, T<:Topology,
     cull::C
     topology::T
     depth::D
-    _compiled::Base.RefValue{Any}
+    varyings::VY      # Nothing or NamedTuple of types, e.g. (normal=Vec3f, uv=Vec2f)
 end
 
 const Rasterizer = GraphicsPipeline
@@ -35,11 +35,12 @@ function GraphicsPipeline(;
         vertex, fragment,
         geometry=nothing, tess_control=nothing, tess_eval=nothing,
         blend::BlendMode=Opaque(), cull::CullFace=CullBack(),
-        topology::Topology=TriangleList(), depth::DepthMode=DepthLess())
+        topology::Topology=TriangleList(), depth::DepthMode=DepthLess(),
+        varyings=nothing)
     GraphicsPipeline(
         vertex, fragment, geometry, tess_control, tess_eval,
         blend, cull, topology, depth,
-        Ref{Any}(nothing),
+        varyings,
     )
 end
 
@@ -50,25 +51,36 @@ LinePipeline(; vertex, fragment, kw...) = GraphicsPipeline(; vertex, fragment, t
 
 const GFX_SHADER_CACHE = Dict{UInt64, LavaGfxShader}()
 
+# Clear graphics shader/pipeline caches on vk_reset_device!
+push!(_reset_callbacks, function()
+    empty!(GFX_SHADER_CACHE)
+end)
+
 """Return (vert_shader::LavaGfxShader, compiled::CompiledGraphicsPipeline)."""
-function _ensure_compiled_with_shader!(pipeline::GraphicsPipeline, tt_vertex, tt_fragment;
-                              color_format=Vulkan.FORMAT_B8G8R8A8_SRGB)
-    vert = get_or_compile_gfx(pipeline.vertex, tt_vertex, :vertex)
-    compiled = ensure_compiled!(pipeline, tt_vertex, tt_fragment; color_format)
+function _ensure_compiled_with_shader!(pipeline::GraphicsPipeline,
+                              vert_fn, frag_fn, tt_vertex, tt_fragment;
+                              color_format=Vulkan.FORMAT_B8G8R8A8_SRGB,
+                              descriptor_set_layout=nothing)
+    vert = get_or_compile_gfx(vert_fn, tt_vertex, :vertex)
+    compiled = ensure_compiled!(pipeline, vert_fn, frag_fn, tt_vertex, tt_fragment;
+        color_format, descriptor_set_layout)
     return vert, compiled
 end
 
-function ensure_compiled!(pipeline::GraphicsPipeline, tt_vertex, tt_fragment;
-                              color_format=Vulkan.FORMAT_B8G8R8A8_SRGB)
-    if pipeline._compiled[] !== nothing
-        return pipeline._compiled[]::CompiledGraphicsPipeline
-    end
+function ensure_compiled!(pipeline::GraphicsPipeline, vert_fn, frag_fn, tt_vertex, tt_fragment;
+                              color_format=Vulkan.FORMAT_B8G8R8A8_SRGB,
+                              descriptor_set_layout=nothing)
+    # Cache key includes type tuples — different arg types get different compiled pipelines
+    cache_key = hash((vert_fn, frag_fn, tt_vertex, tt_fragment, color_format,
+                       descriptor_set_layout !== nothing))
+    cached = get(GFX_PIPELINE_CACHE, cache_key, nothing)
+    cached !== nothing && return cached::CompiledGraphicsPipeline
 
     # Compile vertex shader
-    vert = get_or_compile_gfx(pipeline.vertex, tt_vertex, :vertex)
+    vert = get_or_compile_gfx(vert_fn, tt_vertex, :vertex)
 
     # Compile fragment shader
-    frag = get_or_compile_gfx(pipeline.fragment, tt_fragment, :fragment)
+    frag = get_or_compile_gfx(frag_fn, tt_fragment, :fragment)
 
     # Optional stages
     geom_spirv = nothing
@@ -102,9 +114,10 @@ function ensure_compiled!(pipeline::GraphicsPipeline, tt_vertex, tt_fragment;
         push_constant_size=max(vert.push_info.push_size, frag.push_info.push_size),
         geometry_spirv=geom_spirv,
         tess_ctrl_spirv=tc_spirv, tess_eval_spirv=te_spirv,
-        tess_config=tess_cfg)
+        tess_config=tess_cfg,
+        descriptor_set_layout=descriptor_set_layout)
 
-    pipeline._compiled[] = compiled
+    GFX_PIPELINE_CACHE[cache_key] = compiled
     return compiled
 end
 
@@ -119,19 +132,59 @@ end
 
 # ── Draw API ──
 
+"""Convert args to device-side values (LavaArray → LavaDeviceArray, scalars pass through)."""
+convert_args(args::Tuple) = map(arg -> arg isa LavaArray ? LavaDeviceArray(arg) : arg, args)
+convert_args(::Tuple{}) = ()
+
+"""
+Build the full vertex output NamedTuple type from a varyings spec.
+E.g. `(normal=Vec3f, uv=Vec2f)` → `@NamedTuple{position::Vec4f, normal::Vec3f, uv::Vec2f}`
+"""
+function varyings_to_output_type(varyings::NamedTuple)
+    names = (:position, keys(varyings)...)
+    types = (Vec4f, values(varyings)...)
+    return NamedTuple{names, Tuple{types...}}
+end
+
+"""
+Resolve vertex/fragment functions and type tuples, wrapping NamedTuple-returning
+shaders with VertexWrapper/FragmentWrapper as needed.
+Returns (vert_fn, vert_tt, frag_fn, frag_tt).
+"""
+function resolve_shader_pair(pipeline, vert_tt::Type, frag_tt::Type)
+    if pipeline.varyings !== nothing
+        vout = varyings_to_output_type(pipeline.varyings)
+        wrapped_vert = VertexWrapper{typeof(pipeline.vertex)}()
+        wrapped_frag = FragmentWrapper{typeof(pipeline.fragment), vout}()
+        return wrapped_vert, vert_tt, wrapped_frag, frag_tt
+    else
+        # Legacy API: user calls gfx_output/gfx_input directly
+        return pipeline.vertex, vert_tt, pipeline.fragment, frag_tt
+    end
+end
+
 """
     draw!(pipeline::GraphicsPipeline, target::RenderTarget, vertex_count;
-          args=(), instances=1, tt_vertex=Tuple{}, tt_fragment=Tuple{},
+          args=(), frag_args=(), instances=1,
           clear_color=(0f0, 0f0, 0f0, 1f0))
 
 Draw using the given graphics pipeline to the render target.
+Device-side type tuples are inferred automatically from args.
 """
-function draw!(pipeline::GraphicsPipeline, target::WindowTarget, vertex_count::Integer;
-               args=(), instances::Integer=1,
-               tt_vertex::Type=Tuple{}, tt_fragment::Type=Tuple{},
+function draw!(bq::BatchQueue, pipeline::GraphicsPipeline, target::WindowTarget, vertex_count::Integer;
+               args=(), frag_args=(), instances::Integer=1,
                clear_color::Union{Nothing, NTuple{4, Float32}}=(0.0f0, 0.0f0, 0.0f0, 1.0f0))
     win = target.window
-    vert_shader, compiled = _ensure_compiled_with_shader!(pipeline, tt_vertex, tt_fragment;
+
+    converted_vert = convert_args(args)
+    converted_frag = convert_args(frag_args)
+    vert_tt = typeof(converted_vert)
+    frag_tt = typeof(converted_frag)
+
+    vert_fn, vert_tt, frag_fn, frag_tt = resolve_shader_pair(pipeline, vert_tt, frag_tt)
+
+    vert_shader, compiled = _ensure_compiled_with_shader!(pipeline,
+        vert_fn, frag_fn, vert_tt, frag_tt;
         color_format=win.format)
 
     view = win.views[win.current_image_idx + 1]
@@ -139,27 +192,37 @@ function draw!(pipeline::GraphicsPipeline, target::WindowTarget, vertex_count::I
 
     push_data = isempty(args) ? UInt8[] : pack_gfx_args(args, vert_shader.push_info)
 
-    vk_draw!(compiled, view, image, win.extent, vertex_count;
+    vk_draw!(bq, compiled, view, image, win.extent, vertex_count;
         push_data, instances, clear_color)
 end
 
-function draw!(pipeline::GraphicsPipeline, target::OffscreenTarget, vertex_count::Integer;
-               args=(), instances::Integer=1,
-               tt_vertex::Type=Tuple{}, tt_fragment::Type=Tuple{},
-               clear_color::Union{Nothing, NTuple{4, Float32}}=(0.0f0, 0.0f0, 0.0f0, 1.0f0))
+function draw!(bq::BatchQueue, pipeline::GraphicsPipeline, target::OffscreenTarget, vertex_count::Integer;
+               args=(), frag_args=(), instances::Integer=1,
+               clear_color::Union{Nothing, NTuple{4, Float32}}=(0.0f0, 0.0f0, 0.0f0, 1.0f0),
+               descriptor_set_layout=nothing,
+               descriptor_set=nothing)
     fb = target.fb
-    vert_shader, compiled = _ensure_compiled_with_shader!(pipeline, tt_vertex, tt_fragment;
-        color_format=fb.color_format)
+
+    converted_vert = convert_args(args)
+    converted_frag = convert_args(frag_args)
+    vert_tt = typeof(converted_vert)
+    frag_tt = typeof(converted_frag)
+
+    vert_fn, vert_tt, frag_fn, frag_tt = resolve_shader_pair(pipeline, vert_tt, frag_tt)
+
+    vert_shader, compiled = _ensure_compiled_with_shader!(pipeline,
+        vert_fn, frag_fn, vert_tt, frag_tt;
+        color_format=fb.color_format, descriptor_set_layout)
 
     push_data = isempty(args) ? UInt8[] : pack_gfx_args(args, vert_shader.push_info)
 
-    vk_draw!(compiled, fb.color_view, fb.color_image,
+    vk_draw!(bq, compiled, fb.color_view, fb.color_image,
         Vulkan.Extent2D(UInt32(fb.width), UInt32(fb.height)),
         vertex_count;
         push_data, instances,
         depth_view=fb.depth_view,
         depth_image=fb.depth_image,
-        clear_color)
+        clear_color, descriptor_set)
 end
 
 function pack_gfx_args(args, push_info::PushConstantInfo)
@@ -222,27 +285,39 @@ function blit_vertex()
     return nothing
 end
 
-# Built-in fragment shader for blitting a BDA buffer to screen
-function blit_fragment(buffer_ptr::Ptr{Vec4f}, width::Int32, height::Int32)
+# Convert any RGBA-like color to Vec4f for fragment output
+to_vec4f(v::Vec4f) = v
+to_vec4f(c) = Vec4f(c.r, c.g, c.b, c.alpha)
+
+# Built-in fragment shader for blitting a GPU buffer to screen.
+# Buffer is in Julia column-major layout: element [row, col] is at linear index col * height + row + 1.
+# Screen coords: fx = column (x), fy = row (y, 0 = top in Vulkan).
+function blit_fragment(buffer, width::Int32, height::Int32)
     fx = frag_coord_x()
     fy = frag_coord_y()
-    ix = unsafe_trunc(Int32, fx)
-    iy = unsafe_trunc(Int32, fy)
-    idx = iy * width + ix + Int32(1)
-    pixel = unsafe_load(buffer_ptr, idx)
+    ix = unsafe_trunc(Int32, fx)   # column (0-based)
+    iy = unsafe_trunc(Int32, fy)   # row (0-based)
+    # Column-major indexing: col * height + row + 1
+    idx = ix * height + iy + Int32(1)
+    pixel = to_vec4f(buffer[idx])
     gfx_output(0, pixel)
     return nothing
 end
 
 const BLIT_PIPELINE = Ref{Any}(nothing)
 
+push!(_reset_callbacks, function()
+    BLIT_PIPELINE[] = nothing
+end)
+
 """
-    blit!(target::RenderTarget, source::LavaArray; clear=true)
+    blit!(bq, target::RenderTarget, source::LavaArray; clear=true)
 
 Display a GPU array on screen using a fullscreen blit.
-The source array should contain RGBA Float32 pixels.
+The source array should contain RGBA Float32 pixels (or any 4-component type).
+The buffer is read in Julia column-major order by the fragment shader.
 """
-function blit!(target::RenderTarget, source::LavaArray;
+function blit!(bq::BatchQueue, target::RenderTarget, source::LavaArray;
                clear::Bool=true)
     win = if target isa WindowTarget
         target.window
@@ -265,42 +340,36 @@ function blit!(target::RenderTarget, source::LavaArray;
 
     pipeline = BLIT_PIPELINE[]
 
-    # Pack args into arg buffer (same BDA pattern as compute)
-    # Fragment shader takes: (buffer_ptr::Ptr{...}, width::Int32, height::Int32)
-    # Arg buffer layout: [0:8] BDA ptr, [8:12] width i32, [12:16] height i32
-    arg_buf = get_arg_buffer(24)  # 8 (ptr) + 4 (i32) + 4 (i32), padded to 8-align = 24
-    ptr = arg_buf.mapped_ptr
-    managed = source.buf[]
-    addr = managed.address + UInt64(source.offset)
-    unsafe_store!(Ptr{UInt64}(ptr), addr)
-    unsafe_store!(Ptr{Int32}(ptr + 8), Int32(w))
-    unsafe_store!(Ptr{Int32}(ptr + 12), Int32(h))
-    # Push constant = BDA of arg buffer
-    push_data = Vector{UInt8}(undef, 8)
-    GC.@preserve push_data begin
-        unsafe_store!(Ptr{UInt64}(pointer(push_data)), arg_buf.address)
-    end
+    # Fragment shader takes: (buffer::LavaDeviceArray, width::Int32, height::Int32)
+    # Use the fragment shader's push_info for arg packing since vertex has no args.
+    frag_args = (source, Int32(w), Int32(h))
+    converted_frag = convert_args(frag_args)
+    frag_tt = typeof(converted_frag)
 
-    compiled = ensure_compiled!(pipeline, Tuple{}, Tuple{Ptr{Vec4f}, Int32, Int32};
+    _, compiled = _ensure_compiled_with_shader!(pipeline,
+        pipeline.vertex, pipeline.fragment, Tuple{}, frag_tt;
         color_format=win.format)
+
+    # Pack fragment args via the fragment shader's push_info
+    frag_shader = get_or_compile_gfx(pipeline.fragment, frag_tt, :fragment)
+    push_data = pack_gfx_args(frag_args, frag_shader.push_info)
 
     view = win.views[win.current_image_idx + 1]
     image = win.images[win.current_image_idx + 1]
 
     clear_color = clear ? (0.0f0, 0.0f0, 0.0f0, 1.0f0) : nothing
 
-    vk_draw!(compiled, view, image, win.extent, 3;
+    vk_draw!(bq, compiled, view, image, win.extent, 3;
         push_data, clear_color)
 end
 
 """
-    present_frame!(win::RenderWindow)
+    present_frame!(bq::BatchQueue, win::RenderWindow)
 
 Submit recorded draw commands and present to screen.
 """
-function present_frame!(win::RenderWindow)
-    ctx = vk_context()
-    batch = ctx.active_batch
+function present_frame!(bq::BatchQueue, win::RenderWindow)
+    batch = bq.active_batch
     batch === nothing && error("present_frame! called without an active recording batch")
     cmd = batch.cmd_buf
 
@@ -322,17 +391,13 @@ function present_frame!(win::RenderWindow)
         [cmd],
         [win.render_finished[fi]],
     )
-    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=win.in_flight[fi]))
+    unwrap(Vulkan.queue_submit(bq.queue, [submit_info]; fence=win.in_flight[fi]))
 
-    # Reset batch state (we handled submission ourselves via window fence)
-    # Note: batch state must be reset BEFORE flush_deferred_frees! so GC finalizers
-    # triggered during deferred free processing free immediately (GPU is idle).
-    batch.recording = false
-    batch.dispatch_count = 0
-    batch.last_was_rt = false
-    empty!(batch.data_refs)
-    ctx.active_batch = nothing
-    push!(ctx.free_batches, batch)
+    # Store batch in window's per-frame slot — it will be reclaimed in
+    # acquire_next_image! after the fence wait confirms GPU completion.
+    # Do NOT push to free_batches here: the GPU is still using this command buffer.
+    bq.active_batch = nothing
+    win.frame_batches[fi] = batch
 
     flush_deferred_frees!()
     reset_arg_buffer_pool!()

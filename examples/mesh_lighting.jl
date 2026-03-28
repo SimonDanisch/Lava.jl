@@ -1,38 +1,15 @@
-# Mesh Lighting Example
-#
-# Renders a GeometryBasics mesh with Lambertian directional lighting in a
-# window with an orbiting camera. Demonstrates:
-#
-# - BDA vertex pulling (positions + normals from LavaArrays)
-# - MVP transform via column-major matrix stored in a LavaArray
-# - Vertex-to-fragment data passing via gfx_output/gfx_input
-# - RenderWindow with swapchain, acquire/present loop
-# - Per-frame uniform updates (orbiting camera)
-#
-# No GLSL, no descriptor sets -- just Julia functions as shaders.
-
 using Lava, GeometryBasics, LinearAlgebra
 import GLFW
 
 # =============================================================================
 # Mesh preparation: flatten indexed mesh to per-vertex arrays
 # =============================================================================
-
 function flatten_mesh(mesh)
-    faces_list = GeometryBasics.faces(mesh)
+    f = GeometryBasics.faces(mesh)
     verts = GeometryBasics.coordinates(mesh)
     norms = GeometryBasics.normals(mesh)
-    n_tris = length(faces_list)
-    n_verts = n_tris * 3
-    positions = Vector{Vec3f}(undef, n_verts)
-    normals = Vector{Vec3f}(undef, n_verts)
-    for (i, face) in enumerate(faces_list)
-        for (j, vi) in enumerate(face)
-            idx = (i - 1) * 3 + j
-            positions[idx] = Vec3f(verts[vi])
-            normals[idx] = Vec3f(norms[vi])
-        end
-    end
+    positions = Vec3f[Vec3f(verts[face[j]]) for face in f for j in 1:3]
+    normals   = Vec3f[Vec3f(norms[face[j]]) for face in f for j in 1:3]
     return positions, normals
 end
 
@@ -68,59 +45,28 @@ function perspective_mvp(;
     return proj * view
 end
 
-function update_mvp!(gpu_mvp::LavaArray{Vec4f, 1}, m::Mat4f)
-    cols = [Vec4f(m[1, j], m[2, j], m[3, j], m[4, j]) for j in 1:4]
-    copyto!(gpu_mvp, cols)
-end
-
 # =============================================================================
 # Shaders
 # =============================================================================
 
 function mesh_vertex(
-    positions::Lava.LavaDeviceArray{Vec3f, 1},
-    normals::Lava.LavaDeviceArray{Vec3f, 1},
-    mvp_cols::Lava.LavaDeviceArray{Vec4f, 1},
-)
+        positions::AbstractVector{Vec3f},
+        normals::AbstractVector{Vec3f},
+        mvp::Mat4f,
+    )
     idx = vertex_index()
     @inbounds pos = positions[idx]
     @inbounds n = normals[idx]
-
-    @inbounds c0 = mvp_cols[1]
-    @inbounds c1 = mvp_cols[2]
-    @inbounds c2 = mvp_cols[3]
-    @inbounds c3 = mvp_cols[4]
-
-    clip_x = c0[1] * pos[1] + c1[1] * pos[2] + c2[1] * pos[3] + c3[1]
-    clip_y = c0[2] * pos[1] + c1[2] * pos[2] + c2[2] * pos[3] + c3[2]
-    clip_z = c0[3] * pos[1] + c1[3] * pos[2] + c2[3] * pos[3] + c3[3]
-    clip_w = c0[4] * pos[1] + c1[4] * pos[2] + c2[4] * pos[3] + c3[4]
-
-    set_position!(Vec4f(clip_x, clip_y, clip_z, clip_w))
-    gfx_output(0, n)
-    return nothing
+    clip = mvp * Vec4f(pos[1], pos[2], pos[3], 1.0f0)
+    return (position=clip, normal=n)
 end
 
-function mesh_fragment()
-    normal = gfx_input(Vec3f, 0)
-
-    len = sqrt(normal[1] * normal[1] + normal[2] * normal[2] + normal[3] * normal[3])
-    len = max(len, 1.0f-6)
-    nx = normal[1] / len
-    ny = normal[2] / len
-    nz = normal[3] / len
-
-    # Directional light
-    lx = 0.4f0; ly = 0.7f0; lz = 0.5f0
-    ll = sqrt(lx * lx + ly * ly + lz * lz)
-    lx /= ll; ly /= ll; lz /= ll
-
-    ndotl = nx * lx + ny * ly + nz * lz
-    diffuse = max(ndotl, 0.0f0)
+function mesh_fragment(inputs)
+    n = normalize(inputs.normal)
+    light_dir = normalize(Vec3f(0.4f0, 0.7f0, 0.5f0))
+    diffuse = max(dot(n, light_dir), 0.0f0)
     intensity = 0.15f0 + diffuse * 0.85f0
-
-    gfx_output(0, Vec4f(intensity * 0.9f0, intensity * 0.7f0, intensity * 0.5f0, 1.0f0))
-    return nothing
+    return Vec4f(intensity * 0.9f0, intensity * 0.7f0, intensity * 0.5f0, 1.0f0)
 end
 
 # =============================================================================
@@ -136,7 +82,6 @@ n_verts = length(positions)
 
 gpu_positions = LavaArray(positions)
 gpu_normals = LavaArray(normals)
-gpu_mvp = LavaArray(Vec4f[Vec4f(0) for _ in 1:4])
 
 # Pipeline
 # DepthOff because window rendering doesn't have a depth attachment yet.
@@ -144,15 +89,10 @@ gpu_mvp = LavaArray(Vec4f[Vec4f(0) for _ in 1:4])
 pipeline = Rasterizer(
     vertex = mesh_vertex,
     fragment = mesh_fragment,
+    varyings = (normal = Vec3f,),
     cull = CullBack(),
     depth = DepthOff(),
 )
-
-TT_VERT = Tuple{
-    Lava.LavaDeviceArray{Vec3f, 1},
-    Lava.LavaDeviceArray{Vec3f, 1},
-    Lava.LavaDeviceArray{Vec4f, 1},
-}
 
 # Window
 win = RenderWindow(WIDTH, HEIGHT; title="Lava - Mesh Lighting", vsync=true)
@@ -161,7 +101,8 @@ win = RenderWindow(WIDTH, HEIGHT; title="Lava - Mesh Lighting", vsync=true)
 # Render loop
 # =============================================================================
 
-function render_loop(win, pipeline, n_verts, gpu_positions, gpu_normals, gpu_mvp)
+function render_loop(win, pipeline, n_verts, gpu_positions, gpu_normals)
+    bq = vk_context().default_bq
     t0 = time()
     frame = 0
 
@@ -180,21 +121,18 @@ function render_loop(win, pipeline, n_verts, gpu_positions, gpu_normals, gpu_mvp
         w, h = size(win)
         aspect = Float32(w) / Float32(max(h, 1))
         mvp = perspective_mvp(; eye, aspect, fov=60f0)
-        update_mvp!(gpu_mvp, mvp)
 
         # Acquire swapchain image
         acquire_next_image!(win)
 
         # Draw
-        draw!(pipeline, WindowTarget(win), n_verts;
-            args = (gpu_positions, gpu_normals, gpu_mvp),
-            tt_vertex = TT_VERT,
-            tt_fragment = Tuple{},
+        draw!(bq, pipeline, WindowTarget(win), n_verts;
+            args = (gpu_positions, gpu_normals, mvp),
             clear_color = (0.1f0, 0.1f0, 0.15f0, 1.0f0),
         )
 
         # Submit + present
-        present_frame!(win)
+        present_frame!(bq, win)
 
         frame += 1
         if frame % 300 == 0
@@ -208,4 +146,4 @@ function render_loop(win, pipeline, n_verts, gpu_positions, gpu_normals, gpu_mvp
     println("Done. $frame frames rendered.")
 end
 
-render_loop(win, pipeline, n_verts, gpu_positions, gpu_normals, gpu_mvp)
+render_loop(win, pipeline, n_verts, gpu_positions, gpu_normals)

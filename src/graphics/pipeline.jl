@@ -14,12 +14,18 @@ struct CompiledGraphicsPipeline
     modules::Vector{Vulkan.ShaderModule}
     push_constant_size::UInt32
     descriptor_set_layout::Union{Nothing, Vulkan.DescriptorSetLayout}
+    push_stage_flags::Vulkan.ShaderStageFlag
     # Pipeline state (for debug/inspection)
     color_format::Vulkan.Format
     has_depth::Bool
 end
 
 const GFX_PIPELINE_CACHE = Dict{UInt64, CompiledGraphicsPipeline}()
+
+# Clear graphics pipeline cache on vk_reset_device!
+push!(_reset_callbacks, function()
+    empty!(GFX_PIPELINE_CACHE)
+end)
 
 """
     create_graphics_pipeline(vertex_spirv, fragment_spirv;
@@ -196,6 +202,7 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
         pipeline, layout, modules,
         UInt32(push_constant_size),
         descriptor_set_layout,
+        all_stage_flags,
         color_format, has_depth,
     )
 end
@@ -213,7 +220,8 @@ vk_topology(::TriangleStrip) = Vulkan.PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
 vk_topology(::LineList)      = Vulkan.PRIMITIVE_TOPOLOGY_LINE_LIST
 vk_topology(::LineStrip)     = Vulkan.PRIMITIVE_TOPOLOGY_LINE_STRIP
 vk_topology(::PointList)     = Vulkan.PRIMITIVE_TOPOLOGY_POINT_LIST
-vk_topology(::PatchList)     = Vulkan.PRIMITIVE_TOPOLOGY_PATCH_LIST
+vk_topology(::PatchList)              = Vulkan.PRIMITIVE_TOPOLOGY_PATCH_LIST
+vk_topology(::LineListAdjacency)      = Vulkan.PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY
 
 vk_cull(::NoCull)    = Vulkan.CULL_MODE_NONE
 vk_cull(::CullBack)  = Vulkan.CULL_MODE_BACK_BIT
@@ -286,7 +294,8 @@ end
 
 Record a draw command using dynamic rendering.
 """
-function vk_draw!(pipeline::CompiledGraphicsPipeline,
+function vk_draw!(bq::BatchQueue,
+                   pipeline::CompiledGraphicsPipeline,
                    color_view::Vulkan.ImageView,
                    color_image::Vulkan.Image,
                    extent::Vulkan.Extent2D,
@@ -297,9 +306,9 @@ function vk_draw!(pipeline::CompiledGraphicsPipeline,
                    depth_image::Union{Nothing, Vulkan.Image}=nothing,
                    clear_color::Union{Nothing, NTuple{4, Float32}}=nothing,
                    indices_buffer::Union{Nothing, Vulkan.Buffer}=nothing,
-                   index_count::Integer=0)
-    ctx = vk_context()
-    batch = ensure_active_batch!(ctx)
+                   index_count::Integer=0,
+                   descriptor_set::Union{Nothing, Vulkan.DescriptorSet}=nothing)
+    batch = ensure_active_batch!(bq)
     cmd = batch.cmd_buf
 
     # Memory barrier: compute/RT → graphics
@@ -387,6 +396,12 @@ function vk_draw!(pipeline::CompiledGraphicsPipeline,
     # Bind pipeline
     Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_GRAPHICS, pipeline.pipeline)
 
+    # Bind descriptor set (for textures)
+    if descriptor_set !== nothing
+        Vulkan.cmd_bind_descriptor_sets(cmd, Vulkan.PIPELINE_BIND_POINT_GRAPHICS,
+            pipeline.pipeline_layout, UInt32(0), [descriptor_set], UInt32[])
+    end
+
     # Dynamic viewport + scissor
     viewport = Vulkan.Viewport(0.0f0, 0.0f0,
         Float32(extent.width), Float32(extent.height),
@@ -398,10 +413,9 @@ function vk_draw!(pipeline::CompiledGraphicsPipeline,
 
     # Push constants
     if !isempty(push_data)
-        all_stage_flags = Vulkan.SHADER_STAGE_VERTEX_BIT | Vulkan.SHADER_STAGE_FRAGMENT_BIT
         GC.@preserve push_data begin
             Vulkan.cmd_push_constants(cmd, pipeline.pipeline_layout,
-                all_stage_flags, UInt32(0), UInt32(length(push_data)),
+                pipeline.push_stage_flags, UInt32(0), UInt32(length(push_data)),
                 Ptr{Nothing}(pointer(push_data)))
         end
     end
@@ -419,6 +433,8 @@ function vk_draw!(pipeline::CompiledGraphicsPipeline,
 
     batch.dispatch_count += 1
     batch.last_was_rt = false
+    # Pin pipeline to batch
+    push!(batch.data_refs, pipeline)
 end
 
 """Transition an image layout using a pipeline barrier."""
@@ -449,26 +465,39 @@ end
 Begin a dynamic rendering pass. Call `vk_draw_in_pass!` for each draw,
 then `vk_end_pass!` to finish.
 """
-function vk_begin_pass!(color_view::Vulkan.ImageView,
+function vk_begin_pass!(bq::BatchQueue,
+                         color_view::Vulkan.ImageView,
                          color_image::Vulkan.Image,
                          extent::Vulkan.Extent2D;
-                         clear_color::NTuple{4, Float32}=(0f0, 0f0, 0f0, 1f0),
+                         clear_color::Union{Nothing, NTuple{4, Float32}}=(0f0, 0f0, 0f0, 1f0),
                          depth_view::Union{Nothing, Vulkan.ImageView}=nothing)
-    ctx = vk_context()
-    batch = ensure_active_batch!(ctx)
+    batch = ensure_active_batch!(bq)
     cmd = batch.cmd_buf
 
-    # Transition color image
-    transition_image!(cmd, color_image,
-        Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        Vulkan.PIPELINE_STAGE_TOP_OF_PIPE_BIT, Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        Vulkan.AccessFlag(0), Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+    if clear_color !== nothing
+        # Clear mode: discard old content, start fresh
+        transition_image!(cmd, color_image,
+            Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            Vulkan.PIPELINE_STAGE_TOP_OF_PIPE_BIT, Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            Vulkan.AccessFlag(0), Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
 
-    clear_val = Vulkan.ClearValue(Vulkan.ClearColorValue(clear_color))
+        clear_val = Vulkan.ClearValue(Vulkan.ClearColorValue(clear_color))
+        load_op = Vulkan.ATTACHMENT_LOAD_OP_CLEAR
+    else
+        # Load mode: preserve existing content (for drawing on top of previous pass)
+        transition_image!(cmd, color_image,
+            Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT, Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT | Vulkan.ACCESS_COLOR_ATTACHMENT_READ_BIT)
+
+        clear_val = Vulkan.ClearValue(Vulkan.ClearColorValue((0f0, 0f0, 0f0, 0f0)))
+        load_op = Vulkan.ATTACHMENT_LOAD_OP_LOAD
+    end
+
     color_attachment = Vulkan.RenderingAttachmentInfo(
         Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         Vulkan.IMAGE_LAYOUT_UNDEFINED,
-        Vulkan.ATTACHMENT_LOAD_OP_CLEAR,
+        load_op,
         Vulkan.ATTACHMENT_STORE_OP_STORE,
         clear_val;
         image_view=color_view,
@@ -506,14 +535,14 @@ end
 Record a draw command within an active rendering pass.
 Viewport/scissor are Vulkan structs for per-scene rendering.
 """
-function vk_draw_in_pass!(pipeline::CompiledGraphicsPipeline,
+function vk_draw_in_pass!(bq::BatchQueue,
+                           pipeline::CompiledGraphicsPipeline,
                            vertex_count::Integer;
                            push_data::Vector{UInt8}=UInt8[],
                            instances::Integer=1,
                            viewport::Union{Nothing, Vulkan.Viewport}=nothing,
                            scissor::Union{Nothing, Vulkan.Rect2D}=nothing)
-    ctx = vk_context()
-    batch = ctx.active_batch
+    batch = bq.active_batch
     batch === nothing && error("vk_draw_in_pass! called without an active rendering pass")
     cmd = batch.cmd_buf
 
@@ -529,10 +558,9 @@ function vk_draw_in_pass!(pipeline::CompiledGraphicsPipeline,
 
     # Push constants
     if !isempty(push_data)
-        all_stage_flags = Vulkan.SHADER_STAGE_VERTEX_BIT | Vulkan.SHADER_STAGE_FRAGMENT_BIT
         GC.@preserve push_data begin
             Vulkan.cmd_push_constants(cmd, pipeline.pipeline_layout,
-                all_stage_flags, UInt32(0), UInt32(length(push_data)),
+                pipeline.push_stage_flags, UInt32(0), UInt32(length(push_data)),
                 Ptr{Nothing}(pointer(push_data)))
         end
     end
@@ -540,16 +568,51 @@ function vk_draw_in_pass!(pipeline::CompiledGraphicsPipeline,
     Vulkan.cmd_draw(cmd, UInt32(vertex_count), UInt32(instances), UInt32(0), UInt32(0))
     batch.dispatch_count += 1
     batch.last_was_rt = false
+    # Pin pipeline to batch — prevents GC from destroying it while command buffer references it
+    push!(batch.data_refs, pipeline)
 end
 
 """
-    vk_end_pass!()
+    vk_draw_indexed_in_pass!(pipeline, index_count; push_data, indices_buffer)
 
-End the current dynamic rendering pass.
+Draw indexed geometry inside an active render pass (between vk_begin_pass!/vk_end_pass!).
+Uses the provided index buffer for indexed drawing.
 """
-function vk_end_pass!()
-    ctx = vk_context()
-    batch = ctx.active_batch
+function vk_draw_indexed_in_pass!(bq::BatchQueue,
+                                   pipeline::CompiledGraphicsPipeline,
+                                   index_count::Integer;
+                                   push_data::Vector{UInt8}=UInt8[],
+                                   indices_buffer::Vulkan.Buffer,
+                                   instances::Integer=1)
+    batch = bq.active_batch
+    batch === nothing && error("vk_draw_indexed_in_pass! called without an active rendering pass")
+    cmd = batch.cmd_buf
+
+    Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_GRAPHICS, pipeline.pipeline)
+
+    if !isempty(push_data)
+        GC.@preserve push_data begin
+            Vulkan.cmd_push_constants(cmd, pipeline.pipeline_layout,
+                pipeline.push_stage_flags, UInt32(0), UInt32(length(push_data)),
+                Ptr{Nothing}(pointer(push_data)))
+        end
+    end
+
+    Vulkan.cmd_bind_index_buffer(cmd, indices_buffer, UInt64(0), Vulkan.INDEX_TYPE_UINT32)
+    Vulkan.cmd_draw_indexed(cmd, UInt32(index_count), UInt32(instances),
+                             UInt32(0), Int32(0), UInt32(0))
+    batch.dispatch_count += 1
+    batch.last_was_rt = false
+    push!(batch.data_refs, pipeline)
+end
+
+"""
+    vk_end_pass!(bq::BatchQueue)
+
+End the current dynamic rendering pass on the given batch queue.
+"""
+function vk_end_pass!(bq::BatchQueue)
+    batch = bq.active_batch
     batch === nothing && error("vk_end_pass! called without an active rendering pass")
     Vulkan.cmd_end_rendering(batch.cmd_buf)
 end

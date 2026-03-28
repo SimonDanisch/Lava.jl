@@ -140,7 +140,7 @@ Example:
     a = LavaBuffer{Float32}(n)
     lava_launch!(my_kernel, a, b, Int32(n); ndrange=n, workgroup_size=(256,1,1))
 """
-function lava_launch!(@nospecialize(f), args...;
+function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
                        ndrange::Union{Integer, NTuple{3,<:Integer}},
                        workgroup_size::NTuple{3,Int} = (64, 1, 1))
     _validate_launch_args(args)
@@ -190,7 +190,7 @@ function lava_launch!(@nospecialize(f), args...;
     if dispatch_logging_enabled[]
         last_dispatch_info[] = "compute f=$(nameof(typeof(f))) groups=$groups"
     end
-    vk_dispatch!(pipeline, arg_buf.address, groups)
+    vk_dispatch!(bq, pipeline, arg_buf.address, groups)
 
     return nothing
 end

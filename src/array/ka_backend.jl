@@ -281,7 +281,8 @@ function ka_launch!(@nospecialize(f), all_args::Tuple, block_dims::NTuple{3,Int}
     if dispatch_logging_enabled[]
         last_dispatch_info[] = "ka f=$(_dispatch_name(f, all_args)) groups=$block_dims"
     end
-    vk_dispatch!(pipeline, arg_buf.address, block_dims)
+    bq = something(current_batch_queue(), vk_context().default_bq)
+    vk_dispatch!(bq, pipeline, arg_buf.address, block_dims)
 
     return nothing
 end
@@ -355,7 +356,8 @@ function _fast_prepare_indirect!(indirect_buf::VkIndirectBuffer, ndrange_buf::La
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets, arg_size, byval_sizes, all_args)
 
     # Record dispatch directly — single workgroup of 1 thread
-    vk_dispatch_base!(pipeline, arg_buf.address, 0, 0, 0, 1, 1, 1)
+    bq = something(current_batch_queue(), vk_context().default_bq)
+    vk_dispatch_base!(bq, pipeline, arg_buf.address, 0, 0, 0, 1, 1, 1)
 end
 
 """
@@ -366,8 +368,8 @@ and writes `ceil(size / workgroup_size)` to `indirect_buf` (VkDispatchIndirectCo
 This runs as a single-thread direct dispatch (ndrange=1).
 """
 function _prepare_indirect_dispatch!(indirect_buf::VkIndirectBuffer, ndrange_buf::LavaArray{<:Integer}, workgroup_size::Integer)
-    # Use a raw lava_launch! with a simple function
-    lava_launch!(_prepare_indirect_kernel,
+    bq = something(current_batch_queue(), vk_context().default_bq)
+    lava_launch!(bq, _prepare_indirect_kernel,
                  Ptr{UInt32}(indirect_buf.address), ndrange_buf, UInt32(workgroup_size);
                  ndrange=1, workgroup_size=(1, 1, 1))
 end
@@ -436,7 +438,8 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
     if original_args !== nothing
         keep_data_alive!(original_args)
     end
-    vk_dispatch_indirect!(pipeline, arg_buf.address, indirect_buf)
+    bq = something(current_batch_queue(), vk_context().default_bq)
+    vk_dispatch_indirect!(bq, pipeline, arg_buf.address, indirect_buf)
 
     end # GC.@preserve
 

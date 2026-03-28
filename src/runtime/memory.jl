@@ -100,6 +100,24 @@ Allocate a device-local buffer with BDA support.
 Optional `extra_usage` adds additional `VkBufferUsageFlags` (e.g. for SBT buffers).
 """
 function vk_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0))
+    # Proactively flush deferred frees to prevent unbounded accumulation.
+    n_deferred = length(DEFERRED_FREES)
+    if n_deferred > 0
+        ctx = _vk_context[]
+        if ctx !== nothing
+            batch = ctx.active_batch
+            if (batch === nothing || !batch.recording) && isempty(ctx.in_flight)
+                # Safe to flush immediately — no active work
+                flush_deferred_frees!()
+            elseif n_deferred > _deferred_free_warn_threshold[]
+                # Too many deferred frees — force flush the current batch first,
+                # then process deferred frees. This prevents driver crashes from
+                # unbounded deferred free growth during long recording sessions.
+                vk_flush!()
+                flush_deferred_frees!()
+            end
+        end
+    end
     maybe_collect()
     result = _try_vk_alloc(nbytes; extra_usage)
     if result !== nothing
@@ -216,26 +234,39 @@ end
 
 """Actually destroy a buffer's Vulkan resources. Called from vk_free! or flush_deferred_frees!."""
 function _destroy_buffer!(buf::VkManagedBuffer)
-    # After DEVICE_LOST, all Vulkan handles are invalid — skip destruction to avoid segfault.
-    # Also skip if the buffer was created on an old device (before vk_reset_device!).
-    if _device_lost[] || buf.device_gen != _device_generation[]
+    buf.size == 0 && return  # Already destroyed
+
+    # Check if the Vulkan device/context is still valid.
+    # During Julia shutdown, finalizers fire after the device may be destroyed.
+    # Finalizers cannot do context switches, so we only check simple flags here.
+    ctx = _vk_context[]
+    device_gone = ctx === nothing || _device_lost[] || buf.device_gen != _device_generation[]
+
+    if device_gone
+        # Device is gone — just poison the handle, don't call Vulkan APIs
         buf.mapped_ptr = Ptr{UInt8}(0)
         buf.address = _BDA_POISON
         Threads.atomic_sub!(GPU_LIVE_BYTES, buf.size)
         buf.size = 0
         return
     end
-    # Unmap if this was a unified/BAR buffer
+
+    # Device is valid — safe to call Vulkan cleanup
     if buf.mapped_ptr != Ptr{UInt8}(0)
-        Vulkan.unmap_memory(vk_device(), buf.memory)
+        try
+            Vulkan.unmap_memory(vk_device(), buf.memory)
+        catch
+            # unmap can fail if memory was already freed by driver — ignore
+        end
         buf.mapped_ptr = Ptr{UInt8}(0)
     end
-    # Explicitly destroy in correct order: buffer before memory.
-    # Vulkan.jl handles are refcounted — calling destructor() sets refcount to 0,
-    # so the GC finalizer's second call will be a no-op (refcount underflows, iszero → false).
-    buf.buffer.destructor()
-    buf.memory.destructor()
-    buf.address = _BDA_POISON  # Poison BDA so use-after-free is detectable
+    try
+        buf.buffer.destructor()
+        buf.memory.destructor()
+    catch
+        # Destruction can fail during shutdown — ignore
+    end
+    buf.address = _BDA_POISON
     Threads.atomic_sub!(GPU_LIVE_BYTES, buf.size)
     buf.size = 0
 end
@@ -411,15 +442,16 @@ function _one_shot_copy(src::Vulkan.Buffer, src_offset::Integer,
     ctx = vk_context()
     dev = ctx.device
 
-    # Use dedicated transfer command buffer + fence to avoid interfering with
-    # the dispatch command buffer state on NVIDIA.
-    cmd = ctx.xfer_cmd_buf
-    fence = ctx.xfer_fence
+    # Use the current batch queue's dedicated transfer resources (thread-safe)
+    bq = something(current_batch_queue(), ctx.default_bq)
 
-    # Auto-flush pending dispatches before memory transfer to ensure data is written
-    if has_active_recording(ctx)
-        vk_flush!()
+    # Flush pending dispatches before transfer to ensure data is written
+    if bq.active_batch !== nothing && bq.active_batch.recording
+        flush!(bq, dev)
     end
+
+    cmd = bq.xfer_cmd_buf
+    fence = bq.xfer_fence
 
     unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
         flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
@@ -430,9 +462,9 @@ function _one_shot_copy(src::Vulkan.Buffer, src_offset::Integer,
 
     unwrap(Vulkan.end_command_buffer(cmd))
 
-    # Submit and wait using the dedicated transfer fence
+    # Submit to the batch queue's own queue and wait
     submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    submit_result = Vulkan.queue_submit(ctx.queue, [submit_info]; fence=fence)
+    submit_result = Vulkan.queue_submit(bq.queue, [submit_info]; fence=fence)
     if iserror(submit_result)
         _device_lost[] = true
         unwrap(submit_result)

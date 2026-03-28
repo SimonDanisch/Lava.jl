@@ -154,7 +154,17 @@ function get_compute_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String;
     push!(_pipeline_insertion_order, cache_key)
     while length(_pipeline_insertion_order) > _max_pipeline_cache_size[]
         old_key = popfirst!(_pipeline_insertion_order)
+        evicted = get(_pipeline_cache, old_key, nothing)
         delete!(_pipeline_cache, old_key)
+        # Keep evicted pipeline alive until the current batch flushes —
+        # it may still be referenced by an in-flight command buffer.
+        if evicted !== nothing
+            ctx = vk_context()
+            bq = something(current_batch_queue(), ctx.default_bq)
+            if bq.active_batch !== nothing
+                push!(bq.active_batch.data_refs, evicted)
+            end
+        end
     end
     return result
 end

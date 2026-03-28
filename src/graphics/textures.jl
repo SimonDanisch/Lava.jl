@@ -113,12 +113,11 @@ function upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}) where T
     ctx = vk_context()
     dev = ctx.device
 
-    # Create staging buffer
+    # Use staging buffer for upload
     bytes = reinterpret(UInt8, vec(collect(data)))
-    staging = vk_alloc(length(bytes);
-        usage=Vulkan.BUFFER_USAGE_TRANSFER_SRC_BIT,
-        host_visible=true)
-    upload!(staging, bytes)
+    nbytes = length(bytes)
+    staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
+    unsafe_copyto!(Ptr{UInt8}(mapped_ptr), pointer(bytes), nbytes)
 
     # Flush pending commands first
     vk_flush!()
@@ -144,7 +143,7 @@ function upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}) where T
         Vulkan.Offset3D(0, 0, 0),
         Vulkan.Extent3D(UInt32(tex.width), UInt32(tex.height), UInt32(1)),
     )
-    Vulkan.cmd_copy_buffer_to_image(cmd, staging.buffer, tex.image,
+    Vulkan.cmd_copy_buffer_to_image(cmd, staging_buf, tex.image,
         Vulkan.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, [region])
 
     # Transition to SHADER_READ_ONLY
@@ -180,6 +179,7 @@ struct TextureBindings
     layout::Vulkan.DescriptorSetLayout
     pool::Vulkan.DescriptorPool
     set::Vulkan.DescriptorSet
+    textures::Vector{Any}  # Keep texture + sampler refs alive while descriptor set is in use
 end
 
 """Create a descriptor set binding combined image samplers."""
@@ -191,8 +191,8 @@ function bind_textures(textures::Vector{<:SampledTexture})
     bindings = [Vulkan.DescriptorSetLayoutBinding(
         UInt32(i - 1),
         Vulkan.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        UInt32(1),
-        Vulkan.SHADER_STAGE_FRAGMENT_BIT | Vulkan.SHADER_STAGE_VERTEX_BIT,
+        Vulkan.SHADER_STAGE_FRAGMENT_BIT | Vulkan.SHADER_STAGE_VERTEX_BIT;
+        descriptor_count=UInt32(1),
     ) for i in 1:n]
 
     layout = Vulkan.DescriptorSetLayout(dev, bindings)
@@ -213,14 +213,17 @@ function bind_textures(textures::Vector{<:SampledTexture})
             Vulkan.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         )
         push!(writes, Vulkan.WriteDescriptorSet(
-            dset, UInt32(i - 1), UInt32(0), UInt32(1),
+            dset, UInt32(i - 1), UInt32(0),
             Vulkan.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            [img_info], [], [],
+            [img_info],
+            Vulkan.DescriptorBufferInfo[],
+            Vulkan.BufferView[];
+            descriptor_count=UInt32(1),
         ))
     end
     Vulkan.update_descriptor_sets(dev, writes, [])
 
-    TextureBindings(layout, pool, dset)
+    TextureBindings(layout, pool, dset, Any[textures...])
 end
 
 # Convenience

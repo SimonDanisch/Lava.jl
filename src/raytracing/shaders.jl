@@ -104,7 +104,8 @@ function trace_rays!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args...;
     keep_data_alive!(args)
 
     # Dispatch (push constant = BDA of arg buffer, passed as UInt64, zero-alloc)
-    rt_dispatch!(vk_pipeline, tlas, arg_buf.address, width, height; depth=depth)
+    bq = something(current_batch_queue(), vk_context().default_bq)
+    rt_dispatch!(bq, vk_pipeline, tlas, arg_buf.address, width, height; depth=depth)
 end
 
 """
@@ -135,8 +136,10 @@ function trace_rays_indirect!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args
     # _prepare_indirect_rt_dispatch! → lava_launch! may trigger auto-flush which
     # resets slab pools. If we allocated the RT arg buffer first, the flush would
     # invalidate it (DEVICE_LOST from stale BDA).
+    bq = something(current_batch_queue(), vk_context().default_bq)
+
     indirect_buf = _get_indirect_buffer()
-    _prepare_indirect_rt_dispatch!(indirect_buf, n_rays)
+    _prepare_indirect_rt_dispatch!(bq, indirect_buf, n_rays)
 
     # Now allocate and pack RT args (safe — any auto-flush already happened)
     all_args = (pipeline.raygen_func, args...)
@@ -149,12 +152,12 @@ function trace_rays_indirect!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args
     keep_data_alive!(args)
     push_bda = arg_buf.address
 
-    rt_dispatch_indirect!(vk_pipeline, tlas, push_bda, indirect_buf)
+    rt_dispatch_indirect!(bq, vk_pipeline, tlas, push_bda, indirect_buf)
 end
 
 """Prepare indirect RT dispatch buffer: writes (n_rays, 1, 1) from a GPU-resident count."""
-function _prepare_indirect_rt_dispatch!(indirect_buf::VkIndirectBuffer, n_rays_buf::LavaArray{Int32})
-    lava_launch!(_prepare_indirect_rt_kernel,
+function _prepare_indirect_rt_dispatch!(bq::BatchQueue, indirect_buf::VkIndirectBuffer, n_rays_buf::LavaArray{Int32})
+    lava_launch!(bq, _prepare_indirect_rt_kernel,
                  Ptr{UInt32}(indirect_buf.address), n_rays_buf;
                  ndrange=1, workgroup_size=(1, 1, 1))
 end
