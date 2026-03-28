@@ -30,8 +30,12 @@ end
     end
 
     # ── Tier 2: Golden File Comparison ──
-    @testset "Tier 2: Golden Files" begin
-        include(joinpath(@__DIR__, "test_golden.jl"))
+    # Skipped in CI — SPIR-V IDs differ across platforms (LLVM CSE).
+    # Run locally with: LAVA_BLESS=1 julia --project test/runtests.jl
+    if get(ENV, "CI", "") != "true"
+        @testset "Tier 2: Golden Files" begin
+            include(joinpath(@__DIR__, "test_golden.jl"))
+        end
     end
 
     # ── Tier 3: GPU Execution ──
@@ -63,6 +67,11 @@ end
     # ── Tier 3f: Caching & Allocations ──
     @testset "Tier 3f: Caching & Allocations" begin
         include(joinpath(@__DIR__, "test_caching_and_allocations.jl"))
+    end
+
+    # ── Tier 3g: Graphics Pipeline ──
+    @testset "Tier 3g: Graphics Pipeline" begin
+        include(joinpath(@__DIR__, "test_graphics_pipeline.jl"))
     end
 
     # ── Tier 4: GPUArrays TestSuite ──

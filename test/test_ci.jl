@@ -225,6 +225,10 @@ end
         include(joinpath(@__DIR__, "test_gpu_memory_safety.jl"))
     end
 
+    @testset "Graphics Pipeline" begin
+        include(joinpath(@__DIR__, "test_graphics_pipeline.jl"))
+    end
+
     # ── Tier 4: GPUArrays Subset ────────────────────────────────────────
     # Run only the most important groups that catch real bugs.
     # broadcasting = tuple/closure/fusion bugs

@@ -2,8 +2,27 @@
 #
 # These test that our SPIR-V emitter handles production-grade nested structs,
 # complex control flow, and atomic patterns. No GPU dispatch — compilation only.
+#
+# Requires Hikari + Raycore — skipped if not available (e.g. CI without [sources]).
 
 using Test
+
+# Guard: skip entire file if Hikari/Raycore aren't loadable
+let can_load = try
+        Base.require(Main, :Hikari)
+        Base.require(Main, :Raycore)
+        true
+    catch
+        false
+    end
+    if !can_load
+        @testset "Real Kernel Compilation" begin
+            @test_broken false  # mark as known-skipped
+        end
+        return  # exit file
+    end
+end
+
 if !@isdefined(SPIRVTestUtils)
     include(joinpath(@__DIR__, "..", "spirv_test_utils.jl"))
 end
