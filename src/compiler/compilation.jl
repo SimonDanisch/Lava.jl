@@ -759,6 +759,13 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
         write("/tmp/lava_ir_1_postinline.ll", string(mod))
     end
 
+    # ── Fix barrier-skipping error paths ──
+    # _replace_unreachable! (pre-inlining) converts error paths to early returns.
+    # After inlining, these returns may skip barriers that other invocations reach,
+    # causing undefined behavior (deadlock on CPU/software Vulkan implementations).
+    # Redirect barrier-skipping paths to the barrier-containing continuation.
+    _fix_barrier_skipping_paths!(entry_fn)
+
     # ── Post-inlining optimization ──
     LLVM.run!(LLVM.InstCombinePass(), mod)
     LLVM.run!(LLVM.SROAPass(), mod)
@@ -868,6 +875,11 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # SPIR-V requires the stored value type to match the pointer's pointee type.
     # Rewrite these stores to drill into the alloca type via GEP.
     _fix_alloca_type_mismatched_stores!(mod, dl)
+
+    # Fold type-punned scalar allocas where constant partial stores reconstruct a value.
+    # SROA decomposes e.g. `zero(Float64)` into `store float 0.0` at offset 0 +
+    # `store i32 0` at offset 4, then `load double`. Fold to a direct constant.
+    _fold_typepun_scalar_alloca_constants!(mod, dl)
 
     # Lower chained mismatched-type GEPs on allocas.
     # Julia's MArray/StaticArray patterns create chains like:

@@ -11,6 +11,16 @@ A GPU buffer with a known device address (BDA).
 When `mapped_ptr` is non-null, the buffer is in BAR memory (host-visible + device-local)
 and can be read/written directly from the CPU without staging copies.
 """
+mutable struct PoolBlock
+    buffer::Vulkan.Buffer
+    memory::Vulkan.DeviceMemory
+    base_address::UInt64       # BDA of the start of this block
+    capacity::Int              # Total bytes in this block
+    bump::Int                  # Next free byte offset (bump pointer for initial carving)
+    device_gen::UInt64
+    live_count::Int            # Number of live sub-allocations
+end
+
 mutable struct VkManagedBuffer
     buffer::Vulkan.Buffer
     memory::Vulkan.DeviceMemory
@@ -18,6 +28,8 @@ mutable struct VkManagedBuffer
     mapped_ptr::Ptr{UInt8}  # Non-null for unified/BAR memory
     size::Int
     device_gen::UInt64  # Device generation at creation time (for safe finalizer cleanup)
+    pool_offset::Int    # Byte offset within pool block (0 for non-pooled)
+    pool_block::Union{Nothing, PoolBlock}  # Back-reference for pool free (nothing = non-pooled)
 end
 
 # Strong references to keep Vulkan handles alive until explicit free
@@ -190,7 +202,7 @@ function _try_vk_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0))
     addr_info = Vulkan.BufferDeviceAddressInfo(buf)
     address = Vulkan.get_buffer_device_address(dev, addr_info)
 
-    result = VkManagedBuffer(buf, memory, address, Ptr{UInt8}(0), Int(nbytes), _device_generation[])
+    result = VkManagedBuffer(buf, memory, address, Ptr{UInt8}(0), Int(nbytes), _device_generation[], 0, nothing)
     push!(_live_buffers, result)
     Threads.atomic_add!(GPU_LIVE_BYTES, nbytes)
     Threads.atomic_add!(GPU_BYTES_SINCE_LAST_GC, nbytes)
@@ -235,6 +247,12 @@ end
 """Actually destroy a buffer's Vulkan resources. Called from vk_free! or flush_deferred_frees!."""
 function _destroy_buffer!(buf::VkManagedBuffer)
     buf.size == 0 && return  # Already destroyed
+
+    # Pooled chunk: return to pool, don't destroy the shared VkBuffer
+    if buf.pool_block !== nothing
+        _return_to_pool!(buf)
+        return
+    end
 
     # Check if the Vulkan device/context is still valid.
     # During Julia shutdown, finalizers fire after the device may be destroyed.
@@ -287,6 +305,145 @@ function flush_deferred_frees!()
         _destroy_buffer!(buf)
     end
     empty!(DEFERRED_FREES)
+end
+
+# ── Memory Pool: sub-allocate from large VkBuffer blocks ──
+# Eliminates per-array VkBuffer create/destroy overhead (~30μs each).
+# All sub-allocations share the parent block's VkBuffer handle.
+# Free = return to free list (zero Vulkan API calls).
+
+const POOL_BLOCK_SIZE = 64 * 1024 * 1024  # 64 MiB per block
+const POOL_LARGE_THRESHOLD = POOL_BLOCK_SIZE  # Allocs above this bypass the pool
+const POOL_MIN_SIZE = 16  # Minimum allocation size (Vulkan requires non-zero)
+const POOL_NUM_SIZE_CLASSES = 24  # 2^4=16 to 2^27=128MiB
+
+# Free lists: index i holds reusable VkManagedBuffer objects of size 2^(i+3) bytes
+const _pool_blocks = PoolBlock[]
+const _pool_free_lists = [VkManagedBuffer[] for _ in 1:POOL_NUM_SIZE_CLASSES]
+
+push!(_reset_callbacks, function()
+    # Destroy all pool blocks on device reset
+    for block in _pool_blocks
+        try
+            block.buffer.destructor()
+            block.memory.destructor()
+        catch
+        end
+    end
+    empty!(_pool_blocks)
+    for fl in _pool_free_lists
+        empty!(fl)
+    end
+end)
+
+"""Size class index for a given byte size. Returns 1 for 16B, 2 for 32B, etc."""
+@inline function _size_class_idx(nbytes::Int)
+    nbytes = max(nbytes, POOL_MIN_SIZE)
+    # Round up to next power of 2
+    rounded = nextpow(2, nbytes)
+    return trailing_zeros(rounded) - 3  # 16=2^4 → idx 1, 32=2^5 → idx 2, etc.
+end
+
+"""Rounded-up allocation size for a given byte count."""
+@inline _size_class_bytes(nbytes::Int) = nextpow(2, max(nbytes, POOL_MIN_SIZE))
+
+"""Allocate a new pool block (one large VkBuffer)."""
+function _alloc_pool_block()
+    buf_result = _try_vk_alloc(POOL_BLOCK_SIZE)
+    if buf_result === nothing
+        # OOM — try GC + flush + retry
+        GC.gc(true)
+        flush_deferred_frees!()
+        buf_result = _try_vk_alloc(POOL_BLOCK_SIZE)
+        buf_result === nothing && error("Lava: cannot allocate pool block ($(POOL_BLOCK_SIZE ÷ 1024÷1024) MiB)")
+    end
+    # Extract Vulkan handles from the VkManagedBuffer, then remove it from _live_buffers
+    # (the pool block manages its own lifetime, not the per-chunk tracking)
+    block = PoolBlock(buf_result.buffer, buf_result.memory, buf_result.address,
+                      POOL_BLOCK_SIZE, 0, _device_generation[], 0)
+    delete!(_live_buffers, buf_result)
+    # Don't subtract from GPU_LIVE_BYTES — the block IS live memory.
+    # Individual chunks don't add to GPU_LIVE_BYTES since the block already accounts for it.
+    push!(_pool_blocks, block)
+    return block
+end
+
+"""
+    pool_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0)) -> VkManagedBuffer
+
+Allocate GPU memory. Small allocations come from the pool (zero Vulkan API calls).
+Large allocations or those with non-standard usage flags bypass the pool.
+"""
+function pool_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0))
+    nbytes = max(Int(nbytes), POOL_MIN_SIZE)
+
+    # Large allocations or non-standard usage bypass the pool
+    if nbytes > POOL_LARGE_THRESHOLD || extra_usage != UInt32(0)
+        return vk_alloc(nbytes; extra_usage)
+    end
+
+    maybe_collect()
+
+    alloc_size = _size_class_bytes(nbytes)
+    idx = _size_class_idx(nbytes)
+    idx = clamp(idx, 1, POOL_NUM_SIZE_CLASSES)
+
+    # Try free list first — reuse the cached VkManagedBuffer object (zero Julia alloc)
+    fl = _pool_free_lists[idx]
+    if !isempty(fl)
+        buf = pop!(fl)
+        block = buf.pool_block::PoolBlock
+        block.live_count += 1
+        # Restore the buf fields (they were poisoned on return to pool)
+        buf.address = block.base_address + UInt64(buf.pool_offset)
+        buf.size = alloc_size
+        return buf
+    end
+
+    # Try to carve from an existing block's bump pointer
+    for block in _pool_blocks
+        if block.bump + alloc_size <= block.capacity
+            byte_offset = block.bump
+            block.bump += alloc_size
+            block.live_count += 1
+            return VkManagedBuffer(
+                block.buffer, block.memory,
+                block.base_address + UInt64(byte_offset),
+                Ptr{UInt8}(0),
+                alloc_size, block.device_gen,
+                byte_offset, block)
+        end
+    end
+
+    # All blocks full — allocate a new one
+    block = _alloc_pool_block()
+    byte_offset = block.bump
+    block.bump += alloc_size
+    block.live_count += 1
+    return VkManagedBuffer(
+        block.buffer, block.memory,
+        block.base_address + UInt64(byte_offset),
+        Ptr{UInt8}(0),
+        alloc_size, block.device_gen,
+        byte_offset, block)
+end
+
+"""Return a pooled chunk to the free list. Keeps VkManagedBuffer object for reuse."""
+function _return_to_pool!(buf::VkManagedBuffer)
+    block = buf.pool_block
+    block === nothing && return
+    alloc_size = buf.size
+    alloc_size == 0 && return
+    idx = _size_class_idx(alloc_size)
+    idx = clamp(idx, 1, POOL_NUM_SIZE_CLASSES)
+    block.live_count -= 1
+    # Poison address to detect use-after-free, but keep pool_block + pool_offset
+    # so pool_alloc can restore the address from block.base_address + pool_offset
+    buf.address = _BDA_POISON
+    buf.mapped_ptr = Ptr{UInt8}(0)
+    buf.size = 0
+    # Keep buf.pool_block and buf.pool_offset intact for reuse
+    push!(_pool_free_lists[idx], buf)
 end
 
 # ── Staging buffer for CPU↔GPU transfers ──
@@ -345,6 +502,7 @@ Upload host data to a device-local buffer via staging.
 function upload!(dst::VkManagedBuffer, host_data::Vector{UInt8}; offset::Int=0)
     nbytes = length(host_data)
     nbytes == 0 && return
+    buf_offset = dst.pool_offset + offset
 
     # Fast path: if buffer is in BAR memory (mapped), write directly via mapped ptr.
     if dst.mapped_ptr != Ptr{UInt8}(0)
@@ -359,7 +517,7 @@ function upload!(dst::VkManagedBuffer, host_data::Vector{UInt8}; offset::Int=0)
     staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
     unsafe_copyto!(Ptr{UInt8}(mapped_ptr), pointer(host_data), nbytes)
 
-    _one_shot_copy(staging_buf, 0, dst.buffer, offset, nbytes)
+    _one_shot_copy(staging_buf, 0, dst.buffer, buf_offset, nbytes)
 end
 
 """
@@ -370,6 +528,7 @@ Download data from a device-local buffer to host via staging.
 function download!(host_data::Vector{UInt8}, src::VkManagedBuffer; offset::Int=0)
     nbytes = length(host_data)
     nbytes == 0 && return
+    buf_offset = src.pool_offset + offset
 
     # Fast path: if buffer is in BAR memory (mapped), just flush and read directly.
     # Saves one fence wait by avoiding the staging copy command.
@@ -383,7 +542,7 @@ function download!(host_data::Vector{UInt8}, src::VkManagedBuffer; offset::Int=0
     end
 
     staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
-    _one_shot_copy(src.buffer, offset, staging_buf, 0, nbytes)
+    _one_shot_copy(src.buffer, buf_offset, staging_buf, 0, nbytes)
     unsafe_copyto!(pointer(host_data), Ptr{UInt8}(mapped_ptr), nbytes)
 end
 
@@ -405,6 +564,7 @@ Download data from a device-local buffer into a typed array.
 function download_typed!(data::AbstractVector{T}, src::VkManagedBuffer; offset::Int=0) where T
     nbytes = length(data) * sizeof(T)
     nbytes == 0 && return
+    buf_offset = src.pool_offset + offset
 
     # Fast path: BAR memory — direct CPU read, no staging copy
     if src.mapped_ptr != Ptr{UInt8}(0)
@@ -423,9 +583,9 @@ function download_typed!(data::AbstractVector{T}, src::VkManagedBuffer; offset::
     ctx = vk_context()
     if has_active_recording(ctx)
         # Defined in command.jl (included after memory.jl)
-        _append_copy_and_flush!(ctx, src.buffer, offset, staging_buf, nbytes)
+        _append_copy_and_flush!(ctx, src.buffer, buf_offset, staging_buf, nbytes)
     else
-        _one_shot_copy(src.buffer, offset, staging_buf, 0, nbytes)
+        _one_shot_copy(src.buffer, buf_offset, staging_buf, 0, nbytes)
     end
     GC.@preserve data begin
         unsafe_copyto!(Ptr{UInt8}(pointer(data)), Ptr{UInt8}(mapped_ptr), nbytes)
@@ -554,7 +714,7 @@ function vk_alloc_unified(nbytes::Integer)
     maybe_collect()
     mapped = vk_alloc_mapped(max(nbytes, 16))
     managed = VkManagedBuffer(mapped.buffer, mapped.memory, mapped.address,
-                               mapped.mapped_ptr, Int(mapped.size), _device_generation[])
+                               mapped.mapped_ptr, Int(mapped.size), _device_generation[], 0, nothing)
     push!(_live_buffers, managed)
     Threads.atomic_add!(GPU_LIVE_BYTES, managed.size)
     Threads.atomic_add!(GPU_BYTES_SINCE_LAST_GC, managed.size)

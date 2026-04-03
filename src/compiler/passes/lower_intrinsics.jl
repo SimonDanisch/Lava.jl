@@ -196,6 +196,124 @@ function _strip_assume!(mod::LLVM.Module)
 end
 
 """
+    _fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
+
+After inlining and optimization, detect error paths (from `_replace_unreachable!`)
+that branch directly to the return block, skipping `OpControlBarrier` calls that
+other invocations in the workgroup will reach.
+
+Per the Vulkan spec (and OpenCL), ALL invocations in a workgroup must reach every
+`OpControlBarrier`. If an error path causes one invocation to return early while
+others continue to a barrier, the behavior is undefined (deadlock on CPU/software
+implementations, undefined on GPU hardware).
+
+**Algorithm**: For each block that branches directly to the return block, check if
+its predecessor's alternative path leads to a barrier. If so, redirect the block
+to the barrier-containing path. This makes dead invocations participate in all
+remaining barriers before returning.
+"""
+function _fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
+    isempty(LLVM.blocks(entry_fn)) && return false
+
+    # 1. Find all blocks containing barrier calls
+    barrier_fn_name = "llvm.spv.group.memory.barrier.with.group.sync"
+    barrier_blocks = Set{LLVM.BasicBlock}()
+    for bb in LLVM.blocks(entry_fn), inst in LLVM.instructions(bb)
+        if inst isa LLVM.CallInst
+            callee = LLVM.called_operand(inst)
+            if callee isa LLVM.Function && LLVM.name(callee) == barrier_fn_name
+                push!(barrier_blocks, bb)
+            end
+        end
+    end
+    isempty(barrier_blocks) && return false
+
+    # 2. Find the return block(s)
+    return_blocks = Set{LLVM.BasicBlock}()
+    for bb in LLVM.blocks(entry_fn)
+        term = LLVM.terminator(bb)
+        if term isa LLVM.RetInst
+            push!(return_blocks, bb)
+        end
+    end
+    isempty(return_blocks) && return false
+
+    # 3. Find blocks that skip barriers: branch directly to a return block,
+    #    while their predecessor's other path leads to a barrier.
+    changed = false
+    for bb in collect(LLVM.blocks(entry_fn))
+        bb in barrier_blocks && continue
+        bb in return_blocks && continue
+
+        term = LLVM.terminator(bb)
+        term isa LLVM.BrInst || continue
+        succs = collect(LLVM.successors(term))
+        length(succs) == 1 || continue   # must be unconditional branch
+
+        target = succs[1]
+        target in return_blocks || continue   # must branch to return block
+
+        # This block branches directly to return. Check predecessor.
+        preds = collect(LLVM.predecessors(bb))
+        length(preds) == 1 || continue
+
+        pred = preds[1]
+        pred_term = LLVM.terminator(pred)
+        pred_term isa LLVM.BrInst || continue
+        pred_succs = collect(LLVM.successors(pred_term))
+        length(pred_succs) == 2 || continue  # must be conditional branch
+
+        # Find the "other" target (the non-error path)
+        other_target = pred_succs[1] == bb ? pred_succs[2] : pred_succs[1]
+
+        # Check if the other path leads to a barrier (directly or transitively)
+        if _path_reaches_barrier(other_target, barrier_blocks, return_blocks)
+            # Redirect this block to the barrier-containing path
+            LLVM.@dispose builder = LLVM.IRBuilder() begin
+                LLVM.position!(builder, term)
+                LLVM.br!(builder, other_target)
+            end
+            LLVM.erase!(term)
+
+            # Add incoming values for any PHI nodes in the target
+            for inst in LLVM.instructions(other_target)
+                inst isa LLVM.PHIInst || break  # PHIs must be at block start
+                undef = LLVM.UndefValue(LLVM.value_type(inst))
+                push!(LLVM.incoming(inst), (undef, bb))
+            end
+
+            changed = true
+        end
+    end
+
+    return changed
+end
+
+"""
+Check if any path from `start` reaches a barrier block before reaching a return block.
+Uses BFS with visited set to handle cycles.
+"""
+function _path_reaches_barrier(start::LLVM.BasicBlock,
+                               barrier_blocks::Set{LLVM.BasicBlock},
+                               return_blocks::Set{LLVM.BasicBlock})
+    start in barrier_blocks && return true
+    visited = Set{LLVM.BasicBlock}()
+    queue = LLVM.BasicBlock[start]
+    while !isempty(queue)
+        bb = popfirst!(queue)
+        bb in visited && continue
+        push!(visited, bb)
+        bb in barrier_blocks && return true
+        bb in return_blocks && continue  # don't search past return
+        term = LLVM.terminator(bb)
+        for succ in LLVM.successors(term)
+            succ in visited || push!(queue, succ)
+        end
+    end
+    return false
+end
+
+"""
     _remove_julia_runtime_artifacts!(mod::LLVM.Module)
 
 Remove Julia runtime artifacts that appear after force-inlining error paths.

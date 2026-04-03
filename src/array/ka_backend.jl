@@ -67,6 +67,18 @@ Adapt.adapt_storage(::LavaBackend, a::Array) = Adapt.adapt(LavaArray, a)
 Adapt.adapt_storage(::LavaBackend, a::LavaArray) = a
 Adapt.adapt_storage(::KA.CPU, a::LavaArray) = Array(a)
 
+# @Const support: stop Adapt recursion at the device array level.
+# Without this, constify on SubArray{...,ReshapedArray{...,LavaDeviceArray}} recurses into
+# ReshapedArray → calls Base.reshape → SignedMultiplicativeInverse constructor on GPU,
+# which has a throw(ArgumentError("...$d")) that generates ijl_get_nth_field_checked.
+# AMDGPU handles this by casting the pointer to constant address space; we just return
+# the device array as-is since Vulkan BDA pointers are already readonly-capable.
+Adapt.adapt_storage(::KA.ConstAdaptor, a::LavaDeviceArray) = a
+# Prevent ReshapedArray reconstruction during constify — @Const marks readonly,
+# it should not reconstruct wrapper arrays (which triggers SignedMultiplicativeInverse
+# constructor with its throwing string interpolation path on GPU).
+Adapt.adapt_structure(::KA.ConstAdaptor, A::Base.ReshapedArray) = A
+
 # Type-based adapt_storage for Adapt.adapt(LavaArray, x) dispatch
 Adapt.adapt_storage(::Type{<:LavaArray}, a::Array) = LavaArray(a)
 Adapt.adapt_storage(::Type{<:LavaArray}, a::LavaArray) = a

@@ -319,13 +319,23 @@ The buffer is read in Julia column-major order by the fragment shader.
 """
 function blit!(bq::BatchQueue, target::RenderTarget, source::LavaArray;
                clear::Bool=true)
-    win = if target isa WindowTarget
-        target.window
+    if target isa WindowTarget
+        win = target.window
+        w, h = size(win)
+        color_format = win.format
+        view = win.views[win.current_image_idx + 1]
+        image = win.images[win.current_image_idx + 1]
+        extent = win.extent
+    elseif target isa OffscreenTarget
+        fb = target.fb
+        w, h = fb.width, fb.height
+        color_format = fb.color_format
+        view = fb.color_view
+        image = fb.color_image
+        extent = Vulkan.Extent2D(UInt32(w), UInt32(h))
     else
-        error("blit! currently only supports WindowTarget")
+        error("blit! only supports WindowTarget and OffscreenTarget")
     end
-
-    w, h = size(win)
 
     # Create or reuse blit pipeline
     if BLIT_PIPELINE[] === nothing
@@ -348,18 +358,15 @@ function blit!(bq::BatchQueue, target::RenderTarget, source::LavaArray;
 
     _, compiled = _ensure_compiled_with_shader!(pipeline,
         pipeline.vertex, pipeline.fragment, Tuple{}, frag_tt;
-        color_format=win.format)
+        color_format=color_format)
 
     # Pack fragment args via the fragment shader's push_info
     frag_shader = get_or_compile_gfx(pipeline.fragment, frag_tt, :fragment)
     push_data = pack_gfx_args(frag_args, frag_shader.push_info)
 
-    view = win.views[win.current_image_idx + 1]
-    image = win.images[win.current_image_idx + 1]
-
     clear_color = clear ? (0.0f0, 0.0f0, 0.0f0, 1.0f0) : nothing
 
-    vk_draw!(bq, compiled, view, image, win.extent, 3;
+    vk_draw!(bq, compiled, view, image, extent, 3;
         push_data, clear_color)
 end
 

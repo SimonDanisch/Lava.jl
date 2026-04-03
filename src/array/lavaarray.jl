@@ -22,7 +22,7 @@ end
 
 function LavaArray{T,N}(::UndefInitializer, dims::NTuple{N,Int}) where {T,N}
     nbytes = prod(dims) * sizeof(T)
-    managed_buf = vk_alloc(max(nbytes, 16))
+    managed_buf = pool_alloc(max(nbytes, 16))
     ref = GPUArrays.DataRef(managed_buf) do buf
         vk_free!(buf)
     end
@@ -158,7 +158,7 @@ function update!(dst::LavaArray{T,N}, data::AbstractArray{T,N}) where {T,N}
         GPUArrays.unsafe_free!(old_ref)
         # Allocate new
         new_nbytes = max(length(data) * sizeof(T), 16)
-        new_buf = vk_alloc(new_nbytes)
+        new_buf = pool_alloc(new_nbytes)
         new_ref = GPUArrays.DataRef(new_buf) do buf
             vk_free!(buf)
         end

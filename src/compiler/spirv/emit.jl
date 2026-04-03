@@ -713,15 +713,41 @@ function emit_instruction!(state::SPIRVEmitterState, inst::LLVM.Instruction)
     elseif inst isa LLVM.FPTruncInst
         _emit_conversion!(state, inst, Op.OpFConvert)
     elseif inst isa LLVM.SIToFPInst
-        _emit_conversion!(state, inst, Op.OpConvertSToF)
+        _emit_int_to_fp!(state, inst, Op.OpConvertSToF)
     elseif inst isa LLVM.UIToFPInst
-        _emit_conversion!(state, inst, Op.OpConvertUToF)
+        _emit_int_to_fp!(state, inst, Op.OpConvertUToF)
     elseif inst isa LLVM.FPToSIInst
         _emit_conversion!(state, inst, Op.OpConvertFToS)
     elseif inst isa LLVM.FPToUIInst
         _emit_conversion!(state, inst, Op.OpConvertFToU)
     elseif inst isa LLVM.BitCastInst
-        _emit_conversion!(state, inst, Op.OpBitcast)
+        src_val = LLVM.operands(inst)[1]
+        src_ty = LLVM.value_type(src_val)
+        dst_ty = LLVM.value_type(inst)
+        if src_ty isa LLVM.IntegerType && (dst_ty isa LLVM.LLVMFloat || dst_ty isa LLVM.LLVMDouble)
+            # bitcast int → float (type-punned field access).
+            # The source is typically a trunc i64→i32. We need:
+            #   OpUConvert %uint %src_i64  (if src is wider than float)
+            #   OpBitcast %float %uint_val
+            # Use emit_type_float! directly to avoid PTM contamination.
+            src_id = get_value_id!(state, src_val)
+            int_width = dst_ty isa LLVM.LLVMFloat ? 32 : 64
+            float_width = int_width
+            # If source integer is wider than target float, truncate first
+            src_width = LLVM.width(src_ty)
+            if src_width > int_width
+                int_ty = emit_type_int!(state.mod, UInt32(int_width), UInt32(0))
+                trunc_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpUConvert, int_ty, trunc_id, src_id)
+                src_id = trunc_id
+            end
+            float_ty = emit_type_float!(state.mod, UInt32(float_width))
+            result_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpBitcast, float_ty, result_id, src_id)
+            state.value_map[inst] = result_id
+        else
+            _emit_conversion!(state, inst, Op.OpBitcast)
+        end
     elseif inst isa LLVM.PtrToIntInst
         _emit_conversion!(state, inst, Op.OpConvertPtrToU)
     elseif inst isa LLVM.IntToPtrInst
@@ -4020,6 +4046,11 @@ function _emit_conversion!(state::SPIRVEmitterState, inst::LLVM.Instruction, opc
     llvm_ty = LLVM.value_type(inst)
     result_ty = if llvm_ty isa LLVM.PointerType
         map_pointer_type_for_value!(state.type_ctx, inst)
+    elseif opcode in (Op.OpUConvert, Op.OpSConvert) && llvm_ty isa LLVM.IntegerType
+        # Integer conversion ops MUST produce integer result type.
+        # Use emit_type_int! directly — map_type! cache can be poisoned by
+        # type-punned load analysis that maps i32 → %float.
+        emit_type_int!(state.mod, UInt32(LLVM.width(llvm_ty)), UInt32(0))
     else
         map_type!(state.type_ctx, llvm_ty)
     end
@@ -4028,26 +4059,88 @@ function _emit_conversion!(state::SPIRVEmitterState, inst::LLVM.Instruction, opc
     state.value_map[inst] = result_id
 end
 
+function _emit_int_to_fp!(state::SPIRVEmitterState, inst::LLVM.Instruction, opcode::UInt16)
+    # SPIR-V's OpConvertSToF/OpConvertUToF require integer input, not bool.
+    # LLVM's sitofp/uitofp i1 is valid but we must first convert i1 → i32.
+    src_val = LLVM.operands(inst)[1]
+    src_ty = LLVM.value_type(src_val)
+    if src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 1
+        # i1 → select(bool, 1, 0) → OpConvertUToF/OpConvertSToF
+        src_id = get_value_id!(state, src_val)
+        i32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+        one_id = emit_constant_u32!(state.mod, UInt32(1))
+        zero_id = emit_constant_u32!(state.mod, UInt32(0))
+        int_id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpSelect, i32_ty, int_id, src_id, one_id, zero_id)
+        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+        result_id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, opcode, result_ty, result_id, int_id)
+        state.value_map[inst] = result_id
+    else
+        _emit_conversion!(state, inst, opcode)
+    end
+end
+
 function _emit_trunc!(state::SPIRVEmitterState, inst::LLVM.TruncInst)
-    # trunc can be i64→i32, i32→i16, etc.
+    # trunc is ALWAYS integer→integer in LLVM IR.
     # For i-to-i: OpUConvert (or OpSConvert, but signedness is per-instruction in SPIR-V)
+    # IMPORTANT: Use map_type! on the raw LLVM IntegerType, NOT on the instruction result.
+    # The PTM (Pointee Type Map) may resolve the instruction's type to float (due to
+    # type-punned bitcast users), but OpUConvert requires an integer result type.
     src_ty = LLVM.value_type(LLVM.operands(inst)[1])
     dst_ty = LLVM.value_type(inst)
-    if src_ty isa LLVM.IntegerType && dst_ty isa LLVM.IntegerType
-        # Integer truncation
-        if LLVM.width(dst_ty) == 1
-            # trunc to i1: compare != 0
-            src_id = get_value_id!(state, LLVM.operands(inst)[1])
-            zero_id = _get_zero_constant!(state, src_ty)
-            result_ty = map_type!(state.type_ctx, dst_ty)
-            result_id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.functions, Op.OpINotEqual, result_ty, result_id, src_id, zero_id)
-            state.value_map[inst] = result_id
+    if dst_ty isa LLVM.IntegerType && LLVM.width(dst_ty) == 1
+        # trunc to i1: compare != 0
+        src_id = get_value_id!(state, LLVM.operands(inst)[1])
+        zero_id = _get_zero_constant!(state, src_ty)
+        result_ty = map_type!(state.type_ctx, dst_ty)
+        result_id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpINotEqual, result_ty, result_id, src_id, zero_id)
+        state.value_map[inst] = result_id
+    elseif dst_ty isa LLVM.IntegerType
+        # Integer truncation: emit OpUConvert with integer result type + OpBitcast if
+        # the ONLY user is a bitcast to float. This avoids the mysterious corruption
+        # where the trunc's result type gets overwritten to float in the SPIR-V.
+        src_id = get_value_id!(state, LLVM.operands(inst)[1])
+        # Check: does this trunc feed directly into a bitcast to float?
+        users = collect(LLVM.uses(inst))
+        is_typepun = length(users) == 1 && LLVM.user(first(users)) isa LLVM.BitCastInst
+        if is_typepun
+            # Fold trunc+bitcast: emit OpUConvert %uint then OpBitcast %float
+            # and register the BITCAST instruction's value_map to the final float result.
+            bcast_inst = LLVM.user(first(users))
+            bcast_dst = LLVM.value_type(bcast_inst)
+            int_width = LLVM.width(dst_ty)
+            int_ty = emit_type_int!(state.mod, UInt32(int_width), UInt32(0))
+            trunc_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpUConvert, int_ty, trunc_id, src_id)
+            float_ty = emit_type_float!(state.mod, UInt32(bcast_dst isa LLVM.LLVMFloat ? 32 : 64))
+            bcast_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpBitcast, float_ty, bcast_id, trunc_id)
+            # Map BOTH the trunc and bitcast in value_map
+            state.value_map[inst] = trunc_id
+            state.value_map[bcast_inst] = bcast_id
         else
-            _emit_conversion!(state, inst, Op.OpUConvert)
+            result_ty = emit_type_int!(state.mod, UInt32(LLVM.width(dst_ty)), UInt32(0))
+            result_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpUConvert, result_ty, result_id, src_id)
+            state.value_map[inst] = result_id
         end
     else
-        _emit_conversion!(state, inst, Op.OpUConvert)
+        # trunc with non-IntegerType dst — shouldn't happen in valid LLVM but handle gracefully.
+        # Force i32 and emit OpUConvert + OpBitcast if needed for float result.
+        src_id = get_value_id!(state, LLVM.operands(inst)[1])
+        int_ty = emit_type_int!(state.mod, UInt32(32), UInt32(0))
+        trunc_id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpUConvert, int_ty, trunc_id, src_id)
+        if dst_ty isa LLVM.LLVMFloat || dst_ty isa LLVM.LLVMDouble
+            float_ty = emit_type_float!(state.mod, UInt32(dst_ty isa LLVM.LLVMFloat ? 32 : 64))
+            bcast_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpBitcast, float_ty, bcast_id, trunc_id)
+            state.value_map[inst] = bcast_id
+        else
+            state.value_map[inst] = trunc_id
+        end
     end
 end
 

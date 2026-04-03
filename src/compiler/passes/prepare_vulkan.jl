@@ -2317,6 +2317,146 @@ Also handles struct unpacking:
 This pass rewrites type-mismatched stores to use typed GEPs that SPIR-V can handle.
 For partial element writes (i32 into i64), we use read-modify-write.
 """
+
+"""
+    _fold_typepun_scalar_alloca_constants!(mod, dl)
+
+Fold type-punned scalar allocas where ALL stores are constants and there's a load
+of the alloca's type. SROA decomposes e.g. `zero(Float64)` into partial stores:
+
+    %a = alloca double
+    store float 0.0, ptr %a              ; bytes [0..3]
+    %p4 = gep i8, ptr %a, i64 4
+    store i32 0, ptr %p4                  ; bytes [4..7]
+    %v = load double, ptr %a             ; full 8-byte load
+
+Replace the load with a constant computed from the stored bytes, then remove
+the dead stores and alloca.
+"""
+function _fold_typepun_scalar_alloca_constants!(mod::LLVM.Module, dl)
+    for fn in LLVM.functions(mod)
+        isempty(LLVM.blocks(fn)) && continue
+        entry = first(LLVM.blocks(fn))
+        allocas_to_process = LLVM.AllocaInst[]
+        for inst in LLVM.instructions(entry)
+            inst isa LLVM.AllocaInst || continue
+            alloca_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(inst))
+            (alloca_ty isa LLVM.StructType || alloca_ty isa LLVM.ArrayType) && continue
+            push!(allocas_to_process, inst)
+        end
+        for inst in allocas_to_process
+            alloca_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(inst))
+            (alloca_ty isa LLVM.StructType || alloca_ty isa LLVM.ArrayType) && continue
+            alloca_size = Int(LLVM.storage_size(dl, alloca_ty))
+            alloca_size == 0 && continue
+
+            bytes = fill(UInt8(0xff), alloca_size)
+            all_const = true
+            stores = LLVM.Instruction[]
+            loads = LLVM.Instruction[]
+            geps = LLVM.Instruction[]
+            other_uses = false
+
+            for use in LLVM.uses(inst)
+                user_inst = LLVM.user(use)
+                if user_inst isa LLVM.StoreInst
+                    ops = LLVM.operands(user_inst)
+                    ops[2] == inst || (other_uses = true; break)
+                    val = ops[1]
+                    val isa LLVM.ConstantFP || val isa LLVM.ConstantInt || (all_const = false; break)
+                    vsize = Int(LLVM.storage_size(dl, LLVM.value_type(val)))
+                    raw = _constant_to_bytes(val, vsize)
+                    raw === nothing && (all_const = false; break)
+                    for (j, b) in enumerate(raw)
+                        j <= alloca_size || break
+                        bytes[j] = b
+                    end
+                    push!(stores, user_inst)
+                elseif user_inst isa LLVM.LoadInst
+                    push!(loads, user_inst)
+                elseif user_inst isa LLVM.GetElementPtrInst
+                    push!(geps, user_inst)
+                    for gep_use in LLVM.uses(user_inst)
+                        gep_user = LLVM.user(gep_use)
+                        if gep_user isa LLVM.StoreInst
+                            gep_ops = LLVM.operands(gep_user)
+                            gep_ops[2] == user_inst || (other_uses = true; break)
+                            val = gep_ops[1]
+                            val isa LLVM.ConstantFP || val isa LLVM.ConstantInt || (all_const = false; break)
+                            gep_operands = LLVM.operands(user_inst)
+                            length(gep_operands) == 2 || (all_const = false; break)
+                            gep_operands[2] isa LLVM.ConstantInt || (all_const = false; break)
+                            offset = convert(Int, gep_operands[2])
+                            vsize = Int(LLVM.storage_size(dl, LLVM.value_type(val)))
+                            raw = _constant_to_bytes(val, vsize)
+                            raw === nothing && (all_const = false; break)
+                            for (j, b) in enumerate(raw)
+                                idx = offset + j
+                                1 <= idx <= alloca_size || (all_const = false; break)
+                                bytes[idx] = b
+                            end
+                            push!(stores, gep_user)
+                        else
+                            other_uses = true; break
+                        end
+                    end
+                else
+                    other_uses = true
+                end
+                (!all_const || other_uses) && break
+            end
+
+            !all_const && continue
+            other_uses && continue
+            isempty(loads) && continue
+            any(==(0xff), bytes) && continue
+
+            for load_inst in loads
+                load_ty = LLVM.value_type(load_inst)
+                const_val = _bytes_to_constant(bytes, load_ty)
+                const_val === nothing && continue
+                LLVM.replace_uses!(load_inst, const_val)
+                LLVM.erase!(load_inst)
+            end
+            for s in stores; LLVM.erase!(s); end
+            for g in geps; isempty(LLVM.uses(g)) && LLVM.erase!(g); end
+            isempty(LLVM.uses(inst)) && LLVM.erase!(inst)
+        end
+    end
+end
+
+function _constant_to_bytes(val::LLVM.ConstantInt, size::Int)
+    v = convert(UInt64, val)
+    return [UInt8((v >> (8*(i-1))) & 0xff) for i in 1:size]
+end
+function _constant_to_bytes(val::LLVM.ConstantFP, size::Int)
+    ty = LLVM.value_type(val)
+    if ty == LLVM.FloatType() && size == 4
+        return collect(reinterpret(UInt8, [convert(Float32, val)]))
+    elseif ty == LLVM.DoubleType() && size == 8
+        return collect(reinterpret(UInt8, [convert(Float64, val)]))
+    end
+    return nothing
+end
+_constant_to_bytes(::LLVM.Value, ::Int) = nothing
+
+function _bytes_to_constant(bytes::Vector{UInt8}, ty::LLVM.FloatingPointType)
+    if ty == LLVM.FloatType() && length(bytes) >= 4
+        return LLVM.ConstantFP(ty, Float64(reinterpret(Float32, bytes[1:4])[1]))
+    elseif ty == LLVM.DoubleType() && length(bytes) >= 8
+        return LLVM.ConstantFP(ty, reinterpret(Float64, bytes[1:8])[1])
+    end
+    return nothing
+end
+function _bytes_to_constant(bytes::Vector{UInt8}, ty::LLVM.IntegerType)
+    nbytes = (LLVM.width(ty) + 7) ÷ 8
+    length(bytes) >= nbytes || return nothing
+    v = UInt64(0)
+    for i in 1:nbytes; v |= UInt64(bytes[i]) << (8*(i-1)); end
+    return LLVM.ConstantInt(ty, v)
+end
+_bytes_to_constant(::Vector{UInt8}, ::LLVM.LLVMType) = nothing
+
 function _fix_alloca_type_mismatched_stores!(mod::LLVM.Module, dl)
     for fn in LLVM.functions(mod)
         isempty(LLVM.blocks(fn)) && continue
