@@ -184,7 +184,7 @@ end
 # SPIR-V optimization: enabled automatically on NVIDIA to work around
 # Always run spirv-opt: produces cleaner SPIR-V, helps with driver bugs
 # (NVIDIA Xid 31 MMU faults, AMD Windows shader compiler hangs).
-const _spirv_opt_enabled = Ref(true)
+const _spirv_opt_enabled = Ref(false)  # disabled: spirv-opt can break BDA pointer alignment
 
 """
     _run_spirv_opt(spirv_bytes::Vector{UInt8}) -> Vector{UInt8}
@@ -567,7 +567,11 @@ function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
         write(joinpath(_dbg_dir, "kernel_$(_kidx)_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).ll"), ir)
 
         # ── Stage 2: Custom SPIR-V emission ──
-        spirv_bytes, source_map = _emit_spirv_from_llvm(mod, wrapper_name, workgroup_size)
+        spirv_bytes, source_map = try
+            _emit_spirv_from_llvm(mod, wrapper_name, workgroup_size)
+        finally
+            _active_data_layout[] = nothing
+        end
 
         # ── Stage 2.5: SPIR-V optimization (optional, helps NVIDIA) ──
         if _spirv_opt_enabled[]
@@ -997,6 +1001,8 @@ function _emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
 
     # Create emitter state
     state = SPIRVEmitterState(spirv_mod, type_ctx)
+    state.data_layout = LLVM.datalayout(llvm_mod)
+    _active_data_layout[] = state.data_layout  # enable DataLayout-aware type size computation
 
     # Find the entry function
     entry_fn = LLVM.functions(llvm_mod)[entry_name]

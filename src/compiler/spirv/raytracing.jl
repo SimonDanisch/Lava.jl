@@ -93,6 +93,8 @@ function _emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
 
     # Create emitter state
     state = SPIRVEmitterState(spirv_mod, type_ctx)
+    state.data_layout = LLVM.datalayout(llvm_mod)
+    _active_data_layout[] = state.data_layout
 
     # Find entry function
     entry_fn = LLVM.functions(llvm_mod)[entry_name]

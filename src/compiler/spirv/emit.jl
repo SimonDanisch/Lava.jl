@@ -97,6 +97,8 @@ mutable struct SPIRVEmitterState
     # The function preamble emits unwrapping OpAccessChains to drill through the Block
     # wrapper and stores the unwrapped pointer IDs in value_map.
     wg_wrapped_vars::Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.LLVMType}}
+    # LLVM DataLayout for correct struct field offset computation
+    data_layout::Union{Nothing, LLVM.DataLayout}
 end
 
 function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
@@ -119,6 +121,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{LLVM.Value, Int64}(),
         Dict{LLVM.Value, UInt32}(),
         Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.LLVMType}}(),
+        nothing,  # data_layout (set by caller)
     )
 end
 
@@ -2053,6 +2056,11 @@ function _psb_needs_decomposition(state::SPIRVEmitterState, ptr::LLVM.Value, acc
             # must decompose (common after SROA ptrtoint+add+inttoptr chains)
             return true
         end
+        # Also check tracked pointer alignment from upstream byte-offset GEPs
+        ptr_align = get(state.psb_ptr_alignment, ptr, UInt32(0))
+        if ptr_align > 0 && ptr_align < access_align
+            return true
+        end
     end
 
     access_align <= 4 && return false  # i32/float with proper alignment never need decomposition
@@ -2339,18 +2347,20 @@ function _emit_psb_decomposed_small_store!(state::SPIRVEmitterState, ptr_id::UIn
     u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
     u8_ptr_ty = map_pointer_type!(state.type_ctx, u8_spirv, SC.PhysicalStorageBuffer)
 
-    # Convert value to u32 if it's a float
+    # Convert value to u32 for uniform byte extraction
     raw_val = val_id
     if val_ty isa LLVM.LLVMFloat
         raw_val = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpBitcast, u32_spirv, raw_val, val_id)
     elseif val_ty isa LLVM.LLVMHalf
-        # Half → u16 → u32 (zero-extend)
         u16_spirv = emit_type_int!(state.mod, UInt32(16), UInt32(0))
         half_as_u16 = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpBitcast, u16_spirv, half_as_u16, val_id)
         raw_val = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpUConvert, u32_spirv, raw_val, half_as_u16)
+    elseif val_ty isa LLVM.IntegerType && LLVM.width(val_ty) < 32
+        raw_val = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpUConvert, u32_spirv, raw_val, val_id)
     end
 
     base_u64 = fresh_id!(state.mod)
@@ -2445,7 +2455,7 @@ function _emit_psb_decomposed_small_load!(state::SPIRVEmitterState, ptr_id::UInt
         end
     end
 
-    # Convert u32 to the actual type (float, i16, etc.)
+    # Convert u32 combined value to the actual target type
     if load_ty isa LLVM.LLVMFloat
         result_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpBitcast, result_spirv_ty, result_id, combined)
@@ -2456,6 +2466,11 @@ function _emit_psb_decomposed_small_load!(state::SPIRVEmitterState, ptr_id::UInt
         encode_instruction!(state.mod.functions, Op.OpUConvert, u16_spirv, truncated, combined)
         result_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpBitcast, result_spirv_ty, result_id, truncated)
+        return result_id
+    elseif load_ty isa LLVM.IntegerType && LLVM.width(load_ty) < 32
+        # Truncate u32 to narrower integer (i16, i8)
+        result_id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpUConvert, result_spirv_ty, result_id, combined)
         return result_id
     end
     return combined
@@ -2705,11 +2720,8 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     end
                     idx_val = convert(Int64, idx_op)
                     if current_walk_ty isa LLVM.StructType
-                        elems = LLVM.elements(current_walk_ty)
-                        for j in 0:(idx_val-1)
-                            total_byte_offset += Int64(_compute_type_size(elems[j+1]))
-                        end
-                        current_walk_ty = elems[idx_val+1]
+                        total_byte_offset += compute_struct_field_offset(current_walk_ty, idx_val; dl=state.data_layout)
+                        current_walk_ty = LLVM.elements(current_walk_ty)[idx_val+1]
                     elseif current_walk_ty isa LLVM.ArrayType
                         elem_ty = LLVM.eltype(current_walk_ty)
                         total_byte_offset += idx_val * Int64(_compute_type_size(elem_ty))
@@ -3580,6 +3592,44 @@ function _emit_psb_byte_offset_with_user_type!(state::SPIRVEmitterState,
 
     state.value_map[inst] = result_id
     set_pointee_type!(state.type_ctx.ptm, inst, effective_pointee; priority=4)
+
+    # Track alignment for the result pointer. The byte offset might produce
+    # non-aligned addresses. Analyze the offset to determine worst-case alignment.
+    byte_offset_llvm = ops[2]
+    if byte_offset_llvm isa LLVM.ConstantInt
+        offset = convert(Int64, byte_offset_llvm)
+        if offset != 0
+            offset_align = UInt32(1 << trailing_zeros(abs(offset)))
+            if offset_align < 4
+                state.psb_ptr_alignment[inst] = offset_align
+            end
+        end
+    else
+        # Non-constant offset — check if the computation preserves alignment.
+        # If the offset is a mul by a non-4-aligned stride, record worst-case.
+        stride_align = _infer_mul_stride_alignment(byte_offset_llvm)
+        if stride_align > 0 && stride_align < 4
+            state.psb_ptr_alignment[inst] = stride_align
+        end
+    end
+end
+
+"""Infer the alignment guarantee from a multiply instruction's constant operand."""
+function _infer_mul_stride_alignment(val::LLVM.Value)
+    val isa LLVM.Instruction || return UInt32(0)
+    opcode = LLVM.opcode(val)
+    opcode == LLVM.API.LLVMMul || return UInt32(0)
+    ops = LLVM.operands(val)
+    length(ops) >= 2 || return UInt32(0)
+    # Check if either operand is a constant — that's the stride
+    for op in ops
+        if op isa LLVM.ConstantInt
+            stride = abs(convert(Int64, op))
+            stride > 0 || continue
+            return UInt32(1 << trailing_zeros(stride))
+        end
+    end
+    return UInt32(0)
 end
 
 # _infer_type_from_gep_users is defined in types.jl
@@ -3709,7 +3759,7 @@ function _emit_function_ptr_word!(state::SPIRVEmitterState, llvm_val::LLVM.Value
             # Compute byte offset from this GEP's indices
             gep_ops = LLVM.operands(current)
             source_ty_gep = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(current))
-            byte_offset = _compute_gep_constant_byte_offset(source_ty_gep, gep_ops)
+            byte_offset = _compute_gep_constant_byte_offset(source_ty_gep, gep_ops; dl=state.data_layout)
             total_byte_offset += byte_offset
             current = gep_ops[1]  # walk up to base pointer
         elseif current isa LLVM.BitCastInst
@@ -3753,7 +3803,7 @@ end
 Compute the constant byte offset of a GEP from its source type and operands.
 Used by `_emit_function_ptr_word!` to resolve alloca offsets through GEP chains.
 """
-function _compute_gep_constant_byte_offset(source_ty::LLVM.LLVMType, ops)
+function _compute_gep_constant_byte_offset(source_ty::LLVM.LLVMType, ops; dl::Union{Nothing, LLVM.DataLayout}=nothing)
     total = 0
     # First index (ops[2]) is the base element offset: offset = idx * sizeof(source_ty)
     first_idx = ops[2]
@@ -3770,11 +3820,8 @@ function _compute_gep_constant_byte_offset(source_ty::LLVM.LLVMType, ops)
         idx_op = ops[i]
         idx_val = idx_op isa LLVM.ConstantInt ? convert(Int64, idx_op) : 0
         if current_ty isa LLVM.StructType
-            elems = LLVM.elements(current_ty)
-            for j in 0:(idx_val - 1)
-                total += _compute_type_size(elems[j + 1])
-            end
-            current_ty = elems[idx_val + 1]
+            total += compute_struct_field_offset(current_ty, idx_val; dl)
+            current_ty = LLVM.elements(current_ty)[idx_val + 1]
         elseif current_ty isa LLVM.ArrayType
             elem_ty = LLVM.eltype(current_ty)
             total += idx_val * _compute_type_size(elem_ty)
@@ -4026,6 +4073,28 @@ function _emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     end
 end
 
+"""Compute byte offset to field `field_idx` (0-based) in a struct, including alignment padding.
+Uses LLVM's DataLayout when available for guaranteed correctness."""
+function compute_struct_field_offset(struct_ty::LLVM.StructType, field_idx::Int;
+                                      dl::Union{Nothing, LLVM.DataLayout}=nothing)
+    if dl !== nothing
+        return Int64(API.LLVMOffsetOfElement(dl, struct_ty, UInt32(field_idx)))
+    end
+    # Fallback: manual computation matching LLVM's default layout rules
+    offset = UInt32(0)
+    for j in 0:(field_idx - 1)
+        elem = LLVM.elements(struct_ty)[j + 1]
+        elem_align = UInt32(_compute_type_alignment(elem))
+        offset = (offset + elem_align - 1) & ~(elem_align - 1)
+        offset += _compute_type_size(elem)
+    end
+    if field_idx > 0
+        target_align = UInt32(_compute_type_alignment(LLVM.elements(struct_ty)[field_idx + 1]))
+        offset = (offset + target_align - 1) & ~(target_align - 1)
+    end
+    return Int64(offset)
+end
+
 """
 Ensure a pointer type used with OpPtrAccessChain has an ArrayStride decoration.
 Required by SPIR-V validation for OpPtrAccessChain.
@@ -4170,7 +4239,16 @@ function _decompose_flat_index_for_composite!(state::SPIRVEmitterState,
     return indices
 end
 
+# Module-level DataLayout ref, set during compilation for accurate type size computation.
+# Using a Ref instead of passing DataLayout through every call site.
+const _active_data_layout = Ref{Any}(nothing)
+
 function _compute_type_size(ty::LLVM.LLVMType)
+    # Use LLVM's DataLayout for struct/array types when available
+    dl = _active_data_layout[]
+    if dl !== nothing && (ty isa LLVM.StructType || ty isa LLVM.ArrayType)
+        return UInt32(API.LLVMABISizeOfType(dl, ty))
+    end
     if ty isa LLVM.LLVMFloat
         return UInt32(4)
     elseif ty isa LLVM.LLVMDouble
@@ -4180,25 +4258,23 @@ function _compute_type_size(ty::LLVM.LLVMType)
     elseif ty isa LLVM.IntegerType
         return UInt32(max(1, LLVM.width(ty) ÷ 8))
     elseif ty isa LLVM.StructType
-        # Compute struct size with alignment padding (matching LLVM's DataLayout).
+        # Fallback: manual computation matching LLVM's default layout rules
         total = UInt32(0)
         struct_align = UInt32(1)
         for elem in LLVM.elements(ty)
             elem_align = UInt32(_compute_type_alignment(elem))
             struct_align = max(struct_align, elem_align)
-            # Align the offset
             total = (total + elem_align - 1) & ~(elem_align - 1)
             total += _compute_type_size(elem)
         end
-        # Pad to struct alignment
         total = (total + struct_align - 1) & ~(struct_align - 1)
         return total
     elseif ty isa LLVM.ArrayType
         return UInt32(length(ty)) * _compute_type_size(eltype(ty))
     elseif ty isa LLVM.PointerType
-        return UInt32(8)  # 64-bit pointers
+        return UInt32(8)
     else
-        return UInt32(4)  # Default
+        return UInt32(4)
     end
 end
 

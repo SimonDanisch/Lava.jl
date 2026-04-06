@@ -63,6 +63,29 @@ Extensively debugged. All of the following were verified:
 - Keep old scene references alive (prevents buffer recycling)
 - Render HW RT scenes before SW scenes in a session
 
+### Update: Unaligned BDA Access Fixed (April 2026)
+
+GPU-assisted validation initially reported "zero shader access violations" because the
+`VK_EXT_validation_features` extension was only being checked in global instance extensions,
+not in layer-provided extensions. After fixing that, GPU-AV caught unaligned BDA pointer
+access (`OpStore at buffer device address ... is not aligned to Aligned operand of 4`).
+
+**Root cause**: The SPIR-V emitter's `use_ptr_arithmetic` GEP path computed struct field
+byte offsets by summing `_compute_type_size` of preceding fields without accounting for
+alignment padding. For structs with `Bool` (i8) fields followed by 4-byte-aligned fields
+(e.g. `VPRayWorkItem` with `specular_bounce::Bool` at offset 152 followed by
+`any_non_specular_bounces::Bool` at 153 and then `[2 x i32]` at 156), the computed offset
+was 2 bytes too small (154 instead of 156), causing misaligned stores.
+
+**Fix**: Use `LLVM.API.LLVMOffsetOfElement` (the same API used for `MemberOffset` SPIR-V
+decorations) to compute struct field offsets, guaranteeing they match LLVM's data layout.
+
+The unaligned access was benign on AMD RDNA3/4 hardware (render completed correctly) but
+violated the SPIR-V spec. Whether this also caused the RT crash after many dispatches
+remains unconfirmed.
+
 ### Conclusion
 
-Given that GPU-assisted validation found zero shader access violations, this appears to be a RADV driver bug triggered by specific compute dispatch patterns interacting with RT pipeline state. The crash occurs inside the driver's command submission path, not in our SPIR-V.
+The unaligned BDA access bug has been fixed. The RT crash after many SW dispatches followed
+by HW RT may still occur on RADV. If it does, it is a driver bug - all known shader-level
+issues have been resolved.

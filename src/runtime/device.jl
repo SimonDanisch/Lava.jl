@@ -218,14 +218,17 @@ function init_vulkan!()
         application_name="Lava.jl",
         engine_name="Lava"
     )
-    # Try with validation layers, fall back without
+    # Validation layers: opt-in via LAVA_VALIDATION=1 (default: off)
+    want_validation = get(ENV, "LAVA_VALIDATION", "0") != "0"
     layers = String[]
-    available_layers = unwrap(Vulkan.enumerate_instance_layer_properties())
-    for l in available_layers
-        name = String(filter(!=('\0'), collect(l.layer_name)))
-        if name == "VK_LAYER_KHRONOS_validation"
-            push!(layers, "VK_LAYER_KHRONOS_validation")
-            break
+    if want_validation
+        available_layers = unwrap(Vulkan.enumerate_instance_layer_properties())
+        for l in available_layers
+            name = String(filter(!=('\0'), collect(l.layer_name)))
+            if name == "VK_LAYER_KHRONOS_validation"
+                push!(layers, "VK_LAYER_KHRONOS_validation")
+                break
+            end
         end
     end
 
@@ -261,10 +264,10 @@ function init_vulkan!()
         push!(inst_extensions, "VK_EXT_metal_surface")
     end
 
-    # Enable GPU-assisted validation when validation layers are available.
-    # This instruments shaders to detect out-of-bounds buffer access at runtime.
+    # GPU-assisted validation: opt-in via LAVA_GPU_AV=1 (instruments shaders, very slow)
     gpu_assisted = false
-    if has_validation && "VK_EXT_validation_features" in ext_names
+    want_gpu_av = get(ENV, "LAVA_GPU_AV", "0") != "0"
+    if want_gpu_av && has_validation && "VK_EXT_validation_features" in ext_names
         push!(inst_extensions, "VK_EXT_validation_features")
         validation_features = Vulkan.ValidationFeaturesEXT(
             [Vulkan.VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT,
@@ -284,7 +287,7 @@ function init_vulkan!()
             inst_extensions;
             application_info=app_info
         )
-        if has_validation
+        if has_validation && want_gpu_av
             @warn "Vulkan validation layers active but VK_EXT_validation_features not available. GPU-assisted validation disabled."
         end
     end
@@ -486,7 +489,7 @@ function init_vulkan!()
     else
         @info "Lava: initialized Vulkan device (no RT)" device=dev_name queue_family=qf_idx validation=has_validation gpu_assisted=gpu_assisted debug_utils=has_debug_utils
     end
-    if !has_validation
+    if !has_validation && want_validation
         @warn "Vulkan validation layers not found. Install vulkan-validationlayers for GPU error diagnostics."
     end
 
