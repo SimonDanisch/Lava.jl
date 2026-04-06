@@ -163,7 +163,7 @@ Get or create the global Vulkan context. Lazily initializes on first call.
 function vk_context()
     ctx = _vk_context[]
     if ctx === nothing
-        ctx = _init_vulkan!()
+        ctx = init_vulkan!()
         _vk_context[] = ctx
     end
     return ctx
@@ -205,13 +205,13 @@ function vk_reset_device!()
     return nothing
 end
 
-"""Check if a recording is active (any batch is recording)."""
+"""Check if a recording is active on the default batch queue."""
 function has_active_recording(ctx::VkContext)
-    batch = ctx.active_batch
+    batch = ctx.default_bq.active_batch
     return batch !== nothing && batch.recording
 end
 
-function _init_vulkan!()
+function init_vulkan!()
     # Create instance
     app_info = Vulkan.ApplicationInfo(
         v"0.1.0", v"0.1.0", v"1.3.0";
@@ -229,14 +229,18 @@ function _init_vulkan!()
         end
     end
 
-    # Instance extensions for surface/window support
-    inst_extensions = String[
-        "VK_KHR_surface",
-    ]
-    # Debug utils for validation message capture (works even without validation layers
-    # for driver-level error reporting)
+    # Collect all available instance extensions (driver + layer-provided)
+    inst_extensions = String["VK_KHR_surface"]
     available_ext = unwrap(Vulkan.enumerate_instance_extension_properties())
     ext_names = Set(String(filter(!=('\0'), collect(e.extension_name))) for e in available_ext)
+    # Also collect extensions provided by the validation layer
+    has_validation = !isempty(layers)
+    if has_validation
+        layer_ext = unwrap(Vulkan.enumerate_instance_extension_properties(; layer_name="VK_LAYER_KHRONOS_validation"))
+        for e in layer_ext
+            push!(ext_names, String(filter(!=('\0'), collect(e.extension_name))))
+        end
+    end
     has_debug_utils = "VK_EXT_debug_utils" in ext_names
     if has_debug_utils
         push!(inst_extensions, "VK_EXT_debug_utils")
@@ -257,16 +261,38 @@ function _init_vulkan!()
         push!(inst_extensions, "VK_EXT_metal_surface")
     end
 
-    instance = Vulkan.Instance(
-        layers,
-        inst_extensions;
-        application_info=app_info
-    )
+    # Enable GPU-assisted validation when validation layers are available.
+    # This instruments shaders to detect out-of-bounds buffer access at runtime.
+    gpu_assisted = false
+    if has_validation && "VK_EXT_validation_features" in ext_names
+        push!(inst_extensions, "VK_EXT_validation_features")
+        validation_features = Vulkan.ValidationFeaturesEXT(
+            [Vulkan.VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT,
+             Vulkan.VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_RESERVE_BINDING_SLOT_EXT],
+            []
+        )
+        instance = Vulkan.Instance(
+            layers,
+            inst_extensions;
+            application_info=app_info,
+            next=validation_features
+        )
+        gpu_assisted = true
+    else
+        instance = Vulkan.Instance(
+            layers,
+            inst_extensions;
+            application_info=app_info
+        )
+        if has_validation
+            @warn "Vulkan validation layers active but VK_EXT_validation_features not available. GPU-assisted validation disabled."
+        end
+    end
 
     # Set up debug messenger to capture validation/driver error messages
     debug_messenger = nothing
     if has_debug_utils
-        debug_messenger = _setup_debug_messenger(instance)
+        debug_messenger = setup_debug_messenger(instance)
     end
 
     # Pick physical device (prefer discrete GPU)
@@ -276,12 +302,12 @@ function _init_vulkan!()
         "No Vulkan-capable GPU found",
         "Ensure Vulkan drivers are installed"))
 
-    phys_dev = _pick_physical_device(phys_devs)
+    phys_dev = pick_physical_device(phys_devs)
     props = Vulkan.get_physical_device_properties(phys_dev)
     dev_name = String(filter(!=('\0'), collect(props.device_name)))
 
     # Find queue family (prefer graphics+compute for graphics pipeline support)
-    qf_idx = _find_graphics_compute_queue_family(phys_dev)
+    qf_idx = find_graphics_compute_queue_family(phys_dev)
 
     # Create logical device with required features
     # Request up to 4 queues: primary, async compute, + 2 for per-screen graphics
@@ -292,10 +318,10 @@ function _init_vulkan!()
     queue_ci = [Vulkan.DeviceQueueCreateInfo(qf_idx, queue_priorities)]
 
     # Check for RT extension support
-    has_rt = _has_rt_extensions(phys_dev)
+    has_rt = has_rt_extensions(phys_dev)
 
     # Check for workgroup memory explicit layout (needed for mixed-type shared memory structs)
-    has_wg_explicit = _has_extension(phys_dev, "VK_KHR_workgroup_memory_explicit_layout")
+    has_wg_explicit = has_extension(phys_dev, "VK_KHR_workgroup_memory_explicit_layout")
 
     # Device extensions
     extensions = String[
@@ -456,13 +482,18 @@ function _init_vulkan!()
 
     has_validation = !isempty(layers)
     if has_rt
-        @info "Lava: initialized Vulkan device with RT" device=dev_name queue_family=qf_idx handle_size=rt_props.shader_group_handle_size max_recursion=rt_props.max_ray_recursion_depth validation=has_validation debug_utils=has_debug_utils
+        @info "Lava: initialized Vulkan device with RT" device=dev_name queue_family=qf_idx handle_size=rt_props.shader_group_handle_size max_recursion=rt_props.max_ray_recursion_depth validation=has_validation gpu_assisted=gpu_assisted debug_utils=has_debug_utils
     else
-        @info "Lava: initialized Vulkan device (no RT)" device=dev_name queue_family=qf_idx validation=has_validation debug_utils=has_debug_utils
+        @info "Lava: initialized Vulkan device (no RT)" device=dev_name queue_family=qf_idx validation=has_validation gpu_assisted=gpu_assisted debug_utils=has_debug_utils
     end
     if !has_validation
         @warn "Vulkan validation layers not found. Install vulkan-validationlayers for GPU error diagnostics."
     end
+
+    # Clear validation messages accumulated during device creation.
+    # GPU-assisted validation emits harmless "adjusting settings" warnings during
+    # vkCreateDevice that would otherwise block the first shader compilation.
+    clear_validation_messages!()
 
     # Initialize zero-alloc Vulkan function pointers for hot paths
     _cmd_pipeline_barrier_fptr[] = Vulkan.function_pointer(device, "vkCmdPipelineBarrier")
@@ -497,7 +528,7 @@ function allocate_batch_queue!()
     return BatchQueue(ctx.device, queue, ctx.queue_family_index)
 end
 
-function _pick_physical_device(devs)
+function pick_physical_device(devs)
     # Prefer discrete GPU
     for dev in devs
         props = Vulkan.get_physical_device_properties(dev)
@@ -509,7 +540,7 @@ function _pick_physical_device(devs)
     return first(devs)
 end
 
-function _find_graphics_compute_queue_family(phys_dev)
+function find_graphics_compute_queue_family(phys_dev)
     qf_props = Vulkan.get_physical_device_queue_family_properties(phys_dev)
     # Prefer graphics+compute (needed for graphics pipeline support)
     for (i, qfp) in enumerate(qf_props)
@@ -531,7 +562,7 @@ function _find_graphics_compute_queue_family(phys_dev)
 end
 
 """Check if the physical device supports the RT extensions we need."""
-function _has_extension(phys_dev, ext_name::String)
+function has_extension(phys_dev, ext_name::String)
     available = unwrap(Vulkan.enumerate_device_extension_properties(phys_dev))
     for ext in available
         name = String(filter(!=('\0'), collect(ext.extension_name)))
@@ -540,7 +571,7 @@ function _has_extension(phys_dev, ext_name::String)
     return false
 end
 
-function _has_rt_extensions(phys_dev)
+function has_rt_extensions(phys_dev)
     available = unwrap(Vulkan.enumerate_device_extension_properties(phys_dev))
     names = Set{String}()
     for ext in available
@@ -553,7 +584,7 @@ end
 
 # ── Validation layer debug messenger ──
 
-function _debug_callback(
+function debug_callback(
     severity,
     type,
     p_callback_data::Ptr{Vulkan.VkCore.VkDebugUtilsMessengerCallbackDataEXT},
@@ -583,9 +614,9 @@ function _debug_callback(
     return UInt32(0)
 end
 
-function _setup_debug_messenger(instance::Vulkan.Instance)
+function setup_debug_messenger(instance::Vulkan.Instance)
     callback_ptr = @cfunction(
-        _debug_callback,
+        debug_callback,
         UInt32,
         (Vulkan.DebugUtilsMessageSeverityFlagEXT,
          Vulkan.DebugUtilsMessageTypeFlagEXT,

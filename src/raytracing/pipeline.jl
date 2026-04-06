@@ -55,11 +55,11 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
         "Ensure VK_KHR_ray_tracing_pipeline is available"))
 
     # Create shader modules
-    raygen_mod = _create_shader_module(dev, raygen_spirv)
+    raygen_mod = create_shader_module(dev, raygen_spirv)
     check_validation_errors!("vkCreateShaderModule (raygen)")
-    miss_mod = _create_shader_module(dev, miss_spirv)
+    miss_mod = create_shader_module(dev, miss_spirv)
     check_validation_errors!("vkCreateShaderModule (miss)")
-    chit_mod = _create_shader_module(dev, chit_spirv)
+    chit_mod = create_shader_module(dev, chit_spirv)
     check_validation_errors!("vkCreateShaderModule (closest-hit)")
     shader_modules = [raygen_mod, miss_mod, chit_mod]
 
@@ -76,7 +76,7 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
     ]
 
     if has_anyhit
-        anyhit_mod = _create_shader_module(dev, anyhit_spirv)
+        anyhit_mod = create_shader_module(dev, anyhit_spirv)
         check_validation_errors!("vkCreateShaderModule (any-hit)")
         push!(stages, Vulkan.PipelineShaderStageCreateInfo(
             Vulkan.SHADER_STAGE_ANY_HIT_BIT_KHR, anyhit_mod, "main"))
@@ -155,7 +155,7 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
 
     # Build SBT (still 3 groups — any-hit is part of the hit group, not a separate group)
     sbt_buf, raygen_region, miss_region, hit_region, callable_region =
-        _build_sbt(dev, pipeline, rt_props, 3)
+        build_sbt(dev, pipeline, rt_props, 3)
 
     return LavaRTPipeline(
         pipeline, layout, ds_layout,
@@ -226,19 +226,19 @@ function rt_dispatch!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::LavaTLAS,
         extra_dst_access=Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
         is_rt=true,
         info="rt_trace w=$width h=$height"
-    ) do cmd
+    ) do batch
+        cmd = batch.cmd_buf
         desc_set = get_rt_descriptor_set(pipeline, tlas)
         Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline.pipeline)
+        push!(batch.data_refs, pipeline)
         Vulkan.cmd_bind_descriptor_sets(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR,
             pipeline.pipeline_layout, UInt32(0), [desc_set], UInt32[])
+        push!(batch.data_refs, tlas)
         push_constants_bda!(cmd, pipeline.pipeline_layout, pipeline.stage_flags, push_bda)
         Vulkan.cmd_trace_rays_khr(cmd,
             pipeline.raygen_region, pipeline.miss_region,
             pipeline.hit_region, pipeline.callable_region,
             UInt32(width), UInt32(height), UInt32(depth))
-    end
-    if bq.active_batch !== nothing
-        push!(bq.active_batch.data_refs, pipeline)
     end
 end
 
@@ -258,11 +258,14 @@ function rt_dispatch_indirect!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::L
         extra_dst_access=Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT,
         is_rt=true,
         info="rt_indirect"
-    ) do cmd
+    ) do batch
+        cmd = batch.cmd_buf
         desc_set = get_rt_descriptor_set(pipeline, tlas)
         Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline.pipeline)
+        push!(batch.data_refs, pipeline)
         Vulkan.cmd_bind_descriptor_sets(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR,
             pipeline.pipeline_layout, UInt32(0), [desc_set], UInt32[])
+        push!(batch.data_refs, tlas)
         push_constants_bda!(cmd, pipeline.pipeline_layout, pipeline.stage_flags, push_bda)
 
         indirect_address = indirect_buf isa VkIndirectBuffer ? indirect_buf.address : indirect_buf.address
@@ -270,22 +273,20 @@ function rt_dispatch_indirect!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::L
             pipeline.raygen_region, pipeline.miss_region,
             pipeline.hit_region, pipeline.callable_region,
             UInt64(indirect_address + indirect_offset))
-    end
-    if bq.active_batch !== nothing
-        push!(bq.active_batch.data_refs, pipeline)
+        push!(batch.data_refs, indirect_buf)
     end
 end
 
 # ── Internal helpers ──
 
-function _create_shader_module(dev, spirv_bytes::Vector{UInt8})
+function create_shader_module(dev, spirv_bytes::Vector{UInt8})
     @assert length(spirv_bytes) % 4 == 0 "SPIR-V must be 4-byte aligned"
     code_u32 = reinterpret(UInt32, spirv_bytes)
     return Vulkan.ShaderModule(dev, length(spirv_bytes), code_u32)
 end
 
 """Build the shader binding table for a 3-group RT pipeline (raygen, miss, chit)."""
-function _build_sbt(dev, pipeline::Vulkan.Pipeline, rt_props::RTPipelineProperties,
+function build_sbt(dev, pipeline::Vulkan.Pipeline, rt_props::RTPipelineProperties,
                     n_groups::Int)
     handle_size = rt_props.shader_group_handle_size
     base_align = rt_props.shader_group_base_alignment

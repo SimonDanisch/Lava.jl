@@ -30,9 +30,9 @@ end
 Create an offscreen framebuffer with color and optional depth attachments.
 """
 function LavaFramebuffer(width::Integer, height::Integer;
+                          ctx::VkContext=vk_context(),
                           depth::Bool=true,
                           color_format::Vulkan.Format=Vulkan.FORMAT_B8G8R8A8_SRGB)
-    ctx = vk_context()
     dev = ctx.device
     phys = ctx.physical_device
 
@@ -148,8 +148,7 @@ Returns a width x height matrix with element type matching the framebuffer forma
 - `FORMAT_R32G32B32A32_SFLOAT`: `NTuple{4, Float32}` (RGBA float)
 - `FORMAT_R16G16B16A16_SFLOAT`: `NTuple{4, Float16}` (RGBA half)
 """
-function readback_framebuffer(fb::LavaFramebuffer)
-    ctx = vk_context()
+function readback_framebuffer(fb::LavaFramebuffer; ctx::VkContext=vk_context())
     dev = ctx.device
 
     if has_active_recording(ctx)
@@ -201,8 +200,7 @@ Read back the current swapchain image to CPU memory.
 Must be called after rendering but BEFORE present_frame!.
 Returns a width x height matrix of BGRA byte tuples.
 """
-function readback_window(win::RenderWindow)
-    ctx = vk_context()
+function readback_window(win::RenderWindow; ctx::VkContext=vk_context())
     dev = ctx.device
 
     if has_active_recording(ctx)

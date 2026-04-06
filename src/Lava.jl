@@ -39,7 +39,7 @@ export tess_coord, tess_coord_uvw, set_tess_level_outer!, set_tess_level_inner!
 export sample_texture_2d, GfxTexture2D
 
 # Ray tracing exports
-export HardwareAccel, RTRay, RTHitResult
+export HardwareAccel, RTRay, RTHitResult, ASBuildContext, as_build
 export trace_closest_hits!, trace_closest_hits_indirect!, RayTracingPipeline, trace_rays!, trace_rays_indirect!
 export set_anyhit_pipeline!, trace_closest_hits_anyhit!, trace_closest_hits_anyhit_indirect!
 export lava_rt_ignore_intersection, lava_rt_terminate_ray
@@ -188,7 +188,7 @@ function __init__()
     last_dispatch_info[] = ""
     prev_dispatch_info[] = ""
     empty!(dispatch_log)
-    _init_pipeline_thread!()
+    init_pipeline_thread!()
 
     # Mark device as lost during shutdown so GC finalizers don't call into
     # the Vulkan driver after it's been torn down. The atexit hook runs

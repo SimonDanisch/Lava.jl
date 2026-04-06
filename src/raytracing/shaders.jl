@@ -56,7 +56,7 @@ function RayTracingPipeline(; raygen, closest_hit, miss, any_hit=nothing, payloa
 end
 
 """Invalidate RT pipeline cache if the Vulkan device was reset since last use."""
-function _invalidate_stale_rt_cache!(pipeline::RayTracingPipeline)
+function invalidate_stale_rt_cache!(pipeline::RayTracingPipeline)
     if pipeline._cache_device_gen != _device_generation[]
         empty!(pipeline._pipeline_cache)
         pipeline._compiled = nothing
@@ -81,30 +81,30 @@ function trace_rays!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args...;
     cache_key = hash((tt,))
 
     # Invalidate cache if device was reset (pipelines reference old VkDevice)
-    _invalidate_stale_rt_cache!(pipeline)
+    invalidate_stale_rt_cache!(pipeline)
 
     # Get or compile pipeline for this argument signature
     cached = get(pipeline._pipeline_cache, cache_key, nothing)
     if cached === nothing
-        cached = _compile_rt_pipeline(pipeline, tt)
+        cached = compile_rt_pipeline(pipeline, tt)
         pipeline._pipeline_cache[cache_key] = cached
     end
     vk_pipeline, raygen_compiled, offsets, byval_sizes = cached
 
     # Pack args directly to mapped memory (unified path with compute)
     all_args = (pipeline.raygen_func, args...)
-    inline_extra = _compute_inline_extra_from_byval(byval_sizes)
+    inline_extra = compute_inline_extra_from_byval(byval_sizes)
     total_size = raygen_compiled.push_info.arg_buffer_size + inline_extra
 
     arg_buf = get_arg_buffer(total_size)
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        raygen_compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
-    # Keep data buffer references alive until vk_flush!()
-    keep_data_alive!(args)
+    # Keep data buffer references alive until flush
+    bq = vk_context().default_bq
+    batch = ensure_active_batch!(bq)
+    push!(batch.data_refs, args)
 
-    # Dispatch (push constant = BDA of arg buffer, passed as UInt64, zero-alloc)
-    bq = something(current_batch_queue(), vk_context().default_bq)
     rt_dispatch!(bq, vk_pipeline, tlas, arg_buf.address, width, height; depth=depth)
 end
 
@@ -122,47 +122,48 @@ function trace_rays_indirect!(pipeline::RayTracingPipeline, tlas::LavaTLAS, args
     cache_key = hash((tt,))
 
     # Invalidate cache if device was reset (pipelines reference old VkDevice)
-    _invalidate_stale_rt_cache!(pipeline)
+    invalidate_stale_rt_cache!(pipeline)
 
     # Get or compile pipeline for this argument signature
     cached = get(pipeline._pipeline_cache, cache_key, nothing)
     if cached === nothing
-        cached = _compile_rt_pipeline(pipeline, tt)
+        cached = compile_rt_pipeline(pipeline, tt)
         pipeline._pipeline_cache[cache_key] = cached
     end
     vk_pipeline, raygen_compiled, offsets, byval_sizes = cached
 
     # Prepare the indirect buffer FIRST, before allocating the RT arg buffer.
-    # _prepare_indirect_rt_dispatch! → lava_launch! may trigger auto-flush which
+    # prepare_indirect_rt_dispatch! → lava_launch! may trigger auto-flush which
     # resets slab pools. If we allocated the RT arg buffer first, the flush would
     # invalidate it (DEVICE_LOST from stale BDA).
-    bq = something(current_batch_queue(), vk_context().default_bq)
+    bq = vk_context().default_bq
 
-    indirect_buf = _get_indirect_buffer()
-    _prepare_indirect_rt_dispatch!(bq, indirect_buf, n_rays)
+    indirect_buf = get_indirect_buffer()
+    prepare_indirect_rt_dispatch!(bq, indirect_buf, n_rays)
 
     # Now allocate and pack RT args (safe — any auto-flush already happened)
     all_args = (pipeline.raygen_func, args...)
-    inline_extra = _compute_inline_extra_from_byval(byval_sizes)
+    inline_extra = compute_inline_extra_from_byval(byval_sizes)
     total_size = raygen_compiled.push_info.arg_buffer_size + inline_extra
 
     arg_buf = get_arg_buffer(total_size)
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        raygen_compiled.push_info.arg_buffer_size, byval_sizes, all_args)
-    keep_data_alive!(args)
+    batch = ensure_active_batch!(bq)
+    push!(batch.data_refs, args)
     push_bda = arg_buf.address
 
     rt_dispatch_indirect!(bq, vk_pipeline, tlas, push_bda, indirect_buf)
 end
 
 """Prepare indirect RT dispatch buffer: writes (n_rays, 1, 1) from a GPU-resident count."""
-function _prepare_indirect_rt_dispatch!(bq::BatchQueue, indirect_buf::VkIndirectBuffer, n_rays_buf::LavaArray{Int32})
-    lava_launch!(bq, _prepare_indirect_rt_kernel,
+function prepare_indirect_rt_dispatch!(bq::BatchQueue, indirect_buf::VkIndirectBuffer, n_rays_buf::LavaArray{Int32})
+    lava_launch!(bq, prepare_indirect_rt_kernel,
                  Ptr{UInt32}(indirect_buf.address), n_rays_buf;
                  ndrange=1, workgroup_size=(1, 1, 1))
 end
 
-function _prepare_indirect_rt_kernel(indirect::Ptr{UInt32}, n_rays_buf::Ptr{Int32})
+function prepare_indirect_rt_kernel(indirect::Ptr{UInt32}, n_rays_buf::Ptr{Int32})
     n = UInt32(unsafe_load(n_rays_buf, 1))
     unsafe_store!(indirect, n, 1)          # width = n_rays
     unsafe_store!(indirect, UInt32(1), 2)  # height = 1
@@ -172,7 +173,7 @@ end
 
 # ── Internal: Compile RT pipeline ──
 
-function _compile_rt_pipeline(pipeline::RayTracingPipeline, raygen_tt)
+function compile_rt_pipeline(pipeline::RayTracingPipeline, raygen_tt)
     pt = pipeline.payload_type
 
     # Compile raygen

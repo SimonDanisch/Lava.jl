@@ -162,7 +162,7 @@ function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
     tt = Tuple{map(_arg_llvm_type, args)...}
 
     # Compile + pipeline (cached, single lookup — avoids re-hashing SPIR-V)
-    compiled, pipeline, offsets, byval_sizes = _get_compiled_kernel_and_pipeline(f, tt, workgroup_size)
+    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(f, tt, workgroup_size)
 
     # Include f as first arg — GPUCompiler includes typeof(f) as the first LLVM parameter,
     # and wrap_entry_for_vulkan! creates a BDA slot for it (unless ghost-elided).
@@ -171,7 +171,7 @@ function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
     # Compute total size: base layout + inline struct data
     # Uses LLVM byval sizes (not Julia sizeof) to avoid size mismatch for types
     # with zero-sized fields (e.g. Nothing) that LLVM represents differently.
-    inline_extra = _compute_inline_extra_from_byval(byval_sizes)
+    inline_extra = compute_inline_extra_from_byval(byval_sizes)
     total_size = compiled.push_info.arg_buffer_size + inline_extra
 
     # Get host-visible mapped arg buffer
@@ -183,7 +183,8 @@ function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
 
     # Keep data buffer references alive until vk_flush!() — BDA addresses in the
     # arg buffer are raw pointers with no GC reference to the backing VkManagedBuffer.
-    keep_data_alive!(args)
+    batch = ensure_active_batch!(bq)
+    push!(batch.data_refs, args)
 
     # Dispatch (batched — call vk_flush!() to submit)
     # Push constant = BDA of arg buffer (passed as UInt64, zero-alloc)
@@ -267,13 +268,13 @@ _is_bda_buffer(::Type{VkManagedBuffer}) = true
 _is_bda_buffer(::Type) = false
 
 """
-    _compute_inline_extra_from_byval(byval_sizes::Vector{Int})
+    compute_inline_extra_from_byval(byval_sizes::Vector{Int})
 
 Compute the total bytes needed for inline struct data appended after the base
 arg layout. Uses LLVM byval sizes (which can be larger than Julia's sizeof for
 types with zero-sized fields like Nothing).
 """
-function _compute_inline_extra_from_byval(byval_sizes::Vector{Int})
+function compute_inline_extra_from_byval(byval_sizes::Vector{Int})
     extra = 0
     for sz in byval_sizes
         sz > 0 || continue
@@ -291,7 +292,7 @@ after the base arg layout. Returns a constant. Buffer types (LavaBuffer, LavaArr
 VkManagedBuffer) are passed as UInt64 BDA addresses, not inlined.
 
 NOTE: This uses Julia's sizeof which can underestimate for types with zero-sized
-fields. Prefer _compute_inline_extra_from_byval with LLVM sizes when available.
+fields. Prefer compute_inline_extra_from_byval with LLVM sizes when available.
 """
 @generated function _compute_inline_extra(::Type{T}) where T <: Tuple
     types = T.parameters
@@ -387,9 +388,9 @@ _arg_llvm_type(::LavaArray{T}) where T = Ptr{T}
 _arg_llvm_type(x::T) where T = T  # Scalars pass through
 
 # Convert arguments to BDA-compatible values for pack_kernel_args
-_arg_to_bda(buf::LavaBuffer) = buf.buf.address
-_arg_to_bda(a::LavaArray) = bda_address(a)
-function _arg_to_bda(x)
+arg_to_bda(buf::LavaBuffer) = buf.buf.address
+arg_to_bda(a::LavaArray) = bda_address(a)
+function arg_to_bda(x)
     # Julia passes isbits structs by pointer at the LLVM level.
     # Inline struct bytes into the arg buffer to avoid double BDA indirection.
     T = typeof(x)
@@ -406,22 +407,22 @@ end
 _is_ghost(@nospecialize(T::Type)) = sizeof(T) == 0
 
 """
-    _args_to_bda_filtered(args) -> Tuple
+    args_to_bda_filtered(args) -> Tuple
 
 Convert arguments to BDA-compatible values, filtering ghost types (zero-sized singletons)
 that GPUCompiler elides from LLVM IR.
 """
-function _args_to_bda_filtered(args::Tuple)
+function args_to_bda_filtered(args::Tuple)
     result = Any[]
     for x in args
         T = typeof(x)
         _is_ghost(T) && continue
-        push!(result, _arg_to_bda(x))
+        push!(result, arg_to_bda(x))
     end
     return tuple(result...)
 end
 
-function _get_compiled_kernel(@nospecialize(f), @nospecialize(tt), workgroup_size)
+function get_compiled_kernel(@nospecialize(f), @nospecialize(tt), workgroup_size)
     key = hash((f, tt, workgroup_size))
     cached = get(_kernel_cache, key, nothing)
     if cached !== nothing
@@ -435,7 +436,7 @@ end
 const _spirv_dump_dir = Ref("")
 const _spirv_dump_counter = Ref(0)
 
-function _get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), workgroup_size)
+function get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), workgroup_size)
     key = hash((f, tt, workgroup_size))
 
     compiled = get(_kernel_cache, key, nothing)
@@ -444,7 +445,7 @@ function _get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), 
         _kernel_cache[key] = compiled
         # Track insertion order for cache eviction
         push!(_kernel_insertion_order, key)
-        _evict_kernel_cache_if_full!()
+        evict_kernel_cache_if_full!()
         # Dump SPIR-V if dump dir is set
         if !isempty(_spirv_dump_dir[])
             _spirv_dump_counter[] += 1
@@ -477,7 +478,7 @@ function _get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), 
 end
 
 """Evict oldest kernel cache entries when cache exceeds max size."""
-function _evict_kernel_cache_if_full!()
+function evict_kernel_cache_if_full!()
     max_size = _max_kernel_cache_size[]
     while length(_kernel_insertion_order) > max_size
         old_key = popfirst!(_kernel_insertion_order)
@@ -520,7 +521,7 @@ const _arg_alloc_count = Ref(0)  # Total allocations this batch (for stats)
 const _arg_buffers = VkMappedBuffer[]  # unused, kept for gpu_memory_usage()
 const _arg_buffer_idx = Ref(0)
 
-function _ensure_arg_slab!(min_size::Int)
+function ensure_arg_slab!(min_size::Int)
     while length(_arg_slabs) < _arg_slab_idx[]
         push!(_arg_slabs, vk_alloc_mapped(max(ARG_SLAB_SIZE, min_size)))
     end
@@ -538,7 +539,7 @@ end
 function get_arg_buffer(nbytes::Integer)
     aligned_size = (max(Int(nbytes), 16) + ARG_SLAB_ALIGN - 1) & ~(ARG_SLAB_ALIGN - 1)
 
-    _ensure_arg_slab!(aligned_size)
+    ensure_arg_slab!(aligned_size)
 
     slab = _arg_slabs[_arg_slab_idx[]]
     offset = _arg_slab_offset[]

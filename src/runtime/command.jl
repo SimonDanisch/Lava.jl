@@ -151,15 +151,14 @@ function current_batch_queue()
     return get(task.storage, TASK_BATCH_QUEUE_KEY, nothing)
 end
 
-# VkContext delegates to task-local override or default_bq
+# VkContext convenience: use default batch queue
 function ensure_active_batch!(ctx::VkContext)
-    bq = something(current_batch_queue(), ctx.default_bq)
-    return ensure_active_batch!(bq)
+    return ensure_active_batch!(ctx.default_bq)
 end
 
 """Allocate a new CommandBatch (new command buffer + fence from the pool)."""
 function allocate_batch(bq::BatchQueue)
-    cmd_buf = _alloc_cmd_buf(bq)
+    cmd_buf = alloc_cmd_buf(bq)
     fence = Vulkan.Fence(vk_context().device)
     data_refs = Any[]
     sizehint!(data_refs, 128)
@@ -167,7 +166,7 @@ function allocate_batch(bq::BatchQueue)
 end
 
 """Allocate a command buffer from the free pool, or create a new one."""
-function _alloc_cmd_buf(bq::BatchQueue)
+function alloc_cmd_buf(bq::BatchQueue)
     if !isempty(bq.free_cmd_bufs)
         return pop!(bq.free_cmd_bufs)
     end
@@ -199,7 +198,7 @@ end
 
 
 """
-    _maybe_split_cb!(batch, ctx)
+    maybe_split_cb!(batch, ctx)
 
 If the current CB segment has reached `cb_split_threshold` dispatches, seal it
 and start a fresh CB. The sealed CB is stored in `batch.sealed_cmd_bufs` and will
@@ -208,7 +207,7 @@ be submitted alongside the active CB in `vk_flush!`.
 Barriers work across CB boundaries per Vulkan spec — submission order defines
 the scope of pipeline barriers, not command buffer boundaries.
 """
-function _maybe_split_cb!(batch::CommandBatch, bq::BatchQueue)
+function maybe_split_cb!(batch::CommandBatch, bq::BatchQueue)
     threshold = cb_split_threshold[]
     threshold <= 0 && return
     batch.segment_dispatches < threshold && return
@@ -218,7 +217,7 @@ function _maybe_split_cb!(batch::CommandBatch, bq::BatchQueue)
     push!(batch.sealed_cmd_bufs, batch.cmd_buf)
 
     # Start fresh CB segment
-    batch.cmd_buf = _alloc_cmd_buf(bq)
+    batch.cmd_buf = alloc_cmd_buf(bq)
     unwrap(Vulkan.begin_command_buffer(batch.cmd_buf, Vulkan.CommandBufferBeginInfo(
         flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
     )))
@@ -234,18 +233,23 @@ end
 # Vulkan commands.
 
 """
-    record_dispatch!(f, ctx; dst_stage, extra_dst_access=0, is_rt=false, info="")
+    record_dispatch!(f, bq; dst_stage, extra_dst_access=0, is_rt=false, info="")
 
 Record a dispatch into the active command batch. Handles:
 1. Getting/creating the active batch
 2. Inserting a pipeline barrier if this isn't the first dispatch
-3. Calling `f(cmd)` with the command buffer
+3. Calling `f(batch)` with the CommandBatch (provides cmd_buf AND data_refs)
 4. Updating dispatch count, counter, and debug log
 
+The do-block receives the `CommandBatch`, not a raw command buffer. This lets
+dispatch functions push resources to `batch.data_refs` directly, ensuring all
+GPU-referenced objects stay alive until flush.
+
 Example:
-    record_dispatch!(ctx; dst_stage=PIPELINE_STAGE_COMPUTE_SHADER_BIT, info="my_kernel") do cmd
-        Vulkan.cmd_bind_pipeline(cmd, ...)
-        Vulkan.cmd_dispatch(cmd, ...)
+    record_dispatch!(bq; dst_stage=PIPELINE_STAGE_COMPUTE_SHADER_BIT) do batch
+        Vulkan.cmd_bind_pipeline(batch.cmd_buf, ...)
+        push!(batch.data_refs, pipeline)
+        Vulkan.cmd_dispatch(batch.cmd_buf, ...)
     end
 """
 @inline function record_dispatch!(f, bq::BatchQueue;
@@ -276,8 +280,9 @@ Example:
               UInt32(0), C_NULL)
     end
 
-    # Record the actual dispatch commands
-    f(cmd)
+    # Record the actual dispatch commands. The do-block receives the batch
+    # so it can push resources to data_refs alongside recording commands.
+    f(batch)
 
     # Bookkeeping
     batch.dispatch_count += 1
@@ -289,7 +294,7 @@ Example:
     end
 
     # Split to a new CB if this segment is full
-    _maybe_split_cb!(batch, bq)
+    maybe_split_cb!(batch, bq)
 end
 
 """
@@ -348,8 +353,10 @@ end
     record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         info=dispatch_info
-    ) do cmd
+    ) do batch
+        cmd = batch.cmd_buf
         Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline)
+        push!(batch.data_refs, pipeline)
         push_constants_bda!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_bda)
 
         if base_x == 0 && base_y == 0 && base_z == 0
@@ -359,9 +366,6 @@ end
                 UInt32(base_x), UInt32(base_y), UInt32(base_z),
                 UInt32(gx), UInt32(gy), UInt32(gz))
         end
-    end
-    if bq.active_batch !== nothing
-        push!(bq.active_batch.data_refs, pipeline)
     end
 end
 
@@ -382,16 +386,16 @@ VkDispatchIndirectCommand (3×UInt32), written by a previous GPU kernel.
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
         extra_dst_access=Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT,
         info=dispatch_info
-    ) do cmd
+    ) do batch
+        cmd = batch.cmd_buf
         Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline)
+        push!(batch.data_refs, pipeline)
         push_constants_bda!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_bda)
 
         vk_buf = indirect_buf isa Vulkan.Buffer ? indirect_buf : indirect_buf.buffer
         buf_offset = indirect_buf isa VkIndirectBuffer ? indirect_buf.buffer_offset : UInt64(0)
         Vulkan.cmd_dispatch_indirect(cmd, vk_buf, buf_offset + UInt64(indirect_offset))
-    end
-    if bq.active_batch !== nothing
-        push!(bq.active_batch.data_refs, pipeline)
+        push!(batch.data_refs, indirect_buf)
     end
 end
 
@@ -469,34 +473,31 @@ end
 """
     vk_flush!()
 
-Submit the active command batch and wait for GPU completion.
-Respects `with_batch_queue` — if called inside a `with_batch_queue(bq)` block,
-flushes `bq` instead of the default queue.
+Flush the default batch queue. Convenience wrapper for interactive use.
 """
 function vk_flush!()
     _device_lost[] && throw(LavaError("command flush", "Vulkan device lost",
         "Call Lava.vk_reset_device!() to reinitialize, or restart Julia session."))
     ctx = vk_context()
-    bq = something(current_batch_queue(), ctx.default_bq)
-    flush!(bq, ctx.device)
+    flush!(ctx.default_bq, ctx.device)
     return
 end
 
 # ── Piggybacked Download ──
 
 """
-    _append_copy_and_flush!(ctx, src_buffer, src_offset, dst_staging, nbytes)
+    append_copy_and_flush!(ctx, src_buffer, src_offset, dst_staging, nbytes)
 
 Append a GPU→staging buffer copy to the active command batch and flush.
-Saves one fence roundtrip compared to vk_flush!() + _one_shot_copy() by
+Saves one fence roundtrip compared to vk_flush!() + one_shot_copy() by
 combining all dispatch commands and the copy into a single submission.
 
-The caller must ensure `has_active_recording(ctx)` is true.
+The caller must ensure an active recording exists on the default batch queue.
 """
-function _append_copy_and_flush!(ctx::VkContext, src_buffer::Vulkan.Buffer,
+function append_copy_and_flush!(ctx::VkContext, src_buffer::Vulkan.Buffer,
                                   src_offset::Integer, dst_staging::Vulkan.Buffer,
                                   nbytes::Integer)
-    batch = ctx.active_batch
+    batch = ctx.default_bq.active_batch
     cmd = batch.cmd_buf
 
     # Barrier: shader writes → transfer read
@@ -526,22 +527,6 @@ function _append_copy_and_flush!(ctx::VkContext, src_buffer::Vulkan.Buffer,
     vk_flush!()
 end
 
-# ── Data Lifetime ──
-
-"""
-    keep_data_alive!(refs)
-
-Keep Julia objects alive until the next `vk_flush!()` completes.
-Prevents GC from freeing LavaArray backing buffers while the GPU is still
-reading from them via BDA addresses in the recorded command buffer.
-"""
-function keep_data_alive!(refs)
-    ctx = vk_context()
-    batch = ctx.active_batch
-    if batch !== nothing
-        push!(batch.data_refs, refs)
-    end
-end
 
 # ── Error Reporting ──
 

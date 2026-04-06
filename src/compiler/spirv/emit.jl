@@ -1036,8 +1036,17 @@ function _emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
         # addresses into two i32 loads with Aligned 4.
         llvm_align = UInt32(LLVM.alignment(inst))
         if _psb_needs_decomposition(state, ptr, actual_load; llvm_align)
-            load_id = _emit_psb_decomposed_load!(state, ptr_id, actual_load, spirv_load_ty)
-            # Decomposed load returns i64 integer. If original load was a pointer,
+            access_align = _get_alignment_for_type(actual_load)
+            if access_align <= 4
+                # Small type (i32/float/i16) at potentially non-4-aligned address:
+                # decompose into individual byte loads with Aligned 1
+                load_id = _emit_psb_decomposed_small_load!(state, ptr_id, actual_load, spirv_load_ty)
+            else
+                # Wide type (i64/double) at non-8-aligned address:
+                # decompose into two i32 loads with Aligned 4
+                load_id = _emit_psb_decomposed_load!(state, ptr_id, actual_load, spirv_load_ty)
+            end
+            # Decomposed load returns an integer. If original load was a pointer,
             # convert the integer to a typed PSB pointer.
             if actual_load isa LLVM.PointerType
                 int_id = load_id
@@ -1760,7 +1769,16 @@ function _emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
         # addresses into two i32 stores with Aligned 4.
         llvm_align = UInt32(LLVM.alignment(inst))
         if _psb_needs_decomposition(state, ptr, store_ty; llvm_align)
-            _emit_psb_decomposed_store!(state, ptr_id, val_id, store_ty)
+            access_align = _get_alignment_for_type(store_ty)
+            if access_align <= 4
+                # Small type (i32/float/i16) at potentially non-4-aligned address:
+                # decompose into individual byte stores with Aligned 1
+                _emit_psb_decomposed_small_store!(state, ptr_id, val_id, store_ty)
+            else
+                # Wide type (i64/double) at non-8-aligned address:
+                # decompose into two i32 stores with Aligned 4
+                _emit_psb_decomposed_store!(state, ptr_id, val_id, store_ty)
+            end
         else
             align = _get_alignment_for_type(store_ty)
             ptr_id = _fix_psb_ptr_type_for_store!(state, ptr, ptr_id, value)
@@ -2016,7 +2034,28 @@ into narrower ones (e.g., i64 → two i32).
 function _psb_needs_decomposition(state::SPIRVEmitterState, ptr::LLVM.Value, access_ty::LLVM.LLVMType;
                                    llvm_align::UInt32=UInt32(0))
     access_align = _get_alignment_for_type(access_ty)
-    access_align <= 4 && return false  # i32/float/i16/i8 never need decomposition
+
+    # Check LLVM alignment first — even small types (i32/float) can be misaligned
+    # when LLVM explicitly says so via align 1 on the load/store instruction.
+    # Julia's BDA pointer arithmetic through `gep i8, ptr, i64 %byte_offset` can
+    # produce non-4-aligned pointers (e.g. accessing struct fields within arrays of
+    # non-power-of-2-sized structs through SROA-flattened byte offsets).
+    if llvm_align > 0 && llvm_align < access_align
+        if ptr isa LLVM.GetElementPtrInst
+            gep_src_ty_ref = LLVM.API.LLVMGetGEPSourceElementType(ptr)
+            gep_src_ty = LLVM.LLVMType(gep_src_ty_ref)
+            gep_src_align = _get_alignment_for_type(gep_src_ty)
+            if gep_src_align < access_align
+                return true
+            end
+        elseif ptr isa LLVM.IntToPtrInst
+            # inttoptr from computed address — LLVM says alignment is insufficient,
+            # must decompose (common after SROA ptrtoint+add+inttoptr chains)
+            return true
+        end
+    end
+
+    access_align <= 4 && return false  # i32/float with proper alignment never need decomposition
 
     # Check 0 (universal): LLVM's own alignment on the load/store instruction.
     # LLVM SROA produces `load i64, ptr %gep, align 1` when the byte GEP offset may not
@@ -2289,6 +2328,139 @@ function _emit_psb_decomposed_load!(state::SPIRVEmitterState, ptr_id::UInt32,
     return combined
 end
 
+"""
+Emit a decomposed PSB store for a 4-byte value (i32/float) into 4 individual byte stores.
+Used when the PSB pointer might not be 4-byte aligned (LLVM `align 1` on byte-offset GEP).
+"""
+function _emit_psb_decomposed_small_store!(state::SPIRVEmitterState, ptr_id::UInt32, val_id::UInt32,
+                                            val_ty::LLVM.LLVMType)
+    u8_spirv = emit_type_int!(state.mod, UInt32(8), UInt32(0))
+    u32_spirv = emit_type_int!(state.mod, UInt32(32), UInt32(0))
+    u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+    u8_ptr_ty = map_pointer_type!(state.type_ctx, u8_spirv, SC.PhysicalStorageBuffer)
+
+    # Convert value to u32 if it's a float
+    raw_val = val_id
+    if val_ty isa LLVM.LLVMFloat
+        raw_val = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpBitcast, u32_spirv, raw_val, val_id)
+    elseif val_ty isa LLVM.LLVMHalf
+        # Half → u16 → u32 (zero-extend)
+        u16_spirv = emit_type_int!(state.mod, UInt32(16), UInt32(0))
+        half_as_u16 = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpBitcast, u16_spirv, half_as_u16, val_id)
+        raw_val = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpUConvert, u32_spirv, raw_val, half_as_u16)
+    end
+
+    base_u64 = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, ptr_id)
+
+    nbytes = _compute_type_size(val_ty)
+    for byte_idx in UInt32(0):UInt32(nbytes - 1)
+        # Extract byte: (val >> (byte_idx * 8)) & 0xFF
+        if byte_idx == 0
+            byte_val = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpUConvert, u8_spirv, byte_val, raw_val)
+        else
+            shift_amt = emit_constant_u32!(state.mod, UInt32(byte_idx * 8))
+            shifted = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpShiftRightLogical, u32_spirv, shifted, raw_val, shift_amt)
+            byte_val = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpUConvert, u8_spirv, byte_val, shifted)
+        end
+
+        # Compute address for this byte
+        if byte_idx == 0
+            byte_addr = base_u64
+        else
+            offset_const = emit_constant_u64!(state.mod, UInt64(byte_idx))
+            byte_addr = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpIAdd, u64_spirv, byte_addr, base_u64, offset_const)
+        end
+
+        byte_ptr = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, u8_ptr_ty, byte_ptr, byte_addr)
+
+        push!(state.mod.functions, (UInt32(5) << 16) | UInt32(Op.OpStore))
+        push!(state.mod.functions, byte_ptr)
+        push!(state.mod.functions, byte_val)
+        push!(state.mod.functions, UInt32(0x02))  # Aligned
+        push!(state.mod.functions, UInt32(1))
+    end
+end
+
+"""
+Emit a decomposed PSB load for a 4-byte value (i32/float) from 4 individual byte loads.
+Used when the PSB pointer might not be 4-byte aligned.
+Returns the SPIR-V result ID of the combined value.
+"""
+function _emit_psb_decomposed_small_load!(state::SPIRVEmitterState, ptr_id::UInt32,
+                                           load_ty::LLVM.LLVMType, result_spirv_ty::UInt32)
+    u8_spirv = emit_type_int!(state.mod, UInt32(8), UInt32(0))
+    u32_spirv = emit_type_int!(state.mod, UInt32(32), UInt32(0))
+    u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+    u8_ptr_ty = map_pointer_type!(state.type_ctx, u8_spirv, SC.PhysicalStorageBuffer)
+
+    base_u64 = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, ptr_id)
+
+    nbytes = _compute_type_size(load_ty)
+    combined = nothing
+
+    for byte_idx in UInt32(0):UInt32(nbytes - 1)
+        # Compute address for this byte
+        if byte_idx == 0
+            byte_addr = base_u64
+        else
+            offset_const = emit_constant_u64!(state.mod, UInt64(byte_idx))
+            byte_addr = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpIAdd, u64_spirv, byte_addr, base_u64, offset_const)
+        end
+
+        byte_ptr = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, u8_ptr_ty, byte_ptr, byte_addr)
+
+        byte_val = fresh_id!(state.mod)
+        push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
+        push!(state.mod.functions, u8_spirv)
+        push!(state.mod.functions, byte_val)
+        push!(state.mod.functions, byte_ptr)
+        push!(state.mod.functions, UInt32(0x02))  # Aligned
+        push!(state.mod.functions, UInt32(1))
+
+        # Zero-extend byte to u32 and shift into position
+        byte_u32 = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpUConvert, u32_spirv, byte_u32, byte_val)
+
+        if byte_idx == 0
+            combined = byte_u32
+        else
+            shift_amt = emit_constant_u32!(state.mod, UInt32(byte_idx * 8))
+            shifted = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpShiftLeftLogical, u32_spirv, shifted, byte_u32, shift_amt)
+            new_combined = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpBitwiseOr, u32_spirv, new_combined, combined, shifted)
+            combined = new_combined
+        end
+    end
+
+    # Convert u32 to the actual type (float, i16, etc.)
+    if load_ty isa LLVM.LLVMFloat
+        result_id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpBitcast, result_spirv_ty, result_id, combined)
+        return result_id
+    elseif load_ty isa LLVM.LLVMHalf
+        u16_spirv = emit_type_int!(state.mod, UInt32(16), UInt32(0))
+        truncated = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpUConvert, u16_spirv, truncated, combined)
+        result_id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpBitcast, result_spirv_ty, result_id, truncated)
+        return result_id
+    end
+    return combined
+end
+
 function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
     ops = LLVM.operands(inst)
     base_ptr = ops[1]
@@ -2308,11 +2480,11 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
     # the byte offset to an element index (byte_offset / sizeof(element)).
     if source_ty isa LLVM.IntegerType && LLVM.width(source_ty) == 8 && n_indices == 1
         base_pointee = get_pointee_type(state.type_ctx.ptm, base_ptr)
+        sc = _get_pointer_storage_class(base_ptr)
         if base_pointee !== nothing && !(base_pointee isa LLVM.IntegerType && LLVM.width(base_pointee) == 8)
             if base_pointee isa LLVM.PointerType
                 # Opaque pointer base (e.g. BDA inttoptr after SROA): infer actual access
                 # type from users and use PSB byte arithmetic.
-                sc = _get_pointer_storage_class(base_ptr)
                 if sc == SC.PhysicalStorageBuffer
                     _emit_psb_byte_offset_with_user_type!(state, inst, base_id, ops)
                     return
@@ -2322,6 +2494,12 @@ function _emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                 _emit_byte_offset_gep!(state, inst, base_ptr, base_id, base_pointee)
                 return
             end
+        elseif sc == SC.PhysicalStorageBuffer
+            # PSB pointer with unknown or i8 pointee — use raw byte-offset arithmetic.
+            # Without this, the GEP falls through to _emit_psb_ptr_arithmetic! with
+            # stride=1, producing non-aligned pointers for subsequent stores.
+            _emit_psb_byte_offset_with_user_type!(state, inst, base_id, ops)
+            return
         end
     end
 

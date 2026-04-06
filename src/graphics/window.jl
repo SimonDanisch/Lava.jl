@@ -37,8 +37,8 @@ end
 Create a new window with Vulkan surface and swapchain.
 """
 function RenderWindow(width::Integer, height::Integer;
+                      ctx::VkContext=vk_context(),
                       title::String="Lava", vsync::Bool=true)
-    ctx = vk_context()
 
     # Initialize GLFW (no OpenGL context — we use Vulkan)
     GLFW.Init()
@@ -73,8 +73,7 @@ end
 
 Create or recreate the swapchain for the window.
 """
-function create_swapchain!(win::RenderWindow; vsync::Bool=true)
-    ctx = vk_context()
+function create_swapchain!(win::RenderWindow; ctx::VkContext=vk_context(), vsync::Bool=true)
     dev = ctx.device
     phys = ctx.physical_device
 
@@ -179,8 +178,7 @@ end
 Acquire the next swapchain image. Returns the image index.
 Must be called before recording rendering commands.
 """
-function acquire_next_image!(win::RenderWindow)
-    ctx = vk_context()
+function acquire_next_image!(win::RenderWindow; ctx::VkContext=vk_context())
     dev = ctx.device
     fi = win.current_frame
 
@@ -212,8 +210,7 @@ end
 Present the rendered frame to the screen.
 Must be called after recording and submitting rendering commands.
 """
-function present!(win::RenderWindow)
-    ctx = vk_context()
+function present!(win::RenderWindow; ctx::VkContext=vk_context())
     win.acquired || error("Cannot present: no image acquired (call acquire_next_image! first)")
 
     fi = win.current_frame
@@ -234,8 +231,7 @@ end
 
 Handle window resize by recreating the swapchain.
 """
-function Base.resize!(win::RenderWindow)
-    ctx = vk_context()
+function Base.resize!(win::RenderWindow; ctx::VkContext=vk_context())
     Vulkan.device_wait_idle(ctx.device)
     # Reclaim in-flight frame batches before recreating swapchain
     for i in eachindex(win.frame_batches)
@@ -256,10 +252,9 @@ function Base.isopen(win::RenderWindow)
     win.handle.handle != C_NULL && !GLFW.WindowShouldClose(win.handle)
 end
 
-function Base.close(win::RenderWindow)
-    # Idempotent — safe to call multiple times
+function Base.close(win::RenderWindow; ctx::VkContext=vk_context())
+    # Idempotent -- safe to call multiple times
     win.handle.handle == C_NULL && return
-    ctx = vk_context()
     Vulkan.device_wait_idle(ctx.device)
     # Reclaim any in-flight frame batches (GPU is idle after device_wait_idle)
     for i in eachindex(win.frame_batches)

@@ -39,8 +39,7 @@ end
 
 # ── Sampler Construction ──
 
-function LavaSampler(; filter::Symbol=:linear, wrap::Symbol=:repeat, anisotropy::Real=0.0f0)
-    ctx = vk_context()
+function LavaSampler(; ctx::VkContext=vk_context(), filter::Symbol=:linear, wrap::Symbol=:repeat, anisotropy::Real=0.0f0)
     dev = ctx.device
 
     vk_filter = filter == :nearest ? Vulkan.FILTER_NEAREST :
@@ -72,8 +71,7 @@ end
 # ── Texture Construction ──
 
 """Create a 2D texture from a matrix of data."""
-function LavaTexture2D(data::Matrix{T}; filter=:linear, wrap=:repeat) where T
-    ctx = vk_context()
+function LavaTexture2D(data::Matrix{T}; ctx::VkContext=vk_context(), filter=:linear, wrap=:repeat) where T
     dev = ctx.device
     phys = ctx.physical_device
 
@@ -109,8 +107,7 @@ function LavaTexture2D(data::Matrix{T}; filter=:linear, wrap=:repeat) where T
 end
 
 """Upload pixel data to a texture via staging buffer."""
-function upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}) where T
-    ctx = vk_context()
+function upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}; ctx::VkContext=vk_context()) where T
     dev = ctx.device
 
     # Use staging buffer for upload
@@ -183,8 +180,7 @@ struct TextureBindings
 end
 
 """Create a descriptor set binding combined image samplers."""
-function bind_textures(textures::Vector{<:SampledTexture})
-    ctx = vk_context()
+function bind_textures(textures::Vector{<:SampledTexture}; ctx::VkContext=vk_context())
     dev = ctx.device
 
     n = length(textures)

@@ -355,8 +355,11 @@ end
         # Build triangle: (0,0,0), (1,0,0), (0,1,0)
         vertices = [(0f0, 0f0, 0f0), (1f0, 0f0, 0f0), (0f0, 1f0, 0f0)]
         indices = UInt32[0, 1, 2]
-        blas = Lava.build_blas(vertices, indices)
-        tlas = Lava.build_tlas([blas])
+        blas, tlas = Lava.as_build() do ctx
+            b = Lava.build_blas(ctx, vertices, indices)
+            t = Lava.build_tlas(ctx, [b])
+            (b, t)
+        end
 
         # Build shaders
         raygen_spirv = build_raygen_shader()

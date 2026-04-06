@@ -57,7 +57,7 @@ push!(_reset_callbacks, function()
 end)
 
 """Return (vert_shader::LavaGfxShader, compiled::CompiledGraphicsPipeline)."""
-function _ensure_compiled_with_shader!(pipeline::GraphicsPipeline,
+function ensure_compiled_with_shader!(pipeline::GraphicsPipeline,
                               vert_fn, frag_fn, tt_vertex, tt_fragment;
                               color_format=Vulkan.FORMAT_B8G8R8A8_SRGB,
                               descriptor_set_layout=nothing)
@@ -183,7 +183,7 @@ function draw!(bq::BatchQueue, pipeline::GraphicsPipeline, target::WindowTarget,
 
     vert_fn, vert_tt, frag_fn, frag_tt = resolve_shader_pair(pipeline, vert_tt, frag_tt)
 
-    vert_shader, compiled = _ensure_compiled_with_shader!(pipeline,
+    vert_shader, compiled = ensure_compiled_with_shader!(pipeline,
         vert_fn, frag_fn, vert_tt, frag_tt;
         color_format=win.format)
 
@@ -210,7 +210,7 @@ function draw!(bq::BatchQueue, pipeline::GraphicsPipeline, target::OffscreenTarg
 
     vert_fn, vert_tt, frag_fn, frag_tt = resolve_shader_pair(pipeline, vert_tt, frag_tt)
 
-    vert_shader, compiled = _ensure_compiled_with_shader!(pipeline,
+    vert_shader, compiled = ensure_compiled_with_shader!(pipeline,
         vert_fn, frag_fn, vert_tt, frag_tt;
         color_format=fb.color_format, descriptor_set_layout)
 
@@ -244,7 +244,7 @@ function pack_gfx_args(args, push_info::PushConstantInfo)
     offsets = [p.first for p in push_info.arg_layout]
     byval_sizes = push_info.byval_llvm_sizes
 
-    inline_extra = _compute_inline_extra_from_byval(byval_sizes)
+    inline_extra = compute_inline_extra_from_byval(byval_sizes)
     total_size = push_info.arg_buffer_size + inline_extra
 
     arg_buf = get_arg_buffer(total_size)
@@ -252,7 +252,9 @@ function pack_gfx_args(args, push_info::PushConstantInfo)
                        push_info.arg_buffer_size, byval_sizes, converted)
 
     # Keep data buffer references alive until vk_flush!()
-    keep_data_alive!(args)
+    bq = vk_context().default_bq
+    batch = ensure_active_batch!(bq)
+    push!(batch.data_refs, args)
 
     # Push constant = BDA of arg buffer
     push_data = Vector{UInt8}(undef, 8)
@@ -356,7 +358,7 @@ function blit!(bq::BatchQueue, target::RenderTarget, source::LavaArray;
     converted_frag = convert_args(frag_args)
     frag_tt = typeof(converted_frag)
 
-    _, compiled = _ensure_compiled_with_shader!(pipeline,
+    _, compiled = ensure_compiled_with_shader!(pipeline,
         pipeline.vertex, pipeline.fragment, Tuple{}, frag_tt;
         color_format=color_format)
 

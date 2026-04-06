@@ -40,6 +40,7 @@ Uses VK_KHR_dynamic_rendering — no VkRenderPass needed.
 """
 function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
                                     fragment_spirv::Vector{UInt8};
+                                    ctx::VkContext=vk_context(),
                                     blend::BlendMode=Opaque(),
                                     cull::CullFace=CullBack(),
                                     topology::Topology=TriangleList(),
@@ -52,7 +53,6 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
                                     tess_eval_spirv::Union{Nothing, Vector{UInt8}}=nothing,
                                     tess_config::Union{Nothing, TessConfig}=nothing,
                                     descriptor_set_layout::Union{Nothing, Vulkan.DescriptorSetLayout}=nothing)
-    ctx = vk_context()
     dev = ctx.device
 
     # Create shader modules

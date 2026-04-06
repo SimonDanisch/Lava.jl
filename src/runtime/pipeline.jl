@@ -24,7 +24,7 @@ struct _VkCreatePipelineArgs
     _pad2::Int32
 end
 
-function _vk_pipeline_thread_callback(args_ptr::Ptr{Cvoid})::UInt32
+function vk_pipeline_thread_callback(args_ptr::Ptr{Cvoid})::UInt32
     args = unsafe_load(Ptr{_VkCreatePipelineArgs}(args_ptr))
     result = ccall((:vkCreateComputePipelines, "vulkan-1"),
         Int32,
@@ -40,14 +40,14 @@ end # if _LARGE_STACK_PIPELINE
 const _pipeline_thread_cfunc = Ref{Ptr{Nothing}}(C_NULL)
 
 if _LARGE_STACK_PIPELINE
-function _init_pipeline_thread!()
-    _pipeline_thread_cfunc[] = @cfunction(_vk_pipeline_thread_callback, UInt32, (Ptr{Cvoid},))
+function init_pipeline_thread!()
+    _pipeline_thread_cfunc[] = @cfunction(vk_pipeline_thread_callback, UInt32, (Ptr{Cvoid},))
 end
 else
-_init_pipeline_thread!() = nothing
+init_pipeline_thread!() = nothing
 end
 
-function _create_compute_pipeline_large_stack(device::Ptr{Cvoid}, create_info_ptr::Ptr{Cvoid},
+function create_compute_pipeline_large_stack(device::Ptr{Cvoid}, create_info_ptr::Ptr{Cvoid},
                                                p_pipelines::Ptr{Cvoid})
     args = Ref(_VkCreatePipelineArgs(
         device, C_NULL, UInt32(1), UInt32(0),
@@ -147,7 +147,7 @@ function get_compute_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String;
     ci = Vulkan.ComputePipelineCreateInfo(stage, layout, -1;
         flags=Vulkan.PIPELINE_CREATE_DISPATCH_BASE_BIT)
 
-    pipeline = _create_compute_pipeline(dev, ci)
+    pipeline = create_compute_pipeline(dev, ci)
 
     result = LavaComputePipeline(shader_mod, layout, pipeline, UInt32(push_constant_size))
     _pipeline_cache[cache_key] = result
@@ -159,8 +159,7 @@ function get_compute_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String;
         # Keep evicted pipeline alive until the current batch flushes —
         # it may still be referenced by an in-flight command buffer.
         if evicted !== nothing
-            ctx = vk_context()
-            bq = something(current_batch_queue(), ctx.default_bq)
+            bq = vk_context().default_bq
             if bq.active_batch !== nothing
                 push!(bq.active_batch.data_refs, evicted)
             end
@@ -169,14 +168,14 @@ function get_compute_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String;
     return result
 end
 
-function _create_compute_pipeline(dev::Vulkan.Device, ci::Vulkan.ComputePipelineCreateInfo)
+function create_compute_pipeline(dev::Vulkan.Device, ci::Vulkan.ComputePipelineCreateInfo)
     if _LARGE_STACK_PIPELINE
         ci_low = convert(Vulkan._ComputePipelineCreateInfo, ci)
         vk_ci_ref = Ref(ci_low.vks)
         pipeline_out = Ref(Ptr{Cvoid}(C_NULL))
 
         GC.@preserve ci_low vk_ci_ref pipeline_out begin
-            vk_result = _create_compute_pipeline_large_stack(
+            vk_result = create_compute_pipeline_large_stack(
                 dev.vks,
                 Ptr{Cvoid}(pointer_from_objref(vk_ci_ref)),
                 Ptr{Cvoid}(pointer_from_objref(pipeline_out)))

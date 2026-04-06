@@ -83,7 +83,7 @@ function Base.copyto!(dest::LavaArray{T}, doffs::Integer,
     n == 0 && return dest
     bytes = Vector{UInt8}(undef, n * sizeof(T))
     unsafe_copyto!(Ptr{UInt8}(pointer(bytes)), Ptr{UInt8}(pointer(src, soffs)), n * sizeof(T))
-    # upload! → _one_shot_copy auto-flushes pending dispatches and does its own submit+wait
+    # upload! → one_shot_copy auto-flushes pending dispatches and does its own submit+wait
     upload!(dest.buf[], bytes; offset=(dest.offset + Int(doffs) - 1) * sizeof(T))
     return dest
 end
@@ -91,7 +91,7 @@ end
 function Base.copyto!(dest::Array{T}, doffs::Integer,
                       src::LavaArray{T}, soffs::Integer, n::Integer) where T
     n == 0 && return dest
-    # download! → _one_shot_copy auto-flushes pending dispatches and does its own submit+wait
+    # download! → one_shot_copy auto-flushes pending dispatches and does its own submit+wait
     bytes = Vector{UInt8}(undef, n * sizeof(T))
     download!(bytes, src.buf[]; offset=(src.offset + Int(soffs) - 1) * sizeof(T))
     unsafe_copyto!(Ptr{UInt8}(pointer(dest, doffs)), Ptr{UInt8}(pointer(bytes)), n * sizeof(T))
@@ -105,7 +105,7 @@ function Base.copyto!(dest::LavaArray{T}, doffs::Integer,
     src_offset = src.buf[].pool_offset + (src.offset + Int(soffs) - 1) * sizeof(T)
     dst_offset = dest.buf[].pool_offset + (dest.offset + Int(doffs) - 1) * sizeof(T)
     nbytes = n * sizeof(T)
-    _one_shot_copy(src.buf[].buffer, src_offset, dest.buf[].buffer, dst_offset, nbytes)
+    one_shot_copy(src.buf[].buffer, src_offset, dest.buf[].buffer, dst_offset, nbytes)
     return dest
 end
 
@@ -133,7 +133,7 @@ function Base.resize!(a::LavaArray{T,1}, n::Integer) where T
     if old_len > 0 && n > 0
         copy_len = min(old_len, Int(n)) * sizeof(T)
         src_off = a.buf[].pool_offset + a.offset * sizeof(T)
-        _one_shot_copy(a.buf[].buffer, src_off, new_buf.buffer, new_buf.pool_offset, copy_len)
+        one_shot_copy(a.buf[].buffer, src_off, new_buf.buffer, new_buf.pool_offset, copy_len)
     end
     new_ref = GPUArrays.DataRef(new_buf) do buf
         vk_free!(buf)

@@ -13,7 +13,7 @@ export LavaBackend
 # For workqueue foreach dispatches, the KA kernel is always `_workqueue_map_kernel!`
 # but the actual inner function (e.g. `vp_trace_shadow_rays_kernel!`) is in args.
 # all_args layout: (kernel_func, ctx, inner_func, queue, extra_args...)
-function _dispatch_name(@nospecialize(f), @nospecialize(all_args))
+function dispatch_name(@nospecialize(f), @nospecialize(all_args))
     fname = nameof(typeof(f))
     # Check if this is a workqueue_map_kernel dispatch — inner func is arg 3
     if length(all_args) >= 3 && occursin("workqueue_map_kernel", string(fname))
@@ -25,7 +25,20 @@ end
 
 # ── Backend struct ──
 
-struct LavaBackend <: KA.GPU end
+"""
+    LavaBackend <: KA.GPU
+
+Lava's GPU compute backend. Carries the Vulkan context and batch queue explicitly.
+Every dispatch uses `backend.bq` for command recording.
+
+    LavaBackend()           # default: global context + its default queue
+    LavaBackend(bq)         # explicit queue, global context
+"""
+struct LavaBackend <: KA.GPU
+    bq::BatchQueue
+end
+
+LavaBackend() = LavaBackend(vk_context().default_bq)
 
 # ── Backend queries ──
 
@@ -35,7 +48,7 @@ KA.get_backend(::LavaArray) = LavaBackend()
 # read GPU results. GPU-side ordering between dispatches is handled by pipeline
 # barriers in record_dispatch!, so synchronize() is only needed when the CPU
 # must observe GPU results (or at natural batch boundaries like end-of-sample).
-KA.synchronize(::LavaBackend) = vk_flush!()
+KA.synchronize(backend::LavaBackend) = flush!(backend.bq, vk_device())
 KA.supports_unified(::LavaBackend) = true
 function KA.allocate(::LavaBackend, ::Type{T}, dims::Tuple; unified::Bool=false) where T
     nbytes = prod(dims) * sizeof(T)
@@ -133,13 +146,13 @@ KA.argconvert(::KA.Kernel{LavaBackend}, arg) = Adapt.adapt(LavaAdaptor(), arg)
 
 function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=nothing)
     _validate_launch_args(args)
+    bq = obj.backend.bq
+
     # GPU-resident ndrange → indirect dispatch (no CPU readback)
     if ndrange isa LavaArray
         converted_args = KA.argconvert.(Ref(obj), args)
-        # Keep original args alive — argconvert strips LavaArray → Ptr (no backing ref).
-        # Pass original_args so ka_launch_indirect! can re-establish keepalive
-        # after internal vk_flush!() calls that clear batch data_refs.
-        keep_data_alive!(args)
+        batch = ensure_active_batch!(bq)
+        push!(batch.data_refs, args)
         ka_launch_indirect!(obj, converted_args, ndrange, workgroupsize, args)
         return nothing
     end
@@ -151,29 +164,17 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     nblocks = length(blocks)
     nblocks == 0 && return nothing
 
-    # N-D block grid for dispatch (avoids exceeding per-dimension workgroup count limits).
-    # Workgroups are always 1D (matching CUDA.jl/AMDGPU.jl pattern): the local thread
-    # index is just threadIdx.x / lava_local_invocation_id_x(), and KA.expand() maps
-    # the (linear_block, linear_local) pair back to N-D indices via the iterspace.
     block_dims = pad_to_3d(size(blocks))
     nthreads = length(KA.workitems(iterspace))
     ws_3d = (nthreads, 1, 1)
 
-    # Collect all arguments: function first (for BDA self param), ctx, then user args
-    # GPUCompiler includes typeof(f) as the first LLVM parameter.
-    # wrap_entry_for_vulkan! creates a BDA slot for it (unless ghost-elided).
-    # We must include f in the args so BDA packing matches the layout.
     converted_args = KA.argconvert.(Ref(obj), args)
     all_args = (obj.f, ctx, converted_args...)
 
-    # Keep original args alive until vk_flush!() — argconvert converts
-    # LavaArray → LavaDeviceArray(Ptr{T}), losing the backing buffer reference.
-    # Without this, GC can free the VkManagedBuffer while the GPU command buffer
-    # still references it via BDA, causing DEVICE_LOST under GC pressure.
-    keep_data_alive!(args)
+    batch = ensure_active_batch!(bq)
+    push!(batch.data_refs, args)
 
-    # Launch via our compilation pipeline
-    ka_launch!(obj.f, all_args, block_dims, ws_3d)
+    ka_launch!(bq, obj.f, all_args, block_dims, ws_3d)
 
     return nothing
 end
@@ -190,7 +191,7 @@ end
 const _MAX_WG_DIMS = Ref((65535, 65535, 65535))  # conservative defaults
 const _MAX_WG_DIMS_INITIALIZED = Ref(false)
 
-function _init_max_wg_dims!()
+function init_max_wg_dims!()
     _MAX_WG_DIMS_INITIALIZED[] && return
     ctx = vk_context()
     props = Vulkan.get_physical_device_properties(ctx.physical_device)
@@ -205,7 +206,7 @@ end)
 
 # Find exact factor of n that is ≤ max_dim, for splitting workgroup counts.
 # Returns the largest factor ≤ max_dim, or max_dim if none found (over-dispatch).
-function _find_split_factor(n::Int, max_dim::Int)
+function find_split_factor(n::Int, max_dim::Int)
     # Try exact division first (fast path for powers of 2, multiples of common factors)
     for d in (max_dim, max_dim-1, max_dim-2, max_dim-3)
         d > 0 && n % d == 0 && return d
@@ -223,13 +224,13 @@ function _find_split_factor(n::Int, max_dim::Int)
 end
 
 function pad_to_3d(t::NTuple{1,<:Integer})
-    _init_max_wg_dims!()
+    init_max_wg_dims!()
     n = Int(t[1])
     max_x, max_y, max_z = _MAX_WG_DIMS[]
     n <= max_x && return (n, 1, 1)
     # Need to split into X * Y (or X * Y * Z)
     # Find X such that X divides n exactly and X ≤ max_x
-    x = _find_split_factor(n, max_x)
+    x = find_split_factor(n, max_x)
     y = cld(n, x)
     if x * y == n && y <= max_y
         return (x, y, 1)
@@ -246,7 +247,7 @@ function pad_to_3d(t::NTuple{1,<:Integer})
     return (x, y, 1)
 end
 function pad_to_3d(t::NTuple{2,<:Integer})
-    _init_max_wg_dims!()
+    init_max_wg_dims!()
     x, y = Int(t[1]), Int(t[2])
     max_x, max_y, _ = _MAX_WG_DIMS[]
     if x <= max_x && y <= max_y
@@ -268,7 +269,7 @@ Internal launch function for KA kernels. Compiles and dispatches the GPU functio
 """
 const _DBG_LAUNCH_COUNT = Ref(0)
 
-function ka_launch!(@nospecialize(f), all_args::Tuple, block_dims::NTuple{3,Int}, workgroup_size::NTuple{3,Int})
+function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple, block_dims::NTuple{3,Int}, workgroup_size::NTuple{3,Int})
     _DBG_LAUNCH_COUNT[] += 1
     _n = _DBG_LAUNCH_COUNT[]
     # Build type tuple for compilation (excludes f — GPUCompiler prepends typeof(f))
@@ -276,10 +277,10 @@ function ka_launch!(@nospecialize(f), all_args::Tuple, block_dims::NTuple{3,Int}
     tt = Tuple{map(ka_arg_llvm_type, Base.tail(all_args))...}
 
     # Compile + pipeline + offsets (cached, single lookup)
-    compiled, pipeline, offsets, byval_sizes = _get_compiled_kernel_and_pipeline(f, tt, workgroup_size)
+    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(f, tt, workgroup_size)
 
     # Compute total size: base layout + inline struct data
-    inline_extra = _compute_inline_extra_from_byval(byval_sizes)
+    inline_extra = compute_inline_extra_from_byval(byval_sizes)
     total_size = compiled.push_info.arg_buffer_size + inline_extra
 
     # Get host-visible mapped arg buffer
@@ -291,9 +292,8 @@ function ka_launch!(@nospecialize(f), all_args::Tuple, block_dims::NTuple{3,Int}
 
     # Dispatch with N-D block grid (preserves KA's block dimensions)
     if dispatch_logging_enabled[]
-        last_dispatch_info[] = "ka f=$(_dispatch_name(f, all_args)) groups=$block_dims"
+        last_dispatch_info[] = "ka f=$(dispatch_name(f, all_args)) groups=$block_dims"
     end
-    bq = something(current_batch_queue(), vk_context().default_bq)
     vk_dispatch!(bq, pipeline, arg_buf.address, block_dims)
 
     return nothing
@@ -307,7 +307,7 @@ ka_arg_llvm_type(x) = typeof(x)  # Everything passes through as-is
 
 # ── Indirect dispatch support ──
 
-function _prepare_indirect_kernel(indirect::Ptr{UInt32}, ndrange_buf::Ptr{Int32}, ws::UInt32)
+function prepare_indirect_kernel(indirect::Ptr{UInt32}, ndrange_buf::Ptr{Int32}, ws::UInt32)
     n = UInt32(unsafe_load(ndrange_buf, 1))
     groups = (n + ws - UInt32(1)) ÷ ws
     unsafe_store!(indirect, groups, 1)    # groupCountX
@@ -335,12 +335,12 @@ push!(_reset_callbacks, function()
     _prepare_indirect_arg_buf_size_ref[] = 0
 end)
 
-function _init_prepare_indirect_pipeline!()
+function init_prepare_indirect_pipeline!()
     _prepare_indirect_pipeline_ref[] !== nothing && return
     tt = Tuple{Ptr{UInt32}, Ptr{Int32}, UInt32}
     ws = (1, 1, 1)
-    compiled, pipeline, offsets, byval_sizes = _get_compiled_kernel_and_pipeline(
-        _prepare_indirect_kernel, tt, ws)
+    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(
+        prepare_indirect_kernel, tt, ws)
     _prepare_indirect_pipeline_ref[] = pipeline
     _prepare_indirect_offsets_ref[] = offsets
     _prepare_indirect_byval_ref[] = byval_sizes
@@ -351,11 +351,11 @@ end
     _fast_prepare_indirect!(indirect_buf, ndrange_buf, workgroup_size)
 
 Fast path for prepare-indirect dispatch. Bypasses lava_launch! entirely:
-no validation, no auto-flush check, no keep_data_alive!, no logging overhead.
+no validation, no auto-flush check, no batch.data_refs push, no logging overhead.
 Records a single-thread direct dispatch to compute ceil(n/ws) group counts.
 """
-function _fast_prepare_indirect!(indirect_buf::VkIndirectBuffer, ndrange_buf::LavaArray{<:Integer}, workgroup_size::Integer)
-    _init_prepare_indirect_pipeline!()
+function fast_prepare_indirect!(bq::BatchQueue, indirect_buf::VkIndirectBuffer, ndrange_buf::LavaArray{<:Integer}, workgroup_size::Integer)
+    init_prepare_indirect_pipeline!()
 
     pipeline = _prepare_indirect_pipeline_ref[]
     offsets = _prepare_indirect_offsets_ref[]
@@ -363,25 +363,16 @@ function _fast_prepare_indirect!(indirect_buf::VkIndirectBuffer, ndrange_buf::La
     arg_size = _prepare_indirect_arg_buf_size_ref[]
 
     # Pack args: f (ghost, skipped), Ptr{UInt32} (BDA), LavaArray (BDA), UInt32 (direct)
-    all_args = (_prepare_indirect_kernel, Ptr{UInt32}(indirect_buf.address), ndrange_buf, UInt32(workgroup_size))
+    all_args = (prepare_indirect_kernel, Ptr{UInt32}(indirect_buf.address), ndrange_buf, UInt32(workgroup_size))
     arg_buf = get_arg_buffer(arg_size)
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets, arg_size, byval_sizes, all_args)
 
     # Record dispatch directly — single workgroup of 1 thread
-    bq = something(current_batch_queue(), vk_context().default_bq)
     vk_dispatch_base!(bq, pipeline, arg_buf.address, 0, 0, 0, 1, 1, 1)
 end
 
-"""
-    _prepare_indirect_dispatch!(indirect_buf, ndrange_buf, workgroup_size)
-
-Compile and dispatch a tiny kernel that reads `ndrange_buf[1]` (a GPU-resident queue size)
-and writes `ceil(size / workgroup_size)` to `indirect_buf` (VkDispatchIndirectCommand).
-This runs as a single-thread direct dispatch (ndrange=1).
-"""
-function _prepare_indirect_dispatch!(indirect_buf::VkIndirectBuffer, ndrange_buf::LavaArray{<:Integer}, workgroup_size::Integer)
-    bq = something(current_batch_queue(), vk_context().default_bq)
-    lava_launch!(bq, _prepare_indirect_kernel,
+function prepare_indirect_dispatch!(bq::BatchQueue, indirect_buf::VkIndirectBuffer, ndrange_buf::LavaArray{<:Integer}, workgroup_size::Integer)
+    lava_launch!(bq, prepare_indirect_kernel,
                  Ptr{UInt32}(indirect_buf.address), ndrange_buf, UInt32(workgroup_size);
                  ndrange=1, workgroup_size=(1, 1, 1))
 end
@@ -393,7 +384,8 @@ Launch a KA kernel using indirect dispatch. `ndrange_buf` is a GPU array contain
 the work item count (1-element Int32 array). The prepare-indirect kernel writes
 group counts to an indirect buffer, then vk_dispatch_indirect! dispatches the main kernel.
 """
-function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, original_args=nothing)
+function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, original_args=nothing;
+                             bq::BatchQueue=obj.backend.bq)
     # Respect static workgroup size from @kernel definition
     ws = if workgroupsize !== nothing
         workgroupsize isa Integer ? (workgroupsize,) : workgroupsize
@@ -422,10 +414,10 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
 
     # Build type tuple for compilation
     tt = Tuple{map(ka_arg_llvm_type, Base.tail(all_args))...}
-    compiled, pipeline, offsets, byval_sizes = _get_compiled_kernel_and_pipeline(obj.f, tt, ws_3d)
+    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(obj.f, tt, ws_3d)
 
     # Precompute arg buffer size (allocation deferred until after flush)
-    inline_extra = _compute_inline_extra_from_byval(byval_sizes)
+    inline_extra = compute_inline_extra_from_byval(byval_sizes)
     total_size = compiled.push_info.arg_buffer_size + inline_extra
 
     # GC.@preserve ensures original_args (the pre-argconvert LavaArrays) stay alive
@@ -440,17 +432,17 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
     _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
-    indirect_buf = _get_indirect_buffer()
-    _fast_prepare_indirect!(indirect_buf, ndrange_buf, ws_prod)
+    indirect_buf = get_indirect_buffer()
+    fast_prepare_indirect!(bq, indirect_buf, ndrange_buf, ws_prod)
 
     if dispatch_logging_enabled[]
-        last_dispatch_info[] = "indirect f=$(_dispatch_name(obj.f, all_args))"
+        last_dispatch_info[] = "indirect f=$(dispatch_name(obj.f, all_args))"
     end
-    keep_data_alive!(args)
+    batch = ensure_active_batch!(bq)
+    push!(batch.data_refs, args)
     if original_args !== nothing
-        keep_data_alive!(original_args)
+        push!(batch.data_refs, original_args)
     end
-    bq = something(current_batch_queue(), vk_context().default_bq)
     vk_dispatch_indirect!(bq, pipeline, arg_buf.address, indirect_buf)
 
     end # GC.@preserve
