@@ -167,17 +167,19 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
     )
 end
 
-# Descriptor set cache: (pipeline ds_layout handle, tlas accel handle) → (pool, descriptor_set)
-# Kept alive as long as the pipeline and TLAS objects exist (GC-safe via Vulkan.jl handles).
+# Descriptor set cache: keyed by (ds_layout handle, tlas Julia objectid) to avoid
+# handle recycling issues. Raw Vulkan handles can be reused after destruction,
+# so using objectid ensures we never return a stale descriptor set.
 const _rt_desc_cache = Dict{Tuple{UInt64, UInt64}, Tuple{Vulkan.DescriptorPool, Vulkan.DescriptorSet}}()
 
-# In-flight descriptor pools to keep alive until vk_flush!()
-const _inflight_rt_desc_pools = Vulkan.DescriptorPool[]
+push!(_reset_callbacks, function()
+    empty!(_rt_desc_cache)
+end)
 
 function get_rt_descriptor_set(pipeline::LavaRTPipeline, tlas::LavaTLAS)
-    # Cache key: use raw Vulkan handle values for identity
+    # Cache key: use objectid for TLAS to avoid handle recycling after GC
     key = (UInt64(pipeline.descriptor_set_layout.vks),
-           UInt64(tlas.accel.vks))
+           objectid(tlas))
     cached = get(_rt_desc_cache, key, nothing)
     if cached !== nothing
         return cached[2]

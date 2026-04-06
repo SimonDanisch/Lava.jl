@@ -3,41 +3,8 @@
 # Provides HardwareAccel and trace_closest_hits!() as a drop-in replacement
 # for Raycore's software BVH traversal closest_hit().
 
-"""
-    RTHitResult
-
-Result of a hardware ray trace for a single ray.
-After tracing, use `blas_offsets` and `triangle_data` to look up the full
-triangle geometry:
-
-    tri = triangle_data[blas_offsets[result.instance_custom_index + 1] + result.primitive_id + 1]
-"""
-struct RTHitResult
-    hit::UInt32             # 1 if hit, 0 if miss
-    t::Float32              # Ray parameter at hit (distance)
-    primitive_id::UInt32    # Triangle index within the BLAS (0-based)
-    instance_custom_index::UInt32  # BLAS index (0-based, set by build_hw_accel_from_tlas)
-    bary_u::Float32         # Barycentric u coordinate
-    bary_v::Float32         # Barycentric v coordinate
-    _pad1::UInt32           # Padding to 32 bytes
-    _pad2::UInt32
-end
-
-"""
-    RTRay
-
-Input ray for hardware ray tracing.
-"""
-struct RTRay
-    origin_x::Float32
-    origin_y::Float32
-    origin_z::Float32
-    tmin::Float32
-    dir_x::Float32
-    dir_y::Float32
-    dir_z::Float32
-    tmax::Float32
-end
+# Use Raycore's RTRay and RTHitResult (same memory layout, single definition)
+using Raycore: RTRay, RTHitResult
 
 """
     HardwareAccel

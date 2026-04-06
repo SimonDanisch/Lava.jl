@@ -462,6 +462,7 @@ function flush!(bq::BatchQueue, device::Vulkan.Device)
     bq.active_batch = nothing
     check_validation_errors!("vk_flush!")
     flush_deferred_frees!()
+
     return
 end
 
