@@ -2052,9 +2052,18 @@ function _psb_needs_decomposition(state::SPIRVEmitterState, ptr::LLVM.Value, acc
                 return true
             end
         elseif ptr isa LLVM.IntToPtrInst
-            # inttoptr from computed address — LLVM says alignment is insufficient,
-            # must decompose (common after SROA ptrtoint+add+inttoptr chains)
-            return true
+            # inttoptr from computed address — only decompose when the source is an
+            # add with a non-aligned constant (SROA ptrtoint+add+inttoptr chains).
+            # Simple inttoptr(load_from_push_constant) is well-aligned; decomposing
+            # those unnecessarily can disrupt downstream pointer-tracking.
+            src = LLVM.operands(ptr)[1]
+            const_offset = _extract_constant_offset_from_adds(src)
+            if const_offset != 0
+                addr_align = UInt32(1 << trailing_zeros(abs(const_offset)))
+                if addr_align < access_align
+                    return true
+                end
+            end
         end
         # Also check tracked pointer alignment from upstream byte-offset GEPs
         ptr_align = get(state.psb_ptr_alignment, ptr, UInt32(0))
