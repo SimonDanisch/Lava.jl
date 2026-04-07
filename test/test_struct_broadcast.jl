@@ -230,3 +230,226 @@ end
         end
     end
 end
+
+# ── CPU-vs-GPU roundtrip tests ──
+# The ultimate correctness check: run the same kernel on CPU (KernelAbstractions.CPU()) and GPU,
+# compare results. This catches any SPIR-V emission bug that produces wrong values
+# (not just alignment faults). Uses struct types modeled after the actual VolPath
+# work items (164-byte VPRayWorkItem, 320-byte VPMediumSampleWorkItem, etc.).
+
+struct RoundtripSmall
+    pos::NTuple{3, Float32}  # 12 bytes
+    dir::NTuple{3, Float32}  # 12 bytes
+    t::Float32               # 4 bytes
+    depth::Int32             # 4 bytes = 32 total
+end
+
+struct RoundtripWithBool
+    pos::NTuple{3, Float32}
+    dir::NTuple{3, Float32}
+    t_max::Float32
+    time::Float32
+    active::Bool              # offset 32, 3 bytes padding
+    origin::NTuple{3, Float32}  # offset 36
+    target::NTuple{3, Float32}  # offset 48
+    scale::Float32            # offset 60
+end
+
+struct RoundtripTwoBool
+    beta::NTuple{4, Float32}      # 16 bytes
+    r_u::NTuple{4, Float32}       # 16 bytes
+    prev_p::NTuple{3, Float32}    # 12 bytes
+    prev_n::NTuple{3, Float32}    # 12 bytes
+    eta::Float32                  # 4 bytes
+    specular::Bool                # offset 60, +1 byte
+    any_nonspecular::Bool         # offset 61, 2 bytes padding
+    medium_type::UInt32           # offset 64
+    medium_idx::UInt32            # offset 68 = 72 total with padding
+end
+
+struct RoundtripNested
+    inner::RoundtripSmall
+    weight::Float32
+    flag::Bool
+    extra::Float32
+end
+
+@testset "CPU-vs-GPU Roundtrip" begin
+    backend = Lava.LavaBackend()
+    N = 512
+
+    @kernel function roundtrip_small_kernel(dst, @Const(src), scale::Float32)
+        i = @index(Global)
+        @inbounds begin
+            s = src[i]
+            p = s.pos; d = s.dir
+            dst[i] = RoundtripSmall(
+                (p[1]*scale, p[2]*scale, p[3]*scale),
+                (d[1]+1f0, d[2]+1f0, d[3]+1f0),
+                s.t * 2f0,
+                s.depth + Int32(1)
+            )
+        end
+    end
+
+    @testset "RoundtripSmall (no Bool)" begin
+        data = [RoundtripSmall(ntuple(j->Float32(i*10+j), 3), ntuple(j->Float32(j), 3), Float32(i), Int32(i)) for i in 1:N]
+        src_cpu = copy(data); dst_cpu = similar(data)
+        roundtrip_small_kernel(KernelAbstractions.CPU())(dst_cpu, src_cpu, 0.5f0; ndrange=N)
+        src_gpu = Lava.LavaArray(data); dst_gpu = Lava.LavaArray{RoundtripSmall}(undef, N)
+        roundtrip_small_kernel(backend)(dst_gpu, src_gpu, 0.5f0; ndrange=N)
+        Lava.vk_flush!()
+        @test Array(dst_gpu) == dst_cpu
+    end
+
+    @kernel function roundtrip_bool_kernel(dst, @Const(src))
+        i = @index(Global)
+        @inbounds begin
+            s = src[i]
+            val = s.active ? s.t_max + s.scale : s.time - s.scale
+            dst[i] = RoundtripWithBool(
+                s.pos, s.dir, s.t_max, s.time,
+                !s.active,
+                (s.origin[1]+val, s.origin[2]+val, s.origin[3]+val),
+                s.target, s.scale * 2f0
+            )
+        end
+    end
+
+    @testset "RoundtripWithBool (1 Bool + padding)" begin
+        data = [RoundtripWithBool(
+            ntuple(j->Float32(i+j), 3), ntuple(j->Float32(j), 3),
+            Float32(i), 0.5f0, isodd(i),
+            ntuple(j->Float32(10+j), 3), ntuple(j->Float32(20+j), 3), Float32(i)*0.1f0
+        ) for i in 1:N]
+        src_cpu = copy(data); dst_cpu = similar(data)
+        roundtrip_bool_kernel(KernelAbstractions.CPU())(dst_cpu, src_cpu; ndrange=N)
+        src_gpu = Lava.LavaArray(data); dst_gpu = Lava.LavaArray{RoundtripWithBool}(undef, N)
+        roundtrip_bool_kernel(backend)(dst_gpu, src_gpu; ndrange=N)
+        Lava.vk_flush!()
+        @test Array(dst_gpu) == dst_cpu
+    end
+
+    @kernel function roundtrip_twobool_kernel(dst_f, @Const(src))
+        i = @index(Global)
+        @inbounds begin
+            s = src[i]
+            val = s.beta[1] + s.r_u[1] + s.prev_p[1] + s.prev_n[1] + s.eta
+            if s.specular; val *= 2f0; end
+            if s.any_nonspecular; val += Float32(s.medium_type); end
+            val += Float32(s.medium_idx)
+            dst_f[i] = val
+        end
+    end
+
+    @testset "RoundtripTwoBool (consecutive Bools at offset 60-61)" begin
+        data = [RoundtripTwoBool(
+            ntuple(j->Float32(i+j), 4), ntuple(j->Float32(j*0.1f0), 4),
+            ntuple(j->Float32(j), 3), ntuple(j->Float32(j+3), 3),
+            Float32(i)*0.01f0, isodd(i), i%3==0, UInt32(i%10), UInt32(i)
+        ) for i in 1:N]
+        src_cpu = copy(data); dst_cpu = zeros(Float32, N)
+        roundtrip_twobool_kernel(KernelAbstractions.CPU())(dst_cpu, src_cpu; ndrange=N)
+        src_gpu = Lava.LavaArray(data); dst_gpu = Lava.LavaArray(zeros(Float32, N))
+        roundtrip_twobool_kernel(backend)(dst_gpu, src_gpu; ndrange=N)
+        Lava.vk_flush!()
+        @test Array(dst_gpu) ≈ dst_cpu
+    end
+
+    @kernel function roundtrip_nested_kernel(dst, @Const(src), offset::Float32)
+        i = @index(Global)
+        @inbounds begin
+            s = src[i]
+            inner = s.inner
+            val = inner.pos[1] + inner.t + s.weight + s.extra + offset
+            if s.flag; val *= -1f0; end
+            dst[i] = val
+        end
+    end
+
+    @testset "RoundtripNested (Bool inside nested struct)" begin
+        data = [RoundtripNested(
+            RoundtripSmall(ntuple(j->Float32(i+j),3), ntuple(j->1f0,3), Float32(i), Int32(0)),
+            Float32(i)*0.5f0, isodd(i), Float32(i)*0.1f0
+        ) for i in 1:N]
+        src_cpu = copy(data); dst_cpu = zeros(Float32, N)
+        roundtrip_nested_kernel(KernelAbstractions.CPU())(dst_cpu, src_cpu, 100f0; ndrange=N)
+        src_gpu = Lava.LavaArray(data); dst_gpu = Lava.LavaArray(zeros(Float32, N))
+        roundtrip_nested_kernel(backend)(dst_gpu, src_gpu, 100f0; ndrange=N)
+        Lava.vk_flush!()
+        @test Array(dst_gpu) ≈ dst_cpu
+    end
+end
+
+# ── Struct layout fuzzing ──
+# Generate random struct types with Bool/Int8/UInt8/Int16/Float32/Int32/Float64 fields
+# at various positions. For each type, compile a kernel that reads all fields,
+# combines them into a Float64 checksum, and compare CPU vs GPU results.
+# This catches any alignment/padding mismatch in the SPIR-V emitter.
+
+const FUZZ_FIELD_TYPES = [Bool, UInt8, Int16, Float32, Int32, Float64]
+
+# Build struct types at eval time so they're real concrete types
+module FuzzStructs
+    using Random
+
+    const generated = Dict{UInt64, DataType}()
+
+    function make_fuzz_struct(field_types::Vector{DataType}, id::Int)
+        name = Symbol("FuzzStruct_$(id)")
+        fields = [Symbol("f$i") for i in 1:length(field_types)]
+        # Build the struct expression
+        field_exprs = [:($(fields[i])::$(field_types[i])) for i in 1:length(field_types)]
+        eval(:(struct $name; $(field_exprs...); end))
+        return eval(name)
+    end
+end
+
+random_fuzz_value(::Type{Bool}) = rand(Bool)
+random_fuzz_value(::Type{UInt8}) = rand(UInt8)
+random_fuzz_value(::Type{Int16}) = rand(Int16)
+random_fuzz_value(::Type{Float32}) = randn(Float32)
+random_fuzz_value(::Type{Int32}) = rand(Int32(1):Int32(1000))
+random_fuzz_value(::Type{Float64}) = randn(Float64)
+
+@testset "Struct Layout Fuzzing" begin
+    import Random
+    backend = Lava.LavaBackend()
+    N = 128
+    rng = Random.MersenneTwister(42)  # deterministic seed
+
+    # Generate 20 random struct layouts
+    for trial in 1:20
+        n_fields = rand(rng, 2:8)
+        field_types = [FUZZ_FIELD_TYPES[rand(rng, 1:length(FUZZ_FIELD_TYPES))] for _ in 1:n_fields]
+
+        # Ensure at least one Bool or sub-4-byte field (the interesting cases)
+        if !any(t -> t in (Bool, UInt8, Int16), field_types)
+            field_types[rand(rng, 1:n_fields)] = Bool
+        end
+
+        T = FuzzStructs.make_fuzz_struct(field_types, trial)
+
+        # Create test data
+        data = [T((random_fuzz_value(ft) for ft in field_types)...) for _ in 1:N]
+
+        # Build a checksum function that works on both CPU and GPU:
+        # sum all fields converted to Float64
+        # We use broadcast copy (dst .= src) as the simplest possible kernel --
+        # if the struct layout is wrong, the copied values will be corrupted.
+        src_cpu = copy(data)
+        dst_cpu = similar(data)
+        dst_cpu .= src_cpu
+
+        src_gpu = Lava.LavaArray(data)
+        dst_gpu = Lava.LavaArray{T}(undef, N)
+        dst_gpu .= src_gpu
+        Lava.vk_flush!()
+
+        result_gpu = Array(dst_gpu)
+
+        @testset "fuzz #$trial: $(join(string.(field_types), ",")) ($(sizeof(T)) bytes)" begin
+            @test result_gpu == dst_cpu
+        end
+    end
+end

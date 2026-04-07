@@ -742,6 +742,20 @@ end
 
 function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # ── CFG cleanup ──
+    # Verify IR after each custom pass to catch corruption early.
+    # Only in debug mode — verify is cheap but adds up across 30+ passes.
+    verify_passes = get(ENV, "LAVA_VERIFY_PASSES", "") == "1"
+    function verify_ir!(label)
+        verify_passes || return
+        try
+            LLVM.verify(mod)
+        catch e
+            ir = string(mod)
+            write("/tmp/lava_broken_$(label).ll", ir)
+            error("LLVM IR verification failed after $label — dumped to /tmp/lava_broken_$(label).ll\n$(sprint(showerror, e))")
+        end
+    end
+
     # Remove constructs that SPIR-V can't handle
     # Replace freeze before optimization: GPU kernel arguments are never undef,
     # so freeze is unnecessary. Removing it early lets LLVM produce simpler IR.
@@ -752,12 +766,14 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     GPUCompiler.rm_trap!(mod)
     _replace_unreachable!(mod)
     _strip_noreturn!(mod)
+    verify_ir!("pre_inline")
 
     # ── Force-inline all internal functions ──
     # GPU shaders are single-function programs. GPUCompiler generates helper
     # functions (error throwing, boxing, etc.) that must be inlined into the
     # entry function. After inlining, the error paths become dead code.
     _force_inline_all!(mod, entry_fn)
+    verify_ir!("force_inline")
 
     if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
         write("/tmp/lava_ir_1_postinline.ll", string(mod))
@@ -769,6 +785,7 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # causing undefined behavior (deadlock on CPU/software Vulkan implementations).
     # Redirect barrier-skipping paths to the barrier-containing continuation.
     _fix_barrier_skipping_paths!(entry_fn)
+    verify_ir!("barrier_fix")
 
     # ── Post-inlining optimization ──
     LLVM.run!(LLVM.InstCombinePass(), mod)
@@ -784,6 +801,10 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # for BDA pointer fields. These should be addrspace 1 (PhysicalStorageBuffer)
     # for correct SPIR-V emission. Convert them and update all downstream uses.
     _fix_inttoptr_addrspace!(mod)
+    # Note: IR is temporarily invalid here — addrspace(1) inttoptr results are used by
+    # GEPs that still reference the original addrspace(0) type. The SPIR-V emitter
+    # handles this correctly, and subsequent passes don't depend on address space
+    # consistency in GEP source types. Skipping verify here.
 
     # ── Remove Julia runtime artifacts from inlined error paths ──
     # After force-inlining, error/boxing helpers may reference Julia runtime:
@@ -792,21 +813,29 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # These are dead error paths that will never execute on GPU. Remove them
     # so the SPIR-V emitter doesn't need to handle runtime declarations.
     _remove_julia_runtime_artifacts!(mod)
+    # After _fix_inttoptr_addrspace!, IR has addrspace mismatches in GEPs (addrspace(1)
+    # pointers used by addrspace(0) typed GEPs). This is handled correctly by the SPIR-V
+    # emitter but makes LLVM.verify fail. Disable per-pass verification for the rest.
+    # The final SPIR-V output is validated by spirv-val instead.
+    verify_passes = false
 
     # ── Lower LLVM intrinsics unsupported by SPIR-V ──
     # memcpy → typed loads/stores, lifetime markers → removed
     _lower_unsupported_intrinsics!(mod)
+    verify_ir!("lower_intrinsics")
 
     # ── Fix GEPs with mismatched source types on allocas ──
     # After SROA + inlining, some GEPs reference the original full tuple type
     # through a smaller alloca pointer. Convert these to byte-offset GEPs so the
     # lift_byte_geps pass can properly convert them using the alloca's type.
     _fix_gep_alloca_type_mismatches!(mod)
+    verify_ir!("fix_gep_alloca_types")
 
     # ── Flatten chained GEPs on allocas ──
     # Pattern: gep i8 alloca -4 → gep i32 result %idx  →  gep i8 alloca (-4 + idx*4)
     # This handles Julia's 1-based MArray indexing where the base is shifted.
     _flatten_chained_geps_on_allocas!(mod)
+    verify_ir!("flatten_chained_geps")
 
     # ── Lift byte-offset GEPs to typed GEPs ──
     # Julia accesses struct fields via `getelementptr i8, ptr %p, i64 <offset>`.
@@ -816,15 +845,18 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     _lift_byte_geps_on_allocas!(mod)
     LLVM.run!(LLVM.InstCombinePass(), mod)
     _lift_byte_geps_on_allocas!(mod)
+    verify_ir!("lift_byte_geps")
 
     # ── Combine consecutive same-type GEPs ──
     # Patterns like `gep T, (gep T, p, i), j` → `gep T, p, add(i, j)`.
     # This avoids chained OpPtrAccessChain which some drivers handle incorrectly.
     _combine_chained_geps!(mod)
+    verify_ir!("combine_geps")
 
     # ── Structured control flow ──
     # SPIR-V requires structured CF. Run the full structurize pipeline.
     run_structurize_cfg_pipeline!(mod)
+    verify_ir!("structurize_cfg")
 
     # ── Flatten nested workgroup array globals ──
     # Replace [32 x [2 x float]] → [64 x float] in addrspace(3).
@@ -832,6 +864,7 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # cannot have ArrayStride decorations, and NVIDIA miscomputes the stride
     # for nested arrays. Flattening to scalar arrays avoids this.
     _flatten_nested_workgroup_arrays!(mod)
+    verify_ir!("flatten_wg_arrays")
 
     # ── Lift byte-offset GEPs on workgroup globals ──
     # Convert `gep i8, @shared, <offset>` ConstantExpr to typed struct-member GEPs.
@@ -846,6 +879,7 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # Struct loads/stores on addrspace(3) must be decomposed into scalar ops
     # because shared memory is flattened to scalar arrays in SPIR-V.
     _decompose_composite_workgroup_accesses!(mod, dl)
+    verify_ir!("decompose_wg_accesses_1")
 
     # ── Decompose type-punned alloca loads ──
     # LLVM memcpy lowering may create `load i64, ptr %alloca_of_struct` which
@@ -853,6 +887,7 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # the entire copy into per-field struct stores. For other uses, replace
     # with first-field load + zext.
     _decompose_typepun_alloca_loads!(mod, dl)
+    verify_ir!("decompose_typepun_alloca")
 
     # Re-run composite workgroup decomposition: the typepun pass may have created
     # new struct stores to workgroup memory that need field-by-field decomposition.
@@ -862,6 +897,7 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # LLVM memcpy optimization creates `load i64, ptr %gep_to_float_field` —
     # reads crossing struct field boundaries. Decompose into per-field loads + pack.
     _decompose_typepun_gep_loads!(mod, dl)
+    verify_ir!("decompose_typepun_gep")
 
     # Re-combine chained byte-offset GEPs that were left undecomposed above
     # (because the chain contains dynamic indices). E.g.:
@@ -916,6 +952,7 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # extraction and creates parallel value PHI chains.
     # Critical for MVector{32,UInt32} stored as [16 x i64] in BVH stack traversal.
     _lower_phi_typepunned_loads!(mod)
+    verify_ir!("lower_phi_typepun")
 
     # ── Lift byte-offset GEPs on workgroup globals ──
     # The decompose passes above may create byte-offset ConstantExpr GEPs like
@@ -935,6 +972,7 @@ function _run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # wrong type (e.g., load i32 from a double*). Run the typepun GEP load decomposition
     # one more time to fix these.
     _decompose_typepun_gep_loads!(mod, dl)
+    verify_ir!("final")
 
     return nothing
 end

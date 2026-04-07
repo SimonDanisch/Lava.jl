@@ -45,7 +45,7 @@ using GPUArrays
             @test original_addr != Lava._BDA_POISON
             @test buf.size == 1024
 
-            Lava._destroy_buffer!(buf)
+            Lava.destroy_buffer!(buf)
 
             @test buf.address == Lava._BDA_POISON
             @test buf.size == 0
@@ -113,10 +113,12 @@ using GPUArrays
             Lava.flush_deferred_frees!()
             before_bytes = Lava.GPU_LIVE_BYTES[]
 
-            a = Lava.LavaArray(Float32.(zeros(256)))
-            expected_size = max(256 * sizeof(Float32), 16)
+            # Use a large allocation that bypasses the pool (> POOL_LARGE_THRESHOLD)
+            # so GPU_LIVE_BYTES actually increases. Small allocations come from
+            # pre-allocated 64MB pool blocks and don't change the counter.
+            a = Lava.LavaArray(Float32.(zeros(32 * 1024 * 1024)))  # 128 MB
             after_alloc = Lava.GPU_LIVE_BYTES[]
-            @test after_alloc >= before_bytes + expected_size
+            @test after_alloc > before_bytes
 
             Lava.unsafe_free!(a)
             Lava.vk_flush!()

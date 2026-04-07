@@ -4117,9 +4117,13 @@ function _ensure_array_stride_decoration!(state::SPIRVEmitterState, ptr_type_id:
     end
 end
 
-"""Compute the byte size of an LLVM type (for ArrayStride decoration)."""
 # Compute the natural alignment of an LLVM type in bytes.
+# Uses the active DataLayout when available for struct/array types.
 function _compute_type_alignment(ty::LLVM.LLVMType)
+    dl = _active_data_layout[]
+    if dl !== nothing && (ty isa LLVM.StructType || ty isa LLVM.ArrayType)
+        return Int(API.LLVMABIAlignmentOfType(dl, ty))
+    end
     if ty isa LLVM.LLVMFloat
         return 4
     elseif ty isa LLVM.LLVMDouble

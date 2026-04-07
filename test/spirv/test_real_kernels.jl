@@ -220,7 +220,7 @@ using StaticArrays
                 # Create a VPShadowRayWorkItem and write it
                 ray = Raycore.Ray(Point3f(val, 0.0f0, 0.0f0),
                                   Vec3f(0.0f0, 0.0f0, 1.0f0),
-                                  1000.0f0, 0.0f0)
+                                  0.0f0, 1000.0f0, 0.0f0)
                 lambda = Hikari.SampledWavelengths{4}(
                     NTuple{4, Float32}((400.0f0, 500.0f0, 600.0f0, 700.0f0)),
                     NTuple{4, Float32}((0.25f0, 0.25f0, 0.25f0, 0.25f0)))
