@@ -13,7 +13,7 @@
 # ── Graphics Builtin Mapping ──
 # Maps __spirv_BuiltIn* names to BuiltIn decoration IDs for graphics shaders.
 
-const _SPIRV_GFX_BUILTIN_MAP = Dict{String, UInt32}(
+const SPIRV_GFX_BUILTIN_MAP = Dict{String, UInt32}(
     # Vertex input
     "__spirv_BuiltInVertexIndex"       => BuiltIn.VertexIndex,
     "__spirv_BuiltInInstanceIndex"     => BuiltIn.InstanceIndex,
@@ -28,7 +28,7 @@ const _SPIRV_GFX_BUILTIN_MAP = Dict{String, UInt32}(
 )
 
 # Register graphics builtins in the global builtin map
-merge!(_SPIRV_BUILTIN_MAP, _SPIRV_GFX_BUILTIN_MAP)
+merge!(SPIRV_BUILTIN_MAP, SPIRV_GFX_BUILTIN_MAP)
 
 # ── Graphics Shader Stage Info ──
 
@@ -37,7 +37,7 @@ struct GfxShaderStageInfo
     stage_name::String
 end
 
-const _GFX_STAGE_INFO = Dict{Symbol, GfxShaderStageInfo}(
+const GFX_STAGE_INFO = Dict{Symbol, GfxShaderStageInfo}(
     :vertex       => GfxShaderStageInfo(ExecModel.Vertex, "vertex"),
     :fragment     => GfxShaderStageInfo(ExecModel.Fragment, "fragment"),
     :geometry     => GfxShaderStageInfo(ExecModel.Geometry, "geometry"),
@@ -90,19 +90,19 @@ GfxIOState() = GfxIOState(
 # ── Main Emission Function ──
 
 """
-    _emit_spirv_from_llvm_gfx(llvm_mod, entry_name, stage; config=nothing)
+    emit_spirv_from_llvm_gfx(llvm_mod, entry_name, stage; config=nothing)
 
 Emit SPIR-V from LLVM IR for a graphics shader stage.
-Same skeleton as `_emit_spirv_from_llvm` (compute) and `_emit_spirv_from_llvm_rt` but:
+Same skeleton as `emit_spirv_from_llvm` (compute) and `emit_spirv_from_llvm_rt` but:
 1. Execution model = graphics stage (Vertex, Fragment, Geometry, etc.)
 2. No LocalSize execution mode (except geometry/tessellation have stage-specific modes)
 3. Geometry capability for geometry stage, Tessellation for tess stages
 4. Graphics builtin globals (VertexIndex, FragCoord, TessCoord, etc.)
 5. User-defined I/O variables with Location decorations
 """
-function _emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
+function emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
                                      stage::Symbol; config=nothing)
-    stage_info = get(_GFX_STAGE_INFO, stage, nothing)
+    stage_info = get(GFX_STAGE_INFO, stage, nothing)
     stage_info === nothing && error("Unknown graphics shader stage: $stage")
 
     # Build pointee type map (same as compute)
@@ -132,25 +132,25 @@ function _emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
     # Create emitter state
     state = SPIRVEmitterState(spirv_mod, type_ctx)
     state.data_layout = LLVM.datalayout(llvm_mod)
-    _active_data_layout[] = state.data_layout
+    ACTIVE_DATA_LAYOUT[] = state.data_layout
 
     # Graphics I/O state — stored in a module-level ref during emission
     gfx_io = GfxIOState()
 
     # Set geometry shader input vertex count from config
     if stage == :geometry && config !== nothing
-        gfx_io.geom_input_vertex_count = _geometry_input_vertex_count(config.input_topology)
+        gfx_io.geom_input_vertex_count = geometry_input_vertex_count(config.input_topology)
     end
 
     # Find entry function
     entry_fn = LLVM.functions(llvm_mod)[entry_name]
 
     # Emit standard globals (push constants, builtins, constants)
-    interface_ids = _emit_globals!(state, llvm_mod)
+    interface_ids = emit_globals!(state, llvm_mod)
 
     # Pre-scan for graphics intrinsic calls to determine needed I/O variables.
     # This must happen before function emission so variables exist when calls are emitted.
-    _gfx_prescan_io!(state, gfx_io, entry_fn, stage)
+    gfx_prescan_io!(state, gfx_io, entry_fn, stage)
 
     # Add I/O variables to interface list
     for (_, (var_id, _)) in gfx_io.output_vars
@@ -183,14 +183,14 @@ function _emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
     if n_params == 0
         func_id = emit_function!(state, entry_fn; is_entry=true)
     else
-        func_id = _emit_entry_wrapper!(state, entry_fn)
+        func_id = emit_entry_wrapper!(state, entry_fn)
     end
 
     # Entry point
     emit_entry_point!(spirv_mod, stage_info.exec_model, func_id, "main", interface_ids)
 
     # Execution modes (stage-dependent)
-    _emit_gfx_execution_modes!(spirv_mod, func_id, stage, config)
+    emit_gfx_execution_modes!(spirv_mod, func_id, stage, config)
 
     emit_name!(spirv_mod, func_id, entry_name)
 
@@ -202,16 +202,16 @@ end
 
 # ── Execution Modes ──
 
-function _emit_gfx_execution_modes!(mod::SPIRVModule, func_id::UInt32,
+function emit_gfx_execution_modes!(mod::SPIRVModule, func_id::UInt32,
                                       stage::Symbol, config)
     if stage == :fragment
         emit_execution_mode!(mod, func_id, ExecMode.OriginUpperLeft)
     elseif stage == :geometry && config !== nothing
         # Input topology
-        input_mode = _geometry_input_mode(config.input_topology)
+        input_mode = geometry_input_mode(config.input_topology)
         emit_execution_mode!(mod, func_id, input_mode)
         # Output topology
-        output_mode = _geometry_output_mode(config.output_topology)
+        output_mode = geometry_output_mode(config.output_topology)
         emit_execution_mode!(mod, func_id, output_mode)
         # Max vertices
         emit_execution_mode!(mod, func_id, ExecMode.OutputVertices, UInt32(config.max_vertices))
@@ -221,19 +221,19 @@ function _emit_gfx_execution_modes!(mod::SPIRVModule, func_id::UInt32,
         emit_execution_mode!(mod, func_id, ExecMode.OutputVertices, UInt32(config.patch_vertices))
     elseif stage == :tess_eval && config !== nothing
         # Domain
-        domain_mode = _tess_domain_mode(config.domain)
+        domain_mode = tess_domain_mode(config.domain)
         emit_execution_mode!(mod, func_id, domain_mode)
         # Spacing
-        spacing_mode = _tess_spacing_mode(config.spacing)
+        spacing_mode = tess_spacing_mode(config.spacing)
         emit_execution_mode!(mod, func_id, spacing_mode)
         # Winding
-        winding_mode = _tess_winding_mode(config.winding)
+        winding_mode = tess_winding_mode(config.winding)
         emit_execution_mode!(mod, func_id, winding_mode)
     end
     # Vertex stage has no execution modes
 end
 
-function _geometry_input_vertex_count(t::Topology)
+function geometry_input_vertex_count(t::Topology)
     t isa PointList           ? 1 :
     t isa LineList             ? 2 :
     t isa LineListAdjacency    ? 4 :
@@ -241,7 +241,7 @@ function _geometry_input_vertex_count(t::Topology)
     error("Unsupported geometry input topology for vertex count: $t")
 end
 
-function _geometry_input_mode(t::Topology)
+function geometry_input_mode(t::Topology)
     t isa PointList           ? ExecMode.InputPoints :
     t isa LineList             ? ExecMode.InputLines :
     t isa LineListAdjacency    ? ExecMode.InputLinesAdjacency :
@@ -249,28 +249,28 @@ function _geometry_input_mode(t::Topology)
     error("Unsupported geometry input topology: $t")
 end
 
-function _geometry_output_mode(t::Topology)
+function geometry_output_mode(t::Topology)
     t isa PointList       ? ExecMode.OutputPoints :
     t isa LineStrip       ? ExecMode.OutputLineStrip :
     t isa TriangleStrip   ? ExecMode.OutputTriangleStrip :
     error("Unsupported geometry output topology: $t")
 end
 
-function _tess_domain_mode(d::TessDomain)
+function tess_domain_mode(d::TessDomain)
     d isa TessTriangles ? ExecMode.Triangles :
     d isa TessQuads     ? ExecMode.Quads :
     d isa TessIsolines  ? ExecMode.Isolines :
     error("Unsupported tessellation domain: $d")
 end
 
-function _tess_spacing_mode(s::TessSpacing)
+function tess_spacing_mode(s::TessSpacing)
     s isa EqualSpacing          ? ExecMode.SpacingEqual :
     s isa FractionalEvenSpacing ? ExecMode.SpacingFractionalEven :
     s isa FractionalOddSpacing  ? ExecMode.SpacingFractionalOdd :
     error("Unsupported tessellation spacing: $s")
 end
 
-function _tess_winding_mode(w::TessWinding)
+function tess_winding_mode(w::TessWinding)
     w isa WindingCW  ? ExecMode.VertexOrderCw :
     w isa WindingCCW ? ExecMode.VertexOrderCcw :
     error("Unsupported tessellation winding: $w")
@@ -280,7 +280,7 @@ end
 # Scans the LLVM IR for graphics intrinsic calls to determine what I/O variables need
 # to be created before function emission.
 
-function _gfx_prescan_io!(state::SPIRVEmitterState, gfx_io::GfxIOState,
+function gfx_prescan_io!(state::SPIRVEmitterState, gfx_io::GfxIOState,
                            entry_fn::LLVM.Function, stage::Symbol)
     mod = state.mod
 
@@ -293,47 +293,47 @@ function _gfx_prescan_io!(state::SPIRVEmitterState, gfx_io::GfxIOState,
             fn_name = LLVM.name(called)
 
             if fn_name == "_lava_gfx_set_position"
-                _gfx_ensure_position_var!(state, gfx_io, stage)
+                gfx_ensure_position_var!(state, gfx_io, stage)
             elseif fn_name == "_lava_gfx_set_point_size"
-                _gfx_ensure_point_size_var!(state, gfx_io, stage)
+                gfx_ensure_point_size_var!(state, gfx_io, stage)
             elseif startswith(fn_name, "_lava_gfx_output_")
-                loc = _extract_constant_u32(LLVM.operands(inst)[1])
+                loc = extract_constant_u32(LLVM.operands(inst)[1])
                 is_flat = contains(fn_name, "_flat_")
-                iotype = _gfx_output_type_from_name(fn_name)
-                _gfx_ensure_output_var!(state, gfx_io, loc, iotype, stage; flat=is_flat)
+                iotype = gfx_output_type_from_name(fn_name)
+                gfx_ensure_output_var!(state, gfx_io, loc, iotype, stage; flat=is_flat)
             elseif startswith(fn_name, "_lava_gfx_input_")
-                loc = _extract_constant_u32(LLVM.operands(inst)[1])
+                loc = extract_constant_u32(LLVM.operands(inst)[1])
                 is_flat = contains(fn_name, "_flat_")
-                iotype = _gfx_input_type_from_name(fn_name)
-                _gfx_ensure_input_var!(state, gfx_io, loc, iotype, stage; flat=is_flat)
+                iotype = gfx_input_type_from_name(fn_name)
+                gfx_ensure_input_var!(state, gfx_io, loc, iotype, stage; flat=is_flat)
             elseif fn_name == "_lava_gfx_set_tess_level_outer"
-                _gfx_ensure_tess_outer_var!(state, gfx_io)
+                gfx_ensure_tess_outer_var!(state, gfx_io)
             elseif fn_name == "_lava_gfx_set_tess_level_inner"
-                _gfx_ensure_tess_inner_var!(state, gfx_io)
+                gfx_ensure_tess_inner_var!(state, gfx_io)
             elseif fn_name == "_lava_gfx_sample_2d"
-                binding = _extract_constant_u32(LLVM.operands(inst)[1])
-                _gfx_ensure_sampler_var!(state, gfx_io, binding)
+                binding = extract_constant_u32(LLVM.operands(inst)[1])
+                gfx_ensure_sampler_var!(state, gfx_io, binding)
             elseif fn_name == "_lava_gfx_emit_vertex" || fn_name == "_lava_gfx_end_primitive"
                 # No I/O variables needed, just capability (already added)
             elseif fn_name == "_lava_geom_input_position"
-                _gfx_ensure_geom_position_input_var!(state, gfx_io)
+                gfx_ensure_geom_position_input_var!(state, gfx_io)
             elseif startswith(fn_name, "_lava_geom_input_")
-                loc = _extract_constant_u32(LLVM.operands(inst)[1])
-                iotype = _geom_input_type_from_name(fn_name)
-                _gfx_ensure_geom_input_var!(state, gfx_io, loc, iotype)
+                loc = extract_constant_u32(LLVM.operands(inst)[1])
+                iotype = geom_input_type_from_name(fn_name)
+                gfx_ensure_geom_input_var!(state, gfx_io, loc, iotype)
             end
         end
     end
 end
 
-function _extract_constant_u32(val::LLVM.Value)
+function extract_constant_u32(val::LLVM.Value)
     if val isa LLVM.ConstantInt
         return UInt32(convert(Int, val))
     end
     error("Expected constant integer for graphics I/O location, got: $val")
 end
 
-function _gfx_output_type_from_name(name::String)
+function gfx_output_type_from_name(name::String)
     endswith(name, "_vec4") && return :vec4
     endswith(name, "_vec3") && return :vec3
     endswith(name, "_vec2") && return :vec2
@@ -341,7 +341,7 @@ function _gfx_output_type_from_name(name::String)
     error("Unknown graphics output type: $name")
 end
 
-function _gfx_input_type_from_name(name::String)
+function gfx_input_type_from_name(name::String)
     endswith(name, "_vec4") && return :vec4
     endswith(name, "_vec3") && return :vec3
     endswith(name, "_vec2") && return :vec2
@@ -351,7 +351,7 @@ end
 
 # ── Create I/O Variables ──
 
-function _gfx_spirv_type_for_io(mod::SPIRVModule, iotype::Symbol)
+function gfx_spirv_type_for_io(mod::SPIRVModule, iotype::Symbol)
     f32_ty = emit_type_float!(mod, UInt32(32))
     if iotype == :f32
         return f32_ty
@@ -366,7 +366,7 @@ function _gfx_spirv_type_for_io(mod::SPIRVModule, iotype::Symbol)
     end
 end
 
-function _gfx_ensure_position_var!(state::SPIRVEmitterState, gfx_io::GfxIOState, stage::Symbol)
+function gfx_ensure_position_var!(state::SPIRVEmitterState, gfx_io::GfxIOState, stage::Symbol)
     gfx_io.position_var_id !== nothing && return
     mod = state.mod
     f32_ty = emit_type_float!(mod, UInt32(32))
@@ -379,7 +379,7 @@ function _gfx_ensure_position_var!(state::SPIRVEmitterState, gfx_io::GfxIOState,
     gfx_io.position_var_id = var_id
 end
 
-function _gfx_ensure_point_size_var!(state::SPIRVEmitterState, gfx_io::GfxIOState, stage::Symbol)
+function gfx_ensure_point_size_var!(state::SPIRVEmitterState, gfx_io::GfxIOState, stage::Symbol)
     gfx_io.point_size_var_id !== nothing && return
     mod = state.mod
     f32_ty = emit_type_float!(mod, UInt32(32))
@@ -391,12 +391,12 @@ function _gfx_ensure_point_size_var!(state::SPIRVEmitterState, gfx_io::GfxIOStat
     gfx_io.point_size_var_id = var_id
 end
 
-function _gfx_ensure_output_var!(state::SPIRVEmitterState, gfx_io::GfxIOState,
+function gfx_ensure_output_var!(state::SPIRVEmitterState, gfx_io::GfxIOState,
                                    location::UInt32, iotype::Symbol, stage::Symbol;
                                    flat::Bool=false)
     haskey(gfx_io.output_vars, location) && return
     mod = state.mod
-    value_ty = _gfx_spirv_type_for_io(mod, iotype)
+    value_ty = gfx_spirv_type_for_io(mod, iotype)
     ptr_ty = map_pointer_type!(state.type_ctx, value_ty, SC.Output)
     var_id = fresh_id!(mod)
     encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Output)
@@ -406,12 +406,12 @@ function _gfx_ensure_output_var!(state::SPIRVEmitterState, gfx_io::GfxIOState,
     gfx_io.output_vars[location] = (var_id, iotype)
 end
 
-function _gfx_ensure_input_var!(state::SPIRVEmitterState, gfx_io::GfxIOState,
+function gfx_ensure_input_var!(state::SPIRVEmitterState, gfx_io::GfxIOState,
                                   location::UInt32, iotype::Symbol, stage::Symbol;
                                   flat::Bool=false)
     haskey(gfx_io.input_vars, location) && return
     mod = state.mod
-    value_ty = _gfx_spirv_type_for_io(mod, iotype)
+    value_ty = gfx_spirv_type_for_io(mod, iotype)
     ptr_ty = map_pointer_type!(state.type_ctx, value_ty, SC.Input)
     var_id = fresh_id!(mod)
     encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Input)
@@ -426,7 +426,7 @@ end
 #   in vec4 g_color[N]  →  OpTypeArray(vec4, N) with Location decoration
 # where N = number of input vertices (e.g. 4 for lines_adjacency).
 
-function _geom_input_type_from_name(name::String)
+function geom_input_type_from_name(name::String)
     endswith(name, "_vec4") && return :vec4
     endswith(name, "_vec3") && return :vec3
     endswith(name, "_vec2") && return :vec2
@@ -435,22 +435,22 @@ function _geom_input_type_from_name(name::String)
     error("Unknown geometry input type: $name")
 end
 
-function _gfx_spirv_type_for_geom_io(mod::SPIRVModule, iotype::Symbol)
+function gfx_spirv_type_for_geom_io(mod::SPIRVModule, iotype::Symbol)
     if iotype == :i32
         return emit_type_int!(mod, UInt32(32), UInt32(1))  # signed i32
     else
-        return _gfx_spirv_type_for_io(mod, iotype)
+        return gfx_spirv_type_for_io(mod, iotype)
     end
 end
 
 """Create an array-typed Input variable for geometry shader: `in T var[N]`."""
-function _gfx_ensure_geom_input_var!(state::SPIRVEmitterState, gfx_io::GfxIOState,
+function gfx_ensure_geom_input_var!(state::SPIRVEmitterState, gfx_io::GfxIOState,
                                        location::UInt32, iotype::Symbol)
     haskey(gfx_io.geom_input_vars, location) && return
     n = gfx_io.geom_input_vertex_count
     n > 0 || error("Geometry shader input vertex count not set (is config missing?)")
     mod = state.mod
-    elem_ty = _gfx_spirv_type_for_geom_io(mod, iotype)
+    elem_ty = gfx_spirv_type_for_geom_io(mod, iotype)
     len_id = emit_constant_u32!(mod, UInt32(n))
     arr_ty = emit_type_array!(mod, elem_ty, len_id)
     ptr_ty = map_pointer_type!(state.type_ctx, arr_ty, SC.Input)
@@ -469,7 +469,7 @@ In SPIR-V this is:
   OpVariable Input
 with BuiltIn Position on member 0 and Block decoration on the struct.
 """
-function _gfx_ensure_geom_position_input_var!(state::SPIRVEmitterState, gfx_io::GfxIOState)
+function gfx_ensure_geom_position_input_var!(state::SPIRVEmitterState, gfx_io::GfxIOState)
     gfx_io.geom_position_input_var_id !== nothing && return
     n = gfx_io.geom_input_vertex_count
     n > 0 || error("Geometry shader input vertex count not set (is config missing?)")
@@ -492,7 +492,7 @@ function _gfx_ensure_geom_position_input_var!(state::SPIRVEmitterState, gfx_io::
     gfx_io.geom_position_input_var_id = var_id
 end
 
-function _gfx_ensure_tess_outer_var!(state::SPIRVEmitterState, gfx_io::GfxIOState)
+function gfx_ensure_tess_outer_var!(state::SPIRVEmitterState, gfx_io::GfxIOState)
     gfx_io.tess_outer_var_id !== nothing && return
     mod = state.mod
     f32_ty = emit_type_float!(mod, UInt32(32))
@@ -508,7 +508,7 @@ function _gfx_ensure_tess_outer_var!(state::SPIRVEmitterState, gfx_io::GfxIOStat
     gfx_io.tess_outer_var_id = var_id
 end
 
-function _gfx_ensure_tess_inner_var!(state::SPIRVEmitterState, gfx_io::GfxIOState)
+function gfx_ensure_tess_inner_var!(state::SPIRVEmitterState, gfx_io::GfxIOState)
     gfx_io.tess_inner_var_id !== nothing && return
     mod = state.mod
     f32_ty = emit_type_float!(mod, UInt32(32))
@@ -524,7 +524,7 @@ function _gfx_ensure_tess_inner_var!(state::SPIRVEmitterState, gfx_io::GfxIOStat
     gfx_io.tess_inner_var_id = var_id
 end
 
-function _gfx_ensure_sampler_var!(state::SPIRVEmitterState, gfx_io::GfxIOState, binding::UInt32)
+function gfx_ensure_sampler_var!(state::SPIRVEmitterState, gfx_io::GfxIOState, binding::UInt32)
     haskey(gfx_io.sampler_vars, binding) && return
     mod = state.mod
 
@@ -563,7 +563,7 @@ end
 # ── Graphics Intrinsic Call Emission ──
 # Called from emit.jl's call handler when a _lava_gfx_* function is encountered.
 
-function _emit_gfx_set_position!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_gfx_set_position!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
     var_id = gfx_io.position_var_id
@@ -586,7 +586,7 @@ function _emit_gfx_set_position!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     encode_instruction!(mod.functions, Op.OpStore, var_id, vec_id)
 end
 
-function _emit_gfx_set_point_size!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_gfx_set_point_size!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
     var_id = gfx_io.point_size_var_id
@@ -594,10 +594,10 @@ function _emit_gfx_set_point_size!(state::SPIRVEmitterState, inst::LLVM.CallInst
     encode_instruction!(mod.functions, Op.OpStore, var_id, val_id)
 end
 
-function _emit_gfx_output_vec4!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_gfx_output_vec4!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
-    loc = _extract_constant_u32(LLVM.operands(inst)[1])
+    loc = extract_constant_u32(LLVM.operands(inst)[1])
     var_id, _ = gfx_io.output_vars[loc]
 
     x_id = get_value_id!(state, LLVM.operands(inst)[2])
@@ -613,10 +613,10 @@ function _emit_gfx_output_vec4!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     encode_instruction!(mod.functions, Op.OpStore, var_id, vec_id)
 end
 
-function _emit_gfx_output_vec3!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_gfx_output_vec3!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
-    loc = _extract_constant_u32(LLVM.operands(inst)[1])
+    loc = extract_constant_u32(LLVM.operands(inst)[1])
     var_id, _ = gfx_io.output_vars[loc]
 
     x_id = get_value_id!(state, LLVM.operands(inst)[2])
@@ -631,10 +631,10 @@ function _emit_gfx_output_vec3!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     encode_instruction!(mod.functions, Op.OpStore, var_id, vec_id)
 end
 
-function _emit_gfx_output_vec2!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_gfx_output_vec2!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
-    loc = _extract_constant_u32(LLVM.operands(inst)[1])
+    loc = extract_constant_u32(LLVM.operands(inst)[1])
     var_id, _ = gfx_io.output_vars[loc]
 
     x_id = get_value_id!(state, LLVM.operands(inst)[2])
@@ -648,22 +648,22 @@ function _emit_gfx_output_vec2!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     encode_instruction!(mod.functions, Op.OpStore, var_id, vec_id)
 end
 
-function _emit_gfx_output_f32!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_gfx_output_f32!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
-    loc = _extract_constant_u32(LLVM.operands(inst)[1])
+    loc = extract_constant_u32(LLVM.operands(inst)[1])
     var_id, _ = gfx_io.output_vars[loc]
     val_id = get_value_id!(state, LLVM.operands(inst)[2])
     encode_instruction!(mod.functions, Op.OpStore, var_id, val_id)
 end
 
-function _emit_gfx_input!(state::SPIRVEmitterState, inst::LLVM.CallInst, iotype::Symbol)
+function emit_gfx_input!(state::SPIRVEmitterState, inst::LLVM.CallInst, iotype::Symbol)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
-    loc = _extract_constant_u32(LLVM.operands(inst)[1])
+    loc = extract_constant_u32(LLVM.operands(inst)[1])
     var_id, _ = gfx_io.input_vars[loc]
 
-    value_ty = _gfx_spirv_type_for_io(mod, iotype)
+    value_ty = gfx_spirv_type_for_io(mod, iotype)
 
     if iotype == :f32
         # Direct load
@@ -695,13 +695,13 @@ Emit read from arrayed geometry input: `in T var[vertex_idx]`.
 For vec types: extracts a single float component.
 For f32/i32: loads the scalar directly.
 """
-function _emit_geom_input!(state::SPIRVEmitterState, inst::LLVM.CallInst, iotype::Symbol)
+function emit_geom_input!(state::SPIRVEmitterState, inst::LLVM.CallInst, iotype::Symbol)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
-    loc = _extract_constant_u32(LLVM.operands(inst)[1])
+    loc = extract_constant_u32(LLVM.operands(inst)[1])
     var_id, _ = gfx_io.geom_input_vars[loc]
 
-    elem_ty = _gfx_spirv_type_for_geom_io(mod, iotype)
+    elem_ty = gfx_spirv_type_for_geom_io(mod, iotype)
     elem_ptr_ty = map_pointer_type!(state.type_ctx, elem_ty, SC.Input)
 
     # OpAccessChain into the array: var[vertex_idx]
@@ -738,7 +738,7 @@ SPIR-V: %ptr = OpAccessChain %ptr_vec4 %gl_in %vidx %zero  (member 0 = Position)
         %vec = OpLoad %vec4 %ptr
         %val = OpVectorExtractDynamic %f32 %vec %comp
 """
-function _emit_geom_input_position!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_geom_input_position!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
     gl_in_var = gfx_io.geom_position_input_var_id
@@ -770,7 +770,7 @@ function _emit_geom_input_position!(state::SPIRVEmitterState, inst::LLVM.CallIns
     state.value_map[inst] = result_id
 end
 
-function _emit_gfx_derivative!(state::SPIRVEmitterState, inst::LLVM.CallInst, opcode::UInt16)
+function emit_gfx_derivative!(state::SPIRVEmitterState, inst::LLVM.CallInst, opcode::UInt16)
     # OpDPdx/OpDPdy: result_type result_id operand
     mod = state.mod
     operand = LLVM.operands(inst)[1]
@@ -781,15 +781,15 @@ function _emit_gfx_derivative!(state::SPIRVEmitterState, inst::LLVM.CallInst, op
     state.value_map[inst] = result_id
 end
 
-function _emit_gfx_emit_vertex!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_gfx_emit_vertex!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     encode_instruction!(state.mod.functions, Op.OpEmitVertex)
 end
 
-function _emit_gfx_end_primitive!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_gfx_end_primitive!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     encode_instruction!(state.mod.functions, Op.OpEndPrimitive)
 end
 
-function _emit_gfx_set_tess_level!(state::SPIRVEmitterState, inst::LLVM.CallInst, is_outer::Bool)
+function emit_gfx_set_tess_level!(state::SPIRVEmitterState, inst::LLVM.CallInst, is_outer::Bool)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
     var_id = is_outer ? gfx_io.tess_outer_var_id : gfx_io.tess_inner_var_id
@@ -806,11 +806,11 @@ function _emit_gfx_set_tess_level!(state::SPIRVEmitterState, inst::LLVM.CallInst
     encode_instruction!(mod.functions, Op.OpStore, ac_id, val_id)
 end
 
-function _emit_gfx_sample_2d!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_gfx_sample_2d!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
 
-    binding = _extract_constant_u32(LLVM.operands(inst)[1])
+    binding = extract_constant_u32(LLVM.operands(inst)[1])
     u_id = get_value_id!(state, LLVM.operands(inst)[2])
     v_id = get_value_id!(state, LLVM.operands(inst)[3])
     comp_id = get_value_id!(state, LLVM.operands(inst)[4])

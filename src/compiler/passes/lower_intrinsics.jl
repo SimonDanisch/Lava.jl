@@ -1,7 +1,7 @@
 # LLVM pass: CFG cleanup and intrinsic lowering.
 #
-# Ported from Abacus compilation.jl (_replace_unreachable!, _replace_freeze!,
-# _strip_noreturn!, _strip_assume!).
+# Ported from Abacus compilation.jl (replace_unreachable!, replace_freeze!,
+# strip_noreturn!, strip_assume!).
 #
 # These passes clean up LLVM IR patterns that the SPIR-V emitter cannot handle:
 # - `unreachable` terminators from GPUCompiler's lower_throw! (create dead-end blocks)
@@ -10,12 +10,12 @@
 # - `llvm.assume` calls (can cause validation failures when misplaced near merge blocks)
 #
 # Pass pipeline order (assembled in compilation.jl):
-#   GPUCompiler.rm_trap! -> _replace_unreachable! -> _replace_freeze!
-#   -> _strip_noreturn! -> _strip_assume!
+#   GPUCompiler.rm_trap! -> replace_unreachable! -> replace_freeze!
+#   -> strip_noreturn! -> strip_assume!
 #   (then SimplifyCFG -> structurize_cfg pipeline)
 
 """
-    _replace_unreachable!(mod::LLVM.Module)
+    replace_unreachable!(mod::LLVM.Module)
 
 Replace `unreachable` terminators with branches to a unified return block.
 
@@ -29,7 +29,7 @@ For void functions, the return block contains `ret void`.
 For value-returning functions, a PHI node merges the return values from all
 predecessors (with `undef` for formerly-unreachable paths).
 """
-function _replace_unreachable!(mod::LLVM.Module)
+function replace_unreachable!(mod::LLVM.Module)
     for f in LLVM.functions(mod)
         isempty(LLVM.blocks(f)) && continue
 
@@ -115,7 +115,7 @@ function _replace_unreachable!(mod::LLVM.Module)
 end
 
 """
-    _replace_freeze!(mod::LLVM.Module)
+    replace_freeze!(mod::LLVM.Module)
 
 Replace `freeze` instructions with their operands.
 
@@ -124,7 +124,7 @@ has no poison/undef semantics, so we can safely replace `freeze %x` with `%x`.
 Without this, the SPIR-V emitter would need to handle an opcode that has no
 SPIR-V equivalent.
 """
-function _replace_freeze!(mod::LLVM.Module)
+function replace_freeze!(mod::LLVM.Module)
     for f in LLVM.functions(mod)
         isempty(LLVM.blocks(f)) && continue
         to_erase = LLVM.Instruction[]
@@ -140,16 +140,16 @@ function _replace_freeze!(mod::LLVM.Module)
 end
 
 """
-    _strip_noreturn!(mod::LLVM.Module)
+    strip_noreturn!(mod::LLVM.Module)
 
 Strip `noreturn` attribute from all functions and call sites in the module.
 
-After `_replace_unreachable!` converts error paths to normal returns,
+After `replace_unreachable!` converts error paths to normal returns,
 the functions are no longer truly noreturn. But LLVM's SimplifyCFG sees the
 `noreturn` attribute and reintroduces `unreachable` terminators after calls
 to these functions, undoing our fix. Stripping the attribute prevents this.
 """
-function _strip_noreturn!(mod::LLVM.Module)
+function strip_noreturn!(mod::LLVM.Module)
     noreturn_kind = LLVM.kind(LLVM.EnumAttribute("noreturn"))
     for f in LLVM.functions(mod)
         # Strip from function definition attributes
@@ -172,7 +172,7 @@ function _strip_noreturn!(mod::LLVM.Module)
 end
 
 """
-    _strip_assume!(mod::LLVM.Module)
+    strip_assume!(mod::LLVM.Module)
 
 Remove `llvm.assume` intrinsic calls from the module.
 
@@ -180,7 +180,7 @@ These are optimization hints that have no effect on correctness. The SPIR-V
 emitter doesn't need them, and they can cause issues if misplaced relative
 to OpSelectionMerge instructions during structured control flow emission.
 """
-function _strip_assume!(mod::LLVM.Module)
+function strip_assume!(mod::LLVM.Module)
     if haskey(LLVM.functions(mod), "llvm.assume")
         assume_fn = LLVM.functions(mod)["llvm.assume"]
         for use in collect(LLVM.uses(assume_fn))
@@ -196,9 +196,9 @@ function _strip_assume!(mod::LLVM.Module)
 end
 
 """
-    _fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
+    fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
 
-After inlining and optimization, detect error paths (from `_replace_unreachable!`)
+After inlining and optimization, detect error paths (from `replace_unreachable!`)
 that branch directly to the return block, skipping `OpControlBarrier` calls that
 other invocations in the workgroup will reach.
 
@@ -212,7 +212,7 @@ its predecessor's alternative path leads to a barrier. If so, redirect the block
 to the barrier-containing path. This makes dead invocations participate in all
 remaining barriers before returning.
 """
-function _fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
+function fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
     isempty(LLVM.blocks(entry_fn)) && return false
 
     # 1. Find all blocks containing barrier calls
@@ -267,7 +267,7 @@ function _fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
         other_target = pred_succs[1] == bb ? pred_succs[2] : pred_succs[1]
 
         # Check if the other path leads to a barrier (directly or transitively)
-        if _path_reaches_barrier(other_target, barrier_blocks, return_blocks)
+        if path_reaches_barrier(other_target, barrier_blocks, return_blocks)
             # Redirect this block to the barrier-containing path
             LLVM.@dispose builder = LLVM.IRBuilder() begin
                 LLVM.position!(builder, term)
@@ -293,7 +293,7 @@ end
 Check if any path from `start` reaches a barrier block before reaching a return block.
 Uses BFS with visited set to handle cycles.
 """
-function _path_reaches_barrier(start::LLVM.BasicBlock,
+function path_reaches_barrier(start::LLVM.BasicBlock,
                                barrier_blocks::Set{LLVM.BasicBlock},
                                return_blocks::Set{LLVM.BasicBlock})
     start in barrier_blocks && return true
@@ -314,7 +314,7 @@ function _path_reaches_barrier(start::LLVM.BasicBlock,
 end
 
 """
-    _remove_julia_runtime_artifacts!(mod::LLVM.Module)
+    remove_julia_runtime_artifacts!(mod::LLVM.Module)
 
 Remove Julia runtime artifacts that appear after force-inlining error paths.
 
@@ -328,7 +328,7 @@ These are dead error paths that should never execute on GPU. We replace:
 2. Loads from external function declarations (jl_*_type) → replace with zero
 3. Runs DCE to clean up dead code chains
 """
-function _remove_julia_runtime_artifacts!(mod::LLVM.Module)
+function remove_julia_runtime_artifacts!(mod::LLVM.Module)
     for fn in LLVM.functions(mod)
         isempty(LLVM.blocks(fn)) && continue
         to_erase = LLVM.Instruction[]
@@ -378,14 +378,14 @@ Run the full CFG cleanup pipeline. Must be called BEFORE the structurize_cfg pip
 
 Order:
 1. GPUCompiler.rm_trap!(mod) -- call this separately before this function
-2. _replace_unreachable! -- replace dead-end blocks with branches to exit
-3. _replace_freeze! -- remove freeze instructions (no SPIR-V equivalent)
-4. _strip_noreturn! -- prevent SimplifyCFG from reintroducing unreachable
-5. _strip_assume! -- remove optimization hints that cause merge placement issues
+2. replace_unreachable! -- replace dead-end blocks with branches to exit
+3. replace_freeze! -- remove freeze instructions (no SPIR-V equivalent)
+4. strip_noreturn! -- prevent SimplifyCFG from reintroducing unreachable
+5. strip_assume! -- remove optimization hints that cause merge placement issues
 """
 function run_cfg_cleanup!(mod::LLVM.Module)
-    _replace_unreachable!(mod)
-    _replace_freeze!(mod)
-    _strip_noreturn!(mod)
-    _strip_assume!(mod)
+    replace_unreachable!(mod)
+    replace_freeze!(mod)
+    strip_noreturn!(mod)
+    strip_assume!(mod)
 end

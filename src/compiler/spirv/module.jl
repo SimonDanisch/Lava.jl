@@ -414,7 +414,7 @@ mutable struct SPIRVModule
     declared_extensions::Set{String}
 
     # Source mapping: SPIR-V result ID → (julia_file, julia_line)
-    # Populated during emission by _record_source_location!()
+    # Populated during emission by record_source_location!()
     source_locations::Dict{UInt32, Tuple{String, Int}}
 end
 

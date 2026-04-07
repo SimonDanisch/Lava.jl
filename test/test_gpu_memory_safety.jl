@@ -42,12 +42,12 @@ using GPUArrays
         @testset "BDA poison value set on destroy" begin
             buf = Lava.vk_alloc(1024)
             original_addr = buf.address
-            @test original_addr != Lava._BDA_POISON
+            @test original_addr != Lava.BDA_POISON
             @test buf.size == 1024
 
             Lava.destroy_buffer!(buf)
 
-            @test buf.address == Lava._BDA_POISON
+            @test buf.address == Lava.BDA_POISON
             @test buf.size == 0
         end
 
@@ -63,7 +63,7 @@ using GPUArrays
             Lava.flush_deferred_frees!()
 
             # The DataRef may have already called vk_free! via its destructor
-            @test buf.size == 0 || buf.address == Lava._BDA_POISON
+            @test buf.size == 0 || buf.address == Lava.BDA_POISON
         end
     end
 
@@ -93,7 +93,7 @@ using GPUArrays
             GC.gc(true)
             Lava.vk_flush!()
             Lava.flush_deferred_frees!()
-            baseline = length(Lava._live_buffers)
+            baseline = length(Lava.LIVE_BUFFERS)
 
             # Allocate and free many arrays
             for _ in 1:100
@@ -103,7 +103,7 @@ using GPUArrays
 
             Lava.vk_flush!()
             Lava.flush_deferred_frees!()
-            after = length(Lava._live_buffers)
+            after = length(Lava.LIVE_BUFFERS)
             @test after == baseline
         end
 
@@ -180,12 +180,12 @@ using GPUArrays
             # Check it was deferred (address not yet poisoned)
             ctx = Lava.vk_context()
             if ctx.active_batch !== nothing && ctx.active_batch.recording
-                @test temp.address != Lava._BDA_POISON || temp in Lava.DEFERRED_FREES
+                @test temp.address != Lava.BDA_POISON || temp in Lava.DEFERRED_FREES
             end
 
             # After flush, deferred frees are processed
             Lava.vk_flush!()
-            @test temp.address == Lava._BDA_POISON
+            @test temp.address == Lava.BDA_POISON
             @test temp.size == 0
 
             Lava.unsafe_free!(a)
@@ -209,7 +209,7 @@ using GPUArrays
 
             # Buffer should NOT be destroyed (child holds a DataRef copy)
             @test child_buf.size > 0
-            @test child_buf.address != Lava._BDA_POISON
+            @test child_buf.address != Lava.BDA_POISON
 
             # Reading from child should still work
             result = Array(child)
@@ -246,7 +246,7 @@ using GPUArrays
         end
 
         @testset "validation enabled by default" begin
-            @test Lava._launch_arg_validation[] == true
+            @test Lava.LAUNCH_ARG_VALIDATION[] == true
         end
 
         @testset "catches freed array (DataRef released)" begin
@@ -263,7 +263,7 @@ using GPUArrays
             a = Lava.LavaArray(Float32[1, 2, 3])
             buf = a.buf[]
             original_addr = buf.address
-            buf.address = Lava._BDA_POISON
+            buf.address = Lava.BDA_POISON
 
             @test_throws Lava.LavaError begin
                 noop_k!(Lava.LavaBackend())(a; ndrange=3)
@@ -294,14 +294,14 @@ using GPUArrays
             buf = a.buf[]
             buf.size = 0  # Would normally trigger validation error
 
-            Lava._launch_arg_validation[] = false
+            Lava.LAUNCH_ARG_VALIDATION[] = false
             try
                 # Should NOT throw with validation disabled
                 # (but we don't actually dispatch — just test that validation is skipped)
                 # We can't safely dispatch with a corrupted buffer, so just test the toggle
-                @test Lava._launch_arg_validation[] == false
+                @test Lava.LAUNCH_ARG_VALIDATION[] == false
             finally
-                Lava._launch_arg_validation[] = true
+                Lava.LAUNCH_ARG_VALIDATION[] = true
                 buf.size = max(3 * sizeof(Float32), 16)  # Restore
             end
             Lava.unsafe_free!(a)
@@ -374,8 +374,8 @@ using GPUArrays
 
             # After flush, slab allocator resets
             Lava.vk_flush!()
-            @test Lava._arg_slab_offset[] == 0
-            @test Lava._arg_slab_idx[] == 1
+            @test Lava.ARG_SLAB_OFFSET[] == 0
+            @test Lava.ARG_SLAB_IDX[] == 1
 
             result = Array(a)
             @test result[1] ≈ 1.0f0
@@ -410,7 +410,7 @@ using GPUArrays
     @testset "device generation tracking" begin
         @testset "buffer records device generation at creation" begin
             buf = Lava.vk_alloc(256)
-            @test buf.device_gen == Lava._device_generation[]
+            @test buf.device_gen == Lava.DEVICE_GENERATION[]
             Lava.vk_free!(buf)
             Lava.flush_deferred_frees!()
         end

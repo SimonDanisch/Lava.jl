@@ -141,11 +141,11 @@ Return current GPU memory usage statistics.
 """
 function gpu_memory_usage()
     (live_bytes = GPU_LIVE_BYTES[],
-     live_buffers = length(_live_buffers),
+     LIVE_BUFFERS = length(LIVE_BUFFERS),
      deferred_frees = length(DEFERRED_FREES),
-     arg_slabs = length(_arg_slabs),
-     pipelines_cached = length(_pipeline_cache),
-     kernels_cached = length(_kernel_cache))
+     ARG_SLABS = length(ARG_SLABS),
+     pipelines_cached = length(PIPELINE_CACHE),
+     kernels_cached = length(KERNEL_CACHE))
 end
 
 """
@@ -154,48 +154,48 @@ end
 Print a comprehensive summary of Lava.jl runtime state for debugging.
 """
 function dump_state(; io::IO=stdout)
-    ctx = _vk_context[]
+    ctx = VK_CONTEXT_REF[]
     println(io, "=== Lava.jl State ===")
     println(io, "Device: ", ctx === nothing ? "not initialized" : ctx.device_name)
-    println(io, "Device lost: ", _device_lost[])
+    println(io, "Device lost: ", DEVICE_LOST[])
     mem = gpu_memory_usage()
     live_mb = mem.live_bytes ÷ (1024 * 1024)
-    println(io, "GPU memory: $(live_mb) MiB in $(mem.live_buffers) buffers ($(mem.deferred_frees) deferred)")
-    println(io, "Pipelines cached: $(mem.pipelines_cached) (max $(_max_pipeline_cache_size[]))")
-    println(io, "Kernels cached: $(mem.kernels_cached) (max $(_max_kernel_cache_size[]))")
-    println(io, "Arg slabs: $(mem.arg_slabs) (slab_idx=$(_arg_slab_idx[]), offset=$(_arg_slab_offset[]))")
+    println(io, "GPU memory: $(live_mb) MiB in $(mem.LIVE_BUFFERS) buffers ($(mem.deferred_frees) deferred)")
+    println(io, "Pipelines cached: $(mem.pipelines_cached) (max $(MAX_PIPELINE_CACHE_SIZE[]))")
+    println(io, "Kernels cached: $(mem.kernels_cached) (max $(MAX_KERNEL_CACHE_SIZE[]))")
+    println(io, "Arg slabs: $(mem.ARG_SLABS) (slab_idx=$(ARG_SLAB_IDX[]), offset=$(ARG_SLAB_OFFSET[]))")
     if ctx !== nothing
         println(io, "Free batches: $(length(ctx.free_batches))")
         println(io, "Free cmd bufs: $(length(ctx.free_cmd_bufs))")
-        println(io, "CB split threshold: $(cb_split_threshold[])")
+        println(io, "CB split threshold: $(CB_SPLIT_THRESHOLD[])")
     end
     println(io, "Flushes: $(FLUSH_COUNTER[])")
     println(io, "Total dispatches: $(TOTAL_DISPATCH_COUNTER[])")
-    println(io, "Dispatch logging: $(dispatch_logging_enabled[])")
-    if !isempty(dispatch_log)
-        println(io, "Last dispatch: ", last(dispatch_log))
+    println(io, "Dispatch logging: $(DISPATCH_LOGGING_ENABLED[])")
+    if !isempty(DISPATCH_LOG)
+        println(io, "Last dispatch: ", last(DISPATCH_LOG))
     end
     return nothing
 end
 
-function __init__()
+function init__()
     # Reset runtime counters that should not survive precompilation.
     # These Ref values get serialized into the pkgimage — a device crash
     # during precompilation would permanently poison all future sessions.
-    _device_lost[] = false
+    DEVICE_LOST[] = false
     FLUSH_COUNTER[] = 0
     TOTAL_DISPATCH_COUNTER[] = 0
-    last_dispatch_info[] = ""
-    prev_dispatch_info[] = ""
-    empty!(dispatch_log)
+    LAST_DISPATCH_INFO[] = ""
+    PREV_DISPATCH_INFO[] = ""
+    empty!(DISPATCH_LOG)
     init_pipeline_thread!()
 
     # Mark device as lost during shutdown so GC finalizers don't call into
     # the Vulkan driver after it's been torn down. The atexit hook runs
     # before Julia's global finalizer sweep.
     atexit() do
-        _device_lost[] = true
-        _vk_context[] = nothing
+        DEVICE_LOST[] = true
+        VK_CONTEXT_REF[] = nothing
     end
 end
 

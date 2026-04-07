@@ -54,7 +54,7 @@ end
 # ── Pre-computed LLVM IR constants for atomicrmw ──
 # All IR strings must be compile-time constants for llvmcall.
 
-const _ir_add_i32 = ("""
+const ir_add_i32 = ("""
     define i32 @entry(ptr %ptr, i32 %val) #0 {
         %old = atomicrmw add ptr %ptr, i32 %val syncscope("device") seq_cst
         ret i32 %old
@@ -62,7 +62,7 @@ const _ir_add_i32 = ("""
     attributes #0 = { alwaysinline }
 """, "entry")
 
-const _ir_sub_i32 = ("""
+const ir_sub_i32 = ("""
     define i32 @entry(ptr %ptr, i32 %val) #0 {
         %old = atomicrmw sub ptr %ptr, i32 %val syncscope("device") seq_cst
         ret i32 %old
@@ -70,7 +70,7 @@ const _ir_sub_i32 = ("""
     attributes #0 = { alwaysinline }
 """, "entry")
 
-const _ir_and_i32 = ("""
+const ir_and_i32 = ("""
     define i32 @entry(ptr %ptr, i32 %val) #0 {
         %old = atomicrmw and ptr %ptr, i32 %val syncscope("device") seq_cst
         ret i32 %old
@@ -78,7 +78,7 @@ const _ir_and_i32 = ("""
     attributes #0 = { alwaysinline }
 """, "entry")
 
-const _ir_or_i32 = ("""
+const ir_or_i32 = ("""
     define i32 @entry(ptr %ptr, i32 %val) #0 {
         %old = atomicrmw or ptr %ptr, i32 %val syncscope("device") seq_cst
         ret i32 %old
@@ -86,7 +86,7 @@ const _ir_or_i32 = ("""
     attributes #0 = { alwaysinline }
 """, "entry")
 
-const _ir_xor_i32 = ("""
+const ir_xor_i32 = ("""
     define i32 @entry(ptr %ptr, i32 %val) #0 {
         %old = atomicrmw xor ptr %ptr, i32 %val syncscope("device") seq_cst
         ret i32 %old
@@ -94,7 +94,7 @@ const _ir_xor_i32 = ("""
     attributes #0 = { alwaysinline }
 """, "entry")
 
-const _ir_min_i32 = ("""
+const ir_min_i32 = ("""
     define i32 @entry(ptr %ptr, i32 %val) #0 {
         %old = atomicrmw min ptr %ptr, i32 %val syncscope("device") seq_cst
         ret i32 %old
@@ -102,7 +102,7 @@ const _ir_min_i32 = ("""
     attributes #0 = { alwaysinline }
 """, "entry")
 
-const _ir_max_i32 = ("""
+const ir_max_i32 = ("""
     define i32 @entry(ptr %ptr, i32 %val) #0 {
         %old = atomicrmw max ptr %ptr, i32 %val syncscope("device") seq_cst
         ret i32 %old
@@ -110,7 +110,7 @@ const _ir_max_i32 = ("""
     attributes #0 = { alwaysinline }
 """, "entry")
 
-const _ir_umin_i32 = ("""
+const ir_umin_i32 = ("""
     define i32 @entry(ptr %ptr, i32 %val) #0 {
         %old = atomicrmw umin ptr %ptr, i32 %val syncscope("device") seq_cst
         ret i32 %old
@@ -118,7 +118,7 @@ const _ir_umin_i32 = ("""
     attributes #0 = { alwaysinline }
 """, "entry")
 
-const _ir_umax_i32 = ("""
+const ir_umax_i32 = ("""
     define i32 @entry(ptr %ptr, i32 %val) #0 {
         %old = atomicrmw umax ptr %ptr, i32 %val syncscope("device") seq_cst
         ret i32 %old
@@ -126,7 +126,7 @@ const _ir_umax_i32 = ("""
     attributes #0 = { alwaysinline }
 """, "entry")
 
-const _ir_xchg_i32 = ("""
+const ir_xchg_i32 = ("""
     define i32 @entry(ptr %ptr, i32 %val) #0 {
         %old = atomicrmw xchg ptr %ptr, i32 %val syncscope("device") seq_cst
         ret i32 %old
@@ -134,7 +134,7 @@ const _ir_xchg_i32 = ("""
     attributes #0 = { alwaysinline }
 """, "entry")
 
-const _ir_f32_cas = ("""
+const ir_f32_cas = ("""
     define i32 @entry(ptr %ptr, float %val) #0 {
     entry:
         %orig = load atomic i32, ptr %ptr syncscope("device") seq_cst, align 4
@@ -159,49 +159,49 @@ const _ir_f32_cas = ("""
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{Int32}, ::typeof(+), val::Int32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old = Base.llvmcall(_ir_add_i32, Int32, Tuple{Ptr{Int32}, Int32}, ptr, val)
+    old = Base.llvmcall(ir_add_i32, Int32, Tuple{Ptr{Int32}, Int32}, ptr, val)
     old => old + val
 end
 
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{Int32}, ::typeof(-), val::Int32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old = Base.llvmcall(_ir_sub_i32, Int32, Tuple{Ptr{Int32}, Int32}, ptr, val)
+    old = Base.llvmcall(ir_sub_i32, Int32, Tuple{Ptr{Int32}, Int32}, ptr, val)
     old => old - val
 end
 
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{Int32}, ::typeof(&), val::Int32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old = Base.llvmcall(_ir_and_i32, Int32, Tuple{Ptr{Int32}, Int32}, ptr, val)
+    old = Base.llvmcall(ir_and_i32, Int32, Tuple{Ptr{Int32}, Int32}, ptr, val)
     old => old & val
 end
 
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{Int32}, ::typeof(|), val::Int32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old = Base.llvmcall(_ir_or_i32, Int32, Tuple{Ptr{Int32}, Int32}, ptr, val)
+    old = Base.llvmcall(ir_or_i32, Int32, Tuple{Ptr{Int32}, Int32}, ptr, val)
     old => old | val
 end
 
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{Int32}, ::typeof(xor), val::Int32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old = Base.llvmcall(_ir_xor_i32, Int32, Tuple{Ptr{Int32}, Int32}, ptr, val)
+    old = Base.llvmcall(ir_xor_i32, Int32, Tuple{Ptr{Int32}, Int32}, ptr, val)
     old => xor(old, val)
 end
 
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{Int32}, ::typeof(min), val::Int32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old = Base.llvmcall(_ir_min_i32, Int32, Tuple{Ptr{Int32}, Int32}, ptr, val)
+    old = Base.llvmcall(ir_min_i32, Int32, Tuple{Ptr{Int32}, Int32}, ptr, val)
     old => min(old, val)
 end
 
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{Int32}, ::typeof(max), val::Int32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old = Base.llvmcall(_ir_max_i32, Int32, Tuple{Ptr{Int32}, Int32}, ptr, val)
+    old = Base.llvmcall(ir_max_i32, Int32, Tuple{Ptr{Int32}, Int32}, ptr, val)
     old => max(old, val)
 end
 
@@ -210,42 +210,42 @@ end
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{UInt32}, ::typeof(+), val::UInt32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old = Base.llvmcall(_ir_add_i32, UInt32, Tuple{Ptr{UInt32}, UInt32}, ptr, val)
+    old = Base.llvmcall(ir_add_i32, UInt32, Tuple{Ptr{UInt32}, UInt32}, ptr, val)
     old => old + val
 end
 
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{UInt32}, ::typeof(-), val::UInt32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old = Base.llvmcall(_ir_sub_i32, UInt32, Tuple{Ptr{UInt32}, UInt32}, ptr, val)
+    old = Base.llvmcall(ir_sub_i32, UInt32, Tuple{Ptr{UInt32}, UInt32}, ptr, val)
     old => old - val
 end
 
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{UInt32}, ::typeof(&), val::UInt32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old = Base.llvmcall(_ir_and_i32, UInt32, Tuple{Ptr{UInt32}, UInt32}, ptr, val)
+    old = Base.llvmcall(ir_and_i32, UInt32, Tuple{Ptr{UInt32}, UInt32}, ptr, val)
     old => old & val
 end
 
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{UInt32}, ::typeof(|), val::UInt32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old = Base.llvmcall(_ir_or_i32, UInt32, Tuple{Ptr{UInt32}, UInt32}, ptr, val)
+    old = Base.llvmcall(ir_or_i32, UInt32, Tuple{Ptr{UInt32}, UInt32}, ptr, val)
     old => old | val
 end
 
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{UInt32}, ::typeof(min), val::UInt32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old = Base.llvmcall(_ir_umin_i32, UInt32, Tuple{Ptr{UInt32}, UInt32}, ptr, val)
+    old = Base.llvmcall(ir_umin_i32, UInt32, Tuple{Ptr{UInt32}, UInt32}, ptr, val)
     old => min(old, val)
 end
 
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{UInt32}, ::typeof(max), val::UInt32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old = Base.llvmcall(_ir_umax_i32, UInt32, Tuple{Ptr{UInt32}, UInt32}, ptr, val)
+    old = Base.llvmcall(ir_umax_i32, UInt32, Tuple{Ptr{UInt32}, UInt32}, ptr, val)
     old => max(old, val)
 end
 
@@ -254,14 +254,14 @@ end
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{Int32}, ::typeof(Atomix.right), val::Int32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old = Base.llvmcall(_ir_xchg_i32, Int32, Tuple{Ptr{Int32}, Int32}, ptr, val)
+    old = Base.llvmcall(ir_xchg_i32, Int32, Tuple{Ptr{Int32}, Int32}, ptr, val)
     old => val
 end
 
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{UInt32}, ::typeof(Atomix.right), val::UInt32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old = Base.llvmcall(_ir_xchg_i32, UInt32, Tuple{Ptr{UInt32}, UInt32}, ptr, val)
+    old = Base.llvmcall(ir_xchg_i32, UInt32, Tuple{Ptr{UInt32}, UInt32}, ptr, val)
     old => val
 end
 
@@ -270,7 +270,7 @@ end
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{Float32}, ::typeof(+), val::Float32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old_bits = Base.llvmcall(_ir_f32_cas, UInt32, Tuple{Ptr{Float32}, Float32}, ptr, val)
+    old_bits = Base.llvmcall(ir_f32_cas, UInt32, Tuple{Ptr{Float32}, Float32}, ptr, val)
     old = reinterpret(Float32, old_bits)
     old => old + val
 end

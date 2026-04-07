@@ -8,9 +8,9 @@
 
 # ── RT Builtin Mapping ──
 # Maps __spirv_BuiltIn* names to BuiltIn decoration IDs for RT shaders.
-# These are added to _SPIRV_BUILTIN_MAP at module load time.
+# These are added to SPIRV_BUILTIN_MAP at module load time.
 
-const _SPIRV_RT_BUILTIN_MAP = Dict{String, UInt32}(
+const SPIRV_RT_BUILTIN_MAP = Dict{String, UInt32}(
     # uvec3 builtins (raygen)
     "__spirv_BuiltInLaunchIdKHR"            => BuiltIn.LaunchIdKHR,
     "__spirv_BuiltInLaunchSizeKHR"          => BuiltIn.LaunchSizeKHR,
@@ -34,7 +34,7 @@ const _SPIRV_RT_BUILTIN_MAP = Dict{String, UInt32}(
 )
 
 # Register RT builtins in the global builtin map
-merge!(_SPIRV_BUILTIN_MAP, _SPIRV_RT_BUILTIN_MAP)
+merge!(SPIRV_BUILTIN_MAP, SPIRV_RT_BUILTIN_MAP)
 
 # ── RT Shader Stage Info ──
 
@@ -46,7 +46,7 @@ struct RTShaderStageInfo
     payload_sc::UInt32
 end
 
-const _RT_STAGE_INFO = Dict{Symbol, RTShaderStageInfo}(
+const RT_STAGE_INFO = Dict{Symbol, RTShaderStageInfo}(
     :raygen     => RTShaderStageInfo(ExecModel.RayGenerationKHR, SC.RayPayloadKHR),
     :closesthit => RTShaderStageInfo(ExecModel.ClosestHitKHR, SC.IncomingRayPayloadKHR),
     :miss       => RTShaderStageInfo(ExecModel.MissKHR, SC.IncomingRayPayloadKHR),
@@ -56,10 +56,10 @@ const _RT_STAGE_INFO = Dict{Symbol, RTShaderStageInfo}(
 )
 
 """
-    _emit_spirv_from_llvm_rt(llvm_mod, entry_name, stage; payload_type=:f32)
+    emit_spirv_from_llvm_rt(llvm_mod, entry_name, stage; payload_type=:f32)
 
 Emit SPIR-V from LLVM IR for a ray tracing shader stage.
-Same skeleton as `_emit_spirv_from_llvm` but:
+Same skeleton as `emit_spirv_from_llvm` but:
 1. Execution model = RT stage (RayGenerationKHR, ClosestHitKHR, MissKHR)
 2. No LocalSize execution mode
 3. RayTracingKHR capability + SPV_KHR_ray_tracing extension
@@ -67,9 +67,9 @@ Same skeleton as `_emit_spirv_from_llvm` but:
 5. Payload global variable (RayPayloadKHR or IncomingRayPayloadKHR)
 6. TLAS descriptor variable (for raygen — AccelerationStructureKHR)
 """
-function _emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
+function emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
                                    stage::Symbol; payload_type::Symbol=:f32)
-    stage_info = get(_RT_STAGE_INFO, stage, nothing)
+    stage_info = get(RT_STAGE_INFO, stage, nothing)
     stage_info === nothing && error("Unknown RT shader stage: $stage")
 
     # Build pointee type map (same as compute)
@@ -94,31 +94,31 @@ function _emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
     # Create emitter state
     state = SPIRVEmitterState(spirv_mod, type_ctx)
     state.data_layout = LLVM.datalayout(llvm_mod)
-    _active_data_layout[] = state.data_layout
+    ACTIVE_DATA_LAYOUT[] = state.data_layout
 
     # Find entry function
     entry_fn = LLVM.functions(llvm_mod)[entry_name]
 
     # Emit standard globals (push constants, builtins, constants)
-    interface_ids = _emit_globals!(state, llvm_mod)
+    interface_ids = emit_globals!(state, llvm_mod)
 
     # ── RT-specific globals ──
 
     # Create payload variable (Float32 for now)
-    payload_var_id = _emit_rt_payload_global!(state, stage_info.payload_sc, payload_type)
+    payload_var_id = emit_rt_payload_global!(state, stage_info.payload_sc, payload_type)
     push!(interface_ids, payload_var_id)
 
     # For raygen: create TLAS descriptor variable
     tlas_var_id = nothing
     if stage == :raygen
-        tlas_var_id = _emit_rt_tlas_descriptor!(state)
+        tlas_var_id = emit_rt_tlas_descriptor!(state)
         push!(interface_ids, tlas_var_id)
     end
 
     # For closesthit/anyhit: create hit attribute variable (vec2 barycentrics)
     hit_attrib_var_id = nothing
     if stage in (:closesthit, :anyhit, :intersection)
-        hit_attrib_var_id = _emit_rt_hit_attrib_global!(state)
+        hit_attrib_var_id = emit_rt_hit_attrib_global!(state)
         push!(interface_ids, hit_attrib_var_id)
     end
 
@@ -135,7 +135,7 @@ function _emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
     if n_params == 0
         func_id = emit_function!(state, entry_fn; is_entry=true)
     else
-        func_id = _emit_entry_wrapper!(state, entry_fn)
+        func_id = emit_entry_wrapper!(state, entry_fn)
     end
 
     # Entry point — RT execution model, no LocalSize
@@ -155,7 +155,7 @@ Create a payload global variable in the given storage class.
 For raygen: RayPayloadKHR (location 0)
 For closesthit/miss: IncomingRayPayloadKHR (location 0)
 """
-function _emit_rt_payload_global!(state::SPIRVEmitterState, storage_class::UInt32,
+function emit_rt_payload_global!(state::SPIRVEmitterState, storage_class::UInt32,
                                    payload_type::Symbol)
     mod = state.mod
 
@@ -196,7 +196,7 @@ Create the TLAS descriptor variable for raygen shaders.
 OpTypeAccelerationStructureKHR in UniformConstant storage class.
 Decorated with DescriptorSet=0, Binding=0.
 """
-function _emit_rt_tlas_descriptor!(state::SPIRVEmitterState)
+function emit_rt_tlas_descriptor!(state::SPIRVEmitterState)
     mod = state.mod
 
     # OpTypeAccelerationStructureKHR
@@ -226,12 +226,12 @@ end
 # ── OpTraceRayKHR Emission ──
 
 """
-Emit OpTraceRayKHR from a call to _lava_rt_trace_ray.
+Emit OpTraceRayKHR from a call to lava_rt_trace_ray.
 The call has 13 parameters (flags, mask, sbt_off, sbt_stride, miss_idx,
 ox, oy, oz, tmin, dx, dy, dz, tmax).
 The TLAS and payload are implicit (from RT globals).
 """
-function _emit_rt_trace_ray!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_rt_trace_ray!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
 
     # Get operand SPIR-V IDs
@@ -241,7 +241,7 @@ function _emit_rt_trace_ray!(state::SPIRVEmitterState, inst::LLVM.CallInst)
         push!(args, get_value_id!(state, arg))
     end
 
-    length(args) == 13 || error("_lava_rt_trace_ray expects 13 arguments, got $(length(args))")
+    length(args) == 13 || error("lava_rt_trace_ray expects 13 arguments, got $(length(args))")
 
     # Unpack: flags, mask, sbt_off, sbt_stride, miss_idx, ox, oy, oz, tmin, dx, dy, dz, tmax
     flags_id      = args[1]
@@ -298,9 +298,9 @@ end
 # ── Payload Load/Store Emission ──
 
 """
-Emit OpStore to the payload variable from _lava_rt_payload_store_f32.
+Emit OpStore to the payload variable from lava_rt_payload_store_f32.
 """
-function _emit_rt_payload_store!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_rt_payload_store!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     val = LLVM.operands(inst)[1]
     val_id = get_value_id!(state, val)
@@ -309,9 +309,9 @@ function _emit_rt_payload_store!(state::SPIRVEmitterState, inst::LLVM.CallInst)
 end
 
 """
-Emit OpLoad from the payload variable for _lava_rt_payload_load_f32.
+Emit OpLoad from the payload variable for lava_rt_payload_load_f32.
 """
-function _emit_rt_payload_load!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_rt_payload_load!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     payload_var = state.rt_payload_var_id
 
@@ -332,10 +332,10 @@ end
 # ── Indexed Payload Load/Store (for array payloads) ──
 
 """
-Emit OpAccessChain + OpStore for _lava_rt_payload_store_f32_at(val, idx).
+Emit OpAccessChain + OpStore for lava_rt_payload_store_f32_at(val, idx).
 Payload must be an array type (e.g., :f32_6).
 """
-function _emit_rt_payload_store_at!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_rt_payload_store_at!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     val = LLVM.operands(inst)[1]
     idx = LLVM.operands(inst)[2]
@@ -345,7 +345,7 @@ function _emit_rt_payload_store_at!(state::SPIRVEmitterState, inst::LLVM.CallIns
 
     # Get pointer to element: OpAccessChain
     f32_ty = emit_type_float!(mod, UInt32(32))
-    payload_sc = state.rt_payload_type == :f32 ? SC.RayPayloadKHR : _payload_sc_for_state(state)
+    payload_sc = state.rt_payload_type == :f32 ? SC.RayPayloadKHR : payload_sc_for_state(state)
     elem_ptr_ty = map_pointer_type!(state.type_ctx, f32_ty, payload_sc)
 
     ac_id = fresh_id!(mod)
@@ -355,16 +355,16 @@ function _emit_rt_payload_store_at!(state::SPIRVEmitterState, inst::LLVM.CallIns
 end
 
 """
-Emit OpAccessChain + OpLoad for _lava_rt_payload_load_f32_at(idx).
+Emit OpAccessChain + OpLoad for lava_rt_payload_load_f32_at(idx).
 """
-function _emit_rt_payload_load_at!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_rt_payload_load_at!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     idx = LLVM.operands(inst)[1]
     idx_id = get_value_id!(state, idx)
     payload_var = state.rt_payload_var_id
 
     f32_ty = emit_type_float!(mod, UInt32(32))
-    payload_sc = _payload_sc_for_state(state)
+    payload_sc = payload_sc_for_state(state)
     elem_ptr_ty = map_pointer_type!(state.type_ctx, f32_ty, payload_sc)
 
     ac_id = fresh_id!(mod)
@@ -378,7 +378,7 @@ function _emit_rt_payload_load_at!(state::SPIRVEmitterState, inst::LLVM.CallInst
 end
 
 """Get the payload storage class from the emitter state."""
-function _payload_sc_for_state(state::SPIRVEmitterState)
+function payload_sc_for_state(state::SPIRVEmitterState)
     # If rt_tlas_var_id is set, we're in raygen → RayPayloadKHR
     # Otherwise → IncomingRayPayloadKHR
     state.rt_tlas_var_id !== nothing ? SC.RayPayloadKHR : SC.IncomingRayPayloadKHR
@@ -391,7 +391,7 @@ Create a hit attribute global variable (vec2 float) in HitAttributeKHR storage c
 Only for closesthit/anyhit/intersection shaders.
 Contains barycentric coordinates (u, v) for triangle intersections.
 """
-function _emit_rt_hit_attrib_global!(state::SPIRVEmitterState)
+function emit_rt_hit_attrib_global!(state::SPIRVEmitterState)
     mod = state.mod
 
     f32_ty = emit_type_float!(mod, UInt32(32))
@@ -407,16 +407,16 @@ function _emit_rt_hit_attrib_global!(state::SPIRVEmitterState)
 end
 
 """
-Emit OpAccessChain + OpLoad for _lava_rt_hit_attrib_load_f32_at(idx).
+Emit OpAccessChain + OpLoad for lava_rt_hit_attrib_load_f32_at(idx).
 Reads a component from the HitAttributeKHR vec2 variable.
 """
-function _emit_rt_hit_attrib_load_at!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_rt_hit_attrib_load_at!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     idx = LLVM.operands(inst)[1]
     idx_id = get_value_id!(state, idx)
 
     hit_var = state.rt_hit_attrib_var_id
-    hit_var === nothing && error("_lava_rt_hit_attrib_load_f32_at requires HitAttributeKHR variable (only valid in closesthit/anyhit)")
+    hit_var === nothing && error("lava_rt_hit_attrib_load_f32_at requires HitAttributeKHR variable (only valid in closesthit/anyhit)")
 
     f32_ty = emit_type_float!(mod, UInt32(32))
     elem_ptr_ty = map_pointer_type!(state.type_ctx, f32_ty, SC.HitAttributeKHR)
@@ -437,7 +437,7 @@ end
 Emit OpIgnoreIntersectionKHR — block terminator in any-hit shaders.
 Rejects the current intersection and continues traversal.
 """
-function _emit_rt_ignore_intersection!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_rt_ignore_intersection!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     encode_instruction!(state.mod.functions, Op.OpIgnoreIntersectionKHR)
     state.rt_block_terminated = true
 end
@@ -446,7 +446,7 @@ end
 Emit OpTerminateRayKHR — block terminator in any-hit shaders.
 Accepts the current hit and stops traversal immediately.
 """
-function _emit_rt_terminate_ray!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+function emit_rt_terminate_ray!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     encode_instruction!(state.mod.functions, Op.OpTerminateRayKHR)
     state.rt_block_terminated = true
 end

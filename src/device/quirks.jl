@@ -67,15 +67,15 @@ end
 # Linear indexing: CartesianIndices{N}[linear_idx::Int] → CartesianIndex{N}
 # Computes _ind2sub without throws. Required for KA's expand() on 2D+ dispatch.
 @lava_device_override function Base.getindex(iter::CartesianIndices{N,R}, i::Int) where {N,R}
-    @inbounds _gpu_ind2sub(iter, i)
+    @inbounds gpu_ind2sub(iter, i)
 end
 
 # Convert 1-based linear index to CartesianIndex over CartesianIndices ranges
-@inline function _gpu_ind2sub(iter::CartesianIndices{0}, i::Int)
+@inline function gpu_ind2sub(iter::CartesianIndices{0}, i::Int)
     CartesianIndex()
 end
 
-@inline function _gpu_ind2sub(iter::CartesianIndices{1}, i::Int)
+@inline function gpu_ind2sub(iter::CartesianIndices{1}, i::Int)
     f = first(iter)
     @inbounds CartesianIndex(f[1] + i - 1)
 end
@@ -84,48 +84,48 @@ end
 # Julia's checked_sdiv_int / checked_srem_int generate div-by-zero and INT_MIN/-1 guards
 # that produce complex SPIR-V control flow patterns NVIDIA's shader compiler miscompiles.
 # All values here are non-negative for valid CartesianIndices, so unsigned ops are correct.
-_gpu_urem(a::Int, b::Int) = Base.bitcast(Int, Base.urem_int(Base.bitcast(UInt, a), Base.bitcast(UInt, b)))
-_gpu_udiv(a::Int, b::Int) = Base.bitcast(Int, Base.udiv_int(Base.bitcast(UInt, a), Base.bitcast(UInt, b)))
+gpu_urem(a::Int, b::Int) = Base.bitcast(Int, Base.urem_int(Base.bitcast(UInt, a), Base.bitcast(UInt, b)))
+gpu_udiv(a::Int, b::Int) = Base.bitcast(Int, Base.udiv_int(Base.bitcast(UInt, a), Base.bitcast(UInt, b)))
 
-@inline function _gpu_ind2sub(iter::CartesianIndices{2}, i::Int)
+@inline function gpu_ind2sub(iter::CartesianIndices{2}, i::Int)
     f = first(iter)
     s = size(iter)
     i0 = i - 1
     d1 = s[1]
-    j1 = _gpu_urem(i0, d1)
-    j2 = _gpu_udiv(i0, d1)
+    j1 = gpu_urem(i0, d1)
+    j2 = gpu_udiv(i0, d1)
     @inbounds CartesianIndex(f[1] + j1, f[2] + j2)
 end
 
-@inline function _gpu_ind2sub(iter::CartesianIndices{3}, i::Int)
+@inline function gpu_ind2sub(iter::CartesianIndices{3}, i::Int)
     f = first(iter)
     s = size(iter)
     i0 = i - 1
     d1 = s[1]
     d12 = d1 * s[2]
-    j1 = _gpu_urem(i0, d1)
-    j2 = _gpu_udiv(_gpu_urem(i0, d12), d1)
-    j3 = _gpu_udiv(i0, d12)
+    j1 = gpu_urem(i0, d1)
+    j2 = gpu_udiv(gpu_urem(i0, d12), d1)
+    j3 = gpu_udiv(i0, d12)
     @inbounds CartesianIndex(f[1] + j1, f[2] + j2, f[3] + j3)
 end
 
 # 4D
-@inline function _gpu_ind2sub(iter::CartesianIndices{4}, i::Int)
+@inline function gpu_ind2sub(iter::CartesianIndices{4}, i::Int)
     f = first(iter)
     s = size(iter)
     i0 = i - 1
     d1 = s[1]
     d12 = d1 * s[2]
     d123 = d12 * s[3]
-    j1 = _gpu_urem(i0, d1)
-    j2 = _gpu_udiv(_gpu_urem(i0, d12), d1)
-    j3 = _gpu_udiv(_gpu_urem(i0, d123), d12)
-    j4 = _gpu_udiv(i0, d123)
+    j1 = gpu_urem(i0, d1)
+    j2 = gpu_udiv(gpu_urem(i0, d12), d1)
+    j3 = gpu_udiv(gpu_urem(i0, d123), d12)
+    j4 = gpu_udiv(i0, d123)
     @inbounds CartesianIndex(f[1] + j1, f[2] + j2, f[3] + j3, f[4] + j4)
 end
 
 # Generic N-dimensional (for large N like 18D permutedims)
-@inline function _gpu_ind2sub(iter::CartesianIndices{N}, i::Int) where N
+@inline function gpu_ind2sub(iter::CartesianIndices{N}, i::Int) where N
     f = first(iter)
     s = size(iter)
     i0 = i - 1
@@ -135,7 +135,7 @@ end
         for k in 1:(d-1)
             stride *= s[k]
         end
-        f[d] + _gpu_urem(_gpu_udiv(i0, stride), s[d])
+        f[d] + gpu_urem(gpu_udiv(i0, stride), s[d])
     end
     @inbounds CartesianIndex(inds)
 end

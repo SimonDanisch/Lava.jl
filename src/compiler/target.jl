@@ -64,7 +64,7 @@ GPUCompiler.kernel_state_type(::LavaCompilerJob) = Nothing
 # llvm.spv.* intrinsics are used by the LLVM SPIR-V backend.
 # OpenCL-mangled names (_Z*) are registered dynamically by our intrinsics
 # module when @builtin_ccall is used.
-const known_intrinsics = String[]
+const KNOWN_INTRINSICS = String[]
 
 function GPUCompiler.isintrinsic(::LavaCompilerJob, fn::String)
     # LLVM SPIR-V intrinsics (used by the SPIR-V backend for workgroup/subgroup ops)
@@ -74,7 +74,7 @@ function GPUCompiler.isintrinsic(::LavaCompilerJob, fn::String)
     # RT intrinsics → SPIR-V emitter maps to OpTraceRayKHR, payload load/store
     startswith(fn, "_lava_rt_") && return true
     # OpenCL C++ mangled builtins (thread indices, barriers, math)
-    fn in known_intrinsics && return true
+    fn in KNOWN_INTRINSICS && return true
     return false
 end
 
@@ -88,7 +88,7 @@ function GPUCompiler.check_invocation(job::LavaCompilerJob)
         GPUCompiler.isghosttype(dt) && continue
         Core.Compiler.isconstType(dt) && continue
         fieldcount(dt) == 0 && continue
-        if !isbitstype(dt) && !_is_gpu_compatible(dt)
+        if !isbitstype(dt) && !is_gpu_compatible(dt)
             throw(GPUCompiler.KernelError(job, "passing non-bitstype argument",
                 """Argument $arg_i to your kernel function is of type $dt, which is not a bitstype:
                    $(GPUCompiler.explain_nonisbits(dt))
@@ -101,7 +101,7 @@ end
 
 # Check if a non-isbits type is still GPU-compatible by verifying all
 # non-isbits fields are zero-sized (will be elided by LLVM).
-function _is_gpu_compatible(@nospecialize(dt::Type))
+function is_gpu_compatible(@nospecialize(dt::Type))
     isbitstype(dt) && return true
     isabstracttype(dt) && return false
     try
@@ -119,14 +119,14 @@ function _is_gpu_compatible(@nospecialize(dt::Type))
             return false
         end
         # Recurse into non-isbits, non-zero-sized fields
-        _is_gpu_compatible(ft) || return false
+        is_gpu_compatible(ft) || return false
     end
     return true
 end
 
 # ── Compiler configuration cache ──
 
-const _compiler_configs = Dict{UInt, LavaCompilerConfig}()
+const COMPILER_CONFIGS = Dict{UInt, LavaCompilerConfig}()
 
 """
     lava_compiler_config(; workgroup_size=(64,1,1)) -> LavaCompilerConfig
@@ -141,16 +141,16 @@ GPUCompiler's SPIRVCompilerTarget with:
 """
 function lava_compiler_config(; workgroup_size::NTuple{3,Int} = (64, 1, 1), kwargs...)
     h = hash((workgroup_size, kwargs))
-    config = get(_compiler_configs, h, nothing)
+    config = get(COMPILER_CONFIGS, h, nothing)
     if config !== nothing
         return config
     end
-    config = _lava_compiler_config(; workgroup_size, kwargs...)
-    _compiler_configs[h] = config
+    config = lava_full_compiler_config(; workgroup_size, kwargs...)
+    COMPILER_CONFIGS[h] = config
     return config
 end
 
-@noinline function _lava_compiler_config(;
+@noinline function lava_full_compiler_config(;
         kernel = true,
         name = nothing,
         always_inline = true,

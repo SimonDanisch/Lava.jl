@@ -7,14 +7,14 @@
 # stack to work around AMD's proprietary Vulkan driver overflowing its internal
 # compiler stack when processing certain SPIR-V patterns.
 
-const _LARGE_STACK_PIPELINE = Sys.iswindows()
-const _LARGE_STACK_SIZE = 256 * 1024 * 1024  # 256 MB
+const LARGE_STACK_PIPELINE = Sys.iswindows()
+const LARGE_STACK_SIZE = 256 * 1024 * 1024  # 256 MB
 
-if _LARGE_STACK_PIPELINE
+if LARGE_STACK_PIPELINE
 
 struct _VkCreatePipelineArgs
     device::Ptr{Cvoid}
-    pipeline_cache::Ptr{Cvoid}
+    PIPELINE_CACHE::Ptr{Cvoid}
     create_info_count::UInt32
     _pad::UInt32
     p_create_infos::Ptr{Cvoid}
@@ -29,19 +29,19 @@ function vk_pipeline_thread_callback(args_ptr::Ptr{Cvoid})::UInt32
     result = ccall((:vkCreateComputePipelines, "vulkan-1"),
         Int32,
         (Ptr{Cvoid}, Ptr{Cvoid}, UInt32, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
-        args.device, args.pipeline_cache, args.create_info_count,
+        args.device, args.PIPELINE_CACHE, args.create_info_count,
         args.p_create_infos, args.p_allocator, args.p_pipelines)
     unsafe_store!(Ptr{Int32}(args_ptr + 48), result)
     return UInt32(0)
 end
 
-end # if _LARGE_STACK_PIPELINE
+end # if LARGE_STACK_PIPELINE
 
-const _pipeline_thread_cfunc = Ref{Ptr{Nothing}}(C_NULL)
+const PIPELINE_THREAD_CFUNC = Ref{Ptr{Nothing}}(C_NULL)
 
-if _LARGE_STACK_PIPELINE
+if LARGE_STACK_PIPELINE
 function init_pipeline_thread!()
-    _pipeline_thread_cfunc[] = @cfunction(vk_pipeline_thread_callback, UInt32, (Ptr{Cvoid},))
+    PIPELINE_THREAD_CFUNC[] = @cfunction(vk_pipeline_thread_callback, UInt32, (Ptr{Cvoid},))
 end
 else
 init_pipeline_thread!() = nothing
@@ -59,7 +59,7 @@ function create_compute_pipeline_large_stack(device::Ptr{Cvoid}, create_info_ptr
         thread_id = Ref(UInt32(0))
         handle = ccall((:CreateThread, "kernel32"), Ptr{Cvoid},
             (Ptr{Cvoid}, Csize_t, Ptr{Cvoid}, Ptr{Cvoid}, UInt32, Ptr{UInt32}),
-            C_NULL, _LARGE_STACK_SIZE, _pipeline_thread_cfunc[], args_ptr,
+            C_NULL, LARGE_STACK_SIZE, PIPELINE_THREAD_CFUNC[], args_ptr,
             UInt32(0), thread_id)
         handle == C_NULL && error("CreateThread failed for vkCreateComputePipelines")
         # 60 second timeout — AMD's Windows driver can hang on certain SPIR-V patterns
@@ -88,14 +88,14 @@ struct LavaComputePipeline
     push_constant_size::UInt32
 end
 
-const _pipeline_cache = Dict{UInt64, LavaComputePipeline}()
-const _pipeline_insertion_order = UInt64[]
-const _max_pipeline_cache_size = Ref(1024)
+const PIPELINE_CACHE = Dict{UInt64, LavaComputePipeline}()
+const PIPELINE_INSERTION_ORDER = UInt64[]
+const MAX_PIPELINE_CACHE_SIZE = Ref(1024)
 
 # Register cleanup callback for vk_reset_device!
-push!(_reset_callbacks, function()
-    empty!(_pipeline_cache)
-    empty!(_pipeline_insertion_order)
+push!(RESET_CALLBACKS, function()
+    empty!(PIPELINE_CACHE)
+    empty!(PIPELINE_INSERTION_ORDER)
 end)
 
 """
@@ -108,7 +108,7 @@ Validates SPIR-V before creating the shader module.
 function get_compute_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String;
                                push_constant_size::Integer=8)
     cache_key = hash((spirv_bytes, entry_name, push_constant_size))
-    cached = get(_pipeline_cache, cache_key, nothing)
+    cached = get(PIPELINE_CACHE, cache_key, nothing)
     if cached !== nothing
         return cached
     end
@@ -150,12 +150,12 @@ function get_compute_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String;
     pipeline = create_compute_pipeline(dev, ci)
 
     result = LavaComputePipeline(shader_mod, layout, pipeline, UInt32(push_constant_size))
-    _pipeline_cache[cache_key] = result
-    push!(_pipeline_insertion_order, cache_key)
-    while length(_pipeline_insertion_order) > _max_pipeline_cache_size[]
-        old_key = popfirst!(_pipeline_insertion_order)
-        evicted = get(_pipeline_cache, old_key, nothing)
-        delete!(_pipeline_cache, old_key)
+    PIPELINE_CACHE[cache_key] = result
+    push!(PIPELINE_INSERTION_ORDER, cache_key)
+    while length(PIPELINE_INSERTION_ORDER) > MAX_PIPELINE_CACHE_SIZE[]
+        old_key = popfirst!(PIPELINE_INSERTION_ORDER)
+        evicted = get(PIPELINE_CACHE, old_key, nothing)
+        delete!(PIPELINE_CACHE, old_key)
         # Keep evicted pipeline alive until the current batch flushes —
         # it may still be referenced by an in-flight command buffer.
         if evicted !== nothing
@@ -169,7 +169,7 @@ function get_compute_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String;
 end
 
 function create_compute_pipeline(dev::Vulkan.Device, ci::Vulkan.ComputePipelineCreateInfo)
-    if _LARGE_STACK_PIPELINE
+    if LARGE_STACK_PIPELINE
         ci_low = convert(Vulkan._ComputePipelineCreateInfo, ci)
         vk_ci_ref = Ref(ci_low.vks)
         pipeline_out = Ref(Ptr{Cvoid}(C_NULL))

@@ -327,7 +327,7 @@ function create_scratch_buffer(ctx::VkContext, nbytes)
     return buf, memory, addr
 end
 
-const _VkBRI = Vulkan.VulkanCore.LibVulkan.VkAccelerationStructureBuildRangeInfoKHR
+const VkBRI = Vulkan.VulkanCore.LibVulkan.VkAccelerationStructureBuildRangeInfoKHR
 
 # VulkanCore.jl alignment bug: VkDeviceOrHostAddressConstKHR is NTuple{8,UInt8} (alignment 1)
 # but in C it's a union of uint64_t/void* (alignment 8). This causes misaligned fields in:
@@ -335,14 +335,14 @@ const _VkBRI = Vulkan.VulkanCore.LibVulkan.VkAccelerationStructureBuildRangeInfo
 #   VkAccelerationStructureGeometryDataKHR:   geometry union at offset 20 vs C offset 24
 # We construct all AS-related C structs manually with correct field offsets.
 
-const _C_SIZEOF_AS_GEOMETRY_KHR = 96
+const C_SIZEOF_AS_GEOMETRY_KHR = 96
 
 # VkStructureType values
-const _VK_STYPE_BGI = Int32(1000150000)   # BUILD_GEOMETRY_INFO
-const _VK_STYPE_SIZES = Int32(1000150020) # BUILD_SIZES_INFO (VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR)
-const _VK_STYPE_GEO = Int32(1000150006)   # GEOMETRY
-const _VK_STYPE_TRI = Int32(1000150005)   # GEOMETRY_TRIANGLES_DATA
-const _VK_STYPE_INST = Int32(1000150004)  # GEOMETRY_INSTANCES_DATA
+const VK_STYPE_BGI = Int32(1000150000)   # BUILD_GEOMETRY_INFO
+const VK_STYPE_SIZES = Int32(1000150020) # BUILD_SIZES_INFO (VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR)
+const VK_STYPE_GEO = Int32(1000150006)   # GEOMETRY
+const VK_STYPE_TRI = Int32(1000150005)   # GEOMETRY_TRIANGLES_DATA
+const VK_STYPE_INST = Int32(1000150004)  # GEOMETRY_INSTANCES_DATA
 
 """Pack VkAccelerationStructureGeometryKHR (96 bytes, correct C layout) into `buf`.
 
@@ -363,14 +363,14 @@ function pack_geometry!(buf::Vector{UInt8}, offset::Int;
         instance_addr::UInt64=UInt64(0),
         geo_flags::UInt32=UInt32(0))
     p = pointer(buf, offset + 1)
-    unsafe_store!(Ptr{Int32}(p), _VK_STYPE_GEO)           # sType @ 0
+    unsafe_store!(Ptr{Int32}(p), VK_STYPE_GEO)           # sType @ 0
     unsafe_store!(Ptr{Ptr{Nothing}}(p + 8), C_NULL)         # pNext @ 8
 
     q = p + 24  # geometry union start
     if geometry_type == :triangles
         unsafe_store!(Ptr{UInt32}(p + 16), UInt32(0))       # geometryType = TRIANGLES @ 16
         # Triangles sub-struct within union
-        unsafe_store!(Ptr{Int32}(q), _VK_STYPE_TRI)                  # sType @ 0
+        unsafe_store!(Ptr{Int32}(q), VK_STYPE_TRI)                  # sType @ 0
         unsafe_store!(Ptr{Ptr{Nothing}}(q + 8), C_NULL)              # pNext @ 8
         unsafe_store!(Ptr{UInt32}(q + 16), vertex_format)            # vertexFormat @ 16
         unsafe_store!(Ptr{UInt64}(q + 24), vertex_addr)              # vertexData @ 24
@@ -382,7 +382,7 @@ function pack_geometry!(buf::Vector{UInt8}, offset::Int;
     elseif geometry_type == :instances
         unsafe_store!(Ptr{UInt32}(p + 16), UInt32(2))       # geometryType = INSTANCES (VK_GEOMETRY_TYPE_INSTANCES_KHR=2) @ 16
         # Instances sub-struct within union
-        unsafe_store!(Ptr{Int32}(q), _VK_STYPE_INST)                 # sType @ 0
+        unsafe_store!(Ptr{Int32}(q), VK_STYPE_INST)                 # sType @ 0
         unsafe_store!(Ptr{Ptr{Nothing}}(q + 8), C_NULL)              # pNext @ 8
         unsafe_store!(Ptr{UInt32}(q + 16), UInt32(0))                # arrayOfPointers @ 16
         unsafe_store!(Ptr{UInt64}(q + 24), instance_addr)            # data @ 24
@@ -402,7 +402,7 @@ function pack_build_geometry_info!(buf::Vector{UInt8}, offset::Int;
         p_geometries::Ptr{Nothing}=C_NULL,
         scratch_addr::UInt64=UInt64(0))
     p = pointer(buf, offset + 1)
-    unsafe_store!(Ptr{Int32}(p), _VK_STYPE_BGI)              # sType @ 0
+    unsafe_store!(Ptr{Int32}(p), VK_STYPE_BGI)              # sType @ 0
     unsafe_store!(Ptr{Ptr{Nothing}}(p + 8), C_NULL)           # pNext @ 8
     unsafe_store!(Ptr{UInt32}(p + 16), as_type)               # type @ 16
     unsafe_store!(Ptr{UInt32}(p + 20), build_flags)           # flags @ 20
@@ -424,7 +424,7 @@ VulkanCore.jl alignment bug in VkAccelerationStructureGeometryKHR.
 function query_as_build_sizes(dev::Vulkan.Device; as_type::UInt32,
         build_flags::UInt32=UInt32(0), max_primitive_count::UInt32=UInt32(0),
         kwargs...)
-    geo_buf = zeros(UInt8, _C_SIZEOF_AS_GEOMETRY_KHR)
+    geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
     pack_geometry!(geo_buf, 0; kwargs...)
 
     bgi_buf = zeros(UInt8, 80)
@@ -432,7 +432,7 @@ function query_as_build_sizes(dev::Vulkan.Device; as_type::UInt32,
     # Output struct: VkAccelerationStructureBuildSizesInfoKHR
     # sType(4) + pad(4) + pNext(8) + accelerationStructureSize(8) + updateScratchSize(8) + buildScratchSize(8) = 40
     sizes_buf = zeros(UInt8, 40)
-    unsafe_store!(Ptr{Int32}(pointer(sizes_buf)), _VK_STYPE_SIZES)
+    unsafe_store!(Ptr{Int32}(pointer(sizes_buf)), VK_STYPE_SIZES)
 
     fptr = Vulkan.function_pointer(dev, "vkGetAccelerationStructureBuildSizesKHR")
 
@@ -550,14 +550,14 @@ function build_as_on_gpu(ctx::ASBuildContext, accel::Vulkan.AccelerationStructur
     cmd = ctx.cmd_buf
 
     # Pack geometry (96 bytes, correct C layout)
-    geo_buf = zeros(UInt8, _C_SIZEOF_AS_GEOMETRY_KHR)
+    geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
     pack_geometry!(geo_buf, 0; kwargs...)
 
     # Pack build geometry info (80 bytes)
     bgi_buf = zeros(UInt8, 80)
 
     # Pack range info (16 bytes)
-    c_range = _VkBRI(primitive_count, UInt32(0), UInt32(0), UInt32(0))
+    c_range = VkBRI(primitive_count, UInt32(0), UInt32(0), UInt32(0))
 
     fptr = Vulkan.function_pointer(ctx.device, "vkCmdBuildAccelerationStructuresKHR")
 
@@ -591,7 +591,7 @@ function build_as_on_gpu(ctx::ASBuildContext, accel::Vulkan.AccelerationStructur
             ccall(fptr, Cvoid,
                 (Ptr{Nothing}, UInt32,
                  Ptr{Nothing},
-                 Ptr{Ptr{_VkBRI}}),
+                 Ptr{Ptr{VkBRI}}),
                 cmd.vks, UInt32(1),
                 pointer(bgi_buf),
                 pp_ranges)

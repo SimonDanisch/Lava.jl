@@ -12,7 +12,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
     @testset "basic closest hit" begin
         function basic_chit()
             t = Lava.lava_rt_ray_tmax()
-            Lava._lava_rt_payload_store_f32(t)
+            Lava.lava_rt_payload_store_f32(t)
             return nothing
         end
         d, _ = compile_and_disasm(basic_chit, Tuple{};
@@ -31,7 +31,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
             prim = Lava.lava_rt_primitive_id()
             inst = Lava.lava_rt_instance_custom_index()
             kind = Lava.lava_rt_hit_kind()
-            Lava._lava_rt_payload_store_f32(Float32(prim + inst + kind))
+            Lava.lava_rt_payload_store_f32(Float32(prim + inst + kind))
             return nothing
         end
         d, _ = compile_and_disasm(chit_builtins, Tuple{};
@@ -45,7 +45,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         function chit_bary()
             u = Lava.lava_rt_hit_bary_u()
             v = Lava.lava_rt_hit_bary_v()
-            Lava._lava_rt_payload_store_f32(u + v)
+            Lava.lava_rt_payload_store_f32(u + v)
             return nothing
         end
         d, _ = compile_and_disasm(chit_bary, Tuple{};
@@ -57,8 +57,8 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         function chit_multi()
             t = Lava.lava_rt_ray_tmax()
             prim = Lava.lava_rt_primitive_id()
-            Lava._lava_rt_payload_store_f32_at(t, UInt32(0))
-            Lava._lava_rt_payload_store_f32_at(Float32(prim), UInt32(1))
+            Lava.lava_rt_payload_store_f32_at(t, UInt32(0))
+            Lava.lava_rt_payload_store_f32_at(Float32(prim), UInt32(1))
             return nothing
         end
         d, _ = compile_and_disasm(chit_multi, Tuple{};

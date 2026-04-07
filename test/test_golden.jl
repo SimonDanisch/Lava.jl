@@ -66,14 +66,14 @@ const GOLDEN_DIR = joinpath(@__DIR__, "golden")
     @testset "raygen_simple" begin
         function raygen_simple(output)
             ix = Lava.lava_rt_launch_id_x()
-            Lava._lava_rt_payload_store_f32(0.0f0)
-            Lava._lava_rt_trace_ray(
+            Lava.lava_rt_payload_store_f32(0.0f0)
+            Lava.lava_rt_trace_ray(
                 UInt32(0), UInt32(0xFF),
                 UInt32(0), UInt32(0), UInt32(0),
                 0.0f0, 0.0f0, -1.0f0, 0.001f0,
                 0.0f0, 0.0f0, 1.0f0, 100.0f0
             )
-            result = Lava._lava_rt_payload_load_f32()
+            result = Lava.lava_rt_payload_load_f32()
             @inbounds output[ix + UInt32(1)] = result
             return nothing
         end
@@ -86,7 +86,7 @@ const GOLDEN_DIR = joinpath(@__DIR__, "golden")
     @testset "closesthit_simple" begin
         function chit_simple()
             t = Lava.lava_rt_ray_tmax()
-            Lava._lava_rt_payload_store_f32(t)
+            Lava.lava_rt_payload_store_f32(t)
             return nothing
         end
         _, bytes = compile_and_disasm(chit_simple, Tuple{};
@@ -96,7 +96,7 @@ const GOLDEN_DIR = joinpath(@__DIR__, "golden")
 
     @testset "miss_simple" begin
         function miss_simple()
-            Lava._lava_rt_payload_store_f32(-1.0f0)
+            Lava.lava_rt_payload_store_f32(-1.0f0)
             return nothing
         end
         _, bytes = compile_and_disasm(miss_simple, Tuple{};

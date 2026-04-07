@@ -171,29 +171,29 @@ end
 import LinearAlgebra
 
 # Float16/Float32: accumulate in Float64 to avoid overflow entirely (no rescaling needed)
-function _lava_norm_p2_widen(v::LavaArray{T}) where T
+function lava_norm_p2_widen(v::LavaArray{T}) where T
     s = sum(x -> Float64(abs(x))^2, v; init=Float64(0))
     return typeof(float(LinearAlgebra.norm(zero(T))))(sqrt(s))
 end
 
-function _lava_norm_p1_widen(v::LavaArray{T}) where T
+function lava_norm_p1_widen(v::LavaArray{T}) where T
     s = sum(x -> Float64(abs(x)), v; init=Float64(0))
     return typeof(float(LinearAlgebra.norm(zero(T))))(s)
 end
 
-function _lava_norm_pp_widen(v::LavaArray{T}, spp::Float64) where T
+function lava_norm_pp_widen(v::LavaArray{T}, spp::Float64) where T
     # Use exp2(p*log2(x)) instead of x^p to avoid ^ operator dispatch issues on GPU
     s = sum(x -> exp2(spp * log2(Float64(abs(x)))), v; init=Float64(0))
     return typeof(float(LinearAlgebra.norm(zero(T))))(exp2(inv(spp) * log2(s)))
 end
 
 # Float64: rescale by inv_maxabs to avoid overflow
-function _lava_norm_p2_rescale(v::LavaArray{T}, inv_maxabs::Float64, maxabs::Float64) where T
+function lava_norm_p2_rescale(v::LavaArray{T}, inv_maxabs::Float64, maxabs::Float64) where T
     s = sum(x -> (abs(x) * inv_maxabs)^2, v; init=Float64(0))
     return typeof(float(LinearAlgebra.norm(zero(T))))(maxabs * sqrt(s))
 end
 
-function _lava_norm_pp_rescale(v::LavaArray{T}, inv_maxabs::Float64, maxabs::Float64, spp::Float64) where T
+function lava_norm_pp_rescale(v::LavaArray{T}, inv_maxabs::Float64, maxabs::Float64, spp::Float64) where T
     # Use exp2(p*log2(x)) instead of x^p to avoid ^ operator dispatch issues on GPU
     s = sum(x -> exp2(spp * log2(abs(x) * inv_maxabs)), v; init=Float64(0))
     return typeof(float(LinearAlgebra.norm(zero(T))))(maxabs * exp2(inv(spp) * log2(s)))
@@ -212,9 +212,9 @@ function LinearAlgebra.norm(v::LavaArray{T}, p::Real=2) where T
 
     # Float16/Float32/ComplexF16/ComplexF32: accumulate in Float64 (no overflow possible)
     if RT === Float32 || RT === Float16
-        p == 2 && return _lava_norm_p2_widen(v)
-        p == 1 && return _lava_norm_p1_widen(v)
-        return _lava_norm_pp_widen(v, Float64(p))
+        p == 2 && return lava_norm_p2_widen(v)
+        p == 1 && return lava_norm_p1_widen(v)
+        return lava_norm_pp_widen(v, Float64(p))
     end
 
     # Float64/ComplexF64: rescale by max to avoid overflow
@@ -228,7 +228,7 @@ function LinearAlgebra.norm(v::LavaArray{T}, p::Real=2) where T
     end
 
     inv_maxabs = 1.0 / maxabs
-    p == 2 && return _lava_norm_p2_rescale(v, inv_maxabs, maxabs)
+    p == 2 && return lava_norm_p2_rescale(v, inv_maxabs, maxabs)
     p == 1 && return convert(RT, sum(abs, v; init=Float64(0)))
-    return _lava_norm_pp_rescale(v, inv_maxabs, maxabs, Float64(p))
+    return lava_norm_pp_rescale(v, inv_maxabs, maxabs, Float64(p))
 end

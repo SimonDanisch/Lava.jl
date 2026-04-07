@@ -5,7 +5,7 @@
 # `OpUConvert %uint %ulong` followed by `OpBitcast %float %uint`.
 #
 # Root cause: The Pointee Type Map (PTM) resolves the trunc i64→i32 result type to `float`
-# because the only user of the trunc is a `bitcast i32 to float`. The _emit_conversion!
+# because the only user of the trunc is a `bitcast i32 to float`. The emit_conversion!
 # function then uses this PTM-resolved type as the OpUConvert result type, which is invalid
 # (OpUConvert requires integer result type).
 #

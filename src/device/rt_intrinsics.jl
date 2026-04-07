@@ -5,7 +5,7 @@
 # globals with __spirv_BuiltIn* names. The SPIR-V emitter recognizes these
 # and creates Input variables with BuiltIn decorations.
 #
-# RT-specific intrinsics (_lava_rt_trace_ray) use addrspace(8) globals
+# RT-specific intrinsics (lava_rt_trace_ray) use addrspace(8) globals
 # for payload and addrspace(9) for acceleration structure descriptors.
 # The RT emitter handles these specially.
 
@@ -13,12 +13,12 @@
 # Available in raygen shaders: LaunchIdKHR, LaunchSizeKHR
 # Available in hit/miss shaders: WorldRayOriginKHR, WorldRayDirectionKHR, etc.
 
-const _RT_BUILTIN_3D_U32 = (
+const RT_BUILTIN_3D_U32 = (
     :lava_rt_launch_id       => :__spirv_BuiltInLaunchIdKHR,
     :lava_rt_launch_size     => :__spirv_BuiltInLaunchSizeKHR,
 )
 
-for (jl_name, spirv_name) in _RT_BUILTIN_3D_U32
+for (jl_name, spirv_name) in RT_BUILTIN_3D_U32
     gvar = "@$spirv_name"
     ir = """
         $gvar = external addrspace(7) global <3 x i32>
@@ -44,14 +44,14 @@ end
 # Available in closest-hit/miss: WorldRayOriginKHR, WorldRayDirectionKHR,
 # ObjectRayOriginKHR, ObjectRayDirectionKHR
 
-const _RT_BUILTIN_3D_F32 = (
+const RT_BUILTIN_3D_F32 = (
     :lava_rt_world_ray_origin    => :__spirv_BuiltInWorldRayOriginKHR,
     :lava_rt_world_ray_direction => :__spirv_BuiltInWorldRayDirectionKHR,
     :lava_rt_object_ray_origin   => :__spirv_BuiltInObjectRayOriginKHR,
     :lava_rt_object_ray_direction => :__spirv_BuiltInObjectRayDirectionKHR,
 )
 
-for (jl_name, spirv_name) in _RT_BUILTIN_3D_F32
+for (jl_name, spirv_name) in RT_BUILTIN_3D_F32
     gvar = "@$spirv_name"
     ir = """
         $gvar = external addrspace(7) global <3 x float>
@@ -80,12 +80,12 @@ end
 # PrimitiveId (uint) — available in intersection/anyhit/closesthit
 # InstanceId (uint) — available in intersection/anyhit/closesthit
 
-const _RT_BUILTIN_SCALAR_F32 = (
+const RT_BUILTIN_SCALAR_F32 = (
     :lava_rt_ray_tmin  => :__spirv_BuiltInRayTminKHR,
     :lava_rt_ray_tmax  => :__spirv_BuiltInRayTmaxKHR,
 )
 
-for (jl_name, spirv_name) in _RT_BUILTIN_SCALAR_F32
+for (jl_name, spirv_name) in RT_BUILTIN_SCALAR_F32
     gvar = "@$spirv_name"
     ir = """
         $gvar = external addrspace(7) global float
@@ -100,7 +100,7 @@ for (jl_name, spirv_name) in _RT_BUILTIN_SCALAR_F32
     end
 end
 
-const _RT_BUILTIN_SCALAR_U32 = (
+const RT_BUILTIN_SCALAR_U32 = (
     :lava_rt_hit_kind             => :__spirv_BuiltInHitKindKHR,
     :lava_rt_instance_custom_index => :__spirv_BuiltInInstanceCustomIndexKHR,
     :lava_rt_primitive_id         => :__spirv_BuiltInPrimitiveId,
@@ -108,7 +108,7 @@ const _RT_BUILTIN_SCALAR_U32 = (
     :lava_rt_incoming_ray_flags   => :__spirv_BuiltInIncomingRayFlagsKHR,
 )
 
-for (jl_name, spirv_name) in _RT_BUILTIN_SCALAR_U32
+for (jl_name, spirv_name) in RT_BUILTIN_SCALAR_U32
     gvar = "@$spirv_name"
     ir = """
         $gvar = external addrspace(7) global i32
@@ -128,12 +128,12 @@ end
 # Available in intersection/anyhit/closesthit
 # We expose individual element access: lava_rt_object_to_world(row, col)
 
-const _RT_BUILTIN_MAT4X3 = (
+const RT_BUILTIN_MAT4X3 = (
     :lava_rt_object_to_world => :__spirv_BuiltInObjectToWorldKHR,
     :lava_rt_world_to_object => :__spirv_BuiltInWorldToObjectKHR,
 )
 
-for (jl_name, spirv_name) in _RT_BUILTIN_MAT4X3
+for (jl_name, spirv_name) in RT_BUILTIN_MAT4X3
     gvar = "@$spirv_name"
     # SPIR-V mat4x3 = 4 columns of vec3 = [12 x float]
     # Access as flat array: index = col * 3 + row
@@ -152,7 +152,7 @@ for (jl_name, spirv_name) in _RT_BUILTIN_MAT4X3
 end
 
 # ── OpTraceRayKHR Intrinsic ──
-# This is the main RT trace call. The emitter recognizes "_lava_rt_trace_ray"
+# This is the main RT trace call. The emitter recognizes "lava_rt_trace_ray"
 # and emits OpTraceRayKHR.
 #
 # SPIR-V signature: OpTraceRayKHR %accel %ray_flags %cull_mask
@@ -166,14 +166,14 @@ end
 # The function is a no-op at LLVM level — the emitter replaces the call
 # with OpTraceRayKHR referencing the implicit TLAS and payload variables.
 
-@inline function _lava_rt_trace_ray(
+@inline function lava_rt_trace_ray(
     ray_flags::UInt32, cull_mask::UInt32,
     sbt_offset::UInt32, sbt_stride::UInt32, miss_index::UInt32,
     origin_x::Float32, origin_y::Float32, origin_z::Float32, tmin::Float32,
     dir_x::Float32, dir_y::Float32, dir_z::Float32, tmax::Float32
 )
     Base.llvmcall(("""
-        declare void @_lava_rt_trace_ray(
+        declare void @lava_rt_trace_ray(
             i32, i32, i32, i32, i32,
             float, float, float, float,
             float, float, float, float) #0
@@ -181,7 +181,7 @@ end
             i32 %flags, i32 %mask, i32 %sbt_off, i32 %sbt_stride, i32 %miss_idx,
             float %ox, float %oy, float %oz, float %tmin,
             float %dx, float %dy, float %dz, float %tmax) #0 {
-            call void @_lava_rt_trace_ray(
+            call void @lava_rt_trace_ray(
                 i32 %flags, i32 %mask, i32 %sbt_off, i32 %sbt_stride, i32 %miss_idx,
                 float %ox, float %oy, float %oz, float %tmin,
                 float %dx, float %dy, float %dz, float %tmax)
@@ -203,7 +203,7 @@ end
     origin_x::Float32, origin_y::Float32, origin_z::Float32, tmin::Float32,
     dir_x::Float32, dir_y::Float32, dir_z::Float32, tmax::Float32
 )
-    _lava_rt_trace_ray(
+    lava_rt_trace_ray(
         ray_flags, cull_mask, sbt_offset, sbt_stride, miss_index,
         origin_x, origin_y, origin_z, tmin,
         dir_x, dir_y, dir_z, tmax)
@@ -214,22 +214,22 @@ end
 # The emitter maps these to OpLoad/OpStore on the RayPayloadKHR or
 # IncomingRayPayloadKHR variable.
 
-@inline function _lava_rt_payload_store_f32(val::Float32)
+@inline function lava_rt_payload_store_f32(val::Float32)
     Base.llvmcall(("""
-        declare void @_lava_rt_payload_store_f32(float) #0
+        declare void @lava_rt_payload_store_f32(float) #0
         define void @entry(float %val) #0 {
-            call void @_lava_rt_payload_store_f32(float %val)
+            call void @lava_rt_payload_store_f32(float %val)
             ret void
         }
         attributes #0 = { alwaysinline }
     """, "entry"), Cvoid, Tuple{Float32}, val)
 end
 
-@inline function _lava_rt_payload_load_f32()
+@inline function lava_rt_payload_load_f32()
     Base.llvmcall(("""
-        declare float @_lava_rt_payload_load_f32() #0
+        declare float @lava_rt_payload_load_f32() #0
         define float @entry() #0 {
-            %val = call float @_lava_rt_payload_load_f32()
+            %val = call float @lava_rt_payload_load_f32()
             ret float %val
         }
         attributes #0 = { alwaysinline }
@@ -240,22 +240,22 @@ end
 # For multi-field payloads (payload_type = :f32_N).
 # Store/load at a specific index in the payload array.
 
-@inline function _lava_rt_payload_store_f32_at(val::Float32, idx::UInt32)
+@inline function lava_rt_payload_store_f32_at(val::Float32, idx::UInt32)
     Base.llvmcall(("""
-        declare void @_lava_rt_payload_store_f32_at(float, i32) #0
+        declare void @lava_rt_payload_store_f32_at(float, i32) #0
         define void @entry(float %val, i32 %idx) #0 {
-            call void @_lava_rt_payload_store_f32_at(float %val, i32 %idx)
+            call void @lava_rt_payload_store_f32_at(float %val, i32 %idx)
             ret void
         }
         attributes #0 = { alwaysinline }
     """, "entry"), Cvoid, Tuple{Float32, UInt32}, val, idx)
 end
 
-@inline function _lava_rt_payload_load_f32_at(idx::UInt32)
+@inline function lava_rt_payload_load_f32_at(idx::UInt32)
     Base.llvmcall(("""
-        declare float @_lava_rt_payload_load_f32_at(i32) #0
+        declare float @lava_rt_payload_load_f32_at(i32) #0
         define float @entry(i32 %idx) #0 {
-            %val = call float @_lava_rt_payload_load_f32_at(i32 %idx)
+            %val = call float @lava_rt_payload_load_f32_at(i32 %idx)
             ret float %val
         }
         attributes #0 = { alwaysinline }
@@ -266,11 +266,11 @@ end
 # In closesthit shaders, gl_HitAttributeEXT contains vec2 barycentrics (u, v).
 # w = 1 - u - v is the weight for vertex 0.
 
-@inline function _lava_rt_hit_attrib_load_f32_at(idx::UInt32)
+@inline function lava_rt_hit_attrib_load_f32_at(idx::UInt32)
     Base.llvmcall(("""
-        declare float @_lava_rt_hit_attrib_load_f32_at(i32) #0
+        declare float @lava_rt_hit_attrib_load_f32_at(i32) #0
         define float @entry(i32 %idx) #0 {
-            %val = call float @_lava_rt_hit_attrib_load_f32_at(i32 %idx)
+            %val = call float @lava_rt_hit_attrib_load_f32_at(i32 %idx)
             ret float %val
         }
         attributes #0 = { alwaysinline }
@@ -278,30 +278,30 @@ end
 end
 
 # Convenience wrappers
-@inline lava_rt_hit_bary_u() = _lava_rt_hit_attrib_load_f32_at(UInt32(0))
-@inline lava_rt_hit_bary_v() = _lava_rt_hit_attrib_load_f32_at(UInt32(1))
+@inline lava_rt_hit_bary_u() = lava_rt_hit_attrib_load_f32_at(UInt32(0))
+@inline lava_rt_hit_bary_v() = lava_rt_hit_attrib_load_f32_at(UInt32(1))
 
 # ── OpIgnoreIntersectionKHR / OpTerminateRayKHR Intrinsics ──
 # These are SPIR-V block terminators — valid only in any-hit shaders.
 # OpIgnoreIntersectionKHR: reject the current intersection, continue traversal.
 # OpTerminateRayKHR: accept the current hit and stop traversal immediately.
 
-@inline function _lava_rt_ignore_intersection()
+@inline function lava_rt_ignore_intersection()
     Base.llvmcall(("""
-        declare void @_lava_rt_ignore_intersection() #0
+        declare void @lava_rt_ignore_intersection() #0
         define void @entry() #0 {
-            call void @_lava_rt_ignore_intersection()
+            call void @lava_rt_ignore_intersection()
             ret void
         }
         attributes #0 = { alwaysinline }
     """, "entry"), Cvoid, Tuple{})
 end
 
-@inline function _lava_rt_terminate_ray()
+@inline function lava_rt_terminate_ray()
     Base.llvmcall(("""
-        declare void @_lava_rt_terminate_ray() #0
+        declare void @lava_rt_terminate_ray() #0
         define void @entry() #0 {
-            call void @_lava_rt_terminate_ray()
+            call void @lava_rt_terminate_ray()
             ret void
         }
         attributes #0 = { alwaysinline }
@@ -309,11 +309,11 @@ end
 end
 
 # Register RT intrinsic names for GPUCompiler validation
-push!(known_intrinsics, "_lava_rt_trace_ray")
-push!(known_intrinsics, "_lava_rt_payload_store_f32")
-push!(known_intrinsics, "_lava_rt_payload_load_f32")
-push!(known_intrinsics, "_lava_rt_payload_store_f32_at")
-push!(known_intrinsics, "_lava_rt_payload_load_f32_at")
-push!(known_intrinsics, "_lava_rt_hit_attrib_load_f32_at")
-push!(known_intrinsics, "_lava_rt_ignore_intersection")
-push!(known_intrinsics, "_lava_rt_terminate_ray")
+push!(KNOWN_INTRINSICS, "lava_rt_trace_ray")
+push!(KNOWN_INTRINSICS, "lava_rt_payload_store_f32")
+push!(KNOWN_INTRINSICS, "lava_rt_payload_load_f32")
+push!(KNOWN_INTRINSICS, "lava_rt_payload_store_f32_at")
+push!(KNOWN_INTRINSICS, "lava_rt_payload_load_f32_at")
+push!(KNOWN_INTRINSICS, "lava_rt_hit_attrib_load_f32_at")
+push!(KNOWN_INTRINSICS, "lava_rt_ignore_intersection")
+push!(KNOWN_INTRINSICS, "lava_rt_terminate_ray")

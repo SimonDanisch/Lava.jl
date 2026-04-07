@@ -13,7 +13,7 @@ using Test
 using Lava
 using KernelAbstractions
 using Lava: LavaDeviceArray, lava_compile, CompilationResult,
-            LavaCompilationError, _shorten_path
+            LavaCompilationError, shorten_path
 
 # ═══════════════════════════════════════════════════════════════════════
 # Helper: define test kernels inside Lava module to avoid world age issues
@@ -393,14 +393,14 @@ end
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 9: _shorten_path works correctly
+# Test 9: shorten_path works correctly
 # ═══════════════════════════════════════════════════════════════════════
 
-@testset "_shorten_path" begin
-    @test _shorten_path("/home/sim/programmieren/VulkanDev/dev/Lava/src/foo.jl") == "Lava/src/foo.jl"
-    @test _shorten_path("/home/sim/.julia/packages/GPUCompiler/abc/src/bar.jl") == "GPUCompiler/abc/src/bar.jl"
-    @test endswith(_shorten_path("/usr/share/julia/stdlib/v1.12/Test/src/Test.jl"), "Test.jl")
-    @test _shorten_path("relative/path.jl") == "path.jl"
+@testset "shorten_path" begin
+    @test shorten_path("/home/sim/programmieren/VulkanDev/dev/Lava/src/foo.jl") == "Lava/src/foo.jl"
+    @test shorten_path("/home/sim/.julia/packages/GPUCompiler/abc/src/bar.jl") == "GPUCompiler/abc/src/bar.jl"
+    @test endswith(shorten_path("/usr/share/julia/stdlib/v1.12/Test/src/Test.jl"), "Test.jl")
+    @test shorten_path("relative/path.jl") == "path.jl"
 end
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -693,7 +693,7 @@ end
     Lava._try_vk_alloc(40_000_000_000)  # 40GB, will fail
 
     # Validation messages should be drained by the failed alloc
-    @test isempty(Lava._validation_messages)
+    @test isempty(Lava.VALIDATION_MESSAGES)
 
     # Next compilation should succeed without stale validation errors
     r = lava_compile(Lava._srcmap_add!,

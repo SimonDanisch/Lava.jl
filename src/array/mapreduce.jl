@@ -8,7 +8,7 @@ import AcceleratedKernels as AK
 
 function GPUArrays.mapreducedim!(f::F, op::OP, R::LavaArray{T}, A::AbstractArray;
                                   init=nothing) where {F, OP, T}
-    _mapreducedim_ak!(f, op, R, A; init)
+    mapreducedim_ak!(f, op, R, A; init)
     return R
 end
 
@@ -17,11 +17,11 @@ function GPUArrays.mapreducedim!(f::F, op::OP, R::LavaArray{T},
                                   init=nothing) where {F, OP, T}
     # Materialize broadcasted to LavaArray first — AK expects AbstractArray
     A_mat = Base.materialize(A)
-    _mapreducedim_ak!(f, op, R, A_mat; init)
+    mapreducedim_ak!(f, op, R, A_mat; init)
     return R
 end
 
-function _mapreducedim_ak!(f::F, op::OP, R::LavaArray{T}, A;
+function mapreducedim_ak!(f::F, op::OP, R::LavaArray{T}, A;
                             init=nothing) where {F, OP, T}
     n = length(A)
     n == 0 && return R
@@ -43,7 +43,7 @@ function _mapreducedim_ak!(f::F, op::OP, R::LavaArray{T}, A;
     else
         # Partial reduction (dims=N) — determine which dim is being reduced
         A_arr = A isa LavaArray ? A : convert(LavaArray, collect(A))
-        rdim = _find_reduced_dim(size(A_arr), size(R))
+        rdim = find_reduced_dim(size(A_arr), size(R))
         if rdim !== nothing
             # AK.mapreduce with dims= expects temp to have same ndims as input
             # with the reduced dim collapsed to 1. If R has fewer dims (implicit
@@ -68,14 +68,14 @@ function _mapreducedim_ak!(f::F, op::OP, R::LavaArray{T}, A;
         else
             # Multiple dims reduced or ndims mismatch — reduce sequentially
             # along each reduced dimension
-            _multi_dim_reduce!(f, op, R, A_arr, init_val)
+            multi_dim_reduce!(f, op, R, A_arr, init_val)
         end
     end
     return R
 end
 
 """Reduce along multiple dimensions by iterating over each reduced dim."""
-function _multi_dim_reduce!(f::F, op::OP, R::LavaArray{T}, A::LavaArray,
+function multi_dim_reduce!(f::F, op::OP, R::LavaArray{T}, A::LavaArray,
                             init_val) where {F, OP, T}
     # Find all dimensions that need reducing (size went to 1 or was dropped)
     szA = size(A)
@@ -117,7 +117,7 @@ end
 
 """Find which single dimension was reduced (size went to 1).
 Handles implicit singleton dimensions (e.g., (2,2) → (2,) means dim 2 reduced)."""
-function _find_reduced_dim(szA, szR)
+function find_reduced_dim(szA, szR)
     ndA = length(szA)
     ndR = length(szR)
 

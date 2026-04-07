@@ -60,7 +60,7 @@ function wrap_entry_for_vulkan!(mod::LLVM.Module, entry::LLVM.Function;
     arg_layout = Pair{Int,Int}[]
     offset = 0
     for pt in param_types
-        sz = _llvm_sizeof(pt)
+        sz = llvm_sizeof(pt)
         align = max(4, sz)  # Natural alignment, minimum 4
         offset = (offset + align - 1) & ~(align - 1)
         push!(arg_layout, offset => sz)
@@ -69,9 +69,9 @@ function wrap_entry_for_vulkan!(mod::LLVM.Module, entry::LLVM.Function;
     arg_buffer_size = offset
 
     # Extract byval type sizes using LLVM DataLayout for accurate struct sizes.
-    # _llvm_sizeof sums field sizes WITHOUT alignment padding, undercounting for
+    # llvm_sizeof sums field sizes WITHOUT alignment padding, undercounting for
     # structs with mixed-size fields (e.g., WorkQueue{T} has {DevArr, DevArr, i32}
-    # → _llvm_sizeof=36 but ABI size=40 due to trailing padding).
+    # → llvm_sizeof=36 but ABI size=40 due to trailing padding).
     # Multiple byval args with padding gaps cause inline data overlap in the arg buffer.
     dl = LLVM.datalayout(mod)
     byval_kind_id = LLVM.API.LLVMGetEnumAttributeKindForName("byval", 5)
@@ -132,7 +132,7 @@ function wrap_entry_for_vulkan!(mod::LLVM.Module, entry::LLVM.Function;
                                  "arg$(i)_addr")
                 field_ptr = LLVM.inttoptr!(builder, addr, T_ptr_as1, "arg$(i)_ptr")
                 val = LLVM.load!(builder, pt, field_ptr, "arg$(i)")
-                align = max(4, _llvm_sizeof(pt))
+                align = max(4, llvm_sizeof(pt))
                 LLVM.alignment!(val, align)
                 push!(args, val)
             end
@@ -173,7 +173,7 @@ function pack_kernel_args(args::Tuple, layout::Vector{Pair{Int,Int}}, total_size
 end
 
 """Size of an LLVM type in bytes."""
-function _llvm_sizeof(t::LLVM.LLVMType)
+function llvm_sizeof(t::LLVM.LLVMType)
     if t isa LLVM.IntegerType
         return max(1, LLVM.width(t) ÷ 8)
     elseif t isa LLVM.LLVMFloat
@@ -185,11 +185,11 @@ function _llvm_sizeof(t::LLVM.LLVMType)
     elseif t isa LLVM.PointerType
         return 8  # 64-bit pointers → stored as i64 BDA
     elseif t isa LLVM.ArrayType
-        return length(t) * _llvm_sizeof(eltype(t))
+        return length(t) * llvm_sizeof(eltype(t))
     elseif t isa LLVM.StructType
         total = 0
         for m in LLVM.elements(t)
-            total += _llvm_sizeof(m)
+            total += llvm_sizeof(m)
         end
         return total
     else

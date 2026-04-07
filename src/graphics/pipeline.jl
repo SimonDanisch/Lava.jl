@@ -23,7 +23,7 @@ end
 const GFX_PIPELINE_CACHE = Dict{UInt64, CompiledGraphicsPipeline}()
 
 # Clear graphics pipeline cache on vk_reset_device!
-push!(_reset_callbacks, function()
+push!(RESET_CALLBACKS, function()
     empty!(GFX_PIPELINE_CACHE)
 end)
 

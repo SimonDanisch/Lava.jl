@@ -215,8 +215,8 @@ end
 
     @testset "Barrier deadlock fix" begin
         # Regression test: error paths must not skip barriers.
-        # _replace_unreachable! converts trap+unreachable to early returns,
-        # which can skip @synchronize() calls. _fix_barrier_skipping_paths!
+        # replace_unreachable! converts trap+unreachable to early returns,
+        # which can skip @synchronize() calls. fix_barrier_skipping_paths!
         # redirects these paths through the barrier-containing continuation.
         # Without the fix, this deadlocks on lavapipe (software Vulkan).
 

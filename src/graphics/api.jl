@@ -52,7 +52,7 @@ LinePipeline(; vertex, fragment, kw...) = GraphicsPipeline(; vertex, fragment, t
 const GFX_SHADER_CACHE = Dict{UInt64, LavaGfxShader}()
 
 # Clear graphics shader/pipeline caches on vk_reset_device!
-push!(_reset_callbacks, function()
+push!(RESET_CALLBACKS, function()
     empty!(GFX_SHADER_CACHE)
 end)
 
@@ -248,7 +248,7 @@ function pack_gfx_args(args, push_info::PushConstantInfo)
     total_size = push_info.arg_buffer_size + inline_extra
 
     arg_buf = get_arg_buffer(total_size)
-    _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
+    pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        push_info.arg_buffer_size, byval_sizes, converted)
 
     # Keep data buffer references alive until vk_flush!()
@@ -308,7 +308,7 @@ end
 
 const BLIT_PIPELINE = Ref{Any}(nothing)
 
-push!(_reset_callbacks, function()
+push!(RESET_CALLBACKS, function()
     BLIT_PIPELINE[] = nothing
 end)
 

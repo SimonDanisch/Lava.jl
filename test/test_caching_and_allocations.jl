@@ -13,8 +13,8 @@ using KernelAbstractions
     @testset "kernel cache eviction" begin
         @testset "FIFO eviction at max size" begin
             # Save original max
-            old_max = Lava._max_kernel_cache_size[]
-            Lava._max_kernel_cache_size[] = 5
+            old_max = Lava.MAX_KERNEL_CACHE_SIZE[]
+            Lava.MAX_KERNEL_CACHE_SIZE[] = 5
 
             try
                 # Create 7 distinct kernels by varying workgroup size
@@ -29,8 +29,8 @@ using KernelAbstractions
                 Lava.vk_flush!()
 
                 # Cache should have at most 5 entries
-                @test length(Lava._kernel_cache) <= 5
-                @test length(Lava._kernel_insertion_order) <= 5
+                @test length(Lava.KERNEL_CACHE) <= 5
+                @test length(Lava.KERNEL_INSERTION_ORDER) <= 5
 
                 # Result should still be correct (latest kernel worked)
                 r = Array(results)
@@ -39,7 +39,7 @@ using KernelAbstractions
 
                 Lava.unsafe_free!(results)
             finally
-                Lava._max_kernel_cache_size[] = old_max
+                Lava.MAX_KERNEL_CACHE_SIZE[] = old_max
             end
         end
 
@@ -70,8 +70,8 @@ using KernelAbstractions
 
     # ── 2. Pipeline cache eviction ──
     @testset "pipeline cache eviction" begin
-        old_max = Lava._max_pipeline_cache_size[]
-        Lava._max_pipeline_cache_size[] = 3
+        old_max = Lava.MAX_PIPELINE_CACHE_SIZE[]
+        Lava.MAX_PIPELINE_CACHE_SIZE[] = 3
 
         try
             a = Lava.LavaArray{Float32}(undef, 16)
@@ -105,15 +105,15 @@ using KernelAbstractions
             pk5!(Lava.LavaBackend())(a; ndrange=16)
             Lava.vk_flush!()
 
-            @test length(Lava._pipeline_cache) <= 3
-            @test length(Lava._pipeline_insertion_order) <= 3
+            @test length(Lava.PIPELINE_CACHE) <= 3
+            @test length(Lava.PIPELINE_INSERTION_ORDER) <= 3
 
             # Latest pipeline still works
             @test Array(a)[1] ≈ 5.0f0
 
             Lava.unsafe_free!(a)
         finally
-            Lava._max_pipeline_cache_size[] = old_max
+            Lava.MAX_PIPELINE_CACHE_SIZE[] = old_max
         end
     end
 
@@ -179,17 +179,17 @@ using KernelAbstractions
                 slab_k!(Lava.LavaBackend())(a; ndrange=16)
             end
             Lava.vk_flush!()
-            n_slabs_after_first = length(Lava._arg_slabs)
+            n_slabs_after_first = length(Lava.ARG_SLABS)
 
             # Second batch — should reuse same slabs
             for _ in 1:100
                 slab_k!(Lava.LavaBackend())(a; ndrange=16)
             end
             Lava.vk_flush!()
-            n_slabs_after_second = length(Lava._arg_slabs)
+            n_slabs_after_second = length(Lava.ARG_SLABS)
 
             @test n_slabs_after_second == n_slabs_after_first
-            @test Lava._arg_slab_offset[] == 0  # Reset after flush
+            @test Lava.ARG_SLAB_OFFSET[] == 0  # Reset after flush
 
             Lava.unsafe_free!(a)
         end
@@ -211,8 +211,8 @@ using KernelAbstractions
             end
             Lava.vk_flush!()
 
-            @test Lava._indirect_slab_offset[] == 0
-            @test Lava._indirect_slab_idx[] == 1
+            @test Lava.INDIRECT_SLAB_OFFSET[] == 0
+            @test Lava.INDIRECT_SLAB_IDX[] == 1
 
             Lava.unsafe_free!(a)
         end
@@ -283,7 +283,7 @@ using KernelAbstractions
             GC.gc(true)
             Lava.vk_flush!()
             Lava.flush_deferred_frees!()
-            baseline = length(Lava._live_buffers)
+            baseline = length(Lava.LIVE_BUFFERS)
 
             for _ in 1:20
                 a = Lava.LavaArray(Float32.(rand(128)))
@@ -297,7 +297,7 @@ using KernelAbstractions
 
             Lava.vk_flush!()
             Lava.flush_deferred_frees!()
-            after = length(Lava._live_buffers)
+            after = length(Lava.LIVE_BUFFERS)
             @test after == baseline
         end
     end

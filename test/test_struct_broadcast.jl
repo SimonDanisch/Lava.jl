@@ -74,9 +74,9 @@ end
     # Test that byval_llvm_sizes are populated during compilation
     @testset "byval_llvm_sizes populated" begin
         # After running broadcasts above, cache should have entries
-        @test !isempty(Lava._byval_sizes_cache)
+        @test !isempty(Lava.BYVAL_SIZES_CACHE)
         # All byval_sizes should be non-negative
-        for (k, v) in Lava._byval_sizes_cache
+        for (k, v) in Lava.BYVAL_SIZES_CACHE
             @test all(s -> s >= 0, v)
         end
     end
@@ -117,7 +117,7 @@ end
 # ── Bool-padding alignment regression tests ──
 # Bug: structs with Bool fields followed by Float32/Int32 have alignment padding
 # (3 bytes after Bool). The SPIR-V emitter computed byte offsets for struct fields
-# by summing _compute_type_size without padding, producing addresses shifted by
+# by summing compute_type_size without padding, producing addresses shifted by
 # 1-3 bytes. This caused GPUVM faults on RADV and unaligned BDA access errors
 # in GPU-assisted validation.
 

@@ -145,7 +145,7 @@ KA.argconvert(::KA.Kernel{LavaBackend}, arg) = Adapt.adapt(LavaAdaptor(), arg)
 # ── Kernel call (main entry point) ──
 
 function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=nothing)
-    _validate_launch_args(args)
+    validate_launch_args(args)
     bq = obj.backend.bq
 
     # GPU-resident ndrange → indirect dispatch (no CPU readback)
@@ -188,20 +188,20 @@ end
 # without bounds checks — phantom workgroups cause out-of-bounds GPU memory writes.
 
 # Cached per-dimension workgroup count limits (filled on first use from device properties)
-const _MAX_WG_DIMS = Ref((65535, 65535, 65535))  # conservative defaults
-const _MAX_WG_DIMS_INITIALIZED = Ref(false)
+const MAX_WG_DIMS = Ref((65535, 65535, 65535))  # conservative defaults
+const MAX_WG_DIMS_INITIALIZED = Ref(false)
 
 function init_max_wg_dims!()
-    _MAX_WG_DIMS_INITIALIZED[] && return
+    MAX_WG_DIMS_INITIALIZED[] && return
     ctx = vk_context()
     props = Vulkan.get_physical_device_properties(ctx.physical_device)
     wgc = props.limits.max_compute_work_group_count
-    _MAX_WG_DIMS[] = (Int(wgc[1]), Int(wgc[2]), Int(wgc[3]))
-    _MAX_WG_DIMS_INITIALIZED[] = true
+    MAX_WG_DIMS[] = (Int(wgc[1]), Int(wgc[2]), Int(wgc[3]))
+    MAX_WG_DIMS_INITIALIZED[] = true
 end
 
-push!(_reset_callbacks, function()
-    _MAX_WG_DIMS_INITIALIZED[] = false
+push!(RESET_CALLBACKS, function()
+    MAX_WG_DIMS_INITIALIZED[] = false
 end)
 
 # Find exact factor of n that is ≤ max_dim, for splitting workgroup counts.
@@ -226,7 +226,7 @@ end
 function pad_to_3d(t::NTuple{1,<:Integer})
     init_max_wg_dims!()
     n = Int(t[1])
-    max_x, max_y, max_z = _MAX_WG_DIMS[]
+    max_x, max_y, max_z = MAX_WG_DIMS[]
     n <= max_x && return (n, 1, 1)
     # Need to split into X * Y (or X * Y * Z)
     # Find X such that X divides n exactly and X ≤ max_x
@@ -249,7 +249,7 @@ end
 function pad_to_3d(t::NTuple{2,<:Integer})
     init_max_wg_dims!()
     x, y = Int(t[1]), Int(t[2])
-    max_x, max_y, _ = _MAX_WG_DIMS[]
+    max_x, max_y, _ = MAX_WG_DIMS[]
     if x <= max_x && y <= max_y
         return (x, y, 1)
     end
@@ -267,11 +267,11 @@ end
 """
 Internal launch function for KA kernels. Compiles and dispatches the GPU function.
 """
-const _DBG_LAUNCH_COUNT = Ref(0)
+const DBG_LAUNCH_COUNT = Ref(0)
 
 function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple, block_dims::NTuple{3,Int}, workgroup_size::NTuple{3,Int})
-    _DBG_LAUNCH_COUNT[] += 1
-    _n = _DBG_LAUNCH_COUNT[]
+    DBG_LAUNCH_COUNT[] += 1
+    _n = DBG_LAUNCH_COUNT[]
     # Build type tuple for compilation (excludes f — GPUCompiler prepends typeof(f))
     # all_args[1] is f itself (included for BDA packing), rest are the actual args
     tt = Tuple{map(ka_arg_llvm_type, Base.tail(all_args))...}
@@ -287,12 +287,12 @@ function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple, block_dim
     arg_buf = get_arg_buffer(total_size)
 
     # Pack args directly to mapped memory (zero intermediate allocations)
-    _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
+    pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
     # Dispatch with N-D block grid (preserves KA's block dimensions)
-    if dispatch_logging_enabled[]
-        last_dispatch_info[] = "ka f=$(dispatch_name(f, all_args)) groups=$block_dims"
+    if DISPATCH_LOGGING_ENABLED[]
+        LAST_DISPATCH_INFO[] = "ka f=$(dispatch_name(f, all_args)) groups=$block_dims"
     end
     vk_dispatch!(bq, pipeline, arg_buf.address, block_dims)
 
@@ -322,29 +322,29 @@ end
 # so we compile once and cache everything. Saves ~30K lava_launch! calls per render
 # (hash lookups, validation, auto-flush, keep_alive, etc.).
 
-const _prepare_indirect_pipeline_ref = Ref{Union{Nothing, LavaComputePipeline}}(nothing)
-const _prepare_indirect_offsets_ref = Ref{Union{Nothing, Vector{Int}}}(nothing)
-const _prepare_indirect_byval_ref = Ref{Union{Nothing, Vector{Int}}}(nothing)
-const _prepare_indirect_arg_buf_size_ref = Ref{Int}(0)
+const PREPARE_INDIRECT_PIPELINE_REF = Ref{Union{Nothing, LavaComputePipeline}}(nothing)
+const PREPARE_INDIRECT_OFFSETS_REF = Ref{Union{Nothing, Vector{Int}}}(nothing)
+const PREPARE_INDIRECT_BYVAL_REF = Ref{Union{Nothing, Vector{Int}}}(nothing)
+const PREPARE_INDIRECT_ARG_BUF_SIZE_REF = Ref{Int}(0)
 
 # Register cleanup callback for vk_reset_device!
-push!(_reset_callbacks, function()
-    _prepare_indirect_pipeline_ref[] = nothing
-    _prepare_indirect_offsets_ref[] = nothing
-    _prepare_indirect_byval_ref[] = nothing
-    _prepare_indirect_arg_buf_size_ref[] = 0
+push!(RESET_CALLBACKS, function()
+    PREPARE_INDIRECT_PIPELINE_REF[] = nothing
+    PREPARE_INDIRECT_OFFSETS_REF[] = nothing
+    PREPARE_INDIRECT_BYVAL_REF[] = nothing
+    PREPARE_INDIRECT_ARG_BUF_SIZE_REF[] = 0
 end)
 
 function init_prepare_indirect_pipeline!()
-    _prepare_indirect_pipeline_ref[] !== nothing && return
+    PREPARE_INDIRECT_PIPELINE_REF[] !== nothing && return
     tt = Tuple{Ptr{UInt32}, Ptr{Int32}, UInt32}
     ws = (1, 1, 1)
     compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(
         prepare_indirect_kernel, tt, ws)
-    _prepare_indirect_pipeline_ref[] = pipeline
-    _prepare_indirect_offsets_ref[] = offsets
-    _prepare_indirect_byval_ref[] = byval_sizes
-    _prepare_indirect_arg_buf_size_ref[] = compiled.push_info.arg_buffer_size
+    PREPARE_INDIRECT_PIPELINE_REF[] = pipeline
+    PREPARE_INDIRECT_OFFSETS_REF[] = offsets
+    PREPARE_INDIRECT_BYVAL_REF[] = byval_sizes
+    PREPARE_INDIRECT_ARG_BUF_SIZE_REF[] = compiled.push_info.arg_buffer_size
 end
 
 """
@@ -357,15 +357,15 @@ Records a single-thread direct dispatch to compute ceil(n/ws) group counts.
 function fast_prepare_indirect!(bq::BatchQueue, indirect_buf::VkIndirectBuffer, ndrange_buf::LavaArray{<:Integer}, workgroup_size::Integer)
     init_prepare_indirect_pipeline!()
 
-    pipeline = _prepare_indirect_pipeline_ref[]
-    offsets = _prepare_indirect_offsets_ref[]
-    byval_sizes = _prepare_indirect_byval_ref[]
-    arg_size = _prepare_indirect_arg_buf_size_ref[]
+    pipeline = PREPARE_INDIRECT_PIPELINE_REF[]
+    offsets = PREPARE_INDIRECT_OFFSETS_REF[]
+    byval_sizes = PREPARE_INDIRECT_BYVAL_REF[]
+    arg_size = PREPARE_INDIRECT_ARG_BUF_SIZE_REF[]
 
     # Pack args: f (ghost, skipped), Ptr{UInt32} (BDA), LavaArray (BDA), UInt32 (direct)
     all_args = (prepare_indirect_kernel, Ptr{UInt32}(indirect_buf.address), ndrange_buf, UInt32(workgroup_size))
     arg_buf = get_arg_buffer(arg_size)
-    _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets, arg_size, byval_sizes, all_args)
+    pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets, arg_size, byval_sizes, all_args)
 
     # Record dispatch directly — single workgroup of 1 thread
     vk_dispatch_base!(bq, pipeline, arg_buf.address, 0, 0, 0, 1, 1, 1)
@@ -429,14 +429,14 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
     GC.@preserve original_args begin
 
     arg_buf = get_arg_buffer(total_size)
-    _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
+    pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
     indirect_buf = get_indirect_buffer()
     fast_prepare_indirect!(bq, indirect_buf, ndrange_buf, ws_prod)
 
-    if dispatch_logging_enabled[]
-        last_dispatch_info[] = "indirect f=$(dispatch_name(obj.f, all_args))"
+    if DISPATCH_LOGGING_ENABLED[]
+        LAST_DISPATCH_INFO[] = "indirect f=$(dispatch_name(obj.f, all_args))"
     end
     batch = ensure_active_batch!(bq)
     push!(batch.data_refs, args)
@@ -484,25 +484,25 @@ end
 
 # CartesianIndex indexing for multi-dimensional broadcast support (any N)
 @lava_device_override @inline function Base.getindex(a::LavaDeviceArray{T,N}, I::CartesianIndex{N}) where {T,N}
-    @inbounds unsafe_load(a.ptr, _linear_index(a.dims, I))
+    @inbounds unsafe_load(a.ptr, linear_index(a.dims, I))
 end
 
 @lava_device_override @inline function Base.setindex!(a::LavaDeviceArray{T,N}, v, I::CartesianIndex{N}) where {T,N}
-    @inbounds unsafe_store!(a.ptr, convert(T, v), _linear_index(a.dims, I))
+    @inbounds unsafe_store!(a.ptr, convert(T, v), linear_index(a.dims, I))
     return v
 end
 
 # Convert CartesianIndex to linear index for LavaDeviceArray
-@inline function _linear_index(dims::NTuple{1,Int}, I::CartesianIndex{1})
+@inline function linear_index(dims::NTuple{1,Int}, I::CartesianIndex{1})
     I[1]
 end
-@inline function _linear_index(dims::NTuple{2,Int}, I::CartesianIndex{2})
+@inline function linear_index(dims::NTuple{2,Int}, I::CartesianIndex{2})
     I[1] + dims[1] * (I[2] - 1)
 end
-@inline function _linear_index(dims::NTuple{3,Int}, I::CartesianIndex{3})
+@inline function linear_index(dims::NTuple{3,Int}, I::CartesianIndex{3})
     I[1] + dims[1] * (I[2] - 1) + dims[1] * dims[2] * (I[3] - 1)
 end
-@inline function _linear_index(dims::NTuple{N,Int}, I::CartesianIndex{N}) where N
+@inline function linear_index(dims::NTuple{N,Int}, I::CartesianIndex{N}) where N
     idx = I[1]
     stride = 1
     for d in 2:N

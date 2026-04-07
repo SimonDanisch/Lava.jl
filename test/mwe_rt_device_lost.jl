@@ -6,7 +6,7 @@
 # - Running many render iterations with camera changes
 # - Adding GC pressure between iterations
 #
-# Run: julia --project=. dev/Lava/test/mwe_rt_device_lost.jl
+# Run: julia --project=. dev/Lava/test/mwe_rt_DEVICE_LOST.jl
 
 using Hikari, Lava, GeometryBasics
 import KernelAbstractions as KA

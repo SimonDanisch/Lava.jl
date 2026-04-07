@@ -51,9 +51,9 @@ Build a HardwareAccel from a pre-built Vulkan TLAS + triangle data + offsets.
 """
 function HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets)
     rt = RayTracingPipeline(
-        raygen=_hw_raygen,
-        closest_hit=_hw_closesthit,
-        miss=_hw_miss,
+        raygen=hw_raygen,
+        closest_hit=hw_closesthit,
+        miss=hw_miss,
         payload_type=:f32_6,
     )
     HardwareAccel(hw_tlas, triangle_data, blas_offsets, rt, nothing)
@@ -68,8 +68,8 @@ The `anyhit_func` and `raygen_func` must have matching BDA arg signatures.
 function set_anyhit_pipeline!(accel::HardwareAccel, anyhit_func, raygen_func)
     accel.anyhit_pipeline = RayTracingPipeline(
         raygen=raygen_func,
-        closest_hit=_hw_closesthit,
-        miss=_hw_miss,
+        closest_hit=hw_closesthit,
+        miss=hw_miss,
         any_hit=anyhit_func,
         payload_type=:f32_6,
     )
@@ -125,18 +125,18 @@ end
 
 # ── Built-in RT Shaders ──
 
-function _hw_raygen(rays::Ptr{RTRay}, results::Ptr{RTHitResult})
+function hw_raygen(rays::Ptr{RTRay}, results::Ptr{RTHitResult})
     lid = lava_rt_launch_id_x()
 
     # Read ray from input buffer
     ray = unsafe_load(rays, lid + 1)
 
     # Initialize payload to miss
-    _lava_rt_payload_store_f32_at(0f0, UInt32(0))   # hit=0
-    _lava_rt_payload_store_f32_at(-1f0, UInt32(1))   # t=-1
+    lava_rt_payload_store_f32_at(0f0, UInt32(0))   # hit=0
+    lava_rt_payload_store_f32_at(-1f0, UInt32(1))   # t=-1
 
     # Trace
-    _lava_rt_trace_ray(
+    lava_rt_trace_ray(
         UInt32(0),    # flags
         UInt32(0xFF), # cull mask
         UInt32(0),    # sbt offset
@@ -147,12 +147,12 @@ function _hw_raygen(rays::Ptr{RTRay}, results::Ptr{RTHitResult})
     )
 
     # Read payload results
-    hit  = _lava_rt_payload_load_f32_at(UInt32(0))
-    t    = _lava_rt_payload_load_f32_at(UInt32(1))
-    pid  = _lava_rt_payload_load_f32_at(UInt32(2))
-    ci   = _lava_rt_payload_load_f32_at(UInt32(3))
-    bu   = _lava_rt_payload_load_f32_at(UInt32(4))
-    bv   = _lava_rt_payload_load_f32_at(UInt32(5))
+    hit  = lava_rt_payload_load_f32_at(UInt32(0))
+    t    = lava_rt_payload_load_f32_at(UInt32(1))
+    pid  = lava_rt_payload_load_f32_at(UInt32(2))
+    ci   = lava_rt_payload_load_f32_at(UInt32(3))
+    bu   = lava_rt_payload_load_f32_at(UInt32(4))
+    bv   = lava_rt_payload_load_f32_at(UInt32(5))
 
     # Write result to output buffer
     result = RTHitResult(
@@ -167,28 +167,28 @@ function _hw_raygen(rays::Ptr{RTRay}, results::Ptr{RTHitResult})
     return nothing
 end
 
-function _hw_closesthit()
+function hw_closesthit()
     t = lava_rt_ray_tmax()
     ci = lava_rt_instance_custom_index()
     pid = lava_rt_primitive_id()
     bu = lava_rt_hit_bary_u()
     bv = lava_rt_hit_bary_v()
 
-    _lava_rt_payload_store_f32_at(reinterpret(Float32, UInt32(1)), UInt32(0))  # hit=1
-    _lava_rt_payload_store_f32_at(t, UInt32(1))
-    _lava_rt_payload_store_f32_at(reinterpret(Float32, pid), UInt32(2))
-    _lava_rt_payload_store_f32_at(reinterpret(Float32, ci), UInt32(3))
-    _lava_rt_payload_store_f32_at(bu, UInt32(4))
-    _lava_rt_payload_store_f32_at(bv, UInt32(5))
+    lava_rt_payload_store_f32_at(reinterpret(Float32, UInt32(1)), UInt32(0))  # hit=1
+    lava_rt_payload_store_f32_at(t, UInt32(1))
+    lava_rt_payload_store_f32_at(reinterpret(Float32, pid), UInt32(2))
+    lava_rt_payload_store_f32_at(reinterpret(Float32, ci), UInt32(3))
+    lava_rt_payload_store_f32_at(bu, UInt32(4))
+    lava_rt_payload_store_f32_at(bv, UInt32(5))
     return nothing
 end
 
-function _hw_miss()
-    _lava_rt_payload_store_f32_at(0f0, UInt32(0))   # hit=0
-    _lava_rt_payload_store_f32_at(-1f0, UInt32(1))   # t=-1
-    _lava_rt_payload_store_f32_at(0f0, UInt32(2))
-    _lava_rt_payload_store_f32_at(0f0, UInt32(3))
-    _lava_rt_payload_store_f32_at(0f0, UInt32(4))
-    _lava_rt_payload_store_f32_at(0f0, UInt32(5))
+function hw_miss()
+    lava_rt_payload_store_f32_at(0f0, UInt32(0))   # hit=0
+    lava_rt_payload_store_f32_at(-1f0, UInt32(1))   # t=-1
+    lava_rt_payload_store_f32_at(0f0, UInt32(2))
+    lava_rt_payload_store_f32_at(0f0, UInt32(3))
+    lava_rt_payload_store_f32_at(0f0, UInt32(4))
+    lava_rt_payload_store_f32_at(0f0, UInt32(5))
     return nothing
 end

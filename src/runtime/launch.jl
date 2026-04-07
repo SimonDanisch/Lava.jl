@@ -35,48 +35,48 @@ function download(src::LavaBuffer{T}) where T
 end
 
 # Cache compiled GPU kernels by (function, type tuple, workgroup_size)
-const _kernel_cache = Dict{UInt64, LavaGPUKernel}()
+const KERNEL_CACHE = Dict{UInt64, LavaGPUKernel}()
 # Cache pipelines alongside compiled kernels (avoids re-hashing SPIR-V bytes)
-const _pipeline_by_kernel = Dict{UInt64, LavaComputePipeline}()
+const PIPELINE_BY_KERNEL = Dict{UInt64, LavaComputePipeline}()
 # Cache arg layout offsets as Vector{Int} (Vector{Int} indexing is zero-alloc,
 # unlike Vector{Pair{Int,Int}} which boxes Pair on access)
-const _arg_offsets_cache = Dict{UInt64, Vector{Int}}()
-# Cache byval LLVM sizes — maps to same keys as _arg_offsets_cache
-const _byval_sizes_cache = Dict{UInt64, Vector{Int}}()
+const ARG_OFFSETS_CACHE = Dict{UInt64, Vector{Int}}()
+# Cache byval LLVM sizes — maps to same keys as ARG_OFFSETS_CACHE
+const BYVAL_SIZES_CACHE = Dict{UInt64, Vector{Int}}()
 # Insertion order for kernel cache eviction (FIFO)
-const _kernel_insertion_order = UInt64[]
-const _max_kernel_cache_size = Ref(1024)
+const KERNEL_INSERTION_ORDER = UInt64[]
+const MAX_KERNEL_CACHE_SIZE = Ref(1024)
 
 # Register cleanup callback for vk_reset_device!
-push!(_reset_callbacks, function()
-    empty!(_kernel_cache)
-    empty!(_pipeline_by_kernel)
-    empty!(_arg_offsets_cache)
-    empty!(_byval_sizes_cache)
-    empty!(_kernel_insertion_order)
+push!(RESET_CALLBACKS, function()
+    empty!(KERNEL_CACHE)
+    empty!(PIPELINE_BY_KERNEL)
+    empty!(ARG_OFFSETS_CACHE)
+    empty!(BYVAL_SIZES_CACHE)
+    empty!(KERNEL_INSERTION_ORDER)
     # Reset arg buffer slab allocator
-    empty!(_arg_slabs)
-    _arg_slab_idx[] = 1
-    _arg_slab_offset[] = 0
-    _arg_alloc_count[] = 0
+    empty!(ARG_SLABS)
+    ARG_SLAB_IDX[] = 1
+    ARG_SLAB_OFFSET[] = 0
+    ARG_ALLOC_COUNT[] = 0
     # Legacy compat
-    _arg_buffer_idx[] = 0
-    empty!(_arg_buffers)
+    ARG_BUFFER_IDX[] = 0
+    empty!(ARG_BUFFERS)
 end)
 
 # ── Launch argument validation ──
 
 """
-    _validate_launch_args(args)
+    validate_launch_args(args)
 
 Check that buffer arguments are valid (not freed, not poisoned).
-Runs by default; disable with `Lava._launch_arg_validation[] = false`.
+Runs by default; disable with `Lava.LAUNCH_ARG_VALIDATION[] = false`.
 """
-const _launch_arg_validation = Ref(true)
+const LAUNCH_ARG_VALIDATION = Ref(true)
 
-@generated function _validate_launch_args(args::T) where T <: Tuple
+@generated function validate_launch_args(args::T) where T <: Tuple
     exprs = Expr[]
-    push!(exprs, :((_launch_arg_validation[] || return)))
+    push!(exprs, :((LAUNCH_ARG_VALIDATION[] || return)))
     for i in 1:fieldcount(T)
         Ti = fieldtype(T, i)
         if Ti <: LavaArray
@@ -95,7 +95,7 @@ const _launch_arg_validation = Ref(true)
                             "Argument $($i): LavaArray has been freed (size=0)",
                             "Don't pass freed arrays to GPU kernels. Check array lifetime."))
                     end
-                    if buf.address == _BDA_POISON
+                    if buf.address == BDA_POISON
                         throw(LavaError("kernel launch",
                             "Argument $($i): LavaArray backing buffer was destroyed (poisoned BDA)",
                             "This array was freed. Reallocate before use."))
@@ -110,7 +110,7 @@ const _launch_arg_validation = Ref(true)
                             "Argument $($i): LavaBuffer has been freed (size=0)",
                             "Don't pass freed buffers to GPU kernels."))
                     end
-                    if arg.buf.address == _BDA_POISON
+                    if arg.buf.address == BDA_POISON
                         throw(LavaError("kernel launch",
                             "Argument $($i): LavaBuffer backing buffer was destroyed (poisoned BDA)",
                             "This buffer was freed. Reallocate before use."))
@@ -143,7 +143,7 @@ Example:
 function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
                        ndrange::Union{Integer, NTuple{3,<:Integer}},
                        workgroup_size::NTuple{3,Int} = (64, 1, 1))
-    _validate_launch_args(args)
+    validate_launch_args(args)
     # Normalize ndrange to 3D
     if ndrange isa Integer
         ndrange_3d = (Int(ndrange), 1, 1)
@@ -159,7 +159,7 @@ function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
     )
 
     # Build the type tuple from arguments
-    tt = Tuple{map(_arg_llvm_type, args)...}
+    tt = Tuple{map(arg_llvm_type, args)...}
 
     # Compile + pipeline (cached, single lookup — avoids re-hashing SPIR-V)
     compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(f, tt, workgroup_size)
@@ -178,7 +178,7 @@ function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
     arg_buf = get_arg_buffer(total_size)
 
     # Pack args directly to mapped memory (zero intermediate allocations)
-    _pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
+    pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
     # Keep data buffer references alive until vk_flush!() — BDA addresses in the
@@ -188,8 +188,8 @@ function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
 
     # Dispatch (batched — call vk_flush!() to submit)
     # Push constant = BDA of arg buffer (passed as UInt64, zero-alloc)
-    if dispatch_logging_enabled[]
-        last_dispatch_info[] = "compute f=$(nameof(typeof(f))) groups=$groups"
+    if DISPATCH_LOGGING_ENABLED[]
+        LAST_DISPATCH_INFO[] = "compute f=$(nameof(typeof(f))) groups=$groups"
     end
     vk_dispatch!(bq, pipeline, arg_buf.address, groups)
 
@@ -258,14 +258,14 @@ end
 # ── Zero-allocation arg packing (replaces _args_to_bda + pack_kernel_args_inline) ──
 
 """
-    _is_bda_buffer(::Type{T})
+    is_bda_buffer(::Type{T})
 
 Check at compile time whether a type is a GPU buffer that should be passed as a BDA address.
 """
-_is_bda_buffer(::Type{<:LavaBuffer}) = true
-_is_bda_buffer(::Type{<:LavaArray}) = true
-_is_bda_buffer(::Type{VkManagedBuffer}) = true
-_is_bda_buffer(::Type) = false
+is_bda_buffer(::Type{<:LavaBuffer}) = true
+is_bda_buffer(::Type{<:LavaArray}) = true
+is_bda_buffer(::Type{VkManagedBuffer}) = true
+is_bda_buffer(::Type) = false
 
 """
     compute_inline_extra_from_byval(byval_sizes::Vector{Int})
@@ -285,7 +285,7 @@ function compute_inline_extra_from_byval(byval_sizes::Vector{Int})
 end
 
 """
-    _compute_inline_extra(::Type{T}) where T <: Tuple
+    compute_inline_extra(::Type{T}) where T <: Tuple
 
 Compute at compile time the total bytes needed for inline struct data appended
 after the base arg layout. Returns a constant. Buffer types (LavaBuffer, LavaArray,
@@ -294,12 +294,12 @@ VkManagedBuffer) are passed as UInt64 BDA addresses, not inlined.
 NOTE: This uses Julia's sizeof which can underestimate for types with zero-sized
 fields. Prefer compute_inline_extra_from_byval with LLVM sizes when available.
 """
-@generated function _compute_inline_extra(::Type{T}) where T <: Tuple
+@generated function compute_inline_extra(::Type{T}) where T <: Tuple
     types = T.parameters
     extra = 0
     for Ti in types
         sizeof(Ti) == 0 && continue
-        _is_bda_buffer(Ti) && continue  # buffers → UInt64 BDA, no inline data
+        is_bda_buffer(Ti) && continue  # buffers → UInt64 BDA, no inline data
         if isbitstype(Ti) && !isprimitivetype(Ti)
             extra = (extra + 7) & ~7  # align to 8
             extra += sizeof(Ti)
@@ -309,7 +309,7 @@ fields. Prefer compute_inline_extra_from_byval with LLVM sizes when available.
 end
 
 """
-    _pack_args_direct!(mapped_ptr, arg_buf_bda, offsets, base_size, all_args)
+    pack_args_direct!(mapped_ptr, arg_buf_bda, offsets, base_size, all_args)
 
 Write kernel arguments directly to mapped GPU memory, inlining struct data.
 This is a `@generated` function that statically filters ghost types and avoids
@@ -323,7 +323,7 @@ Handles all argument types:
 - UInt64/Ptr: written directly
 - Other primitives: written directly
 """
-@generated function _pack_args_direct!(mapped_ptr::Ptr{UInt8}, arg_buf_bda::UInt64,
+@generated function pack_args_direct!(mapped_ptr::Ptr{UInt8}, arg_buf_bda::UInt64,
                                         offsets::Vector{Int}, base_size::Int,
                                         byval_sizes::Vector{Int},
                                         all_args::T) where {T <: Tuple}
@@ -337,7 +337,7 @@ Handles all argument types:
     exprs = Expr[]
     for (layout_i, arg_i) in enumerate(non_ghost)
         Ti = types[arg_i]
-        if _is_bda_buffer(Ti)
+        if is_bda_buffer(Ti)
             # GPU buffer → write BDA address as UInt64
             if Ti <: LavaBuffer
                 push!(exprs, :(unsafe_store!(Ptr{UInt64}(mapped_ptr + @inbounds(offsets[$layout_i])),
@@ -383,9 +383,9 @@ end
 # ── Argument type mapping ──
 
 # Map Julia arg types to LLVM-level types for compilation
-_arg_llvm_type(::LavaBuffer{T}) where T = Ptr{T}
-_arg_llvm_type(::LavaArray{T}) where T = Ptr{T}
-_arg_llvm_type(x::T) where T = T  # Scalars pass through
+arg_llvm_type(::LavaBuffer{T}) where T = Ptr{T}
+arg_llvm_type(::LavaArray{T}) where T = Ptr{T}
+arg_llvm_type(x::T) where T = T  # Scalars pass through
 
 # Convert arguments to BDA-compatible values for pack_kernel_args
 arg_to_bda(buf::LavaBuffer) = buf.buf.address
@@ -404,7 +404,7 @@ end
 
 # Fast ghost type check — sizeof(T)==0 is equivalent to GPUCompiler.isghosttype for isbits types.
 # Avoids creating an LLVM Context on every call (~4μs → ~0.01μs per type).
-_is_ghost(@nospecialize(T::Type)) = sizeof(T) == 0
+is_ghost(@nospecialize(T::Type)) = sizeof(T) == 0
 
 """
     args_to_bda_filtered(args) -> Tuple
@@ -416,7 +416,7 @@ function args_to_bda_filtered(args::Tuple)
     result = Any[]
     for x in args
         T = typeof(x)
-        _is_ghost(T) && continue
+        is_ghost(T) && continue
         push!(result, arg_to_bda(x))
     end
     return tuple(result...)
@@ -424,54 +424,54 @@ end
 
 function get_compiled_kernel(@nospecialize(f), @nospecialize(tt), workgroup_size)
     key = hash((f, tt, workgroup_size))
-    cached = get(_kernel_cache, key, nothing)
+    cached = get(KERNEL_CACHE, key, nothing)
     if cached !== nothing
         return cached
     end
     compiled = lava_compile_gpu(f, tt; workgroup_size)
-    _kernel_cache[key] = compiled
+    KERNEL_CACHE[key] = compiled
     return compiled
 end
 
-const _spirv_dump_dir = Ref("")
-const _spirv_dump_counter = Ref(0)
+const SPIRV_DUMP_DIR = Ref("")
+const SPIRV_DUMP_COUNTER = Ref(0)
 
 function get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), workgroup_size)
     key = hash((f, tt, workgroup_size))
 
-    compiled = get(_kernel_cache, key, nothing)
+    compiled = get(KERNEL_CACHE, key, nothing)
     if compiled === nothing
         compiled = lava_compile_gpu(f, tt; workgroup_size)
-        _kernel_cache[key] = compiled
+        KERNEL_CACHE[key] = compiled
         # Track insertion order for cache eviction
-        push!(_kernel_insertion_order, key)
+        push!(KERNEL_INSERTION_ORDER, key)
         evict_kernel_cache_if_full!()
         # Dump SPIR-V if dump dir is set
-        if !isempty(_spirv_dump_dir[])
-            _spirv_dump_counter[] += 1
+        if !isempty(SPIRV_DUMP_DIR[])
+            SPIRV_DUMP_COUNTER[] += 1
             fname = string(nameof(typeof(f)))
-            path = joinpath(_spirv_dump_dir[], "$(lpad(_spirv_dump_counter[], 3, '0'))_$(fname).spv")
+            path = joinpath(SPIRV_DUMP_DIR[], "$(lpad(SPIRV_DUMP_COUNTER[], 3, '0'))_$(fname).spv")
             write(path, compiled.spirv_bytes)
         end
     end
 
-    pipeline = get(_pipeline_by_kernel, key, nothing)
+    pipeline = get(PIPELINE_BY_KERNEL, key, nothing)
     if pipeline === nothing
         pipeline = get_compute_pipeline(compiled.spirv_bytes, compiled.entry_name;
                                         push_constant_size=compiled.push_info.push_size)
-        _pipeline_by_kernel[key] = pipeline
+        PIPELINE_BY_KERNEL[key] = pipeline
     end
 
-    offsets = get(_arg_offsets_cache, key, nothing)
+    offsets = get(ARG_OFFSETS_CACHE, key, nothing)
     if offsets === nothing
         offsets = Int[p.first for p in compiled.push_info.arg_layout]
-        _arg_offsets_cache[key] = offsets
+        ARG_OFFSETS_CACHE[key] = offsets
     end
 
-    byval_sizes = get(_byval_sizes_cache, key, nothing)
+    byval_sizes = get(BYVAL_SIZES_CACHE, key, nothing)
     if byval_sizes === nothing
         byval_sizes = compiled.push_info.byval_llvm_sizes
-        _byval_sizes_cache[key] = byval_sizes
+        BYVAL_SIZES_CACHE[key] = byval_sizes
     end
 
     return compiled, pipeline, offsets, byval_sizes
@@ -479,13 +479,13 @@ end
 
 """Evict oldest kernel cache entries when cache exceeds max size."""
 function evict_kernel_cache_if_full!()
-    max_size = _max_kernel_cache_size[]
-    while length(_kernel_insertion_order) > max_size
-        old_key = popfirst!(_kernel_insertion_order)
-        delete!(_kernel_cache, old_key)
-        delete!(_pipeline_by_kernel, old_key)
-        delete!(_arg_offsets_cache, old_key)
-        delete!(_byval_sizes_cache, old_key)
+    max_size = MAX_KERNEL_CACHE_SIZE[]
+    while length(KERNEL_INSERTION_ORDER) > max_size
+        old_key = popfirst!(KERNEL_INSERTION_ORDER)
+        delete!(KERNEL_CACHE, old_key)
+        delete!(PIPELINE_BY_KERNEL, old_key)
+        delete!(ARG_OFFSETS_CACHE, old_key)
+        delete!(BYVAL_SIZES_CACHE, old_key)
     end
 end
 
@@ -512,26 +512,26 @@ struct ArgBufferAlloc
     size::Int            # Allocated size
 end
 
-const _arg_slabs = VkMappedBuffer[]
-const _arg_slab_idx = Ref(1)     # Current slab index (1-based)
-const _arg_slab_offset = Ref(0)  # Byte offset within current slab
-const _arg_alloc_count = Ref(0)  # Total allocations this batch (for stats)
+const ARG_SLABS = VkMappedBuffer[]
+const ARG_SLAB_IDX = Ref(1)     # Current slab index (1-based)
+const ARG_SLAB_OFFSET = Ref(0)  # Byte offset within current slab
+const ARG_ALLOC_COUNT = Ref(0)  # Total allocations this batch (for stats)
 
 # Legacy compatibility
-const _arg_buffers = VkMappedBuffer[]  # unused, kept for gpu_memory_usage()
-const _arg_buffer_idx = Ref(0)
+const ARG_BUFFERS = VkMappedBuffer[]  # unused, kept for gpu_memory_usage()
+const ARG_BUFFER_IDX = Ref(0)
 
 function ensure_arg_slab!(min_size::Int)
-    while length(_arg_slabs) < _arg_slab_idx[]
-        push!(_arg_slabs, vk_alloc_mapped(max(ARG_SLAB_SIZE, min_size)))
+    while length(ARG_SLABS) < ARG_SLAB_IDX[]
+        push!(ARG_SLABS, vk_alloc_mapped(max(ARG_SLAB_SIZE, min_size)))
     end
-    slab = _arg_slabs[_arg_slab_idx[]]
+    slab = ARG_SLABS[ARG_SLAB_IDX[]]
     # If current slab is too small for the allocation, move to next slab
-    if _arg_slab_offset[] + min_size > slab.size
-        _arg_slab_idx[] += 1
-        _arg_slab_offset[] = 0
-        while length(_arg_slabs) < _arg_slab_idx[]
-            push!(_arg_slabs, vk_alloc_mapped(max(ARG_SLAB_SIZE, min_size)))
+    if ARG_SLAB_OFFSET[] + min_size > slab.size
+        ARG_SLAB_IDX[] += 1
+        ARG_SLAB_OFFSET[] = 0
+        while length(ARG_SLABS) < ARG_SLAB_IDX[]
+            push!(ARG_SLABS, vk_alloc_mapped(max(ARG_SLAB_SIZE, min_size)))
         end
     end
 end
@@ -541,10 +541,10 @@ function get_arg_buffer(nbytes::Integer)
 
     ensure_arg_slab!(aligned_size)
 
-    slab = _arg_slabs[_arg_slab_idx[]]
-    offset = _arg_slab_offset[]
-    _arg_slab_offset[] = offset + aligned_size
-    _arg_alloc_count[] += 1
+    slab = ARG_SLABS[ARG_SLAB_IDX[]]
+    offset = ARG_SLAB_OFFSET[]
+    ARG_SLAB_OFFSET[] = offset + aligned_size
+    ARG_ALLOC_COUNT[] += 1
 
     return ArgBufferAlloc(
         slab.address + UInt64(offset),
@@ -555,7 +555,7 @@ end
 
 """Reset arg buffer slab allocator after flush (all in-flight dispatches completed)."""
 function reset_arg_buffer_pool!()
-    _arg_slab_idx[] = 1
-    _arg_slab_offset[] = 0
-    _arg_alloc_count[] = 0
+    ARG_SLAB_IDX[] = 1
+    ARG_SLAB_OFFSET[] = 0
+    ARG_ALLOC_COUNT[] = 0
 end

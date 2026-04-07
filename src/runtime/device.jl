@@ -24,7 +24,7 @@ end
     CommandBatch
 
 A single recording batch that may span multiple Vulkan command buffers.
-When the number of dispatches in the current CB segment exceeds `cb_split_threshold`,
+When the number of dispatches in the current CB segment exceeds `CB_SPLIT_THRESHOLD`,
 the CB is sealed and a fresh one is started. At flush time, all sealed CBs + the
 active CB are submitted in a single `vkQueueSubmit` call.
 
@@ -137,23 +137,23 @@ Base.setproperty!(ctx::VkContext, s::Symbol, v) = begin
 end
 
 # Ring buffer of recent validation messages for context on DEVICE_LOST
-const _validation_messages = String[]
-const _max_validation_messages = 50
+const VALIDATION_MESSAGES = String[]
+const MAX_VALIDATION_MESSAGES = 50
 
-const _vk_context = Ref{Union{Nothing, VkContext}}(nothing)
+const VK_CONTEXT_REF = Ref{Union{Nothing, VkContext}}(nothing)
 
 # Set to true after DEVICE_LOST — prevents finalizers from calling Vulkan on invalid handles
-const _device_lost = Ref(false)
+const DEVICE_LOST = Ref(false)
 
 # Device generation counter — incremented on each vk_reset_device!().
 # VkManagedBuffer records the generation at creation time. If a GC finalizer
 # fires after a device reset, the buffer's generation won't match the current
 # one and destruction is skipped (the old device cleaned up its own resources).
-const _device_generation = Ref{UInt64}(0)
+const DEVICE_GENERATION = Ref{UInt64}(0)
 
 # Callbacks for vk_reset_device! — registered by later-included files (pipeline.jl,
 # command.jl, launch.jl, memory.jl) to clear their module-level caches.
-const _reset_callbacks = Function[]
+const RESET_CALLBACKS = Function[]
 
 """
     vk_context() -> VkContext
@@ -161,10 +161,10 @@ const _reset_callbacks = Function[]
 Get or create the global Vulkan context. Lazily initializes on first call.
 """
 function vk_context()
-    ctx = _vk_context[]
+    ctx = VK_CONTEXT_REF[]
     if ctx === nothing
         ctx = init_vulkan!()
-        _vk_context[] = ctx
+        VK_CONTEXT_REF[] = ctx
     end
     return ctx
 end
@@ -184,15 +184,15 @@ kernels, arg buffers).
 GPU buffers no longer exist. You must reallocate all GPU data.
 """
 function vk_reset_device!()
-    _device_generation[] += 1  # Invalidate old VkManagedBuffer handles
-    _device_lost[] = false
-    _vk_context[] = nothing
+    DEVICE_GENERATION[] += 1  # Invalidate old VkManagedBuffer handles
+    DEVICE_LOST[] = false
+    VK_CONTEXT_REF[] = nothing
     # Don't destroy old Vulkan handles — they're invalid after DEVICE_LOST.
     # GC will eventually try to destroy them; _destroy_buffer! skips when
-    # _device_lost was true (and we set it false only after clearing context).
-    empty!(_validation_messages)
+    # DEVICE_LOST was true (and we set it false only after clearing context).
+    empty!(VALIDATION_MESSAGES)
     # Run cleanup callbacks registered by other modules
-    for cb in _reset_callbacks
+    for cb in RESET_CALLBACKS
         try
             cb()
         catch e
@@ -499,7 +499,7 @@ function init_vulkan!()
     clear_validation_messages!()
 
     # Initialize zero-alloc Vulkan function pointers for hot paths
-    _cmd_pipeline_barrier_fptr[] = Vulkan.function_pointer(device, "vkCmdPipelineBarrier")
+    CMD_PIPELINE_BARRIER_FPTR[] = Vulkan.function_pointer(device, "vkCmdPipelineBarrier")
 
     return VkContext(
         instance, phys_dev, device, qf_idx, dev_name,
@@ -599,10 +599,10 @@ function debug_callback(
     message = msg_ptr == C_NULL ? "(no message)" : unsafe_string(msg_ptr)
 
     # Store in ring buffer for context on DEVICE_LOST
-    if length(_validation_messages) >= _max_validation_messages
-        popfirst!(_validation_messages)
+    if length(VALIDATION_MESSAGES) >= MAX_VALIDATION_MESSAGES
+        popfirst!(VALIDATION_MESSAGES)
     end
-    push!(_validation_messages, message)
+    push!(VALIDATION_MESSAGES, message)
 
     # Print based on severity — errors are always printed immediately
     is_error = (severity & Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0
@@ -613,7 +613,7 @@ function debug_callback(
         @warn "Vulkan validation warning" message
     end
     # Return VK_FALSE — can't throw from @cfunction callback (would corrupt Vulkan state).
-    # Errors are collected in _validation_messages and checked after Vulkan calls.
+    # Errors are collected in VALIDATION_MESSAGES and checked after Vulkan calls.
     return UInt32(0)
 end
 
@@ -640,14 +640,14 @@ end
 
 Return recent validation layer messages. Useful for diagnosing DEVICE_LOST errors.
 """
-get_validation_messages() = copy(_validation_messages)
+get_validation_messages() = copy(VALIDATION_MESSAGES)
 
 """
     clear_validation_messages!()
 
 Clear the validation message buffer.
 """
-clear_validation_messages!() = empty!(_validation_messages)
+clear_validation_messages!() = empty!(VALIDATION_MESSAGES)
 
 """
     check_validation_errors!(context::String)
@@ -658,15 +658,15 @@ Call this after Vulkan operations that may trigger validation errors
 (shader module creation, pipeline creation, dispatch recording).
 """
 function check_validation_errors!(context::String)
-    isempty(_validation_messages) && return
+    isempty(VALIDATION_MESSAGES) && return
     # Check for actual errors (not just warnings)
     # Validation messages containing "WARNING" are just warnings, not errors.
-    errors = filter(m -> !contains(m, "WARNING"), _validation_messages)
+    errors = filter(m -> !contains(m, "WARNING"), VALIDATION_MESSAGES)
     isempty(errors) && return
     n = min(length(errors), 5)
     detail = join(["  [$i] $(first(errors[i], 300))" for i in 1:n], "\n")
     # Clear after reporting to avoid re-triggering
-    empty!(_validation_messages)
+    empty!(VALIDATION_MESSAGES)
     throw(LavaError(
         context,
         "Vulkan validation error(s):\n$detail",

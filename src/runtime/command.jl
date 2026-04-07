@@ -15,34 +15,34 @@ const FLUSH_COUNTER = Threads.Atomic{Int}(0)
 const TOTAL_DISPATCH_COUNTER = Threads.Atomic{Int}(0)
 
 # Dispatch info for debugging DEVICE_LOST
-const last_dispatch_info = Ref{String}("")
-const prev_dispatch_info = Ref{String}("")
+const LAST_DISPATCH_INFO = Ref{String}("")
+const PREV_DISPATCH_INFO = Ref{String}("")
 
 # Ring buffer of last N dispatch names for crash debugging
-const dispatch_log = String[]
+const DISPATCH_LOG = String[]
 const MAX_DISPATCH_LOG = 2000
 
 # Toggle dispatch logging (disabled by default for zero-alloc dispatch path).
-# Enable with Lava.dispatch_logging_enabled[] = true for debugging.
+# Enable with Lava.DISPATCH_LOGGING_ENABLED[] = true for debugging.
 # On DEVICE_LOST, the error handler re-enables logging automatically.
-const dispatch_logging_enabled = Ref{Bool}(false)
+const DISPATCH_LOGGING_ENABLED = Ref{Bool}(false)
 
 function log_dispatch!(info::String)
-    dispatch_logging_enabled[] || return
-    if length(dispatch_log) >= MAX_DISPATCH_LOG
-        popfirst!(dispatch_log)
+    DISPATCH_LOGGING_ENABLED[] || return
+    if length(DISPATCH_LOG) >= MAX_DISPATCH_LOG
+        popfirst!(DISPATCH_LOG)
     end
-    push!(dispatch_log, info)
+    push!(DISPATCH_LOG, info)
 end
 
 # Register cleanup callback for vk_reset_device!
-push!(_reset_callbacks, function()
+push!(RESET_CALLBACKS, function()
     FLUSH_COUNTER[] = 0
     TOTAL_DISPATCH_COUNTER[] = 0
-    last_dispatch_info[] = ""
-    prev_dispatch_info[] = ""
-    empty!(dispatch_log)
-    dispatch_logging_enabled[] = false
+    LAST_DISPATCH_INFO[] = ""
+    PREV_DISPATCH_INFO[] = ""
+    empty!(DISPATCH_LOG)
+    DISPATCH_LOGGING_ENABLED[] = false
 end)
 
 # Pre-allocated barrier buffer using raw VkMemoryBarrier (isbits).
@@ -55,17 +55,17 @@ import Vulkan.VkCore: VkMemoryBarrier, VK_STRUCTURE_TYPE_MEMORY_BARRIER,
     VkPipelineStageFlags, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
     VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
     VK_PIPELINE_STAGE_TRANSFER_BIT, VkDependencyFlags
-const _vk_barrier_ref = Ref(VkMemoryBarrier(
+const VK_BARRIER_REF = Ref(VkMemoryBarrier(
     VK_STRUCTURE_TYPE_MEMORY_BARRIER, C_NULL,
     VkAccessFlags(VK_ACCESS_SHADER_WRITE_BIT),
     VkAccessFlags(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)))
 # Function pointer for vkCmdPipelineBarrier — initialized in _init_vulkan!
-const _cmd_pipeline_barrier_fptr = Ref{Ptr{Nothing}}(C_NULL)
+const CMD_PIPELINE_BARRIER_FPTR = Ref{Ptr{Nothing}}(C_NULL)
 
 # Pre-allocated Ref for BDA push constants (zero-alloc path).
 # Used inside push_constants_bda! — set and read synchronously in a single ccall,
 # so no aliasing risk from nested dispatches (unlike a shared Vector{UInt8}).
-const _push_bda_ref = Ref{UInt64}(0)
+const PUSH_BDA_REF = Ref{UInt64}(0)
 
 # CB split threshold: seal the current command buffer and start a new one after
 # this many dispatches per segment. All segments are submitted in a single
@@ -73,7 +73,7 @@ const _push_bda_ref = Ref{UInt64}(0)
 # (30k+ dispatches) while maintaining single-submit efficiency.
 # Default 3000 ≈ 1 Hikari volpath sample (50 bounces × 60 dispatches/bounce).
 # Set to 0 to disable splitting.
-const cb_split_threshold = Ref{Int}(3000)
+const CB_SPLIT_THRESHOLD = Ref{Int}(3000)
 
 
 # ── Batch lifecycle ──
@@ -200,7 +200,7 @@ end
 """
     maybe_split_cb!(batch, ctx)
 
-If the current CB segment has reached `cb_split_threshold` dispatches, seal it
+If the current CB segment has reached `CB_SPLIT_THRESHOLD` dispatches, seal it
 and start a fresh CB. The sealed CB is stored in `batch.sealed_cmd_bufs` and will
 be submitted alongside the active CB in `vk_flush!`.
 
@@ -208,7 +208,7 @@ Barriers work across CB boundaries per Vulkan spec — submission order defines
 the scope of pipeline barriers, not command buffer boundaries.
 """
 function maybe_split_cb!(batch::CommandBatch, bq::BatchQueue)
-    threshold = cb_split_threshold[]
+    threshold = CB_SPLIT_THRESHOLD[]
     threshold <= 0 && return
     batch.segment_dispatches < threshold && return
 
@@ -267,15 +267,15 @@ Example:
             VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR :
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
         dst_access = VkAccessFlags(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT) | VkAccessFlags(extra_dst_access)
-        _vk_barrier_ref[] = VkMemoryBarrier(
+        VK_BARRIER_REF[] = VkMemoryBarrier(
             VK_STRUCTURE_TYPE_MEMORY_BARRIER, C_NULL,
             VkAccessFlags(VK_ACCESS_SHADER_WRITE_BIT), dst_access)
-        ccall(_cmd_pipeline_barrier_fptr[], Cvoid,
+        ccall(CMD_PIPELINE_BARRIER_FPTR[], Cvoid,
               (Ptr{Nothing}, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
                UInt32, Ptr{VkMemoryBarrier}, UInt32, Ptr{Nothing}, UInt32, Ptr{Nothing}),
               cmd.vks,
               VkPipelineStageFlags(src_stage), VkPipelineStageFlags(dst_stage), VkDependencyFlags(0),
-              UInt32(1), _vk_barrier_ref,
+              UInt32(1), VK_BARRIER_REF,
               UInt32(0), C_NULL,
               UInt32(0), C_NULL)
     end
@@ -288,7 +288,7 @@ Example:
     batch.dispatch_count += 1
     batch.segment_dispatches += 1
     batch.last_was_rt = is_rt
-    if dispatch_logging_enabled[]
+    if DISPATCH_LOGGING_ENABLED[]
         Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, 1)
         log_dispatch!("$(TOTAL_DISPATCH_COUNTER[]) $info")
     end
@@ -319,11 +319,11 @@ Ref{UInt64} that is set and consumed synchronously in a single Vulkan ccall.
 """
 @inline function push_constants_bda!(cmd::Vulkan.CommandBuffer, layout::Vulkan.PipelineLayout,
                                       stage_flags, bda::UInt64)
-    _push_bda_ref[] = bda
-    GC.@preserve _push_bda_ref begin
+    PUSH_BDA_REF[] = bda
+    GC.@preserve PUSH_BDA_REF begin
         Vulkan.cmd_push_constants(cmd, layout, stage_flags,
             UInt32(0), UInt32(8),
-            Ptr{Nothing}(Base.unsafe_convert(Ptr{UInt64}, _push_bda_ref)))
+            Ptr{Nothing}(Base.unsafe_convert(Ptr{UInt64}, PUSH_BDA_REF)))
     end
 end
 
@@ -344,8 +344,8 @@ end
 @inline function vk_dispatch_base!(bq::BatchQueue, pipeline::LavaComputePipeline, push_bda::UInt64,
                             base_x::Int, base_y::Int, base_z::Int,
                             gx::Int, gy::Int, gz::Int)
-    dispatch_info = if dispatch_logging_enabled[]
-        info = last_dispatch_info[]
+    dispatch_info = if DISPATCH_LOGGING_ENABLED[]
+        info = LAST_DISPATCH_INFO[]
         "$info base=($base_x,$base_y,$base_z) g=($gx,$gy,$gz)"
     else
         ""
@@ -379,8 +379,8 @@ VkDispatchIndirectCommand (3×UInt32), written by a previous GPU kernel.
 """
 @inline function vk_dispatch_indirect!(bq::BatchQueue, pipeline::LavaComputePipeline, push_bda::UInt64,
                                indirect_buf, indirect_offset::Integer=0)
-    dispatch_info = dispatch_logging_enabled[] ?
-        "$(last_dispatch_info[]) (indirect)" : ""
+    dispatch_info = DISPATCH_LOGGING_ENABLED[] ?
+        "$(LAST_DISPATCH_INFO[]) (indirect)" : ""
 
     record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
@@ -436,12 +436,12 @@ function flush!(bq::BatchQueue, device::Vulkan.Device)
 
     saved_dispatch_count = batch.dispatch_count
     saved_last_was_rt = batch.last_was_rt
-    prev_dispatch_info[] = last_dispatch_info[]
+    PREV_DISPATCH_INFO[] = LAST_DISPATCH_INFO[]
 
     submit_info = Vulkan.SubmitInfo([], [], all_cmd_bufs, [])
     submit_result = Vulkan.queue_submit(bq.queue, [submit_info]; fence=batch.fence)
     if iserror(submit_result)
-        _device_lost[] = true
+        DEVICE_LOST[] = true
         reset_batch_on_error!()
         throw_with_validation_context("vkQueueSubmit", submit_result,
             saved_dispatch_count, saved_last_was_rt)
@@ -449,17 +449,17 @@ function flush!(bq::BatchQueue, device::Vulkan.Device)
 
     fence_result = Vulkan.wait_for_fences(device, [batch.fence], true, typemax(UInt64))
     if iserror(fence_result)
-        _device_lost[] = true
+        DEVICE_LOST[] = true
         reset_batch_on_error!()
         throw_with_validation_context("vkWaitForFences", fence_result,
             saved_dispatch_count, saved_last_was_rt)
     end
     unwrap(Vulkan.reset_fences(device, [batch.fence]))
 
-    last_dispatch_info[] = "$(batch.dispatch_count) dispatches ($(batch.last_was_rt ? "RT" : "compute"))"
+    LAST_DISPATCH_INFO[] = "$(batch.dispatch_count) dispatches ($(batch.last_was_rt ? "RT" : "compute"))"
     Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, batch.dispatch_count)
-    if dispatch_logging_enabled[]
-        append!(dispatch_log, batch.dispatch_log)
+    if DISPATCH_LOGGING_ENABLED[]
+        append!(DISPATCH_LOG, batch.dispatch_log)
     end
 
     reclaim_batch!(bq, batch)
@@ -476,7 +476,7 @@ end
 Flush the default batch queue. Convenience wrapper for interactive use.
 """
 function vk_flush!()
-    _device_lost[] && throw(LavaError("command flush", "Vulkan device lost",
+    DEVICE_LOST[] && throw(LavaError("command flush", "Vulkan device lost",
         "Call Lava.vk_reset_device!() to reinitialize, or restart Julia session."))
     ctx = vk_context()
     flush!(ctx.default_bq, ctx.device)
@@ -504,18 +504,18 @@ function append_copy_and_flush!(ctx::VkContext, src_buffer::Vulkan.Buffer,
     src_stage = batch.last_was_rt ?
         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR :
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
-    _vk_barrier_ref[] = VkMemoryBarrier(
+    VK_BARRIER_REF[] = VkMemoryBarrier(
         VK_STRUCTURE_TYPE_MEMORY_BARRIER, C_NULL,
         VkAccessFlags(VK_ACCESS_SHADER_WRITE_BIT),
         VkAccessFlags(VK_ACCESS_TRANSFER_READ_BIT))
-    ccall(_cmd_pipeline_barrier_fptr[], Cvoid,
+    ccall(CMD_PIPELINE_BARRIER_FPTR[], Cvoid,
           (Ptr{Nothing}, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
            UInt32, Ptr{VkMemoryBarrier}, UInt32, Ptr{Nothing}, UInt32, Ptr{Nothing}),
           cmd.vks,
           VkPipelineStageFlags(src_stage),
           VkPipelineStageFlags(VK_PIPELINE_STAGE_TRANSFER_BIT),
           VkDependencyFlags(0),
-          UInt32(1), _vk_barrier_ref,
+          UInt32(1), VK_BARRIER_REF,
           UInt32(0), C_NULL,
           UInt32(0), C_NULL)
 
@@ -534,7 +534,7 @@ end
 function throw_with_validation_context(call_name::String, err_result,
         dispatch_count::Int=0, last_was_rt::Bool=false)
     # Re-enable dispatch logging so the next run captures debug info
-    dispatch_logging_enabled[] = true
+    DISPATCH_LOGGING_ENABLED[] = true
     vk_err = unwrap_error(err_result)
     msgs = get_validation_messages()
     validation_detail = if isempty(msgs)
@@ -544,16 +544,16 @@ function throw_with_validation_context(call_name::String, err_result,
         "Last $n validation message(s):\n" * join(["  [$i] $(msgs[end-n+i])" for i in 1:n], "\n")
     end
 
-    dispatch_detail = if isempty(dispatch_log)
+    dispatch_detail = if isempty(DISPATCH_LOG)
         "No dispatches logged."
     else
-        "Recent dispatch log (last $(length(dispatch_log))):\n" *
-        join(["  $d" for d in dispatch_log], "\n")
+        "Recent dispatch log (last $(length(DISPATCH_LOG))):\n" *
+        join(["  $d" for d in DISPATCH_LOG], "\n")
     end
 
     total = TOTAL_DISPATCH_COUNTER[]
-    prev_info = prev_dispatch_info[]
-    curr_info = last_dispatch_info[]
+    prev_info = PREV_DISPATCH_INFO[]
+    curr_info = LAST_DISPATCH_INFO[]
     throw(LavaError(
         call_name,
         """$vk_err after $dispatch_count dispatches in batch ($total total, last_was_rt=$last_was_rt)
@@ -574,11 +574,11 @@ Enable or disable dispatch name logging. When enabled, each dispatch records
 its kernel name and parameters for crash debugging. Disabled by default for
 zero-alloc performance. Auto-enabled on DEVICE_LOST.
 """
-set_dispatch_logging!(enabled::Bool) = (dispatch_logging_enabled[] = enabled)
+set_dispatch_logging!(enabled::Bool) = (DISPATCH_LOGGING_ENABLED[] = enabled)
 
 """
     get_dispatch_log() -> Vector{String}
 
 Return a copy of the recent dispatch log (up to $MAX_DISPATCH_LOG entries).
 """
-get_dispatch_log() = copy(dispatch_log)
+get_dispatch_log() = copy(DISPATCH_LOG)

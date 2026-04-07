@@ -16,7 +16,7 @@ using Atomix
 # Fix 1: OpBitcast on PSB pointers crashes NVIDIA RT shader compiler
 #
 # Symptom: Segfault in libnvidia-glvkspirv.so during vkCreateRayTracingPipelinesKHR
-# Fix: _emit_psb_ptr_reinterpret!() uses ConvertPtrToU+ConvertUToPtr instead of OpBitcast
+# Fix: emit_psb_ptr_reinterpret!() uses ConvertPtrToU+ConvertUToPtr instead of OpBitcast
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Fix 1: No OpBitcast on PSB pointers (SPIR-V)" begin
@@ -227,7 +227,7 @@ end
 # ═══════════════════════════════════════════════════════════════════════
 # Fix 7: PHI cycle detection infinite loop
 #
-# Symptom: _trace_to_non_alloca() mishandled PHI cycles, returning wrong
+# Symptom: trace_to_non_alloca() mishandled PHI cycles, returning wrong
 # storage class. GPU crash on multi-material scenes.
 # Fix: Return true (=PSB) for cycles, since PHI cycles only occur with PSB pointers
 # ═══════════════════════════════════════════════════════════════════════
@@ -453,7 +453,7 @@ end
 # command buffer processing fails on very large CBs.
 #
 # Fix: Automatically seal the current CB and start a fresh one when
-# dispatches per segment reach cb_split_threshold. All segments are
+# dispatches per segment reach CB_SPLIT_THRESHOLD. All segments are
 # submitted in a single vkQueueSubmit call, preserving barrier semantics.
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -467,8 +467,8 @@ end
 
     # Test 1: Splitting occurs at threshold
     @testset "Split at threshold" begin
-        old_threshold = Lava.cb_split_threshold[]
-        Lava.cb_split_threshold[] = 100  # Low threshold for fast test
+        old_threshold = Lava.CB_SPLIT_THRESHOLD[]
+        Lava.CB_SPLIT_THRESHOLD[] = 100  # Low threshold for fast test
 
         a = Lava.LavaArray(zeros(Float32, 64))
         kernel = cb_split_inc!(backend)
@@ -488,13 +488,13 @@ end
         # Sealed CBs returned to free pool
         @test length(batch.sealed_cmd_bufs) == 0
 
-        Lava.cb_split_threshold[] = old_threshold
+        Lava.CB_SPLIT_THRESHOLD[] = old_threshold
     end
 
     # Test 2: Splitting disabled (threshold=0)
     @testset "Splitting disabled" begin
-        old_threshold = Lava.cb_split_threshold[]
-        Lava.cb_split_threshold[] = 0
+        old_threshold = Lava.CB_SPLIT_THRESHOLD[]
+        Lava.CB_SPLIT_THRESHOLD[] = 0
 
         a = Lava.LavaArray(zeros(Float32, 64))
         kernel = cb_split_inc!(backend)
@@ -510,13 +510,13 @@ end
         Lava.vk_flush!()
         @test Array(a) == fill(500.0f0, 64)
 
-        Lava.cb_split_threshold[] = old_threshold
+        Lava.CB_SPLIT_THRESHOLD[] = old_threshold
     end
 
     # Test 3: Multiple flushes with splitting produce correct results
     @testset "Multiple flushes with splitting" begin
-        old_threshold = Lava.cb_split_threshold[]
-        Lava.cb_split_threshold[] = 50
+        old_threshold = Lava.CB_SPLIT_THRESHOLD[]
+        Lava.CB_SPLIT_THRESHOLD[] = 50
 
         a = Lava.LavaArray(zeros(Float32, 64))
         kernel = cb_split_inc!(backend)
@@ -535,7 +535,7 @@ end
         Lava.vk_flush!()
         @test Array(a) == fill(400.0f0, 64)
 
-        Lava.cb_split_threshold[] = old_threshold
+        Lava.CB_SPLIT_THRESHOLD[] = old_threshold
     end
 
     # Test 4: Large dispatch count (simulating Hikari-scale workload)
@@ -549,7 +549,7 @@ end
         ctx = Lava.vk_context()
         batch = ctx.active_batch
         @test batch.dispatch_count == 5000
-        threshold = Lava.cb_split_threshold[]
+        threshold = Lava.CB_SPLIT_THRESHOLD[]
         if threshold > 0
             expected_sealed = div(5000, threshold) - (5000 % threshold == 0 ? 1 : 0)
             @test length(batch.sealed_cmd_bufs) >= 1
