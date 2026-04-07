@@ -1861,8 +1861,3 @@ function lower_memset!(inst::LLVM.CallInst)
     end
 end
 
-# ── Compiler caches ──
-
-const COMPILER_CACHE = Dict{Any, Any}()
-const KERNEL_CACHE = Dict{UInt, Any}()
-const compile_lock = ReentrantLock()

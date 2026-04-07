@@ -69,6 +69,11 @@ end
         include(joinpath(@__DIR__, "test_caching_and_allocations.jl"))
     end
 
+    # ── Tier 3h: Disk Cache & Two-Tier Caching ──
+    @testset "Tier 3h: Kernel Cache" begin
+        include(joinpath(@__DIR__, "test_disk_cache.jl"))
+    end
+
     # ── Tier 3g: Graphics Pipeline ──
     @testset "Tier 3g: Graphics Pipeline" begin
         include(joinpath(@__DIR__, "test_graphics_pipeline.jl"))

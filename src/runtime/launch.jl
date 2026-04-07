@@ -34,25 +34,37 @@ function download(src::LavaBuffer{T}) where T
     return result
 end
 
-# Cache compiled GPU kernels by (function, type tuple, workgroup_size)
-const KERNEL_CACHE = Dict{UInt64, LavaGPUKernel}()
-# Cache pipelines alongside compiled kernels (avoids re-hashing SPIR-V bytes)
-const PIPELINE_BY_KERNEL = Dict{UInt64, LavaComputePipeline}()
-# Cache arg layout offsets as Vector{Int} (Vector{Int} indexing is zero-alloc,
-# unlike Vector{Pair{Int,Int}} which boxes Pair on access)
-const ARG_OFFSETS_CACHE = Dict{UInt64, Vector{Int}}()
-# Cache byval LLVM sizes — maps to same keys as ARG_OFFSETS_CACHE
-const BYVAL_SIZES_CACHE = Dict{UInt64, Vector{Int}}()
-# Insertion order for kernel cache eviction (FIFO)
+# ── Two-tier GPU kernel cache ──
+#
+# Tier 1 (hot path, ~144ns): hash-based Dict lookup by (f, tt, workgroup_size).
+#   Returns the linked result (VkPipeline + offsets + byval sizes) directly.
+#   This is the in-session fast path used by ka_launch! on every dispatch.
+#
+# Tier 2 (warm path, ~1ms): GPUCompiler.cached_compilation with disk cache.
+#   On Tier 1 miss, looks up the MethodInstance in GPUCompiler's CodeInstance
+#   cache, then checks the disk cache for serialized SPIR-V bytes.
+#   On disk hit: deserialize SPIR-V + create VkPipeline (skips LLVM + SPIR-V emission).
+#   On disk miss: full compilation, then serialize to disk for next session.
+#
+# Tier 1 stores session-dependent objects (VkPipeline handles).
+# Tier 2's compiler output (SPIR-V bytes + push_info) is session-independent and serializable.
+
+# Linked result: session-dependent, stored in Tier 1 cache
+struct LavaLinkedKernel
+    compiled::LavaGPUKernel        # SPIR-V bytes + push_info (also in Tier 2)
+    pipeline::LavaComputePipeline  # VkPipeline (session-dependent, NOT serializable)
+    offsets::Vector{Int}           # arg layout offsets (derived from push_info)
+    byval_sizes::Vector{Int}      # LLVM byval sizes (derived from push_info)
+end
+
+# Tier 1: fast hash-based lookup (session-only, cleared on device reset)
+const LINKED_KERNEL_CACHE = Dict{UInt64, LavaLinkedKernel}()
 const KERNEL_INSERTION_ORDER = UInt64[]
 const MAX_KERNEL_CACHE_SIZE = Ref(1024)
 
 # Register cleanup callback for vk_reset_device!
 push!(RESET_CALLBACKS, function()
-    empty!(KERNEL_CACHE)
-    empty!(PIPELINE_BY_KERNEL)
-    empty!(ARG_OFFSETS_CACHE)
-    empty!(BYVAL_SIZES_CACHE)
+    empty!(LINKED_KERNEL_CACHE)
     empty!(KERNEL_INSERTION_ORDER)
     # Reset arg buffer slab allocator
     empty!(ARG_SLABS)
@@ -422,70 +434,159 @@ function args_to_bda_filtered(args::Tuple)
     return tuple(result...)
 end
 
-function get_compiled_kernel(@nospecialize(f), @nospecialize(tt), workgroup_size)
-    key = hash((f, tt, workgroup_size))
-    cached = get(KERNEL_CACHE, key, nothing)
-    if cached !== nothing
-        return cached
-    end
-    compiled = lava_compile_gpu(f, tt; workgroup_size)
-    KERNEL_CACHE[key] = compiled
-    return compiled
-end
-
 const SPIRV_DUMP_DIR = Ref("")
 const SPIRV_DUMP_COUNTER = Ref(0)
 
-function get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), workgroup_size)
-    key = hash((f, tt, workgroup_size))
+# ── Lava disk cache ──
+# GPUCompiler's disk cache only works for precompiled package code (needs build_id).
+# KA @kernel macros generate functions at expansion time without build_id, so we
+# implement our own disk cache keyed by (specTypes hash, workgroup_size).
+# The specTypes hash is stable across sessions for the same kernel+argtypes.
 
-    compiled = get(KERNEL_CACHE, key, nothing)
-    if compiled === nothing
-        compiled = lava_compile_gpu(f, tt; workgroup_size)
-        KERNEL_CACHE[key] = compiled
-        # Track insertion order for cache eviction
-        push!(KERNEL_INSERTION_ORDER, key)
-        evict_kernel_cache_if_full!()
-        # Dump SPIR-V if dump dir is set
-        if !isempty(SPIRV_DUMP_DIR[])
-            SPIRV_DUMP_COUNTER[] += 1
-            fname = string(nameof(typeof(f)))
-            path = joinpath(SPIRV_DUMP_DIR[], "$(lpad(SPIRV_DUMP_COUNTER[], 3, '0'))_$(fname).spv")
-            write(path, compiled.spirv_bytes)
-        end
+const LAVA_DISK_CACHE_DIR = Ref("")
+
+function lava_disk_cache_dir()
+    dir = LAVA_DISK_CACHE_DIR[]
+    if isempty(dir)
+        dir = joinpath(first(Base.DEPOT_PATH), "scratchspaces", "lava_spirv_cache")
+        LAVA_DISK_CACHE_DIR[] = dir
     end
-
-    pipeline = get(PIPELINE_BY_KERNEL, key, nothing)
-    if pipeline === nothing
-        pipeline = get_compute_pipeline(compiled.spirv_bytes, compiled.entry_name;
-                                        push_constant_size=compiled.push_info.push_size)
-        PIPELINE_BY_KERNEL[key] = pipeline
-    end
-
-    offsets = get(ARG_OFFSETS_CACHE, key, nothing)
-    if offsets === nothing
-        offsets = Int[p.first for p in compiled.push_info.arg_layout]
-        ARG_OFFSETS_CACHE[key] = offsets
-    end
-
-    byval_sizes = get(BYVAL_SIZES_CACHE, key, nothing)
-    if byval_sizes === nothing
-        byval_sizes = compiled.push_info.byval_llvm_sizes
-        BYVAL_SIZES_CACHE[key] = byval_sizes
-    end
-
-    return compiled, pipeline, offsets, byval_sizes
+    return dir
 end
 
-"""Evict oldest kernel cache entries when cache exceeds max size."""
-function evict_kernel_cache_if_full!()
+function lava_disk_cache_key(source::Core.MethodInstance, workgroup_size)
+    # Hash the type signature as a STRING for stability across sessions.
+    # Julia's hash(Type) uses object identity which changes per session.
+    # String representation is stable for the same source code.
+    h = hash(string(source.specTypes))
+    h = hash(workgroup_size, h)
+    return string(h, base=16) * ".jls"
+end
+
+"""
+    lava_disk_cache_load(source, workgroup_size) -> Union{Nothing, LavaGPUKernel}
+
+Try to load cached SPIR-V from disk. Returns nothing on miss.
+"""
+function lava_disk_cache_load(source::Core.MethodInstance, workgroup_size)
+    dir = lava_disk_cache_dir()
+    isdir(dir) || return nothing
+    path = joinpath(dir, lava_disk_cache_key(source, workgroup_size))
+    isfile(path) || return nothing
+    local entry
+    try
+        entry = open(Serialization.deserialize, path)
+    catch ex
+        @warn "Lava: disk cache load failed" path exception=(ex, catch_backtrace())
+        return nothing
+    end
+    if string(entry.spec_types) == string(source.specTypes) && entry.workgroup_size == workgroup_size
+        return entry.kernel::LavaGPUKernel
+    end
+    return nothing
+end
+
+"""
+    lava_disk_cache_store(source, workgroup_size, kernel::LavaGPUKernel)
+
+Store compiled SPIR-V to disk for future sessions.
+"""
+function lava_disk_cache_store(source::Core.MethodInstance, workgroup_size, kernel::LavaGPUKernel)
+    dir = lava_disk_cache_dir()
+    mkpath(dir)
+    path = joinpath(dir, lava_disk_cache_key(source, workgroup_size))
+    entry = (
+        spec_types = source.specTypes,
+        workgroup_size = workgroup_size,
+        kernel = LavaGPUKernel(
+            kernel.spirv_bytes, kernel.entry_name, kernel.workgroup_size,
+            kernel.push_info, ""  # don't cache the LLVM IR string (large, session-specific)
+        ),
+    )
+    try
+        tmppath, io = mktemp(dir; cleanup=false)
+        Serialization.serialize(io, entry)
+        close(io)
+        mv(tmppath, path; force=true)
+    catch ex
+        @debug "Lava: disk cache store failed" path exception=ex
+    end
+end
+
+"""Clear Lava's SPIR-V disk cache."""
+function clear_spirv_disk_cache!()
+    dir = lava_disk_cache_dir()
+    isdir(dir) && rm(dir; recursive=true, force=true)
+end
+
+"""
+    link_kernel(compiled::LavaGPUKernel) -> LavaLinkedKernel
+
+Create session-dependent Vulkan objects (VkPipeline) from cached SPIR-V bytes.
+"""
+function link_kernel(compiled::LavaGPUKernel)
+    pipeline = get_compute_pipeline(compiled.spirv_bytes, compiled.entry_name;
+                                    push_constant_size=compiled.push_info.push_size)
+    offsets = Int[p.first for p in compiled.push_info.arg_layout]
+    byval_sizes = compiled.push_info.byval_llvm_sizes
+    return LavaLinkedKernel(compiled, pipeline, offsets, byval_sizes)
+end
+
+"""
+    get_compiled_kernel_and_pipeline(f, tt, workgroup_size) -> (compiled, pipeline, offsets, byval_sizes)
+
+Three-tier cached kernel compilation:
+1. Hash-based in-memory lookup (~14μs) for hot-path dispatches
+2. Lava disk cache (~1-2ms) for cross-session persistence
+3. Full LLVM + SPIR-V compilation (~300ms) on cold miss
+"""
+function get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), workgroup_size)
+    # Tier 1: fast hash-based in-memory lookup
+    key = hash((f, tt, workgroup_size))
+    linked = get(LINKED_KERNEL_CACHE, key, nothing)
+    if linked !== nothing
+        return linked.compiled, linked.pipeline, linked.offsets, linked.byval_sizes
+    end
+
+    # Resolve MethodInstance (needed for Tier 2 disk key and Tier 3 compilation)
+    config = lava_compiler_config(; workgroup_size)
+    source = GPUCompiler.methodinstance(typeof(f), tt)
+
+    # Tier 2: Lava disk cache (SPIR-V bytes survive restarts)
+    compiled = lava_disk_cache_load(source, workgroup_size)
+    if compiled !== nothing
+        @debug "Lava: disk cache hit" f tt workgroup_size
+        linked = link_kernel(compiled)
+    else
+        # Tier 3: full compilation (LLVM -> SPIR-V -> validate)
+        compiled = lava_compile_gpu(f, tt; workgroup_size)
+        linked = link_kernel(compiled)
+        # Store to disk for next session
+        lava_disk_cache_store(source, workgroup_size, compiled)
+    end
+
+    # Populate Tier 1 for subsequent fast lookups
+    LINKED_KERNEL_CACHE[key] = linked
+    push!(KERNEL_INSERTION_ORDER, key)
+    evict_linked_cache_if_full!()
+
+    # Dump SPIR-V if dump dir is set
+    if !isempty(SPIRV_DUMP_DIR[])
+        SPIRV_DUMP_COUNTER[] += 1
+        fname = string(nameof(typeof(f)))
+        path = joinpath(SPIRV_DUMP_DIR[], "$(lpad(SPIRV_DUMP_COUNTER[], 3, '0'))_$(fname).spv")
+        write(path, linked.compiled.spirv_bytes)
+    end
+
+    return linked.compiled, linked.pipeline, linked.offsets, linked.byval_sizes
+end
+
+"""Evict oldest linked kernel cache entries when cache exceeds max size."""
+function evict_linked_cache_if_full!()
     max_size = MAX_KERNEL_CACHE_SIZE[]
     while length(KERNEL_INSERTION_ORDER) > max_size
         old_key = popfirst!(KERNEL_INSERTION_ORDER)
-        delete!(KERNEL_CACHE, old_key)
-        delete!(PIPELINE_BY_KERNEL, old_key)
-        delete!(ARG_OFFSETS_CACHE, old_key)
-        delete!(BYVAL_SIZES_CACHE, old_key)
+        delete!(LINKED_KERNEL_CACHE, old_key)
     end
 end
 

@@ -44,6 +44,7 @@ export trace_closest_hits!, trace_closest_hits_indirect!, RayTracingPipeline, tr
 export set_anyhit_pipeline!, trace_closest_hits_anyhit!, trace_closest_hits_anyhit_indirect!
 export lava_rt_ignore_intersection, lava_rt_terminate_ray
 
+import Serialization
 using Vulkan
 using GPUCompiler
 using LLVM
@@ -145,7 +146,7 @@ function gpu_memory_usage()
      deferred_frees = length(DEFERRED_FREES),
      ARG_SLABS = length(ARG_SLABS),
      pipelines_cached = length(PIPELINE_CACHE),
-     kernels_cached = length(KERNEL_CACHE))
+     kernels_cached = length(LINKED_KERNEL_CACHE))
 end
 
 """
@@ -197,6 +198,48 @@ function init__()
         DEVICE_LOST[] = true
         VK_CONTEXT_REF[] = nothing
     end
+end
+
+# ── Precompilation hints ──
+# Precompile hot Julia-side codepaths via explicit method hints.
+# IMPORTANT: We must NOT initialize any Vulkan device or allocate GPU memory here.
+# Stale Vulkan handles serialized into the pkgimage would segfault on load.
+# Instead, use precompile() to force type inference on key methods.
+
+using PrecompileTools
+
+@setup_workload begin
+    @compile_workload begin
+        # Safe: compiler config creation (pure Julia, no Vulkan)
+        lava_compiler_config(; workgroup_size=(64, 1, 1))
+        lava_compiler_config(; workgroup_size=(256, 1, 1))
+
+        # Safe: hash computation for cache keys (pure Julia)
+        hash((typeof(identity), Tuple{Ptr{Float32}, Ptr{Float32}}, (64, 1, 1)))
+
+        # Safe: LavaAdaptor and adapt paths (pure Julia type dispatch)
+        Adapt.adapt(LavaAdaptor(), Float32(1.0))
+        Adapt.adapt(LavaAdaptor(), Int32(1))
+
+        # Safe: GPUCompiler target configuration (pure Julia)
+        GPUCompiler.SPIRVCompilerTarget(; backend=:llvm, validate=false, supports_fp64=true)
+    end
+end
+
+# Explicit precompile hints for hot methods that involve complex type parameters.
+# These force Julia to cache the type inference results without executing anything.
+let
+    # Arg packing (@generated functions) - common kernel argument types
+    for T in (Float32, Int32, UInt32)
+        precompile(Tuple{typeof(hash), Tuple{Type, Type, NTuple{3,Int}}})
+    end
+
+    # LavaArray operations
+    precompile(Tuple{typeof(Adapt.adapt), LavaAdaptor, Vector{Float32}})
+
+    # Disk cache paths
+    precompile(Tuple{typeof(lava_disk_cache_dir)})
+    precompile(Tuple{typeof(lava_disk_cache_key), Core.MethodInstance, NTuple{3,Int}})
 end
 
 end # module Lava

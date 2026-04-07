@@ -29,7 +29,7 @@ using KernelAbstractions
                 Lava.vk_flush!()
 
                 # Cache should have at most 5 entries
-                @test length(Lava.KERNEL_CACHE) <= 5
+                @test length(Lava.LINKED_KERNEL_CACHE) <= 5
                 @test length(Lava.KERNEL_INSERTION_ORDER) <= 5
 
                 # Result should still be correct (latest kernel worked)

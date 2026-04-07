@@ -73,11 +73,11 @@ end
 
     # Test that byval_llvm_sizes are populated during compilation
     @testset "byval_llvm_sizes populated" begin
-        # After running broadcasts above, cache should have entries
-        @test !isempty(Lava.BYVAL_SIZES_CACHE)
+        # After running broadcasts above, linked cache should have entries
+        @test !isempty(Lava.LINKED_KERNEL_CACHE)
         # All byval_sizes should be non-negative
-        for (k, v) in Lava.BYVAL_SIZES_CACHE
-            @test all(s -> s >= 0, v)
+        for (k, linked) in Lava.LINKED_KERNEL_CACHE
+            @test all(s -> s >= 0, linked.byval_sizes)
         end
     end
 end
