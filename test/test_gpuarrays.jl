@@ -9,10 +9,18 @@ gpuarrays_testsuite = joinpath(dirname(dirname(pathof(GPUArrays))), "test", "tes
 include(gpuarrays_testsuite)
 
 # Supported element types — Lava supports a broad set via SPIR-V
-TestSuite.supported_eltypes(::Type{<:LavaArray}) = (Int16, Int32, Int64,
-                                                     Float16, Float32, Float64,
-                                                     ComplexF16, ComplexF32, ComplexF64,
-                                                     Complex{Int16}, Complex{Int32}, Complex{Int64})
+# Float64/ComplexF64 require shader_float_64 (unavailable on MoltenVK)
+if Lava.has_device_feature(:shader_float_64)
+    TestSuite.supported_eltypes(::Type{<:LavaArray}) = (Int16, Int32, Int64,
+                                                         Float16, Float32, Float64,
+                                                         ComplexF16, ComplexF32, ComplexF64,
+                                                         Complex{Int16}, Complex{Int32}, Complex{Int64})
+else
+    TestSuite.supported_eltypes(::Type{<:LavaArray}) = (Int16, Int32, Int64,
+                                                         Float16, Float32,
+                                                         ComplexF16, ComplexF32,
+                                                         Complex{Int16}, Complex{Int32}, Complex{Int64})
+end
 
 # Disallow scalar indexing — matches CUDA/Metal/AMDGPU behavior
 GPUArrays.allowscalar(false)
@@ -54,6 +62,7 @@ const SKIP = Set([
     "alloc cache",  # needs alloc_cache support
     "random",       # needs RNG on GPU (not implemented)
     "statistics",   # mean(sin, A; dims=2) precision mismatch on lavapipe — TODO fix
+    (!Lava.has_device_feature(:shader_float_64) ? ["linalg/norm"] : [])...,  # norm uses Float64 widening internally
 ])
 
 function run_gpuarrays_tests()

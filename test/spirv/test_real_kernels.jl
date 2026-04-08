@@ -8,20 +8,21 @@
 using Test
 
 # Guard: skip entire file if Hikari/Raycore aren't loadable
-let can_load = try
-        Base.require(Main, :Hikari)
-        Base.require(Main, :Raycore)
-        true
-    catch
-        false
-    end
-    if !can_load
-        @testset "Real Kernel Compilation" begin
-            @test_broken false  # mark as known-skipped
-        end
-        return  # exit file
-    end
+const _HAS_HIKARI_RAYCORE = try
+    Base.require(Main, :Hikari)
+    Base.require(Main, :Raycore)
+    true
+catch
+    false
 end
+
+if !_HAS_HIKARI_RAYCORE
+
+@testset "Real Kernel Compilation" begin
+    @test_broken false  # mark as known-skipped
+end
+
+else  # Hikari + Raycore available
 
 if !@isdefined(SPIRVTestUtils)
     include(joinpath(@__DIR__, "..", "spirv_test_utils.jl"))
@@ -249,4 +250,4 @@ using StaticArrays
 
 end
 
-
+end  # if _HAS_HIKARI_RAYCORE

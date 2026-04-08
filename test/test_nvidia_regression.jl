@@ -404,11 +404,13 @@ end
     Lava.vk_flush!()
     @test Array(b) == UInt32[5, 15, 25, 35]
 
-    # Float64
-    a = Lava.LavaArray(Float64[1.0, 2.0, 3.0])
-    b = a .* 2.0
-    Lava.vk_flush!()
-    @test Array(b) ≈ Float64[2.0, 4.0, 6.0]
+    # Float64 (requires shader_float_64)
+    if Lava.has_device_feature(:shader_float_64)
+        a = Lava.LavaArray(Float64[1.0, 2.0, 3.0])
+        b = a .* 2.0
+        Lava.vk_flush!()
+        @test Array(b) ≈ Float64[2.0, 4.0, 6.0]
+    end
 end
 
 @testset "Stress: struct array of arrays pattern" begin
