@@ -369,11 +369,18 @@ Handles all argument types:
             push!(exprs, quote
                 let x = all_args[$arg_i]
                     inline_offset = (inline_offset + 7) & ~7
+                    llvm_size = @inbounds(byval_sizes[$layout_i])
+                    julia_size = $(sizeof(Ti))
+                    if julia_size != llvm_size
+                        @warn "Lava: byval size mismatch" T=$(QuoteNode(Ti)) julia_size llvm_size maxlog=1
+                    end
+                    # Zero the entire byval region first, then write Julia data.
+                    ccall(:memset, Ptr{Cvoid}, (Ptr{Cvoid}, Cint, Csize_t),
+                          mapped_ptr + inline_offset, 0, llvm_size)
                     unsafe_store!(Ptr{$Ti}(mapped_ptr + inline_offset), x)
                     unsafe_store!(Ptr{UInt64}(mapped_ptr + @inbounds(offsets[$layout_i])),
                                   arg_buf_bda + UInt64(inline_offset))
-                    # Use LLVM byval size (≥ Julia sizeof) to prevent overlap with next inline arg
-                    inline_offset += @inbounds(byval_sizes[$layout_i])
+                    inline_offset += llvm_size
                 end
             end)
         elseif Ti === UInt64

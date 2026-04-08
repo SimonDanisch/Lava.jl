@@ -167,22 +167,45 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
     )
 end
 
-# Descriptor set cache: keyed by (ds_layout handle, tlas Julia objectid) to avoid
-# handle recycling issues. Raw Vulkan handles can be reused after destruction,
-# so using objectid ensures we never return a stale descriptor set.
-const RT_DESC_CACHE = Dict{Tuple{UInt64, UInt64}, Tuple{Vulkan.DescriptorPool, Vulkan.DescriptorSet}}()
+# Descriptor set cache: keyed by (ds_layout handle, tlas Julia objectid).
+# Also stores a WeakRef to the TLAS so we can detect when it's been GC'd
+# and clean up stale descriptor pools.
+const RT_DESC_CACHE = Dict{Tuple{UInt64, UInt64}, Tuple{Vulkan.DescriptorPool, Vulkan.DescriptorSet, WeakRef}}()
+const MAX_RT_DESC_CACHE_SIZE = 32
 
 push!(RESET_CALLBACKS, function()
+    # Destroy all descriptor pools on device reset
+    for (key, (pool, ds, wr)) in RT_DESC_CACHE
+        try pool.destructor() catch end
+    end
     empty!(RT_DESC_CACHE)
 end)
 
+function evict_stale_rt_desc_cache!()
+    stale_keys = Tuple{UInt64, UInt64}[]
+    for (key, (pool, ds, wr)) in RT_DESC_CACHE
+        if wr.value === nothing
+            push!(stale_keys, key)
+        end
+    end
+    for key in stale_keys
+        pool, ds, wr = RT_DESC_CACHE[key]
+        try pool.destructor() catch end
+        delete!(RT_DESC_CACHE, key)
+    end
+end
+
 function get_rt_descriptor_set(pipeline::LavaRTPipeline, tlas::LavaTLAS)
-    # Cache key: use objectid for TLAS to avoid handle recycling after GC
     key = (UInt64(pipeline.descriptor_set_layout.vks),
            objectid(tlas))
     cached = get(RT_DESC_CACHE, key, nothing)
     if cached !== nothing
         return cached[2]
+    end
+
+    # Evict stale entries before adding new ones
+    if length(RT_DESC_CACHE) >= MAX_RT_DESC_CACHE_SIZE
+        evict_stale_rt_desc_cache!()
     end
 
     dev = vk_device()
@@ -206,7 +229,7 @@ function get_rt_descriptor_set(pipeline::LavaRTPipeline, tlas::LavaTLAS)
     )
     Vulkan.update_descriptor_sets(dev, [write_ds], [])
 
-    RT_DESC_CACHE[key] = (desc_pool, desc_set)
+    RT_DESC_CACHE[key] = (desc_pool, desc_set, WeakRef(tlas))
     return desc_set
 end
 

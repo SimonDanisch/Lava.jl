@@ -567,11 +567,7 @@ function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
         write(joinpath(_dbg_dir, "kernel_$(_kidx)_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).ll"), ir)
 
         # ── Stage 2: Custom SPIR-V emission ──
-        spirv_bytes, source_map = try
-            emit_spirv_from_llvm(mod, wrapper_name, workgroup_size)
-        finally
-            ACTIVE_DATA_LAYOUT[] = nothing
-        end
+        spirv_bytes, source_map = emit_spirv_from_llvm(mod, wrapper_name, workgroup_size)
 
         # ── Stage 2.5: SPIR-V optimization (optional, helps NVIDIA) ──
         if SPIRV_OPT_ENABLED[]
@@ -1040,7 +1036,6 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
     # Create emitter state
     state = SPIRVEmitterState(spirv_mod, type_ctx)
     state.data_layout = LLVM.datalayout(llvm_mod)
-    ACTIVE_DATA_LAYOUT[] = state.data_layout  # enable DataLayout-aware type size computation
 
     # Find the entry function
     entry_fn = LLVM.functions(llvm_mod)[entry_name]
@@ -1187,7 +1182,7 @@ function emit_push_constant_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVar
         offset = UInt32(0)
         for (i, member_ty) in enumerate(members)
             emit_member_decorate!(mod, struct_spirv_id, UInt32(i - 1), Dec.Offset, offset)
-            offset += UInt32(compute_type_size(member_ty))
+            offset += UInt32(compute_type_size(member_ty, state.data_layout))
         end
     end
 
@@ -1221,17 +1216,13 @@ function emit_workgroup_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariabl
     mod = state.mod
     gv_value_ty = LLVM.global_value_type(gv)
 
-    # Check if this workgroup type contains a struct (needs explicit layout).
-    # Without explicit layout, NVIDIA drivers may use incorrect memory layout
-    # for struct types in workgroup storage, corrupting mixed-type tuple data.
-    needs_explicit_layout = wg_type_contains_struct(gv_value_ty)
-
-    # Create FRESH type IDs for workgroup usage.
-    # map_workgroup_type! now adds MemberOffset/ArrayStride decorations when
-    # the type contains structs (for VK_KHR_workgroup_memory_explicit_layout).
+    # Always use explicit layout for workgroup variables.
+    # Once WorkgroupMemoryExplicitLayoutKHR is enabled (needed for struct-containing
+    # workgroup vars), ALL workgroup variables in the module must follow explicit layout
+    # rules. Using explicit layout unconditionally ensures consistency.
     pointee_spirv = map_workgroup_type!(state.type_ctx, gv_value_ty)
 
-    if needs_explicit_layout
+    begin
         # Wrap in a Block-decorated outer struct for explicit layout.
         # SPIR-V requires: Block on outermost struct, Offset on its members,
         # ArrayStride on arrays of structs, MemberOffset on inner structs.
@@ -1270,15 +1261,6 @@ function emit_workgroup_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariabl
         # The unwrapping AccessChain will drill through the Block struct to get a pointer
         # to the inner array/type, which all existing GEP handlers expect.
         state.wg_wrapped_vars[gv] = (var_id, pointee_spirv, gv_value_ty)
-    else
-        # No struct types — use simple undecorated workgroup variable (original path)
-        ptr_ty = map_pointer_type!(state.type_ctx, pointee_spirv, SC.Workgroup)
-
-        var_id = fresh_id!(mod)
-        encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Workgroup)
-
-        # Register directly in value_map
-        state.value_map[gv] = var_id
     end
 
     # Register pointee type in PTM for downstream GEP/load/store resolution

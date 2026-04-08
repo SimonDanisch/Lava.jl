@@ -174,6 +174,7 @@ module Cap
     const Float64                       = UInt32(10)
     const Int8                          = UInt32(39)
     const Int64                         = UInt32(11)
+    const Int64Atomics                  = UInt32(12)
     const Int16                         = UInt32(22)
     const StorageBuffer16BitAccess      = UInt32(4433)
     const VulkanMemoryModel             = UInt32(5345)

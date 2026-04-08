@@ -1151,9 +1151,18 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
         encode_instruction!(state.mod.functions, Op.OpBitcast, result_ty, result_id, load_id)
         state.value_map[inst] = result_id
     elseif needs_bitcast
-        # Bitcast from actual_load_ty to load_ty (e.g., float → i32)
+        # Type mismatch between loaded type and target type
         result_id = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpBitcast, result_ty, result_id, load_id)
+        if actual_load_ty isa LLVM.PointerType && load_ty isa LLVM.IntegerType
+            # Pointer → integer: use OpConvertPtrToU (not OpBitcast)
+            encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, result_ty, result_id, load_id)
+        elseif actual_load_ty isa LLVM.IntegerType && load_ty isa LLVM.PointerType
+            # Integer → pointer: use OpConvertUToPtr
+            encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ty, result_id, load_id)
+        else
+            # Same-size scalar pun (e.g., float → i32): OpBitcast
+            encode_instruction!(state.mod.functions, Op.OpBitcast, result_ty, result_id, load_id)
+        end
         state.value_map[inst] = result_id
     else
         state.value_map[inst] = load_id
@@ -1231,6 +1240,7 @@ function resolve_struct_field_load!(state::SPIRVEmitterState, ptr::LLVM.Value,
         return (ac_id, nothing, nothing)
     end
 
+
     # No exact match. Try to find a same-sized leaf type (e.g., i32 vs float).
     # Navigate to the scalar leaf and check if sizes match.
     leaf_path, leaf_ty = find_zero_index_path_to_leaf(pointee_ty)
@@ -1299,13 +1309,16 @@ Example: `{ { float, i64 } }` at offset 8 → ([0, 1], i64)
   - outer member 0: { float, i64 } at offset 0 → recurse with remaining offset 8
   - inner member 1: i64 at offset 8 → match!
 """
-function find_struct_member_path_by_offset(struct_ty::LLVM.StructType, target_offset::Int)
+function find_struct_member_path_by_offset(struct_ty::LLVM.StructType, target_offset::Int, dl)
     path = Int[]
-    find_struct_member_path_recursive!(path, struct_ty, target_offset) || return (nothing, nothing)
+    find_struct_member_path_recursive!(path, struct_ty, target_offset, dl) || return (nothing, nothing)
+    # Walk the path to find the leaf type
     leaf_ty = struct_ty
     for idx in path
         if leaf_ty isa LLVM.StructType
             leaf_ty = LLVM.elements(leaf_ty)[idx + 1]
+        elseif leaf_ty isa LLVM.ArrayType
+            leaf_ty = LLVM.eltype(leaf_ty)  # array index selects an element
         else
             return (nothing, nothing)
         end
@@ -1313,31 +1326,48 @@ function find_struct_member_path_by_offset(struct_ty::LLVM.StructType, target_of
     return (path, leaf_ty)
 end
 
-function find_struct_member_path_recursive!(path::Vector{Int}, struct_ty::LLVM.StructType, target_offset::Int)
+function find_struct_member_path_recursive!(path::Vector{Int}, struct_ty::LLVM.StructType, target_offset::Int, dl)
     member_types = LLVM.elements(struct_ty)
-    running_offset = 0
     for (i, mt) in enumerate(member_types)
-        member_align = compute_type_alignment(mt)
-        running_offset = (running_offset + member_align - 1) & ~(member_align - 1)
-        member_size = compute_type_size(mt)
-        if running_offset == target_offset
-            # Exact match at this level
-            push!(path, i - 1)  # 0-based
+        field_offset = Int(compute_struct_field_offset(struct_ty, i - 1; dl))
+        member_size = Int(compute_type_size(mt, dl))
+        if field_offset == target_offset
+            push!(path, i - 1)
             return true
-        elseif running_offset < target_offset && target_offset < running_offset + member_size
-            # Offset falls WITHIN this member — recurse if it's a struct
+        elseif field_offset < target_offset && target_offset < field_offset + member_size
+            remaining = target_offset - field_offset
             if mt isa LLVM.StructType
-                push!(path, i - 1)  # 0-based
-                remaining = target_offset - running_offset
-                if find_struct_member_path_recursive!(path, mt, remaining)
+                push!(path, i - 1)
+                if find_struct_member_path_recursive!(path, mt, remaining, dl)
                     return true
                 end
-                pop!(path)  # recursion failed, backtrack
+                pop!(path)
+            elseif mt isa LLVM.ArrayType
+                # Decompose byte offset within an array member into element index
+                elem_ty = LLVM.eltype(mt)
+                elem_size = Int(compute_type_size(elem_ty, dl))
+                if elem_size > 0
+                    elem_idx = remaining ÷ elem_size
+                    sub_remaining = remaining % elem_size
+                    if sub_remaining == 0
+                        # Exact element boundary
+                        push!(path, i - 1)   # struct member index
+                        push!(path, elem_idx) # array element index
+                        return true
+                    elseif elem_ty isa LLVM.StructType
+                        # Sub-element within array element (nested struct in array)
+                        push!(path, i - 1)
+                        push!(path, elem_idx)
+                        if find_struct_member_path_recursive!(path, elem_ty, sub_remaining, dl)
+                            return true
+                        end
+                        pop!(path)
+                        pop!(path)
+                    end
+                end
             end
-            # Not a struct or recursion failed → offset is in padding/middle of scalar
             return false
         end
-        running_offset += member_size
     end
     return false
 end
@@ -1352,9 +1382,9 @@ When `elem_stride == 0`, returns the first array found (fallback).
 Used for dynamic byte-offset GEPs on Function-SC struct allocas, where the dynamic index
 targets an array field within the struct (e.g., accessing dims in a LavaDeviceArray).
 """
-function find_array_field_in_struct(struct_ty::LLVM.StructType, elem_stride::Int=0)
+function find_array_field_in_struct(struct_ty::LLVM.StructType, dl, elem_stride::Int=0)
     candidates = Vector{Tuple{Vector{Int}, Int, LLVM.ArrayType}}()
-    collect_array_fields!(candidates, Int[], struct_ty, 0)
+    collect_array_fields!(candidates, Int[], struct_ty, 0, dl)
     isempty(candidates) && return nothing
     # If stride hint given, find matching array by leaf element size
     if elem_stride > 0
@@ -1362,7 +1392,7 @@ function find_array_field_in_struct(struct_ty::LLVM.StructType, elem_stride::Int
         for (path, offset, arr_ty) in candidates
             # Check immediate element size
             elem_ty = LLVM.eltype(arr_ty)
-            if compute_type_size(elem_ty) == elem_stride
+            if compute_type_size(elem_ty, dl) == elem_stride
                 push!(matches, (path, offset, arr_ty))
             else
                 # Check leaf element size for nested arrays (e.g., [1 x [8 x double]])
@@ -1370,7 +1400,7 @@ function find_array_field_in_struct(struct_ty::LLVM.StructType, elem_stride::Int
                 while leaf isa LLVM.ArrayType
                     leaf = LLVM.eltype(leaf)
                 end
-                if compute_type_size(leaf) == elem_stride
+                if compute_type_size(leaf, dl) == elem_stride
                     push!(matches, (path, offset, arr_ty))
                 end
             end
@@ -1379,13 +1409,13 @@ function find_array_field_in_struct(struct_ty::LLVM.StructType, elem_stride::Int
             return matches[1]
         elseif length(matches) > 1
             # Multiple arrays match stride — prefer the largest (most elements)
-            best = argmax(i -> compute_type_size(matches[i][3]), eachindex(matches))
+            best = argmax(i -> compute_type_size(matches[i][3], dl), eachindex(matches))
             return matches[best]
         end
     end
     # Fallback: return largest array
     if length(candidates) > 1
-        best = argmax(i -> compute_type_size(candidates[i][3]), eachindex(candidates))
+        best = argmax(i -> compute_type_size(candidates[i][3], dl), eachindex(candidates))
         return candidates[best]
     end
     path, offset, arr_ty = candidates[1]
@@ -1393,18 +1423,15 @@ function find_array_field_in_struct(struct_ty::LLVM.StructType, elem_stride::Int
 end
 
 function collect_array_fields!(results::Vector{Tuple{Vector{Int}, Int, LLVM.ArrayType}},
-                                 path::Vector{Int}, struct_ty::LLVM.StructType, base_offset::Int)
+                                 path::Vector{Int}, struct_ty::LLVM.StructType, base_offset::Int, dl)
     member_types = LLVM.elements(struct_ty)
-    running_offset = 0
     for (i, mt) in enumerate(member_types)
-        member_align = compute_type_alignment(mt)
-        running_offset = (running_offset + member_align - 1) & ~(member_align - 1)
+        field_offset = Int(compute_struct_field_offset(struct_ty, i - 1; dl))
         if mt isa LLVM.ArrayType
-            push!(results, (vcat(path, [i - 1]), base_offset + running_offset, mt))
+            push!(results, (vcat(path, [i - 1]), base_offset + field_offset, mt))
         elseif mt isa LLVM.StructType
-            collect_array_fields!(results, vcat(path, [i - 1]), mt, base_offset + running_offset)
+            collect_array_fields!(results, vcat(path, [i - 1]), mt, base_offset + field_offset, dl)
         end
-        running_offset += compute_type_size(mt)
     end
 end
 
@@ -1413,27 +1440,25 @@ Decompose a byte offset into a multi-level index path through nested arrays/stru
 E.g., `[1 x [2 x i64]]` at offset 8 → [0, 1] (first outer element, second inner element),
 leaf_type = i64.
 """
-function find_array_nested_path(ty::LLVM.LLVMType, target_offset::Int)
+function find_array_nested_path(ty::LLVM.LLVMType, target_offset::Int, dl)
     path = Int[]
-    leaf = find_array_nested_path_recursive!(path, ty, target_offset)
+    leaf = find_array_nested_path_recursive!(path, ty, target_offset, dl)
     leaf === nothing && return (nothing, nothing)
     return (path, leaf)
 end
 
-function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.ArrayType, target_offset::Int)
+function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.ArrayType, target_offset::Int, dl)
     elem_ty = LLVM.eltype(ty)
-    elem_size = compute_type_size(elem_ty)
+    elem_size = compute_type_size(elem_ty, dl)
     elem_size == 0 && return nothing
     outer_idx = target_offset ÷ elem_size
     remainder = target_offset % elem_size
     outer_idx >= LLVM.length(ty) && return nothing
     push!(path, outer_idx)
     if remainder == 0
-        # Exact element boundary
         return elem_ty
     else
-        # Sub-element access: recurse into the element
-        result = find_array_nested_path_recursive!(path, elem_ty, remainder)
+        result = find_array_nested_path_recursive!(path, elem_ty, remainder, dl)
         if result !== nothing
             return result
         end
@@ -1442,33 +1467,29 @@ function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.ArrayType
     end
 end
 
-function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.StructType, target_offset::Int)
+function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.StructType, target_offset::Int, dl)
     member_types = LLVM.elements(ty)
-    running_offset = 0
     for (i, mt) in enumerate(member_types)
-        member_align = compute_type_alignment(mt)
-        running_offset = (running_offset + member_align - 1) & ~(member_align - 1)
-        member_size = compute_type_size(mt)
-        if running_offset == target_offset
+        field_offset = Int(compute_struct_field_offset(ty, i - 1; dl))
+        member_size = Int(compute_type_size(mt, dl))
+        if field_offset == target_offset
             push!(path, i - 1)
             return mt
-        elseif running_offset < target_offset && target_offset < running_offset + member_size
+        elseif field_offset < target_offset && target_offset < field_offset + member_size
             push!(path, i - 1)
-            remaining = target_offset - running_offset
-            result = find_array_nested_path_recursive!(path, mt, remaining)
+            remaining = target_offset - field_offset
+            result = find_array_nested_path_recursive!(path, mt, remaining, dl)
             if result !== nothing
                 return result
             end
             pop!(path)
             return nothing
         end
-        running_offset += member_size
     end
     return nothing
 end
 
-# Fallback: scalar types can't be decomposed further
-function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.LLVMType, target_offset::Int)
+function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.LLVMType, target_offset::Int, dl)
     return nothing
 end
 
@@ -1996,7 +2017,10 @@ function trace_to_non_alloca(ptr::LLVM.Value, visited::Set{LLVM.Value}=Set{LLVM.
     return true
 end
 
-"""Get alignment for a type (for PhysicalStorageBuffer Aligned operand)."""
+"""Get alignment for a type (for PhysicalStorageBuffer Aligned operand).
+NOTE: We always use Aligned 1 for PSB access to avoid misalignment bugs.
+The only exception is i64/ptr loads where we use Aligned 4 (two-u32 decomposition).
+This function is kept for the decomposition check in psb_needs_decomposition."""
 function get_alignment_for_type(ty::LLVM.LLVMType)
     if ty isa LLVM.LLVMFloat
         return UInt32(4)
@@ -2036,110 +2060,13 @@ into narrower ones (e.g., i64 → two i32).
 """
 function psb_needs_decomposition(state::SPIRVEmitterState, ptr::LLVM.Value, access_ty::LLVM.LLVMType;
                                    llvm_align::UInt32=UInt32(0))
-    access_align = get_alignment_for_type(access_ty)
-
-    # Check LLVM alignment first — even small types (i32/float) can be misaligned
-    # when LLVM explicitly says so via align 1 on the load/store instruction.
-    # Julia's BDA pointer arithmetic through `gep i8, ptr, i64 %byte_offset` can
-    # produce non-4-aligned pointers (e.g. accessing struct fields within arrays of
-    # non-power-of-2-sized structs through SROA-flattened byte offsets).
-    if llvm_align > 0 && llvm_align < access_align
-        if ptr isa LLVM.GetElementPtrInst
-            gep_src_ty_ref = LLVM.API.LLVMGetGEPSourceElementType(ptr)
-            gep_src_ty = LLVM.LLVMType(gep_src_ty_ref)
-            gep_src_align = get_alignment_for_type(gep_src_ty)
-            if gep_src_align < access_align
-                return true
-            end
-        elseif ptr isa LLVM.IntToPtrInst
-            # inttoptr from computed address — only decompose when the source is an
-            # add with a non-aligned constant (SROA ptrtoint+add+inttoptr chains).
-            # Simple inttoptr(load_from_push_constant) is well-aligned; decomposing
-            # those unnecessarily can disrupt downstream pointer-tracking.
-            src = LLVM.operands(ptr)[1]
-            const_offset = extract_constant_offset_from_adds(src)
-            if const_offset != 0
-                addr_align = UInt32(1 << trailing_zeros(abs(const_offset)))
-                if addr_align < access_align
-                    return true
-                end
-            end
-        end
-        # Also check tracked pointer alignment from upstream byte-offset GEPs
-        ptr_align = get(state.psb_ptr_alignment, ptr, UInt32(0))
-        if ptr_align > 0 && ptr_align < access_align
-            return true
-        end
-    end
-
-    access_align <= 4 && return false  # i32/float with proper alignment never need decomposition
-
-    # Check 0 (universal): LLVM's own alignment on the load/store instruction.
-    # LLVM SROA produces `load i64, ptr %gep, align 1` when the byte GEP offset may not
-    # be naturally aligned. If LLVM says align < type's natural alignment, decompose.
-    # Only applies to GEP-based pointers — arg buffer loads (IntToPtrInst) always have
-    # proper alignment even when LLVM marks them `align 1` (conservative SROA).
-    # EXCEPTION: typed GEPs (e.g., `gep i64, ptr, i64 %idx`) step in multiples of the
-    # source element size, so if the source element's alignment >= access_align, the
-    # result is always naturally aligned (assuming the base pointer is aligned, which
-    # holds for BDA-loaded pointers). Only byte GEPs (`gep i8, ...`) can break alignment.
-    if llvm_align > 0 && llvm_align < access_align && ptr isa LLVM.GetElementPtrInst
-        gep_src_ty_ref = LLVM.API.LLVMGetGEPSourceElementType(ptr)
-        gep_src_ty = LLVM.LLVMType(gep_src_ty_ref)
-        gep_src_align = get_alignment_for_type(gep_src_ty)
-        if gep_src_align < access_align
-            return true
-        end
-        # typed GEP with source element >= access alignment — preserves alignment, skip
-    end
-
-    # Check 1: pointer's PTM pointee type has smaller alignment
-    pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
-    if pointee_ty !== nothing && !(pointee_ty isa LLVM.PointerType)
-        pointee_align = get_alignment_for_type(pointee_ty)
-        if pointee_align < access_align
-            return true
-        end
-    end
-
-    # Check 2: known byte offset from integer-arithmetic GEP path
-    offset = get(state.psb_known_byte_offsets, ptr, Int64(-1))
-    if offset > 0
-        addr_align = UInt32(1 << trailing_zeros(offset))
-        if addr_align < access_align
-            return true
-        end
-    end
-
-    # Check 3: tracked pointer alignment from runtime-indexed GEP on composite types.
-    # When a byte GEP has a non-constant offset with a stride not a multiple of 8
-    # (e.g., 60-byte struct array), the result pointer is only stride-aligned.
-    # This alignment is propagated through subsequent constant-offset GEP chains.
-    ptr_align = get(state.psb_ptr_alignment, ptr, UInt32(0))
-    if ptr_align > 0 && ptr_align < access_align
-        return true
-    end
-
-    # Check 4: inttoptr(add(..., const)) — LLVM optimization passes convert
-    # struct field GEPs to ptrtoint + add(constant_offset) + inttoptr chains.
-    # E.g., accessing field at byte offset 140 in a 288-byte struct becomes:
-    #   %addr = ptrtoint ptr %struct_ptr to i64
-    #   %field = add i64 %addr, 140
-    #   %ptr = inttoptr i64 %field to ptr
-    #   %val = load i64, ptr %ptr  ; offset 140 is only 4-aligned, NOT 8!
-    # The GEP-based alignment tracking (checks 2-3) misses this because there's no GEP.
-    if ptr isa LLVM.IntToPtrInst
-        src = LLVM.operands(ptr)[1]
-        const_offset = extract_constant_offset_from_adds(src)
-        if const_offset != 0
-            addr_align = UInt32(1 << trailing_zeros(abs(const_offset)))
-            if addr_align < access_align
-                return true
-            end
-        end
-    end
-
-    return false
+    # Always decompose PSB loads/stores into byte-level or 4-byte-level access.
+    # Julia struct layouts may contain Bool (i8) fields that break 4-byte alignment
+    # for subsequent fields. LLVM's alignment annotations trust its own layout rules
+    # which may differ from what the GPU hardware requires. Decomposition to
+    # Aligned 4 (i32 chunks) or Aligned 1 (byte chunks) is always safe and costs
+    # negligible performance on modern GPUs.
+    return true
 end
 
 """
@@ -2192,7 +2119,7 @@ function track_psb_gep_alignment!(state::SPIRVEmitterState, inst::LLVM.Value,
     stride_align = UInt32(0)
     if !(byte_offset_val isa LLVM.ConstantInt) &&
        (base_pointee isa LLVM.StructType || base_pointee isa LLVM.ArrayType)
-        composite_size = compute_type_size(base_pointee)
+        composite_size = compute_type_size(base_pointee, state.data_layout)
         if composite_size > 0 && composite_size % 8 != 0
             stride_align = UInt32(1 << trailing_zeros(composite_size))
         end
@@ -2375,7 +2302,7 @@ function emit_psb_decomposed_small_store!(state::SPIRVEmitterState, ptr_id::UInt
     base_u64 = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, ptr_id)
 
-    nbytes = compute_type_size(val_ty)
+    nbytes = compute_type_size(val_ty, state.data_layout)
     for byte_idx in UInt32(0):UInt32(nbytes - 1)
         # Extract byte: (val >> (byte_idx * 8)) & 0xFF
         if byte_idx == 0
@@ -2424,7 +2351,7 @@ function emit_psb_decomposed_small_load!(state::SPIRVEmitterState, ptr_id::UInt3
     base_u64 = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, ptr_id)
 
-    nbytes = compute_type_size(load_ty)
+    nbytes = compute_type_size(load_ty, state.data_layout)
     combined = nothing
 
     for byte_idx in UInt32(0):UInt32(nbytes - 1)
@@ -2560,7 +2487,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
         # In SPIR-V we must use OpAccessChain into the array, not OpPtrAccessChain.
         base_pointee = get_pointee_type(state.type_ctx.ptm, base_ptr)
         if base_pointee isa LLVM.ArrayType && (LLVM.eltype(base_pointee) == source_ty ||
-            compute_type_size(LLVM.eltype(base_pointee)) == compute_type_size(source_ty))
+            compute_type_size(LLVM.eltype(base_pointee), state.data_layout) == compute_type_size(source_ty, state.data_layout))
             idx_i32 = ensure_index_i32!(state, ops[2])
             result_id = fresh_id!(state.mod)
 
@@ -2620,6 +2547,16 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                 # (OpPtrAccessChain on PSB struct pointers is broken on AMD RADV)
                 result_id = emit_psb_ptr_arithmetic!(state, base_id, idx, result_ptr_ty, source_ty;
                     idx_llvm_ty=LLVM.value_type(ops[2]))
+                # Track pointer alignment from element stride.
+                # E.g., stride=6 (array of {i16,i16,i16}) → ptr alignment = gcd(base, 6) = 2
+                # Downstream stores of i32/float at these addresses need byte decomposition.
+                elem_stride = compute_type_size(source_ty, state.data_layout)
+                if elem_stride > 0
+                    stride_align = UInt32(1 << trailing_zeros(elem_stride))
+                    if stride_align < 4
+                        state.psb_ptr_alignment[inst] = stride_align
+                    end
+                end
             elseif sc == SC.Function
                 # Function storage class: OpPtrAccessChain is NOT valid.
                 base_pointee = get_pointee_type(state.type_ctx.ptm, base_ptr)
@@ -2648,6 +2585,41 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                 encode_instruction!(state.mod.functions, Op.OpAccessChain, result_ptr_ty, result_id, base_id, idx)
             else
                 # Normal pointer arithmetic: OpPtrAccessChain (Workgroup, StorageBuffer)
+                # Check for type mismatch: LLVM opaque pointers allow `gep %struct, ptr %uint_ptr, idx`
+                # but SPIR-V requires the result type to match the base pointer's pointee.
+                # When mismatched, scale the index by sizeof(source_ty)/sizeof(base_pointee)
+                # so OpPtrAccessChain indexes in units of the base pointer's actual type.
+                base_pointee_wg = get_pointee_type(state.type_ctx.ptm, base_ptr)
+                if base_pointee_wg !== nothing && base_pointee_wg != source_ty &&
+                   !(base_pointee_wg isa LLVM.ArrayType) && !(base_pointee_wg isa LLVM.PointerType)
+                    src_size = compute_type_size(source_ty, state.data_layout)
+                    base_size = compute_type_size(base_pointee_wg, state.data_layout)
+                    if base_size > 0 && src_size >= base_size && src_size % base_size == 0
+                        multiplier = src_size ÷ base_size
+                        base_pointee_spirv = sc == SC.Workgroup ?
+                            map_workgroup_type!(state.type_ctx, base_pointee_wg) :
+                            map_type!(state.type_ctx, base_pointee_wg)
+                        actual_ptr_ty = map_pointer_type!(state.type_ctx, base_pointee_spirv, sc)
+                        scaled_idx = if multiplier > 1
+                            i32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+                            mul_const = emit_constant_u32!(state.mod, UInt32(multiplier))
+                            idx_i32 = ensure_index_i32!(state, ops[2])
+                            mul_id = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpIMul, i32_ty, mul_id, idx_i32, mul_const)
+                            mul_id
+                        else
+                            idx
+                        end
+                        result_id = fresh_id!(state.mod)
+                        ensure_array_stride_decoration!(state, actual_ptr_ty, base_pointee_wg)
+                        encode_instruction!(state.mod.functions, UInt16(67), actual_ptr_ty, result_id, base_id, scaled_idx)
+                        # Track that result still points to base's type, not source_ty
+                        set_pointee_type!(state.type_ctx.ptm, inst, base_pointee_wg; priority=5)
+                        state.value_map[inst] = result_id
+                        # Skip the default set_pointee_type below
+                        @goto gep_done
+                    end
+                end
                 result_id = fresh_id!(state.mod)
                 ensure_array_stride_decoration!(state, result_ptr_ty, source_ty)
                 encode_instruction!(state.mod.functions, UInt16(67), result_ptr_ty, result_id, base_id, idx)
@@ -2656,6 +2628,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
             # Track pointee type for downstream store/load handlers
             set_pointee_type!(state.type_ctx.ptm, inst, result_pointee; priority=3)
         end
+        @label gep_done
     else
         # Multiple indices: first index is array offset, rest are struct/array drilling
         first_idx = ops[2]
@@ -2733,10 +2706,10 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                         current_walk_ty = LLVM.elements(current_walk_ty)[idx_val+1]
                     elseif current_walk_ty isa LLVM.ArrayType
                         elem_ty = LLVM.eltype(current_walk_ty)
-                        total_byte_offset += idx_val * Int64(compute_type_size(elem_ty))
+                        total_byte_offset += idx_val * Int64(compute_type_size(elem_ty, state.data_layout))
                         current_walk_ty = elem_ty
                     else
-                        total_byte_offset += idx_val * Int64(compute_type_size(current_walk_ty))
+                        total_byte_offset += idx_val * Int64(compute_type_size(current_walk_ty, state.data_layout))
                     end
                 end
 
@@ -2747,7 +2720,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     # For now, just handle the simple [N x T] single-index case
                     if length(ops) == 3 && source_ty isa LLVM.ArrayType
                         elem_ty = LLVM.eltype(source_ty)
-                        elem_size = compute_type_size(elem_ty)
+                        elem_size = compute_type_size(elem_ty, state.data_layout)
                         idx_op = ops[3]
                         idx_id = get_value_id!(state, idx_op)
                         idx_u64 = idx_id
@@ -2827,6 +2800,12 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     elem_ptr_id = emit_psb_ptr_arithmetic!(state, base_id, first_idx,
                         map_pointer_type!(state.type_ctx, map_type!(state.type_ctx, source_ty), sc),
                         source_ty; idx_llvm_ty=LLVM.value_type(ops[2]))
+                    # Track stride alignment on the result pointer (inherits from element)
+                    elem_stride = compute_type_size(source_ty, state.data_layout)
+                    if elem_stride > 0
+                        stride_align = UInt32(1 << trailing_zeros(elem_stride))
+                        stride_align < 4 && (state.psb_ptr_alignment[inst] = stride_align)
+                    end
                     # Step 2: OpAccessChain for struct member
                     member_idx = ensure_index_i32!(state, ops[3])
                     result_id = fresh_id!(state.mod)
@@ -2843,6 +2822,11 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     elem_ptr_id = emit_psb_ptr_arithmetic!(state, base_id, first_idx,
                         map_pointer_type!(state.type_ctx, map_type!(state.type_ctx, source_ty), sc),
                         source_ty; idx_llvm_ty=LLVM.value_type(ops[2]))
+                    elem_stride = compute_type_size(source_ty, state.data_layout)
+                    if elem_stride > 0
+                        stride_align = UInt32(1 << trailing_zeros(elem_stride))
+                        stride_align < 4 && (state.psb_ptr_alignment[inst] = stride_align)
+                    end
                     remaining_ids = UInt32[]
                     for i in 3:length(ops)
                         push!(remaining_ids, ensure_index_i32!(state, ops[i]))
@@ -2981,7 +2965,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
     if base_pointee isa LLVM.ArrayType
         # Array: divide by element size to get array index, use OpAccessChain
         elem_ty = LLVM.eltype(base_pointee)
-        elem_size = compute_type_size(elem_ty)
+        elem_size = compute_type_size(elem_ty, state.data_layout)
 
         # Check for constant byte offset that needs recursive decomposition.
         # E.g., gep i8, ptr to [1 x [2 x i64]], i64 8 → outer_idx=0, inner_idx=1.
@@ -3030,7 +3014,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                     return
                 elseif elem_ty isa LLVM.ArrayType || elem_ty isa LLVM.StructType
                     # Sub-element access: decompose recursively through nested types
-                    index_path, leaf_ty = find_array_nested_path(base_pointee, const_offset)
+                    index_path, leaf_ty = find_array_nested_path(base_pointee, const_offset, state.data_layout)
                     if index_path !== nothing
                         leaf_spirv = if sc == SC.Workgroup
                             map_workgroup_type!(state.type_ctx, leaf_ty)
@@ -3052,6 +3036,102 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                         append!(state.mod.functions, idx_ids)
                         state.value_map[inst] = result_id
                         set_pointee_type!(state.type_ctx.ptm, inst, leaf_ty; priority=4)
+                        return
+                    end
+                end
+            end
+        end
+
+        # Dynamic byte offset into array of structs: decompose `add i64 %dynamic, constant`
+        # into struct field + array element access.
+        # Pattern: byte_offset = dynamic_part + const_part, where const_part selects a struct
+        # member and dynamic_part / field_elem_size gives the index within that member's array.
+        if elem_ty isa LLVM.StructType && (sc == SC.Function || sc == SC.Private)
+            byte_offset_val = ops[2]
+            const_part = Int64(-1)
+            dynamic_part = nothing
+
+            # Try to extract constant addend from add/or instruction
+            if byte_offset_val isa LLVM.Instruction
+                bo_opcode = LLVM.opcode(byte_offset_val)
+                bo_ops = LLVM.operands(byte_offset_val)
+                if bo_opcode == LLVM.API.LLVMAdd && length(bo_ops) >= 2
+                    if bo_ops[2] isa LLVM.ConstantInt
+                        const_part = convert(Int64, bo_ops[2])
+                        dynamic_part = bo_ops[1]
+                    elseif bo_ops[1] isa LLVM.ConstantInt
+                        const_part = convert(Int64, bo_ops[1])
+                        dynamic_part = bo_ops[2]
+                    end
+                elseif bo_opcode == LLVM.API.LLVMOr && length(bo_ops) >= 2
+                    if bo_ops[2] isa LLVM.ConstantInt
+                        const_part = convert(Int64, bo_ops[2])
+                        dynamic_part = bo_ops[1]
+                    elseif bo_ops[1] isa LLVM.ConstantInt
+                        const_part = convert(Int64, bo_ops[1])
+                        dynamic_part = bo_ops[2]
+                    end
+                end
+            end
+
+            if const_part >= 0 && dynamic_part !== nothing
+                # Find which struct field the constant part maps to
+                sub_path, sub_leaf = find_struct_member_path_by_offset(elem_ty, Int(const_part), state.data_layout)
+                if sub_path !== nothing && sub_leaf isa LLVM.IntegerType
+                    # Constant part selects a scalar field. Dynamic part must be zero
+                    # (or this pattern doesn't apply). Emit AccessChain with index 0 + field path.
+                    sub_leaf_spirv = map_type!(state.type_ctx, sub_leaf)
+                    result_ptr_ty = map_pointer_type!(state.type_ctx, sub_leaf_spirv, sc)
+                    zero_id = emit_constant_u32!(state.mod, UInt32(0))
+                    result_id = fresh_id!(state.mod)
+                    idx_ids = UInt32[zero_id]  # array index 0 (constant part < elem_size)
+                    for idx_val in sub_path
+                        push!(idx_ids, emit_constant_u32!(state.mod, UInt32(idx_val)))
+                    end
+                    word_count = UInt32(4 + length(idx_ids))
+                    push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                    push!(state.mod.functions, result_ptr_ty)
+                    push!(state.mod.functions, result_id)
+                    push!(state.mod.functions, base_id)
+                    append!(state.mod.functions, idx_ids)
+                    state.value_map[inst] = result_id
+                    set_pointee_type!(state.type_ctx.ptm, inst, sub_leaf; priority=4)
+                    return
+                elseif sub_path !== nothing && sub_leaf isa LLVM.ArrayType
+                    # Constant part points to an array field. Dynamic part indexes within it.
+                    inner_elem_ty = LLVM.eltype(sub_leaf)
+                    inner_elem_size = Int(compute_type_size(inner_elem_ty, state.data_layout))
+                    if inner_elem_size > 0
+                        inner_spirv = map_type!(state.type_ctx, inner_elem_ty)
+                        result_ptr_ty = map_pointer_type!(state.type_ctx, inner_spirv, sc)
+                        # Dynamic array index = dynamic_part / inner_elem_size
+                        dyn_id = get_value_id!(state, dynamic_part)
+                        sz_id = emit_int_constant!(state, idx_ty, Int64(inner_elem_size))
+                        dyn_idx_id = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, Op.OpSDiv, idx_spirv_ty, dyn_idx_id, dyn_id, sz_id)
+                        dyn_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
+                            u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+                            conv_id = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, dyn_idx_id)
+                            conv_id
+                        else
+                            dyn_idx_id
+                        end
+                        zero_id = emit_constant_u32!(state.mod, UInt32(0))
+                        result_id = fresh_id!(state.mod)
+                        idx_ids = UInt32[zero_id]  # outer array index 0
+                        for idx_val in sub_path
+                            push!(idx_ids, emit_constant_u32!(state.mod, UInt32(idx_val)))
+                        end
+                        push!(idx_ids, dyn_idx_i32)  # dynamic inner array index
+                        word_count = UInt32(4 + length(idx_ids))
+                        push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                        push!(state.mod.functions, result_ptr_ty)
+                        push!(state.mod.functions, result_id)
+                        push!(state.mod.functions, base_id)
+                        append!(state.mod.functions, idx_ids)
+                        state.value_map[inst] = result_id
+                        set_pointee_type!(state.type_ctx.ptm, inst, inner_elem_ty; priority=4)
                         return
                     end
                 end
@@ -3111,7 +3191,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
         if byte_offset_val isa LLVM.ConstantInt
             offset = convert(Int64, byte_offset_val)
             # Recursively find the member index path for this byte offset
-            index_path, leaf_ty = find_struct_member_path_by_offset(base_pointee, offset)
+            index_path, leaf_ty = find_struct_member_path_by_offset(base_pointee, offset, state.data_layout)
 
             if index_path !== nothing
                 member_spirv = if sc == SC.Workgroup
@@ -3144,7 +3224,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
             if (sc == SC.Function || sc == SC.Private) && haskey(state.array_element_origin, base_ptr)
                 arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
                 arr_elem_ty = LLVM.eltype(arr_type)
-                arr_elem_size = compute_type_size(arr_elem_ty)
+                arr_elem_size = compute_type_size(arr_elem_ty, state.data_layout)
                 if arr_elem_size > 0
                     arr_idx_adjust = offset ÷ arr_elem_size
                     sub_offset = offset % arr_elem_size
@@ -3173,7 +3253,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                         return
                     elseif arr_elem_ty isa LLVM.StructType
                         # Sub-element offset: access array element then struct field
-                        sub_path, sub_leaf = find_struct_member_path_by_offset(arr_elem_ty, sub_offset)
+                        sub_path, sub_leaf = find_struct_member_path_by_offset(arr_elem_ty, sub_offset, state.data_layout)
                         if sub_path !== nothing
                             sub_leaf_spirv = map_type!(state.type_ctx, sub_leaf)
                             result_ptr_ty = map_pointer_type!(state.type_ctx, sub_leaf_spirv, sc)
@@ -3220,7 +3300,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
             if (sc == SC.Function || sc == SC.Private) && haskey(state.array_element_origin, base_ptr)
                 arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
                 arr_elem_ty = LLVM.eltype(arr_type)
-                arr_elem_size = compute_type_size(arr_elem_ty)
+                arr_elem_size = compute_type_size(arr_elem_ty, state.data_layout)
                 if arr_elem_size > 0
                     # Compute the dynamic additional index: byte_offset / elem_size
                     sz_id = emit_int_constant!(state, idx_ty, Int64(arr_elem_size))
@@ -3266,6 +3346,87 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                 end
             end
 
+            # Handle `add i64 %dynamic, constant` pattern: the constant part selects a
+            # struct field, the dynamic part indexes within that field's array.
+            # E.g., byte_offset = val*8 + 40 on struct { {ptr,[4xi64]}, [3xi64] }:
+            #   constant 40 → member 1 ([3xi64]), dynamic val*8 / 8 → array element
+            if sc == SC.Function || sc == SC.Private
+                byte_offset_val = ops[2]
+                const_part = Int64(-1)
+                dynamic_part_val = nothing
+                if byte_offset_val isa LLVM.Instruction
+                    bo_opcode = LLVM.opcode(byte_offset_val)
+                    bo_ops = LLVM.operands(byte_offset_val)
+                    if (bo_opcode == LLVM.API.LLVMAdd || bo_opcode == LLVM.API.LLVMOr) && length(bo_ops) >= 2
+                        if bo_ops[2] isa LLVM.ConstantInt
+                            const_part = convert(Int64, bo_ops[2])
+                            dynamic_part_val = bo_ops[1]
+                        elseif bo_ops[1] isa LLVM.ConstantInt
+                            const_part = convert(Int64, bo_ops[1])
+                            dynamic_part_val = bo_ops[2]
+                        end
+                    end
+                end
+                if const_part > 0 && dynamic_part_val !== nothing
+                    # Recursively find the struct member at the constant offset
+                    # (handles nested structs like { {ptr, [4xi64]}, [3xi64] })
+                    sub_path, sub_leaf = find_struct_member_path_by_offset(base_pointee, Int(const_part), state.data_layout)
+                    if sub_path !== nothing && sub_leaf isa LLVM.ArrayType
+                        inner_elem_ty = LLVM.eltype(sub_leaf)
+                        inner_elem_size = Int(compute_type_size(inner_elem_ty, state.data_layout))
+                        if inner_elem_size > 0
+                            inner_spirv = map_type!(state.type_ctx, inner_elem_ty)
+                            result_ptr_ty = map_pointer_type!(state.type_ctx, inner_spirv, sc)
+                            dyn_id = get_value_id!(state, dynamic_part_val)
+                            sz_id = emit_int_constant!(state, idx_ty, Int64(inner_elem_size))
+                            dyn_idx_id = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpSDiv, idx_spirv_ty, dyn_idx_id, dyn_id, sz_id)
+                            dyn_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
+                                u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+                                conv_id = fresh_id!(state.mod)
+                                encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, dyn_idx_id)
+                                conv_id
+                            else
+                                dyn_idx_id
+                            end
+                            all_indices = UInt32[]
+                            for idx_val in sub_path
+                                push!(all_indices, emit_constant_u32!(state.mod, UInt32(idx_val)))
+                            end
+                            push!(all_indices, dyn_idx_i32)
+                            result_id = fresh_id!(state.mod)
+                            word_count = UInt32(4 + length(all_indices))
+                            push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                            push!(state.mod.functions, result_ptr_ty)
+                            push!(state.mod.functions, result_id)
+                            push!(state.mod.functions, base_id)
+                            append!(state.mod.functions, all_indices)
+                            state.value_map[inst] = result_id
+                            set_pointee_type!(state.type_ctx.ptm, inst, inner_elem_ty; priority=4)
+                            return
+                        end
+                    elseif sub_path !== nothing && !(sub_leaf isa LLVM.ArrayType)
+                        # Constant offset selects a scalar/struct field
+                        sub_leaf_spirv = map_type!(state.type_ctx, sub_leaf)
+                        result_ptr_ty = map_pointer_type!(state.type_ctx, sub_leaf_spirv, sc)
+                        all_indices = UInt32[]
+                        for idx_val in sub_path
+                            push!(all_indices, emit_constant_u32!(state.mod, UInt32(idx_val)))
+                        end
+                        result_id = fresh_id!(state.mod)
+                        word_count = UInt32(4 + length(all_indices))
+                        push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                        push!(state.mod.functions, result_ptr_ty)
+                        push!(state.mod.functions, result_id)
+                        push!(state.mod.functions, base_id)
+                        append!(state.mod.functions, all_indices)
+                        state.value_map[inst] = result_id
+                        set_pointee_type!(state.type_ctx.ptm, inst, sub_leaf; priority=4)
+                        return
+                    end
+                end
+            end
+
             # Find the array field within the struct and emit a dynamic AccessChain.
             # Pattern: gep i8, ptr %struct_alloca, i64 %dynamic_offset
             # where the struct contains an array field (e.g., { ptr, [N x i64] })
@@ -3290,11 +3451,11 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                         end
                     end
                 end
-                arr_info = find_array_field_in_struct(base_pointee, elem_stride)
+                arr_info = find_array_field_in_struct(base_pointee, state.data_layout, elem_stride)
                 if arr_info !== nothing
                     arr_path, arr_byte_offset, arr_ty = arr_info
                     arr_elem_ty = LLVM.eltype(arr_ty)
-                    arr_elem_size = compute_type_size(arr_elem_ty)
+                    arr_elem_size = compute_type_size(arr_elem_ty, state.data_layout)
                     if arr_elem_size > 0
                         # When the array element is itself composite (nested arrays/structs),
                         # compute a flat scalar index and decompose through the full hierarchy.
@@ -3304,7 +3465,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                         while leaf_ty isa LLVM.ArrayType
                             leaf_ty = LLVM.eltype(leaf_ty)
                         end
-                        leaf_size = compute_type_size(leaf_ty)
+                        leaf_size = compute_type_size(leaf_ty, state.data_layout)
                         if leaf_size > 0 && arr_elem_ty isa LLVM.ArrayType
                             # Nested composite: decompose byte offset into flat scalar index
                             # flat_idx = (byte_offset - arr_byte_offset) / leaf_size
@@ -3422,7 +3583,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
         end
     end
 
-    elem_size = compute_type_size(effective_pointee)
+    elem_size = compute_type_size(effective_pointee, state.data_layout)
 
     pointee_spirv = map_type!(state.type_ctx, effective_pointee)
     result_ptr_ty = map_pointer_type!(state.type_ctx, pointee_spirv, sc)
@@ -3702,7 +3863,7 @@ function emit_psb_ptr_arithmetic!(state::SPIRVEmitterState, base_id::UInt32,
                                      idx_id::UInt32, result_ptr_ty::UInt32,
                                      element_ty::LLVM.LLVMType;
                                      idx_llvm_ty::Union{LLVM.LLVMType, Nothing}=nothing)
-    stride = UInt64(compute_type_size(element_ty))
+    stride = UInt64(compute_type_size(element_ty, state.data_layout))
     u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
 
     # OpConvertPtrToU: base_ptr → u64 (cached per block)
@@ -3819,7 +3980,7 @@ function compute_gep_constant_byte_offset(source_ty::LLVM.LLVMType, ops; dl::Uni
     if first_idx isa LLVM.ConstantInt
         idx_val = convert(Int64, first_idx)
         if idx_val != 0
-            total += idx_val * compute_type_size(source_ty)
+            total += idx_val * compute_type_size(source_ty, dl)
         end
     end
 
@@ -3833,10 +3994,10 @@ function compute_gep_constant_byte_offset(source_ty::LLVM.LLVMType, ops; dl::Uni
             current_ty = LLVM.elements(current_ty)[idx_val + 1]
         elseif current_ty isa LLVM.ArrayType
             elem_ty = LLVM.eltype(current_ty)
-            total += idx_val * compute_type_size(elem_ty)
+            total += idx_val * compute_type_size(elem_ty, dl)
             current_ty = elem_ty
         else
-            total += idx_val * compute_type_size(current_ty)
+            total += idx_val * compute_type_size(current_ty, dl)
         end
     end
     return total
@@ -3911,7 +4072,7 @@ function emit_memset!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             elem_id = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, dest_ptr_ty, elem_id, addr_u64)
             if is_dest_psb
-                encode_instruction!(state.mod.functions, Op.OpStore, elem_id, fill_const, UInt32(0x02), UInt32(4))
+                encode_instruction!(state.mod.functions, Op.OpStore, elem_id, fill_const, UInt32(0x02), UInt32(1))
             else
                 encode_instruction!(state.mod.functions, Op.OpStore, elem_id, fill_const)
             end
@@ -4007,7 +4168,7 @@ function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
         load_id = fresh_id!(state.mod)
         if is_src_psb
             encode_instruction!(state.mod.functions, Op.OpLoad, u32_ty, load_id, src_elem_id,
-                                UInt32(0x02), UInt32(4))  # Aligned 4
+                                UInt32(0x02), UInt32(4))
         else
             encode_instruction!(state.mod.functions, Op.OpLoad, u32_ty, load_id, src_elem_id)
         end
@@ -4034,7 +4195,7 @@ function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
         # Store i32 to dest
         if is_dest_psb
             encode_instruction!(state.mod.functions, Op.OpStore, dest_elem_id, load_id,
-                                UInt32(0x02), UInt32(4))  # Aligned 4
+                                UInt32(0x02), UInt32(4))
         else
             encode_instruction!(state.mod.functions, Op.OpStore, dest_elem_id, load_id)
         end
@@ -4093,12 +4254,12 @@ function compute_struct_field_offset(struct_ty::LLVM.StructType, field_idx::Int;
     offset = UInt32(0)
     for j in 0:(field_idx - 1)
         elem = LLVM.elements(struct_ty)[j + 1]
-        elem_align = UInt32(compute_type_alignment(elem))
+        elem_align = UInt32(compute_type_alignment(elem, dl))
         offset = (offset + elem_align - 1) & ~(elem_align - 1)
-        offset += compute_type_size(elem)
+        offset += compute_type_size(elem, dl)
     end
     if field_idx > 0
-        target_align = UInt32(compute_type_alignment(LLVM.elements(struct_ty)[field_idx + 1]))
+        target_align = UInt32(compute_type_alignment(LLVM.elements(struct_ty)[field_idx + 1], dl))
         offset = (offset + target_align - 1) & ~(target_align - 1)
     end
     return Int64(offset)
@@ -4111,7 +4272,7 @@ Required by SPIR-V validation for OpPtrAccessChain.
 function ensure_array_stride_decoration!(state::SPIRVEmitterState, ptr_type_id::UInt32, element_ty::LLVM.LLVMType)
     # Track which pointer types already have ArrayStride decoration
     if !haskey(state.mod.constant_cache, (:array_stride, ptr_type_id))
-        stride = UInt32(compute_type_size(element_ty))
+        stride = UInt32(compute_type_size(element_ty, state.data_layout))
         emit_decorate!(state.mod, ptr_type_id, Dec.ArrayStride, stride)
         state.mod.constant_cache[(:array_stride, ptr_type_id)] = stride
     end
@@ -4119,9 +4280,8 @@ end
 
 # Compute the natural alignment of an LLVM type in bytes.
 # Uses the active DataLayout when available for struct/array types.
-function compute_type_alignment(ty::LLVM.LLVMType)
-    dl = ACTIVE_DATA_LAYOUT[]
-    if dl !== nothing && (ty isa LLVM.StructType || ty isa LLVM.ArrayType)
+function compute_type_alignment(ty::LLVM.LLVMType, dl::LLVM.DataLayout)
+    if ty isa LLVM.StructType || ty isa LLVM.ArrayType
         return Int(API.LLVMABIAlignmentOfType(dl, ty))
     end
     if ty isa LLVM.LLVMFloat
@@ -4135,11 +4295,11 @@ function compute_type_alignment(ty::LLVM.LLVMType)
     elseif ty isa LLVM.StructType
         max_align = 1
         for elem in LLVM.elements(ty)
-            max_align = max(max_align, compute_type_alignment(elem))
+            max_align = max(max_align, compute_type_alignment(elem, dl))
         end
         return max_align
     elseif ty isa LLVM.ArrayType
-        return compute_type_alignment(eltype(ty))
+        return compute_type_alignment(eltype(ty), dl)
     elseif ty isa LLVM.PointerType
         return 8
     else
@@ -4252,14 +4412,8 @@ function decompose_flat_index_for_composite!(state::SPIRVEmitterState,
     return indices
 end
 
-# Module-level DataLayout ref, set during compilation for accurate type size computation.
-# Using a Ref instead of passing DataLayout through every call site.
-const ACTIVE_DATA_LAYOUT = Ref{Any}(nothing)
-
-function compute_type_size(ty::LLVM.LLVMType)
-    # Use LLVM's DataLayout for struct/array types when available
-    dl = ACTIVE_DATA_LAYOUT[]
-    if dl !== nothing && (ty isa LLVM.StructType || ty isa LLVM.ArrayType)
+function compute_type_size(ty::LLVM.LLVMType, dl::LLVM.DataLayout)
+    if ty isa LLVM.StructType || ty isa LLVM.ArrayType
         return UInt32(API.LLVMABISizeOfType(dl, ty))
     end
     if ty isa LLVM.LLVMFloat
@@ -4275,15 +4429,15 @@ function compute_type_size(ty::LLVM.LLVMType)
         total = UInt32(0)
         struct_align = UInt32(1)
         for elem in LLVM.elements(ty)
-            elem_align = UInt32(compute_type_alignment(elem))
+            elem_align = UInt32(compute_type_alignment(elem, dl))
             struct_align = max(struct_align, elem_align)
             total = (total + elem_align - 1) & ~(elem_align - 1)
-            total += compute_type_size(elem)
+            total += compute_type_size(elem, dl)
         end
         total = (total + struct_align - 1) & ~(struct_align - 1)
         return total
     elseif ty isa LLVM.ArrayType
-        return UInt32(length(ty)) * compute_type_size(eltype(ty))
+        return UInt32(length(ty)) * compute_type_size(eltype(ty), dl)
     elseif ty isa LLVM.PointerType
         return UInt32(8)
     else
@@ -4317,7 +4471,7 @@ function emit_conversion!(state::SPIRVEmitterState, inst::LLVM.Instruction, opco
         # Integer conversion ops MUST produce integer result type.
         # Use emit_type_int! directly — map_type! cache can be poisoned by
         # type-punned load analysis that maps i32 → %float.
-        emit_type_int!(state.mod, UInt32(LLVM.width(llvm_ty)), UInt32(0))
+        emit_type_int!(state.mod, spirv_int_width(LLVM.width(llvm_ty)), UInt32(0))
     else
         map_type!(state.type_ctx, llvm_ty)
     end
@@ -4377,8 +4531,7 @@ function emit_trunc!(state::SPIRVEmitterState, inst::LLVM.TruncInst)
             # and register the BITCAST instruction's value_map to the final float result.
             bcast_inst = LLVM.user(first(users))
             bcast_dst = LLVM.value_type(bcast_inst)
-            int_width = LLVM.width(dst_ty)
-            int_ty = emit_type_int!(state.mod, UInt32(int_width), UInt32(0))
+            int_ty = emit_type_int!(state.mod, spirv_int_width(LLVM.width(dst_ty)), UInt32(0))
             trunc_id = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpUConvert, int_ty, trunc_id, src_id)
             float_ty = emit_type_float!(state.mod, UInt32(bcast_dst isa LLVM.LLVMFloat ? 32 : 64))
@@ -4388,7 +4541,7 @@ function emit_trunc!(state::SPIRVEmitterState, inst::LLVM.TruncInst)
             state.value_map[inst] = trunc_id
             state.value_map[bcast_inst] = bcast_id
         else
-            result_ty = emit_type_int!(state.mod, UInt32(LLVM.width(dst_ty)), UInt32(0))
+            result_ty = emit_type_int!(state.mod, spirv_int_width(LLVM.width(dst_ty)), UInt32(0))
             result_id = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpUConvert, result_ty, result_id, src_id)
             state.value_map[inst] = result_id
@@ -5927,6 +6080,11 @@ function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
     # Memory semantics — derived from LLVM ordering + pointer storage class
     mem_sem_id = emit_constant_u32!(state.mod, atomic_mem_semantics(inst, ptr))
 
+    # 64-bit atomics require Int64Atomics capability
+    if result_llvm_ty isa LLVM.IntegerType && LLVM.width(result_llvm_ty) == 64
+        require_capability!(state.mod, Cap.Int64Atomics)
+    end
+
     # Map LLVM atomicrmw operation to SPIR-V opcode
     binop = LLVM.API.LLVMGetAtomicRMWBinOp(inst)
     is_signed = is_signed_integer_context(result_llvm_ty)
@@ -5951,6 +6109,9 @@ function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
         Op.OpAtomicUMax
     elseif binop == LLVM.API.LLVMAtomicRMWBinOpXchg
         Op.OpAtomicExchange
+    elseif binop == LLVM.API.LLVMAtomicRMWBinOpFAdd || binop == LLVM.API.LLVMAtomicRMWBinOpFSub
+        error("Floating-point atomicrmw (fadd/fsub) is not supported in Vulkan SPIR-V. " *
+              "Use Atomix.@atomic with the Lava device overrides instead (these use a CAS loop).")
     else
         error("Unsupported atomicrmw operation: $binop")
     end
@@ -6000,6 +6161,11 @@ function emit_cmpxchg!(state::SPIRVEmitterState, inst::LLVM.AtomicCmpXchgInst)
     # The value type (what we're comparing/exchanging)
     val_llvm_ty = LLVM.value_type(cmp_val)
     val_ty = map_type!(state.type_ctx, val_llvm_ty)
+
+    # 64-bit atomics require Int64Atomics capability
+    if val_llvm_ty isa LLVM.IntegerType && LLVM.width(val_llvm_ty) == 64
+        require_capability!(state.mod, Cap.Int64Atomics)
+    end
 
     # Scope — QueueFamily (equivalent to Device for single-queue, no extra capability)
     scope_id = emit_constant_u32!(state.mod, Scope.QueueFamily)

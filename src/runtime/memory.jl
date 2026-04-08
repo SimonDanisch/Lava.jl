@@ -259,6 +259,16 @@ function destroy_buffer!(buf::VkManagedBuffer)
     end
 
     # Device is valid — safe to call Vulkan cleanup
+    # Re-check DEVICE_LOST right before Vulkan calls -- a concurrent finalizer may have
+    # triggered DEVICE_LOST between our check above and now. RADV segfaults on
+    # vkUnmapMemory after DEVICE_LOST, so we must avoid it.
+    if DEVICE_LOST[]
+        buf.mapped_ptr = Ptr{UInt8}(0)
+        buf.address = BDA_POISON
+        Threads.atomic_sub!(GPU_LIVE_BYTES, buf.size)
+        buf.size = 0
+        return
+    end
     if buf.mapped_ptr != Ptr{UInt8}(0)
         try
             Vulkan.unmap_memory(ctx.device, buf.memory)

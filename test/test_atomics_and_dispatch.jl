@@ -297,3 +297,129 @@ end
         @test all(Array(b) .== 2.0f0)
     end
 end
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tier 3: GPU Execution — Atomix with CartesianIndex + Float32 subtract
+# ═══════════════════════════════════════════════════════════════════════
+
+@testset "KA @private (Scratchpad)" begin
+    @kernel function private_accum!(A)
+        I = @index(Global)
+        priv = @private Float32 (4,)
+        @inbounds for k in 1:4
+            priv[k] = Float32(I * k)
+        end
+        @inbounds A[I] = priv[1] + priv[4]
+    end
+
+    a = Lava.LavaArray(zeros(Float32, 64))
+    private_accum!(Lava.LavaBackend(), 64)(a; ndrange=64)
+    Lava.vk_flush!()
+    result = Array(a)
+    @test result[1] == 1f0 + 4f0
+    @test result[10] == 10f0 + 40f0
+end
+
+@testset "Int64/UInt64 atomics" begin
+    @testset "Int64 atomic add" begin
+        @kernel function atomic_add_i64!(counter)
+            Atomix.@atomic counter[1] += Int64(1)
+        end
+        N = 2048
+        c = Lava.LavaArray(Int64[0])
+        atomic_add_i64!(Lava.LavaBackend())(c; ndrange=N)
+        Lava.vk_flush!()
+        @test Array(c)[1] == Int64(N)
+    end
+
+    @testset "UInt64 atomic add" begin
+        @kernel function atomic_add_u64!(counter)
+            Atomix.@atomic counter[1] += UInt64(1)
+        end
+        N = 1024
+        c = Lava.LavaArray(UInt64[0])
+        atomic_add_u64!(Lava.LavaBackend())(c; ndrange=N)
+        Lava.vk_flush!()
+        @test Array(c)[1] == UInt64(N)
+    end
+end
+
+@testset "Float64 atomics" begin
+    @testset "Float64 atomic add" begin
+        @kernel function atomic_add_f64!(counter)
+            Atomix.@atomic counter[1] += 1.0
+        end
+        N = 1024
+        c = Lava.LavaArray(Float64[0.0])
+        atomic_add_f64!(Lava.LavaBackend())(c; ndrange=N)
+        Lava.vk_flush!()
+        @test Array(c)[1] ≈ Float64(N)
+    end
+
+    @testset "Float64 atomic subtract" begin
+        @kernel function atomic_sub_f64!(counter)
+            Atomix.@atomic counter[1] -= 1.0
+        end
+        N = 1024
+        c = Lava.LavaArray(Float64[Float64(N)])
+        atomic_sub_f64!(Lava.LavaBackend())(c; ndrange=N)
+        Lava.vk_flush!()
+        @test Array(c)[1] ≈ 0.0
+    end
+end
+
+@testset "Atomix CartesianIndex and Float32 subtract" begin
+
+    @testset "Float32 atomic subtract" begin
+        @kernel function atomic_sub_f32!(counter)
+            Atomix.@atomic counter[1] -= 1.0f0
+        end
+
+        N = 1024
+        counter = Lava.LavaArray(Float32[Float32(N)])
+        atomic_sub_f32!(Lava.LavaBackend())(counter; ndrange=N)
+        Lava.vk_flush!()
+        @test Array(counter)[1] ≈ 0.0f0
+    end
+
+    @testset "Atomix with CartesianIndex on 3D array" begin
+        @kernel function atomic_add_3d!(A, idx_array)
+            i = @index(Global)
+            @inbounds ci = idx_array[i]
+            Atomix.@atomic A[ci] += 1.0f0
+        end
+
+        dims = (4, 4, 4)
+        A = Lava.LavaArray(zeros(Float32, dims))
+        # All threads write to the same CartesianIndex
+        target = CartesianIndex(2, 3, 1)
+        N = 512
+        idx_array = Lava.LavaArray(fill(target, N))
+        atomic_add_3d!(Lava.LavaBackend())(A, idx_array; ndrange=N)
+        Lava.vk_flush!()
+        result = Array(A)
+        @test result[2, 3, 1] ≈ Float32(N)
+        @test sum(result) ≈ Float32(N)  # only one cell was touched
+    end
+
+    @testset "Atomix subtract with CartesianIndex on 2D array" begin
+        @kernel function atomic_sub_2d!(A, idx_array, val)
+            i = @index(Global)
+            @inbounds ci = idx_array[i]
+            Atomix.@atomic A[ci] -= val
+        end
+
+        dims = (8, 8)
+        N = 256
+        target = CartesianIndex(4, 5)
+        A = Lava.LavaArray(fill(Float32(N), dims))
+        idx_array = Lava.LavaArray(fill(target, N))
+        atomic_sub_2d!(Lava.LavaBackend())(A, idx_array, 1.0f0; ndrange=N)
+        Lava.vk_flush!()
+        result = Array(A)
+        @test result[4, 5] ≈ 0.0f0
+        # All other cells untouched
+        result[4, 5] = Float32(N)
+        @test all(result .== Float32(N))
+    end
+end

@@ -153,6 +153,7 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
         converted_args = KA.argconvert.(Ref(obj), args)
         batch = ensure_active_batch!(bq)
         push!(batch.data_refs, args)
+        push!(batch.data_refs, obj.f)  # keep original closure alive
         ka_launch_indirect!(obj, converted_args, ndrange, workgroupsize, args)
         return nothing
     end
@@ -168,13 +169,15 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     nthreads = length(KA.workitems(iterspace))
     ws_3d = (nthreads, 1, 1)
 
+    converted_f = KA.argconvert(obj, obj.f)
     converted_args = KA.argconvert.(Ref(obj), args)
-    all_args = (obj.f, ctx, converted_args...)
+    all_args = (converted_f, ctx, converted_args...)
 
     batch = ensure_active_batch!(bq)
     push!(batch.data_refs, args)
+    push!(batch.data_refs, obj.f)  # keep original closure alive (has LavaArray refs)
 
-    ka_launch!(bq, obj.f, all_args, block_dims, ws_3d)
+    ka_launch!(bq, converted_f, all_args, block_dims, ws_3d)
 
     return nothing
 end
@@ -410,11 +413,12 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
     iterspace, dynamic = KA.partition(obj, ndrange_tuple, ws)
     ctx = KA.mkcontext(obj, ndrange_tuple, iterspace)
 
-    all_args = (obj.f, ctx, args...)
+    converted_f = KA.argconvert(obj, obj.f)
+    all_args = (converted_f, ctx, args...)
 
     # Build type tuple for compilation
     tt = Tuple{map(ka_arg_llvm_type, Base.tail(all_args))...}
-    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(obj.f, tt, ws_3d)
+    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(converted_f, tt, ws_3d)
 
     # Precompute arg buffer size (allocation deferred until after flush)
     inline_extra = compute_inline_extra_from_byval(byval_sizes)
@@ -639,6 +643,12 @@ Base.eltype(::LavaSharedArray{T}) where T = T
 
 @lava_device_override @inline function KA.__synchronize()
     lava_workgroup_barrier()
+end
+
+# ── @private: per-thread scratch memory via stack-allocated MArray ──
+
+@lava_device_override @inline function KA.Scratchpad(ctx, ::Type{T}, ::Val{Dims}) where {T, Dims}
+    StaticArrays.MArray{KA.__size(Dims), T}(undef)
 end
 
 # ── Print (no-op on GPU) ──

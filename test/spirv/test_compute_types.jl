@@ -221,4 +221,60 @@ end
         check_not(d, "Aligned 2")
         check_not(d, "Aligned 3")
     end
+
+    # Exotic element types: CartesianIndex, Tuple{Int64, CartesianIndex}
+    # These produce non-standard LLVM integer widths (i3 for type tags)
+    # and struct layouts with pointer + dims array ({ptr, [N x i64]}).
+
+    @testset "CartesianIndex element type (no OpTypeInt 3)" begin
+        function read_cartesian(A, B)
+            i = Lava.lava_global_invocation_id_x()
+            @inbounds begin
+                ci = A[i]
+                B[i] = Int64(ci[1])
+            end
+            return nothing
+        end
+        d, _ = compile_and_disasm(read_cartesian,
+            Tuple{Lava.LavaDeviceArray{CartesianIndex{3},1}, Lava.LavaDeviceArray{Int64,1}};
+            validate=true)
+        # Must NOT have invalid 3-bit OpTypeInt
+        check_not(d, "OpTypeInt 3 ")
+    end
+
+    @testset "Tuple{Int64, CartesianIndex{4}} element type" begin
+        function read_tuple_cartesian(A, B)
+            i = Lava.lava_global_invocation_id_x()
+            @inbounds begin
+                tup = A[i]
+                level = tup[1]
+                B[i] = level
+            end
+            return nothing
+        end
+        d, _ = compile_and_disasm(read_tuple_cartesian,
+            Tuple{Lava.LavaDeviceArray{Tuple{Int64, CartesianIndex{4}},1}, Lava.LavaDeviceArray{Int64,1}};
+            validate=true)
+        check_not(d, "OpTypeInt 3 ")
+    end
+
+    @testset "closure capturing LavaDeviceArray with dynamic dims access" begin
+        # Reproduces the BiotSavartBCs pattern: a closure captures a LavaDeviceArray,
+        # and the kernel reads from it using a dynamic index. The emitter must correctly
+        # decompose byte-offset GEPs into the struct's dims array ({ptr, [N x i64]}).
+        function make_closure_kernel(captured::Lava.LavaDeviceArray{Float32,1})
+            function inner(output)
+                i = Lava.lava_global_invocation_id_x()
+                @inbounds output[i] = captured[i]
+                return nothing
+            end
+            return inner
+        end
+        captured_da = Lava.LavaDeviceArray{Float32,1}(Ptr{Float32}(), (64,))
+        kern = make_closure_kernel(captured_da)
+        d, _ = compile_and_disasm(kern,
+            Tuple{Lava.LavaDeviceArray{Float32,1}};
+            validate=true)
+        check(d, "OpAccessChain")
+    end
 end

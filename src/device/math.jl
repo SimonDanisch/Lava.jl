@@ -275,3 +275,24 @@ end
     im = Float32(imag(z))
     Float16(sqrt(muladd(re, re, im * im)))
 end
+
+# ── Functions that ccall libm and must be overridden to avoid GPU crashes ──
+
+@lava_device_override @inline Base.Math.log1p(x::Float32) = log(1.0f0 + x)
+@lava_device_override @inline Base.Math.log1p(x::Float64) = Float64(log(1.0f0 + Float32(x)))
+
+@lava_device_override @inline function Base.Math.cbrt(x::Float32)
+    s = sign(x)
+    s * abs(x)^(1.0f0 / 3.0f0)
+end
+@lava_device_override @inline function Base.Math.cbrt(x::Float64)
+    s = sign(x)
+    Float64(Float32(s) * Float32(abs(x))^(1.0f0 / 3.0f0))
+end
+
+@lava_device_override @inline function Base.Math.hypot(x::Float32, y::Float32)
+    sqrt(muladd(x, x, y * y))
+end
+@lava_device_override @inline function Base.Math.hypot(x::Float64, y::Float64)
+    Float64(hypot(Float32(x), Float32(y)))
+end

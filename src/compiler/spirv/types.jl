@@ -658,14 +658,11 @@ function emit_workgroup_type!(ctx::SPIRVTypeContext, ty::LLVM.ArrayType)
     id = fresh_id!(ctx.mod)
     encode_instruction!(ctx.mod.types_constants, Op.OpTypeArray, id, elem_spirv, len_id)
 
-    # When the element type is a struct, add ArrayStride decoration for explicit layout.
-    # This is required by VK_KHR_workgroup_memory_explicit_layout when the array
-    # is inside a Block-decorated struct.
+    # ArrayStride decoration is required by VK_KHR_workgroup_memory_explicit_layout
+    # for ALL arrays inside Block-decorated structs, not just arrays of structs.
     elem_llvm = eltype(ty)
-    if elem_llvm isa LLVM.StructType
-        stride = UInt32(wg_compute_type_size(elem_llvm))
-        emit_decorate!(ctx.mod, id, Dec.ArrayStride, stride)
-    end
+    stride = UInt32(wg_compute_type_size(elem_llvm))
+    emit_decorate!(ctx.mod, id, Dec.ArrayStride, stride)
 
     return id
 end
@@ -756,15 +753,28 @@ function emit_llvm_type!(ctx::SPIRVTypeContext, ty::LLVM.VoidType)
     return emit_type_void!(ctx.mod)
 end
 
+"""
+    spirv_int_width(llvm_width) -> UInt32
+
+Round an LLVM integer bit-width to the nearest valid SPIR-V integer width.
+LLVM allows arbitrary widths (i2, i3, i7, ...) but SPIR-V only supports 8, 16, 32, 64.
+Width 1 (i1) is NOT handled here -- callers must map it to OpTypeBool separately.
+"""
+function spirv_int_width(w::Integer)::UInt32
+    w <= 8  && return UInt32(8)
+    w <= 16 && return UInt32(16)
+    w <= 32 && return UInt32(32)
+    return UInt32(64)
+end
+
 function emit_llvm_type!(ctx::SPIRVTypeContext, ty::LLVM.IntegerType)
     w = LLVM.width(ty)
     if w == 1
         # i1 → OpTypeBool
         return emit_type_bool!(ctx.mod)
     else
-        # i8, i16, i32, i64 → OpTypeInt with signedness=0 (SPIR-V unsigned by default)
-        # Signedness is determined per-instruction (OpSLessThan vs OpULessThan), not per-type
-        return emit_type_int!(ctx.mod, UInt32(w), UInt32(0))
+        # SPIR-V only supports 8/16/32/64-bit integers; round up non-standard widths
+        return emit_type_int!(ctx.mod, spirv_int_width(w), UInt32(0))
     end
 end
 

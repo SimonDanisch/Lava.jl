@@ -132,7 +132,6 @@ function emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
     # Create emitter state
     state = SPIRVEmitterState(spirv_mod, type_ctx)
     state.data_layout = LLVM.datalayout(llvm_mod)
-    ACTIVE_DATA_LAYOUT[] = state.data_layout
 
     # Graphics I/O state — stored in a module-level ref during emission
     gfx_io = GfxIOState()

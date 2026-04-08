@@ -56,6 +56,7 @@ using Adapt
 using Atomix
 using SPIRV_Tools_jll
 using LinearAlgebra
+using StaticArrays
 using GeometryBasics
 import GLFW
 

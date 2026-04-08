@@ -10,24 +10,50 @@
     LavaBLAS
 
 Bottom-level acceleration structure wrapping a VkAccelerationStructureKHR.
+Destroyed automatically via finalizer when GC'd (unless device was lost).
 """
-struct LavaBLAS
+mutable struct LavaBLAS
     accel::Vulkan.AccelerationStructureKHR
     buffer::Vulkan.Buffer
     memory::Vulkan.DeviceMemory
     address::UInt64  # AS device address (for TLAS instances)
+    device_gen::UInt64  # generation at creation (skip destroy after device reset)
+end
+
+function destroy!(blas::LavaBLAS)
+    DEVICE_LOST[] && return
+    blas.device_gen != DEVICE_GENERATION[] && return
+    try
+        blas.accel.destructor()
+        blas.buffer.destructor()
+        blas.memory.destructor()
+    catch
+    end
 end
 
 """
     LavaTLAS
 
 Top-level acceleration structure wrapping a VkAccelerationStructureKHR.
+Destroyed automatically via finalizer when GC'd (unless device was lost).
 """
-struct LavaTLAS
+mutable struct LavaTLAS
     accel::Vulkan.AccelerationStructureKHR
     buffer::Vulkan.Buffer
     memory::Vulkan.DeviceMemory
     _blas_refs::Vector{LavaBLAS}  # prevent GC of BLAS backing buffers
+    device_gen::UInt64  # generation at creation (skip destroy after device reset)
+end
+
+function destroy!(tlas::LavaTLAS)
+    DEVICE_LOST[] && return
+    tlas.device_gen != DEVICE_GENERATION[] && return
+    try
+        tlas.accel.destructor()
+        tlas.buffer.destructor()
+        tlas.memory.destructor()
+    catch
+    end
 end
 
 """
@@ -96,7 +122,9 @@ function build_blas(ctx::ASBuildContext, vertices::Vector{NTuple{3,Float32}}, in
     addr_info = Vulkan.AccelerationStructureDeviceAddressInfoKHR(accel)
     as_addr = Vulkan.get_acceleration_structure_device_address_khr(dev, addr_info)
 
-    return LavaBLAS(accel, as_buf, as_mem, as_addr)
+    blas = LavaBLAS(accel, as_buf, as_mem, as_addr, DEVICE_GENERATION[])
+    finalizer(destroy!, blas)
+    return blas
 end
 
 """
@@ -147,7 +175,9 @@ function build_tlas(ctx::ASBuildContext, blas_list::Vector{LavaBLAS};
         primitive_count=UInt32(n_instances))
 
     unique_blas = unique(blas_list)
-    return LavaTLAS(accel, as_buf, as_mem, unique_blas)
+    tlas = LavaTLAS(accel, as_buf, as_mem, unique_blas, DEVICE_GENERATION[])
+    finalizer(destroy!, tlas)
+    return tlas
 end
 
 # ── Internal helpers ──
@@ -533,9 +563,21 @@ function as_build(f)
     unwrap(Vulkan.wait_for_fences(ctx.device, [ctx.fence], true, typemax(UInt64)))
     unwrap(Vulkan.reset_fences(ctx.device, [ctx.fence]))
 
-    empty!(ctx.preserves)
+    # Keep scratch/input buffers alive for the lifetime of the acceleration structures.
+    # RADV on RDNA may retain internal references to vertex/index buffer VAs inside
+    # the built BLAS. If those VAs are freed (vkFreeMemory) and recycled by the driver,
+    # subsequent TLAS traversal follows stale pointers into reused VA space -> page fault.
+    # Accumulate all preserves; cleared only on device reset.
+    append!(AS_BUILD_PRESERVES, ctx.preserves)
     return result
 end
+
+# AS build scratch/input buffers kept alive to prevent RADV VA recycling faults
+const AS_BUILD_PRESERVES = Any[]
+
+push!(RESET_CALLBACKS, function()
+    empty!(AS_BUILD_PRESERVES)
+end)
 
 """Record an acceleration structure build into an ASBuildContext's command buffer.
 
@@ -695,7 +737,9 @@ function build_blas_pooled(all_vertices::Vector{Vector{NTuple{3,Float32}}},
         accel = Vulkan.AccelerationStructureKHR(dev, as_ci)
         addr_info = Vulkan.AccelerationStructureDeviceAddressInfoKHR(accel)
         as_addr = Vulkan.get_acceleration_structure_device_address_khr(dev, addr_info)
-        hw_blas_list[i] = LavaBLAS(accel, as_pool_buf, as_pool_mem, as_addr)
+        blas = LavaBLAS(accel, as_pool_buf, as_pool_mem, as_addr, DEVICE_GENERATION[])
+        # Note: no finalizer here - pool BLAS share a single buffer/memory, destroyed together
+        hw_blas_list[i] = blas
     end
 
     GC.@preserve input_buf input_mem scratch_buf scratch_mem as_pool_buf as_pool_mem begin
@@ -931,7 +975,9 @@ function build_hw_accel_from_tlas(tlas)
         accel = Vulkan.AccelerationStructureKHR(dev, as_ci)
         addr_info = Vulkan.AccelerationStructureDeviceAddressInfoKHR(accel)
         as_addr = Vulkan.get_acceleration_structure_device_address_khr(dev, addr_info)
-        hw_blas_list[i] = LavaBLAS(accel, as_pool_buf, as_pool_mem, as_addr)
+        blas = LavaBLAS(accel, as_pool_buf, as_pool_mem, as_addr, DEVICE_GENERATION[])
+        # Note: no finalizer - pool BLAS share a single buffer/memory, destroyed together
+        hw_blas_list[i] = blas
     end
 
     # Batch all BLAS + TLAS builds into a single GPU submission
