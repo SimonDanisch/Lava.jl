@@ -155,6 +155,28 @@ const DEVICE_GENERATION = Ref{UInt64}(0)
 # command.jl, launch.jl, memory.jl) to clear their module-level caches.
 const RESET_CALLBACKS = Function[]
 
+# Set of optional PhysicalDeviceFeatures enabled on the current device.
+# Populated during init_vulkan!(), queried by compiler target and tests.
+const ENABLED_OPTIONAL_FEATURES = Set{Symbol}()
+
+"""
+    has_device_feature(feature::Symbol) -> Bool
+
+Check if an optional Vulkan device feature is enabled.
+Triggers device initialization if not yet done.
+Returns `true` during precompilation (safe default — the real check
+happens at shader module creation time via Vulkan validation).
+
+Example: `has_device_feature(:shader_float_64)`
+"""
+function has_device_feature(feature::Symbol)
+    if ccall(:jl_generating_output, Cint, ()) != 0
+        return true  # assume available during precompilation
+    end
+    vk_context()  # ensure initialized
+    return feature in ENABLED_OPTIONAL_FEATURES
+end
+
 """
     vk_context() -> VkContext
 
@@ -438,13 +460,30 @@ function init_vulkan!()
         feature_chain = rt_features
     end
 
-    # Enable shader int64, float64, geometry/tessellation shaders, wide lines
-    core_features = Vulkan.PhysicalDeviceFeatures(
-        :shader_int_64, :shader_float_64,
-        :shader_int_16,
-        :geometry_shader, :tessellation_shader,
-        :fill_mode_non_solid, :wide_lines, :large_points,
-    )
+    # Query what the device actually supports before requesting features.
+    # Some features (geometry_shader, tessellation_shader, wide_lines, etc.)
+    # are unavailable on MoltenVK/macOS — requesting them causes VK_ERROR_FEATURE_NOT_PRESENT.
+    supported_features = Vulkan.get_physical_device_features(phys_dev)
+    required_features = Symbol[:shader_int_64, :shader_int_16]
+    optional_features = Symbol[:shader_float_64, :geometry_shader, :tessellation_shader,
+                               :fill_mode_non_solid, :wide_lines, :large_points]
+    enabled = Symbol[]
+    for f in required_features
+        if !getproperty(supported_features, f)
+            throw(LavaError("device initialization",
+                "Required feature $f not supported by $(dev_name)",
+                "Lava requires a GPU that supports $f"))
+        end
+        push!(enabled, f)
+    end
+    empty!(ENABLED_OPTIONAL_FEATURES)
+    for f in optional_features
+        if getproperty(supported_features, f)
+            push!(enabled, f)
+            push!(ENABLED_OPTIONAL_FEATURES, f)
+        end
+    end
+    core_features = Vulkan.PhysicalDeviceFeatures(enabled...)
 
     device = Vulkan.Device(
         phys_dev,
