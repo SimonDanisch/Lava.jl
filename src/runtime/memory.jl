@@ -112,6 +112,9 @@ Allocate a device-local buffer with BDA support.
 Optional `extra_usage` adds additional `VkBufferUsageFlags` (e.g. for SBT buffers).
 """
 function vk_alloc(dev::Vulkan.Device, nbytes::Integer; extra_usage::UInt32=UInt32(0))
+    if TRACK_ALLOCS[]
+        _record_alloc_site!(Int(nbytes))
+    end
     # Proactively flush deferred frees to prevent unbounded accumulation.
     n_deferred = length(DEFERRED_FREES)
     if n_deferred > 0
@@ -367,6 +370,53 @@ function alloc_pool_block()
     return block
 end
 
+# Diagnostic: track allocation call sites during recording.
+# Set TRACK_ALLOCS[] = true to record stack traces of every allocation while the
+# active batch is recording. Used to find per-frame allocations leaking into the
+# render loop. Reads are merged into ALLOC_TRACE; query via dump_alloc_trace().
+const TRACK_ALLOCS = Ref(false)
+const ALLOC_TRACE = Dict{Symbol, Int}()
+const ALLOC_TRACE_LOCK = ReentrantLock()
+
+function _record_alloc_site!(nbytes::Int)
+    bt = stacktrace(backtrace())
+    # Capture full stack as a single key (truncated to first 6 user frames)
+    user_frames = String[]
+    for f in bt
+        s = string(f.file)
+        # Skip Lava infra and Base
+        if occursin("memory.jl", s) || occursin("lavaarray.jl", s) ||
+           occursin("launch.jl", s) || occursin("ka_backend.jl", s) ||
+           occursin("KernelAbstractions", s) || occursin("Base.jl", s) ||
+           occursin("/Base/", s) || occursin("Adapt/src", s) ||
+           occursin("gpuarrays", s) || occursin("dict.jl", s) ||
+           occursin("./", s) && length(s) < 30
+            continue
+        end
+        push!(user_frames, "$(basename(s)):$(f.line) ($(f.func))")
+        length(user_frames) >= 4 && break
+    end
+    site = Symbol(isempty(user_frames) ? "unknown" : join(user_frames, " <- "))
+    lock(ALLOC_TRACE_LOCK) do
+        ALLOC_TRACE[site] = get(ALLOC_TRACE, site, 0) + 1
+    end
+end
+
+function dump_alloc_trace()
+    lock(ALLOC_TRACE_LOCK) do
+        sorted = sort(collect(ALLOC_TRACE), by=x->x[2], rev=true)
+        for (site, count) in sorted
+            println("  $count × $site")
+        end
+    end
+end
+
+function clear_alloc_trace!()
+    lock(ALLOC_TRACE_LOCK) do
+        empty!(ALLOC_TRACE)
+    end
+end
+
 """
     pool_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0)) -> VkManagedBuffer
 
@@ -375,6 +425,9 @@ Large allocations or those with non-standard usage flags bypass the pool.
 """
 function pool_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0))
     nbytes = max(Int(nbytes), POOL_MIN_SIZE)
+    if TRACK_ALLOCS[]
+        _record_alloc_site!(nbytes)
+    end
 
     # Large allocations or non-standard usage bypass the pool
     if nbytes > POOL_LARGE_THRESHOLD || extra_usage != UInt32(0)

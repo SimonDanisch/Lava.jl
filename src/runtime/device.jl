@@ -207,8 +207,12 @@ end
 
 """Check if a recording is active on the default batch queue."""
 function has_active_recording(ctx::VkContext)
-    batch = ctx.default_bq.active_batch
-    return batch !== nothing && batch.recording
+    bq = ctx.default_bq
+    batch = bq.active_batch
+    # Defer frees when ANY dispatches are pending (recording or queued but not yet submitted).
+    # Without this, GC can free buffers between kernel launches while the GPU hasn't
+    # finished executing previous dispatches that reference those buffers.
+    return batch !== nothing
 end
 
 function init_vulkan!()

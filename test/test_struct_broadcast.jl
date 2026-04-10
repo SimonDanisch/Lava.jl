@@ -453,3 +453,84 @@ random_fuzz_value(::Type{Float64}) = randn(Float64)
         end
     end
 end
+
+# ═══════════════════════════════════════════════════════════════════════
+# Constant Struct Broadcasting
+# Regression tests for OpStore type mismatch when broadcasting a constant
+# struct value into a LavaArray. The broadcast kernel's closure captures
+# the constant as a struct alloca, and the BDA-loaded data must correctly
+# match the alloca's SPIR-V type.
+# ═══════════════════════════════════════════════════════════════════════
+
+using ColorTypes: RGB
+
+@testset "Constant struct broadcast" begin
+    @testset "RGB{Float32} constant" begin
+        a = Lava.LavaArray(fill(RGB{Float32}(1,1,1), 64))
+        a .= RGB{Float32}(0, 0, 0)
+        Lava.vk_flush!()
+        @test all(Array(a) .== RGB{Float32}(0, 0, 0))
+    end
+
+    @testset "NTuple{3,Float32} via fill!" begin
+        a = Lava.LavaArray(fill(NTuple{3,Float32}((1,1,1)), 64))
+        fill!(a, NTuple{3,Float32}((0,0,0)))
+        Lava.vk_flush!()
+        @test all(x -> x == NTuple{3,Float32}((0,0,0)), Array(a))
+    end
+
+    @testset "TestS12 Ref broadcast" begin
+        a = Lava.LavaArray(fill(TestS12(1,1,1), 64))
+        a .= Ref(TestS12(0, 0, 0))
+        Lava.vk_flush!()
+        @test all(x -> x == TestS12(0,0,0), Array(a))
+    end
+
+    @testset "BoolPadStruct Ref broadcast" begin
+        a = Lava.LavaArray(fill(BoolPadStruct(1f0, true, 2f0), 64))
+        a .= Ref(BoolPadStruct(0f0, false, 0f0))
+        Lava.vk_flush!()
+        @test all(x -> x == BoolPadStruct(0f0, false, 0f0), Array(a))
+    end
+
+    @testset "2D RGB array constant" begin
+        a = Lava.LavaArray(fill(RGB{Float32}(1,1,1), 16, 16))
+        a .= RGB{Float32}(0.5, 0.5, 0.5)
+        Lava.vk_flush!()
+        @test all(Array(a) .== RGB{Float32}(0.5, 0.5, 0.5))
+    end
+
+    @testset "Ref-wrapped struct with nonzero values" begin
+        a = Lava.LavaArray(fill(TestS12(0,0,0), 64))
+        a .= Ref(TestS12(42, 43, 44))
+        Lava.vk_flush!()
+        @test all(x -> x == TestS12(42,43,44), Array(a))
+    end
+
+    @testset "non-zero value preserves data" begin
+        a = Lava.LavaArray(fill(TestS12(0,0,0), 128))
+        a .= Ref(TestS12(1.5f0, 2.5f0, 3.5f0))
+        Lava.vk_flush!()
+        result = Array(a)
+        @test result[1].a == 1.5f0
+        @test result[1].b == 2.5f0
+        @test result[1].c == 3.5f0
+        @test result[128] == TestS12(1.5f0, 2.5f0, 3.5f0)
+    end
+end
+
+@testset "Broadcast with closure-captured struct array" begin
+    # Array-to-array broadcast through closure (exercises BDA struct copy pattern)
+    src = Lava.LavaArray(rand(Float32, 256))
+    dst = Lava.LavaArray(zeros(Float32, 256))
+    dst .= src
+    Lava.vk_flush!()
+    @test Array(dst) == Array(src)
+
+    # Same with struct elements
+    src_s = Lava.LavaArray([TestS12(rand(Float32, 3)...) for _ in 1:64])
+    dst_s = Lava.LavaArray(fill(TestS12(0,0,0), 64))
+    dst_s .= src_s
+    Lava.vk_flush!()
+    @test Array(dst_s) == Array(src_s)
+end

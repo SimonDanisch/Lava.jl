@@ -99,6 +99,11 @@ mutable struct SPIRVEmitterState
     wg_wrapped_vars::Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.LLVMType}}
     # LLVM DataLayout for correct struct field offset computation
     data_layout::Union{Nothing, LLVM.DataLayout}
+    # Maps SPIR-V alloca variable IDs to their declared LLVM pointee type.
+    spirv_var_pointee::Dict{UInt32, LLVM.LLVMType}
+    # Maps SPIR-V result IDs to their actual emitted LLVM-level type when it
+    # differs from the source IR value type.
+    spirv_id_llvm_type::Dict{UInt32, LLVM.LLVMType}
 end
 
 function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
@@ -122,6 +127,8 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{LLVM.Value, UInt32}(),
         Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.LLVMType}}(),
         nothing,  # data_layout (set by caller)
+        Dict{UInt32, LLVM.LLVMType}(),  # spirv_var_pointee
+        Dict{UInt32, LLVM.LLVMType}(),  # spirv_id_llvm_type
     )
 end
 
@@ -1028,17 +1035,22 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
 
     load_id = fresh_id!(state.mod)
 
+    decomposed_raw_value_ty = nothing
+
     # PhysicalStorageBuffer loads MUST have Aligned memory operand
     if is_psb_pointer(ptr)
         actual_load = needs_bitcast ? actual_load_ty : load_ty
         pointee_ty_ld = get_pointee_type(state.type_ctx.ptm, ptr)
 
-        # Check if this wide load needs decomposition due to misaligned PSB address.
-        # SPIR-V requires Aligned ≥ scalar_size for PSB (VUID 06314), so we can't
-        # just lower alignment. Instead, decompose i64/double loads at non-8-aligned
-        # addresses into two i32 loads with Aligned 4.
+        # Check if this load needs decomposition due to misaligned PSB address.
+        # SPIR-V VUID-StandaloneSpirv-PhysicalStorageBuffer64-06314 requires the
+        # Aligned literal to be >= sizeof(largest scalar). If we know the runtime
+        # pointer is less aligned than that, we must decompose into smaller accesses.
         llvm_align = UInt32(LLVM.alignment(inst))
-        if psb_needs_decomposition(state, ptr, actual_load; llvm_align)
+        # Never decompose composite types (struct/array) - decomposition only handles
+        # scalar types (i32/i64/float/double). Composite PSB loads use typed OpLoad.
+        is_scalar_load = !(actual_load isa LLVM.StructType || actual_load isa LLVM.ArrayType)
+        if is_scalar_load && psb_needs_decomposition(state, ptr, actual_load; llvm_align)
             access_align = get_alignment_for_type(actual_load)
             if access_align <= 4
                 # Small type (i32/float/i16) at potentially non-4-aligned address:
@@ -1048,6 +1060,9 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                 # Wide type (i64/double) at non-8-aligned address:
                 # decompose into two i32 loads with Aligned 4
                 load_id = emit_psb_decomposed_load!(state, ptr_id, actual_load, spirv_load_ty)
+                if actual_load isa LLVM.IntegerType && LLVM.width(actual_load) == 64
+                    decomposed_raw_value_ty = actual_load
+                end
             end
             # Decomposed load returns an integer. If original load was a pointer,
             # convert the integer to a typed PSB pointer.
@@ -1166,6 +1181,13 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
         state.value_map[inst] = result_id
     else
         state.value_map[inst] = load_id
+    end
+
+    # Track raw integer values emitted by wide PSB load decomposition.
+    # Composite typed loads must not be tagged here.
+    if decomposed_raw_value_ty !== nothing
+        final_id = get(state.value_map, inst, load_id)
+        state.spirv_id_llvm_type[final_id] = decomposed_raw_value_ty
     end
 end
 
@@ -1787,10 +1809,10 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
     # PhysicalStorageBuffer stores MUST have Aligned memory operand
     if is_psb
         store_ty = LLVM.value_type(value)
-        # Check if this wide store needs decomposition due to misaligned PSB address.
-        # SPIR-V requires Aligned ≥ scalar_size for PSB (VUID 06314), so we can't
-        # just lower alignment. Instead, decompose i64/double stores at non-8-aligned
-        # addresses into two i32 stores with Aligned 4.
+        # Check if this store needs decomposition due to misaligned PSB address.
+        # SPIR-V VUID-StandaloneSpirv-PhysicalStorageBuffer64-06314 requires the
+        # Aligned literal to be >= sizeof(largest scalar). If we know the runtime
+        # pointer is less aligned than that, we must decompose into smaller stores.
         llvm_align = UInt32(LLVM.alignment(inst))
         if psb_needs_decomposition(state, ptr, store_ty; llvm_align)
             access_align = get_alignment_for_type(store_ty)
@@ -1842,7 +1864,125 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
                 end
             end
         end
+        # Type safety: check if storing a PSB-decomposed scalar to a struct alloca.
+        # Only raw integer decomposition results are tracked in spirv_id_llvm_type.
+        # When such a value is stored to a Function-space struct variable, the types
+        # don't match. Decompose into per-field stores.
+        var_pointee = get(state.spirv_var_pointee, ptr_id, nothing)
+        if var_pointee isa LLVM.StructType
+            actual_val_ty = get(state.spirv_id_llvm_type, val_id, nothing)
+            if actual_val_ty isa LLVM.IntegerType
+                if try_decomposed_struct_store!(state, ptr_id, val_id, actual_val_ty, var_pointee)
+                    return
+                end
+            end
+        end
         encode_instruction!(state.mod.functions, Op.OpStore, ptr_id, val_id)
+    end
+end
+
+"""
+Check if a scalar store to a struct alloca can be decomposed into per-field stores.
+Returns true if decomposition was emitted, false if it couldn't be done.
+"""
+function try_decomposed_struct_store!(state::SPIRVEmitterState, ptr_id::UInt32, val_id::UInt32,
+                                      val_ty::LLVM.LLVMType, struct_ty::LLVM.StructType)
+    leaf_path, leaf_ty = find_zero_index_path_to_leaf(struct_ty)
+    (leaf_path === nothing || leaf_ty === nothing) && return false
+    leaf_bits = llvm_type_bit_width(leaf_ty)
+    store_width = val_ty isa LLVM.IntegerType ? LLVM.width(val_ty) : 64
+    (leaf_bits <= 0 || store_width < leaf_bits || store_width % leaf_bits != 0) && return false
+    emit_decomposed_struct_store!(state, ptr_id, val_id, val_ty, leaf_path, leaf_ty, leaf_bits, store_width)
+    return true
+end
+
+"""
+Decompose a scalar store into per-field stores for a struct alloca.
+Walks the actual struct field layout to handle heterogeneous structs (e.g., Bool padding).
+"""
+function emit_decomposed_struct_store!(state::SPIRVEmitterState, ptr_id::UInt32, val_id::UInt32,
+                                       store_ty::LLVM.LLVMType, leaf_path::Vector{Int},
+                                       leaf_ty::LLVM.LLVMType, leaf_bits::Int, store_width::Int)
+    u32_ty = emit_type_int!(state.mod, UInt32(32), UInt32(0))
+    u64_ty = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+
+    if store_ty isa LLVM.PointerType
+        int_val = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_ty, int_val, val_id)
+        val_id = int_val
+    end
+
+    # Get actual struct type from spirv_var_pointee for field-aware decomposition
+    struct_ty = get(state.spirv_var_pointee, ptr_id, nothing)
+    fields = Tuple{Int, LLVM.LLVMType, Vector{Int}}[]
+    if struct_ty isa LLVM.StructType && state.data_layout !== nothing
+        collect_scalar_fields!(fields, Int[], struct_ty, 0, state.data_layout)
+    end
+
+    store_bytes = store_width ÷ 8
+    for (byte_offset, field_ty, idx_path) in fields
+        byte_offset >= store_bytes && continue
+        field_size = Int(compute_type_size(field_ty, state.data_layout))
+        field_bits = field_size * 8
+
+        chunk_id = val_id
+        if byte_offset > 0
+            shift_bits = byte_offset * 8
+            shift_amount = emit_int_constant!(state, LLVM.IntType(store_width), Int64(shift_bits))
+            shifted = fresh_id!(state.mod)
+            val_spirv_ty = store_width == 64 ? u64_ty : u32_ty
+            encode_instruction!(state.mod.functions, Op.OpShiftRightLogical, val_spirv_ty, shifted, val_id, shift_amount)
+            chunk_id = shifted
+        end
+        if field_bits <= 32 && store_width > 32
+            truncated = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, truncated, chunk_id)
+            chunk_id = truncated
+        end
+        if field_bits < 32
+            field_int_ty = emit_type_int!(state.mod, spirv_int_width(UInt32(field_bits)), UInt32(0))
+            truncated = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpUConvert, field_int_ty, truncated, chunk_id)
+            chunk_id = truncated
+        end
+        field_spirv_ty = map_type!(state.type_ctx, field_ty)
+        if !(field_ty isa LLVM.IntegerType)
+            if field_bits >= 32
+                cast_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpBitcast, field_spirv_ty, cast_id, chunk_id)
+                chunk_id = cast_id
+            end
+        end
+
+        field_ptr_ty = map_pointer_type!(state.type_ctx, field_spirv_ty, SC.Function)
+        ac_id = fresh_id!(state.mod)
+        idx_ids = UInt32[emit_constant_u32!(state.mod, UInt32(i)) for i in idx_path]
+        word_count = UInt32(4 + length(idx_ids))
+        push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+        push!(state.mod.functions, field_ptr_ty)
+        push!(state.mod.functions, ac_id)
+        push!(state.mod.functions, ptr_id)
+        append!(state.mod.functions, idx_ids)
+        encode_instruction!(state.mod.functions, Op.OpStore, ac_id, chunk_id)
+    end
+end
+
+"""Collect all scalar fields from a (possibly nested) struct with their byte offsets and index paths."""
+function collect_scalar_fields!(results::Vector{Tuple{Int, LLVM.LLVMType, Vector{Int}}},
+                                 path::Vector{Int}, ty::LLVM.LLVMType, base_offset::Int, dl)
+    if ty isa LLVM.StructType
+        for (i, mt) in enumerate(LLVM.elements(ty))
+            field_offset = base_offset + Int(compute_struct_field_offset(ty, i - 1; dl))
+            collect_scalar_fields!(results, vcat(path, [i - 1]), mt, field_offset, dl)
+        end
+    elseif ty isa LLVM.ArrayType
+        elem_ty = LLVM.eltype(ty)
+        elem_size = Int(compute_type_size(elem_ty, dl))
+        for i in 0:(length(ty) - 1)
+            collect_scalar_fields!(results, vcat(path, [i]), elem_ty, base_offset + i * elem_size, dl)
+        end
+    else
+        push!(results, (base_offset, ty, copy(path)))
     end
 end
 
@@ -2060,13 +2200,62 @@ into narrower ones (e.g., i64 → two i32).
 """
 function psb_needs_decomposition(state::SPIRVEmitterState, ptr::LLVM.Value, access_ty::LLVM.LLVMType;
                                    llvm_align::UInt32=UInt32(0))
-    # Always decompose PSB loads/stores into byte-level or 4-byte-level access.
-    # Julia struct layouts may contain Bool (i8) fields that break 4-byte alignment
-    # for subsequent fields. LLVM's alignment annotations trust its own layout rules
-    # which may differ from what the GPU hardware requires. Decomposition to
-    # Aligned 4 (i32 chunks) or Aligned 1 (byte chunks) is always safe and costs
-    # negligible performance on modern GPUs.
-    return true
+    access_align = get_alignment_for_type(access_ty)
+    access_align <= 4 && return false  # i32/float/i16/i8 never need decomposition (matches v17)
+
+    # Check 0: LLVM's own alignment on the load/store instruction.
+    # LLVM SROA produces `load i64, ptr %gep, align 1` when the byte GEP offset may not
+    # be naturally aligned. Only byte GEPs (`gep i8, ...`) can break alignment.
+    if llvm_align > 0 && llvm_align < access_align
+        if ptr isa LLVM.GetElementPtrInst
+            gep_src_ty_ref = LLVM.API.LLVMGetGEPSourceElementType(ptr)
+            gep_src_ty = LLVM.LLVMType(gep_src_ty_ref)
+            gep_src_align = get_alignment_for_type(gep_src_ty)
+            if gep_src_align < access_align
+                return true
+            end
+        elseif ptr isa LLVM.IntToPtrInst
+            return true
+        end
+    end
+
+    # Check 1: pointer's PTM pointee type has smaller alignment
+    pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
+    if pointee_ty !== nothing && !(pointee_ty isa LLVM.PointerType)
+        pointee_align = get_alignment_for_type(pointee_ty)
+        if pointee_align < access_align
+            return true
+        end
+    end
+
+    # Check 2: known byte offset from integer-arithmetic GEP path
+    offset = get(state.psb_known_byte_offsets, ptr, Int64(-1))
+    if offset > 0
+        addr_align = UInt32(1 << trailing_zeros(offset))
+        if addr_align < access_align
+            return true
+        end
+    end
+
+    # Check 3: tracked pointer alignment from runtime-indexed GEP on composite types
+    ptr_align = get(state.psb_ptr_alignment, ptr, UInt32(0))
+    if ptr_align > 0 && ptr_align < access_align
+        return true
+    end
+
+    # Check 4: inttoptr(add(..., const)) chains from LLVM optimization passes.
+    if ptr isa LLVM.IntToPtrInst
+        src = LLVM.operands(ptr)[1]
+        const_offset = extract_constant_offset_from_adds(src)
+        if const_offset > 0
+            offset_align = UInt32(1 << trailing_zeros(const_offset))
+            if offset_align < access_align
+                return true
+            end
+        end
+    end
+
+    return false
 end
 
 """
@@ -3763,43 +3952,18 @@ function emit_psb_byte_offset_with_user_type!(state::SPIRVEmitterState,
     state.value_map[inst] = result_id
     set_pointee_type!(state.type_ctx.ptm, inst, effective_pointee; priority=4)
 
-    # Track alignment for the result pointer. The byte offset might produce
-    # non-aligned addresses. Analyze the offset to determine worst-case alignment.
-    byte_offset_llvm = ops[2]
-    if byte_offset_llvm isa LLVM.ConstantInt
-        offset = convert(Int64, byte_offset_llvm)
-        if offset != 0
-            offset_align = UInt32(1 << trailing_zeros(abs(offset)))
-            if offset_align < 4
+    # Track alignment from constant byte offsets only. For dynamic offsets we trust
+    # LLVM/Julia to produce naturally-aligned addresses (matching v17 behavior).
+    byte_offset = ops[2]
+    if byte_offset isa LLVM.ConstantInt
+        offset_val = abs(convert(Int64, byte_offset))
+        if offset_val > 0
+            offset_align = UInt32(1 << min(trailing_zeros(offset_val), 30))
+            if offset_align < 8
                 state.psb_ptr_alignment[inst] = offset_align
             end
         end
-    else
-        # Non-constant offset — check if the computation preserves alignment.
-        # If the offset is a mul by a non-4-aligned stride, record worst-case.
-        stride_align = infer_mul_stride_alignment(byte_offset_llvm)
-        if stride_align > 0 && stride_align < 4
-            state.psb_ptr_alignment[inst] = stride_align
-        end
     end
-end
-
-"""Infer the alignment guarantee from a multiply instruction's constant operand."""
-function infer_mul_stride_alignment(val::LLVM.Value)
-    val isa LLVM.Instruction || return UInt32(0)
-    opcode = LLVM.opcode(val)
-    opcode == LLVM.API.LLVMMul || return UInt32(0)
-    ops = LLVM.operands(val)
-    length(ops) >= 2 || return UInt32(0)
-    # Check if either operand is a constant — that's the stride
-    for op in ops
-        if op isa LLVM.ConstantInt
-            stride = abs(convert(Int64, op))
-            stride > 0 || continue
-            return UInt32(1 << trailing_zeros(stride))
-        end
-    end
-    return UInt32(0)
 end
 
 # infer_type_from_gep_users is defined in types.jl
@@ -4455,6 +4619,7 @@ function emit_alloca!(state::SPIRVEmitterState, inst::LLVM.AllocaInst)
     # Register pointee type so byte-offset GEPs (gep i8, ptr %alloca, i64 %offset)
     # can resolve the actual element type and emit proper OpAccessChain.
     set_pointee_type!(state.type_ctx.ptm, inst, alloc_ty; priority=5)
+    state.spirv_var_pointee[result_id] = alloc_ty
 end
 
 # ================================================================

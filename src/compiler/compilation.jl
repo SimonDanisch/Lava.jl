@@ -1257,6 +1257,10 @@ function emit_workgroup_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariabl
         var_id = fresh_id!(mod)
         encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Workgroup)
 
+        # Aliased decoration: required when multiple Block-decorated Workgroup variables exist.
+        # Always emit it -- harmless for single variables, required for multiple.
+        emit_decorate!(mod, var_id, Dec.Aliased)
+
         # Register the wrapping so the function preamble can emit unwrapping AccessChains.
         # The unwrapping AccessChain will drill through the Block struct to get a pointer
         # to the inner array/type, which all existing GEP handlers expect.

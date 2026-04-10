@@ -277,4 +277,52 @@ end
             validate=true)
         check(d, "OpAccessChain")
     end
+
+    # Constant struct broadcast: a closure captures a constant struct value
+    # and stores it to each element of the output array. This is the pattern
+    # GPUArrays uses for `a .= ConstantStruct(...)`. The closure struct
+    # contains the constant value, which must be correctly loaded from BDA
+    # and stored to a Function-space alloca without type mismatches.
+
+    @testset "constant struct fill via closure (broadcast pattern)" begin
+        struct FillS3
+            x::Float32
+            y::Float32
+            z::Float32
+        end
+        function make_fill_kernel(val::FillS3)
+            function inner(output)
+                i = Lava.lava_global_invocation_id_x()
+                @inbounds output[i] = val
+                return nothing
+            end
+            return inner
+        end
+        kern = make_fill_kernel(FillS3(1f0, 2f0, 3f0))
+        d, _ = compile_and_disasm(kern,
+            Tuple{Lava.LavaDeviceArray{FillS3,1}};
+            validate=true)
+        check(d, "OpStore")
+    end
+
+    @testset "constant struct with Bool fill via closure" begin
+        struct FillBoolS
+            x::Float32
+            flag::Bool
+            y::Float32
+        end
+        function make_bool_fill_kernel(val::FillBoolS)
+            function inner(output)
+                i = Lava.lava_global_invocation_id_x()
+                @inbounds output[i] = val
+                return nothing
+            end
+            return inner
+        end
+        kern = make_bool_fill_kernel(FillBoolS(1f0, true, 3f0))
+        d, _ = compile_and_disasm(kern,
+            Tuple{Lava.LavaDeviceArray{FillBoolS,1}};
+            validate=true)
+        check(d, "OpStore")
+    end
 end

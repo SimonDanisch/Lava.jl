@@ -56,7 +56,7 @@ LavaArray{T}(::UndefInitializer, dims::Integer...) where {T} = LavaArray{T}(unde
 # Construct from host data
 function LavaArray{T,N}(data::AbstractArray{T,N}) where {T,N}
     arr = LavaArray{T,N}(undef, size(data))
-    upload!(arr, data)
+    GC.@preserve arr upload!(arr, data)
     return arr
 end
 LavaArray(data::AbstractArray{T,N}) where {T,N} = LavaArray{T,N}(data)
@@ -139,7 +139,7 @@ function upload!(dst::LavaArray{T}, data::AbstractArray{T}) where T
     GC.@preserve src bytes begin
         unsafe_copyto!(Ptr{UInt8}(pointer(bytes)), Ptr{UInt8}(pointer(src)), nbytes)
     end
-    upload!(dst.buf[], bytes; offset=dst.offset * sizeof(T))
+    GC.@preserve dst upload!(dst.buf[], bytes; offset=dst.offset * sizeof(T))
 end
 
 """

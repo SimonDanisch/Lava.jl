@@ -229,7 +229,7 @@ module Dec
     const DescriptorSet     = UInt32(34)
     const Offset            = UInt32(35)
     const Restrict          = UInt32(42)
-    const Aliased           = UInt32(43)
+    const Aliased           = UInt32(20)
 end
 
 # ---- Built-in Variables ----
