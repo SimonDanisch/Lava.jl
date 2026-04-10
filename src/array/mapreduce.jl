@@ -136,3 +136,22 @@ function find_reduced_dim(szA, szR)
     end
     return rdim
 end
+
+# ── Sort override ──
+# AK.merge_sort_by_key! uses shared memory that must be zero-initialized on
+# Vulkan (workgroup memory is undefined per spec). The block-level merge kernel
+# reads uninitialized positions when len < 2*block_size, producing wrong results.
+# Workaround: implement via sortperm + permute which uses correct kernels.
+function AK.merge_sort_by_key!(
+    keys::LavaArray, values::LavaArray, backend::LavaBackend=LavaBackend();
+    lt=isless, by=identity, rev::Union{Nothing, Bool}=nothing,
+    order::Base.Order.Ordering=Base.Order.Forward, kwargs...
+)
+    perm = AK.sortperm(keys, backend; lt, by, rev, order)
+    KA.synchronize(backend)
+    sorted_keys = keys[perm]
+    sorted_vals = values[perm]
+    copyto!(keys, sorted_keys)
+    copyto!(values, sorted_vals)
+    return keys, values
+end
