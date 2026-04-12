@@ -36,6 +36,77 @@ function fixup_structured_cfg!(mod::LLVM.Module)
 end
 
 """
+    merge_equivalent_loop_phis!(mod::LLVM.Module)
+
+Merge phi nodes in the same block that have identical incoming value/predecessor
+pairs. StructurizeCFGPass frequently duplicates loop-carried phis (e.g., hits
+accumulator, induction variable) when a loop contains a `continue` statement
+that creates an "early" back-edge bypassing the loop tail. The duplicates trace
+the same underlying value but reach the header via different intermediate
+phi/block chains, and LLVM's own value-numbering doesn't eliminate them because
+the chains themselves look structurally distinct.
+
+This pass runs a GVN-style fixed-point merge: two phis in the same block are
+treated as equivalent if, for every predecessor edge, their operands are either
+the same LLVM value or already proven equivalent in a previous round. Merging
+collapses both phi SSA names to a single value, which prevents SPIR-V emission
+from producing two loop-header phis that pick up the increment on different
+back-edges — the source of the walk-with-`continue` miscompile.
+"""
+function merge_equivalent_loop_phis!(mod::LLVM.Module)
+    merged = 0
+    for f in LLVM.functions(mod)
+        isempty(LLVM.blocks(f)) && continue
+        while true
+            changed = false
+            for bb in LLVM.blocks(f)
+                phis = LLVM.PHIInst[]
+                for inst in LLVM.instructions(bb)
+                    inst isa LLVM.PHIInst && push!(phis, inst)
+                end
+                length(phis) >= 2 || continue
+                # Pairwise equivalence check
+                for i in 1:length(phis), j in (i+1):length(phis)
+                    a = phis[i]; b = phis[j]
+                    LLVM.value_type(a) == LLVM.value_type(b) || continue
+                    ai = collect(LLVM.incoming(a))
+                    bi = collect(LLVM.incoming(b))
+                    length(ai) == length(bi) || continue
+                    # Build (pred → value) dicts
+                    amap = Dict{LLVM.BasicBlock, LLVM.Value}(blk => val for (val, blk) in ai)
+                    bmap = Dict{LLVM.BasicBlock, LLVM.Value}(blk => val for (val, blk) in bi)
+                    keys(amap) == keys(bmap) || continue
+                    # Equivalent iff every predecessor maps to same value, OR
+                    # the two different values are themselves phi nodes in the
+                    # same block that we're about to prove equivalent (handled
+                    # by the outer fixed-point) — or one value is the "other" phi.
+                    ok = true
+                    for bb_pred in keys(amap)
+                        av = amap[bb_pred]; bv = bmap[bb_pred]
+                        av == bv && continue
+                        # Accept if av == b and bv == a (mutual self-reference)
+                        (av.ref == b.ref && bv.ref == a.ref) && continue
+                        # Accept if av == a and bv == b (self-reference matched)
+                        (av.ref == a.ref && bv.ref == b.ref) && continue
+                        ok = false; break
+                    end
+                    ok || continue
+                    # Merge: replace uses of b with a, delete b
+                    LLVM.replace_uses!(b, a)
+                    LLVM.API.LLVMInstructionEraseFromParent(b.ref)
+                    merged += 1
+                    changed = true
+                    break
+                end
+                changed && break
+            end
+            changed || break
+        end
+    end
+    return merged
+end
+
+"""
     replace_undef_phi_operands_with_constants!(mod::LLVM.Module)
 
 For every phi node, replace `undef` / `poison` operands of scalar integer/float
@@ -267,6 +338,9 @@ function run_structurize_cfg_pipeline!(mod::LLVM.Module)
     LLVM.run!(LLVM.LoopSimplifyPass(), mod)
     LLVM.run!(LLVM.StructurizeCFGPass(), mod)
     LLVM.run!(LLVM.InstCombinePass(), mod)
+    # Collapse duplicated loop-carried phis that StructurizeCFG introduces for
+    # loops containing `continue`. See merge_equivalent_loop_phis! docstring.
+    merge_equivalent_loop_phis!(mod)
     # Replace `undef` scalar phi operands introduced by StructurizeCFG with
     # constant zeros so the SPIR-V emitter doesn't emit OpUndef — which RADV
     # interprets non-deterministically and causes guard phis to pick the wrong

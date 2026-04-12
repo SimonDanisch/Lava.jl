@@ -184,7 +184,8 @@ end
 # SPIR-V optimization: enabled automatically on NVIDIA to work around
 # Always run spirv-opt: produces cleaner SPIR-V, helps with driver bugs
 # (NVIDIA Xid 31 MMU faults, AMD Windows shader compiler hangs).
-const SPIRV_OPT_ENABLED = Ref(false)  # disabled: spirv-opt can break BDA pointer alignment
+const SPIRV_OPT_ENABLED = Ref(true)  # enabled: cleans up StructurizeCFG's redundant phis
+                                      # that RADV miscompiles for loops containing `continue`
 
 """
     run_spirv_opt(spirv_bytes::Vector{UInt8}) -> Vector{UInt8}
