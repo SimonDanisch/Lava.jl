@@ -912,6 +912,11 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # Rewrite these stores to drill into the alloca type via GEP.
     fix_alloca_type_mismatched_stores!(mod, dl)
 
+    # Fix ConstantExpr GEPs on flattened workgroup globals that have negative indices
+    # (from Julia's 1-based pointer adjustment). Decompose passes above may create new
+    # uses of these CEs that weren't present during the flattening pass.
+    fixup_negative_wg_constexprs!(mod)
+
     # Fold type-punned scalar allocas where constant partial stores reconstruct a value.
     # SROA decomposes e.g. `zero(Float64)` into `store float 0.0` at offset 0 +
     # `store i32 0` at offset 4, then `load double`. Fold to a direct constant.

@@ -481,6 +481,10 @@ end
     unsafe_load(a.ptr, i)
 end
 
+@lava_device_override @inline function Base.setindex!(a::LavaDeviceArray{T}, v::T, i::Integer) where T
+    unsafe_store!(a.ptr, v, i)
+    return v
+end
 @lava_device_override @inline function Base.setindex!(a::LavaDeviceArray{T}, v, i::Integer) where T
     unsafe_store!(a.ptr, convert(T, v), i)
     return v

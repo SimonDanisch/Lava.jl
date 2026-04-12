@@ -119,7 +119,9 @@ function load_composite_from_psb(builder, base_int, type::LLVM.LLVMType,
         end
         field_ptr = LLVM.inttoptr!(builder, field_addr, T_ptr_as1)
         val = LLVM.load!(builder, type, field_ptr)
-        LLVM.alignment!(val, max(4, llvm_type_size(type)))
+        type_align = llvm_type_size(type)
+        offset_align = byte_offset == 0 ? type_align : (1 << trailing_zeros(byte_offset))
+        LLVM.alignment!(val, min(type_align, offset_align))
         return val
     end
 end
@@ -163,7 +165,12 @@ function store_composite_to_psb(builder, val, base_int, type::LLVM.LLVMType,
         end
         field_ptr = LLVM.inttoptr!(builder, field_addr, T_ptr_as1)
         st = LLVM.store!(builder, val, field_ptr)
-        LLVM.alignment!(st, max(4, llvm_type_size(type)))
+        # Alignment = minimum of type's natural alignment and what the byte offset guarantees.
+        # For a Bool (i8) at offset 153, natural align is 1, offset guarantees 1.
+        # For a Float32 at offset 8, natural align is 4, offset guarantees 8 -> use 4.
+        type_align = llvm_type_size(type)  # natural alignment = size for scalar types
+        offset_align = byte_offset == 0 ? type_align : (1 << trailing_zeros(byte_offset))
+        LLVM.alignment!(st, min(type_align, offset_align))
     end
 end
 
@@ -1204,6 +1211,163 @@ Creates a new flat global and rewrites GEP instructions to use flat indices.
 ConstantExpr GEPs (from reduce_group!-style constant-index accesses) are handled
 by replacing the global pointer and letting fix_shared_geps! clean them up.
 """
+# Fix ConstantExpr GEPs on addrspace(3) globals with negative inner indices.
+# Julia's 1-based indexing creates `gep [N x T], ptr @shared, 0, -1` as a base pointer
+# adjustment. After flattening nested arrays, this becomes `gep [M x scalar], ptr @flat, 0, -K`.
+# SPIR-V OpAccessChain treats indices as unsigned, so -K wraps to ~4 billion -- invalid.
+# This pass finds such CEs, computes their byte offset, and replaces each instruction user
+# with a flat GEP that folds the negative offset into the dynamic index.
+function fixup_negative_wg_constexprs!(mod::LLVM.Module)
+    T_i64 = LLVM.Int64Type()
+
+    for gv in collect(LLVM.globals(mod))
+        ptr_ty = LLVM.value_type(gv)
+        ptr_ty isa LLVM.PointerType || continue
+        LLVM.addrspace(ptr_ty) == 3 || continue
+        pointee_ty = LLVM.global_value_type(gv)
+        pointee_ty isa LLVM.ArrayType || continue
+
+        # Only fix flat scalar arrays (from flatten_nested_workgroup_arrays!).
+        # Struct element arrays handle negative CEs correctly via PtrAccessChain
+        # with proper ArrayStride on the struct pointer type.
+        elem_ty = LLVM.eltype(pointee_ty)
+        (elem_ty isa LLVM.StructType || elem_ty isa LLVM.ArrayType) && continue
+
+        # Collect ConstantExpr users with negative indices
+        for use in collect(LLVM.uses(gv))
+            user = LLVM.user(use)
+            user isa LLVM.ConstantExpr || continue
+            LLVM.API.LLVMGetConstOpcode(user) == LLVM.API.LLVMGetElementPtr || continue
+
+            # Check if any index is negative
+            ce_ops = LLVM.operands(user)
+            has_negative = false
+            for i in 2:length(ce_ops)
+                if ce_ops[i] isa LLVM.ConstantInt && convert(Int64, ce_ops[i]) < 0
+                    has_negative = true
+                    break
+                end
+            end
+            has_negative || continue
+
+            # Compute the byte offset of this CE
+            ce_src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(user))
+            dl = LLVM.datalayout(mod)
+            byte_offset = 0
+            cur_ty = ce_src_ty
+            for i in 2:length(ce_ops)
+                idx = ce_ops[i]
+                idx isa LLVM.ConstantInt || continue
+                val = convert(Int64, idx)
+                elem_size = Int64(LLVM.storage_size(dl, cur_ty))
+                byte_offset += val * elem_size
+                if cur_ty isa LLVM.ArrayType
+                    cur_ty = LLVM.eltype(cur_ty)
+                end
+            end
+
+            # Replace each instruction user
+            for inst_use in collect(LLVM.uses(user))
+                inst = LLVM.user(inst_use)
+                inst isa LLVM.Instruction || continue
+
+                if inst isa LLVM.GetElementPtrInst
+                    # GEP on CE: fold CE byte offset into the GEP's indexing
+                    ops = LLVM.operands(inst)
+                    gep_src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inst))
+                    gep_elem_size = Int64(LLVM.storage_size(dl, gep_src_ty))
+
+                    LLVM.@dispose builder=LLVM.IRBuilder() begin
+                        LLVM.position!(builder, inst)
+                        zero = LLVM.ConstantInt(T_i64, 0)
+                        scalar_ty = LLVM.eltype(pointee_ty)
+                        scalar_size = Int64(LLVM.storage_size(dl, scalar_ty))
+
+                        # Compute total byte offset: CE offset + GEP dynamic offset
+                        # Then convert to flat scalar index
+                        if length(ops) == 2 && gep_elem_size > 0
+                            # Simple: gep T, ptr %ce, i64 %idx
+                            # Total bytes = byte_offset + idx * gep_elem_size
+                            # Flat index = total_bytes / scalar_size
+                            idx = ops[2]
+                            if LLVM.value_type(idx) != T_i64
+                                idx = LLVM.sext!(builder, idx, T_i64, "wg_negce_idx64")
+                            end
+                            if gep_elem_size != scalar_size
+                                scale = LLVM.ConstantInt(T_i64, gep_elem_size ÷ scalar_size)
+                                idx = LLVM.mul!(builder, idx, scale, "wg_negce_scale")
+                            end
+                            ce_flat = LLVM.ConstantInt(T_i64, byte_offset ÷ scalar_size)
+                            flat_idx = LLVM.add!(builder, idx, ce_flat, "wg_negce_adj")
+                        elseif length(ops) >= 3
+                            # gep T, ptr %ce, i64 0, i64 %idx (or more)
+                            # Compute dynamic flat index from all GEP indices
+                            flat_idx = LLVM.ConstantInt(T_i64, byte_offset ÷ scalar_size)
+                            gep_cur = gep_src_ty
+                            for i in 2:length(ops)
+                                idx = ops[i]
+                                if LLVM.value_type(idx) != T_i64
+                                    idx = LLVM.sext!(builder, idx, T_i64, "wg_negce_idx64")
+                                end
+                                stride = total_scalar_count(gep_cur)
+                                if stride != 1
+                                    idx = LLVM.mul!(builder, idx, LLVM.ConstantInt(T_i64, stride), "wg_negce_s")
+                                end
+                                flat_idx = LLVM.add!(builder, flat_idx, idx, "wg_negce_acc")
+                                if gep_cur isa LLVM.ArrayType
+                                    gep_cur = LLVM.eltype(gep_cur)
+                                end
+                            end
+                        else
+                            continue
+                        end
+
+                        new_gep = LLVM.gep!(builder, pointee_ty, gv,
+                                           LLVM.Value[zero, flat_idx], "wg_negce_gep")
+                        LLVM.replace_uses!(inst, new_gep)
+                    end
+                    LLVM.erase!(inst)
+
+                elseif inst isa LLVM.LoadInst
+                    # Load from negative CE: compute flat index and load from there
+                    scalar_ty = LLVM.eltype(pointee_ty)
+                    scalar_size = Int64(LLVM.storage_size(dl, scalar_ty))
+                    flat_idx_val = byte_offset ÷ scalar_size
+
+                    LLVM.@dispose builder=LLVM.IRBuilder() begin
+                        LLVM.position!(builder, inst)
+                        zero = LLVM.ConstantInt(T_i64, 0)
+                        off = LLVM.ConstantInt(T_i64, flat_idx_val)
+                        ptr = LLVM.gep!(builder, pointee_ty, gv,
+                                       LLVM.Value[zero, off], "wg_negce_ptr")
+                        new_load = LLVM.load!(builder, LLVM.value_type(inst), ptr, "wg_negce_load")
+                        LLVM.alignment!(new_load, max(1, Int(LLVM.alignment(inst))))
+                        LLVM.replace_uses!(inst, new_load)
+                    end
+                    LLVM.erase!(inst)
+
+                elseif inst isa LLVM.StoreInst
+                    scalar_ty = LLVM.eltype(pointee_ty)
+                    scalar_size = Int64(LLVM.storage_size(dl, scalar_ty))
+                    flat_idx_val = byte_offset ÷ scalar_size
+
+                    LLVM.@dispose builder=LLVM.IRBuilder() begin
+                        LLVM.position!(builder, inst)
+                        zero = LLVM.ConstantInt(T_i64, 0)
+                        off = LLVM.ConstantInt(T_i64, flat_idx_val)
+                        ptr = LLVM.gep!(builder, pointee_ty, gv,
+                                       LLVM.Value[zero, off], "wg_negce_ptr")
+                        val = LLVM.operands(inst)[1]
+                        new_store = LLVM.store!(builder, val, ptr)
+                        LLVM.alignment!(new_store, max(1, Int(LLVM.alignment(inst))))
+                    end
+                    LLVM.erase!(inst)
+                end
+            end
+        end
+    end
+end
+
 function flatten_nested_workgroup_arrays!(mod::LLVM.Module)
     T_i64 = LLVM.Int64Type()
 
@@ -1216,7 +1380,16 @@ function flatten_nested_workgroup_arrays!(mod::LLVM.Module)
 
         # Check if this is a nested array (element is also an array)
         leaf_ty = LLVM.eltype(pointee_ty)
-        leaf_ty isa LLVM.ArrayType || continue  # only fix nested arrays — structs handled elsewhere
+        leaf_ty isa LLVM.ArrayType || continue  # only fix nested arrays -- structs handled elsewhere
+
+        # Skip flattening for simple 2-level nesting (e.g. [N x [2 x i32]] from Julia structs).
+        # The flattening creates negative-index ConstantExprs from Julia's 1-based pointer
+        # adjustment that are invalid in SPIR-V. Only flatten deeper nesting (3+ levels)
+        # which doesn't occur with Julia struct types.
+        inner_leaf = LLVM.eltype(leaf_ty)
+        if !(inner_leaf isa LLVM.ArrayType)
+            continue
+        end
 
         # Compute leaf scalar type and total count
         total_count = LLVM.length(pointee_ty)
@@ -1238,8 +1411,20 @@ function flatten_nested_workgroup_arrays!(mod::LLVM.Module)
         # Rewrite all uses of the old global to use the flat global
         rewrite_all_wg_uses_to_flat!(gv, new_gv, flat_arr_ty, inner_count, T_i64)
 
-        # Any remaining uses (dead ConstantExprs) — RAUW to new_gv so we can erase.
-        # With opaque pointers both are `ptr addrspace(3)` so this is type-safe.
+        # Handle remaining uses: ConstantExprs with negative indices (Julia 1-based
+        # adjustment) that survived rewrite_all_wg_uses_to_flat!.
+        # RAUW would blindly replace @shared with @flat, creating invalid negative-index
+        # ConstantExprs (SPIR-V can't handle negative OpAccessChain indices).
+        # Instead, explicitly handle each remaining CE by inlining the flat offset.
+        remaining_ces = LLVM.Value[]
+        for use in LLVM.uses(gv)
+            user = LLVM.user(use)
+            user isa LLVM.ConstantExpr && push!(remaining_ces, user)
+        end
+        for ce in remaining_ces
+            eliminate_remaining_wg_constexpr!(ce, gv, new_gv, flat_arr_ty, T_i64)
+        end
+        # Only RAUW if there are still remaining uses (shouldn't happen after above)
         if !isempty(collect(LLVM.uses(gv)))
             LLVM.replace_uses!(gv, new_gv)
         end
@@ -1365,6 +1550,11 @@ function rewrite_one_wg_gep!(gep::LLVM.GetElementPtrInst, old_gv, new_gv,
                                LLVM.Value[zero, flat_idx], "wg_flat_gep")
             LLVM.replace_uses!(gep, new_gep)
             LLVM.erase!(gep)
+            # After replacing uses, new_gep may have chained GEP users with stale
+            # non-scalar source types (e.g., `gep [2 x i32], ptr %new_gep, i64 N`).
+            # This happens when Julia splits an index expression into two GEPs and the
+            # flattening only rewrote the first one. Rewrite such users to flat indexing.
+            fixup_chained_flat_gep_users!(new_gep, new_gv, flat_arr_ty, flat_idx, T_i64)
         else
             # GEP didn't reach scalar level — fold chained users into flat index
             rewrite_partial_wg_gep_users!(gep, new_gv, flat_arr_ty, flat_idx, cur_ty, T_i64)
@@ -1455,6 +1645,160 @@ function rewrite_partial_wg_gep_users!(gep, new_gv, flat_arr_ty, base_flat_idx,
     # Erase old GEP if no remaining uses
     if isempty(collect(LLVM.uses(gep)))
         LLVM.erase!(gep)
+    end
+end
+
+"""Fix chained GEPs on a fully-resolved flat workgroup pointer.
+
+After flattening `[N x [K x T]]` to `[N*K x T]` and resolving a GEP to scalar level,
+the result pointer may still be used by GEPs with stale `[K x T]` source types.
+E.g., `gep [2 x i32], ptr %flat_scalar, i64 64` should become `flat_idx + 64 * 2`.
+Rewrites such users to proper flat index arithmetic.
+"""
+function fixup_chained_flat_gep_users!(base_gep, new_gv, flat_arr_ty, base_flat_idx, T_i64)
+    zero = LLVM.ConstantInt(T_i64, 0)
+
+    for use in collect(LLVM.uses(base_gep))
+        user = LLVM.user(use)
+        user isa LLVM.GetElementPtrInst || continue
+        chained_src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(user))
+        # Only fix GEPs with non-scalar source types (the stale inner array type)
+        (chained_src_ty isa LLVM.ArrayType || chained_src_ty isa LLVM.StructType) || continue
+
+        chained_ops = LLVM.operands(user)
+        local new_gep_val
+        local final_flat_idx
+        LLVM.@dispose builder=LLVM.IRBuilder() begin
+            LLVM.position!(builder, user)
+            flat_idx = base_flat_idx
+            cur_ty = chained_src_ty
+
+            for i in 2:length(chained_ops)
+                idx = chained_ops[i]
+                if LLVM.value_type(idx) != T_i64
+                    idx = LLVM.sext!(builder, idx, T_i64, "wg_flat_fix_idx64")
+                end
+                stride = total_scalar_count(cur_ty)
+                if stride != 1
+                    scaled = LLVM.mul!(builder, idx, LLVM.ConstantInt(T_i64, stride), "wg_flat_fix_scale")
+                else
+                    scaled = idx
+                end
+                flat_idx = LLVM.add!(builder, flat_idx, scaled, "wg_flat_fix_acc")
+                if cur_ty isa LLVM.ArrayType
+                    cur_ty = LLVM.eltype(cur_ty)
+                end
+            end
+
+            new_gep_val = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                                   LLVM.Value[zero, flat_idx], "wg_flat_fix_gep")
+            final_flat_idx = flat_idx
+            LLVM.replace_uses!(user, new_gep_val)
+        end
+        LLVM.erase!(user)
+        # Recursively fix further chained GEPs on the new result
+        fixup_chained_flat_gep_users!(new_gep_val, new_gv, flat_arr_ty, final_flat_idx, T_i64)
+    end
+end
+
+"""Handle a ConstantExpr GEP on the OLD workgroup global that survived rewrite_all_wg_uses_to_flat!.
+
+Computes the flat scalar offset from the CE's constant indices (which use the old nested-array
+type), then replaces all instruction users with flat GEPs on the new global that incorporate
+the offset into the dynamic index. This avoids creating ConstantExprs with negative indices
+(from Julia's 1-based pointer adjustment) that would be invalid in SPIR-V.
+"""
+function eliminate_remaining_wg_constexpr!(ce::LLVM.ConstantExpr, old_gv, new_gv,
+                                              flat_arr_ty, T_i64)
+    opcode = LLVM.API.LLVMGetConstOpcode(ce)
+    opcode == LLVM.API.LLVMGetElementPtr || return
+
+    # Compute flat offset from the CE's indices using the OLD type hierarchy
+    ce_ops = LLVM.operands(ce)
+    pointee_ty = LLVM.global_value_type(old_gv)
+    flat_offset = 0
+    cur_ty = pointee_ty
+    for i in 2:length(ce_ops)
+        idx = ce_ops[i]
+        idx isa LLVM.ConstantInt || continue
+        val = convert(Int, idx)
+        stride = total_scalar_count(cur_ty)
+        flat_offset += val * stride
+        if cur_ty isa LLVM.ArrayType
+            cur_ty = LLVM.eltype(cur_ty)
+        end
+    end
+
+    # Replace each instruction user with a flat GEP that incorporates the offset
+    for use in collect(LLVM.uses(ce))
+        user = LLVM.user(use)
+        if user isa LLVM.LoadInst || user isa LLVM.StoreInst || user isa LLVM.GetElementPtrInst
+            # Delegate to the existing eliminate_wg_constexpr! logic
+        elseif user isa LLVM.ConstantExpr
+            # Nested CE: recursively handle
+            continue
+        else
+            continue
+        end
+
+        LLVM.@dispose builder=LLVM.IRBuilder() begin
+            LLVM.position!(builder, user)
+            zero = LLVM.ConstantInt(T_i64, 0)
+
+            if user isa LLVM.LoadInst
+                # load from CE: create flat GEP + load
+                # For negative offsets this is always the CE being used as a base ptr by
+                # a dynamic GEP chain -- but some loads may have been constant-folded.
+                # Create instruction-level GEP so the emitter can handle it properly.
+                off = LLVM.ConstantInt(T_i64, flat_offset)
+                ptr = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                               LLVM.Value[zero, off], "wg_flat_rem_ptr")
+                new_load = LLVM.load!(builder, LLVM.value_type(user), ptr, "wg_flat_rem_load")
+                LLVM.alignment!(new_load, max(1, Int(LLVM.alignment(user))))
+                LLVM.replace_uses!(user, new_load)
+                LLVM.erase!(user)
+            elseif user isa LLVM.StoreInst
+                off = LLVM.ConstantInt(T_i64, flat_offset)
+                ptr = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                               LLVM.Value[zero, off], "wg_flat_rem_ptr")
+                val = LLVM.operands(user)[1]
+                new_store = LLVM.store!(builder, val, ptr)
+                LLVM.alignment!(new_store, max(1, Int(LLVM.alignment(user))))
+                LLVM.erase!(user)
+            elseif user isa LLVM.GetElementPtrInst
+                # GEP on CE: fold CE offset into the GEP's dynamic index
+                ops = LLVM.operands(user)
+                gep_src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(user))
+                stride = total_scalar_count(gep_src_ty)
+                dynamic_inner = zero
+                # Compute the dynamic part from GEP indices
+                gep_cur_ty = gep_src_ty
+                for i in 2:length(ops)
+                    idx = ops[i]
+                    if LLVM.value_type(idx) != T_i64
+                        idx = LLVM.sext!(builder, idx, T_i64, "wg_flat_rem_idx64")
+                    end
+                    s = total_scalar_count(gep_cur_ty)
+                    if s != 1
+                        idx = LLVM.mul!(builder, idx, LLVM.ConstantInt(T_i64, s), "wg_flat_rem_scale")
+                    end
+                    dynamic_inner = LLVM.add!(builder, dynamic_inner, idx, "wg_flat_rem_acc")
+                    if gep_cur_ty isa LLVM.ArrayType
+                        gep_cur_ty = LLVM.eltype(gep_cur_ty)
+                    end
+                end
+                # Add CE flat offset to dynamic index
+                adj_idx = if flat_offset != 0
+                    LLVM.add!(builder, dynamic_inner, LLVM.ConstantInt(T_i64, flat_offset), "wg_flat_rem_adj")
+                else
+                    dynamic_inner
+                end
+                new_gep = LLVM.gep!(builder, flat_arr_ty, new_gv,
+                                   LLVM.Value[zero, adj_idx], "wg_flat_rem_gep")
+                LLVM.replace_uses!(user, new_gep)
+                LLVM.erase!(user)
+            end
+        end
     end
 end
 
@@ -3174,19 +3518,46 @@ function gep_element_type_and_offset(src_ty::LLVM.LLVMType, indices::Vector{Int}
 end
 
 """
-    flatten_type_with_offsets(ty) → [(index_path, scalar_type, byte_offset), ...]
+    flatten_type_with_offsets(ty; dl=nothing) → [(index_path, scalar_type, byte_offset), ...]
 
-Like `flatten_type_to_scalars` but also computes cumulative byte offsets.
+Like `flatten_type_to_scalars` but also computes byte offsets.
+When `dl` is provided, uses LLVM's DataLayout for correct struct padding.
+Without `dl`, offsets are computed by summing field sizes (no padding -- only correct for packed types).
 """
-function flatten_type_with_offsets(ty::LLVM.LLVMType)
-    scalars = flatten_type_to_scalars(ty)
+function flatten_type_with_offsets(ty::LLVM.LLVMType; dl::Union{Nothing,LLVM.DataLayout}=nothing)
     result = Tuple{Vector{Int}, LLVM.LLVMType, Int}[]
-    offset = 0
-    for (path, sty) in scalars
-        push!(result, (path, sty, offset))
-        offset += llvm_type_size(sty)
+    if dl !== nothing
+        flatten_with_dl!(result, Int[], ty, 0, dl)
+    else
+        # Legacy path: sum sizes without padding (only correct for packed types)
+        scalars = flatten_type_to_scalars(ty)
+        offset = 0
+        for (path, sty) in scalars
+            push!(result, (path, sty, offset))
+            offset += llvm_type_size(sty)
+        end
     end
     return result
+end
+
+function flatten_with_dl!(result, path, ty::LLVM.StructType, base_offset, dl::LLVM.DataLayout)
+    for i in 0:(length(LLVM.elements(ty)) - 1)
+        member_ty = LLVM.elements(ty)[i + 1]
+        member_offset = Int(LLVM.API.LLVMOffsetOfElement(dl, ty, UInt32(i)))
+        flatten_with_dl!(result, vcat(path, [i]), member_ty, base_offset + member_offset, dl)
+    end
+end
+
+function flatten_with_dl!(result, path, ty::LLVM.ArrayType, base_offset, dl::LLVM.DataLayout)
+    elem_ty = LLVM.eltype(ty)
+    elem_size = Int(LLVM.storage_size(dl, elem_ty))
+    for i in 0:(LLVM.length(ty) - 1)
+        flatten_with_dl!(result, vcat(path, [i]), elem_ty, base_offset + i * elem_size, dl)
+    end
+end
+
+function flatten_with_dl!(result, path, ty::LLVM.LLVMType, base_offset, ::LLVM.DataLayout)
+    push!(result, (path, ty, base_offset))
 end
 
 """
@@ -3268,7 +3639,7 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                     # the relevant bits via bitcast+shift+trunc.
                     if src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8 &&
                        (alloca_ty isa LLVM.StructType || alloca_ty isa LLVM.ArrayType)
-                        all_fields = flatten_type_with_offsets(alloca_ty)
+                        all_fields = flatten_type_with_offsets(alloca_ty; dl)
                         # Find the scalar field that contains this byte offset
                         containing = nothing
                         for (path, fty, foff) in all_fields
@@ -3328,7 +3699,7 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
 
                     if load_size > elem_size
                         # Wider load: select scalar fields within [gep_byte_off, gep_byte_off + load_size)
-                        all_fields = flatten_type_with_offsets(alloca_ty)
+                        all_fields = flatten_type_with_offsets(alloca_ty; dl)
                         selected = filter(all_fields) do (path, fty, foff)
                             fsz = llvm_type_size(fty)
                             foff >= gep_byte_off && foff + fsz <= gep_byte_off + load_size
@@ -3400,7 +3771,7 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                             # from scalar subfields.
                             if (elem_ty isa LLVM.StructType || elem_ty isa LLVM.ArrayType) &&
                                (elem_size * 8 > 64)
-                                subfields = flatten_type_with_offsets(elem_ty)
+                                subfields = flatten_type_with_offsets(elem_ty; dl)
                                 selected = filter(subfields) do (_, fty, foff)
                                     fsz = llvm_type_size(fty)
                                     foff >= 0 && foff + fsz <= load_size
@@ -3521,7 +3892,7 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                     if src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8 &&
                        (alloca_ty isa LLVM.StructType || alloca_ty isa LLVM.ArrayType) &&
                        elem_size == store_size
-                        all_fields = flatten_type_with_offsets(alloca_ty)
+                        all_fields = flatten_type_with_offsets(alloca_ty; dl)
                         containing = nothing
                         for (path, fty, foff) in all_fields
                             fsz = llvm_type_size(fty)
@@ -3582,7 +3953,7 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
 
                     if store_size > elem_size
                         # Wider store: decompose into per-field stores
-                        all_fields = flatten_type_with_offsets(alloca_ty)
+                        all_fields = flatten_type_with_offsets(alloca_ty; dl)
                         selected = filter(all_fields) do (path, fty, foff)
                             fsz = llvm_type_size(fty)
                             foff >= gep_byte_off && foff + fsz <= gep_byte_off + store_size
@@ -3631,7 +4002,7 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                     elseif store_size < elem_size
                         # Narrower store to wider field: find the containing scalar and
                         # do read-modify-write at the scalar level
-                        all_fields = flatten_type_with_offsets(alloca_ty)
+                        all_fields = flatten_type_with_offsets(alloca_ty; dl)
 
                         # First check: exact size match (store directly)
                         target_field = nothing

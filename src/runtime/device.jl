@@ -602,18 +602,19 @@ function debug_callback(
     msg_ptr = data.pMessage
     message = msg_ptr == C_NULL ? "(no message)" : unsafe_string(msg_ptr)
 
-    # Store in ring buffer for context on DEVICE_LOST
-    if length(VALIDATION_MESSAGES) >= MAX_VALIDATION_MESSAGES
-        popfirst!(VALIDATION_MESSAGES)
-    end
-    push!(VALIDATION_MESSAGES, message)
-
-    # Print based on severity — errors are always printed immediately
+    # Only store ERROR-severity messages that indicate real shader/runtime errors.
+    # GPU-AV setup messages ("Warning that validation is adjusting settings") are
+    # delivered at ERROR severity but are benign -- filter them out.
     is_error = (severity & Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0
     is_warning = (severity & Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0
-    if is_error
+    is_setup_noise = contains(message, "adjusting settings") || contains(message, "VALIDATION-SETTINGS")
+    if is_error && !is_setup_noise
+        if length(VALIDATION_MESSAGES) >= MAX_VALIDATION_MESSAGES
+            popfirst!(VALIDATION_MESSAGES)
+        end
+        push!(VALIDATION_MESSAGES, message)
         @error "Vulkan validation error" message
-    elseif is_warning
+    elseif is_warning || is_setup_noise
         @warn "Vulkan validation warning" message
     end
     # Return VK_FALSE — can't throw from @cfunction callback (would corrupt Vulkan state).
@@ -663,12 +664,14 @@ Call this after Vulkan operations that may trigger validation errors
 """
 function check_validation_errors!(context::String)
     isempty(VALIDATION_MESSAGES) && return
-    # Check for actual errors (not just warnings)
-    # Validation messages containing "WARNING" are just warnings, not errors.
-    errors = filter(m -> !contains(m, "WARNING"), VALIDATION_MESSAGES)
+    # Separate true errors from warnings using the severity recorded by the callback.
+    # GPU-AV messages like "Unaligned pointer access" are errors, not warnings,
+    # even though their text may contain strings like "WARNING-Validation".
+    # We rely on the callback storing only ERROR-severity messages.
+    errors = copy(VALIDATION_MESSAGES)
     isempty(errors) && return
     n = min(length(errors), 5)
-    detail = join(["  [$i] $(first(errors[i], 300))" for i in 1:n], "\n")
+    detail = join(["  [$i] $(first(errors[i], 1000))" for i in 1:n], "\n")
     # Clear after reporting to avoid re-triggering
     empty!(VALIDATION_MESSAGES)
     throw(LavaError(

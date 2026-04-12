@@ -1003,6 +1003,14 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
     ptr = LLVM.operands(inst)[1]
     load_ty = LLVM.value_type(inst)
 
+    # Padding GEP: the pointer targets struct padding (no field at this offset).
+    # Emit OpUndef since padding bytes are undefined.
+    if ptr isa LLVM.GetElementPtrInst && is_padding_gep(ptr, state.data_layout)
+        undef_id = map_undef!(state.type_ctx, load_ty)
+        state.value_map[inst] = undef_id
+        return
+    end
+
     ptr_id = get_value_id!(state, ptr)
     # When loading a pointer value (e.g., extracting a Ptr{T} from a struct),
     # the result is a typed pointer in SPIR-V. Use the PTM to resolve.
@@ -1713,6 +1721,27 @@ function resolve_struct_field_store!(state::SPIRVEmitterState, ptr::LLVM.Value,
     # Check forward path: pointee is a struct containing store_ty as first member
     index_path = find_zero_index_path(pointee_ty, store_ty)
 
+    # If exact type match failed, try same-bitwidth match for the first scalar leaf.
+    # This handles LLVM type punning after decompose_composite_workgroup_accesses!:
+    # field 0's byte-offset-0 GEP is folded away, leaving the pointer typed as struct.
+    # LLVM may also type-pun constants (e.g. `store i32 0` instead of `store float 0.0`).
+    # In that case the store type (i32) differs from field 0's type (float) but has the
+    # same bit width, so we drill down to field 0 via AccessChain and bitcast the value.
+    need_field_bitcast = false
+    target_field_ty = nothing
+    if index_path === nothing && pointee_ty isa LLVM.StructType && !(store_ty isa LLVM.PointerType)
+        leaf_path, leaf_ty = find_zero_index_path_to_leaf(pointee_ty)
+        if leaf_path !== nothing && leaf_ty !== nothing
+            store_bw = llvm_type_bit_width(store_ty)
+            leaf_bw = llvm_type_bit_width(leaf_ty)
+            if store_bw > 0 && store_bw == leaf_bw
+                index_path = leaf_path
+                need_field_bitcast = true
+                target_field_ty = leaf_ty
+            end
+        end
+    end
+
     if index_path === nothing
         # Check reverse path: store_ty is a struct containing pointee_ty as first member.
         # This means the GEP drilled too deep — it reached a scalar member but the store
@@ -1727,10 +1756,15 @@ function resolve_struct_field_store!(state::SPIRVEmitterState, ptr::LLVM.Value,
 
     sc = get_pointer_storage_class(ptr)
 
-    # For pointer store types, use the struct's declared member type for the AccessChain
-    # (must match the struct definition), not the usage-inferred PTM type.
+    # Determine the target SPIR-V type for the store value
     store_val_bitcast_to = nothing
-    if store_ty isa LLVM.PointerType
+    if need_field_bitcast
+        # Same-bitwidth different-type: drill to first leaf field and bitcast value
+        field_spirv_ty = map_type!(state.type_ctx, target_field_ty)
+        store_val_bitcast_to = field_spirv_ty
+    elseif store_ty isa LLVM.PointerType
+        # For pointer store types, use the struct's declared member type for the AccessChain
+        # (must match the struct definition), not the usage-inferred PTM type.
         struct_member_spirv_ty = get_struct_member_ptr_spirv_type(state, pointee_ty)
         inferred_spirv_ty = map_pointer_type_for_value!(state.type_ctx, store_value)
         if struct_member_spirv_ty !== nothing
@@ -1767,6 +1801,12 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
 
     # Skip stores of poison/undef — storing undefined data is a no-op
     if value isa LLVM.PoisonValue || value isa LLVM.UndefValue
+        return
+    end
+
+    # Padding GEP: the destination targets struct padding (no field at this offset).
+    # Skip the store entirely since padding bytes are undefined.
+    if ptr isa LLVM.GetElementPtrInst && is_padding_gep(ptr, state.data_layout)
         return
     end
 
@@ -2201,6 +2241,7 @@ into narrower ones (e.g., i64 → two i32).
 function psb_needs_decomposition(state::SPIRVEmitterState, ptr::LLVM.Value, access_ty::LLVM.LLVMType;
                                    llvm_align::UInt32=UInt32(0))
     access_align = get_alignment_for_type(access_ty)
+
     access_align <= 4 && return false  # i32/float/i16/i8 never need decomposition (matches v17)
 
     # Check 0: LLVM's own alignment on the load/store instruction.
@@ -2707,10 +2748,12 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
             set_pointee_type!(state.type_ctx.ptm, inst, ptm_ty; priority=5)
             # Record array element origin for folding chained GEPs (e.g. array[a][b] → array[a+b])
             state.array_element_origin[inst] = (base_id, UInt32[], idx_i32, base_pointee)
-        elseif (sc == SC.Function || sc == SC.Private) && haskey(state.array_element_origin, base_ptr)
-            # Chained single-index GEP on a Function-SC array element:
+        elseif (sc == SC.Function || sc == SC.Private || sc == SC.Workgroup) && haskey(state.array_element_origin, base_ptr)
+            # Chained single-index GEP on an array element pointer:
             # base was from OpAccessChain into an array, fold by adding indices.
             # gep T, ptr (AccessChain array[a]), b  →  AccessChain array[a + b]
+            # For Workgroup: avoids OpPtrAccessChain which would need ArrayStride on
+            # the result pointer type, causing conflicts with field pointer types.
             arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
             new_idx_i32 = ensure_index_i32!(state, ops[2])
             # Emit IAdd to combine indices
@@ -3047,20 +3090,41 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     push!(state.mod.functions, base_id)
                     append!(state.mod.functions, index_ids)
                 else
-                    # Normal case: OpPtrAccessChain with all indices (Workgroup, StorageBuffer)
-                    ensure_array_stride_decoration!(state, result_ptr_ty, source_ty)
-                    index_ids = UInt32[]
-                    push!(index_ids, get_value_id!(state, ops[2]))
-                    for i in 3:length(ops)
-                        push!(index_ids, ensure_index_i32!(state, ops[i]))
+                    # Workgroup/StorageBuffer: split into OpPtrAccessChain (element advance)
+                    # + OpAccessChain (field drilling) to avoid ArrayStride conflicts.
+                    # A single multi-index OpPtrAccessChain would apply the struct's
+                    # ArrayStride to the field pointer type, which conflicts when that
+                    # pointer type is also used for plain field access elsewhere.
+                    first_idx_id = get_value_id!(state, ops[2])
+                    if length(ops) > 2
+                        # Has field indices: split into element advance + field access
+                        source_spirv = sc == SC.Workgroup ?
+                            map_workgroup_type!(state.type_ctx, source_ty) :
+                            map_type!(state.type_ctx, source_ty)
+                        source_ptr_ty = map_pointer_type!(state.type_ctx, source_spirv, sc)
+                        ensure_array_stride_decoration!(state, source_ptr_ty, source_ty)
+                        elem_id = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, UInt16(67),
+                            source_ptr_ty, elem_id, base_id, first_idx_id)
+                        # Now AccessChain into the struct with remaining indices
+                        remaining_ids = UInt32[]
+                        for i in 3:length(ops)
+                            push!(remaining_ids, ensure_index_i32!(state, ops[i]))
+                        end
+                        result_id = fresh_id!(state.mod)
+                        word_count = UInt32(4 + length(remaining_ids))
+                        push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                        push!(state.mod.functions, result_ptr_ty)
+                        push!(state.mod.functions, result_id)
+                        push!(state.mod.functions, elem_id)
+                        append!(state.mod.functions, remaining_ids)
+                    else
+                        # Single index: plain OpPtrAccessChain
+                        ensure_array_stride_decoration!(state, result_ptr_ty, source_ty)
+                        result_id = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, UInt16(67),
+                            result_ptr_ty, result_id, base_id, first_idx_id)
                     end
-                    result_id = fresh_id!(state.mod)
-                    word_count = UInt32(4 + length(index_ids))
-                    push!(state.mod.functions, (word_count << 16) | UInt32(67))
-                    push!(state.mod.functions, result_ptr_ty)
-                    push!(state.mod.functions, result_id)
-                    push!(state.mod.functions, base_id)
-                    append!(state.mod.functions, index_ids)
                 end
                 state.value_map[inst] = result_id
                 set_pointee_type!(state.type_ctx.ptm, inst, result_pointee; priority=3)
@@ -3130,7 +3194,37 @@ function map_gep_ptr_result!(ctx::SPIRVTypeContext, source_ty::LLVM.LLVMType,
 end
 
 """
-Emit a byte-offset GEP as a typed element access.
+Check if a GEP targets struct padding (no field at the byte offset).
+Returns true when the GEP is a constant byte-offset into a struct alloca
+and the offset doesn't correspond to any struct member. Used by load/store
+handlers to emit OpUndef for loads and skip stores to padding.
+"""
+function is_padding_gep(gep::LLVM.GetElementPtrInst, dl::Union{Nothing, LLVM.DataLayout})
+    # Must be a byte-offset GEP (gep i8, ptr, i64 const)
+    src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
+    !(src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8) && return false
+    ops = LLVM.operands(gep)
+    length(ops) != 2 && return false
+    ops[2] isa LLVM.ConstantInt || return false
+
+    # Base must be an alloca of a struct type
+    base = ops[1]
+    base isa LLVM.AllocaInst || return false
+    alloca_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(base))
+    alloca_ty isa LLVM.StructType || return false
+
+    # Check if offset falls in padding
+    offset = convert(Int64, ops[2])
+    offset < 0 && return false
+    struct_size = dl !== nothing ? Int64(LLVM.storage_size(dl, alloca_ty)) : Int64(0)
+    offset >= struct_size && return false  # past end of struct, not padding
+
+    # Try to find a field at this offset
+    index_path, _ = find_struct_member_path_by_offset(alloca_ty, offset, dl)
+    return index_path === nothing
+end
+
+"""
 Converts `getelementptr i8, ptr %base, i64 %byte_offset` to an OpPtrAccessChain
 using the base pointer's actual element type: idx = byte_offset / sizeof(element).
 Also updates the PTM so downstream stores/loads see the correct pointee type.
@@ -3468,9 +3562,8 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
 
             # Offset falls in struct padding (no member at this offset).
             # For Function storage class, we can't use OpPtrAccessChain.
-            # Use the base pointer directly — the load handler (resolve_struct_field_load!)
-            # will drill into the struct to find a compatible type. Since padding bytes are
-            # undefined, any loaded value is semantically acceptable.
+            # Use the base pointer directly — load/store handlers detect this via
+            # is_padding_gep() and emit OpUndef for loads / skip stores.
             if sc == SC.Function || sc == SC.Private
                 state.value_map[inst] = base_id
                 set_pointee_type!(state.type_ctx.ptm, inst, base_pointee; priority=4)
@@ -6465,7 +6558,7 @@ function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
                 for i in 4:length(ops)
                     idx_val = ops[i]
                     idx_i64 = idx_val isa LLVM.ConstantInt ? convert(Int64, idx_val) : 0
-                    idx_id = emit_constant_u32!(state.mod, UInt32(idx_i64))
+                    idx_id = emit_constant_u32!(state.mod, reinterpret(UInt32, Int32(idx_i64)))
                     new_id = fresh_id!(state.mod)
                     # TODO: compute correct result type for deeper indexing
                     encode_instruction!(state.mod.functions, Op.OpAccessChain,
@@ -6485,7 +6578,7 @@ function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
             idx_val = ops[i]
             if idx_val isa LLVM.ConstantInt
                 idx_i64 = convert(Int64, idx_val)
-                push!(index_ids, emit_constant_u32!(state.mod, UInt32(idx_i64)))
+                push!(index_ids, emit_constant_u32!(state.mod, reinterpret(UInt32, Int32(idx_i64))))
             else
                 error("ConstantExpr GEP with non-constant index: $val")
             end
