@@ -36,6 +36,65 @@ function fixup_structured_cfg!(mod::LLVM.Module)
 end
 
 """
+    replace_undef_phi_operands_with_constants!(mod::LLVM.Module)
+
+For every phi node, replace `undef` / `poison` operands of scalar integer/float
+types with LLVM constants (int 0, float 0.0, bool false). Applies after
+StructurizeCFG, which inserts `undef` as the "don't-care" value on predecessors
+that reach the phi via guard-controlled paths that are semantically never taken.
+
+Why: SPIR-V's OpUndef "may yield a different bit pattern per consumption"
+(RADV interprets this literally), which breaks the guard phis StructurizeCFG
+relies on — the guard bool becomes non-deterministic and the "unreachable" undef
+path executes for real, feeding garbage to downstream uses. Deterministic zero
+constants dominate all predecessors (they're LLVM global constants), preserve
+SSA, and match what LLVM's own freeze-then-propagate would produce.
+
+Pointer-typed phi operands are left as undef; SPIR-V's OpConstantNull is
+forbidden on PhysicalStorageBuffer, and the SPIR-V emitter has a dedicated
+workaround that materializes an `OpConvertUToPtr` from ulong_0 in the
+predecessor block (see emit.jl's deferred-phi handling).
+"""
+function replace_undef_phi_operands_with_constants!(mod::LLVM.Module)
+    replaced = 0
+    for f in LLVM.functions(mod)
+        isempty(LLVM.blocks(f)) && continue
+        for bb in LLVM.blocks(f)
+            phis = LLVM.PHIInst[]
+            for inst in LLVM.instructions(bb)
+                inst isa LLVM.PHIInst && push!(phis, inst)
+            end
+            for phi in phis
+                ty = LLVM.value_type(phi)
+                # Only rewrite scalar types where LLVM.null produces a constant
+                # that the SPIR-V emitter accepts. Pointer types are handled in
+                # emit.jl via OpConvertUToPtr.
+                ty isa LLVM.IntegerType || ty isa LLVM.LLVMFloat ||
+                    ty isa LLVM.LLVMDouble || ty isa LLVM.LLVMHalf || continue
+                incoming_list = [(v, b) for (v, b) in LLVM.incoming(phi)]
+                any(v -> v isa LLVM.UndefValue || v isa LLVM.PoisonValue,
+                    (v for (v, _) in incoming_list)) || continue
+                zero = LLVM.null(ty)
+                builder = LLVM.IRBuilder()
+                LLVM.position!(builder, phi)
+                new_phi = LLVM.phi!(builder, ty)
+                new_incoming = Tuple{LLVM.Value, LLVM.BasicBlock}[]
+                for (v, b) in incoming_list
+                    new_v = (v isa LLVM.UndefValue || v isa LLVM.PoisonValue) ? zero : v
+                    push!(new_incoming, (new_v, b))
+                end
+                LLVM.append!(LLVM.incoming(new_phi), new_incoming)
+                LLVM.replace_uses!(phi, new_phi)
+                LLVM.API.LLVMInstructionEraseFromParent(phi.ref)
+                replaced += 1
+                LLVM.dispose(builder)
+            end
+        end
+    end
+    return replaced
+end
+
+"""
     isolate_shared_merge_targets!(f::LLVM.Function)
 
 Find blocks that are successors of multiple conditional branches and insert
@@ -208,6 +267,11 @@ function run_structurize_cfg_pipeline!(mod::LLVM.Module)
     LLVM.run!(LLVM.LoopSimplifyPass(), mod)
     LLVM.run!(LLVM.StructurizeCFGPass(), mod)
     LLVM.run!(LLVM.InstCombinePass(), mod)
+    # Replace `undef` scalar phi operands introduced by StructurizeCFG with
+    # constant zeros so the SPIR-V emitter doesn't emit OpUndef — which RADV
+    # interprets non-deterministically and causes guard phis to pick the wrong
+    # branch. See replace_undef_phi_operands_with_constants! docstring.
+    replace_undef_phi_operands_with_constants!(mod)
     fixup_post_structurize!(mod)
 end
 

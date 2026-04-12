@@ -5512,12 +5512,43 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
         for (val, bb) in incoming
             val_id = if val isa LLVM.UndefValue && LLVM.value_type(val) isa LLVM.PointerType
                 # UndefValue with opaque pointer type — can't map via map_type!.
-                # Use the PHI's already-resolved typed pointer type_id to emit OpUndef.
-                key = (:undef, type_id)
-                get!(state.type_ctx.mod.constant_cache, key) do
-                    uid = fresh_id!(state.type_ctx.mod)
-                    encode_instruction!(state.type_ctx.mod.types_constants, UInt16(1), type_id, uid)
-                    uid
+                # Emitting OpUndef here lets RADV yield a different bit pattern per
+                # consumption, which breaks StructurizeCFG-inserted guard phis: the
+                # guard bool becomes non-deterministic and the branch enters the
+                # "semantically unreachable" undef path, reading garbage through the
+                # undef pointer. SPIR-V forbids OpConstantNull for PhysicalStorageBuffer,
+                # so for PSB pointers we materialize a deterministic null value via
+                # OpConvertUToPtr from ulong_0 in the predecessor block (before its
+                # terminator, so it dominates the phi use). For other storage classes,
+                # OpConstantNull is valid and simpler.
+                is_psb = any(pair -> pair[1][1] == SC.PhysicalStorageBuffer && pair[2] == type_id,
+                             state.type_ctx.pointer_types)
+                if is_psb
+                    from_id = get_block_id!(state, bb)
+                    redirect = get(state.trampolines, (from_id, block_label_id), nothing)
+                    if redirect === nothing
+                        redirect = get(state.phi_block_redirects, (from_id, block_label_id), nothing)
+                    end
+                    pred_block_id = redirect !== nothing ? redirect : from_id
+                    zero_id = emit_u64_constant!(state.mod, UInt64(0))
+                    null_ptr_id = fresh_id!(state.mod)
+                    conv_words = UInt32[]
+                    push!(conv_words, (UInt32(4) << 16) | UInt32(Op.OpConvertUToPtr))
+                    push!(conv_words, type_id)
+                    push!(conv_words, null_ptr_id)
+                    push!(conv_words, zero_id)
+                    if !haskey(pre_terminator_insertions, pred_block_id)
+                        pre_terminator_insertions[pred_block_id] = UInt32[]
+                    end
+                    append!(pre_terminator_insertions[pred_block_id], conv_words)
+                    null_ptr_id
+                else
+                    key = (:null, type_id)
+                    get!(state.type_ctx.mod.constant_cache, key) do
+                        uid = fresh_id!(state.type_ctx.mod)
+                        encode_instruction!(state.type_ctx.mod.types_constants, UInt16(46), type_id, uid)  # OpConstantNull
+                        uid
+                    end
                 end
             else
                 get_value_id!(state, val)
@@ -5661,6 +5692,12 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
         UInt32(Op.OpBranch), UInt32(Op.OpBranchConditional),
         UInt32(Op.OpReturn), UInt32(Op.OpReturnValue),
     ])
+    # Merge opcodes that must stay immediately before the terminator (SPIR-V spec:
+    # OpSelectionMerge / OpLoopMerge must be the second-to-last instruction in a
+    # block). Insert pre-terminator cast/conversion words before these merges.
+    MERGE_OPCODES = Set{UInt32}([
+        UInt32(Op.OpSelectionMerge), UInt32(Op.OpLoopMerge),
+    ])
 
     # Track current block label for pre-terminator insertions
     current_block_label = UInt32(0)
@@ -5670,8 +5707,10 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
         opcode = word & 0xFFFF
         wc = word >> 16
 
-        # Before emitting a terminator, check for pre-terminator insertions
-        if opcode in TERMINATOR_OPCODES && haskey(pre_terminator_insertions, current_block_label)
+        # Before emitting a terminator (or the merge header that must precede it),
+        # flush any pre-terminator insertions for this block.
+        if (opcode in TERMINATOR_OPCODES || opcode in MERGE_OPCODES) &&
+                haskey(pre_terminator_insertions, current_block_label)
             append!(new_functions, pre_terminator_insertions[current_block_label])
             delete!(pre_terminator_insertions, current_block_label)
         end

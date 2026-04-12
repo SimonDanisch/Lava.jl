@@ -1430,11 +1430,23 @@ function map_constant_fp!(ctx::SPIRVTypeContext, val::LLVM.ConstantFP, ty::LLVM.
 end
 
 function map_undef!(ctx::SPIRVTypeContext, ty::LLVM.LLVMType)
-    type_id = map_type!(ctx, ty)
-    # OpUndef (opcode 1)
-    id = fresh_id!(ctx.mod)
-    encode_instruction!(ctx.mod.types_constants, UInt16(1), type_id, id)
-    return id
+    # Reachable only for residual undef values that weren't rewritten by the
+    # `replace_undef_phi_operands_with_constants!` LLVM pass (e.g. undef used
+    # directly as an instruction operand, not through a phi). Scalar types get
+    # OpConstantNull (deterministic zero) to avoid RADV's non-deterministic
+    # OpUndef behavior; PhysicalStorageBuffer pointer types can't use
+    # OpConstantNull (SPIR-V validation forbids it) so fall back to OpUndef.
+    if ty isa LLVM.PointerType &&
+            llvm_addrspace_to_storage_class(Int(LLVM.addrspace(ty))) == SC.PhysicalStorageBuffer
+        type_id = map_type!(ctx, ty)
+        key = (:undef, type_id)
+        return get!(ctx.mod.constant_cache, key) do
+            id = fresh_id!(ctx.mod)
+            encode_instruction!(ctx.mod.types_constants, UInt16(1), type_id, id)  # OpUndef
+            id
+        end
+    end
+    return map_null_constant!(ctx, ty)
 end
 
 function map_null_constant!(ctx::SPIRVTypeContext, ty::LLVM.LLVMType)

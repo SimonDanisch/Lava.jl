@@ -851,7 +851,13 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
 
     # ── Structured control flow ──
     # SPIR-V requires structured CF. Run the full structurize pipeline.
+    if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
+        write("/tmp/lava_ir_3_pre_structurize.ll", string(mod))
+    end
     run_structurize_cfg_pipeline!(mod)
+    if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
+        write("/tmp/lava_ir_4_post_structurize.ll", string(mod))
+    end
     verify_ir!("structurize_cfg")
 
     # ── Flatten nested workgroup array globals ──
