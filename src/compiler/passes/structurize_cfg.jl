@@ -102,81 +102,6 @@ function merge_equivalent_loop_phis!(mod::LLVM.Module)
 end
 
 """
-    merge_redundant_zero_phis!(mod::LLVM.Module)
-
-StructurizeCFG splits a single loop-carried integer phi (e.g., `hits`) into
-two parallel phis in the loop header, which both start at 0 on entry and
-update via the back-edge — but through different intermediate phi chains.
-These are semantically identical (both represent the same state variable),
-but LLVM's value numbering doesn't prove this because the chains look
-structurally distinct. RADV's compiler misses this equivalence and uses the
-stale copy at the store site (so e.g. `hits + 1` from the leaf body never
-reaches the exit).
-
-This pass looks in every block for pairs of integer phis with identical
-entry operands (same constant from the same predecessor), and for each such
-pair, substitutes the back-edge chain of one with the other — transitively,
-until a fixed point. When the chains truly represent the same value, this
-collapses them to a single SSA name and the duplication bug goes away.
-"""
-function merge_redundant_zero_phis!(mod::LLVM.Module)
-    merged = 0
-    for f in LLVM.functions(mod)
-        isempty(LLVM.blocks(f)) && continue
-        while true
-            changed = false
-            for bb in LLVM.blocks(f)
-                phis = LLVM.PHIInst[]
-                for inst in LLVM.instructions(bb)
-                    inst isa LLVM.PHIInst && push!(phis, inst)
-                end
-                # Group phis with matching constant-entry operands
-                for i in 1:length(phis), j in (i+1):length(phis)
-                    a = phis[i]; b = phis[j]
-                    a_type = LLVM.value_type(a)
-                    a_type == LLVM.value_type(b) || continue
-                    a_type isa LLVM.IntegerType || continue
-                    ai = collect(LLVM.incoming(a))
-                    bi = collect(LLVM.incoming(b))
-                    length(ai) == length(bi) || continue
-                    amap = Dict{LLVM.BasicBlock, LLVM.Value}(blk => val for (val, blk) in ai)
-                    bmap = Dict{LLVM.BasicBlock, LLVM.Value}(blk => val for (val, blk) in bi)
-                    keys(amap) == keys(bmap) || continue
-                    # Find matching-constant entry operand
-                    const_entries = 0
-                    for bb_pred in keys(amap)
-                        av = amap[bb_pred]; bv = bmap[bb_pred]
-                        if av isa LLVM.ConstantInt && bv isa LLVM.ConstantInt &&
-                                convert(Int64, av) == convert(Int64, bv)
-                            const_entries += 1
-                        end
-                    end
-                    const_entries >= 1 || continue
-                    # Check at least one non-constant predecessor where they differ
-                    non_const_diff = 0
-                    for bb_pred in keys(amap)
-                        av = amap[bb_pred]; bv = bmap[bb_pred]
-                        (av.ref == bv.ref) && continue
-                        (av isa LLVM.ConstantInt && bv isa LLVM.ConstantInt) && continue
-                        non_const_diff += 1
-                    end
-                    non_const_diff >= 1 || continue
-                    # Merge b into a: replace all uses of b with a
-                    LLVM.replace_uses!(b, a)
-                    LLVM.API.LLVMInstructionEraseFromParent(b.ref)
-                    merged += 1
-                    changed = true
-                    break
-                end
-                changed && break
-            end
-            changed || break
-        end
-    end
-    return merged
-end
-
-"""
     replace_undef_phi_operands_with_constants!(mod::LLVM.Module)
 
 For every phi node, replace `undef` / `poison` operands of scalar integer/float
@@ -275,30 +200,27 @@ end
 """
     insert_cfg_trampoline!(f, src, target)
 
-Insert a trampoline block isolating `src`'s construct from `target`.
+Isolate `src`'s control-flow construct from `target` by routing every edge
+from "inside `src`'s construct" into `target` through a fresh trampoline
+block. "Inside `src`'s construct" = every block reachable from `src` without
+crossing `target`.
 
-When `src` is a conditional branch header whose construct (all blocks reachable
-from `src` without passing through `target`) also has blocks that branch to
-`target`, ALL those branches must be redirected through the trampoline. Otherwise
-the SPIR-V backend creates a construct where inner blocks exit "not via structured
-exit". This mirrors clspv's `isolateContinue()`.
+Used by `isolate_shared_merge_targets!` (pre-structurize; multiple
+conditional-branch headers sharing a merge target) and by
+`fixup_continue_merge_conflicts!` (post-structurize; continue targets also
+acting as selection merges). Mirrors clspv's `isolateContinue()`.
 
-Steps:
-1. Find all blocks "inside" src's construct (reachable from src without crossing target)
-2. Create trampoline block (unconditional branch to target)
-3. Redirect ALL branches from inside blocks to target through the trampoline
-4. Update PHI nodes in target (partition incoming values into inside/outside)
+Thin wrapper over `insert_edge_trampoline!`: we just enumerate the
+"inside-of-src and branches-to-target" block set and hand it off.
 """
 function insert_cfg_trampoline!(f::LLVM.Function, src::LLVM.BasicBlock,
                                   target::LLVM.BasicBlock)
-    # Step 1: Find all blocks "inside" src's construct.
-    # = blocks reachable from src without passing through target.
     inside = Set{LLVM.BasicBlock}()
     worklist = LLVM.BasicBlock[src]
     while !isempty(worklist)
         bb = pop!(worklist)
-        bb in inside && continue    # already visited
-        bb == target && continue     # don't enter target
+        bb in inside && continue
+        bb == target && continue
         push!(inside, bb)
         term = LLVM.terminator(bb)
         for succ in LLVM.successors(term)
@@ -306,76 +228,11 @@ function insert_cfg_trampoline!(f::LLVM.Function, src::LLVM.BasicBlock,
         end
     end
 
-    # Step 2: Create trampoline block (just branches to target)
-    tramp = LLVM.BasicBlock(f, "cfg_fixup")
-    LLVM.@dispose builder=LLVM.IRBuilder() begin
-        LLVM.position!(builder, tramp)
-        LLVM.br!(builder, target)
-    end
-
-    # Step 3: Redirect ALL branches from inside blocks to target through trampoline
-    for bb in inside
-        term = LLVM.terminator(bb)
-        succs = LLVM.successors(term)
-        for i in 1:length(succs)
-            if succs[i] == target
-                succs[i] = tramp
-            end
-        end
-    end
-
-    # Step 4: Update PHI nodes in target.
-    # Multiple inside blocks may have been predecessors of target with different
-    # values. They all now arrive via trampoline, so we need a PHI in trampoline
-    # to merge their values, and a single entry in target's PHI from trampoline.
-    for inst in collect(LLVM.instructions(target))
-        inst isa LLVM.PHIInst || break  # PHIs are always at block start
-
-        inc = LLVM.incoming(inst)
-        # Partition incoming into inside vs outside
-        inside_pairs = Tuple{LLVM.Value, LLVM.BasicBlock}[]
-        outside_pairs = Tuple{LLVM.Value, LLVM.BasicBlock}[]
-        for k in 1:length(inc)
-            val, blk = inc[k]
-            if blk in inside
-                push!(inside_pairs, (val, blk))
-            else
-                push!(outside_pairs, (val, blk))
-            end
-        end
-
-        isempty(inside_pairs) && continue
-
-        # Determine the value arriving from the trampoline
-        tramp_val = if length(inside_pairs) == 1
-            # Single inside predecessor: use its value directly
-            inside_pairs[1][1]
-        elseif all(p -> p[1] == inside_pairs[1][1], inside_pairs)
-            # All inside predecessors contribute the same value
-            inside_pairs[1][1]
-        else
-            # Multiple different values: create a PHI in the trampoline
-            LLVM.@dispose builder=LLVM.IRBuilder() begin
-                # Position before the terminator (branch) in trampoline
-                LLVM.position!(builder, LLVM.terminator(tramp))
-                phi = LLVM.phi!(builder, LLVM.value_type(inst), "tramp.phi")
-                append!(LLVM.incoming(phi), inside_pairs)
-                phi
-            end
-        end
-
-        # Rebuild target's PHI with trampoline as single predecessor for inside blocks
-        new_pairs = copy(outside_pairs)
-        push!(new_pairs, (tramp_val, tramp))
-
-        LLVM.@dispose builder=LLVM.IRBuilder() begin
-            LLVM.position!(builder, inst)
-            new_phi = LLVM.phi!(builder, LLVM.value_type(inst), LLVM.name(inst) * ".fix")
-            append!(LLVM.incoming(new_phi), new_pairs)
-            LLVM.replace_uses!(inst, new_phi)
-            LLVM.erase!(inst)
-        end
-    end
+    inside_branchers = [bb for bb in inside
+                         if any(==(target), LLVM.successors(LLVM.terminator(bb)))]
+    isempty(inside_branchers) && return
+    insert_edge_trampoline!(f, inside_branchers, target; name = "cfg_fixup")
+    return
 end
 
 """
@@ -573,33 +430,6 @@ function fixup_continue_merge_conflicts!(f::LLVM.Function)
             end
         end
     end
-end
-
-# Compute reverse post-order of basic blocks in a function.
-function compute_rpo(f::LLVM.Function)
-    blocks = collect(LLVM.blocks(f))
-    isempty(blocks) && return blocks
-
-    visited = Set{LLVM.BasicBlock}()
-    postorder = LLVM.BasicBlock[]
-
-    function dfs(bb)
-        bb in visited && return
-        push!(visited, bb)
-        term = LLVM.terminator(bb)
-        for succ in LLVM.successors(term)
-            dfs(succ)
-        end
-        push!(postorder, bb)
-    end
-
-    dfs(first(blocks))
-    # Also visit unreachable blocks
-    for bb in blocks
-        bb in visited || push!(postorder, bb)
-    end
-
-    return reverse(postorder)
 end
 
 # Find the merge block for a loop (first successor outside the loop body).

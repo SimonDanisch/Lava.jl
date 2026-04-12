@@ -75,6 +75,7 @@ include("compiler/spirv/emit.jl")
 
 # ---- LLVM passes ----
 include("compiler/passes/lift_geps.jl")
+include("compiler/passes/cfg_utils.jl")
 include("compiler/passes/structurize_cfg.jl")
 include("compiler/passes/prepare_vulkan.jl")
 include("compiler/passes/lower_intrinsics.jl")
