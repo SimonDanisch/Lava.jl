@@ -72,26 +72,96 @@ function merge_equivalent_loop_phis!(mod::LLVM.Module)
                     ai = collect(LLVM.incoming(a))
                     bi = collect(LLVM.incoming(b))
                     length(ai) == length(bi) || continue
-                    # Build (pred → value) dicts
                     amap = Dict{LLVM.BasicBlock, LLVM.Value}(blk => val for (val, blk) in ai)
                     bmap = Dict{LLVM.BasicBlock, LLVM.Value}(blk => val for (val, blk) in bi)
                     keys(amap) == keys(bmap) || continue
-                    # Equivalent iff every predecessor maps to same value, OR
-                    # the two different values are themselves phi nodes in the
-                    # same block that we're about to prove equivalent (handled
-                    # by the outer fixed-point) — or one value is the "other" phi.
                     ok = true
                     for bb_pred in keys(amap)
                         av = amap[bb_pred]; bv = bmap[bb_pred]
                         av == bv && continue
-                        # Accept if av == b and bv == a (mutual self-reference)
                         (av.ref == b.ref && bv.ref == a.ref) && continue
-                        # Accept if av == a and bv == b (self-reference matched)
                         (av.ref == a.ref && bv.ref == b.ref) && continue
+                        # Allow: one is the other phi (self-equivalence via rewrite)
+                        (av.ref == b.ref) && continue
+                        (bv.ref == a.ref) && continue
                         ok = false; break
                     end
                     ok || continue
-                    # Merge: replace uses of b with a, delete b
+                    LLVM.replace_uses!(b, a)
+                    LLVM.API.LLVMInstructionEraseFromParent(b.ref)
+                    merged += 1
+                    changed = true
+                    break
+                end
+                changed && break
+            end
+            changed || break
+        end
+    end
+    return merged
+end
+
+"""
+    merge_redundant_zero_phis!(mod::LLVM.Module)
+
+StructurizeCFG splits a single loop-carried integer phi (e.g., `hits`) into
+two parallel phis in the loop header, which both start at 0 on entry and
+update via the back-edge — but through different intermediate phi chains.
+These are semantically identical (both represent the same state variable),
+but LLVM's value numbering doesn't prove this because the chains look
+structurally distinct. RADV's compiler misses this equivalence and uses the
+stale copy at the store site (so e.g. `hits + 1` from the leaf body never
+reaches the exit).
+
+This pass looks in every block for pairs of integer phis with identical
+entry operands (same constant from the same predecessor), and for each such
+pair, substitutes the back-edge chain of one with the other — transitively,
+until a fixed point. When the chains truly represent the same value, this
+collapses them to a single SSA name and the duplication bug goes away.
+"""
+function merge_redundant_zero_phis!(mod::LLVM.Module)
+    merged = 0
+    for f in LLVM.functions(mod)
+        isempty(LLVM.blocks(f)) && continue
+        while true
+            changed = false
+            for bb in LLVM.blocks(f)
+                phis = LLVM.PHIInst[]
+                for inst in LLVM.instructions(bb)
+                    inst isa LLVM.PHIInst && push!(phis, inst)
+                end
+                # Group phis with matching constant-entry operands
+                for i in 1:length(phis), j in (i+1):length(phis)
+                    a = phis[i]; b = phis[j]
+                    a_type = LLVM.value_type(a)
+                    a_type == LLVM.value_type(b) || continue
+                    a_type isa LLVM.IntegerType || continue
+                    ai = collect(LLVM.incoming(a))
+                    bi = collect(LLVM.incoming(b))
+                    length(ai) == length(bi) || continue
+                    amap = Dict{LLVM.BasicBlock, LLVM.Value}(blk => val for (val, blk) in ai)
+                    bmap = Dict{LLVM.BasicBlock, LLVM.Value}(blk => val for (val, blk) in bi)
+                    keys(amap) == keys(bmap) || continue
+                    # Find matching-constant entry operand
+                    const_entries = 0
+                    for bb_pred in keys(amap)
+                        av = amap[bb_pred]; bv = bmap[bb_pred]
+                        if av isa LLVM.ConstantInt && bv isa LLVM.ConstantInt &&
+                                convert(Int64, av) == convert(Int64, bv)
+                            const_entries += 1
+                        end
+                    end
+                    const_entries >= 1 || continue
+                    # Check at least one non-constant predecessor where they differ
+                    non_const_diff = 0
+                    for bb_pred in keys(amap)
+                        av = amap[bb_pred]; bv = bmap[bb_pred]
+                        (av.ref == bv.ref) && continue
+                        (av isa LLVM.ConstantInt && bv isa LLVM.ConstantInt) && continue
+                        non_const_diff += 1
+                    end
+                    non_const_diff >= 1 || continue
+                    # Merge b into a: replace all uses of b with a
                     LLVM.replace_uses!(b, a)
                     LLVM.API.LLVMInstructionEraseFromParent(b.ref)
                     merged += 1
