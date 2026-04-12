@@ -1,7 +1,6 @@
-# Shared CFG primitives used by the pre-structurize canonicalization passes
-# (canonicalize_loop_latches!, isolate_shared_merge_targets!, the
-# fixup_continue_merge_conflicts! post-structurize fixup, and anyone else who
-# needs to insert trampolines or reason about back-edges).
+# Shared CFG primitives used by the structurize pipeline
+# (isolate_shared_merge_targets!, fixup_continue_merge_conflicts!, and
+# anyone else who needs to insert trampolines or reason about back-edges).
 #
 # These are low-level LLVM-IR helpers: no globals, no Lava-specific state, no
 # compilation-level caches. Each function takes its `LLVM.Function`/`Module`

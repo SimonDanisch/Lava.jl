@@ -195,6 +195,13 @@ This can help NVIDIA's shader compiler handle complex shaders that would
 otherwise cause miscompilation (Xid 31 MMU faults with large kernels).
 """
 function run_spirv_opt(spirv_bytes::Vector{UInt8})
+    # `-O` runs spirv-opt's default optimization set. Of the passes this
+    # triggers, `--if-conversion` is the one that specifically fixes the
+    # class of RADV miscompile seen with `while true / if / continue / break`
+    # walk patterns (post-StructurizeCFG, RADV sometimes mis-evaluates OpPhi
+    # predecessor selection; replacing phi with OpSelect dodges it). The
+    # other `-O` passes give additional cleanup without known regressions
+    # in the Lava test suite, so we keep the full pipeline.
     spirv_opt = SPIRV_Tools_jll.spirv_opt()
     in_path = tempname() * ".spv"
     out_path = tempname() * ".spv"
