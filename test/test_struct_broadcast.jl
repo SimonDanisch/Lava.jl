@@ -61,14 +61,18 @@ end
         @test result == expected
     end
 
-    @testset "S24 (Float64 fields) broadcast n=$n" for n in [1, 10, 64]
-        src = Lava.LavaArray(TestS24[TestS24(Float64(i), Float64(i+0.5), Float64(i+0.25)) for i in 1:n])
-        dst = Lava.LavaArray{TestS24}(undef, n)
-        dst .= src
-        Lava.vk_flush!()
-        result = Array(dst)
-        expected = Array(src)
-        @test result == expected
+    if Lava.has_device_feature(:shader_float_64)
+        @testset "S24 (Float64 fields) broadcast n=$n" for n in [1, 10, 64]
+            src = Lava.LavaArray(TestS24[TestS24(Float64(i), Float64(i+0.5), Float64(i+0.25)) for i in 1:n])
+            dst = Lava.LavaArray{TestS24}(undef, n)
+            dst .= src
+            Lava.vk_flush!()
+            result = Array(dst)
+            expected = Array(src)
+            @test result == expected
+        end
+    else
+        @info "Skipping S24 (Float64) tests — device lacks shader_float_64"
     end
 
     # Test that byval_llvm_sizes are populated during compilation
@@ -387,7 +391,9 @@ end
 # combines them into a Float64 checksum, and compare CPU vs GPU results.
 # This catches any alignment/padding mismatch in the SPIR-V emitter.
 
-const FUZZ_FIELD_TYPES = [Bool, UInt8, Int16, Float32, Int32, Float64]
+const FUZZ_FIELD_TYPES = Lava.has_device_feature(:shader_float_64) ?
+    [Bool, UInt8, Int16, Float32, Int32, Float64] :
+    [Bool, UInt8, Int16, Float32, Int32]
 
 # Build struct types at eval time so they're real concrete types
 module FuzzStructs

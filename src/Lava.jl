@@ -180,16 +180,38 @@ function dump_state(; io::IO=stdout)
     return nothing
 end
 
-function init__()
-    # Reset runtime counters that should not survive precompilation.
-    # These Ref values get serialized into the pkgimage — a device crash
-    # during precompilation would permanently poison all future sessions.
+function __init__()
+    # Reset runtime state that should not survive precompilation.
+    # Vulkan handles serialized into the pkgimage are invalid in a new process.
+    VK_CONTEXT_REF[] = nothing
     DEVICE_LOST[] = false
     FLUSH_COUNTER[] = 0
     TOTAL_DISPATCH_COUNTER[] = 0
     LAST_DISPATCH_INFO[] = ""
     PREV_DISPATCH_INFO[] = ""
     empty!(DISPATCH_LOG)
+    empty!(ENABLED_OPTIONAL_FEATURES)
+    empty!(COMPILER_CONFIGS)
+    empty!(PIPELINE_CACHE)
+    empty!(LINKED_KERNEL_CACHE)
+    empty!(LIVE_BUFFERS)
+    empty!(DEFERRED_FREES)
+    GPU_LIVE_BYTES[] = 0
+    GPU_BYTES_SINCE_LAST_GC[] = 0
+    empty!(POOL_BLOCKS)
+    for fl in POOL_FREE_LISTS; empty!(fl); end
+    empty!(ARG_SLABS)
+    ARG_SLAB_IDX[] = 1
+    ARG_SLAB_OFFSET[] = 0
+    ARG_ALLOC_COUNT[] = 0
+    empty!(ARG_BUFFERS)
+    ARG_BUFFER_IDX[] = 0
+    empty!(INDIRECT_SLABS)
+    INDIRECT_SLAB_IDX[] = 1
+    INDIRECT_SLAB_OFFSET[] = 0
+    empty!(INDIRECT_BUFFERS)
+    INDIRECT_BUFFER_IDX[] = 0
+    CMD_PIPELINE_BARRIER_FPTR[] = C_NULL
     init_pipeline_thread!()
 
     # Mark device as lost during shutdown so GC finalizers don't call into

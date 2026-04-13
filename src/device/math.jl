@@ -256,9 +256,9 @@ end
 # ══════════════════════════════════════════════════════════════════════
 
 @lava_device_override @inline function Base.abs(z::ComplexF32)
-    re = Float64(real(z))
-    im = Float64(imag(z))
-    Float32(sqrt(muladd(re, re, im * im)))
+    re = real(z)
+    im = imag(z)
+    sqrt(muladd(re, re, im * im))
 end
 
 @lava_device_override @inline function Base.abs(z::ComplexF64)
