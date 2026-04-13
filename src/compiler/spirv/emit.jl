@@ -5954,13 +5954,69 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
         state.value_map[inst] = result_id
         return
     elseif startswith(base_name, "llvm.cttz")
-        # Count trailing zeros → GLSL.std.450 FindILsb (73)
-        # llvm.cttz.i32(val, is_zero_poison) — ignore is_zero_poison, take only val
+        # Count trailing zeros. GLSL.std.450 FindILsb (73) only supports 32-bit
+        # integers — feeding a 64-bit operand returns garbage on RADV. Julia's
+        # Union-packed loop carry forces `cttz.i64` for `trailing_ones`, which
+        # miscompiled the dyn_both!/walk_continue! tree-walk MWEs before this
+        # split. FindILsb(0) is -1 on most drivers; LLVM cttz(val, false) is
+        # bitwidth on zero, so we guard with an explicit val==0 check.
         glsl_id = setup_glsl_std_450!(state.mod)
         val_id = get_value_id!(state, LLVM.operands(inst)[1])
-        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
-        result_id = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpExtInst, result_ty, result_id, glsl_id, UInt32(73), val_id)
+        result_llvm_ty = LLVM.value_type(inst)
+        result_ty = map_type!(state.type_ctx, result_llvm_ty)
+        bw = LLVM.width(result_llvm_ty)
+
+        if bw <= 32
+            lsb_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpExtInst, result_ty, lsb_id, glsl_id, UInt32(73), val_id)
+            cbw_id = map_constant!(state.type_ctx, LLVM.ConstantInt(result_llvm_ty, bw))
+            c0_id = map_constant!(state.type_ctx, LLVM.ConstantInt(result_llvm_ty, 0))
+            bool_ty = map_type!(state.type_ctx, LLVM.IntType(1))
+            zero_check = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpIEqual, bool_ty, zero_check, val_id, c0_id)
+            result_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpSelect, result_ty, result_id, zero_check, cbw_id, lsb_id)
+        else
+            u32_llvm = LLVM.IntType(32)
+            u32_ty = map_type!(state.type_ctx, u32_llvm)
+            u64_ty = result_ty
+
+            c32_id = map_constant!(state.type_ctx, LLVM.ConstantInt(result_llvm_ty, 32))
+            c0_32 = map_constant!(state.type_ctx, LLVM.ConstantInt(u32_llvm, 0))
+            c0_64 = map_constant!(state.type_ctx, LLVM.ConstantInt(result_llvm_ty, 0))
+            c64_32 = map_constant!(state.type_ctx, LLVM.ConstantInt(u32_llvm, 64))
+
+            hi_64 = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpShiftRightLogical, u64_ty, hi_64, val_id, c32_id)
+            hi_32 = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, hi_32, hi_64)
+            lo_32 = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, lo_32, val_id)
+
+            lsb_hi = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpExtInst, u32_ty, lsb_hi, glsl_id, UInt32(73), hi_32)
+            lsb_lo = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpExtInst, u32_ty, lsb_lo, glsl_id, UInt32(73), lo_32)
+
+            c32_32 = map_constant!(state.type_ctx, LLVM.ConstantInt(u32_llvm, 32))
+            hi_ttz_32 = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, hi_ttz_32, lsb_hi, c32_32)
+
+            bool_ty = map_type!(state.type_ctx, LLVM.IntType(1))
+            lo_is_zero = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpIEqual, bool_ty, lo_is_zero, lo_32, c0_32)
+
+            inner_32 = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpSelect, u32_ty, inner_32, lo_is_zero, hi_ttz_32, lsb_lo)
+
+            val_is_zero = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpIEqual, bool_ty, val_is_zero, val_id, c0_64)
+            selected_32 = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpSelect, u32_ty, selected_32, val_is_zero, c64_32, inner_32)
+
+            result_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpUConvert, u64_ty, result_id, selected_32)
+        end
         state.value_map[inst] = result_id
         return
     elseif startswith(base_name, "llvm.ctlz")
