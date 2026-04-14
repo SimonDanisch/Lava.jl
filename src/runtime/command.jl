@@ -549,7 +549,6 @@ One call per dispatch replaces all the lifetime/sync bookkeeping.
     return nothing
 end
 
-@inline record_one!(::BatchQueue, ::CommandBatch, _) = nothing
 @inline record_one!(bq::BatchQueue, batch::CommandBatch, b::VkManagedBuffer) =
     track_buffer_access!(bq, batch, b)
 @inline function record_one!(bq::BatchQueue, batch::CommandBatch, args::Tuple)
@@ -558,8 +557,36 @@ end
     end
     return nothing
 end
+@inline function record_one!(bq::BatchQueue, batch::CommandBatch, args::NamedTuple)
+    for a in values(args)
+        record_one!(bq, batch, a)
+    end
+    return nothing
+end
 # LavaArray / LavaBuffer methods are added in array/lavaarray.jl and array/ka_backend.jl,
 # after their types are defined.
+
+# Generic fallback: recurse through any isstructtype's fields so structs that
+# CONTAIN LavaArray / VkManagedBuffer / LavaBuffer fields still get their
+# inner buffers tracked.  Without this, wrappers like Hikari's `WorkQueue`
+# (which holds `items::LavaArray` + `size::LavaArray`) would hit `::Any`
+# no-op and leave their buffers' `last_write` stale — meaning `vk_free!`
+# would happily destroy a Vulkan buffer while the GPU still needs it.
+@inline function record_one!(bq::BatchQueue, batch::CommandBatch, x)
+    T = typeof(x)
+    if isstructtype(T) && !isprimitivetype(T)
+        @inline _walk_fields(bq, batch, x, T)
+    end
+    return nothing
+end
+
+@generated function _walk_fields(bq::BatchQueue, batch::CommandBatch, x, ::Type{T}) where {T}
+    stmts = Expr[]
+    for f in fieldnames(T)
+        push!(stmts, :(record_one!(bq, batch, getfield(x, $(QuoteNode(f))))))
+    end
+    return Expr(:block, stmts..., :(return nothing))
+end
 
 """
     wait_for_write(buf::VkManagedBuffer)
