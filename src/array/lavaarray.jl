@@ -52,9 +52,9 @@ end
 # Empty vector constructor (matches Array{T,1}() behavior)
 LavaArray{T,1}() where {T} = LavaArray{T,1}(undef, (0,))
 
-LavaArray{T}(::UndefInitializer, dims::NTuple{N,Int}) where {T,N} = LavaArray{T,N}(undef, dims)
-LavaArray{T}(::UndefInitializer, dims::NTuple{N,Integer}) where {T,N} = LavaArray{T,N}(undef, Int.(dims))
-LavaArray{T}(::UndefInitializer, dims::Integer...) where {T} = LavaArray{T}(undef, Int.(dims))
+LavaArray{T}(::UndefInitializer, dims::NTuple{N,Int}; kw...) where {T,N} = LavaArray{T,N}(undef, dims; kw...)
+LavaArray{T}(::UndefInitializer, dims::NTuple{N,Integer}; kw...) where {T,N} = LavaArray{T,N}(undef, Int.(dims); kw...)
+LavaArray{T}(::UndefInitializer, dims::Integer...; kw...) where {T} = LavaArray{T}(undef, Int.(dims); kw...)
 
 # Construct from host data
 function LavaArray{T,N}(data::AbstractArray{T,N}) where {T,N}

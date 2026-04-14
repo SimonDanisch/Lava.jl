@@ -423,7 +423,7 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
 
     # Build type tuple for compilation
     tt = Tuple{map(ka_arg_llvm_type, Base.tail(all_args))...}
-    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(converted_f, tt, ws_3d)
+    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(bq.ctx::VkContext, converted_f, tt, ws_3d)
 
     # Precompute arg buffer size (allocation deferred until after flush)
     inline_extra = compute_inline_extra_from_byval(byval_sizes)
