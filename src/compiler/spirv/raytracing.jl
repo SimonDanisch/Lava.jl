@@ -166,6 +166,11 @@ function emit_rt_payload_global!(state::SPIRVEmitterState, storage_class::UInt32
         # Array of 6 floats for multi-field payload
         len_id = emit_constant_u32!(mod, UInt32(6))
         emit_type_array!(mod, f32_ty, len_id)
+    elseif payload_type == :f32_7
+        # Array of 7 floats (adds slot 6 for gl_InstanceID alongside the
+        # existing 6-slot closest-hit packet).
+        len_id = emit_constant_u32!(mod, UInt32(7))
+        emit_type_array!(mod, f32_ty, len_id)
     else
         error("Unsupported RT payload type: $payload_type")
     end

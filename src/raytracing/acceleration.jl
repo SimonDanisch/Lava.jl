@@ -861,7 +861,8 @@ function build_blas_from_primitives(primitives; opaque::Bool=true)
 end
 
 """
-    build_hw_accel_from_tlas(tlas) -> (hw_tlas, triangle_data, blas_offsets)
+    build_hw_accel_from_tlas(tlas; ctx=vk_context())
+        -> (hw_tlas, triangle_data, blas_offsets, per_instance_tri_offsets)
 
 Build hardware acceleration structures from a Raycore-compatible TLAS.
 
@@ -1057,7 +1058,17 @@ function build_hw_accel_from_tlas(tlas; ctx::VkContext=vk_context())
                 end
             end
 
-            # Build instance list for TLAS
+            # Build instance list for TLAS.
+            #
+            # Vulkan reads two per-instance 24-bit fields: `gl_InstanceID`
+            # (0-based instance array position, always present) and
+            # `gl_InstanceCustomIndexEXT` (user-supplied override).
+            #
+            # Under our semantics: `custom_indices[i]` = the interface
+            # override `inst.instance_id` (forwarded as the 5th closest_hit
+            # return value in SW; here handed straight to the shader as
+            # gl_InstanceCustomIndexEXT).  Callers look up the per-instance
+            # triangle offset via `gl_InstanceID → per_instance_tri_offsets`.
             hw_blas_refs = Vector{LavaBLAS}(undef, n_instances)
             transforms = Vector{NTuple{12,Float32}}(undef, n_instances)
             custom_indices = Vector{UInt32}(undef, n_instances)
@@ -1067,7 +1078,7 @@ function build_hw_accel_from_tlas(tlas; ctx::VkContext=vk_context())
                 blas_idx = Int(inst.blas_index)
                 hw_blas_refs[i] = hw_blas_list[blas_idx]
                 transforms[i] = mat4_to_vk_transform(inst.transform)
-                custom_indices[i] = UInt32(blas_idx - 1)
+                custom_indices[i] = inst.instance_id
             end
 
             return build_tlas(as_ctx, hw_blas_refs; transforms, custom_indices)
@@ -1093,7 +1104,13 @@ function build_hw_accel_from_tlas(tlas; ctx::VkContext=vk_context())
         typed_prims = Any[]
     end
 
-    return (hw_tlas, typed_prims, blas_offsets)
+    # Per-instance triangle-offset table.  Indexed by `gl_InstanceID`
+    # (0-based), each entry is the offset of that instance's BLAS in the
+    # flat `typed_prims` array.  Lets the closest-hit callback find its
+    # triangle with a single indexed load: `typed_prims[off + prim_id + 1]`.
+    per_instance_tri_offsets = UInt32[blas_offsets[Int(instances[i].blas_index)] for i in 1:n_instances]
+
+    return (hw_tlas, typed_prims, blas_offsets, per_instance_tri_offsets)
 end
 
 """Convert a 4×4 matrix to VkTransformMatrixKHR (3×4 row-major) NTuple{12,Float32}.

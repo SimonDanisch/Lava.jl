@@ -28,6 +28,12 @@ mutable struct HardwareAccel
     tlas::LavaTLAS
     triangle_data::Vector           # CPU primitives for lookup
     blas_offsets::Vector{UInt32}
+    # Per-instance triangle-array offset, indexed by `gl_InstanceID`.
+    # `per_instance_tri_offsets[iid+1]` = offset into `triangle_data` where
+    # that instance's BLAS triangles start.  This removes the old
+    # `off_gpu[custom_index + 1]` lookup, freeing `custom_index` to carry
+    # the interface override instead of the BLAS index.
+    per_instance_tri_offsets::Vector{UInt32}
     rt_pipeline::RayTracingPipeline
     # Optional any-hit pipeline (lazy — created on first use via set_anyhit_pipeline!)
     anyhit_pipeline::Union{Nothing, RayTracingPipeline}
@@ -49,26 +55,29 @@ on the same device the AS was allocated against.
 function HardwareAccel(tlas;
                        ctx::VkContext=vk_context(),
                        bq::BatchQueue=ctx.default_bq)
-    hw_tlas, tri_data, offsets = build_hw_accel_from_tlas(tlas; ctx)
-    HardwareAccel(hw_tlas, tri_data, offsets; bq)
+    hw_tlas, tri_data, offsets, per_inst_offsets = build_hw_accel_from_tlas(tlas; ctx)
+    HardwareAccel(hw_tlas, tri_data, offsets, per_inst_offsets; bq)
 end
 
 """
-    HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets; bq=<derived from hw_tlas>) -> HardwareAccel
+    HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets, per_instance_tri_offsets;
+                  bq=<derived from hw_tlas>) -> HardwareAccel
 
 Build a HardwareAccel from a pre-built Vulkan TLAS + triangle data + offsets.
 Default `bq` is taken from `hw_tlas.storage.buf[].ctx.default_bq` so we never
 mismatch the AS against a queue on a different device.
 """
-function HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets;
+function HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets,
+                       per_instance_tri_offsets::AbstractVector{UInt32};
                        bq::BatchQueue=(hw_tlas.storage.buf[].ctx::VkContext).default_bq)
     rt = RayTracingPipeline(
         raygen=hw_raygen,
         closest_hit=hw_closesthit,
         miss=hw_miss,
-        payload_type=:f32_6,
+        payload_type=:f32_7,
     )
-    HardwareAccel(hw_tlas, triangle_data, blas_offsets, rt, nothing, bq)
+    HardwareAccel(hw_tlas, triangle_data, blas_offsets, collect(per_instance_tri_offsets),
+                  rt, nothing, bq)
 end
 
 """
@@ -83,7 +92,7 @@ function set_anyhit_pipeline!(accel::HardwareAccel, anyhit_func, raygen_func)
         closest_hit=hw_closesthit,
         miss=hw_miss,
         any_hit=anyhit_func,
-        payload_type=:f32_6,
+        payload_type=:f32_7,
     )
     return accel
 end
@@ -165,6 +174,7 @@ function hw_raygen(rays::Ptr{RTRay}, results::Ptr{RTHitResult})
     ci   = lava_rt_payload_load_f32_at(UInt32(3))
     bu   = lava_rt_payload_load_f32_at(UInt32(4))
     bv   = lava_rt_payload_load_f32_at(UInt32(5))
+    iid  = lava_rt_payload_load_f32_at(UInt32(6))
 
     # Write result to output buffer
     result = RTHitResult(
@@ -173,7 +183,8 @@ function hw_raygen(rays::Ptr{RTRay}, results::Ptr{RTHitResult})
         reinterpret(UInt32, pid),
         reinterpret(UInt32, ci),
         bu, bv,
-        UInt32(0), UInt32(0)
+        reinterpret(UInt32, iid),   # instance_id (gl_InstanceID, 0-based)
+        UInt32(0)
     )
     unsafe_store!(results, result, lid + 1)
     return nothing
@@ -182,6 +193,7 @@ end
 function hw_closesthit()
     t = lava_rt_ray_tmax()
     ci = lava_rt_instance_custom_index()
+    iid = lava_rt_instance_id()
     pid = lava_rt_primitive_id()
     bu = lava_rt_hit_bary_u()
     bv = lava_rt_hit_bary_v()
@@ -192,6 +204,7 @@ function hw_closesthit()
     lava_rt_payload_store_f32_at(reinterpret(Float32, ci), UInt32(3))
     lava_rt_payload_store_f32_at(bu, UInt32(4))
     lava_rt_payload_store_f32_at(bv, UInt32(5))
+    lava_rt_payload_store_f32_at(reinterpret(Float32, iid), UInt32(6))
     return nothing
 end
 
@@ -202,5 +215,6 @@ function hw_miss()
     lava_rt_payload_store_f32_at(0f0, UInt32(3))
     lava_rt_payload_store_f32_at(0f0, UInt32(4))
     lava_rt_payload_store_f32_at(0f0, UInt32(5))
+    lava_rt_payload_store_f32_at(0f0, UInt32(6))    # instance_id irrelevant on miss
     return nothing
 end
