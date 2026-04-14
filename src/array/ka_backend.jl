@@ -28,17 +28,29 @@ end
 """
     LavaBackend <: KA.GPU
 
-Lava's GPU compute backend. Carries the Vulkan context and batch queue explicitly.
-Every dispatch uses `backend.bq` for command recording.
+Lava's GPU compute backend. Carries the Vulkan context and batch queues explicitly.
 
-    LavaBackend()           # default: global context + its default queue
-    LavaBackend(bq)         # explicit queue, global context
+  * `dispatch_bq`: where KA kernel dispatches are recorded.
+  * `upload_bq`:   where CPU→GPU transfers (upload!, download!, staging)
+                   record their copies. May be the same queue as dispatch_bq
+                   (single-queue mode) or a separate async queue for true
+                   upload/compute overlap.
+
+    LavaBackend()                      # default: dispatch + upload both on default_bq
+    LavaBackend(bq)                    # single queue for both
+    LavaBackend(dispatch_bq, upload_bq)  # split — enables pipelining
 """
 struct LavaBackend <: KA.GPU
-    bq::BatchQueue
+    dispatch_bq::BatchQueue
+    upload_bq::BatchQueue
 end
 
-LavaBackend() = LavaBackend(vk_context().default_bq)
+LavaBackend() = (let bq = vk_context().default_bq; LavaBackend(bq, bq); end)
+LavaBackend(bq::BatchQueue) = LavaBackend(bq, bq)
+
+# Back-compat: callers that read `backend.bq` get the dispatch queue (the
+# one that runs compute kernels).
+Base.getproperty(b::LavaBackend, s::Symbol) = s === :bq ? getfield(b, :dispatch_bq) : getfield(b, s)
 
 # ── Backend queries ──
 
@@ -48,7 +60,15 @@ KA.get_backend(::LavaArray) = LavaBackend()
 # read GPU results. GPU-side ordering between dispatches is handled by pipeline
 # barriers in record_dispatch!, so synchronize() is only needed when the CPU
 # must observe GPU results (or at natural batch boundaries like end-of-sample).
-KA.synchronize(backend::LavaBackend) = flush!(backend.bq, vk_device())
+function KA.synchronize(backend::LavaBackend)
+    dev = vk_device()
+    flush!(backend.dispatch_bq, dev)
+    # If split, the upload queue may have pending transfers worth flushing too.
+    if backend.upload_bq !== backend.dispatch_bq
+        flush!(backend.upload_bq, dev)
+    end
+    return
+end
 KA.supports_unified(::LavaBackend) = true
 function KA.allocate(::LavaBackend, ::Type{T}, dims::Tuple; unified::Bool=false) where T
     nbytes = prod(dims) * sizeof(T)
@@ -152,8 +172,7 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     if ndrange isa LavaArray
         converted_args = KA.argconvert.(Ref(obj), args)
         batch = ensure_active_batch!(bq)
-        push!(batch.data_refs, args)
-        push!(batch.data_refs, obj.f)  # keep original closure alive
+        record_arg_accesses!(bq, batch, args, obj.f)  # args walks for buffers; obj.f pinned only
         ka_launch_indirect!(obj, converted_args, ndrange, workgroupsize, args)
         return nothing
     end
@@ -174,8 +193,7 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     all_args = (converted_f, ctx, converted_args...)
 
     batch = ensure_active_batch!(bq)
-    push!(batch.data_refs, args)
-    push!(batch.data_refs, obj.f)  # keep original closure alive (has LavaArray refs)
+    record_arg_accesses!(bq, batch, args, obj.f)
 
     ka_launch!(bq, converted_f, all_args, block_dims, ws_3d)
 
@@ -286,8 +304,8 @@ function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple, block_dim
     inline_extra = compute_inline_extra_from_byval(byval_sizes)
     total_size = compiled.push_info.arg_buffer_size + inline_extra
 
-    # Get host-visible mapped arg buffer
-    arg_buf = get_arg_buffer(total_size)
+    # Get host-visible mapped arg buffer (per-BQ slab pool)
+    arg_buf = get_arg_buffer(bq, total_size)
 
     # Pack args directly to mapped memory (zero intermediate allocations)
     pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
@@ -367,7 +385,7 @@ function fast_prepare_indirect!(bq::BatchQueue, indirect_buf::VkIndirectBuffer, 
 
     # Pack args: f (ghost, skipped), Ptr{UInt32} (BDA), LavaArray (BDA), UInt32 (direct)
     all_args = (prepare_indirect_kernel, Ptr{UInt32}(indirect_buf.address), ndrange_buf, UInt32(workgroup_size))
-    arg_buf = get_arg_buffer(arg_size)
+    arg_buf = get_arg_buffer(bq, arg_size)
     pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets, arg_size, byval_sizes, all_args)
 
     # Record dispatch directly — single workgroup of 1 thread
@@ -432,20 +450,21 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
     #   are embedded in the arg buffer, causing DEVICE_LOST on NVIDIA
     GC.@preserve original_args begin
 
-    arg_buf = get_arg_buffer(total_size)
+    arg_buf = get_arg_buffer(bq, total_size)
     pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
-    indirect_buf = get_indirect_buffer()
+    indirect_buf = get_indirect_buffer(bq)
     fast_prepare_indirect!(bq, indirect_buf, ndrange_buf, ws_prod)
 
     if DISPATCH_LOGGING_ENABLED[]
         LAST_DISPATCH_INFO[] = "indirect f=$(dispatch_name(obj.f, all_args))"
     end
     batch = ensure_active_batch!(bq)
-    push!(batch.data_refs, args)
     if original_args !== nothing
-        push!(batch.data_refs, original_args)
+        record_arg_accesses!(bq, batch, args, original_args)
+    else
+        record_arg_accesses!(bq, batch, args)
     end
     vk_dispatch_indirect!(bq, pipeline, arg_buf.address, indirect_buf)
 

@@ -41,6 +41,21 @@ mutable struct CommandBatch
     data_refs::Vector{Any}
     dispatch_log::Vector{String}
     sealed_cmd_bufs::Vector{Vulkan.CommandBuffer}  # Completed CB segments awaiting submit
+
+    # ── Explicit-queue refactor additions ────────────────────────────────
+    # Timeline value that this batch's submit will signal on its queue's
+    # `timeline_sem`.  Assigned at record time so `record_buffer_access!`
+    # can write it into `buf.last_write` before submit.
+    signal_value::UInt64
+    # Cross-queue dependencies collected while recording.
+    wait_semaphores::Vector{Tuple{Vulkan.Semaphore, UInt64, Vulkan.PipelineStageFlag2}}
+    # Reaper task spawned by submit (Threads.@spawn).
+    reaper_task::Union{Nothing, Task}
+    # Set by the reaper if wait_semaphores fails.  Read by main thread only
+    # after observing `retired[] == true` (acquire semantics).
+    error::Union{Nothing, Exception}
+    # Release/acquire handshake: reaper flips this true as its final action.
+    retired::Threads.Atomic{Bool}
 end
 
 """
@@ -53,15 +68,63 @@ and batch state. Multiple `BatchQueue`s can record and submit independently
 Create with `BatchQueue(device, queue, queue_family_index)`.
 """
 mutable struct BatchQueue
+    device::Vulkan.Device
     queue::Vulkan.Queue
+    family_index::UInt32
     cmd_pool::Vulkan.CommandPool
     active_batch::Union{Nothing, CommandBatch}
     in_flight::Vector{CommandBatch}
     free_batches::Vector{CommandBatch}
     free_cmd_bufs::Vector{Vulkan.CommandBuffer}
-    # Dedicated transfer command buffer + fence (per-queue, thread-safe)
+    # Dedicated transfer command buffer + fence (per-queue, thread-safe).
+    # Will be removed once one_shot_copy goes through the regular batch path.
     xfer_cmd_buf::Vulkan.CommandBuffer
     xfer_fence::Vulkan.Fence
+
+    # ── Explicit-queue refactor additions ────────────────────────────────
+    # One timeline semaphore per queue.  Each submit signals next_timeline+1.
+    timeline_sem::Vulkan.Semaphore
+    next_timeline::UInt64
+    # Buffers queued for destruction once their last_write timeline value
+    # is reached. Drained by drain_deferred_frees! at natural sync points.
+    # Loose type (VkManagedBuffer is declared later in memory.jl).
+    deferred_frees::Vector{Any}
+    # LavaBLAS / LavaTLAS queued for destruction once their `last_use`
+    # timeline value is reached. Drained by `drain_deferred_as_frees!`.
+    # Loose type — Lava AS types are declared later in raytracing/acceleration.jl.
+    deferred_as_frees::Vector{Any}
+    # Per-BQ argument-buffer slab pool.  Each submit bump-allocates from
+    # the current slab; `reset_arg_buffer_pool!(bq)` (called from
+    # reclaim_batch! once in_flight is empty) rewinds the bump pointer.
+    # Loose type (VkMappedBuffer is declared later in memory.jl).
+    arg_slabs::Vector{Any}
+    arg_slab_idx::Int
+    arg_slab_offset::Int
+    arg_alloc_count::Int
+    # Per-BQ indirect-dispatch buffer slab pool. Same bump-pointer shape as
+    # arg slabs. Reset by `reset_indirect_buffer_pool!(bq)`.
+    indirect_slabs::Vector{Any}
+    indirect_slab_idx::Int
+    indirect_slab_offset::Int
+    # Per-BQ staging buffer for CPU↔GPU transfers. A single VkManagedBuffer
+    # that grows as needed via get_staging!. Reused across transfers.
+    # Loose type — VkManagedBuffer is declared later in memory.jl.
+    staging::Union{Nothing, Any}
+end
+
+function init_batch(device::Vulkan.Device, cb::Vulkan.CommandBuffer)
+    fence = Vulkan.Fence(device)
+    data_refs = Any[]
+    sizehint!(data_refs, 128)
+    waits = Tuple{Vulkan.Semaphore, UInt64, Vulkan.PipelineStageFlag2}[]
+    return CommandBatch(cb, fence, false, 0, 0, false, data_refs, String[],
+        Vulkan.CommandBuffer[],
+        UInt64(0),                       # signal_value (assigned at record time)
+        waits,
+        nothing,                         # reaper_task
+        nothing,                         # error
+        Threads.Atomic{Bool}(false),     # retired
+    )
 end
 
 function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32;
@@ -72,17 +135,23 @@ function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32;
     for _ in 1:n_initial_batches
         alloc_info = Vulkan.CommandBufferAllocateInfo(cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1)
         cb = unwrap(Vulkan.allocate_command_buffers(device, alloc_info))[1]
-        fence = Vulkan.Fence(device)
-        data_refs = Any[]
-        sizehint!(data_refs, 128)
-        push!(batches, CommandBatch(cb, fence, false, 0, 0, false, data_refs, String[], Vulkan.CommandBuffer[]))
+        push!(batches, init_batch(device, cb))
     end
-    # Dedicated transfer command buffer + fence
+    # Dedicated transfer command buffer + fence (legacy)
     xfer_alloc = Vulkan.CommandBufferAllocateInfo(cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1)
     xfer_cmd_buf = unwrap(Vulkan.allocate_command_buffers(device, xfer_alloc))[1]
     xfer_fence = Vulkan.Fence(device)
-    return BatchQueue(queue, cmd_pool, nothing, CommandBatch[], batches, Vulkan.CommandBuffer[],
-                      xfer_cmd_buf, xfer_fence)
+    # Per-queue timeline semaphore for cross-queue ordering.
+    type_info = Vulkan.SemaphoreTypeCreateInfo(Vulkan.SEMAPHORE_TYPE_TIMELINE, UInt64(0))
+    timeline_sem = unwrap(Vulkan.create_semaphore(device,
+        Vulkan.SemaphoreCreateInfo(; next=type_info)))
+    return BatchQueue(device, queue, qf_idx, cmd_pool, nothing,
+                      CommandBatch[], batches, Vulkan.CommandBuffer[],
+                      xfer_cmd_buf, xfer_fence, timeline_sem, UInt64(0),
+                      Any[], Any[],
+                      Any[], 1, 0, 0,  # arg_slabs: idx=1, offset=0, count=0
+                      Any[], 1, 0,     # indirect_slabs: idx=1, offset=0
+                      nothing)          # staging (lazy)
 end
 
 """
@@ -112,6 +181,15 @@ mutable struct VkContext
     # Queue allocation: next available index + total requested from device
     next_queue_index::Int
     max_queue_count::Int
+    # Async compute family (distinct from primary). RADV family 1: 4 queues,
+    # compute+transfer. Used by the explicit-queue refactor for upload_bq.
+    async_queue_family_index::Union{Nothing, UInt32}
+    async_queue_count::Int
+    # Per-device state (was previously a global Ref).
+    # Set to `true` after vkQueueSubmit returns DEVICE_LOST. Finalizers
+    # holding a ref to the context check this to skip Vulkan calls on
+    # invalid handles.
+    device_lost::Bool
 end
 
 # Convenience accessors — keep existing code working with minimal changes.
@@ -142,14 +220,19 @@ const MAX_VALIDATION_MESSAGES = 50
 
 const VK_CONTEXT_REF = Ref{Union{Nothing, VkContext}}(nothing)
 
-# Set to true after DEVICE_LOST — prevents finalizers from calling Vulkan on invalid handles
-const DEVICE_LOST = Ref(false)
+"""
+    device_lost(ctx::VkContext)  ->  Bool
 
-# Device generation counter — incremented on each vk_reset_device!().
-# VkManagedBuffer records the generation at creation time. If a GC finalizer
-# fires after a device reset, the buffer's generation won't match the current
-# one and destruction is skipped (the old device cleaned up its own resources).
-const DEVICE_GENERATION = Ref{UInt64}(0)
+Whether this context's device has been marked lost. Prefer passing `ctx`
+explicitly; the no-arg form looks up the current default context.
+"""
+device_lost(ctx::VkContext) = ctx.device_lost
+device_lost() = let ctx = VK_CONTEXT_REF[]
+    ctx === nothing ? false : ctx.device_lost
+end
+
+"""Mark `ctx`'s device as lost. All subsequent finalizers will skip Vulkan calls."""
+mark_device_lost!(ctx::VkContext) = (ctx.device_lost = true; nothing)
 
 # Callbacks for vk_reset_device! — registered by later-included files (pipeline.jl,
 # command.jl, launch.jl, memory.jl) to clear their module-level caches.
@@ -170,8 +253,6 @@ function vk_context()
 end
 
 vk_device() = vk_context().device
-vk_queue() = vk_context().queue
-vk_compute_queue() = vk_context().compute_queue
 
 """
     vk_reset_device!()
@@ -184,8 +265,9 @@ kernels, arg buffers).
 GPU buffers no longer exist. You must reallocate all GPU data.
 """
 function vk_reset_device!()
-    DEVICE_GENERATION[] += 1  # Invalidate old VkManagedBuffer handles
-    DEVICE_LOST[] = false
+    # Drop the context ref; a fresh one will be created lazily. Pre-reset
+    # VkManagedBuffers hold a strong ref to the OLD ctx whose `device_lost`
+    # is already true, so their finalizers will skip Vulkan calls.
     VK_CONTEXT_REF[] = nothing
     # Don't destroy old Vulkan handles — they're invalid after DEVICE_LOST.
     # GC will eventually try to destroy them; _destroy_buffer! skips when
@@ -205,15 +287,14 @@ function vk_reset_device!()
     return nothing
 end
 
-"""Check if a recording is active on the default batch queue."""
-function has_active_recording(ctx::VkContext)
-    bq = ctx.default_bq
-    batch = bq.active_batch
-    # Defer frees when ANY dispatches are pending (recording or queued but not yet submitted).
-    # Without this, GC can free buffers between kernel launches while the GPU hasn't
-    # finished executing previous dispatches that reference those buffers.
-    return batch !== nothing
-end
+"""
+    has_active_recording(bq::BatchQueue) -> Bool
+
+Whether `bq` has an open/recording CommandBatch.  Used by transfer paths
+to decide "should I flush `bq` before doing my own submit/CPU write?"
+Always takes the queue explicitly — no implicit default_bq lookup.
+"""
+has_active_recording(bq::BatchQueue) = bq.active_batch !== nothing
 
 function init_vulkan!()
     # Create instance
@@ -317,12 +398,23 @@ function init_vulkan!()
     qf_idx = find_graphics_compute_queue_family(phys_dev)
 
     # Create logical device with required features
-    # Request up to 4 queues: primary, async compute, + 2 for per-screen graphics
     qf_props = Vulkan.get_physical_device_queue_family_properties(phys_dev)
     max_queues = qf_props[qf_idx + 1].queue_count
     n_queues = min(4, Int(max_queues))
     queue_priorities = ones(Float32, n_queues)
     queue_ci = [Vulkan.DeviceQueueCreateInfo(qf_idx, queue_priorities)]
+
+    # Additionally, request queues from any compute-capable family that
+    # isn't the primary one (RADV exposes graphics+compute on family 0 with
+    # 1 queue, and compute-only on family 1 with 4 queues). We need these
+    # for async upload/dispatch in the explicit-queue design.
+    async_qf_idx = find_async_compute_queue_family(phys_dev, qf_idx)
+    async_n_queues = 0
+    if async_qf_idx !== nothing
+        async_max = qf_props[async_qf_idx + 1].queue_count
+        async_n_queues = min(4, Int(async_max))
+        push!(queue_ci, Vulkan.DeviceQueueCreateInfo(async_qf_idx, ones(Float32, async_n_queues)))
+    end
 
     # Check for RT extension support
     has_rt = has_rt_extensions(phys_dev)
@@ -390,7 +482,7 @@ function init_vulkan!()
         false,  # shader_subgroup_extended_types
         false,  # separate_depth_stencil_layouts
         false,  # host_query_reset
-        false,  # timeline_semaphore
+        true,   # timeline_semaphore  ← REQUIRED for explicit-queue cross-queue sync
         true,   # buffer_device_address  ← REQUIRED (BDA)
         false,  # buffer_device_address_capture_replay
         false,  # buffer_device_address_multi_device
@@ -511,7 +603,9 @@ function init_vulkan!()
         as_cmd_buf, as_fence,
         rt_props,
         debug_messenger,
-        2, n_queues  # next_queue_index=2 (0=primary, 1=compute), max=n_queues
+        2, n_queues,  # next_queue_index=2 (0=primary, 1=compute), max=n_queues
+        async_qf_idx, async_n_queues,
+        false,        # device_lost (fresh context)
     )
 end
 
@@ -566,6 +660,25 @@ function find_graphics_compute_queue_family(phys_dev)
         "device initialization",
         "No compute-capable queue family found",
         "Ensure your GPU supports Vulkan compute"))
+end
+
+"""
+Find a secondary queue family distinct from `primary_qf_idx` that supports
+compute + transfer. On RDNA/RADV the primary family is graphics+compute with
+1 queue; the async family is compute-only with 4 queues — ideal for the
+upload/dispatch split. Returns `nothing` if no such family exists.
+"""
+function find_async_compute_queue_family(phys_dev, primary_qf_idx::UInt32)
+    qf_props = Vulkan.get_physical_device_queue_family_properties(phys_dev)
+    for (i, qfp) in enumerate(qf_props)
+        family = UInt32(i - 1)
+        family == primary_qf_idx && continue
+        if (qfp.queue_flags & Vulkan.QUEUE_COMPUTE_BIT) != 0 &&
+           (qfp.queue_flags & Vulkan.QUEUE_TRANSFER_BIT) != 0
+            return family
+        end
+    end
+    return nothing
 end
 
 """Check if the physical device supports the RT extensions we need."""

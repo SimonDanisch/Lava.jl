@@ -143,10 +143,18 @@ GPUArraysCore.allowscalar(false)
 Return current GPU memory usage statistics.
 """
 function gpu_memory_usage()
+    ctx = VK_CONTEXT_REF[]
+    bq_deferred = 0
+    n_arg_slabs = 0
+    if ctx !== nothing
+        bq = ctx.default_bq
+        bq_deferred = length(bq.deferred_frees) + length(bq.deferred_as_frees)
+        n_arg_slabs = length(bq.arg_slabs)
+    end
     (live_bytes = GPU_LIVE_BYTES[],
      LIVE_BUFFERS = length(LIVE_BUFFERS),
-     deferred_frees = length(DEFERRED_FREES),
-     ARG_SLABS = length(ARG_SLABS),
+     deferred_frees = bq_deferred,
+     ARG_SLABS = n_arg_slabs,
      pipelines_cached = length(PIPELINE_CACHE),
      kernels_cached = length(LINKED_KERNEL_CACHE))
 end
@@ -160,13 +168,16 @@ function dump_state(; io::IO=stdout)
     ctx = VK_CONTEXT_REF[]
     println(io, "=== Lava.jl State ===")
     println(io, "Device: ", ctx === nothing ? "not initialized" : ctx.device_name)
-    println(io, "Device lost: ", DEVICE_LOST[])
+    println(io, "Device lost: ", device_lost())
     mem = gpu_memory_usage()
     live_mb = mem.live_bytes ÷ (1024 * 1024)
     println(io, "GPU memory: $(live_mb) MiB in $(mem.LIVE_BUFFERS) buffers ($(mem.deferred_frees) deferred)")
     println(io, "Pipelines cached: $(mem.pipelines_cached) (max $(MAX_PIPELINE_CACHE_SIZE[]))")
     println(io, "Kernels cached: $(mem.kernels_cached) (max $(MAX_KERNEL_CACHE_SIZE[]))")
-    println(io, "Arg slabs: $(mem.ARG_SLABS) (slab_idx=$(ARG_SLAB_IDX[]), offset=$(ARG_SLAB_OFFSET[]))")
+    if ctx !== nothing
+        bq = ctx.default_bq
+        println(io, "Arg slabs: $(length(bq.arg_slabs)) (slab_idx=$(bq.arg_slab_idx), offset=$(bq.arg_slab_offset))")
+    end
     if ctx !== nothing
         println(io, "Free batches: $(length(ctx.free_batches))")
         println(io, "Free cmd bufs: $(length(ctx.free_cmd_bufs))")
@@ -181,11 +192,10 @@ function dump_state(; io::IO=stdout)
     return nothing
 end
 
-function init__()
+function __init__()
     # Reset runtime counters that should not survive precompilation.
     # These Ref values get serialized into the pkgimage — a device crash
     # during precompilation would permanently poison all future sessions.
-    DEVICE_LOST[] = false
     FLUSH_COUNTER[] = 0
     TOTAL_DISPATCH_COUNTER[] = 0
     LAST_DISPATCH_INFO[] = ""
@@ -197,7 +207,8 @@ function init__()
     # the Vulkan driver after it's been torn down. The atexit hook runs
     # before Julia's global finalizer sweep.
     atexit() do
-        DEVICE_LOST[] = true
+        ctx = VK_CONTEXT_REF[]
+        ctx === nothing || mark_device_lost!(ctx)
         VK_CONTEXT_REF[] = nothing
     end
 end

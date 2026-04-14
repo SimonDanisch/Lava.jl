@@ -31,32 +31,36 @@ mutable struct HardwareAccel
     rt_pipeline::RayTracingPipeline
     # Optional any-hit pipeline (lazy — created on first use via set_anyhit_pipeline!)
     anyhit_pipeline::Union{Nothing, RayTracingPipeline}
+    # BatchQueue this accel's RT dispatches run on.  Stored explicitly so
+    # callers don't reach for an implicit `vk_context().default_bq`.
+    bq::BatchQueue
 end
 
 """
-    HardwareAccel(tlas) -> HardwareAccel
+    HardwareAccel(tlas; bq=vk_context().default_bq) -> HardwareAccel
 
 Build a HardwareAccel from a Raycore-compatible TLAS.
 The TLAS must have `.blas_array` and `.instances` fields.
 """
-function HardwareAccel(tlas)
+function HardwareAccel(tlas; bq::BatchQueue=vk_context().default_bq)
     hw_tlas, tri_data, offsets = build_hw_accel_from_tlas(tlas)
-    HardwareAccel(hw_tlas, tri_data, offsets)
+    HardwareAccel(hw_tlas, tri_data, offsets; bq)
 end
 
 """
-    HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets) -> HardwareAccel
+    HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets; bq=vk_context().default_bq) -> HardwareAccel
 
 Build a HardwareAccel from a pre-built Vulkan TLAS + triangle data + offsets.
 """
-function HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets)
+function HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets;
+                       bq::BatchQueue=vk_context().default_bq)
     rt = RayTracingPipeline(
         raygen=hw_raygen,
         closest_hit=hw_closesthit,
         miss=hw_miss,
         payload_type=:f32_6,
     )
-    HardwareAccel(hw_tlas, triangle_data, blas_offsets, rt, nothing)
+    HardwareAccel(hw_tlas, triangle_data, blas_offsets, rt, nothing, bq)
 end
 
 """
@@ -86,7 +90,7 @@ Results are written to `results` buffer (one RTHitResult per ray).
 `LavaArray{RTHitResult}`/`LavaArray{RTRay}`, or any type accepted by `trace_rays!`.
 """
 function trace_closest_hits!(results, rays, accel::HardwareAccel, n_rays::Integer)
-    trace_rays!(accel.rt_pipeline, accel.tlas, rays, results;
+    trace_rays!(accel.bq, accel.rt_pipeline, accel.tlas, rays, results;
                 width=Int(n_rays), height=1)
 end
 
@@ -96,7 +100,7 @@ end
 Indirect RT trace — reads ray count from GPU buffer. No CPU readback.
 """
 function trace_closest_hits_indirect!(results, rays, accel::HardwareAccel, n_rays::LavaArray{Int32})
-    trace_rays_indirect!(accel.rt_pipeline, accel.tlas, rays, results; n_rays=n_rays)
+    trace_rays_indirect!(accel.bq, accel.rt_pipeline, accel.tlas, rays, results; n_rays=n_rays)
 end
 
 """
@@ -108,7 +112,7 @@ raygen and any-hit functions via the shared BDA arg buffer.
 function trace_closest_hits_anyhit!(results, rays, accel::HardwareAccel, n_rays::Integer, extra_args...)
     pipeline = accel.anyhit_pipeline
     pipeline === nothing && error("No any-hit pipeline set. Call set_anyhit_pipeline! first.")
-    trace_rays!(pipeline, accel.tlas, rays, results, extra_args...;
+    trace_rays!(accel.bq, pipeline, accel.tlas, rays, results, extra_args...;
                 width=Int(n_rays), height=1)
 end
 
@@ -120,7 +124,7 @@ Indirect RT trace with any-hit shader — reads ray count from GPU buffer.
 function trace_closest_hits_anyhit_indirect!(results, rays, accel::HardwareAccel, n_rays::LavaArray{Int32}, extra_args...)
     pipeline = accel.anyhit_pipeline
     pipeline === nothing && error("No any-hit pipeline set. Call set_anyhit_pipeline! first.")
-    trace_rays_indirect!(pipeline, accel.tlas, rays, results, extra_args...; n_rays=n_rays)
+    trace_rays_indirect!(accel.bq, pipeline, accel.tlas, rays, results, extra_args...; n_rays=n_rays)
 end
 
 # ── Built-in RT Shaders ──

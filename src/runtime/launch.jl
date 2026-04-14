@@ -19,6 +19,10 @@ function LavaBuffer{T}(n::Integer) where T
     LavaBuffer{T}(buf, Int(n))
 end
 
+# Hook into the dispatch-time access tracker (defined in runtime/command.jl).
+@inline record_one!(bq::BatchQueue, batch::CommandBatch, b::LavaBuffer) =
+    track_buffer_access!(bq, batch, b.buf)
+
 Base.eltype(::LavaBuffer{T}) where T = T
 Base.length(b::LavaBuffer) = b.length
 Base.sizeof(b::LavaBuffer{T}) where T = b.length * sizeof(T)
@@ -62,18 +66,12 @@ const LINKED_KERNEL_CACHE = Dict{UInt64, LavaLinkedKernel}()
 const KERNEL_INSERTION_ORDER = UInt64[]
 const MAX_KERNEL_CACHE_SIZE = Ref(1024)
 
-# Register cleanup callback for vk_reset_device!
+# Register cleanup callback for vk_reset_device!.  Arg slabs are per-BQ
+# now, so they die with the old ctx automatically; only the global shader
+# caches need explicit clearing here.
 push!(RESET_CALLBACKS, function()
     empty!(LINKED_KERNEL_CACHE)
     empty!(KERNEL_INSERTION_ORDER)
-    # Reset arg buffer slab allocator
-    empty!(ARG_SLABS)
-    ARG_SLAB_IDX[] = 1
-    ARG_SLAB_OFFSET[] = 0
-    ARG_ALLOC_COUNT[] = 0
-    # Legacy compat
-    ARG_BUFFER_IDX[] = 0
-    empty!(ARG_BUFFERS)
 end)
 
 # ── Launch argument validation ──
@@ -187,7 +185,7 @@ function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
     total_size = compiled.push_info.arg_buffer_size + inline_extra
 
     # Get host-visible mapped arg buffer
-    arg_buf = get_arg_buffer(total_size)
+    arg_buf = get_arg_buffer(bq, total_size)
 
     # Pack args directly to mapped memory (zero intermediate allocations)
     pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
@@ -196,7 +194,7 @@ function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
     # Keep data buffer references alive until vk_flush!() — BDA addresses in the
     # arg buffer are raw pointers with no GC reference to the backing VkManagedBuffer.
     batch = ensure_active_batch!(bq)
-    push!(batch.data_refs, args)
+    record_arg_accesses!(bq, batch, args)
 
     # Dispatch (batched — call vk_flush!() to submit)
     # Push constant = BDA of arg buffer (passed as UInt64, zero-alloc)
@@ -527,6 +525,24 @@ function clear_spirv_disk_cache!()
 end
 
 """
+    clear_kernel_cache!()
+
+Evict the in-session kernel + pipeline cache (`LINKED_KERNEL_CACHE`) so the
+next dispatch of each kernel recompiles from Julia source.
+
+Use this after editing a Julia kernel under Revise — Revise invalidates the
+Julia method, but Lava's hash-keyed kernel cache stays populated with the old
+SPIR-V because `hash(f, tt, workgroup_size)` doesn't change when the method
+body changes. Unlike `vk_reset_device!()`, this keeps all existing
+`LavaArray`s and the Vulkan context alive.
+"""
+function clear_kernel_cache!()
+    empty!(LINKED_KERNEL_CACHE)
+    empty!(KERNEL_INSERTION_ORDER)
+    return nothing
+end
+
+"""
     link_kernel(compiled::LavaGPUKernel) -> LavaLinkedKernel
 
 Create session-dependent Vulkan objects (VkPipeline) from cached SPIR-V bytes.
@@ -620,39 +636,30 @@ struct ArgBufferAlloc
     size::Int            # Allocated size
 end
 
-const ARG_SLABS = VkMappedBuffer[]
-const ARG_SLAB_IDX = Ref(1)     # Current slab index (1-based)
-const ARG_SLAB_OFFSET = Ref(0)  # Byte offset within current slab
-const ARG_ALLOC_COUNT = Ref(0)  # Total allocations this batch (for stats)
-
-# Legacy compatibility
-const ARG_BUFFERS = VkMappedBuffer[]  # unused, kept for gpu_memory_usage()
-const ARG_BUFFER_IDX = Ref(0)
-
-function ensure_arg_slab!(min_size::Int)
-    while length(ARG_SLABS) < ARG_SLAB_IDX[]
-        push!(ARG_SLABS, vk_alloc_mapped(max(ARG_SLAB_SIZE, min_size)))
+function ensure_arg_slab!(bq::BatchQueue, min_size::Int)
+    while length(bq.arg_slabs) < bq.arg_slab_idx
+        push!(bq.arg_slabs, vk_alloc_mapped(max(ARG_SLAB_SIZE, min_size)))
     end
-    slab = ARG_SLABS[ARG_SLAB_IDX[]]
+    slab = bq.arg_slabs[bq.arg_slab_idx]::VkMappedBuffer
     # If current slab is too small for the allocation, move to next slab
-    if ARG_SLAB_OFFSET[] + min_size > slab.size
-        ARG_SLAB_IDX[] += 1
-        ARG_SLAB_OFFSET[] = 0
-        while length(ARG_SLABS) < ARG_SLAB_IDX[]
-            push!(ARG_SLABS, vk_alloc_mapped(max(ARG_SLAB_SIZE, min_size)))
+    if bq.arg_slab_offset + min_size > slab.size
+        bq.arg_slab_idx += 1
+        bq.arg_slab_offset = 0
+        while length(bq.arg_slabs) < bq.arg_slab_idx
+            push!(bq.arg_slabs, vk_alloc_mapped(max(ARG_SLAB_SIZE, min_size)))
         end
     end
 end
 
-function get_arg_buffer(nbytes::Integer)
+function get_arg_buffer(bq::BatchQueue, nbytes::Integer)
     aligned_size = (max(Int(nbytes), 16) + ARG_SLAB_ALIGN - 1) & ~(ARG_SLAB_ALIGN - 1)
 
-    ensure_arg_slab!(aligned_size)
+    ensure_arg_slab!(bq, aligned_size)
 
-    slab = ARG_SLABS[ARG_SLAB_IDX[]]
-    offset = ARG_SLAB_OFFSET[]
-    ARG_SLAB_OFFSET[] = offset + aligned_size
-    ARG_ALLOC_COUNT[] += 1
+    slab = bq.arg_slabs[bq.arg_slab_idx]::VkMappedBuffer
+    offset = bq.arg_slab_offset
+    bq.arg_slab_offset = offset + aligned_size
+    bq.arg_alloc_count += 1
 
     return ArgBufferAlloc(
         slab.address + UInt64(offset),
@@ -661,9 +668,9 @@ function get_arg_buffer(nbytes::Integer)
     )
 end
 
-"""Reset arg buffer slab allocator after flush (all in-flight dispatches completed)."""
-function reset_arg_buffer_pool!()
-    ARG_SLAB_IDX[] = 1
-    ARG_SLAB_OFFSET[] = 0
-    ARG_ALLOC_COUNT[] = 0
+"""Reset arg buffer slab allocator for `bq` after its in_flight batches drained."""
+function reset_arg_buffer_pool!(bq::BatchQueue)
+    bq.arg_slab_idx = 1
+    bq.arg_slab_offset = 0
+    bq.arg_alloc_count = 0
 end

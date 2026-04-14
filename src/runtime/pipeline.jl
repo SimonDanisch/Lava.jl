@@ -154,16 +154,11 @@ function get_compute_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String;
     push!(PIPELINE_INSERTION_ORDER, cache_key)
     while length(PIPELINE_INSERTION_ORDER) > MAX_PIPELINE_CACHE_SIZE[]
         old_key = popfirst!(PIPELINE_INSERTION_ORDER)
-        evicted = get(PIPELINE_CACHE, old_key, nothing)
         delete!(PIPELINE_CACHE, old_key)
-        # Keep evicted pipeline alive until the current batch flushes —
-        # it may still be referenced by an in-flight command buffer.
-        if evicted !== nothing
-            bq = vk_context().default_bq
-            if bq.active_batch !== nothing
-                push!(bq.active_batch.data_refs, evicted)
-            end
-        end
+        # No defensive pin needed: every dispatch pushes its pipeline to
+        # `batch.data_refs`, so any in-flight batch that used this pipeline
+        # holds a strong ref.  Once all such batches retire the ref drops
+        # naturally and GC runs the destructor.
     end
     return result
 end

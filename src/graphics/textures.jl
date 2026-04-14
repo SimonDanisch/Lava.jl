@@ -113,11 +113,13 @@ function upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}; ctx::VkCon
     # Use staging buffer for upload
     bytes = reinterpret(UInt8, vec(collect(data)))
     nbytes = length(bytes)
-    staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
+    staging_buf, _, mapped_ptr, _ = get_staging(ctx.default_bq, nbytes)
     unsafe_copyto!(Ptr{UInt8}(mapped_ptr), pointer(bytes), nbytes)
 
-    # Flush pending commands first
-    vk_flush!()
+    # Flush pending commands on default_bq first (this upload uses ctx.xfer_cmd_buf)
+    if has_active_recording(ctx.default_bq)
+        flush!(ctx.default_bq, ctx.device)
+    end
 
     # Use dedicated transfer command buffer for texture upload
     # (don't interfere with dispatch batches)
@@ -155,7 +157,8 @@ function upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}; ctx::VkCon
     unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=fence))
     unwrap(Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64)))
     unwrap(Vulkan.reset_fences(dev, [fence]))
-    flush_deferred_frees!()
+    drain_deferred_frees!(ctx.default_bq)
+    drain_deferred_as_frees!(ctx.default_bq)
 end
 
 # ── Format Mapping ──

@@ -20,9 +20,15 @@ mutable struct LavaArray{T,N} <: AbstractGPUArray{T,N}
     end
 end
 
-function LavaArray{T,N}(::UndefInitializer, dims::NTuple{N,Int}) where {T,N}
+function LavaArray{T,N}(::UndefInitializer, dims::NTuple{N,Int};
+                        extra_usage::UInt32=UInt32(0)) where {T,N}
     nbytes = prod(dims) * sizeof(T)
-    managed_buf = pool_alloc(max(nbytes, 16))
+    # Non-default usage (index buffer, AS input/storage, scratch, etc.)
+    # bypasses the pool since those buffers need specific usage flags at
+    # VkBuffer creation time. Default `extra_usage=0` uses the pool.
+    managed_buf = extra_usage == UInt32(0) ?
+        pool_alloc(max(nbytes, 16)) :
+        vk_alloc(max(nbytes, 16); extra_usage)
     ref = GPUArrays.DataRef(managed_buf) do buf
         vk_free!(buf)
     end
@@ -30,18 +36,14 @@ function LavaArray{T,N}(::UndefInitializer, dims::NTuple{N,Int}) where {T,N}
 end
 
 # Varargs constructor for LavaArray{T,N}(undef, d1, d2, ...)
-LavaArray{T,N}(::UndefInitializer, dims::Int...) where {T,N} = LavaArray{T,N}(undef, dims)
-LavaArray{T,N}(::UndefInitializer, dims::Integer...) where {T,N} = LavaArray{T,N}(undef, Int.(dims))
-LavaArray{T,N}(::UndefInitializer, dims::NTuple{N,Integer}) where {T,N} = LavaArray{T,N}(undef, Int.(dims))
+LavaArray{T,N}(::UndefInitializer, dims::Int...; kw...) where {T,N} = LavaArray{T,N}(undef, dims; kw...)
+LavaArray{T,N}(::UndefInitializer, dims::Integer...; kw...) where {T,N} = LavaArray{T,N}(undef, Int.(dims); kw...)
+LavaArray{T,N}(::UndefInitializer, dims::NTuple{N,Integer}; kw...) where {T,N} = LavaArray{T,N}(undef, Int.(dims); kw...)
 
 """Allocate a LavaArray with INDEX_BUFFER_BIT for use as Vulkan index buffer."""
-function alloc_index_buffer(data::AbstractVector{UInt32})
-    nbytes = max(length(data) * sizeof(UInt32), 16)
-    managed_buf = vk_alloc(nbytes; extra_usage=UInt32(Vulkan.BUFFER_USAGE_INDEX_BUFFER_BIT))
-    ref = GPUArrays.DataRef(managed_buf) do buf
-        vk_free!(buf)
-    end
-    arr = LavaArray{UInt32,1}(ref, (length(data),))
+alloc_index_buffer(data::AbstractVector{UInt32}) = begin
+    arr = LavaArray{UInt32,1}(undef, (length(data),);
+        extra_usage=UInt32(Vulkan.BUFFER_USAGE_INDEX_BUFFER_BIT))
     upload!(arr, data)
     return arr
 end
@@ -127,6 +129,10 @@ Base.elsize(::Type{<:LavaArray{T}}) where T = sizeof(T)
 function bda_address(a::LavaArray{T}) where T
     a.buf[].address + a.offset * sizeof(T)
 end
+
+# Hook into the dispatch-time access tracker (defined in runtime/command.jl).
+@inline record_one!(bq::BatchQueue, batch::CommandBatch, a::LavaArray) =
+    track_buffer_access!(bq, batch, a.buf[])
 
 # ── Transfers ──
 

@@ -151,14 +151,14 @@ Returns a width x height matrix with element type matching the framebuffer forma
 function readback_framebuffer(fb::LavaFramebuffer; ctx::VkContext=vk_context())
     dev = ctx.device
 
-    if has_active_recording(ctx)
-        vk_flush!()
+    if has_active_recording(ctx.default_bq)
+        flush!(ctx.default_bq, ctx.device)
     end
 
     bpp = format_pixel_size(fb.color_format)
     T = format_element_type(fb.color_format)
     nbytes = fb.width * fb.height * bpp
-    staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
+    staging_buf, _, mapped_ptr, _ = get_staging(ctx.default_bq, nbytes)
 
     cmd = ctx.xfer_cmd_buf
     fence = ctx.xfer_fence
@@ -186,7 +186,8 @@ function readback_framebuffer(fb::LavaFramebuffer; ctx::VkContext=vk_context())
     unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=fence))
     unwrap(Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64)))
     unwrap(Vulkan.reset_fences(dev, [fence]))
-    flush_deferred_frees!()
+    drain_deferred_frees!(ctx.default_bq)
+    drain_deferred_as_frees!(ctx.default_bq)
 
     pixels = Matrix{T}(undef, fb.width, fb.height)
     unsafe_copyto!(Ptr{UInt8}(pointer(pixels)), Ptr{UInt8}(mapped_ptr), nbytes)
@@ -203,15 +204,15 @@ Returns a width x height matrix of BGRA byte tuples.
 function readback_window(win::RenderWindow; ctx::VkContext=vk_context())
     dev = ctx.device
 
-    if has_active_recording(ctx)
-        vk_flush!()
+    if has_active_recording(ctx.default_bq)
+        flush!(ctx.default_bq, ctx.device)
     end
 
     w, h = size(win)
     bpp = format_pixel_size(win.format)
     T = format_element_type(win.format)
     nbytes = w * h * bpp
-    staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
+    staging_buf, _, mapped_ptr, _ = get_staging(ctx.default_bq, nbytes)
 
     image = win.images[win.current_image_idx + 1]
 
@@ -247,7 +248,8 @@ function readback_window(win::RenderWindow; ctx::VkContext=vk_context())
     unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=fence))
     unwrap(Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64)))
     unwrap(Vulkan.reset_fences(dev, [fence]))
-    flush_deferred_frees!()
+    drain_deferred_frees!(ctx.default_bq)
+    drain_deferred_as_frees!(ctx.default_bq)
 
     pixels = Matrix{T}(undef, w, h)
     unsafe_copyto!(Ptr{UInt8}(pointer(pixels)), Ptr{UInt8}(mapped_ptr), nbytes)

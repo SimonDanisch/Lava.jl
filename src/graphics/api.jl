@@ -190,7 +190,7 @@ function draw!(bq::BatchQueue, pipeline::GraphicsPipeline, target::WindowTarget,
     view = win.views[win.current_image_idx + 1]
     image = win.images[win.current_image_idx + 1]
 
-    push_data = isempty(args) ? UInt8[] : pack_gfx_args(args, vert_shader.push_info)
+    push_data = isempty(args) ? UInt8[] : pack_gfx_args(bq, args, vert_shader.push_info)
 
     vk_draw!(bq, compiled, view, image, win.extent, vertex_count;
         push_data, instances, clear_color)
@@ -214,7 +214,7 @@ function draw!(bq::BatchQueue, pipeline::GraphicsPipeline, target::OffscreenTarg
         vert_fn, frag_fn, vert_tt, frag_tt;
         color_format=fb.color_format, descriptor_set_layout)
 
-    push_data = isempty(args) ? UInt8[] : pack_gfx_args(args, vert_shader.push_info)
+    push_data = isempty(args) ? UInt8[] : pack_gfx_args(bq, args, vert_shader.push_info)
 
     vk_draw!(bq, compiled, fb.color_view, fb.color_image,
         Vulkan.Extent2D(UInt32(fb.width), UInt32(fb.height)),
@@ -225,7 +225,7 @@ function draw!(bq::BatchQueue, pipeline::GraphicsPipeline, target::OffscreenTarg
         clear_color, descriptor_set)
 end
 
-function pack_gfx_args(args, push_info::PushConstantInfo)
+function pack_gfx_args(bq::BatchQueue, args, push_info::PushConstantInfo)
     push_info.push_size == 0 && return UInt8[]
     isempty(args) && return UInt8[]
 
@@ -247,14 +247,12 @@ function pack_gfx_args(args, push_info::PushConstantInfo)
     inline_extra = compute_inline_extra_from_byval(byval_sizes)
     total_size = push_info.arg_buffer_size + inline_extra
 
-    arg_buf = get_arg_buffer(total_size)
+    arg_buf = get_arg_buffer(bq, total_size)
     pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
                        push_info.arg_buffer_size, byval_sizes, converted)
 
-    # Keep data buffer references alive until vk_flush!()
-    bq = vk_context().default_bq
     batch = ensure_active_batch!(bq)
-    push!(batch.data_refs, args)
+    record_arg_accesses!(bq, batch, args)
 
     # Push constant = BDA of arg buffer
     push_data = Vector{UInt8}(undef, 8)
@@ -264,10 +262,10 @@ function pack_gfx_args(args, push_info::PushConstantInfo)
     return push_data
 end
 
-# Backwards compat for no-args case
-function pack_gfx_args(args)
+# Empty-args variant
+function pack_gfx_args(::BatchQueue, args, ::Nothing=nothing)
     isempty(args) && return UInt8[]
-    error("pack_gfx_args requires push_info for non-empty args. Use pack_gfx_args(args, push_info).")
+    error("pack_gfx_args requires push_info for non-empty args.")
 end
 
 # ── Blit: Fullscreen Display of GPU Buffer ──
@@ -364,7 +362,7 @@ function blit!(bq::BatchQueue, target::RenderTarget, source::LavaArray;
 
     # Pack fragment args via the fragment shader's push_info
     frag_shader = get_or_compile_gfx(pipeline.fragment, frag_tt, :fragment)
-    push_data = pack_gfx_args(frag_args, frag_shader.push_info)
+    push_data = pack_gfx_args(bq, frag_args, frag_shader.push_info)
 
     clear_color = clear ? (0.0f0, 0.0f0, 0.0f0, 1.0f0) : nothing
 
@@ -392,24 +390,46 @@ function present_frame!(bq::BatchQueue, win::RenderWindow)
     # End command buffer
     unwrap(Vulkan.end_command_buffer(cmd))
 
-    # Submit with per-frame semaphores (using window's own fence, not batch fence)
     fi = win.current_frame
-    submit_info = Vulkan.SubmitInfo(
-        [win.image_available[fi]],
-        [Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT],
-        [cmd],
-        [win.render_finished[fi]],
-    )
-    unwrap(Vulkan.queue_submit(bq.queue, [submit_info]; fence=win.in_flight[fi]))
+
+    # ensure_active_batch! pre-assigned batch.signal_value = next_timeline + 1.
+    # We must signal the timeline semaphore here so any `last_write` entries
+    # set by dispatches in this batch can be observed as "complete".
+    # Otherwise `wait_for_write(buf)` will hang forever on a value that
+    # never arrives.
+    bq.next_timeline += 1
+    @assert batch.signal_value == bq.next_timeline "present_frame! signal desync"
+
+    wait_infos = [
+        # Wait for collected cross-queue deps:
+        [Vulkan.SemaphoreSubmitInfo(s, v, UInt32(0); stage_mask=stage)
+         for (s, v, stage) in batch.wait_semaphores]...,
+        # Wait for swapchain image availability before color attachment writes:
+        Vulkan.SemaphoreSubmitInfo(win.image_available[fi], UInt64(0), UInt32(0);
+            stage_mask=Vulkan.PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT),
+    ]
+    signal_infos = [
+        # Signal timeline for in-Lava lifetime tracking:
+        Vulkan.SemaphoreSubmitInfo(bq.timeline_sem, batch.signal_value, UInt32(0);
+            stage_mask=Vulkan.PIPELINE_STAGE_2_ALL_COMMANDS_BIT),
+        # Signal render_finished for the subsequent present operation:
+        Vulkan.SemaphoreSubmitInfo(win.render_finished[fi], UInt64(0), UInt32(0);
+            stage_mask=Vulkan.PIPELINE_STAGE_2_ALL_COMMANDS_BIT),
+    ]
+    cb_info = Vulkan.CommandBufferSubmitInfo(cmd, UInt32(0))
+    submit_info = Vulkan.SubmitInfo2(wait_infos, [cb_info], signal_infos)
+    unwrap(Vulkan.queue_submit_2(bq.queue, [submit_info]; fence=win.in_flight[fi]))
 
     # Store batch in window's per-frame slot — it will be reclaimed in
     # acquire_next_image! after the fence wait confirms GPU completion.
     # Do NOT push to free_batches here: the GPU is still using this command buffer.
     bq.active_batch = nothing
     win.frame_batches[fi] = batch
+    empty!(batch.wait_semaphores)
 
-    flush_deferred_frees!()
-    reset_arg_buffer_pool!()
+    drain_deferred_frees!(bq)
+    drain_deferred_as_frees!(bq)
+    reset_arg_buffer_pool!(bq)
 
     # Present
     present!(win)
