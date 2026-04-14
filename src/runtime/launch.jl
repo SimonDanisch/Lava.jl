@@ -172,7 +172,7 @@ function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
     tt = Tuple{map(arg_llvm_type, args)...}
 
     # Compile + pipeline (cached, single lookup — avoids re-hashing SPIR-V)
-    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(f, tt, workgroup_size)
+    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(bq.ctx::VkContext, f, tt, workgroup_size)
 
     # Include f as first arg — GPUCompiler includes typeof(f) as the first LLVM parameter,
     # and wrap_entry_for_vulkan! creates a BDA slot for it (unless ghost-elided).
@@ -547,8 +547,8 @@ end
 
 Create session-dependent Vulkan objects (VkPipeline) from cached SPIR-V bytes.
 """
-function link_kernel(compiled::LavaGPUKernel)
-    pipeline = get_compute_pipeline(compiled.spirv_bytes, compiled.entry_name;
+function link_kernel(ctx::VkContext, compiled::LavaGPUKernel)
+    pipeline = get_compute_pipeline(ctx, compiled.spirv_bytes, compiled.entry_name;
                                     push_constant_size=compiled.push_info.push_size)
     offsets = Int[p.first for p in compiled.push_info.arg_layout]
     byval_sizes = compiled.push_info.byval_llvm_sizes
@@ -563,7 +563,7 @@ Three-tier cached kernel compilation:
 2. Lava disk cache (~1-2ms) for cross-session persistence
 3. Full LLVM + SPIR-V compilation (~300ms) on cold miss
 """
-function get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), workgroup_size)
+function get_compiled_kernel_and_pipeline(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workgroup_size)
     # Tier 1: fast hash-based in-memory lookup
     key = hash((f, tt, workgroup_size))
     linked = get(LINKED_KERNEL_CACHE, key, nothing)
@@ -579,11 +579,11 @@ function get_compiled_kernel_and_pipeline(@nospecialize(f), @nospecialize(tt), w
     compiled = lava_disk_cache_load(source, workgroup_size)
     if compiled !== nothing
         @debug "Lava: disk cache hit" f tt workgroup_size
-        linked = link_kernel(compiled)
+        linked = link_kernel(ctx, compiled)
     else
         # Tier 3: full compilation (LLVM -> SPIR-V -> validate)
         compiled = lava_compile_gpu(f, tt; workgroup_size)
-        linked = link_kernel(compiled)
+        linked = link_kernel(ctx, compiled)
         # Store to disk for next session
         lava_disk_cache_store(source, workgroup_size, compiled)
     end

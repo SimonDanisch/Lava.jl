@@ -45,7 +45,8 @@ struct LavaBackend <: KA.GPU
     upload_bq::BatchQueue
 end
 
-LavaBackend() = (let bq = vk_context().default_bq; LavaBackend(bq, bq); end)
+LavaBackend() = LavaBackend(vk_context())
+LavaBackend(ctx::VkContext) = (let bq = ctx.default_bq; LavaBackend(bq, bq); end)
 LavaBackend(bq::BatchQueue) = LavaBackend(bq, bq)
 
 # Back-compat: callers that read `backend.bq` get the dispatch queue (the
@@ -54,7 +55,9 @@ Base.getproperty(b::LavaBackend, s::Symbol) = s === :bq ? getfield(b, :dispatch_
 
 # ── Backend queries ──
 
-KA.get_backend(::LavaArray) = LavaBackend()
+# Derive the backend from the array's own context so cross-context arrays
+# dispatch against the correct queue instead of the global default.
+KA.get_backend(a::LavaArray) = LavaBackend((a.buf[].ctx)::VkContext)
 # KA.synchronize submits all recorded dispatches and waits for GPU completion.
 # This matches CUDA/AMDGPU semantics: after synchronize(), the CPU can safely
 # read GPU results. GPU-side ordering between dispatches is handled by pipeline
@@ -282,7 +285,7 @@ function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple, block_dim
     tt = Tuple{map(ka_arg_llvm_type, Base.tail(all_args))...}
 
     # Compile + pipeline + offsets (cached, single lookup)
-    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(f, tt, workgroup_size)
+    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(bq.ctx::VkContext, f, tt, workgroup_size)
 
     # Compute total size: base layout + inline struct data
     inline_extra = compute_inline_extra_from_byval(byval_sizes)
@@ -340,12 +343,12 @@ push!(RESET_CALLBACKS, function()
     PREPARE_INDIRECT_ARG_BUF_SIZE_REF[] = 0
 end)
 
-function init_prepare_indirect_pipeline!()
+function init_prepare_indirect_pipeline!(ctx::VkContext)
     PREPARE_INDIRECT_PIPELINE_REF[] !== nothing && return
     tt = Tuple{Ptr{UInt32}, Ptr{Int32}, UInt32}
     ws = (1, 1, 1)
     compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(
-        prepare_indirect_kernel, tt, ws)
+        ctx, prepare_indirect_kernel, tt, ws)
     PREPARE_INDIRECT_PIPELINE_REF[] = pipeline
     PREPARE_INDIRECT_OFFSETS_REF[] = offsets
     PREPARE_INDIRECT_BYVAL_REF[] = byval_sizes
@@ -360,7 +363,7 @@ no validation, no auto-flush check, no batch.data_refs push, no logging overhead
 Records a single-thread direct dispatch to compute ceil(n/ws) group counts.
 """
 function fast_prepare_indirect!(bq::BatchQueue, indirect_buf::VkIndirectBuffer, ndrange_buf::LavaArray{<:Integer}, workgroup_size::Integer)
-    init_prepare_indirect_pipeline!()
+    init_prepare_indirect_pipeline!(bq.ctx::VkContext)
 
     pipeline = PREPARE_INDIRECT_PIPELINE_REF[]
     offsets = PREPARE_INDIRECT_OFFSETS_REF[]

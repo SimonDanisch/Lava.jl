@@ -134,13 +134,16 @@ fence, and preserves list. All `build_blas`/`build_tlas` calls take this
 as a required parameter. Created by `as_build()` which manages the lifecycle.
 """
 mutable struct ASBuildContext
-    cmd_buf::Vulkan.CommandBuffer
-    fence::Vulkan.Fence
-    device::Vulkan.Device
-    queue::Vulkan.Queue
+    bq::BatchQueue
     preserves::Vector{Any}
-    vkctx::VkContext
 end
+
+# Derived accessors so call sites stay readable.
+@inline as_cmd_buf(ctx::ASBuildContext) = ctx.bq.as_cmd_buf
+@inline as_fence(ctx::ASBuildContext)   = ctx.bq.as_fence
+@inline as_queue(ctx::ASBuildContext)   = ctx.bq.queue
+@inline as_device(ctx::ASBuildContext)  = ctx.bq.device
+@inline as_vkctx(ctx::ASBuildContext)   = ctx.bq.ctx::VkContext
 
 """
     build_blas(ctx::ASBuildContext, vertices, indices; opaque=true) -> LavaBLAS
@@ -150,11 +153,12 @@ Must be called inside `as_build()`.
 """
 function build_blas(ctx::ASBuildContext, vertices::Vector{NTuple{3,Float32}}, indices::Vector{UInt32};
                     opaque::Bool=true)
-    dev = ctx.device
+    vkctx = as_vkctx(ctx)
+    dev = as_device(ctx)
 
     # Upload vertex/index data to device-local buffers (LavaArrays).
-    vertex_arr = create_as_input_buffer(ctx.vkctx, reinterpret(UInt8, vertices))
-    index_arr  = create_as_input_buffer(ctx.vkctx, reinterpret(UInt8, indices))
+    vertex_arr = create_as_input_buffer(vkctx, reinterpret(UInt8, vertices))
+    index_arr  = create_as_input_buffer(vkctx, reinterpret(UInt8, indices))
     vertex_addr = vertex_arr.buf[].address
     index_addr  = index_arr.buf[].address
 
@@ -174,12 +178,12 @@ function build_blas(ctx::ASBuildContext, vertices::Vector{NTuple{3,Float32}}, in
         max_vertex, index_type=itype, index_addr,
         geo_flags, max_primitive_count=n_triangles)
 
-    storage = create_as_storage_buffer(ctx.vkctx, sizes.acceleration_structure_size)
+    storage = create_as_storage_buffer(vkctx, sizes.acceleration_structure_size)
     accel = Vulkan.AccelerationStructureKHR(dev, Vulkan.AccelerationStructureCreateInfoKHR(
         storage.buf[].buffer, UInt64(0), sizes.acceleration_structure_size,
         Vulkan.ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR))
 
-    scratch_arr, scratch_addr = create_scratch_buffer(ctx.vkctx, sizes.build_scratch_size)
+    scratch_arr, scratch_addr = create_scratch_buffer(vkctx, sizes.build_scratch_size)
 
     # Build inputs (vertex + index) must outlive the BLAS — the driver may
     # retain VAs into them.  Kept as LavaArrays so their own last_write
@@ -214,7 +218,8 @@ Must be called inside `as_build()`.
 function build_tlas(ctx::ASBuildContext, blas_list::Vector{LavaBLAS};
                     transforms::Union{Nothing, Vector{NTuple{12,Float32}}}=nothing,
                     custom_indices::Union{Nothing, Vector{UInt32}}=nothing)
-    dev = ctx.device
+    vkctx = as_vkctx(ctx)
+    dev = as_device(ctx)
     n_instances = length(blas_list)
 
     instance_data = Vector{UInt8}(undef, 64 * n_instances)
@@ -226,7 +231,7 @@ function build_tlas(ctx::ASBuildContext, blas_list::Vector{LavaBLAS};
         )
     end
 
-    inst_arr = create_as_input_buffer(ctx.vkctx, instance_data)
+    inst_arr = create_as_input_buffer(vkctx, instance_data)
     inst_addr = inst_arr.buf[].address
     build_flags = UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
 
@@ -236,12 +241,12 @@ function build_tlas(ctx::ASBuildContext, blas_list::Vector{LavaBLAS};
         instance_addr=inst_addr,
         max_primitive_count=UInt32(n_instances))
 
-    storage = create_as_storage_buffer(ctx.vkctx, sizes.acceleration_structure_size)
+    storage = create_as_storage_buffer(vkctx, sizes.acceleration_structure_size)
     accel = Vulkan.AccelerationStructureKHR(dev, Vulkan.AccelerationStructureCreateInfoKHR(
         storage.buf[].buffer, UInt64(0), sizes.acceleration_structure_size,
         Vulkan.ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR))
 
-    scratch_arr, scratch_addr = create_scratch_buffer(ctx.vkctx, sizes.build_scratch_size)
+    scratch_arr, scratch_addr = create_scratch_buffer(vkctx, sizes.build_scratch_size)
 
     # Instance buffer must outlive the TLAS (driver may retain VAs).
     # Scratch is submit-lifetime — ctx.preserves + fence wait handles it.
@@ -544,20 +549,20 @@ end
 BLAS device addresses are available immediately after `build_blas` returns
 (even before the GPU build executes), so `build_tlas` can reference them.
 """
-function as_build(f; vkctx::VkContext=vk_context())
+function as_build(f; bq::BatchQueue=vk_context().default_bq)
     # Flush any pending compute dispatches before AS builds (the AS build
     # reads vertex/index/instance buffers that prior dispatches may have
     # written to).
-    if has_active_recording(vkctx.default_bq)
-        flush!(vkctx.default_bq, vkctx.device)
+    if has_active_recording(bq)
+        flush!(bq, bq.device)
     end
 
-    cmd = vkctx.as_cmd_buf
+    cmd = bq.as_cmd_buf
     unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
         flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     )))
 
-    ctx = ASBuildContext(cmd, vkctx.as_fence, vkctx.device, vkctx.queue, Any[], vkctx)
+    ctx = ASBuildContext(bq, Any[])
     result = try
         f(ctx)
     catch
@@ -583,10 +588,11 @@ function as_build(f; vkctx::VkContext=vk_context())
 
     unwrap(Vulkan.end_command_buffer(cmd))
 
+    fence = bq.as_fence
     submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=ctx.fence))
-    unwrap(Vulkan.wait_for_fences(ctx.device, [ctx.fence], true, typemax(UInt64)))
-    unwrap(Vulkan.reset_fences(ctx.device, [ctx.fence]))
+    unwrap(Vulkan.queue_submit(bq.queue, [submit_info]; fence=fence))
+    unwrap(Vulkan.wait_for_fences(bq.device, [fence], true, typemax(UInt64)))
+    unwrap(Vulkan.reset_fences(bq.device, [fence]))
 
     # Inputs that must outlive the GPU submit (vertex/index for BLAS, instance
     # buffer for TLAS) are owned by LavaBLAS/LavaTLAS via their preserves.
@@ -606,7 +612,7 @@ function build_as_on_gpu(ctx::ASBuildContext, accel::Vulkan.AccelerationStructur
                          as_type::UInt32, build_flags::UInt32=UInt32(0),
                          primitive_count::UInt32=UInt32(0),
                          kwargs...)
-    cmd = ctx.cmd_buf
+    cmd = as_cmd_buf(ctx)
 
     # Pack geometry (96 bytes, correct C layout)
     geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
@@ -618,7 +624,7 @@ function build_as_on_gpu(ctx::ASBuildContext, accel::Vulkan.AccelerationStructur
     # Pack range info (16 bytes)
     c_range = VkBRI(primitive_count, UInt32(0), UInt32(0), UInt32(0))
 
-    fptr = Vulkan.function_pointer(ctx.device, "vkCmdBuildAccelerationStructuresKHR")
+    fptr = Vulkan.function_pointer(as_device(ctx), "vkCmdBuildAccelerationStructuresKHR")
 
     # Synchronize prior AS builds before this build command.
     pre_barrier = Vulkan.MemoryBarrier(
@@ -794,7 +800,7 @@ function build_blas_pooled(all_vertices::Vector{Vector{NTuple{3,Float32}}},
                         Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
                     )
                     Vulkan.cmd_pipeline_barrier(
-                        as_ctx.cmd_buf, [scratch_barrier], [], [];
+                        as_cmd_buf(as_ctx), [scratch_barrier], [], [];
                         src_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
                         dst_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
                     )
@@ -1044,7 +1050,7 @@ function build_hw_accel_from_tlas(tlas; ctx::VkContext=vk_context())
                         Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
                     )
                     Vulkan.cmd_pipeline_barrier(
-                        as_ctx.cmd_buf, [scratch_barrier], [], [];
+                        as_cmd_buf(as_ctx), [scratch_barrier], [], [];
                         src_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
                         dst_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
                     )

@@ -105,7 +105,7 @@ end)
 Get or create a compute pipeline from SPIR-V binary.
 Validates SPIR-V before creating the shader module.
 """
-function get_compute_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String;
+function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_name::String;
                                push_constant_size::Integer=8)
     cache_key = hash((spirv_bytes, entry_name, push_constant_size))
     cached = get(PIPELINE_CACHE, cache_key, nothing)
@@ -113,7 +113,7 @@ function get_compute_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String;
         return cached
     end
 
-    dev = vk_device()
+    dev = ctx.device
 
     # Create shader module from SPIR-V
     @assert length(spirv_bytes) % 4 == 0 "SPIR-V binary must be 4-byte aligned"

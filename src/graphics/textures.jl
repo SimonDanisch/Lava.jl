@@ -12,6 +12,7 @@ struct LavaTexture2D{T} <: AbstractLavaTexture{T, 2}
     width::Int
     height::Int
     format::Vulkan.Format
+    ctx::VkContext
 end
 
 """1D texture backed by VkImage."""
@@ -21,6 +22,7 @@ struct LavaTexture1D{T} <: AbstractLavaTexture{T, 1}
     view::Vulkan.ImageView
     width::Int
     format::Vulkan.Format
+    ctx::VkContext
 end
 
 """Reusable sampler configuration."""
@@ -29,6 +31,7 @@ struct LavaSampler
     filter::Symbol
     wrap::Symbol
     anisotropy::Float32
+    ctx::VkContext
 end
 
 """Combined texture + sampler, ready for binding."""
@@ -65,7 +68,7 @@ function LavaSampler(; ctx::VkContext=vk_context(), filter::Symbol=:linear, wrap
         false,
     )
 
-    LavaSampler(sampler, filter, wrap, Float32(anisotropy))
+    LavaSampler(sampler, filter, wrap, Float32(anisotropy), ctx)
 end
 
 # ── Texture Construction ──
@@ -97,7 +100,7 @@ function LavaTexture2D(data::Matrix{T}; ctx::VkContext=vk_context(), filter=:lin
         Vulkan.ImageSubresourceRange(Vulkan.IMAGE_ASPECT_COLOR_BIT,
             UInt32(0), UInt32(1), UInt32(0), UInt32(1)))
 
-    tex = LavaTexture2D{T}(image, memory, view, w, h, format)
+    tex = LavaTexture2D{T}(image, memory, view, w, h, format, ctx)
 
     # Upload data
     upload_texture_data!(tex, data)
@@ -106,24 +109,25 @@ function LavaTexture2D(data::Matrix{T}; ctx::VkContext=vk_context(), filter=:lin
 end
 
 """Upload pixel data to a texture via staging buffer."""
-function upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}; ctx::VkContext=vk_context()) where T
+function upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}) where T
+    ctx = tex.ctx
+    bq = ctx.default_bq
     dev = ctx.device
 
     # Use staging buffer for upload
     bytes = reinterpret(UInt8, vec(collect(data)))
     nbytes = length(bytes)
-    staging_buf, _, mapped_ptr, _ = get_staging(ctx.default_bq, nbytes)
+    staging_buf, _, mapped_ptr, _ = get_staging(bq, nbytes)
     unsafe_copyto!(Ptr{UInt8}(mapped_ptr), pointer(bytes), nbytes)
 
-    # Flush pending commands on default_bq first (this upload uses ctx.xfer_cmd_buf)
-    if has_active_recording(ctx.default_bq)
-        flush!(ctx.default_bq, ctx.device)
+    # Flush pending commands on bq first (this upload uses bq.xfer_cmd_buf)
+    if has_active_recording(bq)
+        flush!(bq, dev)
     end
 
-    # Use dedicated transfer command buffer for texture upload
-    # (don't interfere with dispatch batches)
-    cmd = ctx.xfer_cmd_buf
-    fence = ctx.xfer_fence
+    # Use the dedicated transfer command buffer (not the dispatch batches).
+    cmd = bq.xfer_cmd_buf
+    fence = bq.xfer_fence
     unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(;
         flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
 
@@ -153,11 +157,11 @@ function upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}; ctx::VkCon
     # Submit using dedicated transfer fence
     unwrap(Vulkan.end_command_buffer(cmd))
     submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=fence))
+    unwrap(Vulkan.queue_submit(bq.queue, [submit_info]; fence=fence))
     unwrap(Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64)))
     unwrap(Vulkan.reset_fences(dev, [fence]))
-    drain_deferred_frees!(ctx.default_bq)
-    drain_deferred_as_frees!(ctx.default_bq)
+    drain_deferred_frees!(bq)
+    drain_deferred_as_frees!(bq)
 end
 
 # ── Format Mapping ──
@@ -182,7 +186,9 @@ struct TextureBindings
 end
 
 """Create a descriptor set binding combined image samplers."""
-function bind_textures(textures::Vector{<:SampledTexture}; ctx::VkContext=vk_context())
+function bind_textures(textures::Vector{<:SampledTexture})
+    isempty(textures) && error("bind_textures: cannot bind an empty texture list")
+    ctx = textures[1].texture.ctx
     dev = ctx.device
 
     n = length(textures)

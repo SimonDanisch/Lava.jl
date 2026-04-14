@@ -29,6 +29,8 @@ mutable struct RenderWindow
     # Current frame state
     current_image_idx::UInt32
     acquired::Bool
+    # Owning context — swapchain/surface are bound to a specific device.
+    ctx::VkContext
 end
 
 """
@@ -62,6 +64,7 @@ function RenderWindow(width::Integer, height::Integer;
         1,  # current_frame
         Union{Nothing, CommandBatch}[],  # frame_batches
         UInt32(0), false,
+        ctx,
     )
 
     create_swapchain!(win; vsync)
@@ -73,7 +76,8 @@ end
 
 Create or recreate the swapchain for the window.
 """
-function create_swapchain!(win::RenderWindow; ctx::VkContext=vk_context(), vsync::Bool=true)
+function create_swapchain!(win::RenderWindow; vsync::Bool=true)
+    ctx = win.ctx
     dev = ctx.device
     phys = ctx.physical_device
 
@@ -178,7 +182,8 @@ end
 Acquire the next swapchain image. Returns the image index.
 Must be called before recording rendering commands.
 """
-function acquire_next_image!(win::RenderWindow; ctx::VkContext=vk_context())
+function acquire_next_image!(win::RenderWindow)
+    ctx = win.ctx
     dev = ctx.device
     fi = win.current_frame
 
@@ -192,7 +197,7 @@ function acquire_next_image!(win::RenderWindow; ctx::VkContext=vk_context())
         old_batch.dispatch_count = 0
         old_batch.last_was_rt = false
         empty!(old_batch.data_refs)
-        push!(ctx.free_batches, old_batch)
+        push!(ctx.default_bq.free_batches, old_batch)
         win.frame_batches[fi] = nothing
     end
 
@@ -210,16 +215,16 @@ end
 Present the rendered frame to the screen.
 Must be called after recording and submitting rendering commands.
 """
-function present!(win::RenderWindow; ctx::VkContext=vk_context())
+function present!(win::RenderWindow)
     win.acquired || error("Cannot present: no image acquired (call acquire_next_image! first)")
-
+    ctx = win.ctx
     fi = win.current_frame
     present_info = Vulkan.PresentInfoKHR(
         [win.render_finished[fi]],
         [win.swapchain],
         [win.current_image_idx],
     )
-    unwrap(Vulkan.queue_present_khr(ctx.queue, present_info))
+    unwrap(Vulkan.queue_present_khr(ctx.default_bq.queue, present_info))
 
     win.acquired = false
     # Advance to next frame-in-flight slot
@@ -231,7 +236,8 @@ end
 
 Handle window resize by recreating the swapchain.
 """
-function Base.resize!(win::RenderWindow; ctx::VkContext=vk_context())
+function Base.resize!(win::RenderWindow)
+    ctx = win.ctx
     Vulkan.device_wait_idle(ctx.device)
     # Reclaim in-flight frame batches before recreating swapchain
     for i in eachindex(win.frame_batches)
@@ -241,7 +247,7 @@ function Base.resize!(win::RenderWindow; ctx::VkContext=vk_context())
             batch.dispatch_count = 0
             batch.last_was_rt = false
             empty!(batch.data_refs)
-            push!(ctx.free_batches, batch)
+            push!(ctx.default_bq.free_batches, batch)
             win.frame_batches[i] = nothing
         end
     end
@@ -252,9 +258,10 @@ function Base.isopen(win::RenderWindow)
     win.handle.handle != C_NULL && !GLFW.WindowShouldClose(win.handle)
 end
 
-function Base.close(win::RenderWindow; ctx::VkContext=vk_context())
+function Base.close(win::RenderWindow)
     # Idempotent -- safe to call multiple times
     win.handle.handle == C_NULL && return
+    ctx = win.ctx
     Vulkan.device_wait_idle(ctx.device)
     # Reclaim any in-flight frame batches (GPU is idle after device_wait_idle)
     for i in eachindex(win.frame_batches)
@@ -264,7 +271,7 @@ function Base.close(win::RenderWindow; ctx::VkContext=vk_context())
             batch.dispatch_count = 0
             batch.last_was_rt = false
             empty!(batch.data_refs)
-            push!(ctx.free_batches, batch)
+            push!(ctx.default_bq.free_batches, batch)
             win.frame_batches[i] = nothing
         end
     end

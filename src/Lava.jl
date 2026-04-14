@@ -179,8 +179,9 @@ function dump_state(; io::IO=stdout)
         println(io, "Arg slabs: $(length(bq.arg_slabs)) (slab_idx=$(bq.arg_slab_idx), offset=$(bq.arg_slab_offset))")
     end
     if ctx !== nothing
-        println(io, "Free batches: $(length(ctx.free_batches))")
-        println(io, "Free cmd bufs: $(length(ctx.free_cmd_bufs))")
+        bq = ctx.default_bq
+        println(io, "Free batches: $(length(bq.free_batches))")
+        println(io, "Free cmd bufs: $(length(bq.free_cmd_bufs))")
         println(io, "CB split threshold: $(CB_SPLIT_THRESHOLD[])")
     end
     println(io, "Flushes: $(FLUSH_COUNTER[])")

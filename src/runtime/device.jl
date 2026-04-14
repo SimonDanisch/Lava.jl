@@ -80,6 +80,12 @@ mutable struct BatchQueue
     # Will be removed once one_shot_copy goes through the regular batch path.
     xfer_cmd_buf::Vulkan.CommandBuffer
     xfer_fence::Vulkan.Fence
+    # Dedicated AS-build command buffer + fence — allocated from this BQ's
+    # own cmd_pool and submitted on this BQ's queue.  Keeping them on the
+    # BQ (not the VkContext) means AS build, submit and queue are locked
+    # together by construction.
+    as_cmd_buf::Vulkan.CommandBuffer
+    as_fence::Vulkan.Fence
 
     # ── Explicit-queue refactor additions ────────────────────────────────
     # One timeline semaphore per queue.  Each submit signals next_timeline+1.
@@ -146,13 +152,19 @@ function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32;
     xfer_alloc = Vulkan.CommandBufferAllocateInfo(cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1)
     xfer_cmd_buf = unwrap(Vulkan.allocate_command_buffers(device, xfer_alloc))[1]
     xfer_fence = Vulkan.Fence(device)
+    # Dedicated AS-build command buffer + fence (same pool as this bq).
+    as_alloc = Vulkan.CommandBufferAllocateInfo(cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1)
+    as_cmd_buf = unwrap(Vulkan.allocate_command_buffers(device, as_alloc))[1]
+    as_fence = Vulkan.Fence(device)
     # Per-queue timeline semaphore for cross-queue ordering.
     type_info = Vulkan.SemaphoreTypeCreateInfo(Vulkan.SEMAPHORE_TYPE_TIMELINE, UInt64(0))
     timeline_sem = unwrap(Vulkan.create_semaphore(device,
         Vulkan.SemaphoreCreateInfo(; next=type_info)))
     return BatchQueue(device, queue, qf_idx, cmd_pool, nothing,
                       CommandBatch[], batches, Vulkan.CommandBuffer[],
-                      xfer_cmd_buf, xfer_fence, timeline_sem, UInt64(0),
+                      xfer_cmd_buf, xfer_fence,
+                      as_cmd_buf, as_fence,
+                      timeline_sem, UInt64(0),
                       Any[], Any[],
                       Any[], 1, 0, 0,  # arg_slabs: idx=1, offset=0, count=0
                       Any[], 1, 0,     # indirect_slabs: idx=1, offset=0
@@ -177,9 +189,6 @@ mutable struct VkContext
     default_bq::BatchQueue
     # Secondary compute queue (async RT) — same family, separate queue object
     compute_queue::Vulkan.Queue
-    # Dedicated AS build command buffer + fence (always on primary queue)
-    as_cmd_buf::Vulkan.CommandBuffer
-    as_fence::Vulkan.Fence
     # Ray tracing (nothing if not available)
     rt_pipeline_properties::Union{Nothing, RTPipelineProperties}
     # Debug messenger (nothing if validation layers not available)
@@ -199,28 +208,6 @@ mutable struct VkContext
     # Cached physical-device properties (avoid re-querying on every alloc/dispatch).
     memory_properties::Vulkan.PhysicalDeviceMemoryProperties
     max_wg_dims::NTuple{3, Int}
-end
-
-# Convenience accessors — keep existing code working with minimal changes.
-# Batch-related fields and transfer resources delegate to default_bq.
-Base.getproperty(ctx::VkContext, s::Symbol) = begin
-    bq = getfield(ctx, :default_bq)
-    if s === :queue; return bq.queue
-    elseif s === :cmd_pool; return bq.cmd_pool
-    elseif s === :active_batch; return bq.active_batch
-    elseif s === :in_flight; return bq.in_flight
-    elseif s === :free_batches; return bq.free_batches
-    elseif s === :free_cmd_bufs; return bq.free_cmd_bufs
-    elseif s === :xfer_cmd_buf; return bq.xfer_cmd_buf
-    elseif s === :xfer_fence; return bq.xfer_fence
-    else; return getfield(ctx, s)
-    end
-end
-
-Base.setproperty!(ctx::VkContext, s::Symbol, v) = begin
-    if s === :active_batch; getfield(ctx, :default_bq).active_batch = v
-    else; setfield!(ctx, s, v)
-    end
 end
 
 # Ring buffer of recent validation messages for context on DEVICE_LOST
@@ -580,13 +567,8 @@ function init_vulkan!()
         )
     end
 
-    # Default batch queue on the primary queue (includes transfer cmd buf/fence)
+    # Default batch queue on the primary queue (owns transfer + AS-build cmd buf/fence)
     default_bq = BatchQueue(device, queue, qf_idx)
-
-    # Dedicated AS build command buffer + fence (separate from batch system, always primary queue)
-    as_alloc = Vulkan.CommandBufferAllocateInfo(default_bq.cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1)
-    as_cmd_buf = unwrap(Vulkan.allocate_command_buffers(device, as_alloc))[1]
-    as_fence = Vulkan.Fence(device)
 
     has_validation = !isempty(layers)
     if has_rt
@@ -614,7 +596,6 @@ function init_vulkan!()
     ctx = VkContext(
         instance, phys_dev, device, qf_idx, dev_name,
         default_bq, compute_queue,
-        as_cmd_buf, as_fence,
         rt_props,
         debug_messenger,
         2, n_queues,  # next_queue_index=2 (0=primary, 1=compute), max=n_queues

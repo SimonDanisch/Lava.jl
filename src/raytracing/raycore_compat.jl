@@ -37,23 +37,31 @@ mutable struct HardwareAccel
 end
 
 """
-    HardwareAccel(tlas; bq=vk_context().default_bq) -> HardwareAccel
+    HardwareAccel(tlas; bq=<derived from tlas storage>) -> HardwareAccel
 
 Build a HardwareAccel from a Raycore-compatible TLAS.
 The TLAS must have `.blas_array` and `.instances` fields.
+
+`bq` defaults to the BatchQueue whose ctx built the TLAS (the CPU-side TLAS
+object is used to find the ctx via the HW build path), so ray tracing runs
+on the same device the AS was allocated against.
 """
-function HardwareAccel(tlas; bq::BatchQueue=vk_context().default_bq)
-    hw_tlas, tri_data, offsets = build_hw_accel_from_tlas(tlas)
+function HardwareAccel(tlas;
+                       ctx::VkContext=vk_context(),
+                       bq::BatchQueue=ctx.default_bq)
+    hw_tlas, tri_data, offsets = build_hw_accel_from_tlas(tlas; ctx)
     HardwareAccel(hw_tlas, tri_data, offsets; bq)
 end
 
 """
-    HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets; bq=vk_context().default_bq) -> HardwareAccel
+    HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets; bq=<derived from hw_tlas>) -> HardwareAccel
 
 Build a HardwareAccel from a pre-built Vulkan TLAS + triangle data + offsets.
+Default `bq` is taken from `hw_tlas.storage.buf[].ctx.default_bq` so we never
+mismatch the AS against a queue on a different device.
 """
 function HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets;
-                       bq::BatchQueue=vk_context().default_bq)
+                       bq::BatchQueue=(hw_tlas.storage.buf[].ctx::VkContext).default_bq)
     rt = RayTracingPipeline(
         raygen=hw_raygen,
         closest_hit=hw_closesthit,
