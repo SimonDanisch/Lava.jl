@@ -105,7 +105,8 @@ function Base.copyto!(dest::LavaArray{T}, doffs::Integer,
     src_offset = src.buf[].pool_offset + (src.offset + Int(soffs) - 1) * sizeof(T)
     dst_offset = dest.buf[].pool_offset + (dest.offset + Int(doffs) - 1) * sizeof(T)
     nbytes = n * sizeof(T)
-    one_shot_copy(src.buf[].buffer, src_offset, dest.buf[].buffer, dst_offset, nbytes)
+    bq = (dest.buf[].ctx::VkContext).default_bq
+    one_shot_copy(bq, src.buf[].buffer, src_offset, dest.buf[].buffer, dst_offset, nbytes)
     return dest
 end
 
@@ -129,11 +130,13 @@ function Base.resize!(a::LavaArray{T,1}, n::Integer) where T
     n < 0 && throw(ArgumentError("new size must be non-negative"))
     old_len = length(a)
     n == old_len && return a
-    new_buf = pool_alloc(max(Int(n) * sizeof(T), 16))
+    ctx = a.buf[].ctx::VkContext
+    bq = ctx.default_bq
+    new_buf = pool_alloc(ctx, max(Int(n) * sizeof(T), 16))
     if old_len > 0 && n > 0
         copy_len = min(old_len, Int(n)) * sizeof(T)
         src_off = a.buf[].pool_offset + a.offset * sizeof(T)
-        one_shot_copy(a.buf[].buffer, src_off, new_buf.buffer, new_buf.pool_offset, copy_len)
+        one_shot_copy(bq, a.buf[].buffer, src_off, new_buf.buffer, new_buf.pool_offset, copy_len)
     end
     new_ref = GPUArrays.DataRef(new_buf) do buf
         vk_free!(buf)

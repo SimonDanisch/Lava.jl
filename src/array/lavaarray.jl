@@ -21,14 +21,15 @@ mutable struct LavaArray{T,N} <: AbstractGPUArray{T,N}
 end
 
 function LavaArray{T,N}(::UndefInitializer, dims::NTuple{N,Int};
+                        ctx::VkContext=vk_context(),
                         extra_usage::UInt32=UInt32(0)) where {T,N}
     nbytes = prod(dims) * sizeof(T)
     # Non-default usage (index buffer, AS input/storage, scratch, etc.)
     # bypasses the pool since those buffers need specific usage flags at
     # VkBuffer creation time. Default `extra_usage=0` uses the pool.
     managed_buf = extra_usage == UInt32(0) ?
-        pool_alloc(max(nbytes, 16)) :
-        vk_alloc(max(nbytes, 16); extra_usage)
+        pool_alloc(ctx, max(nbytes, 16)) :
+        vk_alloc(ctx, max(nbytes, 16); extra_usage)
     ref = GPUArrays.DataRef(managed_buf) do buf
         vk_free!(buf)
     end
@@ -162,9 +163,10 @@ function update!(dst::LavaArray{T,N}, data::AbstractArray{T,N}) where {T,N}
         # Free old buffer immediately (not deferred)
         old_ref = dst.buf
         GPUArrays.unsafe_free!(old_ref)
-        # Allocate new
+        # Allocate new (reuse the old buf's ctx so updates stay on the same device).
+        ctx = dst.buf[].ctx::VkContext
         new_nbytes = max(length(data) * sizeof(T), 16)
-        new_buf = pool_alloc(new_nbytes)
+        new_buf = pool_alloc(ctx, new_nbytes)
         new_ref = GPUArrays.DataRef(new_buf) do buf
             vk_free!(buf)
         end

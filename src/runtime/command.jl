@@ -136,7 +136,7 @@ function alloc_cmd_buf(bq::BatchQueue)
     alloc_info = Vulkan.CommandBufferAllocateInfo(
         bq.cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1
     )
-    return unwrap(Vulkan.allocate_command_buffers(vk_context().device, alloc_info))[1]
+    return unwrap(Vulkan.allocate_command_buffers(bq.device, alloc_info))[1]
 end
 
 """Reclaim a completed batch: reset fence, clear data refs, return to free pool."""
@@ -413,7 +413,7 @@ function submit!(bq::BatchQueue)
     submit_info = Vulkan.SubmitInfo2(wait_infos, cb_infos, [signal_info])
     submit_result = Vulkan.queue_submit_2(bq.queue, [submit_info])
     if iserror(submit_result)
-        mark_device_lost!(VK_CONTEXT_REF[])
+        mark_device_lost!(bq.ctx::VkContext)
         # Recover: drop the active batch so future submits can proceed.
         batch.recording = false
         empty!(batch.data_refs)
@@ -443,8 +443,7 @@ Called from the main thread at natural quiescent points.
 """
 function sweep_retired_batches!(bq::BatchQueue)
     isempty(bq.in_flight) && return
-    ctx = VK_CONTEXT_REF[]
-    (ctx === nothing || device_lost(ctx)) && return
+    device_lost(bq.ctx::VkContext) && return
     current = try
         unwrap(Vulkan.get_semaphore_counter_value(bq.device, bq.timeline_sem))
     catch
@@ -484,8 +483,7 @@ function flush!(bq::BatchQueue, device::Vulkan.Device)
         Vulkan.SemaphoreWaitInfo([bq.timeline_sem], [target]),
         typemax(UInt64))
     if iserror(wait_result)
-        ctx = VK_CONTEXT_REF[]
-        ctx === nothing || mark_device_lost!(ctx)
+        mark_device_lost!(bq.ctx::VkContext)
         throw_with_validation_context("vkWaitSemaphores", wait_result, 0, false)
     end
     sweep_retired_batches!(bq)
@@ -598,17 +596,22 @@ function wait_for_write(buf::VkManagedBuffer)
 end
 
 """
-    vk_flush!()
+    vk_flush!(bq::BatchQueue)
+    vk_flush!(ctx::VkContext)       # flushes ctx.default_bq
+    vk_flush!()                       # interactive sugar: flushes vk_context().default_bq
 
-Flush the default batch queue. Convenience wrapper for interactive use.
+Flush a specific batch queue.  Prefer the explicit forms so the call site
+makes it obvious which queue/context is being waited on.
 """
-function vk_flush!()
-    device_lost() && throw(LavaError("command flush", "Vulkan device lost",
+function vk_flush!(bq::BatchQueue)
+    ctx = bq.ctx::VkContext
+    device_lost(ctx) && throw(LavaError("command flush", "Vulkan device lost",
         "Call Lava.vk_reset_device!() to reinitialize, or restart Julia session."))
-    ctx = vk_context()
-    flush!(ctx.default_bq, ctx.device)
+    flush!(bq, bq.device)
     return
 end
+vk_flush!(ctx::VkContext) = vk_flush!(ctx.default_bq)
+vk_flush!() = vk_flush!(vk_context())
 
 # ── Piggybacked Download ──
 

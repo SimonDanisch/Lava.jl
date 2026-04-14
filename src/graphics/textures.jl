@@ -73,7 +73,6 @@ end
 """Create a 2D texture from a matrix of data."""
 function LavaTexture2D(data::Matrix{T}; ctx::VkContext=vk_context(), filter=:linear, wrap=:repeat) where T
     dev = ctx.device
-    phys = ctx.physical_device
 
     h, w = size(data)
     format = julia_to_vk_format(T)
@@ -89,7 +88,7 @@ function LavaTexture2D(data::Matrix{T}; ctx::VkContext=vk_context(), filter=:lin
         Vulkan.IMAGE_LAYOUT_UNDEFINED,
     )
 
-    memory = alloc_image_memory(dev, phys, image)
+    memory = alloc_image_memory(ctx, image)
 
     view = Vulkan.ImageView(dev, image, Vulkan.IMAGE_VIEW_TYPE_2D, format,
         Vulkan.ComponentMapping(

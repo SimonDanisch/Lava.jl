@@ -61,28 +61,28 @@ KA.get_backend(::LavaArray) = LavaBackend()
 # barriers in record_dispatch!, so synchronize() is only needed when the CPU
 # must observe GPU results (or at natural batch boundaries like end-of-sample).
 function KA.synchronize(backend::LavaBackend)
-    dev = vk_device()
-    flush!(backend.dispatch_bq, dev)
+    flush!(backend.dispatch_bq, backend.dispatch_bq.device)
     # If split, the upload queue may have pending transfers worth flushing too.
     if backend.upload_bq !== backend.dispatch_bq
-        flush!(backend.upload_bq, dev)
+        flush!(backend.upload_bq, backend.upload_bq.device)
     end
     return
 end
 KA.supports_unified(::LavaBackend) = true
-function KA.allocate(::LavaBackend, ::Type{T}, dims::Tuple; unified::Bool=false) where T
+function KA.allocate(backend::LavaBackend, ::Type{T}, dims::Tuple; unified::Bool=false) where T
+    ctx = backend.dispatch_bq.ctx::VkContext
     nbytes = prod(dims) * sizeof(T)
     # Use unified (BAR) memory when explicitly requested OR for tiny allocations
     # (≤ 64 bytes, e.g. WorkQueue.size counters). BAR memory enables direct CPU
     # readback without staging copy — 2x faster for queue length checks.
     if unified || nbytes <= 64
-        managed = vk_alloc_unified(nbytes)
+        managed = vk_alloc_unified(ctx, nbytes)
         ref = GPUArrays.DataRef(managed) do buf
             vk_free!(buf)
         end
         return LavaArray{T,length(dims)}(ref, Int.(dims))
     end
-    LavaArray{T}(undef, Int.(dims))
+    LavaArray{T}(undef, Int.(dims); ctx=ctx)
 end
 KA.unsafe_free!(x::LavaArray) = unsafe_free!(x)
 
@@ -178,19 +178,19 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     end
 
     ndrange, workgroupsize, iterspace, dynamic = KA.launch_config(obj, ndrange, workgroupsize)
-    ctx = KA.mkcontext(obj, ndrange, iterspace)
+    ka_ctx = KA.mkcontext(obj, ndrange, iterspace)
 
     blocks = KA.blocks(iterspace)
     nblocks = length(blocks)
     nblocks == 0 && return nothing
 
-    block_dims = pad_to_3d(size(blocks))
+    block_dims = pad_to_3d(bq.ctx::VkContext, size(blocks))
     nthreads = length(KA.workitems(iterspace))
     ws_3d = (nthreads, 1, 1)
 
     converted_f = KA.argconvert(obj, obj.f)
     converted_args = KA.argconvert.(Ref(obj), args)
-    all_args = (converted_f, ctx, converted_args...)
+    all_args = (converted_f, ka_ctx, converted_args...)
 
     batch = ensure_active_batch!(bq)
     record_arg_accesses!(bq, batch, args, obj.f)
@@ -208,22 +208,8 @@ end
 # Kernels like AK._accumulate_block! write to auxiliary arrays indexed by workgroup ID
 # without bounds checks — phantom workgroups cause out-of-bounds GPU memory writes.
 
-# Cached per-dimension workgroup count limits (filled on first use from device properties)
-const MAX_WG_DIMS = Ref((65535, 65535, 65535))  # conservative defaults
-const MAX_WG_DIMS_INITIALIZED = Ref(false)
-
-function init_max_wg_dims!()
-    MAX_WG_DIMS_INITIALIZED[] && return
-    ctx = vk_context()
-    props = Vulkan.get_physical_device_properties(ctx.physical_device)
-    wgc = props.limits.max_compute_work_group_count
-    MAX_WG_DIMS[] = (Int(wgc[1]), Int(wgc[2]), Int(wgc[3]))
-    MAX_WG_DIMS_INITIALIZED[] = true
-end
-
-push!(RESET_CALLBACKS, function()
-    MAX_WG_DIMS_INITIALIZED[] = false
-end)
+# Per-dimension workgroup count limits live on `VkContext.max_wg_dims` — queried
+# once at device creation. `pad_to_3d` and friends reach them via `bq.ctx`.
 
 # Find exact factor of n that is ≤ max_dim, for splitting workgroup counts.
 # Returns the largest factor ≤ max_dim, or max_dim if none found (over-dispatch).
@@ -244,10 +230,9 @@ function find_split_factor(n::Int, max_dim::Int)
     return max_dim
 end
 
-function pad_to_3d(t::NTuple{1,<:Integer})
-    init_max_wg_dims!()
+function pad_to_3d(ctx::VkContext, t::NTuple{1,<:Integer})
     n = Int(t[1])
-    max_x, max_y, max_z = MAX_WG_DIMS[]
+    max_x, max_y, _ = ctx.max_wg_dims
     n <= max_x && return (n, 1, 1)
     # Need to split into X * Y (or X * Y * Z)
     # Find X such that X divides n exactly and X ≤ max_x
@@ -267,22 +252,21 @@ function pad_to_3d(t::NTuple{1,<:Integer})
     @warn "pad_to_3d: over-dispatching $n as ($x, $y, 1) = $(x*y) workgroups" maxlog=1
     return (x, y, 1)
 end
-function pad_to_3d(t::NTuple{2,<:Integer})
-    init_max_wg_dims!()
+function pad_to_3d(ctx::VkContext, t::NTuple{2,<:Integer})
     x, y = Int(t[1]), Int(t[2])
-    max_x, max_y, _ = MAX_WG_DIMS[]
+    max_x, max_y, _ = ctx.max_wg_dims
     if x <= max_x && y <= max_y
         return (x, y, 1)
     end
     # Flatten and re-split
-    return pad_to_3d((x * y,))
+    return pad_to_3d(ctx, (x * y,))
 end
-function pad_to_3d(t::NTuple{3,<:Integer})
+function pad_to_3d(::VkContext, t::NTuple{3,<:Integer})
     (Int(t[1]), Int(t[2]), Int(t[3]))
 end
 # For N>3, flatten then split
-function pad_to_3d(t::NTuple{N,<:Integer}) where N
-    pad_to_3d((Int(prod(t)),))
+function pad_to_3d(ctx::VkContext, t::NTuple{N,<:Integer}) where N
+    pad_to_3d(ctx, (Int(prod(t)),))
 end
 
 """
@@ -415,7 +399,7 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
     else
         (256,)
     end
-    ws_3d = pad_to_3d(ws)
+    ws_3d = pad_to_3d(bq.ctx::VkContext, ws)
     ws_prod = prod(ws)
 
     # We need to compile the kernel with a static ndrange for __validindex.

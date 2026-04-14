@@ -34,7 +34,6 @@ function LavaFramebuffer(width::Integer, height::Integer;
                           depth::Bool=true,
                           color_format::Vulkan.Format=Vulkan.FORMAT_B8G8R8A8_SRGB)
     dev = ctx.device
-    phys = ctx.physical_device
 
     # Create color image
     color_image = Vulkan.Image(dev,
@@ -47,7 +46,7 @@ function LavaFramebuffer(width::Integer, height::Integer;
         Vulkan.SHARING_MODE_EXCLUSIVE, UInt32[],
         Vulkan.IMAGE_LAYOUT_UNDEFINED,
     )
-    color_memory = alloc_image_memory(dev, phys, color_image)
+    color_memory = alloc_image_memory(ctx, color_image)
     color_view = Vulkan.ImageView(dev, color_image, Vulkan.IMAGE_VIEW_TYPE_2D, color_format,
         Vulkan.ComponentMapping(
             Vulkan.COMPONENT_SWIZZLE_IDENTITY, Vulkan.COMPONENT_SWIZZLE_IDENTITY,
@@ -73,7 +72,7 @@ function LavaFramebuffer(width::Integer, height::Integer;
             Vulkan.SHARING_MODE_EXCLUSIVE, UInt32[],
             Vulkan.IMAGE_LAYOUT_UNDEFINED,
         )
-        depth_mem = alloc_image_memory(dev, phys, depth_img)
+        depth_mem = alloc_image_memory(ctx, depth_img)
         depth_vw = Vulkan.ImageView(dev, depth_img, Vulkan.IMAGE_VIEW_TYPE_2D, depth_format,
             Vulkan.ComponentMapping(
                 Vulkan.COMPONENT_SWIZZLE_IDENTITY, Vulkan.COMPONENT_SWIZZLE_IDENTITY,
@@ -90,29 +89,13 @@ function LavaFramebuffer(width::Integer, height::Integer;
 end
 
 """Allocate device-local memory for an image."""
-function alloc_image_memory(dev::Vulkan.Device, phys::Vulkan.PhysicalDevice, image::Vulkan.Image)
-    mem_reqs = Vulkan.get_image_memory_requirements(dev, image)
-    mem_props = Vulkan.get_physical_device_memory_properties(phys)
-
-    type_idx = find_memory_type(mem_props, mem_reqs.memory_type_bits,
+function alloc_image_memory(ctx::VkContext, image::Vulkan.Image)
+    mem_reqs = Vulkan.get_image_memory_requirements(ctx.device, image)
+    type_idx = find_memory_type(ctx, mem_reqs.memory_type_bits,
                                   Vulkan.MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-
-    mem = Vulkan.DeviceMemory(dev, mem_reqs.size, type_idx)
-    unwrap(Vulkan.bind_image_memory(dev, image, mem, UInt64(0)))
+    mem = Vulkan.DeviceMemory(ctx.device, mem_reqs.size, type_idx)
+    unwrap(Vulkan.bind_image_memory(ctx.device, image, mem, UInt64(0)))
     return mem
-end
-
-"""Find a memory type index matching required bits and properties."""
-function find_memory_type(mem_props, type_bits::UInt32, required_flags)
-    for i in 0:Int(mem_props.memory_type_count) - 1
-        if (type_bits & (1 << i)) != 0
-            flags = mem_props.memory_types[i + 1].property_flags
-            if (flags & required_flags) == required_flags
-                return UInt32(i)
-            end
-        end
-    end
-    error("No suitable memory type found for image allocation")
 end
 
 Base.size(fb::LavaFramebuffer) = (fb.width, fb.height)

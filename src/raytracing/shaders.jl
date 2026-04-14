@@ -78,7 +78,7 @@ function trace_rays!(bq::BatchQueue, pipeline::RayTracingPipeline, tlas::LavaTLA
 
     cached = get(pipeline.PIPELINE_CACHE, cache_key, nothing)
     if cached === nothing
-        cached = compile_rt_pipeline(pipeline, tt)
+        cached = compile_rt_pipeline(bq.ctx::VkContext, pipeline, tt)
         pipeline.PIPELINE_CACHE[cache_key] = cached
     end
     vk_pipeline, raygen_compiled, offsets, byval_sizes = cached
@@ -115,7 +115,7 @@ function trace_rays_indirect!(bq::BatchQueue, pipeline::RayTracingPipeline,
 
     cached = get(pipeline.PIPELINE_CACHE, cache_key, nothing)
     if cached === nothing
-        cached = compile_rt_pipeline(pipeline, tt)
+        cached = compile_rt_pipeline(bq.ctx::VkContext, pipeline, tt)
         pipeline.PIPELINE_CACHE[cache_key] = cached
     end
     vk_pipeline, raygen_compiled, offsets, byval_sizes = cached
@@ -159,7 +159,7 @@ end
 
 # ── Internal: Compile RT pipeline ──
 
-function compile_rt_pipeline(pipeline::RayTracingPipeline, raygen_tt)
+function compile_rt_pipeline(ctx::VkContext, pipeline::RayTracingPipeline, raygen_tt)
     pt = pipeline.payload_type
 
     # Compile raygen
@@ -187,6 +187,7 @@ function compile_rt_pipeline(pipeline::RayTracingPipeline, raygen_tt)
 
     # Create Vulkan RT pipeline from compiled SPIR-V
     vk_pipeline = create_rt_pipeline(
+        ctx,
         raygen_compiled.spirv_bytes,
         miss_compiled.spirv_bytes,
         chit_compiled.spirv_bytes;

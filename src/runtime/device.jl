@@ -110,6 +110,11 @@ mutable struct BatchQueue
     # that grows as needed via get_staging!. Reused across transfers.
     # Loose type — VkManagedBuffer is declared later in memory.jl.
     staging::Union{Nothing, Any}
+    # Back-reference to owning VkContext. Set post-construction by
+    # init_vulkan!/allocate_batch_queue!. `nothing` only during the brief
+    # window of default_bq construction before VkContext exists.
+    # Loose type — VkContext is declared below.
+    ctx::Any
 end
 
 function init_batch(device::Vulkan.Device, cb::Vulkan.CommandBuffer)
@@ -151,7 +156,8 @@ function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32;
                       Any[], Any[],
                       Any[], 1, 0, 0,  # arg_slabs: idx=1, offset=0, count=0
                       Any[], 1, 0,     # indirect_slabs: idx=1, offset=0
-                      nothing)          # staging (lazy)
+                      nothing,         # staging (lazy)
+                      nothing)         # ctx (set after VkContext is built)
 end
 
 """
@@ -190,6 +196,9 @@ mutable struct VkContext
     # holding a ref to the context check this to skip Vulkan calls on
     # invalid handles.
     device_lost::Bool
+    # Cached physical-device properties (avoid re-querying on every alloc/dispatch).
+    memory_properties::Vulkan.PhysicalDeviceMemoryProperties
+    max_wg_dims::NTuple{3, Int}
 end
 
 # Convenience accessors — keep existing code working with minimal changes.
@@ -597,7 +606,12 @@ function init_vulkan!()
     # Initialize zero-alloc Vulkan function pointers for hot paths
     CMD_PIPELINE_BARRIER_FPTR[] = Vulkan.function_pointer(device, "vkCmdPipelineBarrier")
 
-    return VkContext(
+    mem_props = Vulkan.get_physical_device_memory_properties(phys_dev)
+    phys_props = Vulkan.get_physical_device_properties(phys_dev)
+    wgc = phys_props.limits.max_compute_work_group_count
+    max_wg = (Int(wgc[1]), Int(wgc[2]), Int(wgc[3]))
+
+    ctx = VkContext(
         instance, phys_dev, device, qf_idx, dev_name,
         default_bq, compute_queue,
         as_cmd_buf, as_fence,
@@ -606,7 +620,11 @@ function init_vulkan!()
         2, n_queues,  # next_queue_index=2 (0=primary, 1=compute), max=n_queues
         async_qf_idx, async_n_queues,
         false,        # device_lost (fresh context)
+        mem_props, max_wg,
     )
+    # Wire up the back-reference so bq-aware code never reaches for VK_CONTEXT_REF[].
+    default_bq.ctx = ctx
+    return ctx
 end
 
 """
@@ -618,6 +636,10 @@ Used by Screen for isolated graphics rendering.
 """
 function allocate_batch_queue!()
     ctx = vk_context()
+    allocate_batch_queue!(ctx)
+end
+
+function allocate_batch_queue!(ctx::VkContext)
     idx = ctx.next_queue_index
     if idx < ctx.max_queue_count
         queue = Vulkan.get_device_queue(ctx.device, ctx.queue_family_index, UInt32(idx))
@@ -626,7 +648,9 @@ function allocate_batch_queue!()
         # All hardware queues taken — reuse primary queue with separate command pool
         queue = ctx.default_bq.queue
     end
-    return BatchQueue(ctx.device, queue, ctx.queue_family_index)
+    bq = BatchQueue(ctx.device, queue, ctx.queue_family_index)
+    bq.ctx = ctx
+    return bq
 end
 
 function pick_physical_device(devs)

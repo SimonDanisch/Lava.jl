@@ -14,8 +14,8 @@ struct LavaBuffer{T}
     length::Int
 end
 
-function LavaBuffer{T}(n::Integer) where T
-    buf = vk_alloc(n * sizeof(T))
+function LavaBuffer{T}(n::Integer; ctx::VkContext=vk_context()) where T
+    buf = vk_alloc(ctx, n * sizeof(T))
     LavaBuffer{T}(buf, Int(n))
 end
 
@@ -638,7 +638,7 @@ end
 
 function ensure_arg_slab!(bq::BatchQueue, min_size::Int)
     while length(bq.arg_slabs) < bq.arg_slab_idx
-        push!(bq.arg_slabs, vk_alloc_mapped(max(ARG_SLAB_SIZE, min_size)))
+        push!(bq.arg_slabs, vk_alloc_mapped(bq.ctx::VkContext, max(ARG_SLAB_SIZE, min_size)))
     end
     slab = bq.arg_slabs[bq.arg_slab_idx]::VkMappedBuffer
     # If current slab is too small for the allocation, move to next slab
@@ -646,7 +646,7 @@ function ensure_arg_slab!(bq::BatchQueue, min_size::Int)
         bq.arg_slab_idx += 1
         bq.arg_slab_offset = 0
         while length(bq.arg_slabs) < bq.arg_slab_idx
-            push!(bq.arg_slabs, vk_alloc_mapped(max(ARG_SLAB_SIZE, min_size)))
+            push!(bq.arg_slabs, vk_alloc_mapped(bq.ctx::VkContext, max(ARG_SLAB_SIZE, min_size)))
         end
     end
 end

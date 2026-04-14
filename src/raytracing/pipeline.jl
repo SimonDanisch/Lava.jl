@@ -26,6 +26,9 @@ struct LavaRTPipeline
     push_constant_size::UInt32
     # Stage flags for push constants and descriptor sets
     stage_flags::Vulkan.ShaderStageFlag
+    # Context this pipeline was built against (for descriptor-set creation,
+    # SBT uploads, etc. — no global lookups needed).
+    ctx::VkContext
 end
 
 """
@@ -41,12 +44,12 @@ Layout:
   - Descriptor set 0, binding 0: AccelerationStructure (TLAS)
   - Push constant: BDA pointer (8 bytes by default)
 """
-function create_rt_pipeline(raygen_spirv::Vector{UInt8},
+function create_rt_pipeline(ctx::VkContext,
+                            raygen_spirv::Vector{UInt8},
                             miss_spirv::Vector{UInt8},
                             chit_spirv::Vector{UInt8};
                             anyhit_spirv::Union{Nothing, Vector{UInt8}}=nothing,
                             push_constant_size::Integer=8)
-    ctx = vk_context()
     dev = ctx.device
     rt_props = ctx.rt_pipeline_properties
     rt_props === nothing && throw(LavaError(
@@ -155,7 +158,7 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
 
     # Build SBT (still 3 groups — any-hit is part of the hit group, not a separate group)
     sbt_buf, raygen_region, miss_region, hit_region, callable_region =
-        build_sbt(dev, pipeline, rt_props, 3)
+        build_sbt(ctx, pipeline, rt_props, 3)
 
     return LavaRTPipeline(
         pipeline, layout, ds_layout,
@@ -164,6 +167,7 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
         raygen_region, miss_region, hit_region, callable_region,
         UInt32(push_constant_size),
         all_stage_flags,
+        ctx,
     )
 end
 
@@ -208,7 +212,7 @@ function get_rt_descriptor_set(pipeline::LavaRTPipeline, tlas::LavaTLAS)
         evict_stale_rt_desc_cache!()
     end
 
-    dev = vk_device()
+    dev = pipeline.ctx.device
     desc_pool = Vulkan.DescriptorPool(dev, UInt32(1), [
         Vulkan.DescriptorPoolSize(
             Vulkan.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, UInt32(1)),
@@ -311,8 +315,9 @@ function create_shader_module(dev, spirv_bytes::Vector{UInt8})
 end
 
 """Build the shader binding table for a 3-group RT pipeline (raygen, miss, chit)."""
-function build_sbt(dev, pipeline::Vulkan.Pipeline, rt_props::RTPipelineProperties,
+function build_sbt(ctx::VkContext, pipeline::Vulkan.Pipeline, rt_props::RTPipelineProperties,
                     n_groups::Int)
+    dev = ctx.device
     handle_size = rt_props.shader_group_handle_size
     base_align = rt_props.shader_group_base_alignment
 
@@ -341,7 +346,7 @@ function build_sbt(dev, pipeline::Vulkan.Pipeline, rt_props::RTPipelinePropertie
                      align_up(miss_size, base_align) +
                      align_up(hit_size, base_align)
 
-    sbt_buf = vk_alloc(total_sbt_size;
+    sbt_buf = vk_alloc(ctx, total_sbt_size;
         extra_usage=UInt32(Vulkan.BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR))
 
     # Upload SBT data via staging

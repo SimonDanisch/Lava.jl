@@ -61,22 +61,23 @@ storage_last_write(blas::LavaBLAS) = blas.storage.buf[].last_write
 storage_last_write(tlas::LavaTLAS) = tlas.storage.buf[].last_write
 
 function unsafe_free!(as::Union{LavaBLAS, LavaTLAS})
-    device_lost() && return
     lw = storage_last_write(as)
     if lw !== nothing
         bq = lw[1]::BatchQueue
         val = lw[2]::UInt64
-        ctx = VK_CONTEXT_REF[]
-        if ctx !== nothing
-            current = try
-                unwrap(Vulkan.get_semaphore_counter_value(bq.device, bq.timeline_sem))
-            catch
-                typemax(UInt64)
-            end
-            if current < val
-                push!(bq.deferred_as_frees, as)   # resurrect + defer
-                return
-            end
+        ctx = bq.ctx::VkContext
+        if device_lost(ctx)
+            destroy_now!(as)
+            return
+        end
+        current = try
+            unwrap(Vulkan.get_semaphore_counter_value(bq.device, bq.timeline_sem))
+        catch
+            typemax(UInt64)
+        end
+        if current < val
+            push!(bq.deferred_as_frees, as)   # resurrect + defer
+            return
         end
     end
     destroy_now!(as)
@@ -104,8 +105,8 @@ buffer's `last_write` timeline has been reached.  Called at flush sync points.
 """
 function drain_deferred_as_frees!(bq::BatchQueue)
     isempty(bq.deferred_as_frees) && return
-    ctx = VK_CONTEXT_REF[]
-    (ctx === nothing || device_lost(ctx)) && (empty!(bq.deferred_as_frees); return)
+    ctx = bq.ctx::VkContext
+    device_lost(ctx) && (empty!(bq.deferred_as_frees); return)
     current = try
         unwrap(Vulkan.get_semaphore_counter_value(bq.device, bq.timeline_sem))
     catch
@@ -138,6 +139,7 @@ mutable struct ASBuildContext
     device::Vulkan.Device
     queue::Vulkan.Queue
     preserves::Vector{Any}
+    vkctx::VkContext
 end
 
 """
@@ -151,8 +153,8 @@ function build_blas(ctx::ASBuildContext, vertices::Vector{NTuple{3,Float32}}, in
     dev = ctx.device
 
     # Upload vertex/index data to device-local buffers (LavaArrays).
-    vertex_arr = create_as_input_buffer(reinterpret(UInt8, vertices))
-    index_arr  = create_as_input_buffer(reinterpret(UInt8, indices))
+    vertex_arr = create_as_input_buffer(ctx.vkctx, reinterpret(UInt8, vertices))
+    index_arr  = create_as_input_buffer(ctx.vkctx, reinterpret(UInt8, indices))
     vertex_addr = vertex_arr.buf[].address
     index_addr  = index_arr.buf[].address
 
@@ -172,12 +174,12 @@ function build_blas(ctx::ASBuildContext, vertices::Vector{NTuple{3,Float32}}, in
         max_vertex, index_type=itype, index_addr,
         geo_flags, max_primitive_count=n_triangles)
 
-    storage = create_as_storage_buffer(sizes.acceleration_structure_size)
+    storage = create_as_storage_buffer(ctx.vkctx, sizes.acceleration_structure_size)
     accel = Vulkan.AccelerationStructureKHR(dev, Vulkan.AccelerationStructureCreateInfoKHR(
         storage.buf[].buffer, UInt64(0), sizes.acceleration_structure_size,
         Vulkan.ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR))
 
-    scratch_arr, scratch_addr = create_scratch_buffer(vk_context(), sizes.build_scratch_size)
+    scratch_arr, scratch_addr = create_scratch_buffer(ctx.vkctx, sizes.build_scratch_size)
 
     # Build inputs (vertex + index) must outlive the BLAS — the driver may
     # retain VAs into them.  Kept as LavaArrays so their own last_write
@@ -224,7 +226,7 @@ function build_tlas(ctx::ASBuildContext, blas_list::Vector{LavaBLAS};
         )
     end
 
-    inst_arr = create_as_input_buffer(instance_data)
+    inst_arr = create_as_input_buffer(ctx.vkctx, instance_data)
     inst_addr = inst_arr.buf[].address
     build_flags = UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
 
@@ -234,12 +236,12 @@ function build_tlas(ctx::ASBuildContext, blas_list::Vector{LavaBLAS};
         instance_addr=inst_addr,
         max_primitive_count=UInt32(n_instances))
 
-    storage = create_as_storage_buffer(sizes.acceleration_structure_size)
+    storage = create_as_storage_buffer(ctx.vkctx, sizes.acceleration_structure_size)
     accel = Vulkan.AccelerationStructureKHR(dev, Vulkan.AccelerationStructureCreateInfoKHR(
         storage.buf[].buffer, UInt64(0), sizes.acceleration_structure_size,
         Vulkan.ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR))
 
-    scratch_arr, scratch_addr = create_scratch_buffer(vk_context(), sizes.build_scratch_size)
+    scratch_arr, scratch_addr = create_scratch_buffer(ctx.vkctx, sizes.build_scratch_size)
 
     # Instance buffer must outlive the TLAS (driver may retain VAs).
     # Scratch is submit-lifetime — ctx.preserves + fence wait handles it.
@@ -307,8 +309,7 @@ Unlike `create_as_input_buffer` which uploads specific data, this allocates
 an empty mappable buffer of `nbytes` for the caller to fill via map/memcpy/unmap.
 Returns (buffer, memory, base_device_address).
 """
-function create_as_input_pool(nbytes::UInt64)
-    ctx = vk_context()
+function create_as_input_pool(ctx::VkContext, nbytes::UInt64)
     dev = ctx.device
 
     buf = Vulkan.Buffer(
@@ -321,7 +322,7 @@ function create_as_input_pool(nbytes::UInt64)
 
     mem_reqs = Vulkan.get_buffer_memory_requirements(dev, buf)
     mem_type_idx = find_memory_type(
-        mem_reqs.memory_type_bits,
+        ctx, mem_reqs.memory_type_bits,
         Vulkan.MEMORY_PROPERTY_HOST_VISIBLE_BIT |
         Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT,
     )
@@ -352,17 +353,17 @@ const AS_SCRATCH_USAGE = UInt32(
 
 """Create an AS input buffer (vertex/index/instance data) — a LavaArray
 whose lifetime is tracked through its VkManagedBuffer's `last_write`."""
-function create_as_input_buffer(data::Union{Vector{UInt8}, Base.ReinterpretArray})
+function create_as_input_buffer(ctx::VkContext, data::Union{Vector{UInt8}, Base.ReinterpretArray})
     bytes = data isa Base.ReinterpretArray ? collect(data) : data
     arr = LavaArray{UInt8, 1}(undef, (max(length(bytes), 16),);
-                              extra_usage=AS_INPUT_USAGE)
+                              ctx, extra_usage=AS_INPUT_USAGE)
     upload!(arr, bytes)
     return arr
 end
 
 """Create an AS storage buffer as a LavaArray."""
-function create_as_storage_buffer(nbytes)
-    LavaArray{UInt8, 1}(undef, (max(nbytes, 16),); extra_usage=AS_STORAGE_USAGE)
+function create_as_storage_buffer(ctx::VkContext, nbytes)
+    LavaArray{UInt8, 1}(undef, (max(nbytes, 16),); ctx, extra_usage=AS_STORAGE_USAGE)
 end
 
 """Create a scratch buffer for AS build, aligned to
@@ -375,7 +376,7 @@ function create_scratch_buffer(ctx::VkContext, nbytes)
     scratch_align = max(scratch_align, UInt64(1))
     aligned_size = max(UInt64(nbytes) + (scratch_align - UInt64(1)), scratch_align)
 
-    arr = LavaArray{UInt8, 1}(undef, (Int(aligned_size),); extra_usage=AS_SCRATCH_USAGE)
+    arr = LavaArray{UInt8, 1}(undef, (Int(aligned_size),); ctx, extra_usage=AS_SCRATCH_USAGE)
     base_addr = arr.buf[].address
     aligned_addr = ((base_addr + scratch_align - UInt64(1)) ÷ scratch_align) * scratch_align
     return arr, aligned_addr
@@ -543,9 +544,7 @@ end
 BLAS device addresses are available immediately after `build_blas` returns
 (even before the GPU build executes), so `build_tlas` can reference them.
 """
-function as_build(f)
-    vkctx = vk_context()
-
+function as_build(f; vkctx::VkContext=vk_context())
     # Flush any pending compute dispatches before AS builds (the AS build
     # reads vertex/index/instance buffers that prior dispatches may have
     # written to).
@@ -558,7 +557,7 @@ function as_build(f)
         flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     )))
 
-    ctx = ASBuildContext(cmd, vkctx.as_fence, vkctx.device, vkctx.queue, Any[])
+    ctx = ASBuildContext(cmd, vkctx.as_fence, vkctx.device, vkctx.queue, Any[], vkctx)
     result = try
         f(ctx)
     catch
@@ -674,12 +673,12 @@ of Vulkan allocations to ~6 regardless of mesh count.
 provide per-BLAS geometry. Returns one `LavaBLAS` per input.
 """
 function build_blas_pooled(all_vertices::Vector{Vector{NTuple{3,Float32}}},
-                           all_indices::Vector{Vector{UInt32}})
+                           all_indices::Vector{Vector{UInt32}};
+                           ctx::VkContext=vk_context())
     n_blas = length(all_vertices)
     n_blas == 0 && return LavaBLAS[]
     @assert length(all_indices) == n_blas
 
-    ctx = vk_context()
     dev = ctx.device
 
     vfmt = UInt32(Vulkan.FORMAT_R32G32B32_SFLOAT)
@@ -727,8 +726,8 @@ function build_blas_pooled(all_vertices::Vector{Vector{NTuple{3,Float32}}},
     total_as_bytes = as_cursor
 
     # Pass 2: Allocate pooled buffers (3 allocations total)
-    input_buf, input_mem, input_base_addr = create_as_input_pool(max(total_input_bytes, 16))
-    as_pool_arr = create_as_storage_buffer(max(total_as_bytes, 16))
+    input_buf, input_mem, input_base_addr = create_as_input_pool(ctx, max(total_input_bytes, 16))
+    as_pool_arr = create_as_storage_buffer(ctx, max(total_as_bytes, 16))
     as_pool_buf = as_pool_arr.buf[].buffer
     as_pool_mem = as_pool_arr.buf[].memory
     scratch_arr, scratch_addr = create_scratch_buffer(ctx, max(max_scratch_size, 16))
@@ -881,13 +880,12 @@ tri = triangle_data[blas_offsets[instance_custom_index + 1] + primitive_id + 1]
 ```
 where `instance_custom_index` = BLAS index (0-based) set by this function.
 """
-function build_hw_accel_from_tlas(tlas)
+function build_hw_accel_from_tlas(tlas; ctx::VkContext=vk_context())
     instances = to_cpu_vector(tlas.instances)
     blas_array = to_cpu_vector(tlas.blas_array)
 
     n_blas = length(blas_array)
     n_instances = length(instances)
-    ctx = vk_context()
     dev = ctx.device
 
     # ── Pass 1: Collect all geometry on CPU ──
@@ -973,10 +971,10 @@ function build_hw_accel_from_tlas(tlas)
 
     # ── Pass 3: Allocate pooled buffers ──
     # Input pool: HOST_VISIBLE for direct upload
-    input_buf, input_mem, input_base_addr = create_as_input_pool(max(total_input_bytes, 16))
+    input_buf, input_mem, input_base_addr = create_as_input_pool(ctx, max(total_input_bytes, 16))
 
     # AS storage pool: DEVICE_LOCAL (LavaArray — shared across all pooled BLASes)
-    as_pool_arr = create_as_storage_buffer(max(total_as_bytes, 16))
+    as_pool_arr = create_as_storage_buffer(ctx, max(total_as_bytes, 16))
     as_pool_buf = as_pool_arr.buf[].buffer
     as_pool_mem = as_pool_arr.buf[].memory
 
