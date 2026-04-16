@@ -139,19 +139,15 @@ function readback_framebuffer(fb::LavaFramebuffer)
     bq = ctx.default_bq
     dev = ctx.device
 
-    if has_active_recording(bq)
-        flush!(bq, dev)
-    end
-
     bpp = format_pixel_size(fb.color_format)
     T = format_element_type(fb.color_format)
     nbytes = fb.width * fb.height * bpp
     staging_buf, _, mapped_ptr, _ = get_staging(bq, nbytes)
 
-    cmd = bq.xfer_cmd_buf
-    fence = bq.xfer_fence
-    unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(;
-        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
+    # Record image→buffer copy into the active batch.  flush! at the end
+    # blocks until the GPU finishes, then we read the mapped staging bytes.
+    batch = ensure_active_batch!(bq)
+    cmd = batch.cmd_buf
 
     transition_image!(cmd, fb.color_image,
         Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -168,14 +164,8 @@ function readback_framebuffer(fb::LavaFramebuffer)
     Vulkan.cmd_copy_image_to_buffer(cmd, fb.color_image,
         Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_buf, [region])
 
-    unwrap(Vulkan.end_command_buffer(cmd))
-
-    submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    unwrap(Vulkan.queue_submit(bq.queue, [submit_info]; fence=fence))
-    unwrap(Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64)))
-    unwrap(Vulkan.reset_fences(dev, [fence]))
-    drain_deferred_frees!(bq)
-    drain_deferred_as_frees!(bq)
+    pin!(batch, fb)
+    flush!(bq, dev)
 
     pixels = Matrix{T}(undef, fb.width, fb.height)
     unsafe_copyto!(Ptr{UInt8}(pointer(pixels)), Ptr{UInt8}(mapped_ptr), nbytes)
@@ -194,10 +184,6 @@ function readback_window(win::RenderWindow)
     bq = ctx.default_bq
     dev = ctx.device
 
-    if has_active_recording(bq)
-        flush!(bq, dev)
-    end
-
     w, h = size(win)
     bpp = format_pixel_size(win.format)
     T = format_element_type(win.format)
@@ -206,10 +192,9 @@ function readback_window(win::RenderWindow)
 
     image = win.images[win.current_image_idx + 1]
 
-    cmd = bq.xfer_cmd_buf
-    fence = bq.xfer_fence
-    unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(;
-        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
+    # Record image→buffer copy into the active batch, blocking flush at end.
+    batch = ensure_active_batch!(bq)
+    cmd = batch.cmd_buf
 
     transition_image!(cmd, image,
         Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -232,14 +217,8 @@ function readback_window(win::RenderWindow)
         Vulkan.PIPELINE_STAGE_TRANSFER_BIT, Vulkan.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
         Vulkan.ACCESS_TRANSFER_READ_BIT, Vulkan.AccessFlag(0))
 
-    unwrap(Vulkan.end_command_buffer(cmd))
-
-    submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    unwrap(Vulkan.queue_submit(bq.queue, [submit_info]; fence=fence))
-    unwrap(Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64)))
-    unwrap(Vulkan.reset_fences(dev, [fence]))
-    drain_deferred_frees!(bq)
-    drain_deferred_as_frees!(bq)
+    pin!(batch, win)
+    flush!(bq, dev)
 
     pixels = Matrix{T}(undef, w, h)
     unsafe_copyto!(Ptr{UInt8}(pointer(pixels)), Ptr{UInt8}(mapped_ptr), nbytes)

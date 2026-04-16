@@ -153,7 +153,7 @@ function create_rt_pipeline(ctx::VkContext,
         Int32(-1);  # base_pipeline_index
     )
 
-    pipelines, _ = unwrap(Vulkan.create_ray_tracing_pipelines_khr(dev, [rt_ci]))
+    pipelines, _ = @vk_checked "vkCreateRayTracingPipelinesKHR" Vulkan.create_ray_tracing_pipelines_khr(dev, [rt_ci])
     pipeline = pipelines[1]
 
     # Build SBT (still 3 groups — any-hit is part of the hit group, not a separate group)
@@ -178,9 +178,15 @@ const RT_DESC_CACHE = Dict{Tuple{UInt64, UInt64}, Tuple{Vulkan.DescriptorPool, V
 const MAX_RT_DESC_CACHE_SIZE = 32
 
 push!(RESET_CALLBACKS, function()
-    # Destroy all descriptor pools on device reset
+    # Destroy all descriptor pools on device reset.  A destructor failure
+    # here is almost always "device already torn down" — log via
+    # jl_safe_printf so we never lose the signal without blocking the reset.
     for (key, (pool, ds, wr)) in RT_DESC_CACHE
-        try pool.destructor() catch end
+        try
+            pool.destructor()
+        catch
+            safe_fin_log("Lava RT_DESC_CACHE reset: descriptor pool destructor failed\n")
+        end
     end
     empty!(RT_DESC_CACHE)
 end)
@@ -194,7 +200,11 @@ function evict_stale_rt_desc_cache!()
     end
     for key in stale_keys
         pool, ds, wr = RT_DESC_CACHE[key]
-        try pool.destructor() catch end
+        try
+            pool.destructor()
+        catch
+            safe_fin_log("Lava RT_DESC_CACHE evict: descriptor pool destructor failed\n")
+        end
         delete!(RT_DESC_CACHE, key)
     end
 end
@@ -217,8 +227,8 @@ function get_rt_descriptor_set(pipeline::LavaRTPipeline, tlas::LavaTLAS)
         Vulkan.DescriptorPoolSize(
             Vulkan.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, UInt32(1)),
     ])
-    desc_sets = unwrap(Vulkan.allocate_descriptor_sets(dev,
-        Vulkan.DescriptorSetAllocateInfo(desc_pool, [pipeline.descriptor_set_layout])))
+    desc_sets = @vk_checked "vkAllocateDescriptorSets (RT)" Vulkan.allocate_descriptor_sets(dev,
+        Vulkan.DescriptorSetAllocateInfo(desc_pool, [pipeline.descriptor_set_layout]))
     desc_set = desc_sets[1]
 
     as_write = Vulkan.WriteDescriptorSetAccelerationStructureKHR([tlas.accel])
@@ -257,11 +267,11 @@ function rt_dispatch!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::LavaTLAS,
         cmd = batch.cmd_buf
         desc_set = get_rt_descriptor_set(pipeline, tlas)
         Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline.pipeline)
-        push!(batch.data_refs, pipeline)
+        pin!(batch, pipeline)
         Vulkan.cmd_bind_descriptor_sets(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR,
             pipeline.pipeline_layout, UInt32(0), [desc_set], UInt32[])
-        push!(batch.data_refs, tlas)
-        track_buffer_access!(bq, batch, tlas.storage.buf[])
+        pin!(batch, tlas.accel)
+        pin!(batch, tlas.storage)
         push_constants_bda!(cmd, pipeline.pipeline_layout, pipeline.stage_flags, push_bda)
         Vulkan.cmd_trace_rays_khr(cmd,
             pipeline.raygen_region, pipeline.miss_region,
@@ -290,11 +300,11 @@ function rt_dispatch_indirect!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::L
         cmd = batch.cmd_buf
         desc_set = get_rt_descriptor_set(pipeline, tlas)
         Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline.pipeline)
-        push!(batch.data_refs, pipeline)
+        pin!(batch, pipeline)
         Vulkan.cmd_bind_descriptor_sets(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR,
             pipeline.pipeline_layout, UInt32(0), [desc_set], UInt32[])
-        push!(batch.data_refs, tlas)
-        track_buffer_access!(bq, batch, tlas.storage.buf[])
+        pin!(batch, tlas.accel)
+        pin!(batch, tlas.storage)
         push_constants_bda!(cmd, pipeline.pipeline_layout, pipeline.stage_flags, push_bda)
 
         indirect_address = indirect_buf isa VkIndirectBuffer ? indirect_buf.address : indirect_buf.address
@@ -302,7 +312,7 @@ function rt_dispatch_indirect!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::L
             pipeline.raygen_region, pipeline.miss_region,
             pipeline.hit_region, pipeline.callable_region,
             UInt64(indirect_address + indirect_offset))
-        push!(batch.data_refs, indirect_buf)
+        pin!(batch, indirect_buf)
     end
 end
 

@@ -120,24 +120,16 @@ function upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}) where T
     staging_buf, _, mapped_ptr, _ = get_staging(bq, nbytes)
     unsafe_copyto!(Ptr{UInt8}(mapped_ptr), pointer(bytes), nbytes)
 
-    # Flush pending commands on bq first (this upload uses bq.xfer_cmd_buf)
-    if has_active_recording(bq)
-        flush!(bq, dev)
-    end
+    # Record image upload into the active batch.  Staging buffer is owned
+    # by `bq.staging`; no pin required (the field holds a strong ref).
+    batch = ensure_active_batch!(bq)
+    cmd = batch.cmd_buf
 
-    # Use the dedicated transfer command buffer (not the dispatch batches).
-    cmd = bq.xfer_cmd_buf
-    fence = bq.xfer_fence
-    unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(;
-        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
-
-    # Transition to TRANSFER_DST
     transition_image!(cmd, tex.image,
         Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         Vulkan.PIPELINE_STAGE_TOP_OF_PIPE_BIT, Vulkan.PIPELINE_STAGE_TRANSFER_BIT,
         Vulkan.AccessFlag(0), Vulkan.ACCESS_TRANSFER_WRITE_BIT)
 
-    # Copy buffer to image
     region = Vulkan.BufferImageCopy(
         UInt64(0), UInt32(0), UInt32(0),
         Vulkan.ImageSubresourceLayers(Vulkan.IMAGE_ASPECT_COLOR_BIT,
@@ -148,20 +140,16 @@ function upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}) where T
     Vulkan.cmd_copy_buffer_to_image(cmd, staging_buf, tex.image,
         Vulkan.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, [region])
 
-    # Transition to SHADER_READ_ONLY
     transition_image!(cmd, tex.image,
         Vulkan.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, Vulkan.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         Vulkan.PIPELINE_STAGE_TRANSFER_BIT, Vulkan.PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
         Vulkan.ACCESS_TRANSFER_WRITE_BIT, Vulkan.ACCESS_SHADER_READ_BIT)
 
-    # Submit using dedicated transfer fence
-    unwrap(Vulkan.end_command_buffer(cmd))
-    submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    unwrap(Vulkan.queue_submit(bq.queue, [submit_info]; fence=fence))
-    unwrap(Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64)))
-    unwrap(Vulkan.reset_fences(dev, [fence]))
-    drain_deferred_frees!(bq)
-    drain_deferred_as_frees!(bq)
+    # Pin the texture so the batch keeps it alive until the fence.
+    pin!(batch, tex)
+    # Flush now — upload!(tex) is a synchronous API (caller expects the texture
+    # to be ready on return).
+    flush!(bq, dev)
 end
 
 # ── Format Mapping ──
@@ -205,7 +193,7 @@ function bind_textures(textures::Vector{<:SampledTexture})
         [Vulkan.DescriptorPoolSize(Vulkan.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, UInt32(n))])
 
     alloc_info = Vulkan.DescriptorSetAllocateInfo(pool, [layout])
-    sets = unwrap(Vulkan.allocate_descriptor_sets(dev, alloc_info))
+    sets = @vk_checked "vkAllocateDescriptorSets (textures)" Vulkan.allocate_descriptor_sets(dev, alloc_info)
     dset = sets[1]
 
     # Write descriptors

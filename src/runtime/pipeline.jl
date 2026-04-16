@@ -155,8 +155,8 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
     while length(PIPELINE_INSERTION_ORDER) > MAX_PIPELINE_CACHE_SIZE[]
         old_key = popfirst!(PIPELINE_INSERTION_ORDER)
         delete!(PIPELINE_CACHE, old_key)
-        # No defensive pin needed: every dispatch pushes its pipeline to
-        # `batch.data_refs`, so any in-flight batch that used this pipeline
+        # No defensive pin needed: every dispatch pin!s its pipeline into
+        # `batch.pinned`, so any in-flight batch that used this pipeline
         # holds a strong ref.  Once all such batches retire the ref drops
         # naturally and GC runs the destructor.
     end
@@ -182,7 +182,7 @@ function create_compute_pipeline(dev::Vulkan.Device, ci::Vulkan.ComputePipelineC
         destructor = x -> Vulkan._destroy_pipeline(parent, x)
         return Vulkan.Pipeline(raw_pipeline, destructor, dev)
     else
-        pipelines, _ = unwrap(Vulkan.create_compute_pipelines(dev, [ci]))
+        pipelines, _ = @vk_checked "vkCreateComputePipelines" Vulkan.create_compute_pipelines(dev, [ci])
         return pipelines[1]
     end
 end

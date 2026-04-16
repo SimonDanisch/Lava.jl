@@ -229,15 +229,13 @@ function pack_gfx_args(bq::BatchQueue, args, push_info::PushConstantInfo)
     push_info.push_size == 0 && return UInt8[]
     isempty(args) && return UInt8[]
 
-    # Convert LavaArray -> LavaDeviceArray (same as KA's Adapt path)
-    # so the byval struct {ptr, dims} gets inlined correctly into the arg buffer.
-    converted = map(args) do arg
-        if arg isa LavaArray
-            return LavaDeviceArray(arg)
-        else
-            return arg
-        end
-    end
+    batch = ensure_active_batch!(bq)
+    # LavaAdaptor is the single point that strips LavaArray → LavaDeviceArray
+    # AND pins the original into batch.pinned.  Adapt.jl's recursion handles
+    # wrapper structs / Broadcasted / NamedTuple, so any nested LavaArray
+    # gets both its pointer strip and its pin in the same pass.
+    adaptor = LavaAdaptor(batch)
+    converted = map(a -> Adapt.adapt(adaptor, a), args)
 
     # Use the same arg buffer packing as compute: inline byval structs into
     # the arg buffer with self-referencing BDA pointers.
@@ -248,11 +246,9 @@ function pack_gfx_args(bq::BatchQueue, args, push_info::PushConstantInfo)
     total_size = push_info.arg_buffer_size + inline_extra
 
     arg_buf = get_arg_buffer(bq, total_size)
-    pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
-                       push_info.arg_buffer_size, byval_sizes, converted)
 
-    batch = ensure_active_batch!(bq)
-    record_arg_accesses!(bq, batch, args)
+    pack_args_direct!(bq, arg_buf.mapped_ptr, arg_buf.address, offsets,
+                       push_info.arg_buffer_size, byval_sizes, converted)
 
     # Push constant = BDA of arg buffer
     push_data = Vector{UInt8}(undef, 8)

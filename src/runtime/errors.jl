@@ -88,6 +88,37 @@ function Base.showerror(io::IO, e::LavaVulkanError)
     end
 end
 
+"""
+    safe_fin_log(msg)
+
+Finalizer-safe logging. Uses `jl_safe_printf` which is a raw ccall that
+cannot yield — the only form of diagnostic output allowed inside a Julia
+finalizer.  `msg` must be a `String` that already contains any trailing
+newline; no interpolation at call time (that would trigger dispatch /
+world-age / allocation).  Prefer short fixed strings built by the caller.
+"""
+@inline safe_fin_log(msg::String) = ccall(:jl_safe_printf, Cvoid, (Cstring,), msg)
+
+"""
+    @vk_checked site_str vk_call
+
+Wrap a Vulkan API call that returns a `ResultTypes.Result`: `unwrap` it
+(propagating VkResult errors as exceptions), then flush accumulated
+validation-layer messages via `check_validation_errors!(site_str)`.  Ensures
+no validation error survives past the create/allocate call that produced
+it and leaks into an unrelated later frame's diagnostic.
+
+Usage:
+    pipeline = @vk_checked "create_graphics_pipeline" Vulkan.create_graphics_pipelines(dev, [ci])[1]
+"""
+macro vk_checked(site, call)
+    quote
+        r = unwrap($(esc(call)))
+        check_validation_errors!($(esc(site)))
+        r
+    end
+end
+
 # ── Source Mapping ──
 
 """

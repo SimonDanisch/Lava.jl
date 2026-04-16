@@ -20,6 +20,16 @@ mutable struct PoolBlock
     live_count::Int            # Number of live sub-allocations
 end
 
+# Buffer lifecycle states (atomic CAS transitions).  Every VkManagedBuffer
+# starts ALIVE.  `unsafe_free!` transitions ALIVE → DEFERRED (queued on a
+# bq's deferred_frees list) or ALIVE → DEAD (destroyed immediately).
+# `destroy_buffer!` transitions {ALIVE, DEFERRED} → DEAD.  Any call on a
+# DEAD buffer is a no-op.  Using an `@atomic` field with CAS guarantees
+# idempotent double-free protection across main + finalizer threads.
+const BUF_STATE_ALIVE    = UInt8(0)
+const BUF_STATE_DEFERRED = UInt8(1)
+const BUF_STATE_DEAD     = UInt8(2)
+
 mutable struct VkManagedBuffer
     buffer::Vulkan.Buffer
     memory::Vulkan.DeviceMemory
@@ -29,11 +39,16 @@ mutable struct VkManagedBuffer
     pool_offset::Int    # Byte offset within pool block (0 for non-pooled)
     pool_block::Union{Nothing, PoolBlock}  # Back-reference for pool free (nothing = non-pooled)
     # Cross-queue synchronization: records which BatchQueue last wrote to
-    # this buffer, at which timeline value. Consumed by record_buffer_access!
-    # to auto-insert semaphore waits when a dispatch on a different queue
+    # this buffer, at which timeline value. Consumed by sync_access! to
+    # auto-insert semaphore waits when a dispatch on a different queue
     # takes this buffer as an argument. Nothing = never written.
     # Typed as Any so BatchQueue (defined later) doesn't force a cyclic include.
-    last_write::Union{Nothing, Tuple{Any, UInt64}}
+    # @atomic so the finalizer thread (vk_free!) and main thread (record /
+    # sync_access!) can read/write it safely.
+    @atomic last_write::Union{Nothing, Tuple{Any, UInt64}}
+    # Lifecycle state — see BUF_STATE_* constants above.  @atomic CAS is the
+    # single point where double-free / use-after-free is ruled out.
+    @atomic state::UInt8
     # Owning VkContext — so upload!/download!/vk_free! don't need the global.
     # Loose type because VkContext is declared in device.jl, included first.
     ctx::Any
@@ -42,7 +57,9 @@ end
 # Strong references to keep Vulkan handles alive until explicit free
 const LIVE_BUFFERS = Set{VkManagedBuffer}()
 
-# Poison value for freed buffer addresses — enables use-after-free detection.
+# Poison value for freed buffer addresses — enables use-after-free detection
+# on the GPU side (a shader dereffing a freed BDA traps with this value).
+# The CPU-side use-after-free gate is `buf.state`.
 const BDA_POISON = 0xDEAD_DEAD_DEAD_DEAD
 
 # Register cleanup callback for vk_reset_device!.  Indirect slabs are per-BQ now
@@ -85,15 +102,18 @@ function maybe_collect()
     since_gc = GPU_BYTES_SINCE_LAST_GC[]
     since_gc < 256 * 1024 * 1024 && return  # <256 MiB new allocs: no pressure
     t = time()
-    # Full GC has its own timer — incremental GC must not starve it
+    # Full GC has its own timer — incremental GC must not starve it.
+    # atomic_xchg! is the ONLY safe reset: a plain `[]=0` would lose any
+    # atomic_add! that races with our read → the bytes-since counter would
+    # drift negative (effectively) and future GCs would never fire.
     if since_gc > 512 * 1024 * 1024 && (t - GPU_LAST_FULL_GC_TIME[]) > 2.0
         GPU_LAST_FULL_GC_TIME[] = t
         GPU_LAST_INCR_GC_TIME[] = t
-        GPU_BYTES_SINCE_LAST_GC[] = 0
+        Threads.atomic_xchg!(GPU_BYTES_SINCE_LAST_GC, 0)
         GC.gc(true)
     elseif (t - GPU_LAST_INCR_GC_TIME[]) > 0.1
         GPU_LAST_INCR_GC_TIME[] = t
-        GPU_BYTES_SINCE_LAST_GC[] = 0
+        Threads.atomic_xchg!(GPU_BYTES_SINCE_LAST_GC, 0)
         GC.gc(false)
     end
     return
@@ -185,7 +205,7 @@ function try_vk_alloc(ctx::VkContext, nbytes::Integer; extra_usage::UInt32=UInt3
     addr_info = Vulkan.BufferDeviceAddressInfo(buf)
     address = Vulkan.get_buffer_device_address(dev, addr_info)
 
-    result = VkManagedBuffer(buf, memory, address, Ptr{UInt8}(0), Int(nbytes), 0, nothing, nothing, ctx)
+    result = VkManagedBuffer(buf, memory, address, Ptr{UInt8}(0), Int(nbytes), 0, nothing, nothing, BUF_STATE_ALIVE, ctx)
     push!(LIVE_BUFFERS, result)
     Threads.atomic_add!(GPU_LIVE_BYTES, nbytes)
     Threads.atomic_add!(GPU_BYTES_SINCE_LAST_GC, nbytes)
@@ -203,11 +223,12 @@ finalizers freeing GPU memory that the in-flight command buffer still
 references via BDA addresses.
 """
 function vk_free!(buf::VkManagedBuffer)
-    if buf.address == BDA_POISON
-        @warn "Lava: double-free detected on VkManagedBuffer (address already poisoned)" maxlog=1
-        return
-    end
-    buf.size == 0 && return  # Already freed
+    # Atomic CAS ALIVE → DEFERRED (optimistic — we haven't yet decided we'll
+    # defer; we just need to claim the buffer so no other thread races us).
+    # If someone else already transitioned this buffer out of ALIVE, we bail
+    # out silently — the work has already been done (or is being done).
+    _, ok = @atomicreplace buf.state BUF_STATE_ALIVE => BUF_STATE_DEFERRED
+    ok || return  # already DEFERRED or DEAD — nothing to do
 
     delete!(LIVE_BUFFERS, buf)
 
@@ -216,21 +237,24 @@ function vk_free!(buf::VkManagedBuffer)
     # buf.last_write = (bq, val) means the last dispatch recorded against
     # this buffer will signal `bq.timeline_sem` to `val` when done. If the
     # current counter is already >= val, the GPU is done and free is safe.
-    # Otherwise queue the buffer on that BQ's deferred-free list; it will
-    # be destroyed next time the BQ sweeps completed batches.
-    lw = buf.last_write
+    # Otherwise the buffer stays in DEFERRED state on that BQ's deferred-free
+    # list; it will be destroyed next time the BQ sweeps completed batches.
+    lw = @atomic :acquire buf.last_write
     if lw !== nothing
         bq = lw[1]::BatchQueue
         val = lw[2]::UInt64
         if !device_lost(bq.ctx::VkContext)
-            current = try
-                unwrap(Vulkan.get_semaphore_counter_value(bq.device, bq.timeline_sem))
-            catch
-                typemax(UInt64)  # on error, assume done
-            end
+            # query_timeline rethrows on healthy-device failure.  We are
+            # inside a finalizer-reachable path: a throw here is logged by
+            # Julia's finalizer machinery rather than propagating.
+            current = query_timeline(bq)
             if current < val
-                push!(bq.deferred_frees, buf)
-                return
+                # Finalizer-thread push into the deferred list — SpinLock so
+                # the main thread's drain doesn't race.
+                lock(bq.deferred_frees_lock) do
+                    push!(bq.deferred_frees, buf)
+                end
+                return     # state stays DEFERRED; drain_deferred_frees! will transition to DEAD
             end
         end
     end
@@ -238,9 +262,19 @@ function vk_free!(buf::VkManagedBuffer)
     destroy_buffer!(buf)
 end
 
-"""Actually destroy a buffer's Vulkan resources. Called from `vk_free!` or `drain_deferred_frees!`."""
+"""Actually destroy a buffer's Vulkan resources. Called from `vk_free!` or
+`drain_deferred_frees!`.  Atomic CAS ({ALIVE, DEFERRED} → DEAD) ensures the
+Vulkan destructor fires exactly once even under racing callers."""
 function destroy_buffer!(buf::VkManagedBuffer)
-    buf.size == 0 && return  # Already destroyed
+    # Transition {ALIVE, DEFERRED} → DEAD.  First try DEFERRED (the common
+    # path — vk_free! or drain always goes through DEFERRED now); fall back
+    # to ALIVE for the rare direct-destroy path (e.g. dropping a buffer we
+    # never pushed into deferred_frees).
+    _, ok = @atomicreplace buf.state BUF_STATE_DEFERRED => BUF_STATE_DEAD
+    if !ok
+        _, ok = @atomicreplace buf.state BUF_STATE_ALIVE => BUF_STATE_DEAD
+    end
+    ok || return  # was already DEAD; idempotent
 
     # Pooled chunk: return to pool, don't destroy the shared VkBuffer
     if buf.pool_block !== nothing
@@ -264,7 +298,10 @@ function destroy_buffer!(buf::VkManagedBuffer)
         try
             Vulkan.unmap_memory(ctx.device, buf.memory)
         catch
-            # unmap can fail if memory was already freed by driver — ignore
+            # unmap may fail if the driver released the memory first — log it
+            # loudly (finalizer-safe via jl_safe_printf) so we can notice driver
+            # misbehaviour, but don't propagate (finalizers must not throw).
+            safe_fin_log("Lava destroy_buffer!: unmap_memory failed\n")
         end
         buf.mapped_ptr = Ptr{UInt8}(0)
     end
@@ -272,7 +309,7 @@ function destroy_buffer!(buf::VkManagedBuffer)
         buf.buffer.destructor()
         buf.memory.destructor()
     catch
-        # Destruction can fail during shutdown — ignore
+        safe_fin_log("Lava destroy_buffer!: Vulkan destructor failed\n")
     end
     buf.address = BDA_POISON
     Threads.atomic_sub!(GPU_LIVE_BYTES, buf.size)
@@ -290,21 +327,30 @@ completes, and from `sweep_retired!`.
 function drain_deferred_frees!(bq::BatchQueue)
     isempty(bq.deferred_frees) && return
     ctx = bq.ctx::VkContext
-    device_lost(ctx) && (empty!(bq.deferred_frees); return)
-    current = try
-        unwrap(Vulkan.get_semaphore_counter_value(bq.device, bq.timeline_sem))
-    catch
-        typemax(UInt64)
+    # Device-lost shortcut: empty under the lock so no finalizer-thread push
+    # survives past our empty!().
+    if device_lost(ctx)
+        lock(bq.deferred_frees_lock) do
+            empty!(bq.deferred_frees)
+        end
+        return
     end
-    i = 1
-    while i <= length(bq.deferred_frees)
-        buf = bq.deferred_frees[i]::VkManagedBuffer
-        lw = buf.last_write
-        if lw === nothing || (lw[1]::BatchQueue === bq && lw[2]::UInt64 <= current)
-            destroy_buffer!(buf)
-            deleteat!(bq.deferred_frees, i)
-        else
-            i += 1
+    current = query_timeline(bq)
+    # Hold the lock for the full sweep.  Finalizer-thread pushes are rare
+    # (GC pauses only) and the drain body is short; SpinLock contention is
+    # negligible.  destroy_buffer! may run Vulkan destructors inside the
+    # critical section — that's fine under SpinLock (no yield points).
+    lock(bq.deferred_frees_lock) do
+        i = 1
+        while i <= length(bq.deferred_frees)
+            buf = bq.deferred_frees[i]::VkManagedBuffer
+            lw = @atomic :acquire buf.last_write
+            if lw === nothing || (lw[1]::BatchQueue === bq && lw[2]::UInt64 <= current)
+                destroy_buffer!(buf)
+                deleteat!(bq.deferred_frees, i)
+            else
+                i += 1
+            end
         end
     end
     return nothing
@@ -326,12 +372,16 @@ const POOL_BLOCKS = PoolBlock[]
 const POOL_FREE_LISTS = [VkManagedBuffer[] for _ in 1:POOL_NUM_SIZE_CLASSES]
 
 push!(RESET_CALLBACKS, function()
-    # Destroy all pool blocks on device reset
+    # Destroy all pool blocks on device reset.  The reset callback runs after
+    # the device has been marked lost or torn down, so destructor failures are
+    # expected (driver may have released the handles already).  Log via
+    # jl_safe_printf — we never want to silently lose a destructor error.
     for block in POOL_BLOCKS
         try
             block.buffer.destructor()
             block.memory.destructor()
         catch
+            safe_fin_log("Lava POOL_BLOCKS reset: destructor failed (ok during vk_reset_device!)\n")
         end
     end
     empty!(POOL_BLOCKS)
@@ -453,6 +503,10 @@ function pool_alloc(ctx::VkContext, nbytes::Integer; extra_usage::UInt32=UInt32(
         buf.address = block.base_address + UInt64(buf.pool_offset)
         buf.size = alloc_size
         buf.ctx = ctx
+        # Transition DEAD → ALIVE.  return_to_pool! leaves the chunk in DEAD;
+        # here we claim it for a new allocation.  No concurrent claimer is
+        # possible because the pool free-list is main-thread only.
+        @atomic :release buf.state = BUF_STATE_ALIVE
         return buf
     end
 
@@ -467,7 +521,7 @@ function pool_alloc(ctx::VkContext, nbytes::Integer; extra_usage::UInt32=UInt32(
                 block.base_address + UInt64(byte_offset),
                 Ptr{UInt8}(0),
                 alloc_size,
-                byte_offset, block, nothing, ctx)
+                byte_offset, block, nothing, BUF_STATE_ALIVE, ctx)
         end
     end
 
@@ -481,7 +535,7 @@ function pool_alloc(ctx::VkContext, nbytes::Integer; extra_usage::UInt32=UInt32(
         block.base_address + UInt64(byte_offset),
         Ptr{UInt8}(0),
         alloc_size,
-        byte_offset, block, nothing, ctx)
+        byte_offset, block, nothing, BUF_STATE_ALIVE, ctx)
 end
 
 """Return a pooled chunk to the free list. Keeps VkManagedBuffer object for reuse."""
@@ -498,7 +552,7 @@ function return_to_pool!(buf::VkManagedBuffer)
     buf.address = BDA_POISON
     buf.mapped_ptr = Ptr{UInt8}(0)
     buf.size = 0
-    buf.last_write = nothing  # clear scheduling state so a re-use starts fresh
+    @atomic :release buf.last_write = nothing  # clear scheduling state so a re-use starts fresh
     # Keep buf.pool_block and buf.pool_offset intact for reuse
     push!(POOL_FREE_LISTS[idx], buf)
 end
@@ -549,7 +603,7 @@ function get_staging(bq::BatchQueue, nbytes::Integer)
 
     managed = VkManagedBuffer(vkbuf, memory, UInt64(0),   # no BDA needed for staging
                               mapped_ptr, Int(alloc_size),
-                              0, nothing, nothing, ctx)
+                              0, nothing, nothing, BUF_STATE_ALIVE, ctx)
     push!(LIVE_BUFFERS, managed)
     Threads.atomic_add!(GPU_LIVE_BYTES, managed.size)
     Threads.atomic_add!(GPU_BYTES_SINCE_LAST_GC, managed.size)
@@ -558,139 +612,82 @@ function get_staging(bq::BatchQueue, nbytes::Integer)
 end
 
 """
-    upload!(dst::VkManagedBuffer, host_data::Vector{UInt8}; offset::Int=0)
+    copy_buffer!(direction, managed, host_ptr, nbytes; offset=0)
 
-Upload host data to a device-local buffer via staging.
+Unified CPU↔GPU buffer copy — single entry point for every host-visible
+transfer path.  `direction` is `:upload` (host → GPU) or `:download` (GPU → host).
+
+Fast path (BAR memory): direct memcpy via `managed.mapped_ptr` after
+`wait_for_write(managed)` drains any in-flight writer.  No staging, no batch.
+
+Slow path (device-local): allocate staging, record `cmd_copy_buffer!` into
+the active batch, flush, and memcpy between staging and host.  For downloads
+we route the copy through the queue that last wrote `managed` so the copy
+piggy-backs on producer dispatches (one fence wait instead of two).  For
+uploads we use the buffer's ctx default queue.
+
+The caller is responsible for keeping `host_ptr`'s backing array alive
+(typically via `GC.@preserve`).
 """
+function copy_buffer!(direction::Symbol, managed::VkManagedBuffer,
+                     host_ptr::Ptr{UInt8}, nbytes::Integer; offset::Integer=0)
+    nbytes == 0 && return
+    @assert direction === :upload || direction === :download  "direction must be :upload or :download"
+    buf_offset = managed.pool_offset + Int(offset)
+
+    # BAR fast-path: host-visible mapped memory — direct memcpy, no staging.
+    if managed.mapped_ptr != Ptr{UInt8}(0)
+        wait_for_write(managed)
+        if direction === :upload
+            unsafe_copyto!(managed.mapped_ptr + offset, host_ptr, nbytes)
+        else
+            unsafe_copyto!(host_ptr, managed.mapped_ptr + offset, nbytes)
+        end
+        return
+    end
+
+    # Device-local: route through staging + batched copy.  Pinning `managed`
+    # triggers sync_access!'s cross-queue semaphore wait whenever the buffer
+    # was last written on a different BatchQueue.
+    bq = if direction === :upload
+        (managed.ctx::VkContext).default_bq
+    else
+        lw = @atomic :acquire managed.last_write
+        lw !== nothing ? (lw[1]::BatchQueue) : (managed.ctx::VkContext).default_bq
+    end
+    staging_buf, _, mapped_ptr, _ = get_staging(bq, nbytes)
+    if direction === :upload
+        unsafe_copyto!(Ptr{UInt8}(mapped_ptr), host_ptr, nbytes)
+        cmd_copy_buffer!(bq, staging_buf, managed, nbytes; dst_off=buf_offset)
+        flush!(bq, bq.device)
+    else
+        cmd_copy_buffer!(bq, managed, staging_buf, nbytes; src_off=buf_offset)
+        flush!(bq, bq.device)
+        unsafe_copyto!(host_ptr, Ptr{UInt8}(mapped_ptr), nbytes)
+    end
+    return
+end
+
+"""Upload host data to a device-local buffer (BAR direct or via staging)."""
 function upload!(dst::VkManagedBuffer, host_data::Vector{UInt8}; offset::Int=0)
-    nbytes = length(host_data)
-    nbytes == 0 && return
-    buf_offset = dst.pool_offset + offset
-
-    # Fast path: if buffer is in BAR memory (mapped), write directly via mapped ptr.
-    # Any queue still using this buffer must drain first — wait_for_write blocks
-    # the CPU until the last write's timeline value has been signalled.
-    if dst.mapped_ptr != Ptr{UInt8}(0)
-        wait_for_write(dst)
-        unsafe_copyto!(dst.mapped_ptr + offset, pointer(host_data), nbytes)
-        return
-    end
-
-    bq = (dst.ctx::VkContext).default_bq
-    staging_buf, _, mapped_ptr, _ = get_staging(bq, nbytes)
-    unsafe_copyto!(Ptr{UInt8}(mapped_ptr), pointer(host_data), nbytes)
-
-    one_shot_copy(bq, staging_buf, 0, dst.buffer, buf_offset, nbytes)
+    GC.@preserve host_data copy_buffer!(:upload, dst, pointer(host_data), length(host_data); offset)
 end
 
-"""
-    download!(host_data::Vector{UInt8}, src::VkManagedBuffer; offset::Int=0)
-
-Download data from a device-local buffer to host via staging.
-"""
+"""Download data from a device-local buffer to a host byte vector."""
 function download!(host_data::Vector{UInt8}, src::VkManagedBuffer; offset::Int=0)
-    nbytes = length(host_data)
-    nbytes == 0 && return
-    buf_offset = src.pool_offset + offset
-
-    # Fast path: BAR memory — wait for the last write's timeline, then read directly.
-    if src.mapped_ptr != Ptr{UInt8}(0)
-        wait_for_write(src)
-        unsafe_copyto!(pointer(host_data), src.mapped_ptr + offset, nbytes)
-        return
-    end
-
-    bq = (src.ctx::VkContext).default_bq
-    staging_buf, _, mapped_ptr, _ = get_staging(bq, nbytes)
-    one_shot_copy(bq, src.buffer, buf_offset, staging_buf, 0, nbytes)
-    unsafe_copyto!(pointer(host_data), Ptr{UInt8}(mapped_ptr), nbytes)
+    GC.@preserve host_data copy_buffer!(:download, src, pointer(host_data), length(host_data); offset)
 end
 
-"""
-    upload_typed!(dst::VkManagedBuffer, data::AbstractVector{T}; offset::Int=0)
-
-Upload a typed array to a device-local buffer.
-"""
+"""Upload a typed array to a device-local buffer."""
 function upload_typed!(dst::VkManagedBuffer, data::AbstractVector{T}; offset::Int=0) where T
     bytes = Vector{UInt8}(reinterpret(UInt8, vec(collect(data))))
     upload!(dst, bytes; offset)
 end
 
-"""
-    download_typed!(data::AbstractVector{T}, src::VkManagedBuffer; offset::Int=0)
-
-Download data from a device-local buffer into a typed array.
-"""
+"""Download data from a device-local buffer into a typed array."""
 function download_typed!(data::AbstractVector{T}, src::VkManagedBuffer; offset::Int=0) where T
-    nbytes = length(data) * sizeof(T)
-    nbytes == 0 && return
-    buf_offset = src.pool_offset + offset
-
-    # Fast path: BAR memory — wait for last write's timeline, then direct read.
-    if src.mapped_ptr != Ptr{UInt8}(0)
-        wait_for_write(src)
-        GC.@preserve data begin
-            unsafe_copyto!(Ptr{UInt8}(pointer(data)), src.mapped_ptr + offset, nbytes)
-        end
-        return
-    end
-
-    # Device-local: append copy to active batch if possible (one fence wait instead of two).
-    # If the buffer has a last_write on some queue, route the append through that queue
-    # (so the copy is after the producing dispatches); else use an independent one_shot_copy.
-    bq = (src.ctx::VkContext).default_bq
-    staging_buf, _, mapped_ptr, _ = get_staging(bq, nbytes)
-    lw = src.last_write
-    if lw !== nothing && has_active_recording(lw[1]::BatchQueue)
-        append_copy_and_flush!(lw[1]::BatchQueue, src.buffer, buf_offset, staging_buf, nbytes)
-    else
-        one_shot_copy(bq, src.buffer, buf_offset, staging_buf, 0, nbytes)
-    end
-    GC.@preserve data begin
-        unsafe_copyto!(Ptr{UInt8}(pointer(data)), Ptr{UInt8}(mapped_ptr), nbytes)
-    end
-end
-
-# ── Internal helpers ──
-
-function one_shot_copy(bq::BatchQueue, src::Vulkan.Buffer, src_offset::Integer,
-                        dst::Vulkan.Buffer, dst_offset::Integer,
-                        nbytes::Integer)
-    ctx = bq.ctx::VkContext
-    device_lost(ctx) && throw(LavaError("buffer copy", "Vulkan device lost",
-        "Call Lava.vk_reset_device!() to reinitialize, or restart Julia session."))
-    dev = bq.device
-
-    # Flush pending dispatches before transfer to ensure data is written
-    if bq.active_batch !== nothing && bq.active_batch.recording
-        flush!(bq, dev)
-    end
-
-    cmd = bq.xfer_cmd_buf
-    fence = bq.xfer_fence
-
-    unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
-        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-    )))
-
-    region = Vulkan.BufferCopy(UInt64(src_offset), UInt64(dst_offset), UInt64(nbytes))
-    Vulkan.cmd_copy_buffer(cmd, src, dst, [region])
-
-    unwrap(Vulkan.end_command_buffer(cmd))
-
-    # Submit to the batch queue's own queue and wait
-    submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    submit_result = Vulkan.queue_submit(bq.queue, [submit_info]; fence=fence)
-    if iserror(submit_result)
-        mark_device_lost!(ctx)
-        unwrap(submit_result)
-    end
-    fence_result = Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64))
-    if iserror(fence_result)
-        mark_device_lost!(ctx)
-        unwrap(fence_result)
-    end
-    unwrap(Vulkan.reset_fences(dev, [fence]))
+    GC.@preserve data copy_buffer!(:download, src, Ptr{UInt8}(pointer(data)),
+                                    length(data) * sizeof(T); offset)
 end
 
 """
@@ -770,7 +767,7 @@ function vk_alloc_unified(ctx::VkContext, nbytes::Integer)
     maybe_collect()
     mapped = vk_alloc_mapped(ctx, max(nbytes, 16))
     managed = VkManagedBuffer(mapped.buffer, mapped.memory, mapped.address,
-                               mapped.mapped_ptr, Int(mapped.size), 0, nothing, nothing, ctx)
+                               mapped.mapped_ptr, Int(mapped.size), 0, nothing, nothing, BUF_STATE_ALIVE, ctx)
     push!(LIVE_BUFFERS, managed)
     Threads.atomic_add!(GPU_LIVE_BYTES, managed.size)
     Threads.atomic_add!(GPU_BYTES_SINCE_LAST_GC, managed.size)
@@ -836,6 +833,7 @@ end
 
 """Get or create an indirect dispatch buffer from `bq`'s slab pool."""
 function get_indirect_buffer(bq::BatchQueue)
+    @assert Threads.threadid() == bq.owning_thread  "BatchQueue is single-writer; cross-thread indirect-buf alloc forbidden"
     alloc_size = 256  # 12 bytes needed, aligned to 256
 
     while length(bq.indirect_slabs) < bq.indirect_slab_idx

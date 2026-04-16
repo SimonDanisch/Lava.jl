@@ -80,7 +80,7 @@ end
     src = Lava.LavaArray(data)
     dst = Lava.LavaArray{Fix3_Struct}(undef, N)
     fix3_kernel!(Lava.LavaBackend())(dst, src; ndrange=N)
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     result = Array(dst)
     @test result == data
 end
@@ -119,7 +119,7 @@ end
         src = Lava.LavaArray(data)
         dst = Lava.LavaArray{Struct60}(undef, N)
         copy60!(Lava.LavaBackend())(dst, src; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         @test result == data
     end
@@ -143,7 +143,7 @@ end
         src = Lava.LavaArray(data)
         dst = Lava.LavaArray{Struct52}(undef, N)
         copy52!(Lava.LavaBackend())(dst, src; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         @test result == data
     end
@@ -170,7 +170,7 @@ end
         src = Lava.LavaArray(data)
         dst = Lava.LavaArray{MixedAlign}(undef, N)
         copy_mixed!(Lava.LavaBackend())(dst, src; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         @test result == data
     end
@@ -193,7 +193,7 @@ end
         src = Lava.LavaArray(data)
         dst = Lava.LavaArray{OddOffsets}(undef, N)
         copy_odd!(Lava.LavaBackend())(dst, src; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         @test result == data
     end
@@ -220,7 +220,7 @@ end
     src = Lava.LavaArray([Fix6_S(Float32(i), Float32(2i), Float32(3i)) for i in 1:n])
     dst = Lava.LavaArray{Fix6_S}(undef, n)
     dst .= src
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     @test Array(dst) == Array(src)
 end
 
@@ -253,7 +253,7 @@ end
     output = Lava.LavaArray(zeros(Float32, N))
 
     phi_cycle_kernel!(Lava.LavaBackend())(output, a, b, sel; ndrange=N)
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     result = Array(output)
     sel_h = Array(sel)
     for i in 1:N
@@ -286,7 +286,7 @@ end
         fill_val!(Lava.LavaBackend())(a, 42.0f0; ndrange=N)
         fill_val!(Lava.LavaBackend())(b, 99.0f0; ndrange=N)
     end
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
 
     @test all(Array(a) .== 42.0f0)
     @test all(Array(b) .== 99.0f0)
@@ -327,7 +327,7 @@ end
     for _ in 1:100
         a = a .+ 1.0f0
     end
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     @test all(Array(a) .== 101.0f0)
 end
 
@@ -336,7 +336,7 @@ end
     a = Lava.LavaArray(ones(Float32, N))
     b = Lava.LavaArray(fill(2.0f0, N))
     c = a .+ b .* 3.0f0
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     @test Array(c)[1] == 7.0f0
     @test Array(c)[N] == 7.0f0
 end
@@ -351,7 +351,7 @@ end
         # Let tmp go out of scope — GC may try to free it
     end
     GC.gc()  # Force GC while batch is still recording
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     r = Array(result)
     # Sum of 1..50 = 1275
     @test r[1] ≈ 1275.0f0
@@ -361,7 +361,7 @@ end
     for i in 1:20
         a = Lava.LavaArray(fill(Float32(i), 1024))
         b = a .* 2.0f0
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(b)[1] == Float32(2i)
         # a and b go out of scope each iteration
     end
@@ -377,7 +377,7 @@ end
     M, N = 128, 64
     a = Lava.LavaArray(zeros(Float32, M, N))
     fill_2d!(Lava.LavaBackend())(a; ndrange=(M, N))
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     result = Array(a)
     @test result[1, 1] == 101.0f0
     @test result[M, N] == Float32(M * 100 + N)
@@ -395,19 +395,19 @@ end
     # Int32
     a = Lava.LavaArray(Int32[1, 2, 3, 4])
     b = a .+ Int32(10)
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     @test Array(b) == Int32[11, 12, 13, 14]
 
     # UInt32
     a = Lava.LavaArray(UInt32[10, 20, 30, 40])
     b = a .- UInt32(5)
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     @test Array(b) == UInt32[5, 15, 25, 35]
 
     # Float64
     a = Lava.LavaArray(Float64[1.0, 2.0, 3.0])
     b = a .* 2.0
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     @test Array(b) ≈ Float64[2.0, 4.0, 6.0]
 end
 
@@ -434,7 +434,7 @@ end
     dst = Lava.LavaArray{SpectrumData}(undef, N)
 
     spectrum_add!(Lava.LavaBackend())(dst, a, b; ndrange=N)
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
 
     result = Array(dst)
     for i in 1:N
@@ -483,7 +483,7 @@ end
         @test length(batch.sealed_cmd_bufs) == 3  # 100+100+100 sealed, 50 active
         @test batch.segment_dispatches == 50
 
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(a) == fill(350.0f0, 64)
         # Sealed CBs returned to free pool
         @test length(batch.sealed_cmd_bufs) == 0
@@ -507,7 +507,7 @@ end
         @test batch.dispatch_count == 500
         @test length(batch.sealed_cmd_bufs) == 0  # No splitting
 
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(a) == fill(500.0f0, 64)
 
         Lava.CB_SPLIT_THRESHOLD[] = old_threshold
@@ -525,14 +525,14 @@ end
         for _ in 1:200
             kernel(a; ndrange=64)
         end
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(a) == fill(200.0f0, 64)
 
         # Second pass: reuses CB pool, another 200 dispatches
         for _ in 1:200
             kernel(a; ndrange=64)
         end
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(a) == fill(400.0f0, 64)
 
         Lava.CB_SPLIT_THRESHOLD[] = old_threshold
@@ -555,7 +555,7 @@ end
             @test length(batch.sealed_cmd_bufs) >= 1
         end
 
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(a) == fill(5000.0f0, 256)
     end
 end

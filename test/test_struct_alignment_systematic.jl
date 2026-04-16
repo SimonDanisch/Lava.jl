@@ -165,7 +165,7 @@ const ALL_STRUCT_TYPES = [
     src = Lava.LavaArray(src_data)
     dst = Lava.LavaArray{S}(undef, n)
     dst .= src
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     result = Array(dst)
     @test result == src_data
 end
@@ -325,7 +325,7 @@ const CHECKSUM_KERNELS = Dict{DataType, Any}(
 
     kern = CHECKSUM_KERNELS[S]
     kern(Lava.LavaBackend(), 64)(dst, src; ndrange=n)
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
 
     gpu_result = Array(dst)
     cpu_result = [checksum(s) for s in src_data]
@@ -386,7 +386,7 @@ end
         src = Lava.LavaArray(src_data)
         dst = Lava.LavaArray{S01_ThreeF32}(undef, n)
         write_modified_S01(Lava.LavaBackend(), 64)(dst, src, offset; ndrange=n)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         expected = [S01_ThreeF32(s.x + offset, s.y + offset, s.z + offset) for s in src_data]
         @test result == expected
@@ -397,7 +397,7 @@ end
         src = Lava.LavaArray(src_data)
         dst = Lava.LavaArray{S03_MiddleBool}(undef, n)
         write_modified_S03(Lava.LavaBackend(), 64)(dst, src, offset; ndrange=n)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         expected = [S03_MiddleBool(s.x + offset, s.flag, s.y + offset) for s in src_data]
         @test result == expected
@@ -408,7 +408,7 @@ end
         src = Lava.LavaArray(src_data)
         dst = Lava.LavaArray{S06_MixedI64}(undef, n)
         write_modified_S06(Lava.LavaBackend(), 64)(dst, src, offset; ndrange=n)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         expected = [S06_MixedI64(s.a + offset, s.b + 1, s.c + offset) for s in src_data]
         @test result == expected
@@ -419,7 +419,7 @@ end
         src = Lava.LavaArray(src_data)
         dst = Lava.LavaArray{S14_KitchenSink}(undef, n)
         write_modified_S14(Lava.LavaBackend(), 64)(dst, src, offset; ndrange=n)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         expected = [S14_KitchenSink(s.flag1, s.small, s.pad16,
             s.f32val + offset, s.i32val, s.flag2,
@@ -432,7 +432,7 @@ end
         src = Lava.LavaArray(src_data)
         dst = Lava.LavaArray{S15_AllF64}(undef, n)
         write_modified_S15(Lava.LavaBackend(), 64)(dst, src, offset; ndrange=n)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         expected = [S15_AllF64(s.a + Float64(offset), s.b + Float64(offset), s.c + Float64(offset)) for s in src_data]
         @test result == expected
@@ -452,7 +452,7 @@ end
     fill_val = test_vals[1]
     dst = Lava.LavaArray{S}(undef, n)
     fill!(dst, fill_val)
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     result = Array(dst)
     @test all(x -> x == fill_val, result)
 end
@@ -472,7 +472,7 @@ end
             kern = CHECKSUM_KERNELS[S]
             wg = min(n, 64)
             kern(Lava.LavaBackend(), wg)(dst, src; ndrange=n)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
 
             gpu_result = Array(dst)
             cpu_result = [checksum(s) for s in src_data]
@@ -549,7 +549,7 @@ const SHARED_COPY_KERNELS = Dict{DataType, Any}(
 
     kern = SHARED_COPY_KERNELS[S]
     kern(Lava.LavaBackend(), 64)(dst, src; ndrange=n)
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
 
     result = Array(dst)
     @test result == src_data

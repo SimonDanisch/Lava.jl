@@ -196,7 +196,8 @@ function acquire_next_image!(win::RenderWindow)
         old_batch.recording = false
         old_batch.dispatch_count = 0
         old_batch.last_was_rt = false
-        empty!(old_batch.data_refs)
+        empty!(old_batch.pinned)
+        empty!(old_batch.wait_semaphores)
         push!(ctx.default_bq.free_batches, old_batch)
         win.frame_batches[fi] = nothing
     end
@@ -246,7 +247,8 @@ function Base.resize!(win::RenderWindow)
             batch.recording = false
             batch.dispatch_count = 0
             batch.last_was_rt = false
-            empty!(batch.data_refs)
+            empty!(batch.pinned)
+            empty!(batch.wait_semaphores)
             push!(ctx.default_bq.free_batches, batch)
             win.frame_batches[i] = nothing
         end
@@ -270,7 +272,8 @@ function Base.close(win::RenderWindow)
             batch.recording = false
             batch.dispatch_count = 0
             batch.last_was_rt = false
-            empty!(batch.data_refs)
+            empty!(batch.pinned)
+            empty!(batch.wait_semaphores)
             push!(ctx.default_bq.free_batches, batch)
             win.frame_batches[i] = nothing
         end

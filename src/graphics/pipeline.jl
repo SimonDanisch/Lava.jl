@@ -195,7 +195,7 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
         next=rendering_info,
     )
 
-    pipelines, _ = unwrap(Vulkan.create_graphics_pipelines(dev, [ci]))
+    pipelines, _ = @vk_checked "vkCreateGraphicsPipelines" Vulkan.create_graphics_pipelines(dev, [ci])
     pipeline = pipelines[1]
 
     return CompiledGraphicsPipeline(
@@ -434,7 +434,7 @@ function vk_draw!(bq::BatchQueue,
     batch.dispatch_count += 1
     batch.last_was_rt = false
     # Pin pipeline to batch
-    push!(batch.data_refs, pipeline)
+    pin!(batch, pipeline)
 end
 
 """Transition an image layout using a pipeline barrier."""
@@ -569,7 +569,7 @@ function vk_draw_in_pass!(bq::BatchQueue,
     batch.dispatch_count += 1
     batch.last_was_rt = false
     # Pin pipeline to batch — prevents GC from destroying it while command buffer references it
-    push!(batch.data_refs, pipeline)
+    pin!(batch, pipeline)
 end
 
 """
@@ -603,7 +603,7 @@ function vk_draw_indexed_in_pass!(bq::BatchQueue,
                              UInt32(0), Int32(0), UInt32(0))
     batch.dispatch_count += 1
     batch.last_was_rt = false
-    push!(batch.data_refs, pipeline)
+    pin!(batch, pipeline)
 end
 
 """

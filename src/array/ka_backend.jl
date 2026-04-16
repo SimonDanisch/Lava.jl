@@ -159,11 +159,15 @@ end
 # ── Argument conversion ──
 
 # Convert kernel arguments for GPU compilation via Adapt.jl.
-# LavaArray → Ptr{T} (BDA address). For compound args like Broadcasted,
-# Adapt.adapt recursively converts nested LavaArray fields to Ptr{T}.
-# We use Ptr{T} rather than LavaDeviceArray{T,N} because passing structs
-# through BDA creates alloca+memcpy patterns that StructurizeCFG breaks.
-KA.argconvert(::KA.Kernel{LavaBackend}, arg) = Adapt.adapt(LavaAdaptor(), arg)
+# LavaArray → LavaDeviceArray (Ptr-wrapping). The `LavaAdaptor(batch)` in this
+# conversion path is the single place a LavaArray gets stripped to a pointer,
+# and it pins the original LavaArray into `batch` at the same point.  There is
+# no separate pinning walker — Adapt.jl's own recursion over wrapper structs /
+# Broadcasted / NamedTuple lands every LavaArray at `adapt_storage`, and that
+# method does both the strip and the pin.
+#
+# `obj.f` is the kernel closure — it goes through the same adaptor so any
+# LavaArray captured in closure-over fields is pinned too.
 
 # ── Kernel call (main entry point) ──
 
@@ -173,10 +177,10 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
 
     # GPU-resident ndrange → indirect dispatch (no CPU readback)
     if ndrange isa LavaArray
-        converted_args = KA.argconvert.(Ref(obj), args)
         batch = ensure_active_batch!(bq)
-        record_arg_accesses!(bq, batch, args, obj.f)  # args walks for buffers; obj.f pinned only
-        ka_launch_indirect!(obj, converted_args, ndrange, workgroupsize, args)
+        adaptor = LavaAdaptor(batch)
+        converted_args = map(a -> Adapt.adapt(adaptor, a), args)
+        ka_launch_indirect!(obj, converted_args, ndrange, workgroupsize, args, adaptor)
         return nothing
     end
 
@@ -191,12 +195,11 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     nthreads = length(KA.workitems(iterspace))
     ws_3d = (nthreads, 1, 1)
 
-    converted_f = KA.argconvert(obj, obj.f)
-    converted_args = KA.argconvert.(Ref(obj), args)
-    all_args = (converted_f, ka_ctx, converted_args...)
-
     batch = ensure_active_batch!(bq)
-    record_arg_accesses!(bq, batch, args, obj.f)
+    adaptor = LavaAdaptor(batch)
+    converted_f = Adapt.adapt(adaptor, obj.f)
+    converted_args = map(a -> Adapt.adapt(adaptor, a), args)
+    all_args = (converted_f, ka_ctx, converted_args...)
 
     ka_launch!(bq, converted_f, all_args, block_dims, ws_3d)
 
@@ -294,8 +297,12 @@ function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple, block_dim
     # Get host-visible mapped arg buffer (per-BQ slab pool)
     arg_buf = get_arg_buffer(bq, total_size)
 
-    # Pack args directly to mapped memory (zero intermediate allocations)
-    pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
+    # The KA.Kernel entry point already ran `Adapt.adapt(LavaAdaptor(batch), ..)`
+    # on each original arg, which both pinned every LavaArray (and nested
+    # LavaArrays in wrapper structs) AND stripped them to LavaDeviceArray.
+    # Here `all_args` is post-adapt, so pack sees no further pinnable leaves.
+    ensure_active_batch!(bq)
+    pack_args_direct!(bq, arg_buf.mapped_ptr, arg_buf.address, offsets,
                        compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
     # Dispatch with N-D block grid (preserves KA's block dimensions)
@@ -356,10 +363,10 @@ function init_prepare_indirect_pipeline!(ctx::VkContext)
 end
 
 """
-    _fast_prepare_indirect!(indirect_buf, ndrange_buf, workgroup_size)
+    fast_prepare_indirect!(indirect_buf, ndrange_buf, workgroup_size)
 
 Fast path for prepare-indirect dispatch. Bypasses lava_launch! entirely:
-no validation, no auto-flush check, no batch.data_refs push, no logging overhead.
+no validation, no auto-flush check, no logging overhead.
 Records a single-thread direct dispatch to compute ceil(n/ws) group counts.
 """
 function fast_prepare_indirect!(bq::BatchQueue, indirect_buf::VkIndirectBuffer, ndrange_buf::LavaArray{<:Integer}, workgroup_size::Integer)
@@ -371,9 +378,12 @@ function fast_prepare_indirect!(bq::BatchQueue, indirect_buf::VkIndirectBuffer, 
     arg_size = PREPARE_INDIRECT_ARG_BUF_SIZE_REF[]
 
     # Pack args: f (ghost, skipped), Ptr{UInt32} (BDA), LavaArray (BDA), UInt32 (direct)
+    # pack_args_direct! pins ndrange_buf at the LavaArray leaf; indirect_buf
+    # is explicitly pinned via vk_dispatch_indirect!.
     all_args = (prepare_indirect_kernel, Ptr{UInt32}(indirect_buf.address), ndrange_buf, UInt32(workgroup_size))
     arg_buf = get_arg_buffer(bq, arg_size)
-    pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets, arg_size, byval_sizes, all_args)
+    ensure_active_batch!(bq)
+    pack_args_direct!(bq, arg_buf.mapped_ptr, arg_buf.address, offsets, arg_size, byval_sizes, all_args)
 
     # Record dispatch directly — single workgroup of 1 thread
     vk_dispatch_base!(bq, pipeline, arg_buf.address, 0, 0, 0, 1, 1, 1)
@@ -392,7 +402,7 @@ Launch a KA kernel using indirect dispatch. `ndrange_buf` is a GPU array contain
 the work item count (1-element Int32 array). The prepare-indirect kernel writes
 group counts to an indirect buffer, then vk_dispatch_indirect! dispatches the main kernel.
 """
-function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, original_args=nothing;
+function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, original_args, adaptor::LavaAdaptor;
                              bq::BatchQueue=obj.backend.bq)
     # Respect static workgroup size from @kernel definition
     ws = if workgroupsize !== nothing
@@ -418,7 +428,11 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
     iterspace, dynamic = KA.partition(obj, ndrange_tuple, ws)
     ctx = KA.mkcontext(obj, ndrange_tuple, iterspace)
 
-    converted_f = KA.argconvert(obj, obj.f)
+    # Reuse the caller's adaptor: the original (pre-adapt) `original_args`
+    # were already pinned by the caller's map(Adapt.adapt, ...).  Adapting
+    # `obj.f` through the same adaptor pins anything it captures.
+    batch = adaptor.batch
+    converted_f = Adapt.adapt(adaptor, obj.f)
     all_args = (converted_f, ctx, args...)
 
     # Build type tuple for compilation
@@ -429,16 +443,16 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
     inline_extra = compute_inline_extra_from_byval(byval_sizes)
     total_size = compiled.push_info.arg_buffer_size + inline_extra
 
-    # GC.@preserve ensures original_args (the pre-argconvert LavaArrays) stay alive
-    # throughout this function. This is critical because:
-    # - argconvert strips LavaArray → Ptr{T}, losing buffer references
-    # - vk_flush!() clears batch data_refs and calls maybe_collect()
-    # - Without @preserve, GC can free LavaArray buffers whose BDA pointers
-    #   are embedded in the arg buffer, causing DEVICE_LOST on NVIDIA
+    # GC.@preserve on original_args keeps the pre-strip LavaArrays reachable
+    # through this function.  They were pinned into batch.pinned by the
+    # adaptor, which keeps their backing VkManagedBuffers alive until the
+    # timeline signals — but keeping the LavaArray Julia objects reachable
+    # here too defends against a GC pass between pack and submit.
     GC.@preserve original_args begin
 
     arg_buf = get_arg_buffer(bq, total_size)
-    pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
+    @assert batch === bq.active_batch  "adaptor batch diverged from active bq batch"
+    pack_args_direct!(bq, arg_buf.mapped_ptr, arg_buf.address, offsets,
                        compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
     indirect_buf = get_indirect_buffer(bq)
@@ -446,12 +460,6 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
 
     if DISPATCH_LOGGING_ENABLED[]
         LAST_DISPATCH_INFO[] = "indirect f=$(dispatch_name(obj.f, all_args))"
-    end
-    batch = ensure_active_batch!(bq)
-    if original_args !== nothing
-        record_arg_accesses!(bq, batch, args, original_args)
-    else
-        record_arg_accesses!(bq, batch, args)
     end
     vk_dispatch_indirect!(bq, pipeline, arg_buf.address, indirect_buf)
 

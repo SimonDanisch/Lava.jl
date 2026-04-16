@@ -103,8 +103,8 @@ end
 Trace `n_rays` rays against the hardware acceleration structure.
 Results are written to `results` buffer (one RTHitResult per ray).
 
-`results` and `rays` can be `LavaBuffer{RTHitResult}`/`LavaBuffer{RTRay}`,
-`LavaArray{RTHitResult}`/`LavaArray{RTRay}`, or any type accepted by `trace_rays!`.
+`results` and `rays` can be `LavaArray{RTHitResult}`/`LavaArray{RTRay}`,
+or any type accepted by `trace_rays!`.
 """
 function trace_closest_hits!(results, rays, accel::HardwareAccel, n_rays::Integer)
     trace_rays!(accel.bq, accel.rt_pipeline, accel.tlas, rays, results;

@@ -38,7 +38,7 @@ mutable struct LavaTLAS
     # and the vk_free! timeline-gated defer path.
     storage::LavaArray{UInt8, 1}
     # BLASes this TLAS references.  Field ownership transitively pins their
-    # storage so as long as the TLAS is alive (or pinned in data_refs), every
+    # storage so as long as the TLAS is alive (or pinned in batch.pinned), every
     # referenced BLAS stays alive.
     blases::Vector{LavaBLAS}
     # Build-time inputs (instance buffer).  LavaArrays — each tracks its own
@@ -70,13 +70,16 @@ function unsafe_free!(as::Union{LavaBLAS, LavaTLAS})
             destroy_now!(as)
             return
         end
-        current = try
-            unwrap(Vulkan.get_semaphore_counter_value(bq.device, bq.timeline_sem))
-        catch
-            typemax(UInt64)
-        end
+        # query_timeline throws on healthy-device failure.  In finalizer
+        # context Julia logs and moves on; device_lost is checked fresh on
+        # the next call.
+        current = query_timeline(bq)
         if current < val
-            push!(bq.deferred_as_frees, as)   # resurrect + defer
+            # Finalizer-thread push — guard with the deferred_frees_lock so
+            # the main thread's drain doesn't race.
+            lock(bq.deferred_frees_lock) do
+                push!(bq.deferred_as_frees, as)   # resurrect + defer
+            end
             return
         end
     end
@@ -87,9 +90,19 @@ function destroy_now!(as::Union{LavaBLAS, LavaTLAS})
     try
         as.accel.destructor()     # vkDestroyAccelerationStructureKHR
     catch
+        safe_fin_log("Lava destroy_now!: acceleration-structure destructor failed\n")
     end
-    # Drop refs. storage / preserves / blases are LavaArrays / LavaBLASes
-    # whose own finalizers handle lifetimes via vk_free!'s timeline check.
+    # Eagerly finalize the storage + preserves LavaArrays so their backing
+    # VkManagedBuffers get freed via vk_free!'s timeline-gated defer NOW
+    # instead of waiting for another GC pass to notice unreachability.
+    # RT dispatches call `pin!` on `tlas.storage` and each `blas.storage`,
+    # so in-flight dispatches keep the buffers alive via the timeline-gated
+    # defer path.  Julia's finalizer machinery logs any exception thrown
+    # here — no need to wrap in try/catch.
+    finalize(as.storage)
+    for p in as.preserves
+        p isa LavaArray && finalize(p)
+    end
     empty!(as.preserves)
     as isa LavaTLAS && empty!(as.blases)
 end
@@ -106,21 +119,26 @@ buffer's `last_write` timeline has been reached.  Called at flush sync points.
 function drain_deferred_as_frees!(bq::BatchQueue)
     isempty(bq.deferred_as_frees) && return
     ctx = bq.ctx::VkContext
-    device_lost(ctx) && (empty!(bq.deferred_as_frees); return)
-    current = try
-        unwrap(Vulkan.get_semaphore_counter_value(bq.device, bq.timeline_sem))
-    catch
-        typemax(UInt64)
+    if device_lost(ctx)
+        lock(bq.deferred_frees_lock) do
+            empty!(bq.deferred_as_frees)
+        end
+        return
     end
-    i = 1
-    while i <= length(bq.deferred_as_frees)
-        as = bq.deferred_as_frees[i]
-        lw = storage_last_write(as)
-        if lw === nothing || (lw[1]::BatchQueue === bq && lw[2]::UInt64 <= current)
-            destroy_now!(as)
-            deleteat!(bq.deferred_as_frees, i)
-        else
-            i += 1
+    current = query_timeline(bq)
+    # Hold the SpinLock for the sweep — shares the lock with deferred_frees
+    # since finalizer-thread pushes can target either list.
+    lock(bq.deferred_frees_lock) do
+        i = 1
+        while i <= length(bq.deferred_as_frees)
+            as = bq.deferred_as_frees[i]
+            lw = storage_last_write(as)
+            if lw === nothing || (lw[1]::BatchQueue === bq && lw[2]::UInt64 <= current)
+                destroy_now!(as)
+                deleteat!(bq.deferred_as_frees, i)
+            else
+                i += 1
+            end
         end
     end
     return nothing
@@ -597,8 +615,15 @@ function as_build(f; bq::BatchQueue=vk_context().default_bq)
     # Inputs that must outlive the GPU submit (vertex/index for BLAS, instance
     # buffer for TLAS) are owned by LavaBLAS/LavaTLAS via their preserves.
     # Scratch buffers in `ctx.preserves` are submit-scoped and have been
-    # through the fence wait above, so they're safe to release as ctx goes
-    # out of scope.
+    # through the fence wait above, so eagerly finalize them here.  Without
+    # this, each as_build call leaks ~hundreds of MB of scratch until GC runs,
+    # causing VRAM OOM in multi-frame renders (e.g. dolphin HQ video).
+    for p in ctx.preserves
+        if p isa LavaArray
+            finalize(p)
+        end
+    end
+    empty!(ctx.preserves)
     return result
 end
 

@@ -77,7 +77,7 @@ end
         N = 4096
         counter = Lava.LavaArray(Int32[0])
         atomic_counter_i32!(Lava.LavaBackend())(counter; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(counter)[1] == Int32(N)
     end
 
@@ -89,7 +89,7 @@ end
         N = 4096
         counter = Lava.LavaArray(UInt32[0])
         atomic_counter_u32!(Lava.LavaBackend())(counter; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(counter)[1] == UInt32(N)
     end
 
@@ -101,7 +101,7 @@ end
         N = 1024
         counter = Lava.LavaArray(Float32[0])
         atomic_counter_f32!(Lava.LavaBackend())(counter; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(counter)[1] ≈ Float32(N)
     end
 
@@ -116,7 +116,7 @@ end
         counter = Lava.LavaArray(Int32[0])
         results = Lava.LavaArray(zeros(Int32, N))
         atomic_unique!(Lava.LavaBackend())(counter, results; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
 
         r = Array(results)
         @test Array(counter)[1] == Int32(N)
@@ -164,7 +164,7 @@ end
         siblings_d = Lava.LavaArray(siblings_h)
 
         refit_pattern!(Lava.LavaBackend())(data, flags, results, parents_d, siblings_d; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
 
         r = Array(results)
         expected = Float32[(2k - 1) * 10 + (2k) * 10 for k in 1:P]
@@ -183,7 +183,7 @@ end
         b = Lava.LavaArray(Float32[10, 20, 30, 40])
         c = a .+ b
         d = c .* Float32(2)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(d) == Float32[22, 44, 66, 88]
     end
 
@@ -191,7 +191,7 @@ end
         before = Lava.FLUSH_COUNTER[]
         a = Lava.LavaArray(Float32[1, 2, 3])
         _ = a .+ Float32(1)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Lava.FLUSH_COUNTER[] > before
     end
 
@@ -200,7 +200,7 @@ end
         before = Lava.TOTAL_DISPATCH_COUNTER[]
         a = Lava.LavaArray(Float32[1, 2, 3])
         _ = a .+ Float32(1)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Lava.TOTAL_DISPATCH_COUNTER[] > before
         Lava.DISPATCH_LOGGING_ENABLED[] = false
     end
@@ -218,7 +218,7 @@ end
 
     @testset "empty flush is no-op" begin
         before = Lava.FLUSH_COUNTER[]
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Lava.FLUSH_COUNTER[] == before
     end
 
@@ -237,7 +237,7 @@ end
         B = Lava.LavaArray(zeros(Float32, N))
         write_val!(Lava.LavaBackend())(A, 42.0f0; ndrange=N)
         read_add!(Lava.LavaBackend())(B, A; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test all(Array(B) .== 43.0f0)
     end
 
@@ -250,7 +250,7 @@ end
         A = Lava.LavaArray(zeros(Float32, 1024))
         fill_index!(Lava.LavaBackend())(A; ndrange=1024)
         GC.gc()
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(A)
         @test result[1] == 1.0f0
         @test result[1024] == 1024.0f0
@@ -261,7 +261,7 @@ end
         empty!(Lava.DISPATCH_LOG)
         a = Lava.LavaArray(Float32[1, 2, 3])
         _ = a .+ Float32(1)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test !isempty(Lava.DISPATCH_LOG)
         Lava.DISPATCH_LOGGING_ENABLED[] = false
     end
@@ -278,14 +278,14 @@ end
         for _ in 1:10
             a = a .+ Float32(1)
         end
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test all(Array(a) .== 11.0f0)
     end
 
     @testset "interleaved compute and reduction" begin
         a = Lava.LavaArray(Float32[1, 2, 3, 4, 5, 6, 7, 8])
         b = a .* Float32(2)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test sum(b) ≈ 72.0f0
     end
 
@@ -314,7 +314,7 @@ end
 
     a = Lava.LavaArray(zeros(Float32, 64))
     private_accum!(Lava.LavaBackend(), 64)(a; ndrange=64)
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     result = Array(a)
     @test result[1] == 1f0 + 4f0
     @test result[10] == 10f0 + 40f0
@@ -328,7 +328,7 @@ end
         N = 2048
         c = Lava.LavaArray(Int64[0])
         atomic_add_i64!(Lava.LavaBackend())(c; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(c)[1] == Int64(N)
     end
 
@@ -339,7 +339,7 @@ end
         N = 1024
         c = Lava.LavaArray(UInt64[0])
         atomic_add_u64!(Lava.LavaBackend())(c; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(c)[1] == UInt64(N)
     end
 end
@@ -352,7 +352,7 @@ end
         N = 1024
         c = Lava.LavaArray(Float64[0.0])
         atomic_add_f64!(Lava.LavaBackend())(c; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(c)[1] ≈ Float64(N)
     end
 
@@ -363,7 +363,7 @@ end
         N = 1024
         c = Lava.LavaArray(Float64[Float64(N)])
         atomic_sub_f64!(Lava.LavaBackend())(c; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(c)[1] ≈ 0.0
     end
 end
@@ -378,7 +378,7 @@ end
         N = 1024
         counter = Lava.LavaArray(Float32[Float32(N)])
         atomic_sub_f32!(Lava.LavaBackend())(counter; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(counter)[1] ≈ 0.0f0
     end
 
@@ -396,7 +396,7 @@ end
         N = 512
         idx_array = Lava.LavaArray(fill(target, N))
         atomic_add_3d!(Lava.LavaBackend())(A, idx_array; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(A)
         @test result[2, 3, 1] ≈ Float32(N)
         @test sum(result) ≈ Float32(N)  # only one cell was touched
@@ -415,7 +415,7 @@ end
         A = Lava.LavaArray(fill(Float32(N), dims))
         idx_array = Lava.LavaArray(fill(target, N))
         atomic_sub_2d!(Lava.LavaBackend())(A, idx_array, 1.0f0; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(A)
         @test result[4, 5] ≈ 0.0f0
         # All other cells untouched

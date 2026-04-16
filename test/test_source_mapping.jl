@@ -734,7 +734,7 @@ end
     # Simple add
     a = Lava.LavaArray(Float32[1, 2, 3, 4])
     b = a .+ 10.0f0
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     @test Array(b) == Float32[11, 12, 13, 14]
 
     # Reduction
@@ -757,7 +757,7 @@ end
     src = Lava.LavaArray([SrcMapTestStruct(1.0f0, 2.0f0), SrcMapTestStruct(3.0f0, 4.0f0)])
     dst = Lava.LavaArray{SrcMapTestStruct}(undef, 2)
     srcmap_struct_ka!(Lava.LavaBackend())(dst, src, 2.0f0; ndrange=2)
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     result = Array(dst)
     @test result[1].a ≈ 2.0f0
     @test result[1].b ≈ 4.0f0

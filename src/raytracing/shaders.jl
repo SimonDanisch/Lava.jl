@@ -88,11 +88,20 @@ function trace_rays!(bq::BatchQueue, pipeline::RayTracingPipeline, tlas::LavaTLA
     total_size = raygen_compiled.push_info.arg_buffer_size + inline_extra
 
     arg_buf = get_arg_buffer(bq, total_size)
-    pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
-                       raygen_compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
     batch = ensure_active_batch!(bq)
-    record_arg_accesses!(bq, batch, args)
+
+    # pack_args_direct! inlines pin! calls at every buffer leaf.  TLAS/BLAS
+    # storage and AS handles aren't in the arg tuple (bound via descriptor
+    # set), so they need explicit pin! calls at the dispatch site.
+    pack_args_direct!(bq, arg_buf.mapped_ptr, arg_buf.address, offsets,
+                       raygen_compiled.push_info.arg_buffer_size, byval_sizes, all_args)
+    pin!(batch, tlas.accel)
+    pin!(batch, tlas.storage)
+    for blas in tlas.blases
+        pin!(batch, blas.accel)
+        pin!(batch, blas.storage)
+    end
 
     rt_dispatch!(bq, vk_pipeline, tlas, arg_buf.address, width, height; depth=depth)
 end
@@ -133,14 +142,21 @@ function trace_rays_indirect!(bq::BatchQueue, pipeline::RayTracingPipeline,
     total_size = raygen_compiled.push_info.arg_buffer_size + inline_extra
 
     arg_buf = get_arg_buffer(bq, total_size)
-    pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
-                       raygen_compiled.push_info.arg_buffer_size, byval_sizes, all_args)
+
     batch = ensure_active_batch!(bq)
-    record_arg_accesses!(bq, batch, args)
+    pack_args_direct!(bq, arg_buf.mapped_ptr, arg_buf.address, offsets,
+                       raygen_compiled.push_info.arg_buffer_size, byval_sizes, all_args)
+    pin!(batch, tlas.accel)
+    pin!(batch, tlas.storage)
+    for blas in tlas.blases
+        pin!(batch, blas.accel)
+        pin!(batch, blas.storage)
+    end
     push_bda = arg_buf.address
 
     rt_dispatch_indirect!(bq, vk_pipeline, tlas, push_bda, indirect_buf)
 end
+
 
 """Prepare indirect RT dispatch buffer: writes (n_rays, 1, 1) from a GPU-resident count."""
 function prepare_indirect_rt_dispatch!(bq::BatchQueue, indirect_buf::VkIndirectBuffer, n_rays_buf::LavaArray{Int32})
@@ -205,6 +221,5 @@ end
 
 # VkManagedBuffer passes its BDA as a Ptr
 rt_arg_llvm_type(::VkManagedBuffer) = Ptr{UInt8}
-rt_arg_llvm_type(buf::LavaBuffer{T}) where T = Ptr{T}
 rt_arg_llvm_type(a::LavaArray{T}) where T = Ptr{T}
 rt_arg_llvm_type(x) = typeof(x)

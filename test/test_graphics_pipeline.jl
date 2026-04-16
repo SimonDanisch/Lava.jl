@@ -20,7 +20,7 @@ function draw_and_readback(pipeline, vertex_count;
     bq = ctx.default_bq
     draw!(bq, pipeline, target, vertex_count;
         args, frag_args, instances, clear_color)
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     return readback_framebuffer(fb)
 end
 
@@ -198,7 +198,7 @@ end
         draw!(bq, pip, target, 3;
             args=(Vec4f(0f0, 0f0, 1f0, 1f0), 0.3f0),
             clear_color=nothing)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
 
         pixels = readback_framebuffer(fb)
         # Blue should win (closer)

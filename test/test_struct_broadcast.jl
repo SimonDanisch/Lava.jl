@@ -45,7 +45,7 @@ end
         src = Lava.LavaArray(TestS12[TestS12(Float32(i), Float32(i+0.5), Float32(i+0.25)) for i in 1:n])
         dst = Lava.LavaArray{TestS12}(undef, n)
         dst .= src
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         expected = Array(src)
         @test result == expected
@@ -55,7 +55,7 @@ end
         src = Lava.LavaArray(TestS52[TestS52(ntuple(j -> Float32(i*100 + j), 13)...) for i in 1:n])
         dst = Lava.LavaArray{TestS52}(undef, n)
         dst .= src
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         expected = Array(src)
         @test result == expected
@@ -65,7 +65,7 @@ end
         src = Lava.LavaArray(TestS24[TestS24(Float64(i), Float64(i+0.5), Float64(i+0.25)) for i in 1:n])
         dst = Lava.LavaArray{TestS24}(undef, n)
         dst .= src
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         expected = Array(src)
         @test result == expected
@@ -93,7 +93,7 @@ end
         dst = Lava.LavaArray{TestS12}(undef, n)
         kernel = copy_structs_ka(Lava.LavaBackend())
         kernel(dst, src; ndrange=n)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(dst) == Array(src)
     end
 
@@ -108,7 +108,7 @@ end
         dst = Lava.LavaArray{TestS12}(undef, n)
         kernel = transform_structs_ka(Lava.LavaBackend())
         kernel(dst, src, 2f0; ndrange=n)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         @test all(r -> r == TestS12(2f0, 4f0, 6f0), result)
     end
@@ -159,7 +159,7 @@ end
         src = Lava.LavaArray([BoolPadStruct(Float32(i), isodd(i), Float32(i+1)) for i in 1:n])
         dst = Lava.LavaArray(zeros(Float32, n))
         read_bool_pad(backend)(dst, src; ndrange=n)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         expected = [isodd(i) ? Float32(2i+1) : Float32(-1) for i in 1:n]
         @test result ≈ expected
@@ -173,7 +173,7 @@ end
     @testset "BoolPadStruct write n=$n" for n in [64, 256]
         dst = Lava.LavaArray{BoolPadStruct}(undef, n)
         write_bool_pad(backend)(dst, 2f0; ndrange=n)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         for i in 1:n
             @test result[i].x ≈ Float32(i) * 2f0
@@ -197,7 +197,7 @@ end
         src = Lava.LavaArray([TwoBoolStruct(1f0, 2f0, 3f0, isodd(i), i % 3 == 0, 4f0) for i in 1:n])
         dst = Lava.LavaArray(zeros(Float32, n))
         read_two_bools(backend)(dst, src; ndrange=n)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         for i in 1:n
             expected = 10f0 + (isodd(i) ? 100f0 : 0f0) + (i % 3 == 0 ? 1000f0 : 0f0)
@@ -220,7 +220,7 @@ end
         src = Lava.LavaArray([BoolHeavyStruct(1f0,2f0,3f0, isodd(i), 4f0,5f0,6f0,7f0, i%3==0, 8f0) for i in 1:n])
         dst = Lava.LavaArray(zeros(Float32, n))
         read_bool_heavy(backend)(dst, src; ndrange=n)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(dst)
         for i in 1:n
             base = 36f0  # 1+2+3+4+5+6+7+8
@@ -298,7 +298,7 @@ end
         roundtrip_small_kernel(KernelAbstractions.CPU())(dst_cpu, src_cpu, 0.5f0; ndrange=N)
         src_gpu = Lava.LavaArray(data); dst_gpu = Lava.LavaArray{RoundtripSmall}(undef, N)
         roundtrip_small_kernel(backend)(dst_gpu, src_gpu, 0.5f0; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(dst_gpu) == dst_cpu
     end
 
@@ -326,7 +326,7 @@ end
         roundtrip_bool_kernel(KernelAbstractions.CPU())(dst_cpu, src_cpu; ndrange=N)
         src_gpu = Lava.LavaArray(data); dst_gpu = Lava.LavaArray{RoundtripWithBool}(undef, N)
         roundtrip_bool_kernel(backend)(dst_gpu, src_gpu; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(dst_gpu) == dst_cpu
     end
 
@@ -352,7 +352,7 @@ end
         roundtrip_twobool_kernel(KernelAbstractions.CPU())(dst_cpu, src_cpu; ndrange=N)
         src_gpu = Lava.LavaArray(data); dst_gpu = Lava.LavaArray(zeros(Float32, N))
         roundtrip_twobool_kernel(backend)(dst_gpu, src_gpu; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(dst_gpu) ≈ dst_cpu
     end
 
@@ -376,7 +376,7 @@ end
         roundtrip_nested_kernel(KernelAbstractions.CPU())(dst_cpu, src_cpu, 100f0; ndrange=N)
         src_gpu = Lava.LavaArray(data); dst_gpu = Lava.LavaArray(zeros(Float32, N))
         roundtrip_nested_kernel(backend)(dst_gpu, src_gpu, 100f0; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(dst_gpu) ≈ dst_cpu
     end
 end
@@ -444,7 +444,7 @@ random_fuzz_value(::Type{Float64}) = randn(Float64)
         src_gpu = Lava.LavaArray(data)
         dst_gpu = Lava.LavaArray{T}(undef, N)
         dst_gpu .= src_gpu
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
 
         result_gpu = Array(dst_gpu)
 
@@ -468,49 +468,49 @@ using ColorTypes: RGB
     @testset "RGB{Float32} constant" begin
         a = Lava.LavaArray(fill(RGB{Float32}(1,1,1), 64))
         a .= RGB{Float32}(0, 0, 0)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test all(Array(a) .== RGB{Float32}(0, 0, 0))
     end
 
     @testset "NTuple{3,Float32} via fill!" begin
         a = Lava.LavaArray(fill(NTuple{3,Float32}((1,1,1)), 64))
         fill!(a, NTuple{3,Float32}((0,0,0)))
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test all(x -> x == NTuple{3,Float32}((0,0,0)), Array(a))
     end
 
     @testset "TestS12 Ref broadcast" begin
         a = Lava.LavaArray(fill(TestS12(1,1,1), 64))
         a .= Ref(TestS12(0, 0, 0))
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test all(x -> x == TestS12(0,0,0), Array(a))
     end
 
     @testset "BoolPadStruct Ref broadcast" begin
         a = Lava.LavaArray(fill(BoolPadStruct(1f0, true, 2f0), 64))
         a .= Ref(BoolPadStruct(0f0, false, 0f0))
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test all(x -> x == BoolPadStruct(0f0, false, 0f0), Array(a))
     end
 
     @testset "2D RGB array constant" begin
         a = Lava.LavaArray(fill(RGB{Float32}(1,1,1), 16, 16))
         a .= RGB{Float32}(0.5, 0.5, 0.5)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test all(Array(a) .== RGB{Float32}(0.5, 0.5, 0.5))
     end
 
     @testset "Ref-wrapped struct with nonzero values" begin
         a = Lava.LavaArray(fill(TestS12(0,0,0), 64))
         a .= Ref(TestS12(42, 43, 44))
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test all(x -> x == TestS12(42,43,44), Array(a))
     end
 
     @testset "non-zero value preserves data" begin
         a = Lava.LavaArray(fill(TestS12(0,0,0), 128))
         a .= Ref(TestS12(1.5f0, 2.5f0, 3.5f0))
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(a)
         @test result[1].a == 1.5f0
         @test result[1].b == 2.5f0
@@ -524,13 +524,13 @@ end
     src = Lava.LavaArray(rand(Float32, 256))
     dst = Lava.LavaArray(zeros(Float32, 256))
     dst .= src
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     @test Array(dst) == Array(src)
 
     # Same with struct elements
     src_s = Lava.LavaArray([TestS12(rand(Float32, 3)...) for _ in 1:64])
     dst_s = Lava.LavaArray(fill(TestS12(0,0,0), 64))
     dst_s .= src_s
-    Lava.vk_flush!()
+    Lava.vk_flush!(Lava.vk_context())
     @test Array(dst_s) == Array(src_s)
 end

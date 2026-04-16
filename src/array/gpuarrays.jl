@@ -8,11 +8,18 @@ import Adapt
 
 # ── Adapt.jl integration ──
 
-"""LavaAdaptor: converts LavaArray → Ptr{T} for GPU kernel compilation.
-Used by argconvert to recursively adapt Broadcasted objects containing LavaArray."""
-struct LavaAdaptor end
+# LavaAdaptor struct is declared in array/lavaarray.jl (needed earlier by
+# ka_backend.jl method signatures).  This file defines the Adapt rules.
+#
+# The adaptor is the single place LavaArray → LavaDeviceArray (pointer strip)
+# happens during kernel-arg conversion, so it is also the single place buffer-
+# lifetime pinning fires.  Adapt.jl's recursion handles wrapper structs,
+# Broadcasted, NamedTuple — every LavaArray anywhere inside lands here.
 
-Adapt.adapt_storage(::LavaAdaptor, a::LavaArray{T,N}) where {T,N} = LavaDeviceArray{T,N}(Ptr{T}(bda_address(a)), a.dims)
+function Adapt.adapt_storage(ad::LavaAdaptor, a::LavaArray{T,N}) where {T,N}
+    pin!(ad.batch, a)
+    return LavaDeviceArray{T,N}(Ptr{T}(bda_address(a)), a.dims)
+end
 Adapt.adapt_storage(::LavaAdaptor, x) = x  # Scalars pass through
 
 # Type-based adapt: Array → LavaArray (used by GPUArrays test suite's compare())
@@ -83,7 +90,8 @@ function Base.copyto!(dest::LavaArray{T}, doffs::Integer,
     n == 0 && return dest
     bytes = Vector{UInt8}(undef, n * sizeof(T))
     unsafe_copyto!(Ptr{UInt8}(pointer(bytes)), Ptr{UInt8}(pointer(src, soffs)), n * sizeof(T))
-    # upload! → one_shot_copy auto-flushes pending dispatches and does its own submit+wait
+    # upload! records into the active batch and flushes; sync_access! takes care
+    # of any prior cross-queue writer to `dest.buf[]` via timeline semaphore.
     upload!(dest.buf[], bytes; offset=(dest.offset + Int(doffs) - 1) * sizeof(T))
     return dest
 end
@@ -91,7 +99,8 @@ end
 function Base.copyto!(dest::Array{T}, doffs::Integer,
                       src::LavaArray{T}, soffs::Integer, n::Integer) where T
     n == 0 && return dest
-    # download! → one_shot_copy auto-flushes pending dispatches and does its own submit+wait
+    # download! records a copy into the active batch of whichever queue last
+    # wrote `src.buf[]` and flushes — sync_access! inserts any cross-queue wait.
     bytes = Vector{UInt8}(undef, n * sizeof(T))
     download!(bytes, src.buf[]; offset=(src.offset + Int(soffs) - 1) * sizeof(T))
     unsafe_copyto!(Ptr{UInt8}(pointer(dest, doffs)), Ptr{UInt8}(pointer(bytes)), n * sizeof(T))
@@ -101,12 +110,14 @@ end
 function Base.copyto!(dest::LavaArray{T}, doffs::Integer,
                       src::LavaArray{T}, soffs::Integer, n::Integer) where T
     n == 0 && return dest
-    # Direct GPU→GPU copy via vkCmdCopyBuffer (no CPU staging roundtrip)
+    # Direct GPU→GPU copy via vkCmdCopyBuffer (no CPU staging roundtrip).
     src_offset = src.buf[].pool_offset + (src.offset + Int(soffs) - 1) * sizeof(T)
     dst_offset = dest.buf[].pool_offset + (dest.offset + Int(doffs) - 1) * sizeof(T)
     nbytes = n * sizeof(T)
     bq = (dest.buf[].ctx::VkContext).default_bq
-    one_shot_copy(bq, src.buf[].buffer, src_offset, dest.buf[].buffer, dst_offset, nbytes)
+    cmd_copy_buffer!(bq, src.buf[], dest.buf[], nbytes;
+                     src_off=src_offset, dst_off=dst_offset)
+    flush!(bq, bq.device)
     return dest
 end
 
@@ -136,7 +147,9 @@ function Base.resize!(a::LavaArray{T,1}, n::Integer) where T
     if old_len > 0 && n > 0
         copy_len = min(old_len, Int(n)) * sizeof(T)
         src_off = a.buf[].pool_offset + a.offset * sizeof(T)
-        one_shot_copy(bq, a.buf[].buffer, src_off, new_buf.buffer, new_buf.pool_offset, copy_len)
+        cmd_copy_buffer!(bq, a.buf[], new_buf, copy_len;
+                         src_off=src_off, dst_off=new_buf.pool_offset)
+        flush!(bq, bq.device)
     end
     new_ref = GPUArrays.DataRef(new_buf) do buf
         vk_free!(buf)

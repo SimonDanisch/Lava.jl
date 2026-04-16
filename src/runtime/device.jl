@@ -33,29 +33,28 @@ while keeping submission count minimal (single submit per flush).
 """
 mutable struct CommandBatch
     cmd_buf::Vulkan.CommandBuffer       # Currently recording CB segment
-    fence::Vulkan.Fence                 # Single fence for the whole batch
     recording::Bool
     dispatch_count::Int                 # Total dispatches across all segments (for barriers)
     segment_dispatches::Int             # Dispatches in current CB segment (for split threshold)
     last_was_rt::Bool
-    data_refs::Vector{Any}
+    # All objects this batch keeps alive until the fence is reached.  IdSet
+    # so each object is pinned (and sync-tracked) at most once per batch.
+    # Populated by `pin!` during arg packing and from dispatch entry points.
+    pinned::Base.IdSet{Any}
     dispatch_log::Vector{String}
     sealed_cmd_bufs::Vector{Vulkan.CommandBuffer}  # Completed CB segments awaiting submit
 
-    # ── Explicit-queue refactor additions ────────────────────────────────
-    # Timeline value that this batch's submit will signal on its queue's
-    # `timeline_sem`.  Assigned at record time so `record_buffer_access!`
-    # can write it into `buf.last_write` before submit.
+    # Timeline value this batch will signal on its queue's `timeline_sem`.
+    # Assigned at record time so `sync_access!` can store it into `buf.last_write`.
     signal_value::UInt64
-    # Cross-queue dependencies collected while recording.
+    # Cross-queue dependencies, built up by `sync_access!(::VkManagedBuffer)` at submit.
     wait_semaphores::Vector{Tuple{Vulkan.Semaphore, UInt64, Vulkan.PipelineStageFlag2}}
-    # Reaper task spawned by submit (Threads.@spawn).
-    reaper_task::Union{Nothing, Task}
-    # Set by the reaper if wait_semaphores fails.  Read by main thread only
-    # after observing `retired[] == true` (acquire semantics).
-    error::Union{Nothing, Exception}
-    # Release/acquire handshake: reaper flips this true as its final action.
-    retired::Threads.Atomic{Bool}
+    # Back-reference to the owning BatchQueue.  Set post-construction (chicken/
+    # egg: init_batch runs inside BatchQueue's constructor).  Always non-nothing
+    # after the BatchQueue is fully built; checked via `batch.bq`.
+    # Loose type because BatchQueue is declared above but the reverse dep still
+    # makes `CommandBatch.bq::BatchQueue` fragile in the struct body.
+    bq::Any
 end
 
 """
@@ -76,10 +75,6 @@ mutable struct BatchQueue
     in_flight::Vector{CommandBatch}
     free_batches::Vector{CommandBatch}
     free_cmd_bufs::Vector{Vulkan.CommandBuffer}
-    # Dedicated transfer command buffer + fence (per-queue, thread-safe).
-    # Will be removed once one_shot_copy goes through the regular batch path.
-    xfer_cmd_buf::Vulkan.CommandBuffer
-    xfer_fence::Vulkan.Fence
     # Dedicated AS-build command buffer + fence — allocated from this BQ's
     # own cmd_pool and submitted on this BQ's queue.  Keeping them on the
     # BQ (not the VkContext) means AS build, submit and queue are locked
@@ -94,11 +89,20 @@ mutable struct BatchQueue
     # Buffers queued for destruction once their last_write timeline value
     # is reached. Drained by drain_deferred_frees! at natural sync points.
     # Loose type (VkManagedBuffer is declared later in memory.jl).
+    #
+    # Cross-thread: finalizer threads push into this list via `vk_free!`;
+    # the main thread iterates + drains via `drain_deferred_frees!`.  The
+    # `deferred_frees_lock` below guards both operations on `deferred_frees`
+    # AND `deferred_as_frees`.  SpinLock because contention is near-zero
+    # (finalizer pushes at GC pauses, drain happens at sync points).
     deferred_frees::Vector{Any}
     # LavaBLAS / LavaTLAS queued for destruction once their `last_use`
     # timeline value is reached. Drained by `drain_deferred_as_frees!`.
     # Loose type — Lava AS types are declared later in raytracing/acceleration.jl.
     deferred_as_frees::Vector{Any}
+    # Guards `deferred_frees` AND `deferred_as_frees`.  Acquired on every
+    # push from finalizer threads and on every drain from the main thread.
+    deferred_frees_lock::Base.Threads.SpinLock
     # Per-BQ argument-buffer slab pool.  Each submit bump-allocates from
     # the current slab; `reset_arg_buffer_pool!(bq)` (called from
     # reclaim_batch! once in_flight is empty) rewinds the bump pointer.
@@ -121,24 +125,27 @@ mutable struct BatchQueue
     # window of default_bq construction before VkContext exists.
     # Loose type — VkContext is declared below.
     ctx::Any
+    # Single-writer invariant: only this thread may record into or submit
+    # from this BatchQueue.  Captured at construction from `Threads.threadid()`.
+    # Every dispatch-recording / sweep / slab-alloc entry point asserts that
+    # it is running on this thread — an accidental cross-thread call trips
+    # the assert immediately instead of silently corrupting state.
+    owning_thread::Int
 end
 
-function init_batch(device::Vulkan.Device, cb::Vulkan.CommandBuffer)
-    fence = Vulkan.Fence(device)
-    data_refs = Any[]
-    sizehint!(data_refs, 128)
+function init_batch(cb::Vulkan.CommandBuffer)
+    pinned = Base.IdSet{Any}()
+    sizehint!(pinned, 128)
     waits = Tuple{Vulkan.Semaphore, UInt64, Vulkan.PipelineStageFlag2}[]
-    return CommandBatch(cb, fence, false, 0, 0, false, data_refs, String[],
+    return CommandBatch(cb, false, 0, 0, false, pinned, String[],
         Vulkan.CommandBuffer[],
         UInt64(0),                       # signal_value (assigned at record time)
         waits,
-        nothing,                         # reaper_task
-        nothing,                         # error
-        Threads.Atomic{Bool}(false),     # retired
+        nothing,                         # bq (set after BatchQueue is fully built)
     )
 end
 
-function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32;
+function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32, ctx;
                     n_initial_batches::Int=2)
     cmd_pool = Vulkan.CommandPool(device, qf_idx;
         flags=Vulkan.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
@@ -146,12 +153,8 @@ function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32;
     for _ in 1:n_initial_batches
         alloc_info = Vulkan.CommandBufferAllocateInfo(cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1)
         cb = unwrap(Vulkan.allocate_command_buffers(device, alloc_info))[1]
-        push!(batches, init_batch(device, cb))
+        push!(batches, init_batch(cb))
     end
-    # Dedicated transfer command buffer + fence (legacy)
-    xfer_alloc = Vulkan.CommandBufferAllocateInfo(cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1)
-    xfer_cmd_buf = unwrap(Vulkan.allocate_command_buffers(device, xfer_alloc))[1]
-    xfer_fence = Vulkan.Fence(device)
     # Dedicated AS-build command buffer + fence (same pool as this bq).
     as_alloc = Vulkan.CommandBufferAllocateInfo(cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1)
     as_cmd_buf = unwrap(Vulkan.allocate_command_buffers(device, as_alloc))[1]
@@ -160,16 +163,24 @@ function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32;
     type_info = Vulkan.SemaphoreTypeCreateInfo(Vulkan.SEMAPHORE_TYPE_TIMELINE, UInt64(0))
     timeline_sem = unwrap(Vulkan.create_semaphore(device,
         Vulkan.SemaphoreCreateInfo(; next=type_info)))
-    return BatchQueue(device, queue, qf_idx, cmd_pool, nothing,
-                      CommandBatch[], batches, Vulkan.CommandBuffer[],
-                      xfer_cmd_buf, xfer_fence,
-                      as_cmd_buf, as_fence,
-                      timeline_sem, UInt64(0),
-                      Any[], Any[],
-                      Any[], 1, 0, 0,  # arg_slabs: idx=1, offset=0, count=0
-                      Any[], 1, 0,     # indirect_slabs: idx=1, offset=0
-                      nothing,         # staging (lazy)
-                      nothing)         # ctx (set after VkContext is built)
+    bq = BatchQueue(device, queue, qf_idx, cmd_pool, nothing,
+                    CommandBatch[], batches, Vulkan.CommandBuffer[],
+                    as_cmd_buf, as_fence,
+                    timeline_sem, UInt64(0),
+                    Any[], Any[],    # deferred_frees, deferred_as_frees
+                    Base.Threads.SpinLock(),  # deferred_frees_lock
+                    Any[], 1, 0, 0,  # arg_slabs: idx=1, offset=0, count=0
+                    Any[], 1, 0,     # indirect_slabs: idx=1, offset=0
+                    nothing,         # staging (lazy)
+                    ctx,             # owning VkContext (required)
+                    Threads.threadid())  # owning_thread
+    # Plug the back-reference into every pre-allocated batch so `batch.bq`
+    # is non-nothing as soon as the bq is returned.  Future batches allocated
+    # lazily (alloc_cmd_buf → init_batch) must set .bq themselves.
+    for b in batches
+        b.bq = bq
+    end
+    return bq
 end
 
 """
@@ -185,7 +196,10 @@ mutable struct VkContext
     device::Vulkan.Device
     queue_family_index::UInt32
     device_name::String
-    # Primary batch queue — all global API functions delegate here
+    # Primary batch queue — all global API functions delegate here.  Always
+    # non-nothing after the inner constructor returns (BatchQueue is built
+    # using `new()`-based two-phase init to break the chicken-and-egg with
+    # BatchQueue.ctx).
     default_bq::BatchQueue
     # Secondary compute queue (async RT) — same family, separate queue object
     compute_queue::Vulkan.Queue
@@ -208,6 +222,49 @@ mutable struct VkContext
     # Cached physical-device properties (avoid re-querying on every alloc/dispatch).
     memory_properties::Vulkan.PhysicalDeviceMemoryProperties
     max_wg_dims::NTuple{3, Int}
+
+    # Inner constructor: two-phase init via `new()` so we can hand a live
+    # `ctx` reference to `BatchQueue(...)` while finishing the ctx's own
+    # field assignments.  There is no public ctor that can leave `default_bq`
+    # unset.  `primary_queue` is the raw `Vulkan.Queue` for the default bq;
+    # everything else maps directly to a field.
+    function VkContext(instance::Vulkan.Instance,
+                       physical_device::Vulkan.PhysicalDevice,
+                       device::Vulkan.Device,
+                       queue_family_index::UInt32,
+                       device_name::String,
+                       primary_queue::Vulkan.Queue,
+                       compute_queue::Vulkan.Queue,
+                       rt_pipeline_properties::Union{Nothing, RTPipelineProperties},
+                       debug_messenger::Any,
+                       next_queue_index::Int,
+                       max_queue_count::Int,
+                       async_queue_family_index::Union{Nothing, UInt32},
+                       async_queue_count::Int,
+                       device_lost::Bool,
+                       memory_properties::Vulkan.PhysicalDeviceMemoryProperties,
+                       max_wg_dims::NTuple{3, Int})
+        ctx = new()
+        ctx.instance = instance
+        ctx.physical_device = physical_device
+        ctx.device = device
+        ctx.queue_family_index = queue_family_index
+        ctx.device_name = device_name
+        ctx.compute_queue = compute_queue
+        ctx.rt_pipeline_properties = rt_pipeline_properties
+        ctx.debug_messenger = debug_messenger
+        ctx.next_queue_index = next_queue_index
+        ctx.max_queue_count = max_queue_count
+        ctx.async_queue_family_index = async_queue_family_index
+        ctx.async_queue_count = async_queue_count
+        ctx.device_lost = device_lost
+        ctx.memory_properties = memory_properties
+        ctx.max_wg_dims = max_wg_dims
+        # Now build the default BatchQueue with the live ctx.  Sets the
+        # remaining field; no nullable slot, no post-hoc mutation.
+        ctx.default_bq = BatchQueue(device, primary_queue, queue_family_index, ctx)
+        return ctx
+    end
 end
 
 # Ring buffer of recent validation messages for context on DEVICE_LOST
@@ -293,9 +350,10 @@ Always takes the queue explicitly — no implicit default_bq lookup.
 has_active_recording(bq::BatchQueue) = bq.active_batch !== nothing
 
 function init_vulkan!()
-    # Create instance
+    # Create instance — target Vulkan 1.4 (device supports 1.4.335 on RADV).
+    # Bumping API version unlocks 1.3/1.4 core features we enable below.
     app_info = Vulkan.ApplicationInfo(
-        v"0.1.0", v"0.1.0", v"1.3.0";
+        v"0.1.0", v"0.1.0", v"1.4.0";
         application_name="Lava.jl",
         engine_name="Lava"
     )
@@ -345,31 +403,52 @@ function init_vulkan!()
         push!(inst_extensions, "VK_EXT_metal_surface")
     end
 
-    # GPU-assisted validation: opt-in via LAVA_GPU_AV=1 (instruments shaders, very slow)
+    # Extended validation: opt-in via env vars, all require VK_EXT_validation_features.
+    #   LAVA_GPU_AV=1    → shader instrumentation (OOB descriptor access, ray query misuse);
+    #                      does NOT cover plain BDA ranges in current layers.
+    #   LAVA_SYNC_VAL=1  → synchronization validation (reads before writes, missing barriers,
+    #                      cross-submit hazards).  Catches shadow-ownership UAFs.
+    #   LAVA_BEST=1      → best-practices warnings (perf hints).
+    # All are very slow; use one or a combination as needed for triage.
     gpu_assisted = false
-    want_gpu_av = get(ENV, "LAVA_GPU_AV", "0") != "0"
-    if want_gpu_av && has_validation && "VK_EXT_validation_features" in ext_names
+    sync_val     = false
+    want_gpu_av  = get(ENV, "LAVA_GPU_AV",  "0") != "0"
+    want_sync_val= get(ENV, "LAVA_SYNC_VAL","0") != "0"
+    want_best    = get(ENV, "LAVA_BEST",    "0") != "0"
+    validation_features_reqs = Vulkan.ValidationFeatureEnableEXT[]
+    if want_gpu_av
+        push!(validation_features_reqs,
+              Vulkan.VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT)
+        push!(validation_features_reqs,
+              Vulkan.VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_RESERVE_BINDING_SLOT_EXT)
+    end
+    if want_sync_val
+        push!(validation_features_reqs,
+              Vulkan.VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT)
+    end
+    if want_best
+        push!(validation_features_reqs,
+              Vulkan.VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT)
+    end
+    if !isempty(validation_features_reqs) && has_validation && "VK_EXT_validation_features" in ext_names
         push!(inst_extensions, "VK_EXT_validation_features")
-        validation_features = Vulkan.ValidationFeaturesEXT(
-            [Vulkan.VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT,
-             Vulkan.VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_RESERVE_BINDING_SLOT_EXT],
-            []
-        )
+        validation_features = Vulkan.ValidationFeaturesEXT(validation_features_reqs, [])
         instance = Vulkan.Instance(
             layers,
             inst_extensions;
             application_info=app_info,
             next=validation_features
         )
-        gpu_assisted = true
+        gpu_assisted = want_gpu_av
+        sync_val     = want_sync_val
     else
         instance = Vulkan.Instance(
             layers,
             inst_extensions;
             application_info=app_info
         )
-        if has_validation && want_gpu_av
-            @warn "Vulkan validation layers active but VK_EXT_validation_features not available. GPU-assisted validation disabled."
+        if has_validation && (want_gpu_av || want_sync_val || want_best)
+            @warn "Vulkan validation layers active but VK_EXT_validation_features not available; extended validation disabled."
         end
     end
 
@@ -490,14 +569,36 @@ function init_vulkan!()
         false;  # subgroup_broadcast_dynamic_id
         next=var_ptr_features
     )
-    # Dynamic rendering (Vulkan 1.3 core) — no VkRenderPass/VkFramebuffer boilerplate
-    dyn_rendering_features = Vulkan.PhysicalDeviceDynamicRenderingFeatures(
-        true;   # dynamic_rendering
-        next=vulkan12_features
+    # Vulkan 1.3 core features, bundled.  We turn on the set that's
+    # guaranteed by the 1.3 core spec and useful for a compute/RT backend:
+    #   - synchronization2        (REQUIRED: we use vkQueueSubmit2 / cmd_pipeline_barrier_2)
+    #   - dynamic_rendering       (no VkRenderPass/VkFramebuffer boilerplate)
+    #   - maintenance4            (relaxes shader requirements, e.g. storage-buffer layout)
+    #   - subgroup_size_control   (query/set subgroup size)
+    #   - compute_full_subgroups  (FULL_SUBGROUPS flag in pipeline create)
+    #   - pipeline_creation_cache_control (pipeline-cache hints in create)
+    #   - shader_demote_to_helper_invocation (OpDemoteToHelperInvocation in SPIR-V)
+    #   - shader_terminate_invocation         (OpTerminateInvocation in SPIR-V)
+    #   - shader_integer_dot_product          (OpSDot / OpUDot in SPIR-V)
+    #   - shader_zero_initialize_workgroup_memory (zero-init shared mem)
+    #   - private_data            (VkPrivateDataSlot for driver-side tagging)
+    vulkan13_features = Vulkan.PhysicalDeviceVulkan13Features(
+        :synchronization2,
+        :dynamic_rendering,
+        :maintenance4,
+        :subgroup_size_control,
+        :compute_full_subgroups,
+        :pipeline_creation_cache_control,
+        :shader_demote_to_helper_invocation,
+        :shader_terminate_invocation,
+        :shader_integer_dot_product,
+        :shader_zero_initialize_workgroup_memory,
+        :private_data;
+        next=vulkan12_features,
     )
 
     # Chain workgroup explicit layout if available
-    feature_chain = dyn_rendering_features
+    feature_chain = vulkan13_features
     if has_wg_explicit
         wg_explicit_features = Vulkan.PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR(
             true,   # workgroup_memory_explicit_layout
@@ -567,14 +668,11 @@ function init_vulkan!()
         )
     end
 
-    # Default batch queue on the primary queue (owns transfer + AS-build cmd buf/fence)
-    default_bq = BatchQueue(device, queue, qf_idx)
-
     has_validation = !isempty(layers)
     if has_rt
-        @info "Lava: initialized Vulkan device with RT" device=dev_name queue_family=qf_idx handle_size=rt_props.shader_group_handle_size max_recursion=rt_props.max_ray_recursion_depth validation=has_validation gpu_assisted=gpu_assisted debug_utils=has_debug_utils
+        @info "Lava: initialized Vulkan device with RT" device=dev_name queue_family=qf_idx handle_size=rt_props.shader_group_handle_size max_recursion=rt_props.max_ray_recursion_depth validation=has_validation gpu_assisted=gpu_assisted sync_val=sync_val debug_utils=has_debug_utils
     else
-        @info "Lava: initialized Vulkan device (no RT)" device=dev_name queue_family=qf_idx validation=has_validation gpu_assisted=gpu_assisted debug_utils=has_debug_utils
+        @info "Lava: initialized Vulkan device (no RT)" device=dev_name queue_family=qf_idx validation=has_validation gpu_assisted=gpu_assisted sync_val=sync_val debug_utils=has_debug_utils
     end
     if !has_validation && want_validation
         @warn "Vulkan validation layers not found. Install vulkan-validationlayers for GPU error diagnostics."
@@ -593,18 +691,18 @@ function init_vulkan!()
     wgc = phys_props.limits.max_compute_work_group_count
     max_wg = (Int(wgc[1]), Int(wgc[2]), Int(wgc[3]))
 
+    # VkContext's inner constructor builds its own default_bq via `new()`-
+    # based two-phase init.  Pass the raw primary queue and all other ctx
+    # fields; the ctor wires BatchQueue(device, queue, qfi, ctx) internally.
     ctx = VkContext(
         instance, phys_dev, device, qf_idx, dev_name,
-        default_bq, compute_queue,
-        rt_props,
-        debug_messenger,
+        queue, compute_queue,
+        rt_props, debug_messenger,
         2, n_queues,  # next_queue_index=2 (0=primary, 1=compute), max=n_queues
         async_qf_idx, async_n_queues,
         false,        # device_lost (fresh context)
         mem_props, max_wg,
     )
-    # Wire up the back-reference so bq-aware code never reaches for VK_CONTEXT_REF[].
-    default_bq.ctx = ctx
     return ctx
 end
 
@@ -629,9 +727,7 @@ function allocate_batch_queue!(ctx::VkContext)
         # All hardware queues taken — reuse primary queue with separate command pool
         queue = ctx.default_bq.queue
     end
-    bq = BatchQueue(ctx.device, queue, ctx.queue_family_index)
-    bq.ctx = ctx
-    return bq
+    return BatchQueue(ctx.device, queue, ctx.queue_family_index, ctx)
 end
 
 function pick_physical_device(devs)

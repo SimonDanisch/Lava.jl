@@ -26,7 +26,7 @@ using KernelAbstractions
                     end
                     fill_wg!(Lava.LavaBackend())(results; ndrange=16, workgroupsize=wg)
                 end
-                Lava.vk_flush!()
+                Lava.vk_flush!(Lava.vk_context())
 
                 # Cache should have at most 5 entries
                 @test length(Lava.LINKED_KERNEL_CACHE) <= 5
@@ -52,13 +52,13 @@ using KernelAbstractions
 
             # First call: compile
             double_k!(Lava.LavaBackend())(a; ndrange=64)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             r1 = Array(a)
 
             # Second call: cache hit
             fill!(a, 0.0f0)
             double_k!(Lava.LavaBackend())(a; ndrange=64)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             r2 = Array(a)
 
             @test r1 == r2
@@ -103,7 +103,7 @@ using KernelAbstractions
             pk3!(Lava.LavaBackend())(a; ndrange=16)
             pk4!(Lava.LavaBackend())(a; ndrange=16)
             pk5!(Lava.LavaBackend())(a; ndrange=16)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
 
             @test length(Lava.PIPELINE_CACHE) <= 3
             @test length(Lava.PIPELINE_INSERTION_ORDER) <= 3
@@ -152,13 +152,13 @@ using KernelAbstractions
             # After dispatch, batch should have data_refs
             ctx = Lava.vk_context()
 
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
 
-            # After flush, if batch was reclaimed, data_refs should be cleared
-            # (The batch may be recycled into free_batches with empty data_refs)
+            # After flush, if batch was reclaimed, pinned should be cleared
+            # (The batch may be recycled into free_batches with empty pinned)
             batch = ctx.active_batch
             if batch !== nothing
-                @test isempty(batch.data_refs)
+                @test isempty(batch.pinned)
             end
 
             Lava.unsafe_free!(a)
@@ -178,14 +178,14 @@ using KernelAbstractions
             for _ in 1:100
                 slab_k!(Lava.LavaBackend())(a; ndrange=16)
             end
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             n_slabs_after_first = length(Lava.ARG_SLABS)
 
             # Second batch — should reuse same slabs
             for _ in 1:100
                 slab_k!(Lava.LavaBackend())(a; ndrange=16)
             end
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             n_slabs_after_second = length(Lava.ARG_SLABS)
 
             @test n_slabs_after_second == n_slabs_after_first
@@ -209,7 +209,7 @@ using KernelAbstractions
             for _ in 1:50
                 indirect_k!(Lava.LavaBackend())(a; ndrange=16)
             end
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
 
             @test Lava.INDIRECT_SLAB_OFFSET[] == 0
             @test Lava.INDIRECT_SLAB_IDX[] == 1
@@ -261,15 +261,15 @@ using KernelAbstractions
             fill!(a, 7.0f0)
 
             id_k!(Lava.LavaBackend())(b, a; ndrange=N)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             @test all(Array(b) .≈ 7.0f0)
 
             neg_k!(Lava.LavaBackend())(b, a; ndrange=N)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             @test all(Array(b) .≈ -7.0f0)
 
             add_k!(Lava.LavaBackend())(b, a, 3.0f0; ndrange=N)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             @test all(Array(b) .≈ 10.0f0)
 
             Lava.unsafe_free!(a)
@@ -281,7 +281,7 @@ using KernelAbstractions
     @testset "broadcast allocation stability" begin
         @testset "repeated broadcasts don't leak" begin
             GC.gc(true)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             Lava.flush_deferred_frees!()
             baseline = length(Lava.LIVE_BUFFERS)
 
@@ -289,13 +289,13 @@ using KernelAbstractions
                 a = Lava.LavaArray(Float32.(rand(128)))
                 b = Lava.LavaArray(Float32.(rand(128)))
                 c = a .+ b  # broadcast creates a new array
-                Lava.vk_flush!()
+                Lava.vk_flush!(Lava.vk_context())
                 Lava.unsafe_free!(a)
                 Lava.unsafe_free!(b)
                 Lava.unsafe_free!(c)
             end
 
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             Lava.flush_deferred_frees!()
             after = length(Lava.LIVE_BUFFERS)
             @test after == baseline

@@ -23,7 +23,7 @@ end
             for a in arrays
                 fill_kernel!(backend)(a, Float32(iter); ndrange=100)
             end
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
 
             # Verify last array
             result = Array(arrays[end])
@@ -44,7 +44,7 @@ end
             fill_kernel!(backend)(b, 1f0; ndrange=200)
             # Don't flush — batches accumulate
         end
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         GC.gc(true)
         Lava.flush_deferred_frees!()
         @test true
@@ -68,12 +68,12 @@ end
 
             # Flush every 5 iterations (like the reference test GC between test files)
             if iter % 5 == 0
-                Lava.vk_flush!()
+                Lava.vk_flush!(Lava.vk_context())
                 Lava.flush_deferred_frees!()
                 GC.gc(true)
             end
         end
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         Lava.flush_deferred_frees!()
         GC.gc(true)
         @test true
@@ -98,7 +98,7 @@ end
             fill_kernel!(backend)(positions, 1f0; ndrange=n*3)
             fill_kernel!(backend)(colors, 0.5f0; ndrange=n*4)
 
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
 
             # Explicit cleanup (what the reference tests should do)
             for arr in [positions, quad_offsets, quad_scales, rotations, colors,
@@ -122,7 +122,7 @@ end
             # Don't explicitly free — let GC handle it
         end
 
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         GC.gc(true)
         Lava.flush_deferred_frees!()
 
@@ -136,7 +136,7 @@ end
         for iter in 1:30
             a = Lava.LavaArray(rand(Float32, 100))
             fill_kernel!(backend)(a, Float32(iter); ndrange=100)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             # Let a go out of scope without explicit free — GC finalizer should handle it
         end
         GC.gc(true)
@@ -152,7 +152,7 @@ end
             for a in arrays
                 fill_kernel!(backend)(a, Float32(cycle); ndrange=100)
             end
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
         end
         GC.gc(true)
         Lava.flush_deferred_frees!()

@@ -59,7 +59,7 @@ using GPUArrays
             Lava.unsafe_free!(a)
             # After DataRef releases, the buffer should be freed
             # (either immediately or deferred, but size should eventually be 0)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             Lava.flush_deferred_frees!()
 
             # The DataRef may have already called vk_free! via its destructor
@@ -91,7 +91,7 @@ using GPUArrays
         @testset "buffer count stable across allocations" begin
             # Force GC and flush to get a clean baseline
             GC.gc(true)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             Lava.flush_deferred_frees!()
             baseline = length(Lava.LIVE_BUFFERS)
 
@@ -101,7 +101,7 @@ using GPUArrays
                 Lava.unsafe_free!(a)
             end
 
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             Lava.flush_deferred_frees!()
             after = length(Lava.LIVE_BUFFERS)
             @test after == baseline
@@ -109,7 +109,7 @@ using GPUArrays
 
         @testset "GPU_LIVE_BYTES tracks correctly" begin
             GC.gc(true)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             Lava.flush_deferred_frees!()
             before_bytes = Lava.GPU_LIVE_BYTES[]
 
@@ -121,7 +121,7 @@ using GPUArrays
             @test after_alloc > before_bytes
 
             Lava.unsafe_free!(a)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             Lava.flush_deferred_frees!()
             after_free = Lava.GPU_LIVE_BYTES[]
             @test after_free == before_bytes
@@ -147,7 +147,7 @@ using GPUArrays
             # the buffers from being collected
             GC.gc(false)
 
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             result = Array(b)
             @test result == Float32[2, 3, 4, 5]
 
@@ -184,7 +184,7 @@ using GPUArrays
             end
 
             # After flush, deferred frees are processed
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             @test temp.address == Lava.BDA_POISON
             @test temp.size == 0
 
@@ -216,7 +216,7 @@ using GPUArrays
             @test result == Float32[20, 30, 40]
 
             Lava.unsafe_free!(child)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             Lava.flush_deferred_frees!()
         end
 
@@ -234,7 +234,7 @@ using GPUArrays
             @test result == Float32[1 3 5; 2 4 6]
 
             Lava.unsafe_free!(b)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             Lava.flush_deferred_frees!()
         end
     end
@@ -322,7 +322,7 @@ using GPUArrays
                 y = Lava.LavaArray(Float32.(2.0f0 .* ones(N)))
 
                 saxpy_k!(Lava.LavaBackend())(y, 3.0f0, x; ndrange=N)
-                Lava.vk_flush!()
+                Lava.vk_flush!(Lava.vk_context())
 
                 result = Array(y)
                 @test all(r -> r ≈ 5.0f0, result)
@@ -341,7 +341,7 @@ using GPUArrays
             # Allocate, free, reallocate — new buffer should work correctly
             a = Lava.LavaArray{Float32}(undef, 512)
             fill_k!(Lava.LavaBackend())(a, 42.0f0; ndrange=512)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             @test all(r -> r ≈ 42.0f0, Array(a))
 
             Lava.unsafe_free!(a)
@@ -350,7 +350,7 @@ using GPUArrays
             # New allocation may reuse the same VRAM
             b = Lava.LavaArray{Float32}(undef, 512)
             fill_k!(Lava.LavaBackend())(b, 99.0f0; ndrange=512)
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             @test all(r -> r ≈ 99.0f0, Array(b))
 
             Lava.unsafe_free!(b)
@@ -373,7 +373,7 @@ using GPUArrays
             end
 
             # After flush, slab allocator resets
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
             @test Lava.ARG_SLAB_OFFSET[] == 0
             @test Lava.ARG_SLAB_IDX[] == 1
 
@@ -397,7 +397,7 @@ using GPUArrays
             for _ in 1:500
                 inc_k!(Lava.LavaBackend())(a; ndrange=16)
             end
-            Lava.vk_flush!()
+            Lava.vk_flush!(Lava.vk_context())
 
             result = Array(a)
             @test result[1] ≈ 500.0f0

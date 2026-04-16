@@ -2,42 +2,6 @@
 #
 # Handles: compile → pipeline cache → arg packing → dispatch → sync.
 
-# ── Typed GPU buffer ──
-
-"""
-    LavaBuffer{T} — A typed GPU buffer wrapping VkManagedBuffer.
-
-Carries element type `T` so the compiler knows the pointer type.
-"""
-struct LavaBuffer{T}
-    buf::VkManagedBuffer
-    length::Int
-end
-
-function LavaBuffer{T}(n::Integer; ctx::VkContext=vk_context()) where T
-    buf = vk_alloc(ctx, n * sizeof(T))
-    LavaBuffer{T}(buf, Int(n))
-end
-
-# Hook into the dispatch-time access tracker (defined in runtime/command.jl).
-@inline record_one!(bq::BatchQueue, batch::CommandBatch, b::LavaBuffer) =
-    track_buffer_access!(bq, batch, b.buf)
-
-Base.eltype(::LavaBuffer{T}) where T = T
-Base.length(b::LavaBuffer) = b.length
-Base.sizeof(b::LavaBuffer{T}) where T = b.length * sizeof(T)
-
-function upload!(dst::LavaBuffer{T}, data::AbstractVector{T}) where T
-    bytes = Vector{UInt8}(reinterpret(UInt8, vec(collect(data))))
-    upload!(dst.buf, bytes)
-end
-
-function download(src::LavaBuffer{T}) where T
-    result = Vector{T}(undef, src.length)
-    download_typed!(result, src.buf)
-    return result
-end
-
 # ── Two-tier GPU kernel cache ──
 #
 # Tier 1 (hot path, ~144ns): hash-based Dict lookup by (f, tt, workgroup_size).
@@ -95,35 +59,20 @@ const LAUNCH_ARG_VALIDATION = Ref(true)
                     local buf
                     try
                         buf = arg.buf[]
-                    catch e
+                    catch
                         throw(LavaError("kernel launch",
                             "Argument $($i): LavaArray has been freed (DataRef released)",
                             "Don't pass freed arrays to GPU kernels. Check array lifetime."))
                     end
-                    if buf.size == 0
+                    # Single source of truth: the atomic state machine.  A
+                    # buffer is dead iff its state is BUF_STATE_DEAD.  The
+                    # BDA_POISON marker is kept as a GPU-side use-after-free
+                    # trap (shader reads see 0xDEADDEAD...) but is not the
+                    # CPU-side gate any more.
+                    if (@atomic :acquire buf.state) == BUF_STATE_DEAD
                         throw(LavaError("kernel launch",
-                            "Argument $($i): LavaArray has been freed (size=0)",
-                            "Don't pass freed arrays to GPU kernels. Check array lifetime."))
-                    end
-                    if buf.address == BDA_POISON
-                        throw(LavaError("kernel launch",
-                            "Argument $($i): LavaArray backing buffer was destroyed (poisoned BDA)",
+                            "Argument $($i): LavaArray backing buffer is dead (state=BUF_STATE_DEAD)",
                             "This array was freed. Reallocate before use."))
-                    end
-                end
-            end)
-        elseif Ti <: LavaBuffer
-            push!(exprs, quote
-                let arg = args[$i]
-                    if arg.buf.size == 0
-                        throw(LavaError("kernel launch",
-                            "Argument $($i): LavaBuffer has been freed (size=0)",
-                            "Don't pass freed buffers to GPU kernels."))
-                    end
-                    if arg.buf.address == BDA_POISON
-                        throw(LavaError("kernel launch",
-                            "Argument $($i): LavaBuffer backing buffer was destroyed (poisoned BDA)",
-                            "This buffer was freed. Reallocate before use."))
                     end
                 end
             end)
@@ -139,15 +88,15 @@ end
 Compile and dispatch a Julia function as a Vulkan compute kernel.
 
 Each argument must be either:
-- A `LavaBuffer{T}` (passed as `Ptr{T}` to the kernel)
-- A `VkManagedBuffer` with a type annotation via `Pair`: `buf => Float32`
+- A `LavaArray{T,N}` (passed as `LavaDeviceArray{T,N}` to the kernel)
+- A `VkManagedBuffer` (passed as a raw BDA pointer — low-level use only)
 - A scalar (Int32, Float32, UInt64, etc.)
 
 `ndrange` is the total number of work items (can be Int or NTuple{1-3,Int}).
 `workgroup_size` is threads per workgroup.
 
 Example:
-    a = LavaBuffer{Float32}(n)
+    a = LavaArray{Float32,1}(undef, (n,))
     lava_launch!(my_kernel, a, b, Int32(n); ndrange=n, workgroup_size=(256,1,1))
 """
 function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
@@ -187,14 +136,15 @@ function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
     # Get host-visible mapped arg buffer
     arg_buf = get_arg_buffer(bq, total_size)
 
-    # Pack args directly to mapped memory (zero intermediate allocations)
-    pack_args_direct!(arg_buf.mapped_ptr, arg_buf.address, offsets,
-                       compiled.push_info.arg_buffer_size, byval_sizes, all_args)
+    # Ensure an active batch BEFORE packing, since the pack walker pins
+    # every buffer arg into `bq.active_batch.pinned` (so BDA addresses in
+    # the arg buffer have live backing through the batch's lifetime).
+    ensure_active_batch!(bq)
 
-    # Keep data buffer references alive until vk_flush!() — BDA addresses in the
-    # arg buffer are raw pointers with no GC reference to the backing VkManagedBuffer.
-    batch = ensure_active_batch!(bq)
-    record_arg_accesses!(bq, batch, args)
+    # Pack args directly to mapped memory + pin every visited buffer
+    # (zero intermediate allocations).
+    pack_args_direct!(bq, arg_buf.mapped_ptr, arg_buf.address, offsets,
+                       compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
     # Dispatch (batched — call vk_flush!() to submit)
     # Push constant = BDA of arg buffer (passed as UInt64, zero-alloc)
@@ -272,7 +222,6 @@ end
 
 Check at compile time whether a type is a GPU buffer that should be passed as a BDA address.
 """
-is_bda_buffer(::Type{<:LavaBuffer}) = true
 is_bda_buffer(::Type{<:LavaArray}) = true
 is_bda_buffer(::Type{VkManagedBuffer}) = true
 is_bda_buffer(::Type) = false
@@ -298,7 +247,7 @@ end
     compute_inline_extra(::Type{T}) where T <: Tuple
 
 Compute at compile time the total bytes needed for inline struct data appended
-after the base arg layout. Returns a constant. Buffer types (LavaBuffer, LavaArray,
+after the base arg layout. Returns a constant. Buffer types (LavaArray,
 VkManagedBuffer) are passed as UInt64 BDA addresses, not inlined.
 
 NOTE: This uses Julia's sizeof which can underestimate for types with zero-sized
@@ -319,21 +268,29 @@ fields. Prefer compute_inline_extra_from_byval with LLVM sizes when available.
 end
 
 """
-    pack_args_direct!(mapped_ptr, arg_buf_bda, offsets, base_size, all_args)
+    pack_args_direct!(bq, mapped_ptr, arg_buf_bda, offsets, base_size, byval_sizes, all_args)
 
-Write kernel arguments directly to mapped GPU memory, inlining struct data.
-This is a `@generated` function that statically filters ghost types and avoids
-intermediate `Any[]` boxing and `Vector{UInt8}` allocations — zero allocations
-for the arg packing itself.
+Write kernel arguments directly to mapped GPU memory, inlining struct data,
+AND pin each GPU-visible buffer into `bq.active_batch.pinned` in the same
+walk.  Zero heap allocations for the arg packing itself.
+
+Takes `bq::BatchQueue` and fetches its active batch internally — callers no
+longer pass both `bq` and `batch` separately (they'd always be the paired
+`bq.active_batch`).
 
 Handles all argument types:
-- Ghost types (sizeof==0): skipped
-- LavaBuffer/LavaArray/VkManagedBuffer: written as UInt64 BDA address
-- isbits structs: inlined after base layout, BDA pointer at arg slot
-- UInt64/Ptr: written directly
-- Other primitives: written directly
+- Ghost types (sizeof==0): skipped entirely.
+- LavaArray / VkManagedBuffer: written as UInt64 BDA address
+  AND pinned via `pin!(batch, arg)` so the backing GPU memory survives
+  until the batch's timeline signals.  Dedup is handled by `batch.pinned`
+  being an IdSet — reusing the same buffer across many dispatches in a
+  batch costs one insert on first use, free on every subsequent dispatch.
+- isbits structs: inlined after base layout, BDA pointer at arg slot.
+- UInt64 / Ptr: written directly.
+- Other primitives: written directly.
 """
-@generated function pack_args_direct!(mapped_ptr::Ptr{UInt8}, arg_buf_bda::UInt64,
+@generated function pack_args_direct!(bq::BatchQueue,
+                                        mapped_ptr::Ptr{UInt8}, arg_buf_bda::UInt64,
                                         offsets::Vector{Int}, base_size::Int,
                                         byval_sizes::Vector{Int},
                                         all_args::T) where {T <: Tuple}
@@ -348,14 +305,15 @@ Handles all argument types:
     for (layout_i, arg_i) in enumerate(non_ghost)
         Ti = types[arg_i]
         if is_bda_buffer(Ti)
-            # GPU buffer → write BDA address as UInt64
-            if Ti <: LavaBuffer
-                push!(exprs, :(unsafe_store!(Ptr{UInt64}(mapped_ptr + @inbounds(offsets[$layout_i])),
-                                             all_args[$arg_i].buf.address)))
-            elseif Ti <: LavaArray
+            # GPU buffer → write BDA address as UInt64 AND pin for batch lifetime.
+            # pin!(::VkManagedBuffer) updates last_write at submit via sync_access!.
+            # pin!(::LavaArray) is a forwarder that unwraps to VkManagedBuffer.
+            if Ti <: LavaArray
+                push!(exprs, :(pin!(batch, all_args[$arg_i])))
                 push!(exprs, :(unsafe_store!(Ptr{UInt64}(mapped_ptr + @inbounds(offsets[$layout_i])),
                                              bda_address(all_args[$arg_i]))))
             else  # VkManagedBuffer
+                push!(exprs, :(pin!(batch, all_args[$arg_i])))
                 push!(exprs, :(unsafe_store!(Ptr{UInt64}(mapped_ptr + @inbounds(offsets[$layout_i])),
                                              all_args[$arg_i].address)))
             end
@@ -391,6 +349,9 @@ Handles all argument types:
     end
 
     quote
+        # Fetch active batch from bq — invariant: caller has already called
+        # ensure_active_batch!(bq), so this is always non-nothing.
+        batch = bq.active_batch::CommandBatch
         inline_offset = base_size
         $(exprs...)
         return nothing
@@ -400,12 +361,10 @@ end
 # ── Argument type mapping ──
 
 # Map Julia arg types to LLVM-level types for compilation
-arg_llvm_type(::LavaBuffer{T}) where T = Ptr{T}
 arg_llvm_type(::LavaArray{T}) where T = Ptr{T}
 arg_llvm_type(x::T) where T = T  # Scalars pass through
 
 # Convert arguments to BDA-compatible values for pack_kernel_args
-arg_to_bda(buf::LavaBuffer) = buf.buf.address
 arg_to_bda(a::LavaArray) = bda_address(a)
 function arg_to_bda(x)
     # Julia passes isbits structs by pointer at the LLVM level.
@@ -652,6 +611,7 @@ function ensure_arg_slab!(bq::BatchQueue, min_size::Int)
 end
 
 function get_arg_buffer(bq::BatchQueue, nbytes::Integer)
+    @assert Threads.threadid() == bq.owning_thread  "BatchQueue is single-writer; cross-thread arg-buf alloc forbidden"
     aligned_size = (max(Int(nbytes), 16) + ARG_SLAB_ALIGN - 1) & ~(ARG_SLAB_ALIGN - 1)
 
     ensure_arg_slab!(bq, aligned_size)

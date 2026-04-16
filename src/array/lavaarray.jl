@@ -14,9 +14,15 @@ mutable struct LavaArray{T,N} <: AbstractGPUArray{T,N}
     dims::NTuple{N,Int}
     offset::Int  # offset in number of elements (not bytes)
 
+    # No finalizer on LavaArray itself: lifetime is delegated entirely to
+    # `GPUArrays.DataRef`'s refcount, which runs the `vk_free!` closure when
+    # refcount → 0.  Registering a second finalizer here would mean two
+    # independent vk_free! calls could race on the same VkManagedBuffer.
+    # `VkManagedBuffer.state` atomic CAS covers that corner, but keeping a
+    # single ownership path is simpler and matches AMDGPU.jl's model.
     function LavaArray{T,N}(buf::GPUArrays.DataRef{VkManagedBuffer}, dims::NTuple{N,Int};
                             offset::Integer=0) where {T,N}
-        return finalizer(unsafe_free!, new{T,N}(buf, dims, offset))
+        return new{T,N}(buf, dims, offset)
     end
 end
 
@@ -131,9 +137,17 @@ function bda_address(a::LavaArray{T}) where T
     a.buf[].address + a.offset * sizeof(T)
 end
 
-# Hook into the dispatch-time access tracker (defined in runtime/command.jl).
-@inline record_one!(bq::BatchQueue, batch::CommandBatch, a::LavaArray) =
-    track_buffer_access!(bq, batch, a.buf[])
+# pin! forwarder: unwrap LavaArray's DataRef to its VkManagedBuffer leaf
+# so the ctx assertion + last_write tracking happen on the actual GPU buffer.
+@inline pin!(batch::CommandBatch, a::LavaArray) = pin!(batch, a.buf[])
+
+# LavaAdaptor: converts LavaArray → LavaDeviceArray (Ptr-wrapping) for GPU
+# kernel compilation, and pins every visited LavaArray into the current batch.
+# Declared here (ahead of ka_backend.jl which uses it in method signatures);
+# the `adapt_storage` / `adapt_structure` methods live in gpuarrays.jl.
+struct LavaAdaptor
+    batch::CommandBatch
+end
 
 # ── Transfers ──
 
