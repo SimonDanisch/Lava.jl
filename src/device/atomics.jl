@@ -217,27 +217,35 @@ const ir_umax_i64 = ("""
     attributes #0 = { alwaysinline }
 """, "entry")
 
-# ── Float CAS loops ──
+# ── Float32 hardware atomicrmw (VK_EXT_shader_atomic_float) ──
+# The emitter translates atomicrmw fadd/fmin/fmax to OpAtomicFAdd/FMin/FMaxEXT
+# and requires the corresponding capability + SPV_EXT_shader_atomic_float_* ext.
 
-const ir_f32_cas = ("""
-    define i32 @entry(ptr %ptr, float %val) #0 {
-    entry:
-        %orig = load atomic i32, ptr %ptr syncscope("device") seq_cst, align 4
-        br label %loop
-    loop:
-        %old_bits = phi i32 [ %orig, %entry ], [ %loaded, %loop ]
-        %old_f = bitcast i32 %old_bits to float
-        %new_f = fadd float %old_f, %val
-        %new_bits = bitcast float %new_f to i32
-        %result = cmpxchg ptr %ptr, i32 %old_bits, i32 %new_bits syncscope("device") seq_cst seq_cst
-        %loaded = extractvalue { i32, i1 } %result, 0
-        %success = extractvalue { i32, i1 } %result, 1
-        br i1 %success, label %done, label %loop
-    done:
-        ret i32 %old_bits
+const ir_fadd_f32 = ("""
+    define float @entry(ptr %ptr, float %val) #0 {
+        %old = atomicrmw fadd ptr %ptr, float %val syncscope("device") seq_cst
+        ret float %old
     }
     attributes #0 = { alwaysinline }
 """, "entry")
+
+const ir_fmin_f32 = ("""
+    define float @entry(ptr %ptr, float %val) #0 {
+        %old = atomicrmw fmin ptr %ptr, float %val syncscope("device") seq_cst
+        ret float %old
+    }
+    attributes #0 = { alwaysinline }
+""", "entry")
+
+const ir_fmax_f32 = ("""
+    define float @entry(ptr %ptr, float %val) #0 {
+        %old = atomicrmw fmax ptr %ptr, float %val syncscope("device") seq_cst
+        ret float %old
+    }
+    attributes #0 = { alwaysinline }
+""", "entry")
+
+# ── Float64 CAS loop (f64 atomic_add not enabled in our device features today) ──
 
 const ir_f64_cas = ("""
     define i64 @entry(ptr %ptr, double %val) #0 {
@@ -370,22 +378,35 @@ end
     old => val
 end
 
-# ── Float32 atomic add/sub via CAS loop ──
+# ── Float32 hardware atomicrmw (VK_EXT_shader_atomic_float) ──
 
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{Float32}, ::typeof(+), val::Float32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old_bits = Base.llvmcall(ir_f32_cas, UInt32, Tuple{Ptr{Float32}, Float32}, ptr, val)
-    old = reinterpret(Float32, old_bits)
+    old = Base.llvmcall(ir_fadd_f32, Float32, Tuple{Ptr{Float32}, Float32}, ptr, val)
     old => old + val
 end
 
 @lava_device_override @inline function UnsafeAtomics.modify!(
     ptr::Ptr{Float32}, ::typeof(-), val::Float32, ::typeof(UnsafeAtomics.monotonic)
 )
-    old_bits = Base.llvmcall(ir_f32_cas, UInt32, Tuple{Ptr{Float32}, Float32}, ptr, -val)
-    old = reinterpret(Float32, old_bits)
+    # SPV_EXT_shader_atomic_float_add has no FSub, so negate and fadd.
+    old = Base.llvmcall(ir_fadd_f32, Float32, Tuple{Ptr{Float32}, Float32}, ptr, -val)
     old => old - val
+end
+
+@lava_device_override @inline function UnsafeAtomics.modify!(
+    ptr::Ptr{Float32}, ::typeof(min), val::Float32, ::typeof(UnsafeAtomics.monotonic)
+)
+    old = Base.llvmcall(ir_fmin_f32, Float32, Tuple{Ptr{Float32}, Float32}, ptr, val)
+    old => min(old, val)
+end
+
+@lava_device_override @inline function UnsafeAtomics.modify!(
+    ptr::Ptr{Float32}, ::typeof(max), val::Float32, ::typeof(UnsafeAtomics.monotonic)
+)
+    old = Base.llvmcall(ir_fmax_f32, Float32, Tuple{Ptr{Float32}, Float32}, ptr, val)
+    old => max(old, val)
 end
 
 # ── Int64 atomics ──
@@ -488,10 +509,12 @@ end
 for T in (Int32, UInt32, Int64, UInt64, Float32, Float64)
     for OP in (:(typeof(+)), :(typeof(-)), :(typeof(&)), :(typeof(|)), :(typeof(xor)),
                :(typeof(min)), :(typeof(max)), :(typeof(Atomix.right)))
-        if T in (Float32, Float64) && OP ∉ (:(typeof(+)), :(typeof(-)))
+        # Float64: only + and - wired up today (hardware atomic_add_64 not enabled)
+        if T === Float64 && OP ∉ (:(typeof(+)), :(typeof(-)))
             continue
         end
-        if T in (Float32, Float64) && OP in (:(typeof(&)), :(typeof(|)), :(typeof(xor)))
+        # Float32: hardware supports +, -, min, max via atomicrmw fadd/fmin/fmax
+        if T === Float32 && OP ∉ (:(typeof(+)), :(typeof(-)), :(typeof(min)), :(typeof(max)))
             continue
         end
         if T in (Int64, UInt64) && OP in (:(typeof(&)), :(typeof(|)), :(typeof(xor)))

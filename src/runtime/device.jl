@@ -106,13 +106,15 @@ mutable struct BatchQueue
     # Per-BQ argument-buffer slab pool.  Each submit bump-allocates from
     # the current slab; `reset_arg_buffer_pool!(bq)` (called from
     # reclaim_batch! once in_flight is empty) rewinds the bump pointer.
-    # Loose type (VkMappedBuffer is declared later in memory.jl).
+    # Element type is `LavaArray{UInt8,1}` (unified/BAR memory); kept loose
+    # because LavaArray is declared later in array/lavaarray.jl.
     arg_slabs::Vector{Any}
     arg_slab_idx::Int
     arg_slab_offset::Int
     arg_alloc_count::Int
-    # Per-BQ indirect-dispatch buffer slab pool. Same bump-pointer shape as
-    # arg slabs. Reset by `reset_indirect_buffer_pool!(bq)`.
+    # Per-BQ indirect-dispatch buffer slab pool.  Element type is
+    # `LavaArray{UInt32,1}` (unified + INDIRECT_BUFFER_BIT).  Reset by
+    # `reset_indirect_buffer_pool!(bq)`.
     indirect_slabs::Vector{Any}
     indirect_slab_idx::Int
     indirect_slab_offset::Int
@@ -222,6 +224,9 @@ mutable struct VkContext
     # Cached physical-device properties (avoid re-querying on every alloc/dispatch).
     memory_properties::Vulkan.PhysicalDeviceMemoryProperties
     max_wg_dims::NTuple{3, Int}
+    # Alignment (bytes) for BDAs passed as `pScratchData` in AS builds.
+    # Keyed off `LAVA_SCRATCH_BIT` in `extra_usage` — see `bda_alignment_for`.
+    as_scratch_align::UInt64
 
     # Inner constructor: two-phase init via `new()` so we can hand a live
     # `ctx` reference to `BatchQueue(...)` while finishing the ctx's own
@@ -243,7 +248,8 @@ mutable struct VkContext
                        async_queue_count::Int,
                        device_lost::Bool,
                        memory_properties::Vulkan.PhysicalDeviceMemoryProperties,
-                       max_wg_dims::NTuple{3, Int})
+                       max_wg_dims::NTuple{3, Int},
+                       as_scratch_align::UInt64)
         ctx = new()
         ctx.instance = instance
         ctx.physical_device = physical_device
@@ -260,6 +266,7 @@ mutable struct VkContext
         ctx.device_lost = device_lost
         ctx.memory_properties = memory_properties
         ctx.max_wg_dims = max_wg_dims
+        ctx.as_scratch_align = as_scratch_align
         # Now build the default BatchQueue with the live ctx.  Sets the
         # remaining field; no nullable slot, no post-hoc mutation.
         ctx.default_bq = BatchQueue(device, primary_queue, queue_family_index, ctx)
@@ -496,6 +503,7 @@ function init_vulkan!()
 
     # Check for workgroup memory explicit layout (needed for mixed-type shared memory structs)
     has_wg_explicit = has_extension(phys_dev, "VK_KHR_workgroup_memory_explicit_layout")
+    has_atomic_float = has_extension(phys_dev, "VK_EXT_shader_atomic_float")
 
     # Device extensions
     extensions = String[
@@ -510,6 +518,9 @@ function init_vulkan!()
     end
     if has_wg_explicit
         push!(extensions, "VK_KHR_workgroup_memory_explicit_layout")
+    end
+    if has_atomic_float
+        push!(extensions, "VK_EXT_shader_atomic_float")
     end
 
     # Chain required features — all Vulkan 1.2 promoted features go in Vulkan12Features
@@ -610,6 +621,26 @@ function init_vulkan!()
         feature_chain = wg_explicit_features
     end
 
+    # Chain atomic-float features (used by Lava native reductions via OpAtomicFAdd)
+    if has_atomic_float
+        atomic_float_features = Vulkan.PhysicalDeviceShaderAtomicFloatFeaturesEXT(
+            true,   # shader_buffer_float_32_atomics        — OpAtomicStore/Load/Exchange on f32 SSBO
+            true,   # shader_buffer_float_32_atomic_add     — REQUIRED: OpAtomicFAdd on f32 SSBO
+            false,  # shader_buffer_float_64_atomics
+            false,  # shader_buffer_float_64_atomic_add
+            true,   # shader_shared_float_32_atomics        — atomics on workgroup/shared memory
+            true,   # shader_shared_float_32_atomic_add
+            false,  # shader_shared_float_64_atomics
+            false,  # shader_shared_float_64_atomic_add
+            false,  # shader_image_float_32_atomics
+            false,  # shader_image_float_32_atomic_add
+            false,  # sparse_image_float_32_atomics
+            false;  # sparse_image_float_32_atomic_add
+            next=feature_chain
+        )
+        feature_chain = atomic_float_features
+    end
+
     # Chain RT features if available
     if has_rt
         as_features = Vulkan.PhysicalDeviceAccelerationStructureFeaturesKHR(
@@ -668,6 +699,18 @@ function init_vulkan!()
         )
     end
 
+    # Query AS scratch alignment once and cache on the context — used by
+    # `bda_alignment_for(::VkContext, extra_usage)` to pick the right
+    # alignment for `AS_SCRATCH_USAGE` allocations.  Vulkan has no usage bit
+    # for scratch; we use the Lava-only LAVA_SCRATCH_BIT marker to disambiguate.
+    as_scratch_align = UInt64(1)
+    if has_rt
+        as_props2 = Vulkan.get_physical_device_properties_2(phys_dev,
+            Vulkan.PhysicalDeviceAccelerationStructurePropertiesKHR)
+        as_scratch_align = max(UInt64(1),
+            UInt64(as_props2.next.min_acceleration_structure_scratch_offset_alignment))
+    end
+
     has_validation = !isempty(layers)
     if has_rt
         @info "Lava: initialized Vulkan device with RT" device=dev_name queue_family=qf_idx handle_size=rt_props.shader_group_handle_size max_recursion=rt_props.max_ray_recursion_depth validation=has_validation gpu_assisted=gpu_assisted sync_val=sync_val debug_utils=has_debug_utils
@@ -702,6 +745,7 @@ function init_vulkan!()
         async_qf_idx, async_n_queues,
         false,        # device_lost (fresh context)
         mem_props, max_wg,
+        as_scratch_align,
     )
     return ctx
 end

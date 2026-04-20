@@ -531,26 +531,21 @@ function lava_compile_to_spirv(@nospecialize(f), @nospecialize(tt);
 end
 
 """
-    lava_compile_gpu(f, tt; workgroup_size=(64,1,1), validate=true) -> LavaGPUKernel
+    lava_compile_gpu_from_job(job::CompilerJob; validate=true) -> LavaGPUKernel
 
-Full GPU-ready compilation pipeline with BDA entry wrapper.
-The resulting SPIR-V has a void() entry point that loads arguments from a BDA buffer.
-
-The `push_info` field describes the argument buffer layout for `pack_kernel_args`.
+Run the full LLVM → SPIR-V pipeline on a pre-built `CompilerJob`.  This is the
+`compiler` function passed to `GPUCompiler.cached_compilation` in `launch.jl`,
+so the cache keys it off of Julia's `MethodInstance` (type-based) and gets
+proper world-age tracking for free.
 """
-function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
-                           workgroup_size::NTuple{3,Int} = (64, 1, 1),
-                           validate::Bool = true)
-    config = lava_compiler_config(; workgroup_size)
-    source = GPUCompiler.methodinstance(typeof(f), tt)
-    job = GPUCompiler.CompilerJob(source, config)
-
+function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob; validate::Bool = true)
+    workgroup_size = job.config.params.workgroup_size
     GPUCompiler.JuliaContext() do ctx
         local mod, meta
         try
             mod, meta = GPUCompiler.compile(:llvm, job)
         catch e
-            wrap_gpu_compiler_error(e, f, tt)
+            wrap_gpu_compiler_error(e, job.source.def.sig, job.source.specTypes)
         end
         entry_fn = meta.entry
         entry_name = LLVM.name(entry_fn)
@@ -592,6 +587,23 @@ function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
 
         return LavaGPUKernel(spirv_bytes, wrapper_name, workgroup_size, push_info, ir)
     end
+end
+
+"""
+    lava_compile_gpu(f, tt; workgroup_size=(64,1,1), validate=true) -> LavaGPUKernel
+
+Full GPU-ready compilation pipeline with BDA entry wrapper.  Thin wrapper
+around `lava_compile_gpu_from_job` that builds the `CompilerJob` from
+`(f, tt, workgroup_size)`.  Kept as a public convenience for callers that
+don't want to construct a job manually.
+"""
+function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
+                           workgroup_size::NTuple{3,Int} = (64, 1, 1),
+                           validate::Bool = true)
+    config = lava_compiler_config(; workgroup_size)
+    source = GPUCompiler.methodinstance(typeof(f), tt)
+    job = GPUCompiler.CompilerJob(source, config)
+    return lava_compile_gpu_from_job(job; validate)
 end
 
 # ── RT Shader Compilation ──

@@ -50,15 +50,21 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         check(d, "OpAtomicIAdd")
     end
 
-    @testset "f32 atomic add (CAS loop)" begin
+    @testset "f32 atomic add (hardware OpAtomicFAddEXT)" begin
         function f32_atomic(counter)
             Lava.Atomix.@atomic counter[1] += 1.0f0
             return nothing
         end
         d, _ = compile_and_disasm(f32_atomic,
                                    Tuple{Lava.LavaDeviceArray{Float32,1}})
-        # Float32 atomics use a CAS loop (OpAtomicCompareExchange)
-        check(d, "OpAtomicCompareExchange")
+        # Float32 atomics now use hardware atomicrmw fadd, emitted as
+        # OpAtomicFAddEXT + AtomicFloat32AddEXT capability +
+        # SPV_EXT_shader_atomic_float_add extension.
+        check(d, "OpAtomicFAddEXT")
+        check(d, "AtomicFloat32AddEXT")
+        check(d, "SPV_EXT_shader_atomic_float_add")
+        # No CAS loop any more.
+        check_not(d, "OpAtomicCompareExchange")
     end
 
     @testset "barrier" begin

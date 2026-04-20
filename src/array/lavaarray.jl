@@ -14,32 +14,58 @@ mutable struct LavaArray{T,N} <: AbstractGPUArray{T,N}
     dims::NTuple{N,Int}
     offset::Int  # offset in number of elements (not bytes)
 
-    # No finalizer on LavaArray itself: lifetime is delegated entirely to
-    # `GPUArrays.DataRef`'s refcount, which runs the `vk_free!` closure when
-    # refcount → 0.  Registering a second finalizer here would mean two
-    # independent vk_free! calls could race on the same VkManagedBuffer.
-    # `VkManagedBuffer.state` atomic CAS covers that corner, but keeping a
-    # single ownership path is simpler and matches AMDGPU.jl's model.
+    # Register `unsafe_free!` as a GC finalizer so LavaArrays that fall out
+    # of scope without an explicit `unsafe_free!` call actually release their
+    # GPU memory. `GPUArrays.DataRef` is refcount-based — its `release`
+    # callback only fires on explicit `unsafe_free!`, NOT via Julia GC — so
+    # WITHOUT this finalizer every scratch LavaArray leaks until the process
+    # exits. Matches AMDGPU.ROCArray's pattern (`finalizer(unsafe_free!, xs)`
+    # at `AMDGPU/src/array.jl:13,19`). Idempotency is guaranteed by the
+    # `DataRef.freed` flag + `VkManagedBuffer.state` atomic CAS, so a second
+    # `unsafe_free!` (e.g. explicit user call before GC) is a no-op.
     function LavaArray{T,N}(buf::GPUArrays.DataRef{VkManagedBuffer}, dims::NTuple{N,Int};
                             offset::Integer=0) where {T,N}
-        return new{T,N}(buf, dims, offset)
+        xs = new{T,N}(buf, dims, offset)
+        finalizer(unsafe_free!, xs)
+        return xs
     end
 end
 
 function LavaArray{T,N}(::UndefInitializer, dims::NTuple{N,Int};
-                        ctx::VkContext=vk_context(),
-                        extra_usage::UInt32=UInt32(0)) where {T,N}
+                        bq::BatchQueue=vk_context().default_bq,
+                        extra_usage::UInt32=UInt32(0),
+                        unified::Bool=false) where {T,N}
+    ctx = bq.ctx::VkContext
     nbytes = prod(dims) * sizeof(T)
-    # Non-default usage (index buffer, AS input/storage, scratch, etc.)
-    # bypasses the pool since those buffers need specific usage flags at
-    # VkBuffer creation time. Default `extra_usage=0` uses the pool.
-    managed_buf = extra_usage == UInt32(0) ?
-        pool_alloc(ctx, max(nbytes, 16)) :
-        vk_alloc(ctx, max(nbytes, 16); extra_usage)
+
+    # Alignment is a function of `extra_usage` alone (see `bda_alignment_for`).
+    # We over-allocate by (align - 1) bytes and shift the LavaArray's element
+    # offset so `bda_address(arr)` lands on the right boundary.  For T=UInt8
+    # the offset is always valid; otherwise we assert divisibility.
+    align = bda_alignment_for(ctx, extra_usage)
+    slack = align > 1 ? Int(align) - 1 : 0
+
+    # Non-default usage (index buffer, AS input/storage, scratch, etc.) or
+    # BAR-mapped (unified) memory bypasses the pool since those buffers need
+    # specific flags at VkBuffer/DeviceMemory creation time.
+    use_pool = extra_usage == UInt32(0) && !unified
+    managed_buf = use_pool ?
+        pool_alloc(bq, max(nbytes + slack, 16)) :
+        vk_alloc(bq, max(nbytes + slack, 16); extra_usage, unified)
+
+    elem_offset = 0
+    if align > UInt64(1)
+        base = managed_buf.address
+        aligned = cld(base, align) * align
+        byte_offset = Int(aligned - base)
+        @assert byte_offset % sizeof(T) == 0  "extra_usage alignment ($(align)) is not a multiple of sizeof($T)"
+        elem_offset = byte_offset ÷ sizeof(T)
+    end
+
     ref = GPUArrays.DataRef(managed_buf) do buf
         vk_free!(buf)
     end
-    LavaArray{T,N}(ref, dims)
+    LavaArray{T,N}(ref, dims; offset=elem_offset)
 end
 
 # Varargs constructor for LavaArray{T,N}(undef, d1, d2, ...)
@@ -62,21 +88,19 @@ LavaArray{T}(::UndefInitializer, dims::NTuple{N,Int}; kw...) where {T,N} = LavaA
 LavaArray{T}(::UndefInitializer, dims::NTuple{N,Integer}; kw...) where {T,N} = LavaArray{T,N}(undef, Int.(dims); kw...)
 LavaArray{T}(::UndefInitializer, dims::Integer...; kw...) where {T} = LavaArray{T}(undef, Int.(dims); kw...)
 
-# Construct from host data
-function LavaArray{T,N}(data::AbstractArray{T,N}) where {T,N}
-    arr = LavaArray{T,N}(undef, size(data))
+# Construct from host data.  Forwards alloc kwargs (bq/extra_usage/unified)
+# so callers don't need a separate "alloc-then-upload" helper for each usage.
+function LavaArray{T,N}(data::AbstractArray{T,N}; kw...) where {T,N}
+    arr = LavaArray{T,N}(undef, size(data); kw...)
     GC.@preserve arr upload!(arr, data)
     return arr
 end
-LavaArray(data::AbstractArray{T,N}) where {T,N} = LavaArray{T,N}(data)
+LavaArray(data::AbstractArray{T,N}; kw...) where {T,N} = LavaArray{T,N}(data; kw...)
 
-# Type-converting constructors: LavaArray{T}(array_of_S)
-function LavaArray{T}(data::AbstractArray{S,N}) where {T,S,N}
-    LavaArray{T,N}(convert(AbstractArray{T}, data))
-end
-function LavaArray{T,N}(data::AbstractArray{S,N}) where {T,S,N}
-    LavaArray{T,N}(convert(AbstractArray{T}, data))
-end
+LavaArray{T}(data::AbstractArray{S,N}; kw...) where {T,S,N} =
+    LavaArray{T,N}(convert(AbstractArray{T}, data); kw...)
+LavaArray{T,N}(data::AbstractArray{S,N}; kw...) where {T,S,N} =
+    LavaArray{T,N}(convert(AbstractArray{T}, data); kw...)
 
 # UniformScaling constructor (resolve ambiguity with GPUArrays inner constructor)
 import LinearAlgebra: UniformScaling
@@ -137,9 +161,20 @@ function bda_address(a::LavaArray{T}) where T
     a.buf[].address + a.offset * sizeof(T)
 end
 
-# pin! forwarder: unwrap LavaArray's DataRef to its VkManagedBuffer leaf
-# so the ctx assertion + last_write tracking happen on the actual GPU buffer.
-@inline pin!(batch::CommandBatch, a::LavaArray) = pin!(batch, a.buf[])
+# pin! the LavaArray wrapper itself, NOT just its VkManagedBuffer. The wrapper
+# is what Julia's GC traces: pinning the raw VkManagedBuffer wouldn't keep the
+# LavaArray alive, so its GC finalizer could fire mid-batch, call `unsafe_free!`
+# on the underlying DataRef, and leave the wavefront using a DEFERRED/DEAD
+# buffer — which `sync_access!` rightly asserts against.
+# `sync_access!(::LavaArray)` below forwards to the underlying VkManagedBuffer
+# so cross-queue last_write tracking still runs on the leaf.
+@inline pin!(batch::CommandBatch, a::LavaArray) = begin
+    a in batch.pinned && return
+    push!(batch.pinned, a)
+    return nothing
+end
+
+@inline sync_access!(batch::CommandBatch, a::LavaArray) = sync_access!(batch, a.buf[])
 
 # LavaAdaptor: converts LavaArray → LavaDeviceArray (Ptr-wrapping) for GPU
 # kernel compilation, and pins every visited LavaArray into the current batch.
@@ -166,21 +201,37 @@ end
 """
     update!(dst::LavaArray, data::AbstractArray)
 
-Update a GPU array with new host data. Resizes if needed — frees the old
-buffer immediately (no GC pressure) and allocates a new one.
-If sizes match, uploads in-place with no allocation.
+Update a GPU array with new host data.  Grow-only policy:
+
+* If `data` fits the backing VkManagedBuffer's existing capacity, the GPU
+  buffer is reused (no Vulkan alloc/free churn); only `dst.dims` is updated
+  and the bytes are overwritten.
+* If `data` exceeds capacity, allocate a new buffer sized for the new data
+  and release the old one through the DataRef refcount path.
+
+This is the right shape for animation loops that update per-frame data
+whose size fluctuates but has a bounded peak (streamplot tubes, meshscatter
+triangle lists, dye volumes, etc.) — steady state allocates zero.
 """
 function update!(dst::LavaArray{T,N}, data::AbstractArray{T,N}) where {T,N}
-    if size(dst) == size(data)
+    new_bytes = length(data) * sizeof(T)
+    buf = dst.buf[]
+    # Capacity = backing buffer's allocated size minus our element offset.
+    # For non-pooled buffers that's buf.size; for pooled chunks it's also
+    # buf.size (pool carves exact-size sub-allocations).
+    capacity_bytes = buf.size - dst.offset * sizeof(T)
+
+    if new_bytes <= capacity_bytes
+        # Reuse buffer, just set new dims and overwrite the bytes.
+        dst.dims = size(data)
         upload!(dst, data)
     else
-        # Free old buffer immediately (not deferred)
+        # Need to grow: release old DataRef, allocate a fresh buffer sized for `data`.
         old_ref = dst.buf
+        ctx = buf.ctx::VkContext
         GPUArrays.unsafe_free!(old_ref)
-        # Allocate new (reuse the old buf's ctx so updates stay on the same device).
-        ctx = dst.buf[].ctx::VkContext
-        new_nbytes = max(length(data) * sizeof(T), 16)
-        new_buf = pool_alloc(ctx, new_nbytes)
+        new_nbytes = max(new_bytes, 16)
+        new_buf = pool_alloc(ctx.default_bq, new_nbytes)
         new_ref = GPUArrays.DataRef(new_buf) do buf
             vk_free!(buf)
         end

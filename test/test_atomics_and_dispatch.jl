@@ -32,15 +32,19 @@ using Atomix
         @test !occursin("MakeAvailable", d)
     end
 
-    @testset "monotonic cmpxchg (f32 CAS) → Relaxed" begin
-        function f32_cas_add(counter)
+    @testset "monotonic f32 atomic → hardware OpAtomicFAddEXT" begin
+        function f32_fadd(counter)
             Atomix.@atomic counter[1] += 1.0f0
             return nothing
         end
-        result = Lava.lava_compile_gpu(f32_cas_add,
+        result = Lava.lava_compile_gpu(f32_fadd,
             Tuple{Lava.LavaDeviceArray{Float32,1}}; workgroup_size=(64,1,1), validate=true)
         d = Lava.disassemble_spirv(result.spirv_bytes)
-        @test occursin("OpAtomicCompareExchange", d)
+        # Float32 atomics use VK_EXT_shader_atomic_float's OpAtomicFAddEXT —
+        # no more CAS loop (the previous emulation went through cmpxchg).
+        @test occursin("OpAtomicFAddEXT", d)
+        @test occursin("AtomicFloat32AddEXT", d)
+        @test !occursin("OpAtomicCompareExchange", d)
         @test !occursin("MakeVisible", d)
         @test !occursin("MakeAvailable", d)
     end

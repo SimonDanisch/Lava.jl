@@ -16,8 +16,20 @@ import Adapt
 # lifetime pinning fires.  Adapt.jl's recursion handles wrapper structs,
 # Broadcasted, NamedTuple — every LavaArray anywhere inside lands here.
 
-function Adapt.adapt_storage(ad::LavaAdaptor, a::LavaArray{T,N}) where {T,N}
-    pin!(ad.batch, a)
+"""
+    adapt_storage(::LavaAdaptor, ::LavaArray) → LavaDeviceArray
+
+Pure strip: wrap the GPU buffer address in a device-visible struct. **No pin
+side effect**. Callers must separately invoke `pin_leaves!(batch, args...)`
+before submitting a command buffer that uses the stripped result — otherwise
+the underlying `VkManagedBuffer` can be GC'd before the GPU reads from it.
+
+(AMDGPU's adapt is also pure; they get away without an explicit pin pass
+because `@roc` uses `GC.@preserve vars...` lexically around a synchronous
+dispatch. Lava's dispatches are batched and submitted later, so `@preserve`
+isn't enough — hence the explicit `pin_leaves!` step.)
+"""
+function Adapt.adapt_storage(::LavaAdaptor, a::LavaArray{T,N}) where {T,N}
     return LavaDeviceArray{T,N}(Ptr{T}(bda_address(a)), a.dims)
 end
 Adapt.adapt_storage(::LavaAdaptor, x) = x  # Scalars pass through
@@ -143,7 +155,7 @@ function Base.resize!(a::LavaArray{T,1}, n::Integer) where T
     n == old_len && return a
     ctx = a.buf[].ctx::VkContext
     bq = ctx.default_bq
-    new_buf = pool_alloc(ctx, max(Int(n) * sizeof(T), 16))
+    new_buf = pool_alloc(bq, max(Int(n) * sizeof(T), 16))
     if old_len > 0 && n > 0
         copy_len = min(old_len, Int(n)) * sizeof(T)
         src_off = a.buf[].pool_offset + a.offset * sizeof(T)

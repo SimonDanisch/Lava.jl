@@ -308,133 +308,126 @@ function vk_draw!(bq::BatchQueue,
                    indices_buffer::Union{Nothing, Vulkan.Buffer}=nothing,
                    index_count::Integer=0,
                    descriptor_set::Union{Nothing, Vulkan.DescriptorSet}=nothing)
-    batch = ensure_active_batch!(bq)
-    cmd = batch.cmd_buf
+    # Route through record_dispatch! so the prior-dispatch → draw barrier,
+    # dispatch_count bookkeeping, CB-split logic, and dispatch-log accounting
+    # all come from the single shared helper.  The do-block handles the
+    # graphics-specific work (image transitions, dynamic rendering scope,
+    # bind + draw + end_rendering).
+    record_dispatch!(bq;
+        dst_stage = Vulkan.PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                    Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        extra_dst_access = Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        info = "draw vtx=$vertex_count",
+    ) do batch
+        cmd = batch.cmd_buf
 
-    # Memory barrier: compute/RT → graphics
-    if batch.dispatch_count > 0
-        src_stage = batch.last_was_rt ?
-            Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR :
-            Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT
-        barrier = Vulkan.MemoryBarrier(C_NULL,
-            Vulkan.ACCESS_SHADER_WRITE_BIT,
-            Vulkan.ACCESS_SHADER_READ_BIT | Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
-        Vulkan.cmd_pipeline_barrier(cmd, [barrier], [], [];
-            src_stage_mask=src_stage,
-            dst_stage_mask=Vulkan.PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                           Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT)
-    end
+        # Transition color image to COLOR_ATTACHMENT_OPTIMAL
+        transition_image!(cmd, color_image,
+            Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            Vulkan.PIPELINE_STAGE_TOP_OF_PIPE_BIT, Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            Vulkan.AccessFlag(0), Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
 
-    # Transition color image to COLOR_ATTACHMENT_OPTIMAL
-    transition_image!(cmd, color_image,
-        Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        Vulkan.PIPELINE_STAGE_TOP_OF_PIPE_BIT, Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        Vulkan.AccessFlag(0), Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+        # Transition depth image to DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        if depth_image !== nothing
+            depth_barrier = Vulkan.ImageMemoryBarrier(
+                Vulkan.AccessFlag(0),
+                Vulkan.ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | Vulkan.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                Vulkan.QUEUE_FAMILY_IGNORED, Vulkan.QUEUE_FAMILY_IGNORED,
+                depth_image,
+                Vulkan.ImageSubresourceRange(Vulkan.IMAGE_ASPECT_DEPTH_BIT,
+                    UInt32(0), UInt32(1), UInt32(0), UInt32(1)),
+            )
+            Vulkan.cmd_pipeline_barrier(cmd, [], [], [depth_barrier];
+                src_stage_mask=Vulkan.PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                dst_stage_mask=Vulkan.PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT)
+        end
 
-    # Transition depth image to DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-    if depth_image !== nothing
-        depth_barrier = Vulkan.ImageMemoryBarrier(
-            Vulkan.AccessFlag(0),
-            Vulkan.ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | Vulkan.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-            Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            Vulkan.QUEUE_FAMILY_IGNORED, Vulkan.QUEUE_FAMILY_IGNORED,
-            depth_image,
-            Vulkan.ImageSubresourceRange(Vulkan.IMAGE_ASPECT_DEPTH_BIT,
-                UInt32(0), UInt32(1), UInt32(0), UInt32(1)),
-        )
-        Vulkan.cmd_pipeline_barrier(cmd, [], [], [depth_barrier];
-            src_stage_mask=Vulkan.PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            dst_stage_mask=Vulkan.PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT)
-    end
+        # Color attachment for dynamic rendering
+        clear_val = if clear_color !== nothing
+            Vulkan.ClearValue(Vulkan.ClearColorValue(clear_color))
+        else
+            Vulkan.ClearValue(Vulkan.ClearColorValue((0.0f0, 0.0f0, 0.0f0, 1.0f0)))
+        end
 
-    # Color attachment for dynamic rendering
-    clear_val = if clear_color !== nothing
-        Vulkan.ClearValue(Vulkan.ClearColorValue(clear_color))
-    else
-        Vulkan.ClearValue(Vulkan.ClearColorValue((0.0f0, 0.0f0, 0.0f0, 1.0f0)))
-    end
+        load_op = clear_color !== nothing ? Vulkan.ATTACHMENT_LOAD_OP_CLEAR : Vulkan.ATTACHMENT_LOAD_OP_LOAD
 
-    load_op = clear_color !== nothing ? Vulkan.ATTACHMENT_LOAD_OP_CLEAR : Vulkan.ATTACHMENT_LOAD_OP_LOAD
-
-    color_attachment = Vulkan.RenderingAttachmentInfo(
-        Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        Vulkan.IMAGE_LAYOUT_UNDEFINED,  # resolve image layout (unused)
-        load_op,
-        Vulkan.ATTACHMENT_STORE_OP_STORE,
-        clear_val;
-        image_view=color_view,
-        resolve_mode=Vulkan.RESOLVE_MODE_NONE,
-    )
-
-    # Depth attachment (optional)
-    depth_attachment = C_NULL
-    if depth_view !== nothing
-        depth_clear = Vulkan.ClearValue(Vulkan.ClearDepthStencilValue(1.0f0, UInt32(0)))
-        depth_attachment = Vulkan.RenderingAttachmentInfo(
-            Vulkan.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            Vulkan.IMAGE_LAYOUT_UNDEFINED,
-            Vulkan.ATTACHMENT_LOAD_OP_CLEAR,
-            Vulkan.ATTACHMENT_STORE_OP_DONT_CARE,
-            depth_clear;
-            image_view=depth_view,
+        color_attachment = Vulkan.RenderingAttachmentInfo(
+            Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            Vulkan.IMAGE_LAYOUT_UNDEFINED,  # resolve image layout (unused)
+            load_op,
+            Vulkan.ATTACHMENT_STORE_OP_STORE,
+            clear_val;
+            image_view=color_view,
             resolve_mode=Vulkan.RESOLVE_MODE_NONE,
         )
-    end
 
-    render_area = Vulkan.Rect2D(Vulkan.Offset2D(0, 0), extent)
-
-    rendering_info = Vulkan.RenderingInfo(
-        render_area,
-        UInt32(1),  # layer count
-        UInt32(0),  # view mask
-        [color_attachment];
-        depth_attachment=depth_attachment,
-    )
-
-    Vulkan.cmd_begin_rendering(cmd, rendering_info)
-
-    # Bind pipeline
-    Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_GRAPHICS, pipeline.pipeline)
-
-    # Bind descriptor set (for textures)
-    if descriptor_set !== nothing
-        Vulkan.cmd_bind_descriptor_sets(cmd, Vulkan.PIPELINE_BIND_POINT_GRAPHICS,
-            pipeline.pipeline_layout, UInt32(0), [descriptor_set], UInt32[])
-    end
-
-    # Dynamic viewport + scissor
-    viewport = Vulkan.Viewport(0.0f0, 0.0f0,
-        Float32(extent.width), Float32(extent.height),
-        0.0f0, 1.0f0)
-    Vulkan.cmd_set_viewport(cmd, [viewport])
-
-    scissor = Vulkan.Rect2D(Vulkan.Offset2D(0, 0), extent)
-    Vulkan.cmd_set_scissor(cmd, [scissor])
-
-    # Push constants
-    if !isempty(push_data)
-        GC.@preserve push_data begin
-            Vulkan.cmd_push_constants(cmd, pipeline.pipeline_layout,
-                pipeline.push_stage_flags, UInt32(0), UInt32(length(push_data)),
-                Ptr{Nothing}(pointer(push_data)))
+        # Depth attachment (optional)
+        depth_attachment = C_NULL
+        if depth_view !== nothing
+            depth_clear = Vulkan.ClearValue(Vulkan.ClearDepthStencilValue(1.0f0, UInt32(0)))
+            depth_attachment = Vulkan.RenderingAttachmentInfo(
+                Vulkan.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                Vulkan.IMAGE_LAYOUT_UNDEFINED,
+                Vulkan.ATTACHMENT_LOAD_OP_CLEAR,
+                Vulkan.ATTACHMENT_STORE_OP_DONT_CARE,
+                depth_clear;
+                image_view=depth_view,
+                resolve_mode=Vulkan.RESOLVE_MODE_NONE,
+            )
         end
+
+        render_area = Vulkan.Rect2D(Vulkan.Offset2D(0, 0), extent)
+
+        rendering_info = Vulkan.RenderingInfo(
+            render_area,
+            UInt32(1),  # layer count
+            UInt32(0),  # view mask
+            [color_attachment];
+            depth_attachment=depth_attachment,
+        )
+
+        Vulkan.cmd_begin_rendering(cmd, rendering_info)
+
+        # Bind pipeline + pin for batch lifetime
+        Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_GRAPHICS, pipeline.pipeline)
+        pin!(batch, pipeline)
+
+        # Bind descriptor set (for textures)
+        if descriptor_set !== nothing
+            Vulkan.cmd_bind_descriptor_sets(cmd, Vulkan.PIPELINE_BIND_POINT_GRAPHICS,
+                pipeline.pipeline_layout, UInt32(0), [descriptor_set], UInt32[])
+        end
+
+        # Dynamic viewport + scissor
+        viewport = Vulkan.Viewport(0.0f0, 0.0f0,
+            Float32(extent.width), Float32(extent.height),
+            0.0f0, 1.0f0)
+        Vulkan.cmd_set_viewport(cmd, [viewport])
+
+        scissor = Vulkan.Rect2D(Vulkan.Offset2D(0, 0), extent)
+        Vulkan.cmd_set_scissor(cmd, [scissor])
+
+        # Push constants
+        if !isempty(push_data)
+            GC.@preserve push_data begin
+                Vulkan.cmd_push_constants(cmd, pipeline.pipeline_layout,
+                    pipeline.push_stage_flags, UInt32(0), UInt32(length(push_data)),
+                    Ptr{Nothing}(pointer(push_data)))
+            end
+        end
+
+        # Draw
+        if indices_buffer !== nothing
+            Vulkan.cmd_bind_index_buffer(cmd, indices_buffer, UInt64(0), Vulkan.INDEX_TYPE_UINT32)
+            Vulkan.cmd_draw_indexed(cmd, UInt32(index_count), UInt32(instances),
+                                     UInt32(0), Int32(0), UInt32(0))
+        else
+            Vulkan.cmd_draw(cmd, UInt32(vertex_count), UInt32(instances), UInt32(0), UInt32(0))
+        end
+
+        Vulkan.cmd_end_rendering(cmd)
     end
-
-    # Draw
-    if indices_buffer !== nothing
-        Vulkan.cmd_bind_index_buffer(cmd, indices_buffer, UInt64(0), Vulkan.INDEX_TYPE_UINT32)
-        Vulkan.cmd_draw_indexed(cmd, UInt32(index_count), UInt32(instances),
-                                 UInt32(0), Int32(0), UInt32(0))
-    else
-        Vulkan.cmd_draw(cmd, UInt32(vertex_count), UInt32(instances), UInt32(0), UInt32(0))
-    end
-
-    Vulkan.cmd_end_rendering(cmd)
-
-    batch.dispatch_count += 1
-    batch.last_was_rt = false
-    # Pin pipeline to batch
-    pin!(batch, pipeline)
 end
 
 """Transition an image layout using a pipeline barrier."""

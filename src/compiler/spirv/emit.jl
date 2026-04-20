@@ -5881,6 +5881,11 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return emit_geom_input!(state, inst, :i32)
         end
 
+        # Subgroup / group-non-uniform ops → OpGroupNonUniform*
+        if startswith(fn_name, "_lava_subgroup_")
+            return emit_lava_subgroup!(state, inst, fn_name)
+        end
+
         # Regular function call
         emit_direct_call!(state, inst, called)
     else
@@ -5896,6 +5901,144 @@ function emit_lava_glsl!(state::SPIRVEmitterState, inst::LLVM.CallInst, name::St
         return emit_glsl_ext_inst!(state, inst, glsl_num)
     end
     error("Unknown _lava_glsl function: $name")
+end
+
+# ---------------------------------------------------------------------------
+# Subgroup / group-non-uniform ops (Vulkan 1.1 core)
+#
+# Intrinsic naming convention:
+#   _lava_subgroup_<op>_<suffix>     — reduction/scan or arithmetic-style op
+#   _lava_subgroup_elect             — returns i1, true on exactly one lane
+#   _lava_subgroup_broadcast_first_T — pick value from first active lane
+#   _lava_subgroup_ballot            — i32 → i32 (lane predicate bitmask; we use one dword)
+#   _lava_subgroup_all               — boolean vote: all lanes' predicate true
+#   _lava_subgroup_any               — boolean vote: any lane's predicate true
+#
+# Reduction/scan variants all share a single opcode per op: the GroupOperation
+# (Reduce=0 / InclusiveScan=1 / ExclusiveScan=2) is encoded in the name:
+#   _lava_subgroup_reduce_add_f32
+#   _lava_subgroup_inclusive_scan_add_f32
+#   _lava_subgroup_exclusive_scan_add_f32
+# and similarly for mul/min/max/and/or/xor.
+# ---------------------------------------------------------------------------
+
+# Maps op-name → (int opcode, float opcode). `nothing` means the op is only
+# defined for one signedness — e.g. and/or/xor are integer-only.
+const LAVA_SUBGROUP_ARITH = Dict{String, NamedTuple{(:iop,:fop,:uop), Tuple{Any,Any,Any}}}(
+    "add"  => (iop=Op.OpGroupNonUniformIAdd, fop=Op.OpGroupNonUniformFAdd, uop=Op.OpGroupNonUniformIAdd),
+    "mul"  => (iop=Op.OpGroupNonUniformIMul, fop=Op.OpGroupNonUniformFMul, uop=Op.OpGroupNonUniformIMul),
+    "min"  => (iop=Op.OpGroupNonUniformSMin, fop=Op.OpGroupNonUniformFMin, uop=Op.OpGroupNonUniformUMin),
+    "max"  => (iop=Op.OpGroupNonUniformSMax, fop=Op.OpGroupNonUniformFMax, uop=Op.OpGroupNonUniformUMax),
+    "and"  => (iop=Op.OpGroupNonUniformBitwiseAnd,  fop=nothing, uop=Op.OpGroupNonUniformBitwiseAnd),
+    "or"   => (iop=Op.OpGroupNonUniformBitwiseOr,   fop=nothing, uop=Op.OpGroupNonUniformBitwiseOr),
+    "xor"  => (iop=Op.OpGroupNonUniformBitwiseXor,  fop=nothing, uop=Op.OpGroupNonUniformBitwiseXor),
+)
+
+# GroupOperation encoded in the name prefix (default is Reduce)
+const LAVA_SUBGROUP_GROUPOP = Dict{String, UInt32}(
+    "reduce"           => GroupOp.Reduce,
+    "inclusive_scan"   => GroupOp.InclusiveScan,
+    "exclusive_scan"   => GroupOp.ExclusiveScan,
+)
+
+# Parse `_lava_subgroup_<kind>_<op>_<suffix>` into (kind, op, suffix).
+# Allows the GroupOperation prefix to be omitted (defaults to "reduce"),
+# so both `_lava_subgroup_add_f32` and `_lava_subgroup_reduce_add_f32` work.
+function parse_subgroup_arith_name(name::String)
+    body = name[length("_lava_subgroup_")+1:end]
+    # Try to strip one of the known GroupOperation prefixes
+    kind = "reduce"
+    for (prefix, _) in LAVA_SUBGROUP_GROUPOP
+        if startswith(body, prefix * "_")
+            kind = prefix
+            body = body[length(prefix)+2:end]
+            break
+        end
+    end
+    # Rest should be `<op>_<suffix>` (e.g. "add_f32", "min_i32", "or_u32")
+    m = match(r"^(add|mul|min|max|and|or|xor)_(f16|f32|f64|i32|u32|i64|u64)$", body)
+    m === nothing && return nothing
+    return (kind=kind, op=m.captures[1], suffix=m.captures[2])
+end
+
+function emit_lava_subgroup!(state::SPIRVEmitterState, inst::LLVM.CallInst, name::String)
+    # Every subgroup op needs the GroupNonUniform base capability. Arithmetic
+    # variants additionally require GroupNonUniformArithmetic.
+    require_capability!(state.mod, Cap.GroupNonUniform)
+
+    subgroup_scope_id = emit_constant_u32!(state.mod, Scope.Subgroup)
+    ops = LLVM.operands(inst)
+
+    # ── Elect ──
+    if name == "_lava_subgroup_elect"
+        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+        result_id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpGroupNonUniformElect,
+            result_ty, result_id, subgroup_scope_id)
+        state.value_map[inst] = result_id
+        return
+    end
+
+    # ── Broadcast-first (value from first active lane → all lanes) ──
+    if startswith(name, "_lava_subgroup_broadcast_first_")
+        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+        result_id = fresh_id!(state.mod)
+        val_id = get_value_id!(state, ops[1])
+        encode_instruction!(state.mod.functions, Op.OpGroupNonUniformBroadcastFirst,
+            result_ty, result_id, subgroup_scope_id, val_id)
+        state.value_map[inst] = result_id
+        return
+    end
+
+    # ── Ballot (i1 predicate → 32-bit bitmask of lanes passing the predicate) ──
+    if name == "_lava_subgroup_ballot"
+        require_capability!(state.mod, Cap.GroupNonUniformBallot)
+        # Declare uvec4 result type (ballot is always <4 x i32>); caller sees
+        # just the low lane via extract, which is handled at the Julia side.
+        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+        result_id = fresh_id!(state.mod)
+        pred_id = get_value_id!(state, ops[1])
+        encode_instruction!(state.mod.functions, Op.OpGroupNonUniformBallot,
+            result_ty, result_id, subgroup_scope_id, pred_id)
+        state.value_map[inst] = result_id
+        return
+    end
+
+    # ── All/Any boolean vote ──
+    if name == "_lava_subgroup_all" || name == "_lava_subgroup_any"
+        require_capability!(state.mod, Cap.GroupNonUniformVote)
+        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+        result_id = fresh_id!(state.mod)
+        pred_id = get_value_id!(state, ops[1])
+        opcode = name == "_lava_subgroup_all" ? Op.OpGroupNonUniformAll : Op.OpGroupNonUniformAny
+        encode_instruction!(state.mod.functions, opcode,
+            result_ty, result_id, subgroup_scope_id, pred_id)
+        state.value_map[inst] = result_id
+        return
+    end
+
+    # ── Arithmetic reduce / scan ──
+    parsed = parse_subgroup_arith_name(name)
+    parsed === nothing && error("Unknown _lava_subgroup function: $name")
+    kind, op, suffix = parsed.kind, parsed.op, parsed.suffix
+
+    require_capability!(state.mod, Cap.GroupNonUniformArithmetic)
+    tbl = LAVA_SUBGROUP_ARITH[op]
+    is_float = startswith(suffix, "f")
+    is_unsigned = startswith(suffix, "u")
+    opcode = is_float ? tbl.fop :
+             is_unsigned ? tbl.uop :
+                            tbl.iop
+    opcode === nothing && error("Subgroup op `$op` is not defined for type `$suffix`")
+
+    # GroupOperation is a LITERAL immediate in the SPIR-V encoding, not a constant <id>.
+    group_op_literal = LAVA_SUBGROUP_GROUPOP[kind]
+    val_id = get_value_id!(state, ops[1])
+    result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+    result_id = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, opcode,
+        result_ty, result_id, subgroup_scope_id, group_op_literal, val_id)
+    state.value_map[inst] = result_id
 end
 
 function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, name::String)
@@ -6462,9 +6605,36 @@ function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
         Op.OpAtomicUMax
     elseif binop == LLVM.API.LLVMAtomicRMWBinOpXchg
         Op.OpAtomicExchange
-    elseif binop == LLVM.API.LLVMAtomicRMWBinOpFAdd || binop == LLVM.API.LLVMAtomicRMWBinOpFSub
-        error("Floating-point atomicrmw (fadd/fsub) is not supported in Vulkan SPIR-V. " *
-              "Use Atomix.@atomic with the Lava device overrides instead (these use a CAS loop).")
+    elseif binop == LLVM.API.LLVMAtomicRMWBinOpFAdd
+        # VK_EXT_shader_atomic_float + SPV_EXT_shader_atomic_float_add. f16/f32/f64
+        # pick different capabilities; f64 isn't enabled by Lava's device features
+        # today, so we require the f32/f16 cap based on operand width.
+        w = result_llvm_ty isa LLVM.LLVMFloat  ? 32 :
+            result_llvm_ty isa LLVM.LLVMDouble ? 64 :
+            result_llvm_ty isa LLVM.LLVMHalf   ? 16 :
+            error("OpAtomicFAdd: unsupported float width for $result_llvm_ty")
+        cap = w == 32 ? Cap.AtomicFloat32AddEXT :
+              w == 64 ? Cap.AtomicFloat64AddEXT :
+                        Cap.AtomicFloat16AddEXT
+        require_capability!(state.mod, cap)
+        require_extension!(state.mod, "SPV_EXT_shader_atomic_float_add")
+        Op.OpAtomicFAddEXT
+    elseif binop == LLVM.API.LLVMAtomicRMWBinOpFSub
+        error("atomicrmw fsub: not in SPV_EXT_shader_atomic_float_add. " *
+              "Negate the operand and use fadd instead.")
+    elseif binop == LLVM.API.LLVMAtomicRMWBinOpFMin ||
+           binop == LLVM.API.LLVMAtomicRMWBinOpFMax
+        is_min = binop == LLVM.API.LLVMAtomicRMWBinOpFMin
+        # SPV_EXT_shader_atomic_float_min_max covers the f32 case. f64 / f16
+        # variants need their own capability bits (not defined in Lava today).
+        result_llvm_ty isa LLVM.LLVMFloat ||
+            error("OpAtomicFMin/FMax: only Float32 is wired up today")
+        # Capability numbers for the min/max variants live in the SPV_EXT spec;
+        # we gate the op on the same buffer-atomics device feature as FAdd,
+        # which is the common Vulkan arrangement on AMD/NVIDIA.
+        require_capability!(state.mod, Cap.AtomicFloat32AddEXT)
+        require_extension!(state.mod, "SPV_EXT_shader_atomic_float_min_max")
+        is_min ? Op.OpAtomicFMinEXT : Op.OpAtomicFMaxEXT
     else
         error("Unsupported atomicrmw operation: $binop")
     end

@@ -108,6 +108,8 @@ include("runtime/intrinsics.jl")
 # ---- Array interface (before launch.jl because it references LavaArray) ----
 include("array/lavaarray.jl")
 include("device/atomics.jl")  # needs LavaDeviceArray from lavaarray.jl
+include("device/subgroup.jl") # subgroup / group-non-uniform intrinsics
+include("array/pin_leaves.jl") # @generated walker that pins LavaArray leaves per batch
 
 # ---- Launch API (depends on LavaArray / LavaDeviceArray) ----
 include("runtime/launch.jl")
@@ -173,7 +175,7 @@ function dump_state(; io::IO=stdout)
     live_mb = mem.live_bytes ÷ (1024 * 1024)
     println(io, "GPU memory: $(live_mb) MiB in $(mem.LIVE_BUFFERS) buffers ($(mem.deferred_frees) deferred)")
     println(io, "Pipelines cached: $(mem.pipelines_cached) (max $(MAX_PIPELINE_CACHE_SIZE[]))")
-    println(io, "Kernels cached: $(mem.kernels_cached) (max $(MAX_KERNEL_CACHE_SIZE[]))")
+    println(io, "Kernels cached: $(mem.kernels_cached)")
     if ctx !== nothing
         bq = ctx.default_bq
         println(io, "Arg slabs: $(length(bq.arg_slabs)) (slab_idx=$(bq.arg_slab_idx), offset=$(bq.arg_slab_offset))")

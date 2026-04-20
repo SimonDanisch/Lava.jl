@@ -37,6 +37,14 @@ const MAX_DISPATCH_LOG = 2000
 # Enable with Lava.DISPATCH_LOGGING_ENABLED[] = true for debugging.
 # On DEVICE_LOST, the error handler re-enables logging automatically.
 const DISPATCH_LOGGING_ENABLED = Ref{Bool}(false)
+# TEMP DEBUG: if true, submit! waits for the batch it just submitted to complete
+# and records wall-clock GPU time in BATCH_WAIT_TIMES. This SERIALIZES the pipeline
+# — only for measurement, not production. Used to identify batches whose actual
+# GPU execution time is near the amdgpu TDR threshold (~10 s).
+const BATCH_TIMING_ENABLED = Ref{Bool}(false)
+const BATCH_WAIT_TIMES = Float64[]  # seconds
+const BATCH_WAIT_INFO  = String[]   # last kernel in batch at wait time
+const BATCH_WAIT_DISPATCHES = Int[] # dispatch count for each measured batch
 
 function log_dispatch!(info::String)
     DISPATCH_LOGGING_ENABLED[] || return
@@ -76,6 +84,15 @@ const CMD_PIPELINE_BARRIER_FPTR = Ref{Ptr{Nothing}}(C_NULL)
 # Default 3000 ≈ 1 Hikari volpath sample (50 bounces × 60 dispatches/bounce).
 # Set to 0 to disable splitting.
 const CB_SPLIT_THRESHOLD = Ref{Int}(3000)
+
+# Auto-submit threshold: submit the current batch (starting a new one on the
+# next dispatch) when its dispatch count reaches this value. Measured per-batch
+# GPU execution time is capped at ~51 ms on dolphin HQ (well under amdgpu's
+# ~10 s TDR) so the original TDR hypothesis this was meant to address turned
+# out to be wrong. Leaving the mechanism in place but disabled by default;
+# enable (e.g. 512) if a future workload actually shows per-batch GPU time
+# approaching TDR.
+const AUTO_SUBMIT_THRESHOLD = Ref{Int}(0)
 
 
 # ── Batch lifecycle ──
@@ -159,15 +176,11 @@ function reclaim_batch!(bq::BatchQueue, batch::CommandBatch)
     append!(bq.free_cmd_bufs, batch.sealed_cmd_bufs)
     empty!(batch.sealed_cmd_bufs)
     push!(bq.free_batches, batch)
-
-    # When ALL in-flight batches are done, safe to reset pools and drain
-    # this queue's deferred-frees lists (which are timeline-gated anyway).
-    if isempty(bq.in_flight)
-        drain_deferred_frees!(bq)
-        drain_deferred_as_frees!(bq)
-        reset_arg_buffer_pool!(bq)
-        reset_indirect_buffer_pool!(bq)
-    end
+    # Note: pool reset + deferred-free drain are done in `sweep_retired_batches!`
+    # AFTER the batch is actually removed from `bq.in_flight` (reclaim_batch! is
+    # called with the batch still present in `in_flight`, so `isempty` would
+    # always read `false` here and the reset would never fire — that bug leaked
+    # ~70 MiB/frame via arg/indirect slabs on long per-frame dispatch streams).
 end
 
 
@@ -273,6 +286,17 @@ Example:
 
     # Split to a new CB if this segment is full
     maybe_split_cb!(batch, bq)
+
+    # Auto-submit to avoid TDR when a single submission's GPU execution time
+    # approaches amdgpu's ~10 s lockup_timeout.  `submit!` queues the batch
+    # onto the in-flight list without blocking — next `record_dispatch!` will
+    # `ensure_active_batch!` a fresh batch.  Cross-batch buffer synchronisation
+    # is already handled via `sync_access!` writing `buf.last_write` and
+    # wait_semaphores picking it up on the next pin.
+    threshold = AUTO_SUBMIT_THRESHOLD[]
+    if threshold > 0 && batch.dispatch_count >= threshold
+        submit!(bq)
+    end
 end
 
 """
@@ -351,13 +375,15 @@ end
 # ── Indirect Dispatch ──
 
 """
-    vk_dispatch_indirect!(pipeline, push_bda, indirect_buf, indirect_offset=0)
+    vk_dispatch_indirect!(bq, pipeline, push_bda, indirect::LavaArray{UInt32,1})
 
-Record an indirect compute dispatch. The `indirect_buf` must contain a
-VkDispatchIndirectCommand (3×UInt32), written by a previous GPU kernel.
+Record an indirect compute dispatch.  `indirect` is a LavaArray view of 3
+UInt32s (groupCountX/Y/Z), typically obtained from `get_indirect_buffer(bq)`
+and populated by a prepare-indirect kernel.
 """
-@inline function vk_dispatch_indirect!(bq::BatchQueue, pipeline::LavaComputePipeline, push_bda::UInt64,
-                               indirect_buf, indirect_offset::Integer=0)
+@inline function vk_dispatch_indirect!(bq::BatchQueue, pipeline::LavaComputePipeline,
+                                       push_bda::UInt64,
+                                       indirect)  # LavaArray{UInt32,1} — declared later in array/lavaarray.jl
     dispatch_info = DISPATCH_LOGGING_ENABLED[] ?
         "$(LAST_DISPATCH_INFO[]) (indirect)" : ""
 
@@ -371,10 +397,10 @@ VkDispatchIndirectCommand (3×UInt32), written by a previous GPU kernel.
         pin!(batch, pipeline)
         push_constants_bda!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_bda)
 
-        vk_buf = indirect_buf isa Vulkan.Buffer ? indirect_buf : indirect_buf.buffer
-        buf_offset = indirect_buf isa VkIndirectBuffer ? indirect_buf.buffer_offset : UInt64(0)
-        Vulkan.cmd_dispatch_indirect(cmd, vk_buf, buf_offset + UInt64(indirect_offset))
-        pin!(batch, indirect_buf)
+        mb = indirect.buf[]::VkManagedBuffer
+        byte_offset = UInt64(indirect.offset * sizeof(UInt32))
+        Vulkan.cmd_dispatch_indirect(cmd, mb.buffer, byte_offset)
+        pin!(batch, indirect)
     end
 end
 
@@ -484,6 +510,21 @@ function submit!(bq::BatchQueue)
     if DISPATCH_LOGGING_ENABLED[]
         append!(DISPATCH_LOG, batch.dispatch_log)
     end
+    # DEBUG: synchronous per-batch wall-clock timing. Serializes the pipeline
+    # but lets us see GPU execution time per batch. Guarded by opt-in flag.
+    if BATCH_TIMING_ENABLED[]
+        t0 = time()
+        wr = Vulkan.wait_semaphores(bq.device,
+            Vulkan.SemaphoreWaitInfo([bq.timeline_sem], [batch.signal_value]),
+            typemax(UInt64))
+        dt = time() - t0
+        push!(BATCH_WAIT_TIMES, dt)
+        push!(BATCH_WAIT_INFO, LAST_DISPATCH_INFO[])
+        push!(BATCH_WAIT_DISPATCHES, saved_dispatch_count)
+        if iserror(wr)
+            # Don't throw from here — let the next call surface it normally.
+        end
+    end
     return batch
 end
 
@@ -513,6 +554,13 @@ function sweep_retired_batches!(bq::BatchQueue)
     end
     drain_deferred_frees!(bq)
     drain_deferred_as_frees!(bq)
+    # Reset pools once the queue is idle.  Done HERE (not inside reclaim_batch!)
+    # because reclaim is called with the batch still in `bq.in_flight` — the
+    # isempty check had to run after `deleteat!` to ever return true.
+    if isempty(bq.in_flight)
+        reset_arg_buffer_pool!(bq)
+        reset_indirect_buffer_pool!(bq)
+    end
     return nothing
 end
 

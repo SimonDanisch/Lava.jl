@@ -281,14 +281,13 @@ function rt_dispatch!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::LavaTLAS,
 end
 
 """
-    rt_dispatch_indirect!(pipeline, tlas, push_bda, indirect_buf; indirect_offset=0)
+    rt_dispatch_indirect!(pipeline, tlas, push_bda, indirect::LavaArray{UInt32,1})
 
 Record an indirect RT trace dispatch. The `indirect_buf` must contain a
 VkTraceRaysIndirectCommandKHR (3×UInt32), written by a previous GPU kernel.
 """
 function rt_dispatch_indirect!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::LavaTLAS,
-                               push_bda::UInt64, indirect_buf;
-                               indirect_offset::Integer=0)
+                               push_bda::UInt64, indirect::LavaArray{UInt32,1})
     LAST_DISPATCH_INFO[] = "rt_indirect"
 
     record_dispatch!(bq;
@@ -307,12 +306,13 @@ function rt_dispatch_indirect!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::L
         pin!(batch, tlas.storage)
         push_constants_bda!(cmd, pipeline.pipeline_layout, pipeline.stage_flags, push_bda)
 
-        indirect_address = indirect_buf isa VkIndirectBuffer ? indirect_buf.address : indirect_buf.address
+        # bda_address(indirect) includes the view's element offset, so the
+        # address we pass to Vulkan points exactly at the 3-UInt32 command.
         Vulkan.cmd_trace_rays_indirect_khr(cmd,
             pipeline.raygen_region, pipeline.miss_region,
             pipeline.hit_region, pipeline.callable_region,
-            UInt64(indirect_address + indirect_offset))
-        pin!(batch, indirect_buf)
+            bda_address(indirect))
+        pin!(batch, indirect)
     end
 end
 
@@ -356,7 +356,7 @@ function build_sbt(ctx::VkContext, pipeline::Vulkan.Pipeline, rt_props::RTPipeli
                      align_up(miss_size, base_align) +
                      align_up(hit_size, base_align)
 
-    sbt_buf = vk_alloc(ctx, total_sbt_size;
+    sbt_buf = vk_alloc(ctx.default_bq, total_sbt_size;
         extra_usage=UInt32(Vulkan.BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR))
 
     # Upload SBT data via staging

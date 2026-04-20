@@ -9,39 +9,12 @@ using KernelAbstractions
 
 @testset "Caching & Allocations" begin
 
-    # ── 1. Kernel cache eviction ──
-    @testset "kernel cache eviction" begin
-        @testset "FIFO eviction at max size" begin
-            # Save original max
-            old_max = Lava.MAX_KERNEL_CACHE_SIZE[]
-            Lava.MAX_KERNEL_CACHE_SIZE[] = 5
-
-            try
-                # Create 7 distinct kernels by varying workgroup size
-                results = Lava.LavaArray{Float32}(undef, 16)
-                for wg in (16, 32, 64, 128, 256, 512, 1024)
-                    @kernel function fill_wg!(a)
-                        i = @index(Global, Linear)
-                        @inbounds a[i] = Float32(i)
-                    end
-                    fill_wg!(Lava.LavaBackend())(results; ndrange=16, workgroupsize=wg)
-                end
-                Lava.vk_flush!(Lava.vk_context())
-
-                # Cache should have at most 5 entries
-                @test length(Lava.LINKED_KERNEL_CACHE) <= 5
-                @test length(Lava.KERNEL_INSERTION_ORDER) <= 5
-
-                # Result should still be correct (latest kernel worked)
-                r = Array(results)
-                @test r[1] ≈ 1.0f0
-                @test r[16] ≈ 16.0f0
-
-                Lava.unsafe_free!(results)
-            finally
-                Lava.MAX_KERNEL_CACHE_SIZE[] = old_max
-            end
-        end
+    # ── 1. Kernel cache ──
+    @testset "kernel cache" begin
+        # FIFO-eviction test removed: the hand-rolled LRU was replaced by
+        # `GPUCompiler.cached_compilation`, which uses its own unbounded
+        # MethodInstance-keyed Dict. If cache growth ever becomes a problem,
+        # wire eviction back into `LINKED_KERNEL_CACHE` directly.
 
         @testset "cache hit produces correct results" begin
             a = Lava.LavaArray{Float32}(undef, 64)
@@ -305,7 +278,8 @@ using KernelAbstractions
     # ── 10. Unified buffer allocation ──
     @testset "unified buffer allocation" begin
         @testset "mapped ptr is non-null" begin
-            buf = Lava.vk_alloc_unified(256)
+            bq = Lava.vk_context().default_bq
+            buf = Lava.vk_alloc(bq, 256; unified=true)
             @test buf.mapped_ptr != Ptr{UInt8}(0)
             @test buf.address != 0
             @test buf.size >= 256

@@ -146,17 +146,16 @@ end
 
 # ── Built-in RT Shaders ──
 
-function hw_raygen(rays::Ptr{RTRay}, results::Ptr{RTHitResult})
+function hw_raygen(rays::LavaDeviceArray{RTRay,1},
+                   results::LavaDeviceArray{RTHitResult,1})
     lid = lava_rt_launch_id_x()
 
-    # Read ray from input buffer
-    ray = unsafe_load(rays, lid + 1)
+    ray = rays[lid + 1]
 
     # Initialize payload to miss
     lava_rt_payload_store_f32_at(0f0, UInt32(0))   # hit=0
-    lava_rt_payload_store_f32_at(-1f0, UInt32(1))   # t=-1
+    lava_rt_payload_store_f32_at(-1f0, UInt32(1))  # t=-1
 
-    # Trace
     lava_rt_trace_ray(
         UInt32(0),    # flags
         UInt32(0xFF), # cull mask
@@ -167,7 +166,6 @@ function hw_raygen(rays::Ptr{RTRay}, results::Ptr{RTHitResult})
         ray.dir_x, ray.dir_y, ray.dir_z, ray.tmax
     )
 
-    # Read payload results
     hit  = lava_rt_payload_load_f32_at(UInt32(0))
     t    = lava_rt_payload_load_f32_at(UInt32(1))
     pid  = lava_rt_payload_load_f32_at(UInt32(2))
@@ -176,17 +174,15 @@ function hw_raygen(rays::Ptr{RTRay}, results::Ptr{RTHitResult})
     bv   = lava_rt_payload_load_f32_at(UInt32(5))
     iid  = lava_rt_payload_load_f32_at(UInt32(6))
 
-    # Write result to output buffer
-    result = RTHitResult(
+    results[lid + 1] = RTHitResult(
         reinterpret(UInt32, hit),
         t,
         reinterpret(UInt32, pid),
         reinterpret(UInt32, ci),
         bu, bv,
-        reinterpret(UInt32, iid),   # instance_id (gl_InstanceID, 0-based)
-        UInt32(0)
+        reinterpret(UInt32, iid),
+        UInt32(0),
     )
-    unsafe_store!(results, result, lid + 1)
     return nothing
 end
 

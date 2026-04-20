@@ -73,19 +73,12 @@ function KA.synchronize(backend::LavaBackend)
 end
 KA.supports_unified(::LavaBackend) = true
 function KA.allocate(backend::LavaBackend, ::Type{T}, dims::Tuple; unified::Bool=false) where T
-    ctx = backend.dispatch_bq.ctx::VkContext
+    bq = backend.dispatch_bq
     nbytes = prod(dims) * sizeof(T)
-    # Use unified (BAR) memory when explicitly requested OR for tiny allocations
-    # (≤ 64 bytes, e.g. WorkQueue.size counters). BAR memory enables direct CPU
-    # readback without staging copy — 2x faster for queue length checks.
-    if unified || nbytes <= 64
-        managed = vk_alloc_unified(ctx, nbytes)
-        ref = GPUArrays.DataRef(managed) do buf
-            vk_free!(buf)
-        end
-        return LavaArray{T,length(dims)}(ref, Int.(dims))
-    end
-    LavaArray{T}(undef, Int.(dims); ctx=ctx)
+    # Auto-unified for tiny allocations (≤ 64 bytes, e.g. WorkQueue.size
+    # counters) — BAR memory enables direct CPU readback without staging.
+    want_unified = unified || nbytes <= 64
+    return LavaArray{T,length(dims)}(undef, Int.(dims); bq, unified=want_unified)
 end
 KA.unsafe_free!(x::LavaArray) = unsafe_free!(x)
 
@@ -168,6 +161,16 @@ end
 #
 # `obj.f` is the kernel closure — it goes through the same adaptor so any
 # LavaArray captured in closure-over fields is pinned too.
+#
+# `KA.argconvert(kernel, arg)` is a pure strip used by callers (Raycore's
+# MultiTypeSet, etc.) to cache a device-side view of a LavaArray into their
+# own CPU-side structs *outside* any kernel dispatch.  No pin here — the
+# caller is responsible for keeping the original LavaArray alive until the
+# cached device form is used, and the subsequent kernel dispatch pins that
+# original LavaArray via `LavaAdaptor`.
+KA.argconvert(::KA.Kernel{LavaBackend}, a::LavaArray{T,N}) where {T,N} =
+    LavaDeviceArray{T,N}(Ptr{T}(bda_address(a)), a.dims)
+KA.argconvert(::KA.Kernel{LavaBackend}, x) = x
 
 # ── Kernel call (main entry point) ──
 
@@ -178,6 +181,8 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     # GPU-resident ndrange → indirect dispatch (no CPU readback)
     if ndrange isa LavaArray
         batch = ensure_active_batch!(bq)
+        pin_leaves!(batch, obj.f)
+        pin_leaves!(batch, args)
         adaptor = LavaAdaptor(batch)
         converted_args = map(a -> Adapt.adapt(adaptor, a), args)
         ka_launch_indirect!(obj, converted_args, ndrange, workgroupsize, args, adaptor)
@@ -196,6 +201,11 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     ws_3d = (nthreads, 1, 1)
 
     batch = ensure_active_batch!(bq)
+    # Side-effect pass: pin every LavaArray leaf in the closure + args into
+    # `batch.pinned`, once, via @generated walker (zero alloc, straight-line
+    # code).  `Adapt.adapt` below is now pure — it only strips.
+    pin_leaves!(batch, obj.f)
+    pin_leaves!(batch, args)
     adaptor = LavaAdaptor(batch)
     converted_f = Adapt.adapt(adaptor, obj.f)
     converted_args = map(a -> Adapt.adapt(adaptor, a), args)
@@ -283,9 +293,9 @@ const DBG_LAUNCH_COUNT = Ref(0)
 function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple, block_dims::NTuple{3,Int}, workgroup_size::NTuple{3,Int})
     DBG_LAUNCH_COUNT[] += 1
     _n = DBG_LAUNCH_COUNT[]
-    # Build type tuple for compilation (excludes f — GPUCompiler prepends typeof(f))
-    # all_args[1] is f itself (included for BDA packing), rest are the actual args
-    tt = Tuple{map(ka_arg_llvm_type, Base.tail(all_args))...}
+    # Build type tuple for compilation (excludes f — GPUCompiler prepends typeof(f)).
+    # all_args are already post-adapt (LavaDeviceArray, not Ptr{T}).
+    tt = Tuple{map(arg_sigtype, Base.tail(all_args))...}
 
     # Compile + pipeline + offsets (cached, single lookup)
     compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(bq.ctx::VkContext, f, tt, workgroup_size)
@@ -314,20 +324,20 @@ function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple, block_dim
     return nothing
 end
 
-# ── Argument type mapping for KA ──
-
-# Map KA arguments to LLVM types for compilation
-# LavaDeviceArray is isbits and passed as a struct (via InlineStructArg)
-ka_arg_llvm_type(x) = typeof(x)  # Everything passes through as-is
-
 # ── Indirect dispatch support ──
+#
+# Internal Lava kernels only ever see `LavaDeviceArray` / `LavaDeviceArray`
+# — never `Ptr{T}` / `unsafe_load`.  Callers wrap raw GPU memory in
+# `LavaArray`/`LavaArray view` before handing it to the kernel.
 
-function prepare_indirect_kernel(indirect::Ptr{UInt32}, ndrange_buf::Ptr{Int32}, ws::UInt32)
-    n = UInt32(unsafe_load(ndrange_buf, 1))
+function prepare_indirect_kernel(indirect::LavaDeviceArray{UInt32,1},
+                                  ndrange_buf::LavaDeviceArray{Int32,1},
+                                  ws::UInt32)
+    n = UInt32(ndrange_buf[1])
     groups = (n + ws - UInt32(1)) ÷ ws
-    unsafe_store!(indirect, groups, 1)    # groupCountX
-    unsafe_store!(indirect, UInt32(1), 2)  # groupCountY
-    unsafe_store!(indirect, UInt32(1), 3)  # groupCountZ
+    indirect[1] = groups         # groupCountX
+    indirect[2] = UInt32(1)      # groupCountY
+    indirect[3] = UInt32(1)      # groupCountZ
     return nothing
 end
 
@@ -352,7 +362,9 @@ end)
 
 function init_prepare_indirect_pipeline!(ctx::VkContext)
     PREPARE_INDIRECT_PIPELINE_REF[] !== nothing && return
-    tt = Tuple{Ptr{UInt32}, Ptr{Int32}, UInt32}
+    # Kernel signature (post-adapt): indirect::LavaDeviceArray{UInt32,1},
+    # ndrange_buf::LavaDeviceArray{Int32,1}, ws::UInt32.
+    tt = Tuple{LavaDeviceArray{UInt32,1}, LavaDeviceArray{Int32,1}, UInt32}
     ws = (1, 1, 1)
     compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(
         ctx, prepare_indirect_kernel, tt, ws)
@@ -363,13 +375,16 @@ function init_prepare_indirect_pipeline!(ctx::VkContext)
 end
 
 """
-    fast_prepare_indirect!(indirect_buf, ndrange_buf, workgroup_size)
+    fast_prepare_indirect!(bq, indirect::LavaArray{UInt32,1}, ndrange_buf::LavaArray{<:Integer}, workgroup_size)
 
-Fast path for prepare-indirect dispatch. Bypasses lava_launch! entirely:
-no validation, no auto-flush check, no logging overhead.
-Records a single-thread direct dispatch to compute ceil(n/ws) group counts.
+Fast path for prepare-indirect dispatch.  Bypasses lava_launch!'s validation/
+logging overhead: manually adapts the two LavaArrays (pin + strip) and
+packs directly.
 """
-function fast_prepare_indirect!(bq::BatchQueue, indirect_buf::VkIndirectBuffer, ndrange_buf::LavaArray{<:Integer}, workgroup_size::Integer)
+function fast_prepare_indirect!(bq::BatchQueue,
+                                indirect::LavaArray{UInt32,1},
+                                ndrange_buf::LavaArray{<:Integer},
+                                workgroup_size::Integer)
     init_prepare_indirect_pipeline!(bq.ctx::VkContext)
 
     pipeline = PREPARE_INDIRECT_PIPELINE_REF[]
@@ -377,21 +392,25 @@ function fast_prepare_indirect!(bq::BatchQueue, indirect_buf::VkIndirectBuffer, 
     byval_sizes = PREPARE_INDIRECT_BYVAL_REF[]
     arg_size = PREPARE_INDIRECT_ARG_BUF_SIZE_REF[]
 
-    # Pack args: f (ghost, skipped), Ptr{UInt32} (BDA), LavaArray (BDA), UInt32 (direct)
-    # pack_args_direct! pins ndrange_buf at the LavaArray leaf; indirect_buf
-    # is explicitly pinned via vk_dispatch_indirect!.
-    all_args = (prepare_indirect_kernel, Ptr{UInt32}(indirect_buf.address), ndrange_buf, UInt32(workgroup_size))
+    batch = ensure_active_batch!(bq)
+    adaptor = LavaAdaptor(batch)
+    dev_indirect = Adapt.adapt(adaptor, indirect)::LavaDeviceArray{UInt32,1}
+    dev_ndrange  = Adapt.adapt(adaptor, ndrange_buf)
+
+    # f is a ghost singleton (prepare_indirect_kernel), pack_args_direct! skips it.
+    all_args = (prepare_indirect_kernel, dev_indirect, dev_ndrange, UInt32(workgroup_size))
     arg_buf = get_arg_buffer(bq, arg_size)
-    ensure_active_batch!(bq)
     pack_args_direct!(bq, arg_buf.mapped_ptr, arg_buf.address, offsets, arg_size, byval_sizes, all_args)
 
-    # Record dispatch directly — single workgroup of 1 thread
     vk_dispatch_base!(bq, pipeline, arg_buf.address, 0, 0, 0, 1, 1, 1)
 end
 
-function prepare_indirect_dispatch!(bq::BatchQueue, indirect_buf::VkIndirectBuffer, ndrange_buf::LavaArray{<:Integer}, workgroup_size::Integer)
+function prepare_indirect_dispatch!(bq::BatchQueue,
+                                    indirect::LavaArray{UInt32,1},
+                                    ndrange_buf::LavaArray{<:Integer},
+                                    workgroup_size::Integer)
     lava_launch!(bq, prepare_indirect_kernel,
-                 Ptr{UInt32}(indirect_buf.address), ndrange_buf, UInt32(workgroup_size);
+                 indirect, ndrange_buf, UInt32(workgroup_size);
                  ndrange=1, workgroup_size=(1, 1, 1))
 end
 
@@ -428,26 +447,22 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
     iterspace, dynamic = KA.partition(obj, ndrange_tuple, ws)
     ctx = KA.mkcontext(obj, ndrange_tuple, iterspace)
 
-    # Reuse the caller's adaptor: the original (pre-adapt) `original_args`
-    # were already pinned by the caller's map(Adapt.adapt, ...).  Adapting
-    # `obj.f` through the same adaptor pins anything it captures.
+    # Caller already pinned the original args via `pin_leaves!`; pin the
+    # closure's captures here. `Adapt.adapt` is pure now (strip only).
     batch = adaptor.batch
+    pin_leaves!(batch, obj.f)
     converted_f = Adapt.adapt(adaptor, obj.f)
     all_args = (converted_f, ctx, args...)
 
-    # Build type tuple for compilation
-    tt = Tuple{map(ka_arg_llvm_type, Base.tail(all_args))...}
+    # Kernel ABI is post-adapt: LavaDeviceArray etc.
+    tt = Tuple{map(arg_sigtype, Base.tail(all_args))...}
     compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(bq.ctx::VkContext, converted_f, tt, ws_3d)
 
-    # Precompute arg buffer size (allocation deferred until after flush)
     inline_extra = compute_inline_extra_from_byval(byval_sizes)
     total_size = compiled.push_info.arg_buffer_size + inline_extra
 
     # GC.@preserve on original_args keeps the pre-strip LavaArrays reachable
-    # through this function.  They were pinned into batch.pinned by the
-    # adaptor, which keeps their backing VkManagedBuffers alive until the
-    # timeline signals — but keeping the LavaArray Julia objects reachable
-    # here too defends against a GC pass between pack and submit.
+    # through this function.
     GC.@preserve original_args begin
 
     arg_buf = get_arg_buffer(bq, total_size)
@@ -455,13 +470,13 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
     pack_args_direct!(bq, arg_buf.mapped_ptr, arg_buf.address, offsets,
                        compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
-    indirect_buf = get_indirect_buffer(bq)
-    fast_prepare_indirect!(bq, indirect_buf, ndrange_buf, ws_prod)
+    indirect_view = get_indirect_buffer(bq)
+    fast_prepare_indirect!(bq, indirect_view, ndrange_buf, ws_prod)
 
     if DISPATCH_LOGGING_ENABLED[]
         LAST_DISPATCH_INFO[] = "indirect f=$(dispatch_name(obj.f, all_args))"
     end
-    vk_dispatch_indirect!(bq, pipeline, arg_buf.address, indirect_buf)
+    vk_dispatch_indirect!(bq, pipeline, arg_buf.address, indirect_view)
 
     end # GC.@preserve
 
@@ -534,15 +549,9 @@ end
     return idx
 end
 
-# Ptr{T} indexing (used by lava_launch! path where arrays become Ptr{T})
-@lava_device_override @inline function Base.getindex(p::Ptr{T}, i::Integer) where T
-    unsafe_load(p, i)
-end
-
-@lava_device_override @inline function Base.setindex!(p::Ptr{T}, v, i::Integer) where T
-    unsafe_store!(p, convert(T, v), i)
-    return v
-end
+# Ptr{T} indexing overrides are intentionally absent — device kernels never
+# receive raw Ptr{T} args any more.  All array-like kernel parameters come
+# through LavaAdaptor as LavaDeviceArray and use the overrides above.
 
 # ── Device-side index functions ──
 # These are overridden via @lava_device_override to use SPIR-V builtins.

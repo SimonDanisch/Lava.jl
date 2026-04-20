@@ -18,12 +18,12 @@ Shaders are compiled lazily on first `trace_rays!` call and cached.
 
 # Example
 ```julia
-function my_raygen(output::Ptr{Float32})
+function my_raygen(output::LavaDeviceArray{Float32,1})
     lid = Lava.lava_rt_launch_id_x()
     Lava.lava_rt_payload_store_f32(-1f0)
     Lava.lava_rt_trace_ray(...)
     t = Lava.lava_rt_payload_load_f32()
-    unsafe_store!(output, t, lid + 1)
+    output[lid + 1] = t
 end
 function my_chit()
     Lava.lava_rt_payload_store_f32(Lava.lava_rt_ray_tmax())
@@ -70,32 +70,44 @@ via the BDA argument buffer (same as compute kernel arguments).
 function trace_rays!(bq::BatchQueue, pipeline::RayTracingPipeline, tlas::LavaTLAS,
                      args...;
                      width::Integer, height::Integer, depth::Integer=1)
-    # Build type tuple from arguments (VkManagedBuffer → Ptr{UInt8})
-    tt = Tuple{map(rt_arg_llvm_type, args)...}
-    cache_key = hash((tt,))
-
+    # Resolve or compile the RT pipeline FIRST.  A cold compile builds the
+    # SBT via `upload_typed!`, which calls `flush!(bq)` and invalidates any
+    # active batch — so we must run it before `ensure_active_batch!` below.
+    # On warm calls this is a Dict lookup and does not flush.
     invalidate_stale_rt_cache!(pipeline)
-
+    tt_key = Tuple{map(arg_sigtype, args)...}   # pre-adapt types (same as post-adapt for non-LavaArray)
+    cache_key = hash((tt_key,))
     cached = get(pipeline.PIPELINE_CACHE, cache_key, nothing)
     if cached === nothing
+        # Compile with post-adapt signature: LavaArray args are seen as
+        # LavaDeviceArray in the kernel, matching what pack_args_direct!
+        # writes.  We drive the adapt through a throwaway batch since the
+        # real batch isn't opened yet; adaptor-side pinning on the throwaway
+        # is irrelevant (we re-adapt against the real batch below).
+        dummy_batch = ensure_active_batch!(bq)
+        tt = Tuple{map(a -> arg_sigtype(Adapt.adapt(LavaAdaptor(dummy_batch), a)), args)...}
         cached = compile_rt_pipeline(bq.ctx::VkContext, pipeline, tt)
         pipeline.PIPELINE_CACHE[cache_key] = cached
     end
     vk_pipeline, raygen_compiled, offsets, byval_sizes = cached
 
-    all_args = (pipeline.raygen_func, args...)
+    # Now open (or re-open) the real active batch and adapt args into it.
+    batch = ensure_active_batch!(bq)
+    pin_leaves!(batch, pipeline.raygen_func)
+    pin_leaves!(batch, args)
+    adaptor = LavaAdaptor(batch)
+    converted_raygen = Adapt.adapt(adaptor, pipeline.raygen_func)
+    converted_args = map(a -> Adapt.adapt(adaptor, a), args)
+
+    all_args = (converted_raygen, converted_args...)
     inline_extra = compute_inline_extra_from_byval(byval_sizes)
     total_size = raygen_compiled.push_info.arg_buffer_size + inline_extra
 
     arg_buf = get_arg_buffer(bq, total_size)
 
-    batch = ensure_active_batch!(bq)
-
-    # pack_args_direct! inlines pin! calls at every buffer leaf.  TLAS/BLAS
-    # storage and AS handles aren't in the arg tuple (bound via descriptor
-    # set), so they need explicit pin! calls at the dispatch site.
     pack_args_direct!(bq, arg_buf.mapped_ptr, arg_buf.address, offsets,
                        raygen_compiled.push_info.arg_buffer_size, byval_sizes, all_args)
+    # TLAS/BLAS handles are bound via descriptor set, not the arg tuple — pin explicitly.
     pin!(batch, tlas.accel)
     pin!(batch, tlas.storage)
     for blas in tlas.blases
@@ -116,34 +128,39 @@ No CPU readback — a prepare kernel writes the indirect command, then
 function trace_rays_indirect!(bq::BatchQueue, pipeline::RayTracingPipeline,
                               tlas::LavaTLAS, args...;
                               n_rays::LavaArray{Int32})
-    # Build type tuple from arguments
-    tt = Tuple{map(rt_arg_llvm_type, args)...}
-    cache_key = hash((tt,))
-
+    # See comment in trace_rays!: a cold compile's SBT upload flushes the
+    # active batch, so compile FIRST, then open the real batch below.
     invalidate_stale_rt_cache!(pipeline)
-
+    tt_key = Tuple{map(arg_sigtype, args)...}
+    cache_key = hash((tt_key,))
     cached = get(pipeline.PIPELINE_CACHE, cache_key, nothing)
     if cached === nothing
+        dummy_batch = ensure_active_batch!(bq)
+        tt = Tuple{map(a -> arg_sigtype(Adapt.adapt(LavaAdaptor(dummy_batch), a)), args)...}
         cached = compile_rt_pipeline(bq.ctx::VkContext, pipeline, tt)
         pipeline.PIPELINE_CACHE[cache_key] = cached
     end
     vk_pipeline, raygen_compiled, offsets, byval_sizes = cached
 
-    # Prepare the indirect buffer FIRST, before allocating the RT arg buffer.
-    # prepare_indirect_rt_dispatch! → lava_launch! may trigger auto-flush which
-    # resets slab pools. If we allocated the RT arg buffer first, the flush would
-    # invalidate it (DEVICE_LOST from stale BDA).
-    indirect_buf = get_indirect_buffer(bq)
-    prepare_indirect_rt_dispatch!(bq, indirect_buf, n_rays)
+    # Prepare the indirect buffer before the RT arg buffer: prepare_indirect
+    # dispatches its own kernel which may flush-and-reset slab pools, so if
+    # we allocated the RT arg buffer first it could be invalidated.
+    indirect_view = get_indirect_buffer(bq)
+    prepare_indirect_rt_dispatch!(bq, indirect_view, n_rays)
 
-    # Now allocate and pack RT args (safe — any auto-flush already happened)
-    all_args = (pipeline.raygen_func, args...)
+    batch = ensure_active_batch!(bq)
+    pin_leaves!(batch, pipeline.raygen_func)
+    pin_leaves!(batch, args)
+    adaptor = LavaAdaptor(batch)
+    converted_raygen = Adapt.adapt(adaptor, pipeline.raygen_func)
+    converted_args = map(a -> Adapt.adapt(adaptor, a), args)
+
+    all_args = (converted_raygen, converted_args...)
     inline_extra = compute_inline_extra_from_byval(byval_sizes)
     total_size = raygen_compiled.push_info.arg_buffer_size + inline_extra
 
     arg_buf = get_arg_buffer(bq, total_size)
 
-    batch = ensure_active_batch!(bq)
     pack_args_direct!(bq, arg_buf.mapped_ptr, arg_buf.address, offsets,
                        raygen_compiled.push_info.arg_buffer_size, byval_sizes, all_args)
     pin!(batch, tlas.accel)
@@ -152,24 +169,25 @@ function trace_rays_indirect!(bq::BatchQueue, pipeline::RayTracingPipeline,
         pin!(batch, blas.accel)
         pin!(batch, blas.storage)
     end
-    push_bda = arg_buf.address
 
-    rt_dispatch_indirect!(bq, vk_pipeline, tlas, push_bda, indirect_buf)
+    rt_dispatch_indirect!(bq, vk_pipeline, tlas, arg_buf.address, indirect_view)
 end
 
 
 """Prepare indirect RT dispatch buffer: writes (n_rays, 1, 1) from a GPU-resident count."""
-function prepare_indirect_rt_dispatch!(bq::BatchQueue, indirect_buf::VkIndirectBuffer, n_rays_buf::LavaArray{Int32})
-    lava_launch!(bq, prepare_indirect_rt_kernel,
-                 Ptr{UInt32}(indirect_buf.address), n_rays_buf;
+function prepare_indirect_rt_dispatch!(bq::BatchQueue,
+                                       indirect::LavaArray{UInt32,1},
+                                       n_rays::LavaArray{Int32})
+    lava_launch!(bq, prepare_indirect_rt_kernel, indirect, n_rays;
                  ndrange=1, workgroup_size=(1, 1, 1))
 end
 
-function prepare_indirect_rt_kernel(indirect::Ptr{UInt32}, n_rays_buf::Ptr{Int32})
-    n = UInt32(unsafe_load(n_rays_buf, 1))
-    unsafe_store!(indirect, n, 1)          # width = n_rays
-    unsafe_store!(indirect, UInt32(1), 2)  # height = 1
-    unsafe_store!(indirect, UInt32(1), 3)  # depth = 1
+function prepare_indirect_rt_kernel(indirect::LavaDeviceArray{UInt32,1},
+                                     n_rays_buf::LavaDeviceArray{Int32,1})
+    n = UInt32(n_rays_buf[1])
+    indirect[1] = n            # width = n_rays
+    indirect[2] = UInt32(1)    # height = 1
+    indirect[3] = UInt32(1)    # depth = 1
     return nothing
 end
 
@@ -217,9 +235,5 @@ function compile_rt_pipeline(ctx::VkContext, pipeline::RayTracingPipeline, rayge
     return (vk_pipeline, raygen_compiled, offsets, byval_sizes)
 end
 
-# ── RT Argument Type Mapping ──
-
-# VkManagedBuffer passes its BDA as a Ptr
-rt_arg_llvm_type(::VkManagedBuffer) = Ptr{UInt8}
-rt_arg_llvm_type(a::LavaArray{T}) where T = Ptr{T}
-rt_arg_llvm_type(x) = typeof(x)
+# RT args go through the same LavaAdaptor contract as lava_launch! / KA —
+# no parallel type mapping here.  See `trace_rays!` / `trace_rays_indirect!`.
