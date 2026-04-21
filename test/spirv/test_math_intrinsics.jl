@@ -217,6 +217,103 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         @test Array(fout)[1] == 1f0  # compiles without emitter error
     end
 
+    @testset "saturating integer arith" begin
+        # LLVM's InstCombine synthesizes llvm.usub.sat from patterns like
+        # `a - min(a, b)` — Julia's `Base.rem_internal` produces it during
+        # float exponent arithmetic. AMDGPU/CUDA rely on native LLVM backend
+        # support; for SPIR-V we emulate in the emitter.
+
+        # Unsigned saturating subtract / add via a kernel that receives
+        # inputs from device arrays (so LLVM can't constant-fold).
+        @kernel function usub_sat_kernel!(out, a, b)
+            i = @index(Global, Linear)
+            @inbounds out[i] = Base.llvmcall(("""
+                declare i32 @llvm.usub.sat.i32(i32, i32)
+                define i32 @entry(i32 %a, i32 %b) #0 {
+                    %r = call i32 @llvm.usub.sat.i32(i32 %a, i32 %b)
+                    ret i32 %r
+                }
+                attributes #0 = { alwaysinline }
+            """, "entry"), UInt32, Tuple{UInt32, UInt32}, a[i], b[i])
+        end
+        a = Lava.LavaArray(UInt32[10, 5, 0, typemax(UInt32), 3])
+        b = Lava.LavaArray(UInt32[3, 7, 1, 1, typemax(UInt32)])
+        out = Lava.LavaArray(zeros(UInt32, 5))
+        usub_sat_kernel!(Lava.LavaBackend())(out, a, b; ndrange=5)
+        Lava.vk_flush!(Lava.vk_context())
+        @test Array(out) == UInt32[7, 0, 0, typemax(UInt32) - 1, 0]
+
+        @kernel function uadd_sat_kernel!(out, a, b)
+            i = @index(Global, Linear)
+            @inbounds out[i] = Base.llvmcall(("""
+                declare i32 @llvm.uadd.sat.i32(i32, i32)
+                define i32 @entry(i32 %a, i32 %b) #0 {
+                    %r = call i32 @llvm.uadd.sat.i32(i32 %a, i32 %b)
+                    ret i32 %r
+                }
+                attributes #0 = { alwaysinline }
+            """, "entry"), UInt32, Tuple{UInt32, UInt32}, a[i], b[i])
+        end
+        a = Lava.LavaArray(UInt32[10, typemax(UInt32), typemax(UInt32) - 5, 0, 1])
+        b = Lava.LavaArray(UInt32[3, 1, 10, 0, typemax(UInt32)])
+        out = Lava.LavaArray(zeros(UInt32, 5))
+        uadd_sat_kernel!(Lava.LavaBackend())(out, a, b; ndrange=5)
+        Lava.vk_flush!(Lava.vk_context())
+        @test Array(out) == UInt32[13, typemax(UInt32), typemax(UInt32), 0, typemax(UInt32)]
+
+        # Signed saturating add/sub
+        @kernel function sadd_sat_kernel!(out, a, b)
+            i = @index(Global, Linear)
+            @inbounds out[i] = Base.llvmcall(("""
+                declare i32 @llvm.sadd.sat.i32(i32, i32)
+                define i32 @entry(i32 %a, i32 %b) #0 {
+                    %r = call i32 @llvm.sadd.sat.i32(i32 %a, i32 %b)
+                    ret i32 %r
+                }
+                attributes #0 = { alwaysinline }
+            """, "entry"), Int32, Tuple{Int32, Int32}, a[i], b[i])
+        end
+        a = Lava.LavaArray(Int32[10, typemax(Int32), typemin(Int32), -5, 100])
+        b = Lava.LavaArray(Int32[3, 1, -1, -typemax(Int32), -50])
+        out = Lava.LavaArray(zeros(Int32, 5))
+        sadd_sat_kernel!(Lava.LavaBackend())(out, a, b; ndrange=5)
+        Lava.vk_flush!(Lava.vk_context())
+        @test Array(out) == Int32[13, typemax(Int32), typemin(Int32), typemin(Int32), 50]
+
+        @kernel function ssub_sat_kernel!(out, a, b)
+            i = @index(Global, Linear)
+            @inbounds out[i] = Base.llvmcall(("""
+                declare i32 @llvm.ssub.sat.i32(i32, i32)
+                define i32 @entry(i32 %a, i32 %b) #0 {
+                    %r = call i32 @llvm.ssub.sat.i32(i32 %a, i32 %b)
+                    ret i32 %r
+                }
+                attributes #0 = { alwaysinline }
+            """, "entry"), Int32, Tuple{Int32, Int32}, a[i], b[i])
+        end
+        a = Lava.LavaArray(Int32[10, typemax(Int32), typemin(Int32), 5, -100])
+        b = Lava.LavaArray(Int32[3, -1, 1, -5, 50])
+        out = Lava.LavaArray(zeros(Int32, 5))
+        ssub_sat_kernel!(Lava.LavaBackend())(out, a, b; ndrange=5)
+        Lava.vk_flush!(Lava.vk_context())
+        @test Array(out) == Int32[7, typemax(Int32), typemin(Int32), 10, -150]
+
+        # End-to-end: Base.rem on Float32 (the use case that triggered this).
+        @kernel function rem_kernel!(out, x, y)
+            i = @index(Global, Linear)
+            @inbounds out[i] = rem(x[i], y[i])
+        end
+        rx = Lava.LavaArray(Float32[7f0, -7f0, 5.5f0, 100f0])
+        ry = Lava.LavaArray(Float32[3f0, 3f0, 2.0f0, 0.3f0])
+        rout = Lava.LavaArray(zeros(Float32, 4))
+        rem_kernel!(Lava.LavaBackend())(rout, rx, ry; ndrange=4)
+        Lava.vk_flush!(Lava.vk_context())
+        gpu = Array(rout)
+        cpu = Float32[rem(x, y) for (x, y) in zip(
+            Float32[7, -7, 5.5, 100], Float32[3, 3, 2.0, 0.3])]
+        @test gpu ≈ cpu
+    end
+
     @testset "round halfway (round-to-nearest-even)" begin
         # Julia's `round(::Float32)` lowers to `llvm.rint` (round-half-to-even).
         # GLSL.std.450 opcode 1 (`Round`) has implementation-defined halfway
