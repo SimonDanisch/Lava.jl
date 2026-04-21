@@ -398,7 +398,7 @@ and populated by a prepare-indirect kernel.
         push_constants_bda!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_bda)
 
         mb = indirect.buf[]::VkManagedBuffer
-        byte_offset = UInt64(indirect.offset * sizeof(UInt32))
+        byte_offset = UInt64(indirect.offset)
         Vulkan.cmd_dispatch_indirect(cmd, mb.buffer, byte_offset)
         pin!(batch, indirect)
     end

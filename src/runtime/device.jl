@@ -860,18 +860,40 @@ function debug_callback(
     msg_ptr = data.pMessage
     message = msg_ptr == C_NULL ? "(no message)" : unsafe_string(msg_ptr)
 
-    # Only store ERROR-severity messages that indicate real shader/runtime errors.
-    # GPU-AV setup messages ("Warning that validation is adjusting settings") are
-    # delivered at ERROR severity but are benign -- filter them out.
-    is_error = (severity & Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0
-    is_warning = (severity & Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0
+    # Distinguish *validation layer* output (opt-in via LAVA_VALIDATION=1) from
+    # *driver-general* output (always on with debug_utils). Per the Vulkan spec,
+    # the message-type bits classify the source:
+    #
+    #   VALIDATION (0x2) — VK_LAYER_KHRONOS_validation + driver spec checks
+    #   GENERAL    (0x1) — driver runtime notes (not spec checks)
+    #   PERFORMANCE (0x4), DEVICE_ADDRESS_BINDING (0x8) — self-explanatory
+    #
+    # Only VALIDATION-typed errors are captured as hard failures — that's the
+    # "validation is the knob" contract: when you don't opt into validation,
+    # nothing is a hard failure outside of what VkResult itself reports.
+    # Driver GENERAL chatter (e.g. lavapipe's SPIR-V linter running inside
+    # vkCreateRayTracingPipelinesKHR) is informational: the API call itself
+    # returns SUCCESS, and the driver is just being loud.
+    # NOTE: Vulkan.jl's flag-set types define `&` to return another flag-set,
+    # which compares `!= 0` *as always true* (a struct is never == an Int).
+    # Coerce to UInt32 first so the bitmask check is actually a bitmask check.
+    sev_u = UInt32(severity)
+    type_u = UInt32(type)
+    is_error = (sev_u & UInt32(Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)) != 0
+    is_warning = (sev_u & UInt32(Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)) != 0
+    is_validation = (type_u & UInt32(Vulkan.DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT)) != 0
     is_setup_noise = contains(message, "adjusting settings") || contains(message, "VALIDATION-SETTINGS")
-    if is_error && !is_setup_noise
+    if is_error && is_validation && !is_setup_noise
         if length(VALIDATION_MESSAGES) >= MAX_VALIDATION_MESSAGES
             popfirst!(VALIDATION_MESSAGES)
         end
         push!(VALIDATION_MESSAGES, message)
         @error "Vulkan validation error" message
+    elseif is_error && !is_validation
+        # Driver-general error (e.g. chatty lavapipe SPIR-V notes). Log but
+        # don't capture — the authoritative signal is the VkResult of the
+        # surrounding API call, which @vk_checked already unwraps.
+        @warn "Vulkan driver note (type=$(type), not a validation error)" message
     elseif is_warning || is_setup_noise
         @warn "Vulkan validation warning" message
     end

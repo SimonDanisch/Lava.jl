@@ -7,21 +7,22 @@
 
 using Test
 
-# Guard: skip entire file if Hikari/Raycore aren't loadable
-let can_load = try
-        Base.require(Main, :Hikari)
-        Base.require(Main, :Raycore)
-        true
-    catch
-        false
-    end
-    if !can_load
-        @testset "Real Kernel Compilation" begin
-            @test_broken false  # mark as known-skipped
-        end
-        return  # exit file
-    end
+# Guard: skip entire file if Hikari/Raycore aren't loadable. `return` at
+# toplevel of an `include`d file is NOT an early exit in Julia, so wrap the
+# rest of the file in an `if` instead.
+const _can_load_hikari_raycore = try
+    Base.require(Main, :Hikari)
+    Base.require(Main, :Raycore)
+    true
+catch
+    false
 end
+
+if !_can_load_hikari_raycore
+    @testset "Real Kernel Compilation" begin
+        @test_broken false  # mark as known-skipped
+    end
+else
 
 if !@isdefined(SPIRVTestUtils)
     include(joinpath(@__DIR__, "..", "spirv_test_utils.jl"))
@@ -249,4 +250,4 @@ using StaticArrays
 
 end
 
-
+end  # if _can_load_hikari_raycore

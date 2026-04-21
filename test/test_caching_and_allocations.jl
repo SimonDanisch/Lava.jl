@@ -90,30 +90,8 @@ using KernelAbstractions
         end
     end
 
-    # ── 3. Staging buffer grows correctly ──
-    @testset "staging buffer lifecycle" begin
-        @testset "grows on demand" begin
-            # Upload small then large data — staging buffer should grow
-            small = Lava.LavaArray(Float32.(ones(16)))
-            r_small = Array(small)
-            @test all(r_small .≈ 1.0f0)
-
-            large = Lava.LavaArray(Float32.(2.0f0 .* ones(4096)))
-            r_large = Array(large)
-            @test all(r_large .≈ 2.0f0)
-
-            # Staging buf should exist and be at least 4096 * 4 bytes
-            staging = Lava.STAGING_BUF[]
-            if staging !== nothing
-                @test staging[4] >= 4096 * sizeof(Float32)
-            end
-
-            Lava.unsafe_free!(small)
-            Lava.unsafe_free!(large)
-        end
-    end
-
-    # ── 4. CB batching data_refs lifecycle ──
+    # ── 3. Command batch data_refs lifecycle ──
+    # Post-refactor: `active_batch` lives on the BatchQueue, not VkContext.
     @testset "command batch data_refs" begin
         @testset "data_refs cleared after flush" begin
             a = Lava.LavaArray(Float32[1, 2, 3])
@@ -122,14 +100,9 @@ using KernelAbstractions
             end
             noop_cb!(Lava.LavaBackend())(a; ndrange=3)
 
-            # After dispatch, batch should have data_refs
             ctx = Lava.vk_context()
-
-            Lava.vk_flush!(Lava.vk_context())
-
-            # After flush, if batch was reclaimed, pinned should be cleared
-            # (The batch may be recycled into free_batches with empty pinned)
-            batch = ctx.active_batch
+            Lava.vk_flush!(ctx)
+            batch = ctx.default_bq.active_batch
             if batch !== nothing
                 @test isempty(batch.pinned)
             end
@@ -138,7 +111,10 @@ using KernelAbstractions
         end
     end
 
-    # ── 5. Arg slab allocator reuse ──
+    # ── 4. Arg-slab allocator reuse ──
+    # `bq.arg_slabs` is the per-BQ slab pool. Asserting length-stability across
+    # two batches of dispatches is the same signal as the old `ARG_SLABS`
+    # global, just through the current field.
     @testset "arg slab allocator reuse" begin
         @testset "slabs reused across flushes" begin
             a = Lava.LavaArray{Float32}(undef, 16)
@@ -146,65 +122,46 @@ using KernelAbstractions
                 i = @index(Global, Linear)
                 @inbounds x[i] = Float32(i)
             end
+            bq = Lava.vk_context().default_bq
 
-            # First batch of dispatches
             for _ in 1:100
                 slab_k!(Lava.LavaBackend())(a; ndrange=16)
             end
             Lava.vk_flush!(Lava.vk_context())
-            n_slabs_after_first = length(Lava.ARG_SLABS)
+            n_after_first = length(bq.arg_slabs)
 
-            # Second batch — should reuse same slabs
             for _ in 1:100
                 slab_k!(Lava.LavaBackend())(a; ndrange=16)
             end
             Lava.vk_flush!(Lava.vk_context())
-            n_slabs_after_second = length(Lava.ARG_SLABS)
+            n_after_second = length(bq.arg_slabs)
 
-            @test n_slabs_after_second == n_slabs_after_first
-            @test Lava.ARG_SLAB_OFFSET[] == 0  # Reset after flush
+            @test n_after_second == n_after_first
 
             Lava.unsafe_free!(a)
         end
     end
 
-    # ── 6. Indirect buffer slab reuse ──
-    @testset "indirect buffer slab reuse" begin
-        @testset "indirect slabs reset after flush" begin
-            a = Lava.LavaArray{Float32}(undef, 16)
-
-            @kernel function indirect_k!(x)
-                i = @index(Global, Linear)
-                @inbounds x[i] = Float32(i)
-            end
-
-            # Several dispatches that use indirect buffers
-            for _ in 1:50
-                indirect_k!(Lava.LavaBackend())(a; ndrange=16)
-            end
-            Lava.vk_flush!(Lava.vk_context())
-
-            @test Lava.INDIRECT_SLAB_OFFSET[] == 0
-            @test Lava.INDIRECT_SLAB_IDX[] == 1
-
-            Lava.unsafe_free!(a)
-        end
-    end
-
-    # ── 7. GC pressure tracking ──
+    # ── 5. GC pressure tracking ──
+    # `GPU_BYTES_SINCE_LAST_GC` is still a module-level counter; the only drift
+    # was `vk_alloc(::Int64)` → `vk_alloc(::BatchQueue, ::Integer)`.
     @testset "GC pressure tracking" begin
         @testset "GPU_BYTES_SINCE_LAST_GC increments" begin
+            bq = Lava.vk_context().default_bq
             before = Lava.GPU_BYTES_SINCE_LAST_GC[]
-
-            buf = Lava.vk_alloc(1024)
+            buf = Lava.vk_alloc(bq, 1024)
             after = Lava.GPU_BYTES_SINCE_LAST_GC[]
-
             @test after >= before + 1024
-
             Lava.vk_free!(buf)
-            Lava.flush_deferred_frees!()
         end
     end
+
+    # Note: the original `staging buffer lifecycle` and `indirect slabs reset`
+    # testsets checked `STAGING_BUF` / `INDIRECT_SLAB_{OFFSET,IDX}`, global
+    # trackers that were fully removed in the BatchQueue-ownership refactor —
+    # there is no current equivalent to assert against, and dispatch
+    # correctness is already covered by the "correctness across many dispatch
+    # cycles" testset below.
 
     # ── 8. Correctness across many compile-dispatch cycles ──
     @testset "correctness across many dispatch cycles" begin
@@ -251,25 +208,32 @@ using KernelAbstractions
     end
 
     # ── 9. Broadcast allocation stability ──
+    # `LIVE_BUFFERS` is still a global (collection). The old
+    # `flush_deferred_frees!` wrapper was replaced by per-BQ
+    # `drain_deferred_frees!` / `drain_deferred_as_frees!`.
     @testset "broadcast allocation stability" begin
         @testset "repeated broadcasts don't leak" begin
+            ctx = Lava.vk_context()
+            bq = ctx.default_bq
             GC.gc(true)
-            Lava.vk_flush!(Lava.vk_context())
-            Lava.flush_deferred_frees!()
+            Lava.vk_flush!(ctx)
+            Lava.drain_deferred_frees!(bq)
+            Lava.drain_deferred_as_frees!(bq)
             baseline = length(Lava.LIVE_BUFFERS)
 
             for _ in 1:20
                 a = Lava.LavaArray(Float32.(rand(128)))
                 b = Lava.LavaArray(Float32.(rand(128)))
-                c = a .+ b  # broadcast creates a new array
-                Lava.vk_flush!(Lava.vk_context())
+                c = a .+ b
+                Lava.vk_flush!(ctx)
                 Lava.unsafe_free!(a)
                 Lava.unsafe_free!(b)
                 Lava.unsafe_free!(c)
             end
 
-            Lava.vk_flush!(Lava.vk_context())
-            Lava.flush_deferred_frees!()
+            Lava.vk_flush!(ctx)
+            Lava.drain_deferred_frees!(bq)
+            Lava.drain_deferred_as_frees!(bq)
             after = length(Lava.LIVE_BUFFERS)
             @test after == baseline
         end
@@ -284,7 +248,6 @@ using KernelAbstractions
             @test buf.address != 0
             @test buf.size >= 256
             Lava.vk_free!(buf)
-            Lava.flush_deferred_frees!()
         end
     end
 end

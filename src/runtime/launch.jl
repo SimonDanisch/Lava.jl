@@ -554,7 +554,7 @@ function get_indirect_buffer(bq::BatchQueue)
     byte_offset = bq.indirect_slab_offset
     bq.indirect_slab_offset = byte_offset + alloc_bytes
     ref = copy(slab.buf)
-    return LavaArray{UInt32,1}(ref, (3,); offset=byte_offset ÷ sizeof(UInt32))
+    return LavaArray{UInt32,1}(ref, (3,); offset=byte_offset)
 end
 
 function reset_indirect_buffer_pool!(bq::BatchQueue)

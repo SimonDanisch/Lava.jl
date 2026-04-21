@@ -104,7 +104,7 @@ function Base.copyto!(dest::LavaArray{T}, doffs::Integer,
     unsafe_copyto!(Ptr{UInt8}(pointer(bytes)), Ptr{UInt8}(pointer(src, soffs)), n * sizeof(T))
     # upload! records into the active batch and flushes; sync_access! takes care
     # of any prior cross-queue writer to `dest.buf[]` via timeline semaphore.
-    upload!(dest.buf[], bytes; offset=(dest.offset + Int(doffs) - 1) * sizeof(T))
+    upload!(dest.buf[], bytes; offset=dest.offset + (Int(doffs) - 1) * sizeof(T))
     return dest
 end
 
@@ -114,7 +114,7 @@ function Base.copyto!(dest::Array{T}, doffs::Integer,
     # download! records a copy into the active batch of whichever queue last
     # wrote `src.buf[]` and flushes — sync_access! inserts any cross-queue wait.
     bytes = Vector{UInt8}(undef, n * sizeof(T))
-    download!(bytes, src.buf[]; offset=(src.offset + Int(soffs) - 1) * sizeof(T))
+    download!(bytes, src.buf[]; offset=src.offset + (Int(soffs) - 1) * sizeof(T))
     unsafe_copyto!(Ptr{UInt8}(pointer(dest, doffs)), Ptr{UInt8}(pointer(bytes)), n * sizeof(T))
     return dest
 end
@@ -123,8 +123,8 @@ function Base.copyto!(dest::LavaArray{T}, doffs::Integer,
                       src::LavaArray{T}, soffs::Integer, n::Integer) where T
     n == 0 && return dest
     # Direct GPU→GPU copy via vkCmdCopyBuffer (no CPU staging roundtrip).
-    src_offset = src.buf[].pool_offset + (src.offset + Int(soffs) - 1) * sizeof(T)
-    dst_offset = dest.buf[].pool_offset + (dest.offset + Int(doffs) - 1) * sizeof(T)
+    src_offset = src.buf[].pool_offset + src.offset + (Int(soffs) - 1) * sizeof(T)
+    dst_offset = dest.buf[].pool_offset + dest.offset + (Int(doffs) - 1) * sizeof(T)
     nbytes = n * sizeof(T)
     bq = (dest.buf[].ctx::VkContext).default_bq
     cmd_copy_buffer!(bq, src.buf[], dest.buf[], nbytes;
@@ -174,7 +174,7 @@ function Base.resize!(a::LavaArray{T,N}, new_dims::Dims{N}) where {T,N}
     new_len = prod(new_dims)
 
     buf = a.buf[]
-    capacity_bytes = buf.size - a.offset * sizeof(T)
+    capacity_bytes = buf.size - a.offset
     if new_len * sizeof(T) <= capacity_bytes
         a.dims = new_dims
         return a
@@ -185,7 +185,7 @@ function Base.resize!(a::LavaArray{T,N}, new_dims::Dims{N}) where {T,N}
     new_buf = pool_alloc(bq, max(new_len * sizeof(T), 16))
     if old_len > 0 && new_len > 0
         copy_len = min(old_len, new_len) * sizeof(T)
-        src_off = buf.pool_offset + a.offset * sizeof(T)
+        src_off = buf.pool_offset + a.offset
         cmd_copy_buffer!(bq, buf, new_buf, copy_len;
                          src_off=src_off, dst_off=new_buf.pool_offset)
         # The copy pinned `buf` into the currently-recording batch. `vk_free!`

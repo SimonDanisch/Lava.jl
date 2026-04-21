@@ -72,13 +72,16 @@ using GPUCompiler
         backend = Lava.LavaBackend()
         c = Lava.LavaArray(zeros(Float32, 4))
 
-        # Compile
+        # Compile once
         repop_test_kernel(backend)(c, 42f0; ndrange=4)
         KernelAbstractions.synchronize(backend)
 
-        # Clear Tier 1 only (simulating session restart without disk)
+        # Simulate session-restart without disk: drop Tier 1 (the linked
+        # kernel table). Tier 2 (on-disk or serialized) must repopulate it.
+        # `KERNEL_INSERTION_ORDER` was removed when the insertion-order
+        # tracking was folded into LINKED_KERNEL_CACHE itself; clearing the
+        # cache is the only access we need.
         empty!(Lava.LINKED_KERNEL_CACHE)
-        empty!(Lava.KERNEL_INSERTION_ORDER)
 
         # Next dispatch should hit Tier 2 and repopulate Tier 1
         repop_test_kernel(backend)(c, 99f0; ndrange=4)

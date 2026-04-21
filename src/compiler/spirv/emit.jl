@@ -5757,17 +5757,27 @@ const GLSL_STD_450_MAP = Dict{String, UInt32}(
     "llvm.log2"     => UInt32(30),  # Log2
     "llvm.pow"      => UInt32(26),  # Pow
     "llvm.fma"      => UInt32(50),  # Fma
-    "llvm.minnum"   => UInt32(37),  # FMin
-    "llvm.maxnum"   => UInt32(40),  # FMax
-    "llvm.minimum"  => UInt32(79),  # NMin (propagates NaN)
-    "llvm.maximum"  => UInt32(80),  # NMax (propagates NaN)
+    # llvm.minnum/maxnum are IEEE 754-2008 minNum/maxNum (non-NaN wins when
+    # exactly one operand is NaN). That matches SPIR-V GLSL.std.450 NMin/NMax
+    # exactly. FMin/FMax (opcodes 37/40) have undefined NaN behavior per
+    # SPIR-V spec — do not use them. `llvm.minimum`/`llvm.maximum` (IEEE
+    # 754-2019 propagating) are NOT in this map: Base.min/max overlay in
+    # device/math.jl routes callers through llvm.minnum, and the emitter
+    # errors on any `llvm.minimum`/`maximum` that slips through.
+    "llvm.minnum"   => UInt32(79),  # NMin
+    "llvm.maxnum"   => UInt32(80),  # NMax
     "llvm.smin"     => UInt32(39),  # SMin (signed integer min)
     "llvm.smax"     => UInt32(42),  # SMax (signed integer max)
     "llvm.umin"     => UInt32(38),  # UMin (unsigned integer min)
     "llvm.umax"     => UInt32(41),  # UMax (unsigned integer max)
     "llvm.fmuladd"  => UInt32(50),  # Fma (fmuladd ≈ fma for GPU)
-    "llvm.rint"     => UInt32(1),   # RoundEven (rint = round to nearest even)
-    "llvm.nearbyint"=> UInt32(1),   # RoundEven
+    # llvm.rint / llvm.nearbyint are round-to-nearest-even. GLSL.std.450
+    # opcode 2 is `RoundEven`; opcode 1 (`Round`) has implementation-defined
+    # halfway behavior per SPIR-V spec and does not match the LLVM semantics.
+    # Julia's `round(Float32)` lowers to `llvm.rint`, so the previous mapping
+    # to opcode 1 silently diverged from CPU at halfway values on strict drivers.
+    "llvm.rint"     => UInt32(2),   # RoundEven
+    "llvm.nearbyint"=> UInt32(2),   # RoundEven
     # Additional trig/hyperbolic (for future use via LLVM intrinsics)
     "llvm.asin"     => UInt32(16),  # Asin
     "llvm.acos"     => UInt32(17),  # Acos
@@ -6050,20 +6060,33 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
         return emit_glsl_ext_inst!(state, inst, glsl_num)
     end
 
-    # copysign(x, y) = FAbs(x) * FSign(y) — not directly in GLSL.std.450
+    # `llvm.copysign` should never reach the emitter: `Base.copysign` is
+    # overlay-overridden in `device/math.jl` with a bitwise sign-copy, and
+    # Base's only caller of `copysign_float` is that method. GLSL.std.450
+    # has no IEEE-correct copysign (FSign(0) == 0 breaks `FAbs·FSign`), so if
+    # something does slip through (new Base caller, LLVM canonicalization,
+    # direct `Core.Intrinsics.copysign_float`), fail loudly instead of
+    # emitting a silently-wrong result.
     if base_name == "llvm.copysign"
-        glsl_id = setup_glsl_std_450!(state.mod)
-        x_id = get_value_id!(state, LLVM.operands(inst)[1])
-        y_id = get_value_id!(state, LLVM.operands(inst)[2])
-        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
-        abs_id = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpExtInst, result_ty, abs_id, glsl_id, UInt32(4), x_id)  # FAbs=4
-        sign_id = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpExtInst, result_ty, sign_id, glsl_id, UInt32(6), y_id)  # FSign=6
-        result_id = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpFMul, result_ty, result_id, abs_id, sign_id)
-        state.value_map[inst] = result_id
-        return
+        error("llvm.copysign reached SPIR-V emitter — this means some code " *
+              "path is bypassing the `Base.copysign` overlay in " *
+              "Lava/src/device/math.jl. GLSL.std.450 has no zero-preserving " *
+              "copysign. Add a Julia-level override for the caller, or " *
+              "implement copysign in the emitter via bitwise sign-copy.")
+    end
+
+    # `llvm.minimum` / `llvm.maximum` (IEEE 754-2019 NaN-propagating) have no
+    # GLSL.std.450 equivalent. `Base.min`/`Base.max` are overlay-overridden in
+    # `device/math.jl` to lower to `llvm.minnum`/`maxnum` (non-propagating,
+    # matches GPU industry convention). If these propagating variants leak
+    # through, silently mapping them to NMin/NMax (non-propagating) would hide
+    # a CPU/GPU semantic divergence — fail loudly.
+    if base_name == "llvm.minimum" || base_name == "llvm.maximum"
+        error("$base_name reached SPIR-V emitter — this means some code path " *
+              "is bypassing the `Base.min`/`Base.max` overlay in " *
+              "Lava/src/device/math.jl. GLSL.std.450 has no NaN-propagating " *
+              "min/max. Route the caller through the overlay, or add a " *
+              "propagating emulation (isnan check + NMin/NMax).")
     end
 
     # Handle other intrinsics
@@ -6258,6 +6281,103 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
         semantics = map_constant!(state.type_ctx, LLVM.ConstantInt(LLVM.IntType(32), 0x6108))  # AcquireRelease|WorkgroupMemory|MakeAvailable|MakeVisible
         encode_instruction!(state.mod.functions, Op.OpControlBarrier, scope_wg, scope_wg, semantics)
         return
+    end
+
+    # ── Saturating integer arithmetic ──
+    # SPIR-V has no saturating arith intrinsics, but these are emitted by LLVM's
+    # InstCombine when it recognizes patterns like `a - min(a, b)` — e.g.
+    # Julia's `Base.rem_internal` on floats (float.jl exponent subtraction)
+    # ends up as `llvm.usub.sat.i32` after optimization. Both CUDA and AMDGPU
+    # sidestep this by relying on their native LLVM backends' saturating
+    # intrinsic support; our custom SPIR-V emitter has to implement them.
+    if base_name == "llvm.usub.sat" || base_name == "llvm.uadd.sat" ||
+       base_name == "llvm.ssub.sat" || base_name == "llvm.sadd.sat"
+        ops = LLVM.operands(inst)
+        a_id = get_value_id!(state, ops[1])
+        b_id = get_value_id!(state, ops[2])
+        result_llvm_ty = LLVM.value_type(inst)
+        result_ty = map_type!(state.type_ctx, result_llvm_ty)
+        bw = Int(LLVM.width(result_llvm_ty))
+        bool_ty = map_type!(state.type_ctx, LLVM.IntType(1))
+        zero_id = map_constant!(state.type_ctx, LLVM.ConstantInt(result_llvm_ty, 0))
+
+        if base_name == "llvm.usub.sat"
+            # a >= b ? a - b : 0
+            ge = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpUGreaterThanEqual, bool_ty, ge, a_id, b_id)
+            diff = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpISub, result_ty, diff, a_id, b_id)
+            result_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpSelect, result_ty, result_id, ge, diff, zero_id)
+            state.value_map[inst] = result_id
+            return
+        elseif base_name == "llvm.uadd.sat"
+            # sum = a + b; (sum < a) ? UMAX : sum
+            sum_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpIAdd, result_ty, sum_id, a_id, b_id)
+            overflow = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpULessThan, bool_ty, overflow, sum_id, a_id)
+            umax_val = (UInt64(1) << bw) - UInt64(1)
+            umax_id = map_constant!(state.type_ctx,
+                LLVM.ConstantInt(result_llvm_ty, reinterpret(Int64, umax_val)))
+            result_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpSelect, result_ty, result_id, overflow, umax_id, sum_id)
+            state.value_map[inst] = result_id
+            return
+        else
+            # Signed saturating add/sub share the overflow/saturate skeleton:
+            #   op_res = a ± b
+            #   overflow iff sign(a) <op_related_to_b> sign(b) AND sign(res) != sign(a)
+            #   sat_val = a >= 0 ? INT_MAX : INT_MIN  = (a >> (N-1)) XOR INT_MAX
+            bw_m1 = map_constant!(state.type_ctx, LLVM.ConstantInt(result_llvm_ty, bw - 1))
+            int_max_val = (UInt64(1) << (bw - 1)) - UInt64(1)
+            int_max_id = map_constant!(state.type_ctx,
+                LLVM.ConstantInt(result_llvm_ty, reinterpret(Int64, int_max_val)))
+
+            # arith shift right by (N-1) gives 0 (a≥0) or -1 (a<0)
+            a_sign = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpShiftRightArithmetic, result_ty, a_sign, a_id, bw_m1)
+            sat_val = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpBitwiseXor, result_ty, sat_val, a_sign, int_max_id)
+
+            # op_res and overflow detection
+            op_res = fresh_id!(state.mod)
+            if base_name == "llvm.sadd.sat"
+                encode_instruction!(state.mod.functions, Op.OpIAdd, result_ty, op_res, a_id, b_id)
+                # Overflow: same-sign operands, result sign differs from a.
+                # ((a XOR b) >= 0) AND ((a XOR res) < 0)  ≡  (~(a^b) & (a^res)) < 0
+                a_xor_b = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpBitwiseXor, result_ty, a_xor_b, a_id, b_id)
+                not_axorb = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpNot, result_ty, not_axorb, a_xor_b)
+                a_xor_r = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpBitwiseXor, result_ty, a_xor_r, a_id, op_res)
+                mask = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpBitwiseAnd, result_ty, mask, not_axorb, a_xor_r)
+                overflow = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpSLessThan, bool_ty, overflow, mask, zero_id)
+                result_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpSelect, result_ty, result_id, overflow, sat_val, op_res)
+                state.value_map[inst] = result_id
+                return
+            else  # llvm.ssub.sat
+                encode_instruction!(state.mod.functions, Op.OpISub, result_ty, op_res, a_id, b_id)
+                # Overflow: operand signs differ, result sign differs from a.
+                # ((a XOR b) < 0) AND ((a XOR res) < 0)  ≡  ((a^b) & (a^res)) < 0
+                a_xor_b = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpBitwiseXor, result_ty, a_xor_b, a_id, b_id)
+                a_xor_r = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpBitwiseXor, result_ty, a_xor_r, a_id, op_res)
+                mask = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpBitwiseAnd, result_ty, mask, a_xor_b, a_xor_r)
+                overflow = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpSLessThan, bool_ty, overflow, mask, zero_id)
+                result_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpSelect, result_ty, result_id, overflow, sat_val, op_res)
+                state.value_map[inst] = result_id
+                return
+            end
+        end
     end
 
     # ── Funnel shifts ──

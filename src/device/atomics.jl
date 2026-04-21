@@ -49,6 +49,13 @@ end
     PtrIndexableRef{T}(r.ptr, li)
 end
 
+# `Atomix.@atomic arr[i, j, ...]` expands to `referenceable(arr)[i, j, ...]`, so
+# we need a getindex that accepts N integer args (one per dim).
+@lava_device_override function Base.getindex(r::LavaAtomicRef{T,N}, I::Vararg{Integer,N}) where {T,N}
+    li = atomic_linear_index(r.dims, CartesianIndex(map(Int, I)))
+    PtrIndexableRef{T}(r.ptr, li)
+end
+
 # CartesianIndex to linear index for atomic refs (mirrors linear_index in ka_backend.jl)
 @inline function atomic_linear_index(dims::NTuple{N,Int}, I::CartesianIndex{N}) where N
     li = I[1]
@@ -545,6 +552,17 @@ end
 ) where {T, N, OP}
     v = convert(T, val)
     li = atomic_linear_index(arr.dims, I)
+    ref = Atomix.Internal.referenceable(arr)[li]
+    return Atomix.modify!(ref, op, v, UnsafeAtomics.seq_cst)
+end
+
+# N-dimensional indexing: `@atomic arr[i, j, ...]` expands to a call with
+# one Integer per dimension. Convert to a linear index and forward.
+@lava_device_override @inline function Base.modifyindex_atomic!(
+    arr::LavaDeviceArray{T,N}, order::Symbol, op::OP, val, I::Vararg{Integer,N}
+) where {T, N, OP}
+    v = convert(T, val)
+    li = atomic_linear_index(arr.dims, CartesianIndex(map(Int, I)))
     ref = Atomix.Internal.referenceable(arr)[li]
     return Atomix.modify!(ref, op, v, UnsafeAtomics.seq_cst)
 end
