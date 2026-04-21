@@ -204,6 +204,19 @@ end
         (reinterpret(UInt64, x) & 0x7FFFFFFFFFFFFFFF) | (reinterpret(UInt64, y) & 0x8000000000000000))
 end
 
+# min/max — `Base.min`/`Base.max` on Float32/Float64 are already overlaid
+# above (via `@_lava_binary_intrinsic Base.min "llvm.minnum"`), which lowers
+# to NMin/NMax (non-propagating, IEEE 754-2008 minNum — matches CUDA fminf,
+# ROCm ocml_fmin, OpenCL fmin, SPIRVIntrinsics).
+#
+# Julia 1.12 additionally lowers `@fastmath min(x, y)` and the internal
+# `Base.FastMath.min_fast` to `llvm.minimum`/`llvm.maximum` (NaN-propagating,
+# IEEE 754-2019) with a fast-math flag. The SPIR-V emitter errors on those
+# intrinsics — so re-route the fast variants through `Base.min`/`Base.max`.
+# Same workaround as JuliaGPU/AMDGPU.jl#756.
+@lava_device_override @inline Base.FastMath.min_fast(x::T, y::T) where {T<:Union{Float32,Float64}} = min(x, y)
+@lava_device_override @inline Base.FastMath.max_fast(x::T, y::T) where {T<:Union{Float32,Float64}} = max(x, y)
+
 # ══════════════════════════════════════════════════════════════════════
 # Integer overrides
 # ══════════════════════════════════════════════════════════════════════

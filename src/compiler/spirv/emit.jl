@@ -5757,10 +5757,15 @@ const GLSL_STD_450_MAP = Dict{String, UInt32}(
     "llvm.log2"     => UInt32(30),  # Log2
     "llvm.pow"      => UInt32(26),  # Pow
     "llvm.fma"      => UInt32(50),  # Fma
-    "llvm.minnum"   => UInt32(37),  # FMin
-    "llvm.maxnum"   => UInt32(40),  # FMax
-    "llvm.minimum"  => UInt32(79),  # NMin (propagates NaN)
-    "llvm.maximum"  => UInt32(80),  # NMax (propagates NaN)
+    # llvm.minnum/maxnum are IEEE 754-2008 minNum/maxNum (non-NaN wins when
+    # exactly one operand is NaN). That matches SPIR-V GLSL.std.450 NMin/NMax
+    # exactly. FMin/FMax (opcodes 37/40) have undefined NaN behavior per
+    # SPIR-V spec — do not use them. `llvm.minimum`/`llvm.maximum` (IEEE
+    # 754-2019 propagating) are NOT in this map: Base.min/max overlay in
+    # device/math.jl routes callers through llvm.minnum, and the emitter
+    # errors on any `llvm.minimum`/`maximum` that slips through.
+    "llvm.minnum"   => UInt32(79),  # NMin
+    "llvm.maxnum"   => UInt32(80),  # NMax
     "llvm.smin"     => UInt32(39),  # SMin (signed integer min)
     "llvm.smax"     => UInt32(42),  # SMax (signed integer max)
     "llvm.umin"     => UInt32(38),  # UMin (unsigned integer min)
@@ -6068,6 +6073,20 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
               "Lava/src/device/math.jl. GLSL.std.450 has no zero-preserving " *
               "copysign. Add a Julia-level override for the caller, or " *
               "implement copysign in the emitter via bitwise sign-copy.")
+    end
+
+    # `llvm.minimum` / `llvm.maximum` (IEEE 754-2019 NaN-propagating) have no
+    # GLSL.std.450 equivalent. `Base.min`/`Base.max` are overlay-overridden in
+    # `device/math.jl` to lower to `llvm.minnum`/`maxnum` (non-propagating,
+    # matches GPU industry convention). If these propagating variants leak
+    # through, silently mapping them to NMin/NMax (non-propagating) would hide
+    # a CPU/GPU semantic divergence — fail loudly.
+    if base_name == "llvm.minimum" || base_name == "llvm.maximum"
+        error("$base_name reached SPIR-V emitter — this means some code path " *
+              "is bypassing the `Base.min`/`Base.max` overlay in " *
+              "Lava/src/device/math.jl. GLSL.std.450 has no NaN-propagating " *
+              "min/max. Route the caller through the overlay, or add a " *
+              "propagating emulation (isnan check + NMin/NMax).")
     end
 
     # Handle other intrinsics

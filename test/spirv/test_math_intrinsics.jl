@@ -171,6 +171,52 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         @test result[4] == -1f0
     end
 
+    @testset "min/max non-propagating (matches GPU convention)" begin
+        # Julia 1.12's `Base.min`/`Base.max` lower to `llvm.minimum`/`maximum`
+        # (NaN-propagating). GLSL.std.450 has no propagating op; overlaying
+        # to `llvm.minnum`/`maxnum` (non-propagating, IEEE 754-2008) matches
+        # CUDA/ROCm/SPIRVIntrinsics. The emitter errors on any leaked
+        # `llvm.minimum`/`maximum`, so these kernels must compile AND return
+        # the non-NaN operand when one input is NaN.
+        @kernel function min_kernel!(out, xs, ys)
+            i = @index(Global, Linear)
+            @inbounds out[i] = min(xs[i], ys[i])
+        end
+        @kernel function max_kernel!(out, xs, ys)
+            i = @index(Global, Linear)
+            @inbounds out[i] = max(xs[i], ys[i])
+        end
+        xs = Lava.LavaArray(Float32[1f0, NaN32, NaN32, 3f0, -1f0])
+        ys = Lava.LavaArray(Float32[NaN32, 2f0, NaN32, 5f0, -2f0])
+        mi = Lava.LavaArray(zeros(Float32, 5))
+        ma = Lava.LavaArray(zeros(Float32, 5))
+        min_kernel!(Lava.LavaBackend())(mi, xs, ys; ndrange=5)
+        max_kernel!(Lava.LavaBackend())(ma, xs, ys; ndrange=5)
+        Lava.vk_flush!(Lava.vk_context())
+        r_min = Array(mi); r_max = Array(ma)
+        # Non-NaN wins where exactly one operand is NaN; both-NaN → NaN.
+        @test r_min[1] == 1f0
+        @test r_min[2] == 2f0
+        @test isnan(r_min[3])
+        @test r_min[4] == 3f0
+        @test r_min[5] == -2f0
+        @test r_max[1] == 1f0
+        @test r_max[2] == 2f0
+        @test isnan(r_max[3])
+        @test r_max[4] == 5f0
+        @test r_max[5] == -1f0
+
+        # @fastmath min/max must also reach the overlay, not llvm.minimum.
+        @kernel function fastmath_min!(out, xs, ys)
+            i = @index(Global, Linear)
+            @inbounds out[i] = @fastmath min(xs[i], ys[i])
+        end
+        fout = Lava.LavaArray(zeros(Float32, 5))
+        fastmath_min!(Lava.LavaBackend())(fout, xs, ys; ndrange=5)
+        Lava.vk_flush!(Lava.vk_context())
+        @test Array(fout)[1] == 1f0  # compiles without emitter error
+    end
+
     @testset "round halfway (round-to-nearest-even)" begin
         # Julia's `round(::Float32)` lowers to `llvm.rint` (round-half-to-even).
         # GLSL.std.450 opcode 1 (`Round`) has implementation-defined halfway
