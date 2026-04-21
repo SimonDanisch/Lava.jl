@@ -66,18 +66,27 @@ end
 Build a HardwareAccel from a pre-built Vulkan TLAS + triangle data + offsets.
 Default `bq` is taken from `hw_tlas.storage.buf[].ctx.default_bq` so we never
 mismatch the AS against a queue on a different device.
+
+A fresh `RayTracingPipeline` (and its SBT buffer) is built per HardwareAccel.
+Callers that want to avoid the per-frame SBT allocation during mesh-swap
+rebuilds should reuse the previous HardwareAccel via the Raycore-side
+`build_hw_tlas(...; accel_prev=hwtlas.hw_accel)` plumbing: that updates the
+geometry-dependent fields (`tlas`, `triangle_data`, `blas_offsets`,
+`per_instance_tri_offsets`) in place and keeps the pipeline alive. In the
+Raycore/RayMakie flow this happens automatically on every `sync!(hwtlas)` —
+one pipeline per HWTLAS, lifetime tied to the HWTLAS.
 """
 function HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets,
                        per_instance_tri_offsets::AbstractVector{UInt32};
                        bq::BatchQueue=(hw_tlas.storage.buf[].ctx::VkContext).default_bq)
-    rt = RayTracingPipeline(
+    pipeline = RayTracingPipeline(
         raygen=hw_raygen,
         closest_hit=hw_closesthit,
         miss=hw_miss,
         payload_type=:f32_7,
     )
     HardwareAccel(hw_tlas, triangle_data, blas_offsets, collect(per_instance_tri_offsets),
-                  rt, nothing, bq)
+                  pipeline, nothing, bq)
 end
 
 """
