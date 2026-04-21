@@ -477,7 +477,7 @@ end
         end
 
         ctx = Lava.vk_context()
-        batch = ctx.active_batch
+        batch = ctx.default_bq.active_batch
         @test batch !== nothing
         @test batch.dispatch_count == 350
         @test length(batch.sealed_cmd_bufs) == 3  # 100+100+100 sealed, 50 active
@@ -503,7 +503,7 @@ end
         end
 
         ctx = Lava.vk_context()
-        batch = ctx.active_batch
+        batch = ctx.default_bq.active_batch
         @test batch.dispatch_count == 500
         @test length(batch.sealed_cmd_bufs) == 0  # No splitting
 
@@ -547,7 +547,7 @@ end
         end
 
         ctx = Lava.vk_context()
-        batch = ctx.active_batch
+        batch = ctx.default_bq.active_batch
         @test batch.dispatch_count == 5000
         threshold = Lava.CB_SPLIT_THRESHOLD[]
         if threshold > 0
