@@ -314,6 +314,71 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         @test gpu ≈ cpu
     end
 
+    @testset "^ overlay (Base.:(^) → llvm.pow → GLSL Pow)" begin
+        # `Base.:(^)(::Float32, ::Float32)` is overlaid in device/math.jl via
+        # `@_lava_binary_intrinsic ... "llvm.pow"`, matching SPIRVIntrinsics'
+        # `Base.:(^) → OpenCL pow` and AMDGPU's `Base.:(^) → __ocml_pow`.
+        # Lock that in: bypass Julia's CPU `^` (which uses Float64 intermediate
+        # `power_by_squaring` and a `throw_exp_domainerror` stub) and hit the
+        # direct llvm.pow → GLSL Pow path.
+        @kernel function pow_kernel!(out, x, y)
+            i = @index(Global, Linear)
+            @inbounds out[i] = x[i] ^ y[i]
+        end
+
+        # Float32, positive base — all cases well-defined in GLSL Pow.
+        x = Lava.LavaArray(Float32[2f0, 3f0, 0.5f0, 10f0, 1f0])
+        y = Lava.LavaArray(Float32[3f0, 0.5f0, -2f0, 0f0, 100f0])
+        out = Lava.LavaArray(zeros(Float32, 5))
+        pow_kernel!(Lava.LavaBackend())(out, x, y; ndrange=5)
+        Lava.vk_flush!(Lava.vk_context())
+        cpu = Float32[2f0^3f0, 3f0^0.5f0, 0.5f0^-2f0, 10f0^0f0, 1f0^100f0]
+        @test Array(out) ≈ cpu rtol=1f-5
+
+        # Float64 — routes through the downcast overlay at math.jl:179
+        # (`^(::Float64, ::Float64) = Float64(Float32(x) ^ Float32(y))`),
+        # which is required because GLSL.std.450 Pow does not support f64.
+        xd = Lava.LavaArray(Float64[2.0, 3.0, 0.5])
+        yd = Lava.LavaArray(Float64[3.0, 0.5, -2.0])
+        outd = Lava.LavaArray(zeros(Float64, 3))
+        pow_kernel!(Lava.LavaBackend())(outd, xd, yd; ndrange=3)
+        Lava.vk_flush!(Lava.vk_context())
+        @test Array(outd) ≈ [8.0, sqrt(3.0), 4.0] rtol=1e-5
+
+        # Negative base with integer exponent — must take the
+        # `power_by_squaring` path, NOT llvm.pow (GLSL Pow is spec-undefined
+        # for x<0). Julia's `Base.:(^)(::Float32, ::Integer)` handles this
+        # correctly; the overlay does not touch the Integer method.
+        @kernel function pow_int_kernel!(out, x, y::Int32)
+            i = @index(Global, Linear)
+            @inbounds out[i] = x[i] ^ y
+        end
+        xn = Lava.LavaArray(Float32[-2f0, -3f0, 2f0, 0f0, -1f0])
+        on = Lava.LavaArray(zeros(Float32, 5))
+        pow_int_kernel!(Lava.LavaBackend())(on, xn, Int32(3); ndrange=5)
+        Lava.vk_flush!(Lava.vk_context())
+        @test Array(on) == Float32[-8, -27, 8, 0, -1]
+
+        # Even integer exponent — sign must flip back
+        oe = Lava.LavaArray(zeros(Float32, 5))
+        pow_int_kernel!(Lava.LavaBackend())(oe, xn, Int32(4); ndrange=5)
+        Lava.vk_flush!(Lava.vk_context())
+        @test Array(oe) == Float32[16, 81, 16, 0, 1]
+
+        # `@fastmath ^` on Julia 1.12 rewrites to a fast-math `Base.:(^)`
+        # call, which hits the same overlay. Compiles AND gives numeric result.
+        @kernel function fastmath_pow!(out, x, y)
+            i = @index(Global, Linear)
+            @inbounds out[i] = @fastmath x[i] ^ y[i]
+        end
+        xf = Lava.LavaArray(Float32[2f0, 3f0])
+        yf = Lava.LavaArray(Float32[3f0, 2f0])
+        of = Lava.LavaArray(zeros(Float32, 2))
+        fastmath_pow!(Lava.LavaBackend())(of, xf, yf; ndrange=2)
+        Lava.vk_flush!(Lava.vk_context())
+        @test Array(of) ≈ Float32[8f0, 9f0] rtol=1f-5
+    end
+
     @testset "round halfway (round-to-nearest-even)" begin
         # Julia's `round(::Float32)` lowers to `llvm.rint` (round-half-to-even).
         # GLSL.std.450 opcode 1 (`Round`) has implementation-defined halfway
