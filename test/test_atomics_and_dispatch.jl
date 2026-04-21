@@ -426,4 +426,27 @@ end
         result[4, 5] = Float32(N)
         @test all(result .== Float32(N))
     end
+
+    @testset "Atomix with N integer indices on 2D array (no CartesianIndex)" begin
+        # `@atomic A[i, j] += v` expands to modifyindex_atomic!(A, ..., i, j) —
+        # requires the Vararg{Integer,N} override, not the CartesianIndex one.
+        @kernel function atomic_add_ij!(A, is, js)
+            k = @index(Global, Linear)
+            @inbounds i = is[k]
+            @inbounds j = js[k]
+            Atomix.@atomic A[i, j] += UInt32(1)
+        end
+
+        dims = (6, 5)
+        A = Lava.LavaArray(zeros(UInt32, dims))
+        # All threads hit (3, 4) with Int32 indices like the solar kernel does.
+        N = 1024
+        is = Lava.LavaArray(fill(Int32(3), N))
+        js = Lava.LavaArray(fill(Int32(4), N))
+        atomic_add_ij!(Lava.LavaBackend())(A, is, js; ndrange=N)
+        Lava.vk_flush!(Lava.vk_context())
+        result = Array(A)
+        @test result[3, 4] == UInt32(N)
+        @test sum(result) == UInt32(N)
+    end
 end
