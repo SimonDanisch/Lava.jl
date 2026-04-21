@@ -124,6 +124,13 @@ for (T, llvm_ty) in ((Float32, "float"), (Float64, "double"))
     end
 end
 
+# Float16: overlay Base.min/max onto llvm.minnum/maxnum so reductions +
+# generic numeric code don't hit the emitter's `llvm.minimum`/`maximum`
+# error. GLSL.std.450 NMin/NMax works for f16 when the Float16 capability
+# is enabled.
+@_lava_binary_intrinsic Base.min "llvm.minnum" Float16 "half"
+@_lava_binary_intrinsic Base.max "llvm.maxnum" Float16 "half"
+
 # ══════════════════════════════════════════════════════════════════════
 # Tier 1b: LLVM intrinsics for transcendentals — Float32 ONLY
 # GLSL.std.450 restricts these to 16/32-bit floats.
@@ -203,6 +210,10 @@ end
     reinterpret(Float64,
         (reinterpret(UInt64, x) & 0x7FFFFFFFFFFFFFFF) | (reinterpret(UInt64, y) & 0x8000000000000000))
 end
+@lava_device_override @inline function Base.copysign(x::Float16, y::Float16)
+    reinterpret(Float16,
+        (reinterpret(UInt16, x) & UInt16(0x7FFF)) | (reinterpret(UInt16, y) & UInt16(0x8000)))
+end
 
 # min/max — `Base.min`/`Base.max` on Float32/Float64 are already overlaid
 # above (via `@_lava_binary_intrinsic Base.min "llvm.minnum"`), which lowers
@@ -214,8 +225,8 @@ end
 # IEEE 754-2019) with a fast-math flag. The SPIR-V emitter errors on those
 # intrinsics — so re-route the fast variants through `Base.min`/`Base.max`.
 # Same workaround as JuliaGPU/AMDGPU.jl#756.
-@lava_device_override @inline Base.FastMath.min_fast(x::T, y::T) where {T<:Union{Float32,Float64}} = min(x, y)
-@lava_device_override @inline Base.FastMath.max_fast(x::T, y::T) where {T<:Union{Float32,Float64}} = max(x, y)
+@lava_device_override @inline Base.FastMath.min_fast(x::T, y::T) where {T<:Union{Float16,Float32,Float64}} = min(x, y)
+@lava_device_override @inline Base.FastMath.max_fast(x::T, y::T) where {T<:Union{Float16,Float32,Float64}} = max(x, y)
 
 # ══════════════════════════════════════════════════════════════════════
 # Integer overrides
