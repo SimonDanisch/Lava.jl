@@ -2,6 +2,9 @@
 # Tests GLSL.std.450 mapping, no f64 leakage for f32 math
 
 using Test
+using Lava
+using KernelAbstractions
+using KernelAbstractions: @kernel, @index
 if !@isdefined(SPIRVTestUtils)
     include(joinpath(@__DIR__, "..", "spirv_test_utils.jl"))
 end
@@ -74,6 +77,98 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         d, _ = compile_and_disasm(sign_kernel, Tuple{Lava.LavaDeviceArray{Float32,1},
                                                       Lava.LavaDeviceArray{Float32,1}})
         @test occursin("FSign", d) || occursin("OpFOrdGreaterThan", d) || occursin("OpSelect", d)
+    end
+
+    @testset "copysign zero-preserving (bitwise sign-copy)" begin
+        # copysign(x, 0) must return +|x|, not 0. GLSL.std.450 FSign(0) is 0,
+        # so `FAbs(x) * FSign(y)` produces 0 for any y==0 — breaks ray-tracing
+        # `safe_invdir` clamps and similar IEEE-dependent code.
+        #
+        # The emitter errors on any `llvm.copysign` that slips past the
+        # `Base.copysign` overlay in `device/math.jl`. Each kernel below
+        # compiles (so no leak to the emitter) AND returns the IEEE result.
+
+        @kernel function copysign_kernel!(out, x_arr, y_arr)
+            i = @index(Global, Linear)
+            @inbounds out[i] = copysign(x_arr[i], y_arr[i])
+        end
+
+        x = Float32[1f-5,  1f-5,  1f-5, -3f0, 2f0, 2f0]
+        y = Float32[ 0f0, -0f0, -1f0,  2f0, Inf32, -Inf32]
+        expected = Float32[1f-5, -1f-5, -1f-5, 3f0, 2f0, -2f0]
+
+        x_arr = Lava.LavaArray(x)
+        y_arr = Lava.LavaArray(y)
+        out = Lava.LavaArray(zeros(Float32, length(x)))
+        copysign_kernel!(Lava.LavaBackend())(out, x_arr, y_arr; ndrange=length(x))
+        Lava.vk_flush!(Lava.vk_context())
+        @test reinterpret(UInt32, Array(out)) == reinterpret(UInt32, expected)
+
+        # Float64
+        xd = Float64[1e-10,  1e-10,  1e-10, -3.0]
+        yd = Float64[  0.0,   -0.0,   -1.0,  2.0]
+        expected_d = Float64[1e-10, -1e-10, -1e-10, 3.0]
+        x_arr64 = Lava.LavaArray(xd); y_arr64 = Lava.LavaArray(yd)
+        out64 = Lava.LavaArray(zeros(Float64, length(xd)))
+        copysign_kernel!(Lava.LavaBackend())(out64, x_arr64, y_arr64; ndrange=length(xd))
+        Lava.vk_flush!(Lava.vk_context())
+        @test reinterpret(UInt64, Array(out64)) == reinterpret(UInt64, expected_d)
+    end
+
+    @testset "copysign leak paths (must not reach emitter)" begin
+        # Exercises the ways `llvm.copysign` could slip past the Base.copysign
+        # overlay. Each kernel here will FAIL TO COMPILE if it does, because
+        # the emitter errors on `llvm.copysign`. Numeric checks additionally
+        # confirm correctness.
+
+        # 1. @fastmath: fastmath rewrites `copysign` but still hits Base.copysign.
+        @kernel function fastmath_cs!(out, x, y)
+            i = @index(Global, Linear)
+            @inbounds out[i] = @fastmath copysign(x[i], y[i])
+        end
+        x = Lava.LavaArray(Float32[1f-5, 2f0])
+        y = Lava.LavaArray(Float32[0f0, -1f0])
+        out = Lava.LavaArray(zeros(Float32, 2))
+        fastmath_cs!(Lava.LavaBackend())(out, x, y; ndrange=2)
+        Lava.vk_flush!(Lava.vk_context())
+        @test Array(out) == Float32[1f-5, -2f0]
+
+        # 2. Vectorizable inner loop — gives LLVM a chance to recognize the
+        #    bitwise sign-copy pattern and canonicalize back to `llvm.copysign`.
+        @kernel function loop_cs!(out, xs, ys, n::Int32)
+            i = @index(Global, Linear)
+            acc = 0f0
+            @inbounds for j in Int32(1):n
+                acc += copysign(xs[i, j], ys[i, j])
+            end
+            @inbounds out[i] = acc
+        end
+        xs = Lava.LavaArray(fill(1f-5, 16, 8))
+        ys = Lava.LavaArray(zeros(Float32, 16, 8))  # all zero y's — the bug case
+        lout = Lava.LavaArray(zeros(Float32, 16))
+        loop_cs!(Lava.LavaBackend())(lout, xs, ys, Int32(8); ndrange=16)
+        Lava.vk_flush!(Lava.vk_context())
+        @test all(Array(lout) .≈ 8f0 * 1f-5)  # would be 0 if old bug reappeared
+
+        # 3. Exact `safe_invdir` pattern — the original bug trigger.
+        @kernel function safe_invdir_kernel!(out, d)
+            i = @index(Global, Linear)
+            ooeps = 1f-5
+            @inbounds dv = d[i]
+            clamped = abs(dv) > ooeps ? dv : copysign(ooeps, dv)
+            @inbounds out[i] = 1f0 / clamped
+        end
+        d = Lava.LavaArray(Float32[0f0, -0f0, 1f0, -1f0])
+        sout = Lava.LavaArray(zeros(Float32, 4))
+        safe_invdir_kernel!(Lava.LavaBackend())(sout, d; ndrange=4)
+        Lava.vk_flush!(Lava.vk_context())
+        result = Array(sout)
+        # +0 → clamp to +1e-5 → 1/1e-5 = 1e5   (NOT Inf)
+        # -0 → clamp to -1e-5 → 1/-1e-5 = -1e5 (NOT Inf)
+        @test result[1] == 1f5
+        @test result[2] == -1f5
+        @test result[3] == 1f0
+        @test result[4] == -1f0
     end
 end
 

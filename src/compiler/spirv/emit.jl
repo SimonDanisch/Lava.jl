@@ -6050,20 +6050,19 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
         return emit_glsl_ext_inst!(state, inst, glsl_num)
     end
 
-    # copysign(x, y) = FAbs(x) * FSign(y) — not directly in GLSL.std.450
+    # `llvm.copysign` should never reach the emitter: `Base.copysign` is
+    # overlay-overridden in `device/math.jl` with a bitwise sign-copy, and
+    # Base's only caller of `copysign_float` is that method. GLSL.std.450
+    # has no IEEE-correct copysign (FSign(0) == 0 breaks `FAbs·FSign`), so if
+    # something does slip through (new Base caller, LLVM canonicalization,
+    # direct `Core.Intrinsics.copysign_float`), fail loudly instead of
+    # emitting a silently-wrong result.
     if base_name == "llvm.copysign"
-        glsl_id = setup_glsl_std_450!(state.mod)
-        x_id = get_value_id!(state, LLVM.operands(inst)[1])
-        y_id = get_value_id!(state, LLVM.operands(inst)[2])
-        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
-        abs_id = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpExtInst, result_ty, abs_id, glsl_id, UInt32(4), x_id)  # FAbs=4
-        sign_id = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpExtInst, result_ty, sign_id, glsl_id, UInt32(6), y_id)  # FSign=6
-        result_id = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpFMul, result_ty, result_id, abs_id, sign_id)
-        state.value_map[inst] = result_id
-        return
+        error("llvm.copysign reached SPIR-V emitter — this means some code " *
+              "path is bypassing the `Base.copysign` overlay in " *
+              "Lava/src/device/math.jl. GLSL.std.450 has no zero-preserving " *
+              "copysign. Add a Julia-level override for the caller, or " *
+              "implement copysign in the emitter via bitwise sign-copy.")
     end
 
     # Handle other intrinsics

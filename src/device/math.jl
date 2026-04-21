@@ -190,6 +190,20 @@ end
 @lava_device_override @inline Base.clamp(x::Float32, lo::Float32, hi::Float32) = min(max(x, lo), hi)
 @lava_device_override @inline Base.clamp(x::Float64, lo::Float64, hi::Float64) = min(max(x, lo), hi)
 
+# copysign — IEEE bitwise sign-copy. Base's default lowers to `llvm.copysign`,
+# which we used to emulate as `FAbs(x) * FSign(y)` in the SPIR-V emitter, but
+# GLSL.std.450 FSign(0) == 0 so that produces 0 for any zero y — silently
+# breaks ray-tracing `safe_invdir` clamps and other IEEE-dependent code.
+# Mirrors the structure of Base's `flipsign` (base/floatfuncs.jl).
+@lava_device_override @inline function Base.copysign(x::Float32, y::Float32)
+    reinterpret(Float32,
+        (reinterpret(UInt32, x) & 0x7FFFFFFF) | (reinterpret(UInt32, y) & 0x80000000))
+end
+@lava_device_override @inline function Base.copysign(x::Float64, y::Float64)
+    reinterpret(Float64,
+        (reinterpret(UInt64, x) & 0x7FFFFFFFFFFFFFFF) | (reinterpret(UInt64, y) & 0x8000000000000000))
+end
+
 # ══════════════════════════════════════════════════════════════════════
 # Integer overrides
 # ══════════════════════════════════════════════════════════════════════
