@@ -12,7 +12,13 @@ GPU array backed by a Vulkan device-local buffer with BDA (Buffer Device Address
 mutable struct LavaArray{T,N} <: AbstractGPUArray{T,N}
     buf::GPUArrays.DataRef{VkManagedBuffer}
     dims::NTuple{N,Int}
-    offset::Int  # offset in number of elements (not bytes)
+    # Byte offset from the start of the backing VkManagedBuffer to the first
+    # element of this view. Stored in bytes (not elements) so that a
+    # reinterpret that changes `sizeof(eltype)` doesn't have to round-trip
+    # through element counts — e.g. `reinterpret(Int64, view(a::LavaArray{Int32}, 2:7))`
+    # creates a LavaArray{Int64} with `offset = 4`, which is a legal byte
+    # offset even though it isn't a whole Int64 element.
+    offset::Int
 
     # Register `unsafe_free!` as a GC finalizer so LavaArrays that fall out
     # of scope without an explicit `unsafe_free!` call actually release their
@@ -53,19 +59,18 @@ function LavaArray{T,N}(::UndefInitializer, dims::NTuple{N,Int};
         pool_alloc(bq, max(nbytes + slack, 16)) :
         vk_alloc(bq, max(nbytes + slack, 16); extra_usage, unified)
 
-    elem_offset = 0
+    byte_offset = 0
     if align > UInt64(1)
         base = managed_buf.address
         aligned = cld(base, align) * align
         byte_offset = Int(aligned - base)
         @assert byte_offset % sizeof(T) == 0  "extra_usage alignment ($(align)) is not a multiple of sizeof($T)"
-        elem_offset = byte_offset ÷ sizeof(T)
     end
 
     ref = GPUArrays.DataRef(managed_buf) do buf
         vk_free!(buf)
     end
-    LavaArray{T,N}(ref, dims; offset=elem_offset)
+    LavaArray{T,N}(ref, dims; offset=byte_offset)
 end
 
 # Varargs constructor for LavaArray{T,N}(undef, d1, d2, ...)
@@ -128,8 +133,9 @@ GPUArrays.storage(a::LavaArray) = a.buf
 
 function GPUArrays.derive(::Type{T}, a::LavaArray, dims::Dims{N}, offset::Int) where {T,N}
     ref = copy(a.buf)
-    offset += (a.offset * Base.elsize(a)) ÷ sizeof(T)
-    LavaArray{T,N}(ref, dims; offset)
+    # `offset` arrives in units of T (GPUArrays contract); a.offset is bytes.
+    byte_offset = a.offset + offset * sizeof(T)
+    LavaArray{T,N}(ref, dims; offset=byte_offset)
 end
 
 # ── copy ──
@@ -156,9 +162,9 @@ Base.ndims(::LavaArray{T,N}) where {T,N} = N
 Base.IndexStyle(::Type{<:LavaArray}) = IndexLinear()
 Base.elsize(::Type{<:LavaArray{T}}) where T = sizeof(T)
 
-# BDA address for kernel argument passing (includes offset)
+# BDA address for kernel argument passing (includes offset, already in bytes)
 function bda_address(a::LavaArray{T}) where T
-    a.buf[].address + a.offset * sizeof(T)
+    a.buf[].address + a.offset
 end
 
 # pin! the LavaArray wrapper itself, NOT just its VkManagedBuffer. The wrapper
@@ -195,7 +201,7 @@ function upload!(dst::LavaArray{T}, data::AbstractArray{T}) where T
     GC.@preserve src bytes begin
         unsafe_copyto!(Ptr{UInt8}(pointer(bytes)), Ptr{UInt8}(pointer(src)), nbytes)
     end
-    GC.@preserve dst upload!(dst.buf[], bytes; offset=dst.offset * sizeof(T))
+    GC.@preserve dst upload!(dst.buf[], bytes; offset=dst.offset)
 end
 
 # `Lava.update!` is deleted — use `Base.resize!(arr, length(new)) + Base.copyto!(arr, new)`.
@@ -207,7 +213,7 @@ end
 """Download GPU array to host."""
 function Base.Array(src::LavaArray{T,N}) where {T,N}
     result = Array{T}(undef, src.dims...)
-    download_typed!(vec(result), src.buf[]; offset=src.offset * sizeof(T))
+    download_typed!(vec(result), src.buf[]; offset=src.offset)
     return result
 end
 
