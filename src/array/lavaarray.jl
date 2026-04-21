@@ -198,51 +198,11 @@ function upload!(dst::LavaArray{T}, data::AbstractArray{T}) where T
     GC.@preserve dst upload!(dst.buf[], bytes; offset=dst.offset * sizeof(T))
 end
 
-"""
-    update!(dst::LavaArray, data::AbstractArray)
-
-Update a GPU array with new host data.  Grow-only policy:
-
-* If `data` fits the backing VkManagedBuffer's existing capacity, the GPU
-  buffer is reused (no Vulkan alloc/free churn); only `dst.dims` is updated
-  and the bytes are overwritten.
-* If `data` exceeds capacity, allocate a new buffer sized for the new data
-  and release the old one through the DataRef refcount path.
-
-This is the right shape for animation loops that update per-frame data
-whose size fluctuates but has a bounded peak (streamplot tubes, meshscatter
-triangle lists, dye volumes, etc.) — steady state allocates zero.
-"""
-function update!(dst::LavaArray{T,N}, data::AbstractArray{T,N}) where {T,N}
-    new_bytes = length(data) * sizeof(T)
-    buf = dst.buf[]
-    # Capacity = backing buffer's allocated size minus our element offset.
-    # For non-pooled buffers that's buf.size; for pooled chunks it's also
-    # buf.size (pool carves exact-size sub-allocations).
-    capacity_bytes = buf.size - dst.offset * sizeof(T)
-
-    if new_bytes <= capacity_bytes
-        # Reuse buffer, just set new dims and overwrite the bytes.
-        dst.dims = size(data)
-        upload!(dst, data)
-    else
-        # Need to grow: release old DataRef, allocate a fresh buffer sized for `data`.
-        old_ref = dst.buf
-        ctx = buf.ctx::VkContext
-        GPUArrays.unsafe_free!(old_ref)
-        new_nbytes = max(new_bytes, 16)
-        new_buf = pool_alloc(ctx.default_bq, new_nbytes)
-        new_ref = GPUArrays.DataRef(new_buf) do buf
-            vk_free!(buf)
-        end
-        dst.buf = new_ref
-        dst.dims = size(data)
-        dst.offset = 0
-        upload!(dst, data)
-    end
-    return dst
-end
-update!(dst::LavaArray{T}, data::AbstractArray{S}) where {T,S} = update!(dst, convert(AbstractArray{T}, data))
+# `Lava.update!` is deleted — use `Base.resize!(arr, length(new)) + Base.copyto!(arr, new)`.
+# `Base.resize!(::LavaArray)` is capacity-aware (see array/gpuarrays.jl); `copyto!` is
+# the standard GPUArrays upload path.  That pair is the full "make dst match src"
+# operation and composes with Base semantics across CuArray / ROCArray / LavaArray
+# without a Lava-specific hook.
 
 """Download GPU array to host."""
 function Base.Array(src::LavaArray{T,N}) where {T,N}

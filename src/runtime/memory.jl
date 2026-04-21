@@ -677,6 +677,16 @@ function copy_buffer!(direction::Symbol, managed::VkManagedBuffer,
 
     # BAR fast-path: host-visible mapped memory — direct memcpy, no staging.
     if managed.mapped_ptr != Ptr{UInt8}(0)
+        # wait_for_write reads buf.last_write, which is only populated by
+        # sync_access! at submit time — so a dispatch that is recorded but
+        # not yet submitted is invisible to it. Flush the active batch of
+        # the buffer's ctx first so any pending writer actually lands before
+        # we memcpy. (wait_for_write still matters for cross-queue writers
+        # and already-in-flight batches.)
+        bq = (managed.ctx::VkContext).default_bq
+        if bq.active_batch !== nothing
+            flush!(bq, bq.device)
+        end
         wait_for_write(managed)
         if direction === :upload
             unsafe_copyto!(managed.mapped_ptr + offset, host_ptr, nbytes)

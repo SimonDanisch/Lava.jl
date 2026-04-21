@@ -64,6 +64,16 @@ end
         include(joinpath(@__DIR__, "test_gpu_memory_safety.jl"))
     end
 
+    # ── Tier 3e2: BAR-memory copy_buffer! sync regression ──
+    @testset "Tier 3e2: BAR Memcpy Sync" begin
+        include(joinpath(@__DIR__, "test_bar_memcpy_sync.jl"))
+    end
+
+    # ── Tier 3e3: Raycore MultiTypeSet surgical-per-mutation invariants ──
+    @testset "Tier 3e3: MultiTypeSet Surgical" begin
+        include(joinpath(@__DIR__, "test_multitypeset_surgical.jl"))
+    end
+
     # ── Tier 3f: Caching & Allocations ──
     @testset "Tier 3f: Caching & Allocations" begin
         include(joinpath(@__DIR__, "test_caching_and_allocations.jl"))
