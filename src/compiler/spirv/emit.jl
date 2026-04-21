@@ -5766,8 +5766,13 @@ const GLSL_STD_450_MAP = Dict{String, UInt32}(
     "llvm.umin"     => UInt32(38),  # UMin (unsigned integer min)
     "llvm.umax"     => UInt32(41),  # UMax (unsigned integer max)
     "llvm.fmuladd"  => UInt32(50),  # Fma (fmuladd ≈ fma for GPU)
-    "llvm.rint"     => UInt32(1),   # RoundEven (rint = round to nearest even)
-    "llvm.nearbyint"=> UInt32(1),   # RoundEven
+    # llvm.rint / llvm.nearbyint are round-to-nearest-even. GLSL.std.450
+    # opcode 2 is `RoundEven`; opcode 1 (`Round`) has implementation-defined
+    # halfway behavior per SPIR-V spec and does not match the LLVM semantics.
+    # Julia's `round(Float32)` lowers to `llvm.rint`, so the previous mapping
+    # to opcode 1 silently diverged from CPU at halfway values on strict drivers.
+    "llvm.rint"     => UInt32(2),   # RoundEven
+    "llvm.nearbyint"=> UInt32(2),   # RoundEven
     # Additional trig/hyperbolic (for future use via LLVM intrinsics)
     "llvm.asin"     => UInt32(16),  # Asin
     "llvm.acos"     => UInt32(17),  # Acos

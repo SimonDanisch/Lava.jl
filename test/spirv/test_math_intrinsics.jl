@@ -170,6 +170,27 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         @test result[3] == 1f0
         @test result[4] == -1f0
     end
+
+    @testset "round halfway (round-to-nearest-even)" begin
+        # Julia's `round(::Float32)` lowers to `llvm.rint` (round-half-to-even).
+        # GLSL.std.450 opcode 1 (`Round`) has implementation-defined halfway
+        # behavior per SPIR-V spec; opcode 2 (`RoundEven`) is the IEEE-correct
+        # round-to-nearest-even. Mapping `llvm.rint → RoundEven` keeps GPU
+        # parity with Julia CPU across drivers.
+        @kernel function round_kernel!(out, xs)
+            i = @index(Global, Linear)
+            @inbounds out[i] = round(xs[i])
+        end
+
+        xs = Lava.LavaArray(Float32[0.5, 1.5, 2.5, 3.5, -0.5, -1.5, -2.5, 4.5])
+        out = Lava.LavaArray(zeros(Float32, 8))
+        round_kernel!(Lava.LavaBackend())(out, xs; ndrange=8)
+        Lava.vk_flush!(Lava.vk_context())
+        gpu = Array(out)
+        cpu = Float32[round(x) for x in Float32[0.5, 1.5, 2.5, 3.5, -0.5, -1.5, -2.5, 4.5]]
+        # Expected (round-to-even): 0, 2, 2, 4, -0, -2, -2, 4
+        @test gpu == cpu
+    end
 end
 
 
