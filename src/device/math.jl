@@ -155,9 +155,12 @@ end
 @_lava_glsl_unary  Base.asin "_lava_glsl_asin_f32" Float32 "float"
 @_lava_glsl_unary  Base.acos "_lava_glsl_acos_f32" Float32 "float"
 @_lava_glsl_unary  Base.atan "_lava_glsl_atan_f32" Float32 "float"
-@_lava_glsl_unary  Base.sinh "_lava_glsl_sinh_f32" Float32 "float"
-@_lava_glsl_unary  Base.cosh "_lava_glsl_cosh_f32" Float32 "float"
-@_lava_glsl_unary  Base.tanh "_lava_glsl_tanh_f32" Float32 "float"
+@_lava_glsl_unary  Base.sinh  "_lava_glsl_sinh_f32"  Float32 "float"
+@_lava_glsl_unary  Base.cosh  "_lava_glsl_cosh_f32"  Float32 "float"
+@_lava_glsl_unary  Base.tanh  "_lava_glsl_tanh_f32"  Float32 "float"
+@_lava_glsl_unary  Base.asinh "_lava_glsl_asinh_f32" Float32 "float"
+@_lava_glsl_unary  Base.acosh "_lava_glsl_acosh_f32" Float32 "float"
+@_lava_glsl_unary  Base.atanh "_lava_glsl_atanh_f32" Float32 "float"
 
 # atan(y, x) — atan2, GLSL.std.450 Atan2 (op 25), Float32 only
 @_lava_glsl_binary Base.atan "_lava_glsl_atan2_f32" Float32 "float"
@@ -179,9 +182,12 @@ end
 @lava_device_override @inline Base.asin(x::Float64) = Float64(asin(Float32(x)))
 @lava_device_override @inline Base.acos(x::Float64) = Float64(acos(Float32(x)))
 @lava_device_override @inline Base.atan(x::Float64) = Float64(atan(Float32(x)))
-@lava_device_override @inline Base.sinh(x::Float64) = Float64(sinh(Float32(x)))
-@lava_device_override @inline Base.cosh(x::Float64) = Float64(cosh(Float32(x)))
-@lava_device_override @inline Base.tanh(x::Float64) = Float64(tanh(Float32(x)))
+@lava_device_override @inline Base.sinh(x::Float64)  = Float64(sinh(Float32(x)))
+@lava_device_override @inline Base.cosh(x::Float64)  = Float64(cosh(Float32(x)))
+@lava_device_override @inline Base.tanh(x::Float64)  = Float64(tanh(Float32(x)))
+@lava_device_override @inline Base.asinh(x::Float64) = Float64(asinh(Float32(x)))
+@lava_device_override @inline Base.acosh(x::Float64) = Float64(acosh(Float32(x)))
+@lava_device_override @inline Base.atanh(x::Float64) = Float64(atanh(Float32(x)))
 @lava_device_override @inline Base.atan(y::Float64, x::Float64) = Float64(atan(Float32(y), Float32(x)))
 @lava_device_override @inline Base.:(^)(x::Float64, y::Float64) = Float64(Float32(x) ^ Float32(y))
 
