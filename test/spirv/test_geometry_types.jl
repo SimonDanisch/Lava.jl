@@ -77,3 +77,26 @@ end
     @test sizes.acceleration_structure_size > 0
     @test sizes.build_scratch_size > 0
 end
+
+@testset "AABB BLAS - build_blas_aabb smoke" begin
+    aabbs = [AABB(Point3f(0, 0, 0), Point3f(1, 1, 1)),
+             AABB(Point3f(2, 2, 2), Point3f(3, 3, 3))]
+    blas = Lava.as_build() do ctx
+        Lava.build_blas_aabb(ctx, aabbs)
+    end
+    @test blas isa Lava.LavaBLAS
+    @test blas.address > UInt64(0)
+end
+
+@testset "AABB BLAS - build_blas_aabb errors loudly without ray_query" begin
+    ctx = Lava.vk_context()
+    saved = ctx.ray_query_available
+    ctx.ray_query_available = false
+    try
+        @test_throws ErrorException Lava.as_build() do bc
+            Lava.build_blas_aabb(bc, [AABB(Point3f(0, 0, 0), Point3f(1, 1, 1))])
+        end
+    finally
+        ctx.ray_query_available = saved
+    end
+end

@@ -236,6 +236,77 @@ function build_blas(ctx::ASBuildContext, vertices::Vector{NTuple{3,Float32}}, in
 end
 
 """
+    build_blas_aabb(ctx::ASBuildContext, aabbs::Vector{AABB}; opaque=true) -> LavaBLAS
+
+Build a procedural-AABB BLAS from a vector of `AABB` records. The resulting
+BLAS is intended for use with inline ray queries (rayQuery + AABB candidate
+intersection); accordingly, this function errors loudly if the device does
+not support `VK_KHR_ray_query`.
+"""
+function build_blas_aabb(ctx::ASBuildContext, aabbs::Vector{AABB}; opaque::Bool=true)
+    vk_context().ray_query_available || error(
+        "build_blas_aabb: the active Vulkan device does not support " *
+        "VK_KHR_ray_query. Procedural-AABB BLASes are only useful with " *
+        "ray_query in this codebase. Build on a device that supports it.")
+
+    bq  = ctx.bq
+    dev = as_device(ctx)
+
+    # Pack into VkAabbPositionsKHR layout (24 bytes per AABB: minX,Y,Z,maxX,Y,Z).
+    n     = length(aabbs)
+    bytes = Vector{UInt8}(undef, 24 * n)
+    GC.@preserve bytes begin
+        p = pointer(bytes)
+        for (i, a) in enumerate(aabbs)
+            base = p + (i - 1) * 24
+            unsafe_store!(Ptr{Float32}(base +  0), a.min[1])
+            unsafe_store!(Ptr{Float32}(base +  4), a.min[2])
+            unsafe_store!(Ptr{Float32}(base +  8), a.min[3])
+            unsafe_store!(Ptr{Float32}(base + 12), a.max[1])
+            unsafe_store!(Ptr{Float32}(base + 16), a.max[2])
+            unsafe_store!(Ptr{Float32}(base + 20), a.max[3])
+        end
+    end
+
+    aabb_arr  = LavaArray(bytes; bq, extra_usage=AS_INPUT_USAGE)
+    aabb_addr = aabb_arr.buf[].address
+
+    geom       = AABBsGeometry(; aabb_addr, aabb_stride=UInt64(24))
+    geo_flags  = opaque ? UInt32(Vulkan.GEOMETRY_OPAQUE_BIT_KHR) : UInt32(0)
+    build_flags = UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
+
+    sizes = query_as_build_sizes(dev, geom;
+        as_type=UInt32(1), build_flags,
+        geo_flags, max_primitive_count=UInt32(n))
+
+    storage = LavaArray{UInt8,1}(undef, (max(Int(sizes.acceleration_structure_size), 16),);
+                                  bq, extra_usage=AS_STORAGE_USAGE)
+    accel = Vulkan.AccelerationStructureKHR(dev, Vulkan.AccelerationStructureCreateInfoKHR(
+        storage.buf[].buffer, UInt64(0), sizes.acceleration_structure_size,
+        Vulkan.ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR))
+
+    scratch_arr  = LavaArray{UInt8,1}(undef, (max(Int(sizes.build_scratch_size), 16),);
+                                       bq, extra_usage=AS_SCRATCH_USAGE, scratch=true)
+    scratch_addr = bda_address(scratch_arr)
+    push!(ctx.preserves, scratch_arr)
+
+    blas_preserves = LavaArray[aabb_arr]
+
+    build_as_on_gpu(ctx, accel, scratch_addr, geom;
+        as_type=UInt32(1), build_flags,
+        geo_flags, primitive_count=UInt32(n))
+
+    addr_info = Vulkan.AccelerationStructureDeviceAddressInfoKHR(accel)
+    as_addr   = Vulkan.get_acceleration_structure_device_address_khr(dev, addr_info)
+    if Lava.ALLOC_DEBUG_ENABLED[]
+        push!(Lava.ALLOC_DEBUG_LOG, (kind=:blas_aabb_as, addr=as_addr, size=0, pool=false))
+    end
+    blas = LavaBLAS(accel, storage, as_addr, blas_preserves)
+    finalizer(unsafe_free!, blas)
+    return blas
+end
+
+"""
     build_tlas(ctx::ASBuildContext, blas_list; transforms=nothing, custom_indices=nothing) -> LavaTLAS
 
 Build a top-level acceleration structure. Records into `ctx`'s command buffer.
