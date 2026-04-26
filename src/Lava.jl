@@ -102,6 +102,7 @@ include("compiler/spirv/graphics.jl")     # Graphics stages, I/O variables, emit
 include("device/math.jl")
 include("device/quirks.jl")
 include("device/rt_intrinsics.jl")  # RT builtins + trace_ray intrinsic
+include("device/ray_query_intrinsics.jl")  # lava_ray_query_init
 include("device/gfx_intrinsics.jl")  # Graphics builtins + shader I/O intrinsics
 # atomics.jl is included after lavaarray.jl (needs LavaDeviceArray)
 

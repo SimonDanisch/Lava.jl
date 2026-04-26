@@ -564,13 +564,6 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
         end
         state.mod.functions = real_buf
     end
-    # For the entry function, also inject any function-local OpVariable words
-    # accumulated in state.entry_function_locals (e.g. rayQuery variables).
-    # These must live in the same Function-scope preamble section as allocas.
-    if is_entry && !isempty(state.entry_function_locals)
-        append!(preamble_words, state.entry_function_locals)
-    end
-
     # Emit basic blocks in reverse post-order (dominators before dominated blocks).
     # After StructurizeCFG, LLVM block order may not respect dominance, causing
     # forward references in non-PHI instructions.
@@ -584,8 +577,14 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
         emit_block!(state, bb)
         # After the entry block is emitted (first block), inject OpVariable preamble
         # right after the OpLabel (which is the first instruction emitted by emit_block!).
+        # Also append any function-local OpVariables accumulated during block emission
+        # (e.g. ray query vars created on first use by get_or_create_ray_query_var!).
+        # They are appended here, after block emission, so their IDs are defined before use.
         if !entry_label_emitted
             entry_label_emitted = true
+            if is_entry && !isempty(state.entry_function_locals)
+                append!(preamble_words, state.entry_function_locals)
+            end
             if !isempty(preamble_words)
                 # The entry block's OpLabel was emitted at `entry_label_pos`.
                 # OpLabel is 2 words. Insert preamble at entry_label_pos + 2.
@@ -5886,6 +5885,8 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return emit_rt_ignore_intersection!(state, inst)
         elseif fn_name == "lava_rt_terminate_ray"
             return emit_rt_terminate_ray!(state, inst)
+        elseif fn_name == "lava_ray_query_init"
+            return emit_ray_query_init!(state, inst)
         end
 
         # Check for graphics intrinsics → I/O stores/loads, emit_vertex, etc.

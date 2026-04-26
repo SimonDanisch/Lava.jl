@@ -1,4 +1,5 @@
 using Test, Lava
+using GeometryBasics: Point3f, Vec3f
 if !@isdefined(SPIRVTestUtils)
     include(joinpath(@__DIR__, "..", "spirv_test_utils.jl"))
 end
@@ -79,4 +80,24 @@ end
     check(d, "OpTypeRayQueryKHR")
     check(d, "DescriptorSet 0")
     check(d, "Binding 0")
+end
+
+@testset "Ray Query - Phase A4 OpRayQueryInitializeKHR" begin
+    ctx = Lava.vk_context()
+    saved = ctx.ray_query_available
+    ctx.ray_query_available = true
+    local d
+    try
+        function init_kernel(out)
+            ray = Ray(o=Point3f(0, 0, 0), d=Vec3f(0, 0, 1), t_min=0f0, t_max=1f3)
+            Lava.lava_ray_query_init(ray; mask=UInt32(0xFF))
+            @inbounds out[1] = 1f0
+            return nothing
+        end
+        d, _ = compile_and_disasm(init_kernel, Tuple{Lava.LavaDeviceArray{Float32,1}};
+                                  stage=:compute, enable_ray_query=true)
+    finally
+        ctx.ray_query_available = saved
+    end
+    check(d, "OpRayQueryInitializeKHR")
 end

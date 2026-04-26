@@ -100,3 +100,61 @@ function get_or_create_ray_query_var!(state::SPIRVEmitterState)
     state.current_ray_query_var = var_id
     return var_id
 end
+
+"""
+Lower a `lava_ray_query_init` (scalar form) call to OpRayQueryInitializeKHR.
+Arguments: flags, mask, ox, oy, oz, tmin, dx, dy, dz, tmax (10 scalars).
+"""
+function emit_ray_query_init!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    mod = state.mod
+    args = LLVM.operands(inst)
+
+    flags_id = get_value_id!(state, args[1])
+    mask_id  = get_value_id!(state, args[2])
+    ox_id    = get_value_id!(state, args[3])
+    oy_id    = get_value_id!(state, args[4])
+    oz_id    = get_value_id!(state, args[5])
+    tmin_id  = get_value_id!(state, args[6])
+    dx_id    = get_value_id!(state, args[7])
+    dy_id    = get_value_id!(state, args[8])
+    dz_id    = get_value_id!(state, args[9])
+    tmax_id  = get_value_id!(state, args[10])
+
+    # Construct origin and direction vec3 (same pattern as emit_rt_trace_ray!)
+    f32_ty  = emit_type_float!(mod, UInt32(32))
+    vec3_ty = emit_type_vector!(mod, f32_ty, UInt32(3))
+
+    origin_id = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpCompositeConstruct, vec3_ty, origin_id,
+                        ox_id, oy_id, oz_id)
+
+    dir_id = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpCompositeConstruct, vec3_ty, dir_id,
+                        dx_id, dy_id, dz_id)
+
+    # Load the TLAS acceleration structure
+    accel_ty = emit_acceleration_structure_type!(state)
+    tlas_var = state.rt_tlas_var_id
+    tlas_var === nothing && error("OpRayQueryInitializeKHR requires a TLAS variable (enable_ray_query must be true)")
+
+    tlas_loaded_id = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpLoad, accel_ty, tlas_loaded_id, tlas_var)
+
+    # Get (or create) the per-function OpVariable for the ray query
+    query_var = get_or_create_ray_query_var!(state)
+
+    # OpRayQueryInitializeKHR has no result:
+    # OpRayQueryInitializeKHR %query %accel %flags %mask %origin %tmin %dir %tmax
+    # word count = 1 (opcode) + 8 operands = 9
+    word_count = UInt32(9)
+    push!(mod.functions, (word_count << 16) | UInt32(Op.OpRayQueryInitializeKHR))
+    push!(mod.functions, query_var)
+    push!(mod.functions, tlas_loaded_id)
+    push!(mod.functions, flags_id)
+    push!(mod.functions, mask_id)
+    push!(mod.functions, origin_id)
+    push!(mod.functions, tmin_id)
+    push!(mod.functions, dir_id)
+    push!(mod.functions, tmax_id)
+    return nothing
+end
