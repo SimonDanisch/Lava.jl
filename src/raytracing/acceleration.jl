@@ -332,11 +332,9 @@ function build_tlas(ctx::ASBuildContext, blas_list::Vector{LavaBLAS};
     inst_addr = inst_arr.buf[].address
     build_flags = UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
 
-    sizes = query_as_build_sizes(dev;
-        as_type=UInt32(0), build_flags,
-        geometry_type=:instances,
-        instance_addr=inst_addr,
-        max_primitive_count=UInt32(n_instances))
+    geo_buf_inst = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
+    pack_geometry!(geo_buf_inst, 0; geometry_type=:instances, instance_addr=inst_addr)
+    sizes = query_as_build_sizes_impl(dev, geo_buf_inst, UInt32(0), build_flags, UInt32(n_instances))
 
     storage = LavaArray{UInt8,1}(undef, (max(Int(sizes.acceleration_structure_size), 16),);
                                   bq, extra_usage=AS_STORAGE_USAGE)

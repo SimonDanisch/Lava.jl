@@ -333,6 +333,31 @@ function Base.push!(hwtlas::HWTLAS, mesh::GeometryBasics.Mesh, transforms::Abstr
 end
 
 """
+    push!(hwtlas::HWTLAS, blas::LavaBLAS, transform::Mat4f=Mat4f(I);
+          instance_id::UInt32=UInt32(0)) -> TLASHandle
+
+Register a pre-built `LavaBLAS` (e.g. from `build_blas_aabb`) as a new
+geometry + instance.  No triangle data is associated; accordingly the
+`hw_accel` / ray-tracing pipeline path is not usable on this HWTLAS after
+this call.  Use the compute-rayQuery path (`lava_launch!` with `tlas=hwtlas`)
+instead.
+"""
+function Base.push!(hwtlas::HWTLAS{Tri}, blas::LavaBLAS, transform::Mat4f=Mat4f(I);
+                    instance_id::UInt32=UInt32(0)) where {Tri}
+    # Register the pre-built BLAS — no triangles.
+    push!(hwtlas.blas_list, blas)
+    push!(hwtlas.blas_triangles, Tri[])
+    blas_idx = length(hwtlas.blas_list)
+    offset = isempty(hwtlas.blas_offsets) ? UInt32(0) :
+             hwtlas.blas_offsets[end] + UInt32(length(hwtlas.blas_triangles[end-1]))
+    push!(hwtlas.blas_offsets, offset)
+
+    hwtlas.dirty = true
+    return hwtlas_add_instances!(hwtlas, blas_idx, (transform,);
+                                  instance_ids=UInt32[instance_id])
+end
+
+"""
     update_transform!(hwtlas::HWTLAS, handle::TLASHandle, transform::Mat4f)
 
 Update every instance belonging to `handle` to the same transform.
