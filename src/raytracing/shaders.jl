@@ -94,6 +94,9 @@ function trace_rays!(bq::BatchQueue, pipeline::RayTracingPipeline, tlas::LavaTLA
     # Now open (or re-open) the real active batch and adapt args into it.
     batch = ensure_active_batch!(bq)
     pin_leaves!(batch, pipeline.raygen_func)
+    pin_leaves!(batch, pipeline.closesthit_func)
+    pin_leaves!(batch, pipeline.miss_func)
+    pin_leaves!(batch, pipeline.anyhit_func)   # pin_leaves!(::Nothing) is a no-op
     pin_leaves!(batch, args)
     adaptor = LavaAdaptor(batch)
     converted_raygen = Adapt.adapt(adaptor, pipeline.raygen_func)
@@ -150,6 +153,9 @@ function trace_rays_indirect!(bq::BatchQueue, pipeline::RayTracingPipeline,
 
     batch = ensure_active_batch!(bq)
     pin_leaves!(batch, pipeline.raygen_func)
+    pin_leaves!(batch, pipeline.closesthit_func)
+    pin_leaves!(batch, pipeline.miss_func)
+    pin_leaves!(batch, pipeline.anyhit_func)   # pin_leaves!(::Nothing) is a no-op
     pin_leaves!(batch, args)
     adaptor = LavaAdaptor(batch)
     converted_raygen = Adapt.adapt(adaptor, pipeline.raygen_func)

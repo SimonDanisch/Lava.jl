@@ -105,6 +105,15 @@ Begins command buffer recording if not already started.
 """
 function ensure_active_batch!(bq::BatchQueue)
     @assert Threads.threadid() == bq.owning_thread  "BatchQueue is single-writer; cross-thread dispatch forbidden"
+    # Refuse to start new work on a lost device.  Without this gate, kernel
+    # dispatches keep recording into command buffers that will never run,
+    # leaking arg slabs/cmd bufs until vk_reset_device! and (worse) hiding
+    # the original error behind a flood of follow-on failures.
+    device_lost(bq.ctx::VkContext) && throw(LavaError(
+        "ensure_active_batch!",
+        "Vulkan device is lost — cannot record new dispatches",
+        "Call Lava.vk_reset_device!() to reinitialize, or restart Julia. " *
+        "All existing LavaArrays are invalid after reset and must be re-allocated."))
     # Sweep any reaper-retired batches first so their resources recycle and
     # their errors surface before we start new work.
     sweep_retired_batches!(bq)
@@ -483,6 +492,46 @@ function submit!(bq::BatchQueue)
     # dispatch — the IdSet dedupes multi-dispatch reuse for free.
     for obj in batch.pinned
         sync_access!(batch, obj)
+    end
+
+    # Pre-submit safety scan: catch stale-BDA-in-arg-slab corruption BEFORE
+    # the GPU sees it.  Off by default (Lava.PRESUBMIT_SCAN_ENABLED[] = true to
+    # turn on for debugging).  Cost ~hundreds-of-µs per submit; never on by
+    # default.
+    if PRESUBMIT_SCAN_ENABLED[]
+        unknowns = scan_slabs_for_unknown_bdas(bq)
+        if !isempty(unknowns)
+            @warn "Pre-submit found $(length(unknowns)) unknown BDA(s) in arg slabs"
+            for u in unknowns
+                @warn "  STALE: slab=$(u.slab) idx=$(u.idx) offset=$(u.offset) val=0x$(string(u.val, base=16, pad=16))"
+            end
+            if PRESUBMIT_SCAN_THROWS[]
+                throw(LavaError("submit!", "stale BDA in arg slab", "see warnings"))
+            end
+        end
+    end
+
+    # SLAB DUMP for cascade investigation: if SLAB_DUMP_TARGET[] is non-zero,
+    # search the active arg slab for any UInt64 == target and log offsets.
+    if SLAB_DUMP_TARGET[] != UInt64(0) &&
+       !isempty(bq.arg_slabs) && bq.arg_slab_idx <= length(bq.arg_slabs)
+        target = SLAB_DUMP_TARGET[]
+        slab = bq.arg_slabs[bq.arg_slab_idx]
+        mb = slab.buf[]
+        mp = mb.mapped_ptr
+        if mp != Ptr{UInt8}(0)
+            n = bq.arg_slab_offset ÷ 8
+            p = Ptr{UInt64}(mp)
+            hits = Int[]
+            for k in 0:(n-1)
+                if unsafe_load(p, k+1) == target
+                    push!(hits, k*8)
+                end
+            end
+            if !isempty(hits)
+                push!(SLAB_DUMP_LOG, (sub=Int(bq.next_timeline)+1, target=target, offsets=hits))
+            end
+        end
     end
 
     cb_infos = [Vulkan.CommandBufferSubmitInfo(cb, UInt32(0)) for cb in all_cmd_bufs]

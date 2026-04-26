@@ -20,6 +20,57 @@ mutable struct PoolBlock
     live_count::Int            # Number of live sub-allocations
 end
 
+# Debug instrumentation for iter6 cross-scene cascade investigation.
+# All off by default — opt-in via the *_ENABLED Refs.
+
+# Per-finalizer destruction trace
+const FREE_DEBUG_ENABLED = Ref{Bool}(false)
+const FREE_DEBUG_LOG = NamedTuple[]
+
+# Per-allocation trace
+const ALLOC_DEBUG_ENABLED = Ref{Bool}(false)
+const ALLOC_DEBUG_LOG = NamedTuple[]
+
+# When enabled, vk_free! scans every live BatchQueue's arg/indirect slabs for
+# any UInt64 == buf.address.  Hits are logged + zeroed so the GPU faults on a
+# clean null reference instead of corrupting random memory.  Optionally
+# throws a LavaError instead of just logging (DESTROY_FREED_BDAS_THROWS[]).
+const FREED_BDA_SCAN_ENABLED = Ref{Bool}(false)
+const FREED_BDA_SCAN_LOG = NamedTuple[]
+const DESTROY_FREED_BDAS_THROWS = Ref{Bool}(false)
+
+# Pre-submit unknown-BDA scan: scans the active arg slab region for any
+# BDA-shaped UInt64 that isn't in LIVE_BUFFERS or any pool block / slab.
+# Optionally throws a LavaError instead of just warning.
+const PRESUBMIT_SCAN_ENABLED = Ref{Bool}(false)
+const PRESUBMIT_SCAN_THROWS = Ref{Bool}(false)
+
+# When true, pack_arg!(::VkManagedBuffer, ...) asserts the buffer's state ==
+# ALIVE before packing its BDA.  Catches use-after-free where a stale buffer
+# reference makes it through to a kernel arg.
+const PACK_ARG_ASSERT_LIVE = Ref{Bool}(false)
+
+# When set to a non-zero target BDA, every submit! scans the active arg slab
+# for the target value and logs (submit_idx, offsets) to SLAB_DUMP_LOG.  Used
+# to track when a known-stale address enters/leaves the arg slab.
+const SLAB_DUMP_TARGET = Ref{UInt64}(UInt64(0))
+const SLAB_DUMP_LOG = NamedTuple[]
+
+"""
+    scan_arg_slabs_for_bda!(buf) -> Int
+
+Scan every live BatchQueue's `arg_slabs` (and `indirect_slabs`) for any
+UInt64 word matching `buf.address`.  For each hit, append a record to
+`FREED_BDA_SCAN_LOG` and overwrite the slot with 0 so the GPU faults
+cleanly on a null reference instead of touching the freed memory.
+Returns the number of hits found.
+
+Defined AFTER VkManagedBuffer + BatchQueue (forward-call from vk_free!).
+Cost is ~`(slab_size_bytes / 8)` UInt64 reads per live slab — for 4 MiB
+slabs that's ~512 K reads, fast enough for debug.
+"""
+function scan_arg_slabs_for_bda! end
+
 # Buffer lifecycle states (atomic CAS transitions).  Every VkManagedBuffer
 # starts ALIVE.  `unsafe_free!` transitions ALIVE → DEFERRED (queued on a
 # bq's deferred_frees list) or ALIVE → DEAD (destroyed immediately).
@@ -30,12 +81,6 @@ const BUF_STATE_ALIVE    = UInt8(0)
 const BUF_STATE_DEFERRED = UInt8(1)
 const BUF_STATE_DEAD     = UInt8(2)
 
-# Lava-only marker bit packed into `extra_usage::UInt32` alongside real
-# Vulkan buffer-usage bits.  Vulkan has no usage flag for "this buffer is
-# AS build scratch", so we carry our own high bit and strip it before
-# `Vulkan.Buffer(...)`.  `bda_alignment_for` keys off this bit to pick the
-# cached `ctx.as_scratch_align`.
-const LAVA_SCRATCH_BIT = UInt32(1) << 31
 
 mutable struct VkManagedBuffer
     buffer::Vulkan.Buffer
@@ -67,7 +112,12 @@ const LIVE_BUFFERS = Set{VkManagedBuffer}()
 # Poison value for freed buffer addresses — enables use-after-free detection
 # on the GPU side (a shader dereffing a freed BDA traps with this value).
 # The CPU-side use-after-free gate is `buf.state`.
-const BDA_POISON = 0xDEAD_DEAD_DEAD_DEAD
+#
+# Poison = 0: no valid GPU BDA is ever 0, so this is unambiguous.  Pointer
+# arithmetic on null (ptr + N*sizeof(T)) keeps the result in the unmapped
+# low-VA region, which faults clearly.  Detection is also trivial — scan
+# arg buffer slots for `== 0`.
+const BDA_POISON = UInt64(0)
 
 # Register cleanup callback for vk_reset_device!.  Indirect slabs are per-BQ now
 # and die with the old ctx, so only the global memory stats need resetting.
@@ -139,6 +189,9 @@ only on that queue's timeline, ready for the multi-queue refactor.
   falling back to host-visible only) and map it.  The returned
   `VkManagedBuffer.mapped_ptr` is non-null.  Use for arg/indirect slabs or
   any buffer you want to write from the CPU without staging.
+
+AS-scratch alignment is the caller's responsibility — see
+`bda_alignment_for(ctx, scratch::Bool)`, used in `LavaArray(...; scratch=true)`.
 """
 function vk_alloc(bq::BatchQueue, nbytes::Integer;
                   extra_usage::UInt32=UInt32(0), unified::Bool=false)
@@ -178,18 +231,15 @@ function try_vk_alloc(bq::BatchQueue, nbytes::Integer;
     dev = ctx.device
     nbytes = max(nbytes, 16)
 
-    # Strip Lava-only marker bits before passing usage to Vulkan.
-    vk_extra = extra_usage & ~LAVA_SCRATCH_BIT
-
     usage = Vulkan.BUFFER_USAGE_STORAGE_BUFFER_BIT |
             Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
             Vulkan.BUFFER_USAGE_TRANSFER_SRC_BIT |
             Vulkan.BUFFER_USAGE_TRANSFER_DST_BIT
-    if vk_extra != UInt32(0)
-        usage |= Vulkan.BufferUsageFlag(vk_extra)
+    if extra_usage != UInt32(0)
+        usage |= Vulkan.BufferUsageFlag(extra_usage)
     end
 
-    local buf, memory
+    local buf, memory, mem_type_idx
     mapped_ptr = Ptr{UInt8}(0)
     try
         buf = Vulkan.Buffer(dev, nbytes, usage, Vulkan.SHARING_MODE_EXCLUSIVE, UInt32[])
@@ -233,6 +283,11 @@ function try_vk_alloc(bq::BatchQueue, nbytes::Integer;
     push!(LIVE_BUFFERS, result)
     Threads.atomic_add!(GPU_LIVE_BYTES, nbytes)
     Threads.atomic_add!(GPU_BYTES_SINCE_LAST_GC, nbytes)
+    if ALLOC_DEBUG_ENABLED[]
+        push!(ALLOC_DEBUG_LOG,
+              (kind=:direct, addr=address, size=Int(nbytes), pool=false,
+               mtype=Int(mem_type_idx), unified=unified, usage=UInt32(usage)))
+    end
     return result
 end
 
@@ -256,6 +311,20 @@ function vk_free!(buf::VkManagedBuffer)
 
     delete!(LIVE_BUFFERS, buf)
 
+    if FREE_DEBUG_ENABLED[]
+        ctx_dbg = buf.ctx
+        active_dbg = false
+        try
+            bqd = ctx_dbg.default_bq
+            active_dbg = (bqd.active_batch !== nothing) && bqd.active_batch.recording
+        catch; end
+        push!(FREE_DEBUG_LOG,
+              (addr=buf.address, size=buf.size,
+               pool=buf.pool_block !== nothing,
+               lw=@atomic(:acquire, buf.last_write),
+               active=active_dbg))
+    end
+
     # Defer destruction if the GPU still has work in flight that references
     # this buffer. The per-queue timeline semaphore tells us precisely:
     # buf.last_write = (bq, val) means the last dispatch recorded against
@@ -272,7 +341,21 @@ function vk_free!(buf::VkManagedBuffer)
             # inside a finalizer-reachable path: a throw here is logged by
             # Julia's finalizer machinery rather than propagating.
             current = query_timeline(bq)
-            if current < val
+            # Defer destruction if EITHER:
+            #   (a) GPU still has in-flight work that references this buffer
+            #       (current < val — last submitted dispatch still pending), OR
+            #   (b) the BQ has an active recording batch — even if all submits
+            #       have completed, the recording batch may have captured this
+            #       buffer's BDA via a runtime-pinned reference that pin_leaves!
+            #       didn't catch (e.g. a closure capture in a kernel that takes
+            #       the buffer indirectly). Destroying mid-recording, then
+            #       letting the recording submit, races the freed BDA against
+            #       the dispatch and trips a RADV GPUVM PERMISSION_FAULT.
+            #       The window from finalizer-pause to next batch retirement is
+            #       short, so deferring is cheap; reclaiming the buffer happens
+            #       via `drain_deferred_frees!` at the next flush/submit boundary.
+            active = (bq.active_batch !== nothing) && bq.active_batch.recording
+            if current < val || active
                 # Finalizer-thread push into the deferred list — SpinLock so
                 # the main thread's drain doesn't race.
                 lock(bq.deferred_frees_lock) do
@@ -280,6 +363,19 @@ function vk_free!(buf::VkManagedBuffer)
                 end
                 return     # state stays DEFERRED; drain_deferred_frees! will transition to DEAD
             end
+        end
+    end
+
+    # Pre-destroy safety scan: if `buf.address` still appears in any live arg
+    # slab, that's a use-after-free waiting to happen.  Log it and zero the
+    # slot so the GPU faults on a null reference (BDA_POISON) instead of
+    # corrupting whatever memory is mapped at the old address.
+    if FREED_BDA_SCAN_ENABLED[]
+        hits = scan_arg_slabs_for_bda!(buf)
+        if hits > 0 && DESTROY_FREED_BDAS_THROWS[]
+            throw(LavaError("vk_free!",
+                "destroying buffer at 0x$(string(buf.address, base=16, pad=16)) but its BDA still appears $(hits)× in live arg slabs",
+                "an unpinned reference is leaking — see FREED_BDA_SCAN_LOG"))
         end
     end
 
@@ -338,6 +434,103 @@ function destroy_buffer!(buf::VkManagedBuffer)
     buf.address = BDA_POISON
     Threads.atomic_sub!(GPU_LIVE_BYTES, buf.size)
     buf.size = 0
+end
+
+# Scanner method — reachable now that VkManagedBuffer + BatchQueue are defined.
+function scan_arg_slabs_for_bda!(buf::VkManagedBuffer)
+    target = buf.address
+    target == UInt64(0) && return 0
+    hits = 0
+    ctx = buf.ctx
+    bq = try ctx.default_bq catch; nothing end
+    bq === nothing && return 0
+    for (kind, slabs) in ((:arg, bq.arg_slabs), (:indirect, bq.indirect_slabs))
+        for (i, slab) in enumerate(slabs)
+            mb = slab.buf[]::VkManagedBuffer
+            mb.mapped_ptr == Ptr{UInt8}(0) && continue
+            n = mb.size ÷ 8
+            p = Ptr{UInt64}(mb.mapped_ptr)
+            for k in 0:(n-1)
+                v = unsafe_load(p, k+1)
+                if v == target
+                    push!(FREED_BDA_SCAN_LOG,
+                          (slab=kind, idx=i, offset=k*8, freed_bda=target,
+                           buf_size=buf.size))
+                    unsafe_store!(p, UInt64(0), k+1)
+                    hits += 1
+                end
+            end
+        end
+    end
+    return hits
+end
+
+"""
+    scan_slabs_for_unknown_bdas() -> Vector{NamedTuple}
+
+Walk every UInt64 in every live arg/indirect slab.  Report any value that
+LOOKS like a BDA (in the upper half of the address space, i.e. high bit
+of bit 63 set OR top 16 bits = 0xffff) but is NOT the address of any
+buffer in `LIVE_BUFFERS` and is NOT 0.  Useful for catching stale BDAs
+that pin_leaves! / pack_args_direct! missed.
+
+Call this RIGHT BEFORE submit to catch problems before they reach the GPU.
+"""
+function scan_slabs_for_unknown_bdas(bq)
+    bq === nothing && return NamedTuple[]
+    live = Set{UInt64}()
+    for buf in LIVE_BUFFERS
+        push!(live, buf.address)
+    end
+    pool_ranges = Tuple{UInt64,UInt64}[]
+    for blk in POOL_BLOCKS
+        push!(pool_ranges, (blk.base_address, blk.base_address + UInt64(blk.capacity)))
+    end
+    # Slabs themselves are valid arenas — the arg slab packs nested structs
+    # by writing pointers to within the slab itself (a "byval-inline" arg's
+    # outer arg pointer is `slab_base + inline_offset`).  Whitelist any value
+    # that lands inside a known slab's address range.
+    slab_ranges = Tuple{UInt64,UInt64}[]
+    for slabs in (bq.arg_slabs, bq.indirect_slabs)
+        for slab in slabs
+            mb = slab.buf[]::VkManagedBuffer
+            push!(slab_ranges, (mb.address, mb.address + UInt64(mb.size)))
+        end
+    end
+    @inline function in_known_range(addr)
+        for (lo, hi) in pool_ranges
+            lo <= addr < hi && return true
+        end
+        for (lo, hi) in slab_ranges
+            lo <= addr < hi && return true
+        end
+        return false
+    end
+    results = NamedTuple[]
+    for (kind, slabs) in ((:arg, bq.arg_slabs), (:indirect, bq.indirect_slabs))
+        for (i, slab) in enumerate(slabs)
+            mb = slab.buf[]::VkManagedBuffer
+            mb.mapped_ptr == Ptr{UInt8}(0) && continue
+            n_bytes = if kind == :arg && i == bq.arg_slab_idx
+                bq.arg_slab_offset
+            else
+                Int(mb.size)
+            end
+            n = n_bytes ÷ 8
+            p = Ptr{UInt64}(mb.mapped_ptr)
+            for k in 0:(n-1)
+                v = unsafe_load(p, k+1)
+                # Look only for "0xffff8…" sign-extended BDA-shaped values
+                # whose 48-bit form is in the high half (bit 47 set).
+                v < UInt64(0xffff800000000000) && continue
+                v == typemax(UInt64) && continue  # 0xff..ff often appears in scratch
+                v in live && continue
+                in_known_range(v) && continue
+                push!(results, (slab=kind, idx=i, offset=k*8, val=v))
+            end
+        end
+    end
+    return results
 end
 
 """
@@ -443,6 +636,10 @@ function alloc_pool_block(bq::BatchQueue)
     # Don't subtract from GPU_LIVE_BYTES — the block IS live memory.
     # Individual chunks don't add to GPU_LIVE_BYTES since the block already accounts for it.
     push!(POOL_BLOCKS, block)
+    if ALLOC_DEBUG_ENABLED[]
+        push!(ALLOC_DEBUG_LOG, (kind=:pool_block, addr=buf_result.address,
+                                size=POOL_BLOCK_SIZE, pool=true))
+    end
     return block
 end
 
@@ -741,20 +938,15 @@ function download_typed!(data::AbstractVector{T}, src::VkManagedBuffer; offset::
 end
 
 """
-    bda_alignment_for(ctx::VkContext, extra_usage::UInt32) -> UInt64
+    bda_alignment_for(ctx::VkContext, scratch::Bool) -> UInt64
 
-Required BDA alignment for a buffer created with `extra_usage`.  Keyed
-entirely off the usage bits — callers should never pass an `align` kwarg.
-`LAVA_SCRATCH_BIT` (a Lava-only marker, stripped before Vulkan sees it)
-selects `minAccelerationStructureScratchOffsetAlignment` (cached on ctx).
+Required BDA alignment.  AS-build scratch buffers must be aligned to
+`minAccelerationStructureScratchOffsetAlignment` (cached on ctx).
 Everything else defaults to 1 (Vulkan already guarantees the per-usage
 minimum alignment via `vkGetBufferDeviceAddress`).
 """
-@inline function bda_alignment_for(ctx::VkContext, extra_usage::UInt32)
-    if (extra_usage & LAVA_SCRATCH_BIT) != 0
-        return ctx.as_scratch_align
-    end
-    return UInt64(1)
+@inline function bda_alignment_for(ctx::VkContext, scratch::Bool)
+    return scratch ? ctx.as_scratch_align : UInt64(1)
 end
 
 # VkMappedBuffer / VkIndirectBuffer / alloc_indirect_slab / vk_alloc_mapped /

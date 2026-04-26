@@ -29,8 +29,8 @@ was stripped to `LavaDeviceArray` (via `Adapt.adapt`) for the kernel.
 """
 function pin_leaves! end
 
-# Leaf: the one case that has side effects. `pin!` is idempotent (IdSet push)
-# so repeated calls on the same buffer are O(1).
+# Leaf: the one case that has side effects.  `pin!` is idempotent (IdSet
+# push) so repeated calls on the same buffer are O(1).
 @inline pin_leaves!(batch::CommandBatch, a::LavaArray) =
     (pin!(batch, a); nothing)
 

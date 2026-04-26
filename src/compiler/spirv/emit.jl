@@ -2242,7 +2242,17 @@ function psb_needs_decomposition(state::SPIRVEmitterState, ptr::LLVM.Value, acce
                                    llvm_align::UInt32=UInt32(0))
     access_align = get_alignment_for_type(access_ty)
 
-    access_align <= 4 && return false  # i32/float/i16/i8 never need decomposition (matches v17)
+    # Only i8 accesses are always aligned by definition (1 mod 1 == 0 trivially).
+    # i16/i32/i64/i128 + float/double can ALL be misaligned at runtime if the
+    # pointer's actual byte offset isn't naturally aligned for the access type.
+    # Earlier code returned false for `access_align <= 4` ("matches v17"); that
+    # missed the case where SROA emits `store i32, ptr %unaligned_byte_gep,
+    # align 4` at a byte offset whose lowest two bits are non-zero (typical
+    # pattern: byte-array-typed alloca followed by typepun-pack into i32 stored
+    # back to an unaligned spot in the parent struct, e.g. `ptr +i64 -186` in
+    # `gpu_workqueue_map_kernel` — see investigation notes at
+    # docs/specs/2026-04-25-unaligned-bda-investigation.md).
+    access_align <= 1 && return false
 
     # Check 0: LLVM's own alignment on the load/store instruction.
     # LLVM SROA produces `load i64, ptr %gep, align 1` when the byte GEP offset may not
@@ -2269,12 +2279,26 @@ function psb_needs_decomposition(state::SPIRVEmitterState, ptr::LLVM.Value, acce
         end
     end
 
-    # Check 2: known byte offset from integer-arithmetic GEP path
-    offset = get(state.psb_known_byte_offsets, ptr, Int64(-1))
-    if offset > 0
-        addr_align = UInt32(1 << trailing_zeros(offset))
-        if addr_align < access_align
-            return true
+    # Check 2: known byte offset from integer-arithmetic GEP path.
+    #
+    # `psb_known_byte_offsets` stores the SIGNED constant offset.  SROA emits
+    # negative offsets (e.g. `getelementptr i8, ptr %end, i64 -34`) when it
+    # decomposes a struct that's accessed via end-relative pointer arithmetic.
+    # We must check the offset's |LSB| against the access alignment regardless
+    # of sign — `(base + (-34)) mod 4` is the same problem as `(base + 34) mod 4`.
+    # The sentinel `-1` (no entry) is distinguishable from a real offset of 0
+    # (which is always trivially aligned and short-circuits anyway), so use
+    # `!== nothing`/explicit `haskey` to avoid colliding with real -1 offsets
+    # in future code.  For now the original sentinel-mask is preserved with a
+    # `haskey` guard.
+    if haskey(state.psb_known_byte_offsets, ptr)
+        offset = state.psb_known_byte_offsets[ptr]
+        offset_abs = abs(offset)
+        if offset_abs > 0
+            addr_align = UInt32(1 << trailing_zeros(offset_abs))
+            if addr_align < access_align
+                return true
+            end
         end
     end
 

@@ -188,6 +188,54 @@ const SPIRV_OPT_ENABLED = Ref(true)  # enabled: cleans up StructurizeCFG's redun
                                       # that RADV miscompiles for loops containing `continue`
 
 """
+    dump_spirv_to_disk(spirv_bytes::Vector{UInt8}, post_pass_ir::AbstractString,
+                       kernel_name::AbstractString;
+                       entry_name::AbstractString="")
+
+If `ENV["LAVA_SPIRV_DUMP_DIR"]` is set, write the SPIR-V binary + post-pass
+LLVM IR to `<dir>/<entry>__<sanitised_kernel>__<hash>.{spv,ll}`.  No-op
+when the env var is unset (the compile-path fast-path stays free of file
+I/O).
+
+Used to capture every SPIR-V module Lava compiles in a session — essential
+when triaging GPU-AV alignment errors so we can `spirv-dis` the exact
+shader that tripped the validator and trace the offset back through the
+post-pass IR.
+
+`entry_name` is the original (pre-wrapper) function name, e.g. the Julia
+kernel symbol; if non-empty it is prepended to the filename for human
+readability.  `kernel_name` is the wrapper symbol (typically `"main"`).
+
+The hash is over `spirv_bytes` (not the IR) so structurally-identical
+shaders share a file across runs.
+"""
+function dump_spirv_to_disk(spirv_bytes::Vector{UInt8},
+                            post_pass_ir::AbstractString,
+                            kernel_name::AbstractString;
+                            entry_name::AbstractString="")
+    dir = get(ENV, "LAVA_SPIRV_DUMP_DIR", "")
+    isempty(dir) && return nothing
+    isdir(dir) || mkpath(dir)
+    h = string(hash(spirv_bytes); base=16, pad=16)
+    sanitize(s) = replace(s, r"[^A-Za-z0-9_]" => "_")
+    # Mangled GPUCompiler names can run to several hundred chars (every
+    # type parameter is encoded in the symbol).  Filesystems cap filenames
+    # at ~255 bytes, so trim entry_name to a readable prefix.  The sanitized
+    # `kernel_name` (typically "main") + 16-char SPIR-V hash are unique
+    # enough; entry_name is human-readable hint only.
+    prefix = ""
+    if !isempty(entry_name)
+        s = sanitize(entry_name)
+        s_trim = length(s) > 80 ? s[1:80] : s
+        prefix = s_trim * "__"
+    end
+    base = joinpath(dir, "$(prefix)$(sanitize(kernel_name))__$(h)")
+    write(base * ".spv", spirv_bytes)
+    write(base * ".ll", post_pass_ir)
+    return base * ".spv"
+end
+
+"""
     run_spirv_opt(spirv_bytes::Vector{UInt8}) -> Vector{UInt8}
 
 Run spirv-opt on the SPIR-V binary to optimize it. Uses SPIRV_Tools_jll.
@@ -332,6 +380,7 @@ function lava_compile_full(@nospecialize(f), @nospecialize(tt);
         # Validation
         write("/tmp/lava_last.spv", spirv_bytes)
         write("/tmp/lava_last.ll", post_pass_ir)
+        dump_spirv_to_disk(spirv_bytes, post_pass_ir, wrapper_name; entry_name)
         if validate
             validate_spirv(spirv_bytes, post_pass_ir, source_map)
         end
@@ -375,6 +424,7 @@ function lava_compile_gfx_full(@nospecialize(f), @nospecialize(tt);
 
         write("/tmp/lava_last.spv", spirv_bytes)
         write("/tmp/lava_last.ll", post_pass_ir)
+        dump_spirv_to_disk(spirv_bytes, post_pass_ir, wrapper_name; entry_name)
         if validate
             validate_spirv(spirv_bytes, post_pass_ir, source_map)
         end
@@ -419,6 +469,7 @@ function lava_compile_rt_full(@nospecialize(f), @nospecialize(tt);
 
         write("/tmp/lava_last.spv", spirv_bytes)
         write("/tmp/lava_last.ll", post_pass_ir)
+        dump_spirv_to_disk(spirv_bytes, post_pass_ir, wrapper_name; entry_name)
         if validate
             validate_spirv(spirv_bytes, post_pass_ir, source_map)
         end
@@ -579,6 +630,7 @@ function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob; validate::Bool 
 
         # Save SPIR-V for debugging
         write(joinpath(_dbg_dir, "kernel_$(_kidx)_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).spv"), spirv_bytes)
+        dump_spirv_to_disk(spirv_bytes, ir, wrapper_name; entry_name)
 
         # ── Stage 3: Validation ──
         if validate
@@ -673,6 +725,7 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
                                                 payload_type=payload_type)
 
         write("/tmp/lava_last.spv", spirv_bytes)
+        dump_spirv_to_disk(spirv_bytes, ir, wrapper_name; entry_name)
 
         if validate
             validate_spirv(spirv_bytes, ir, source_map)

@@ -43,6 +43,8 @@ export HardwareAccel, RTRay, RTHitResult, ASBuildContext, as_build
 export trace_closest_hits!, trace_closest_hits_indirect!, RayTracingPipeline, trace_rays!, trace_rays_indirect!
 export set_anyhit_pipeline!, trace_closest_hits_anyhit!, trace_closest_hits_anyhit_indirect!
 export lava_rt_ignore_intersection, lava_rt_terminate_ray
+export HWTLAS, HWAdaptedAccel, PrecomputedHitsAccel
+export batch_trace_indirect, set_custom_anyhit!
 
 import Serialization
 using Vulkan
@@ -132,6 +134,7 @@ include("raytracing/acceleration.jl")  # BLAS/TLAS build
 include("raytracing/pipeline.jl")      # RT pipeline + SBT + dispatch
 include("raytracing/shaders.jl")       # High-level RayTracingPipeline API
 include("raytracing/raycore_compat.jl") # HardwareAccel + trace_closest_hits!
+include("raytracing/hwtlas.jl")         # Lava.HWTLAS — concrete AbstractAccel
 
 # ---- Default settings ----
 # Disable scalar indexing by default (GPU arrays should not be accessed element-by-element)

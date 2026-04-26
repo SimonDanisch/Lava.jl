@@ -93,5 +93,55 @@ end
     @testset "Tier 4: GPUArrays TestSuite" begin
         include(joinpath(@__DIR__, "test_gpuarrays.jl"))
     end
+
+    # ── Tier 3i: HW TLAS (Lava.HWTLAS) ──
+    @testset "HW TLAS — stress + correctness" begin
+        include(joinpath(@__DIR__, "test_hwtlas_stress.jl"))
+    end
+
+    @testset "HW TLAS — mesh update" begin
+        include(joinpath(@__DIR__, "test_hwtlas_mesh_update.jl"))
+    end
+
+    @testset "HW TLAS — UAF safety" begin
+        include(joinpath(@__DIR__, "test_hwtlas_uaf_safety.jl"))
+    end
+
+    @testset "HW TLAS — nonblocking sync!" begin
+        include(joinpath(@__DIR__, "test_hwtlas_nonblocking_sync.jl"))
+    end
+
+    # ── Tier 3j: Phase-M alloc/free regression matrix ──────────────────
+    # Five MWEs that progressively approach Hikari's render workload.
+    # All five MUST stay clean across 20+ iters with per-iter alloc/free.
+    # If one starts crashing, that narrows the failing pattern — see
+    # docs/specs/2026-04-25-iter6-cascade-investigation.md.
+    @testset "Phase-M alloc/free MWE matrix" begin
+        @testset "compute" begin
+            include(joinpath(@__DIR__, "mwe_alloc_dispatch_free_loop.jl"))
+        end
+        @testset "RT direct" begin
+            include(joinpath(@__DIR__, "mwe_rt_alloc_dispatch_free_loop.jl"))
+        end
+        @testset "RT indirect + busy" begin
+            include(joinpath(@__DIR__, "mwe_indirect_rt_busy_loop.jl"))
+        end
+        @testset "12 distinct kernels" begin
+            include(joinpath(@__DIR__, "mwe_distinct_kernels_per_iter.jl"))
+        end
+        @testset "SoA workqueue" begin
+            include(joinpath(@__DIR__, "mwe_soa_workqueue_per_iter.jl"))
+        end
+        @testset "VolPath shape" begin
+            include(joinpath(@__DIR__, "mwe_volpath_shape_per_iter.jl"))
+        end
+    end
+
+    # ── Tier 4: GPU-AV regression (gated on LAVA_GPU_AV=1; ~minutes) ──
+    if get(ENV, "LAVA_GPU_AV", "0") == "1"
+        @testset "GPU-AV clean" begin
+            include(joinpath(@__DIR__, "test_gpuav_clean.jl"))
+        end
+    end
 end
 

@@ -225,7 +225,7 @@ mutable struct VkContext
     memory_properties::Vulkan.PhysicalDeviceMemoryProperties
     max_wg_dims::NTuple{3, Int}
     # Alignment (bytes) for BDAs passed as `pScratchData` in AS builds.
-    # Keyed off `LAVA_SCRATCH_BIT` in `extra_usage` — see `bda_alignment_for`.
+    # Picked by `bda_alignment_for(ctx, scratch=true)`.
     as_scratch_align::UInt64
 
     # Inner constructor: two-phase init via `new()` so we can hand a live
@@ -700,9 +700,9 @@ function init_vulkan!()
     end
 
     # Query AS scratch alignment once and cache on the context — used by
-    # `bda_alignment_for(::VkContext, extra_usage)` to pick the right
-    # alignment for `AS_SCRATCH_USAGE` allocations.  Vulkan has no usage bit
-    # for scratch; we use the Lava-only LAVA_SCRATCH_BIT marker to disambiguate.
+    # `bda_alignment_for(::VkContext, scratch::Bool)` to pick the right
+    # alignment for `LavaArray(...; scratch=true)` allocations.  Vulkan has no
+    # usage flag for "AS scratch", so callers signal via the `scratch` kwarg.
     as_scratch_align = UInt64(1)
     if has_rt
         as_props2 = Vulkan.get_physical_device_properties_2(phys_dev,

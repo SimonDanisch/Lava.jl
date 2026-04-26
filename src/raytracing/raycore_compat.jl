@@ -7,13 +7,15 @@
 using Raycore: RTRay, RTHitResult
 
 """
-    HardwareAccel
+    HardwareAccel{TriVec <: AbstractVector}
 
 Hardware-accelerated ray tracing context. Built from a Raycore-compatible TLAS.
+Parametrised on the concrete triangle-vector type (e.g.
+`Vector{Raycore.Triangle{UInt32}}`) so field accesses stay type-stable.
 
 # Fields
 - `tlas::LavaTLAS` — Vulkan top-level acceleration structure
-- `triangle_data::Vector` — CPU vector of all primitives (for lookup after trace)
+- `triangle_data::TriVec` — CPU vector of all primitives (for lookup after trace)
 - `blas_offsets::Vector{UInt32}` — Per-BLAS offset into triangle_data
 - `rt_pipeline::RayTracingPipeline` — Pre-compiled raygen+closesthit+miss
 
@@ -24,9 +26,9 @@ results = LavaArray{RTHitResult}(n_rays)
 trace_closest_hits!(results, rays, hw)
 ```
 """
-mutable struct HardwareAccel
+mutable struct HardwareAccel{TriVec <: AbstractVector}
     tlas::LavaTLAS
-    triangle_data::Vector           # CPU primitives for lookup
+    triangle_data::TriVec           # CPU primitives for lookup
     blas_offsets::Vector{UInt32}
     # Per-instance triangle-array offset, indexed by `gl_InstanceID`.
     # `per_instance_tri_offsets[iid+1]` = offset into `triangle_data` where
@@ -76,17 +78,18 @@ geometry-dependent fields (`tlas`, `triangle_data`, `blas_offsets`,
 Raycore/RayMakie flow this happens automatically on every `sync!(hwtlas)` —
 one pipeline per HWTLAS, lifetime tied to the HWTLAS.
 """
-function HardwareAccel(hw_tlas::LavaTLAS, triangle_data, blas_offsets,
+function HardwareAccel(hw_tlas::LavaTLAS, triangle_data::TriVec, blas_offsets,
                        per_instance_tri_offsets::AbstractVector{UInt32};
-                       bq::BatchQueue=(hw_tlas.storage.buf[].ctx::VkContext).default_bq)
+                       bq::BatchQueue=(hw_tlas.storage.buf[].ctx::VkContext).default_bq
+                       ) where {TriVec <: AbstractVector}
     pipeline = RayTracingPipeline(
         raygen=hw_raygen,
         closest_hit=hw_closesthit,
         miss=hw_miss,
         payload_type=:f32_7,
     )
-    HardwareAccel(hw_tlas, triangle_data, blas_offsets, collect(per_instance_tri_offsets),
-                  pipeline, nothing, bq)
+    HardwareAccel{TriVec}(hw_tlas, triangle_data, blas_offsets, collect(per_instance_tri_offsets),
+                         pipeline, nothing, bq)
 end
 
 """

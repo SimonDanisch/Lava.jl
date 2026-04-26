@@ -39,19 +39,45 @@ Lava's GPU compute backend. Carries the Vulkan context and batch queues explicit
     LavaBackend()                      # default: dispatch + upload both on default_bq
     LavaBackend(bq)                    # single queue for both
     LavaBackend(dispatch_bq, upload_bq)  # split — enables pipelining
+
+`LavaBackend()` with no arguments resolves `dispatch_bq` / `upload_bq`
+lazily via `vk_context().default_bq` at every property access.  Pinning
+would break after `vk_reset_device!()`: a `const BACKEND = LavaBackend()`
+created at module-load would keep a stale `BatchQueue` tied to the old
+`VkDevice`, and every subsequent buffer created via that backend would end
+up allocated on the dead device — later triggering
+`VUID-vkCmdCopyBuffer-commonparent` and a page-aligned GPUVM fault.
+Explicit queues passed to `LavaBackend(bq)` / `LavaBackend(d, u)` are
+pinned on purpose (the caller wants those exact queues, e.g. an async
+upload queue).
 """
 struct LavaBackend <: KA.GPU
-    dispatch_bq::BatchQueue
-    upload_bq::BatchQueue
+    # nothing = "use vk_context().default_bq at each access" (survives resets)
+    # non-nothing = caller pinned this specific queue
+    dispatch_bq::Union{BatchQueue, Nothing}
+    upload_bq::Union{BatchQueue, Nothing}
 end
 
-LavaBackend() = LavaBackend(vk_context())
+LavaBackend() = LavaBackend(nothing, nothing)
 LavaBackend(ctx::VkContext) = (let bq = ctx.default_bq; LavaBackend(bq, bq); end)
 LavaBackend(bq::BatchQueue) = LavaBackend(bq, bq)
 
-# Back-compat: callers that read `backend.bq` get the dispatch queue (the
-# one that runs compute kernels).
-Base.getproperty(b::LavaBackend, s::Symbol) = s === :bq ? getfield(b, :dispatch_bq) : getfield(b, s)
+# Property access resolves a `nothing`-pinned queue through the live
+# `vk_context()` so a module-level `const BACKEND = LavaBackend()` keeps
+# working across `vk_reset_device!()`. `:bq` stays a back-compat alias for
+# `:dispatch_bq`.
+function Base.getproperty(b::LavaBackend, s::Symbol)
+    if s === :dispatch_bq
+        f = getfield(b, :dispatch_bq)
+        return f === nothing ? vk_context().default_bq : f
+    elseif s === :upload_bq
+        f = getfield(b, :upload_bq)
+        return f === nothing ? vk_context().default_bq : f
+    elseif s === :bq
+        return getproperty(b, :dispatch_bq)
+    end
+    return getfield(b, s)
+end
 
 # ── Backend queries ──
 

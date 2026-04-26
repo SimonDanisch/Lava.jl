@@ -237,6 +237,14 @@ end
                            offset::Int, byval_size::Int, inline_offset::Int,
                            batch::CommandBatch)
     pin!(batch, buf)
+    if PACK_ARG_ASSERT_LIVE[]
+        st = @atomic :acquire buf.state
+        if st != BUF_STATE_ALIVE
+            throw(LavaError("pack_arg!",
+                "packing buffer with state=$st (not ALIVE) at addr=0x$(string(buf.address, base=16, pad=16))",
+                "buffer was freed but its BDA is being packed into an arg slab — use-after-free"))
+        end
+    end
     unsafe_store!(Ptr{UInt64}(mapped_ptr + offset), buf.address)
     return inline_offset
 end

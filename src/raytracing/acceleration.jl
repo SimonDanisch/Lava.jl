@@ -111,6 +111,10 @@ end
 # Back-compat shim for existing callers.
 destroy!(x::Union{LavaBLAS, LavaTLAS}) = unsafe_free!(x)
 
+# No-op for `nothing` so HWTLAS sync! cleanup paths can `unsafe_free!` old
+# backings uniformly without per-call nothing checks.
+unsafe_free!(::Nothing) = nothing
+
 """
     drain_deferred_as_frees!(bq::BatchQueue)
 
@@ -204,7 +208,7 @@ function build_blas(ctx::ASBuildContext, vertices::Vector{NTuple{3,Float32}}, in
         Vulkan.ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR))
 
     scratch_arr = LavaArray{UInt8,1}(undef, (max(Int(sizes.build_scratch_size), 16),);
-                                      bq, extra_usage=AS_SCRATCH_USAGE)
+                                      bq, extra_usage=AS_SCRATCH_USAGE, scratch=true)
     scratch_addr = bda_address(scratch_arr)
 
     # Build inputs (vertex + index) must outlive the BLAS — the driver may
@@ -225,7 +229,9 @@ function build_blas(ctx::ASBuildContext, vertices::Vector{NTuple{3,Float32}}, in
 
     addr_info = Vulkan.AccelerationStructureDeviceAddressInfoKHR(accel)
     as_addr = Vulkan.get_acceleration_structure_device_address_khr(dev, addr_info)
-
+    if Lava.ALLOC_DEBUG_ENABLED[]
+        push!(Lava.ALLOC_DEBUG_LOG, (kind=:blas_as, addr=as_addr, size=0, pool=false))
+    end
     blas = LavaBLAS(accel, storage, as_addr, blas_preserves)
     finalizer(unsafe_free!, blas)
     return blas
@@ -270,7 +276,7 @@ function build_tlas(ctx::ASBuildContext, blas_list::Vector{LavaBLAS};
         Vulkan.ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR))
 
     scratch_arr = LavaArray{UInt8,1}(undef, (max(Int(sizes.build_scratch_size), 16),);
-                                      bq, extra_usage=AS_SCRATCH_USAGE)
+                                      bq, extra_usage=AS_SCRATCH_USAGE, scratch=true)
     scratch_addr = bda_address(scratch_arr)
 
     # Instance buffer must outlive the TLAS (driver may retain VAs).
@@ -364,13 +370,20 @@ function create_as_input_pool(ctx::VkContext, nbytes::UInt64)
 
     addr = Vulkan.get_buffer_device_address(dev, Vulkan.BufferDeviceAddressInfo(buf))
 
+    # DEBUG: log AS-input host-visible buffer addresses (separate memory heap
+    # from device-local pool), to correlate with cross-scene cascade fault
+    # addresses in the 0x8000_xxxx_xxxx range.
+    if Lava.ALLOC_DEBUG_ENABLED[]
+        push!(Lava.ALLOC_DEBUG_LOG,
+              (kind=:as_input_pool, addr=addr, size=Int(nbytes), pool=false))
+    end
+
     return buf, memory, addr
 end
 
-# Buffer usage bits for AS build paths.  LAVA_SCRATCH_BIT (declared in
-# runtime/memory.jl) is a Lava-only high bit on `extra_usage` that picks
-# AS-scratch alignment; `vk_alloc` strips it before handing the usage mask
-# to Vulkan (no dedicated Vulkan usage bit exists for scratch).
+# Buffer usage bits for AS build paths.  AS-build scratch needs a specific
+# BDA alignment (`ctx.as_scratch_align`); pass `scratch=true` to LavaArray
+# alongside `extra_usage=AS_SCRATCH_USAGE` to apply it.
 const AS_INPUT_USAGE = UInt32(
     Vulkan.BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
     Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
@@ -382,7 +395,7 @@ const AS_STORAGE_USAGE = UInt32(
 
 const AS_SCRATCH_USAGE = UInt32(
     Vulkan.BUFFER_USAGE_STORAGE_BUFFER_BIT |
-    Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) | LAVA_SCRATCH_BIT
+    Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
 
 const VkBRI = Vulkan.VulkanCore.LibVulkan.VkAccelerationStructureBuildRangeInfoKHR
 
@@ -745,7 +758,7 @@ function build_blas_pooled(all_vertices::Vector{Vector{NTuple{3,Float32}}},
     as_pool_buf = as_pool_arr.buf[].buffer
     as_pool_mem = as_pool_arr.buf[].memory
     scratch_arr = LavaArray{UInt8,1}(undef, (max(Int(max_scratch_size), 16),);
-                                      bq, extra_usage=AS_SCRATCH_USAGE)
+                                      bq, extra_usage=AS_SCRATCH_USAGE, scratch=true)
     scratch_addr = bda_address(scratch_arr)
     scratch_buf = scratch_arr.buf[].buffer
     scratch_mem = scratch_arr.buf[].memory
@@ -774,6 +787,9 @@ function build_blas_pooled(all_vertices::Vector{Vector{NTuple{3,Float32}}},
         accel = Vulkan.AccelerationStructureKHR(dev, as_ci)
         addr_info = Vulkan.AccelerationStructureDeviceAddressInfoKHR(accel)
         as_addr = Vulkan.get_acceleration_structure_device_address_khr(dev, addr_info)
+        if Lava.ALLOC_DEBUG_ENABLED[]
+            push!(Lava.ALLOC_DEBUG_LOG, (kind=:blas_as_pool, addr=as_addr, size=0, pool=true))
+        end
         # All pooled BLASes share `as_pool_arr` as their storage. They
         # reference the same LavaArray so its VkManagedBuffer's last_write
         # tracks in-flight use of any of them collectively.
@@ -1000,7 +1016,7 @@ function build_hw_accel_from_tlas(tlas;
 
     # Scratch buffer: single allocation, reused for all builds
     scratch_arr = LavaArray{UInt8,1}(undef, (max(Int(max_scratch_size), 16),);
-                                      bq, extra_usage=AS_SCRATCH_USAGE)
+                                      bq, extra_usage=AS_SCRATCH_USAGE, scratch=true)
     scratch_addr = bda_address(scratch_arr)
     scratch_buf = scratch_arr.buf[].buffer
     scratch_mem = scratch_arr.buf[].memory
@@ -1033,6 +1049,9 @@ function build_hw_accel_from_tlas(tlas;
         accel = Vulkan.AccelerationStructureKHR(dev, as_ci)
         addr_info = Vulkan.AccelerationStructureDeviceAddressInfoKHR(accel)
         as_addr = Vulkan.get_acceleration_structure_device_address_khr(dev, addr_info)
+        if Lava.ALLOC_DEBUG_ENABLED[]
+            push!(Lava.ALLOC_DEBUG_LOG, (kind=:blas_as_pool2, addr=as_addr, size=0, pool=true))
+        end
         blas = LavaBLAS(accel, as_pool_arr, as_addr, LavaArray[])
         # No finalizer: each pooled BLAS shares `as_pool_arr` as storage.
         # Julia GC keeps `as_pool_arr` alive while any BLAS references it;

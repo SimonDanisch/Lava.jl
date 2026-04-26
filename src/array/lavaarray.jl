@@ -40,21 +40,23 @@ end
 function LavaArray{T,N}(::UndefInitializer, dims::NTuple{N,Int};
                         bq::BatchQueue=vk_context().default_bq,
                         extra_usage::UInt32=UInt32(0),
+                        scratch::Bool=false,
                         unified::Bool=false) where {T,N}
     ctx = bq.ctx::VkContext
     nbytes = prod(dims) * sizeof(T)
 
-    # Alignment is a function of `extra_usage` alone (see `bda_alignment_for`).
-    # We over-allocate by (align - 1) bytes and shift the LavaArray's element
-    # offset so `bda_address(arr)` lands on the right boundary.  For T=UInt8
-    # the offset is always valid; otherwise we assert divisibility.
-    align = bda_alignment_for(ctx, extra_usage)
+    # AS-build scratch buffers need a specific BDA alignment
+    # (`ctx.as_scratch_align`).  Other buffers default to 1.  We over-allocate
+    # by (align - 1) bytes and shift the LavaArray's element offset so
+    # `bda_address(arr)` lands on the right boundary.  For T=UInt8 the offset
+    # is always valid; otherwise we assert divisibility.
+    align = bda_alignment_for(ctx, scratch)
     slack = align > 1 ? Int(align) - 1 : 0
 
     # Non-default usage (index buffer, AS input/storage, scratch, etc.) or
     # BAR-mapped (unified) memory bypasses the pool since those buffers need
     # specific flags at VkBuffer/DeviceMemory creation time.
-    use_pool = extra_usage == UInt32(0) && !unified
+    use_pool = extra_usage == UInt32(0) && !scratch && !unified
     managed_buf = use_pool ?
         pool_alloc(bq, max(nbytes + slack, 16)) :
         vk_alloc(bq, max(nbytes + slack, 16); extra_usage, unified)
