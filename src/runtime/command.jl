@@ -444,38 +444,23 @@ case, loud is correct: we want the dispatcher / finalizer log to show it.
             "This is a driver bug, stack corruption, or an invalid semaphore handle."))
 end
 
-# ── Vulkan wrappers that auto-mark device_lost on failure ───────────────────
+# ── Vulkan call helpers: single source of truth for device-lost handling ──
 #
-# These are the canonical entry points for queue submits and waits.  ALL
-# callers in Lava (and integrations like Hikari) go through them.  The old
-# way — calling Vulkan.queue_submit / Vulkan.wait_for_fences and remembering
-# to mark_device_lost! on failure at every site — was bug-prone: any
-# forgotten site left the ctx in a "dispatcher gate doesn't fire, user keeps
-# issuing work that silently no-ops" state.
-#
-# Two-level design:
-#   * `mark_if_lost!(bq, result)` — pure side-effect: marks the ctx if
-#     `result` is a DEVICE_LOST error.  Does not throw.  This is the SOLE
-#     place the "VkResult → device_lost flag" mapping lives.  Callers that
-#     need custom recovery + rich error context (e.g. submit!) use this.
-#   * `queue_submit!` / `queue_submit_2!` / `wait_for_fences!`
-#     / `wait_semaphores!` — full wrappers that call the Vulkan API,
-#     run `mark_if_lost!`, and throw `LavaVulkanError` on any error.
-#     Use these from any site that doesn't need extra recovery.
+# Every Vulkan call that can fail should funnel through `throw_if_error` (or
+# its non-throwing sibling `mark_if_lost!` for callers with custom recovery).
+# This is the SOLE place the "VkResult → device_lost flag" rule lives, so
+# the dispatcher gate at `ensure_active_batch!` reliably fires after any
+# DEVICE_LOST regardless of which low-level call surfaced the error.
 
 """
-    mark_if_lost!(result)            # falls back to the global VkContext
+    mark_if_lost!(result)            # uses the global VkContext
     mark_if_lost!(bq::BatchQueue, result)
     mark_if_lost!(ctx::VkContext, result)
 
 Mark `ctx.device_lost = true` iff `result` is a Vulkan `ERROR_DEVICE_LOST`.
-Does not throw.  Single source of truth for the "VkResult → device_lost
-flag" mapping — pair every fallible Vulkan call with this, followed either
-by your own recovery or by the throw of one of the wrappers below.
-
-The bq/ctx-less form uses `VK_CONTEXT_REF[]` so it can be called from sites
-that don't have a queue/ctx in scope (texture upload, bind_*_memory, etc).
-With exactly one VkContext per process, that's unambiguous.
+Does not unwrap, does not throw.  Use this when a caller needs to do its
+own recovery before throwing (`submit!`, `flush!`).  Otherwise prefer
+`throw_if_error` which handles the whole pattern.
 """
 @inline function mark_if_lost!(ctx::VkContext, result)
     iserror(result) || return
@@ -494,65 +479,72 @@ device_lost_hint(call) =
     "Vulkan device is lost during $(call). " *
     "Call Lava.vk_reset_device!() to reinitialize, or restart Julia."
 
-@inline function throw_vk_error(bq::BatchQueue, call::String, result)
-    mark_if_lost!(bq, result)
+"""
+    throw_if_error(result)                                # uses global ctx
+    throw_if_error(bq::BatchQueue, result)
+    throw_if_error(ctx::VkContext, result)
+    throw_if_error(ctx_or_bq, call::String, result)       # adds a call name
+
+Canonical "do everything" Vulkan-call wrapper.
+On success → returns the unwrapped value.
+On error   → marks `ctx.device_lost` (if the error is `DEVICE_LOST`) and
+             throws `LavaVulkanError` with a hint.
+
+Replace any `unwrap(Vulkan.foo(...))` with `throw_if_error(ctx, Vulkan.foo(...))`
+to get the device-lost handling for free.  The wrappers below
+(`queue_submit!`, `wait_for_fences!`, ...) are thin spellings of this.
+"""
+@inline function throw_if_error(ctx::VkContext, call::String, result)
+    iserror(result) || return unwrap(result)
+    mark_if_lost!(ctx, result)
     e = unwrap_error(result)::Vulkan.VulkanError
     suggestion = e.code == Vulkan.ERROR_DEVICE_LOST ? device_lost_hint(call) : ""
     throw(LavaVulkanError(call, Int32(e.code), e.msg, suggestion))
 end
-
-"""
-    queue_submit!(bq, submits::Vector{Vulkan.SubmitInfo}; fence=Vulkan.Fence(C_NULL))
-
-`vkQueueSubmit` wrapper.  Sole entry point for legacy submit (no
-SemaphoreSubmitInfo2).  Auto-marks `bq.ctx.device_lost` on
-`ERROR_DEVICE_LOST` and throws `LavaVulkanError`.
-"""
-function queue_submit!(bq::BatchQueue, submits::AbstractVector{Vulkan.SubmitInfo};
-                            fence=Vulkan.Fence(C_NULL))
-    result = Vulkan.queue_submit(bq.queue, submits; fence=fence)
-    iserror(result) && throw_vk_error(bq, "vkQueueSubmit", result)
-    return unwrap(result)
+@inline throw_if_error(ctx::VkContext, result) = throw_if_error(ctx, "Vulkan call", result)
+@inline throw_if_error(bq::BatchQueue, args...) = throw_if_error(bq.ctx::VkContext, args...)
+@inline function throw_if_error(result)
+    ctx = VK_CONTEXT_REF[]
+    ctx === nothing && return unwrap(result)
+    return throw_if_error(ctx, result)
 end
 
 """
-    queue_submit_2!(bq, submits::Vector{Vulkan.SubmitInfo2}; fence=Vulkan.Fence(C_NULL))
+    queue_submit!(bq, submits; fence=Vulkan.Fence(C_NULL))
 
-`vkQueueSubmit2` wrapper.  Used by `submit!` for the timeline-semaphore
-batch path.  Auto-marks device_lost on failure.
+`vkQueueSubmit` wrapper.  Auto-marks device_lost on failure and throws
+`LavaVulkanError`.
 """
-function queue_submit_2!(bq::BatchQueue, submits::AbstractVector{Vulkan.SubmitInfo2};
-                              fence=Vulkan.Fence(C_NULL))
-    result = Vulkan.queue_submit_2(bq.queue, submits; fence=fence)
-    iserror(result) && throw_vk_error(bq, "vkQueueSubmit2", result)
-    return unwrap(result)
-end
+@inline queue_submit!(bq::BatchQueue, submits::AbstractVector{Vulkan.SubmitInfo};
+                      fence=Vulkan.Fence(C_NULL)) =
+    throw_if_error(bq, "vkQueueSubmit", Vulkan.queue_submit(bq.queue, submits; fence=fence))
+
+"""
+    queue_submit_2!(bq, submits; fence=Vulkan.Fence(C_NULL))
+
+`vkQueueSubmit2` wrapper.  Auto-marks device_lost on failure.
+"""
+@inline queue_submit_2!(bq::BatchQueue, submits::AbstractVector{Vulkan.SubmitInfo2};
+                        fence=Vulkan.Fence(C_NULL)) =
+    throw_if_error(bq, "vkQueueSubmit2", Vulkan.queue_submit_2(bq.queue, submits; fence=fence))
 
 """
     wait_for_fences!(bq, fences; wait_all=true, timeout=typemax(UInt64))
 
-`vkWaitForFences` wrapper.  Used by AS builds and other fence-based syncs.
-Auto-marks device_lost on failure.
+`vkWaitForFences` wrapper.  Auto-marks device_lost on failure.
 """
-function wait_for_fences!(bq::BatchQueue, fences;
-                               wait_all::Bool=true, timeout::UInt64=typemax(UInt64))
-    result = Vulkan.wait_for_fences(bq.device, fences, wait_all, timeout)
-    iserror(result) && throw_vk_error(bq, "vkWaitForFences", result)
-    return unwrap(result)
-end
+@inline wait_for_fences!(bq::BatchQueue, fences;
+                         wait_all::Bool=true, timeout::UInt64=typemax(UInt64)) =
+    throw_if_error(bq, "vkWaitForFences", Vulkan.wait_for_fences(bq.device, fences, wait_all, timeout))
 
 """
-    wait_semaphores!(bq, info::Vulkan.SemaphoreWaitInfo, timeout=typemax(UInt64))
+    wait_semaphores!(bq, info; timeout=typemax(UInt64))
 
-`vkWaitSemaphores` wrapper.  Used by `flush!` for timeline-semaphore
-waits.  Auto-marks device_lost on failure.
+`vkWaitSemaphores` wrapper.  Auto-marks device_lost on failure.
 """
-function wait_semaphores!(bq::BatchQueue, info::Vulkan.SemaphoreWaitInfo;
-                               timeout::UInt64=typemax(UInt64))
-    result = Vulkan.wait_semaphores(bq.device, info, timeout)
-    iserror(result) && throw_vk_error(bq, "vkWaitSemaphores", result)
-    return unwrap(result)
-end
+@inline wait_semaphores!(bq::BatchQueue, info::Vulkan.SemaphoreWaitInfo;
+                         timeout::UInt64=typemax(UInt64)) =
+    throw_if_error(bq, "vkWaitSemaphores", Vulkan.wait_semaphores(bq.device, info, timeout))
 
 """
     submit!(bq::BatchQueue) -> CommandBatch or nothing

@@ -366,7 +366,8 @@ function create_as_input_pool(ctx::VkContext, nbytes::UInt64)
     alloc_flags = Vulkan.MemoryAllocateFlagsInfo(UInt32(0);
         flags=Vulkan.MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT)
     memory = Vulkan.DeviceMemory(dev, mem_reqs.size, mem_type_idx; next=alloc_flags)
-    unwrap(Vulkan.bind_buffer_memory(dev, buf, memory, 0))
+    throw_if_error(ctx, "vkBindBufferMemory",
+        Vulkan.bind_buffer_memory(dev, buf, memory, 0))
 
     addr = Vulkan.get_buffer_device_address(dev, Vulkan.BufferDeviceAddressInfo(buf))
 
@@ -764,7 +765,8 @@ function build_blas_pooled(all_vertices::Vector{Vector{NTuple{3,Float32}}},
     scratch_mem = scratch_arr.buf[].memory
 
     # Pass 3: Upload all vertex/index data into the input pool
-    mapped_ptr = unwrap(Vulkan.map_memory(dev, input_mem, 0, total_input_bytes))
+    mapped_ptr = throw_if_error(ctx, "vkMapMemory",
+        Vulkan.map_memory(dev, input_mem, 0, total_input_bytes))
     for i in 1:n_blas
         vdata = all_vertices[i]
         vbytes = length(vdata) * sizeof(NTuple{3,Float32})
@@ -1022,7 +1024,8 @@ function build_hw_accel_from_tlas(tlas;
     scratch_mem = scratch_arr.buf[].memory
 
     # ── Pass 4: Upload vertex/index data into input pool ──
-    mapped_ptr = unwrap(Vulkan.map_memory(dev, input_mem, 0, total_input_bytes))
+    mapped_ptr = throw_if_error(ctx, "vkMapMemory",
+        Vulkan.map_memory(dev, input_mem, 0, total_input_bytes))
     for i in 1:n_blas
         # Copy vertex data
         vdata = all_vertices[i]

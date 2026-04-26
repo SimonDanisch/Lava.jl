@@ -202,10 +202,9 @@ function acquire_next_image!(win::RenderWindow)
         win.frame_batches[fi] = nothing
     end
 
-    acq_result = Vulkan.acquire_next_image_khr(dev, win.swapchain,
-        typemax(UInt64); semaphore=win.image_available[fi])
-    mark_if_lost!(ctx, acq_result)
-    idx, _ = unwrap(acq_result)
+    idx, _ = throw_if_error(ctx, "vkAcquireNextImageKHR",
+        Vulkan.acquire_next_image_khr(dev, win.swapchain,
+            typemax(UInt64); semaphore=win.image_available[fi]))
 
     win.current_image_idx = idx
     win.acquired = true
@@ -227,9 +226,8 @@ function present!(win::RenderWindow)
         [win.swapchain],
         [win.current_image_idx],
     )
-    present_result = Vulkan.queue_present_khr(ctx.default_bq.queue, present_info)
-    mark_if_lost!(ctx, present_result)
-    unwrap(present_result)
+    throw_if_error(ctx, "vkQueuePresentKHR",
+        Vulkan.queue_present_khr(ctx.default_bq.queue, present_info))
 
     win.acquired = false
     # Advance to next frame-in-flight slot

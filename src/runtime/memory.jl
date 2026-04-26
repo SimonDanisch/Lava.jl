@@ -858,8 +858,10 @@ function get_staging(bq::BatchQueue, nbytes::Integer)
         Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT,
     )
     memory = Vulkan.DeviceMemory(dev, mem_reqs.size, mem_type_idx)
-    unwrap(Vulkan.bind_buffer_memory(dev, vkbuf, memory, 0))
-    mapped_ptr = Ptr{UInt8}(unwrap(Vulkan.map_memory(dev, memory, 0, alloc_size)))
+    throw_if_error(ctx, "vkBindBufferMemory",
+        Vulkan.bind_buffer_memory(dev, vkbuf, memory, 0))
+    mapped_ptr = Ptr{UInt8}(throw_if_error(ctx, "vkMapMemory",
+        Vulkan.map_memory(dev, memory, 0, alloc_size)))
 
     managed = VkManagedBuffer(vkbuf, memory, UInt64(0),   # no BDA needed for staging
                               mapped_ptr, Int(alloc_size),
