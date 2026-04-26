@@ -414,7 +414,7 @@ function present_frame!(bq::BatchQueue, win::RenderWindow)
     ]
     cb_info = Vulkan.CommandBufferSubmitInfo(cmd, UInt32(0))
     submit_info = Vulkan.SubmitInfo2(wait_infos, [cb_info], signal_infos)
-    unwrap(Vulkan.queue_submit_2(bq.queue, [submit_info]; fence=win.in_flight[fi]))
+    queue_submit_2!(bq, [submit_info]; fence=win.in_flight[fi])
 
     # Store batch in window's per-frame slot — it will be reclaimed in
     # acquire_next_image! after the fence wait confirms GPU completion.

@@ -600,8 +600,8 @@ function as_build(f; bq::BatchQueue=vk_context().default_bq)
 
     fence = bq.as_fence
     submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    unwrap(Vulkan.queue_submit(bq.queue, [submit_info]; fence=fence))
-    unwrap(Vulkan.wait_for_fences(bq.device, [fence], true, typemax(UInt64)))
+    queue_submit!(bq, [submit_info]; fence=fence)
+    wait_for_fences!(bq, [fence])
     unwrap(Vulkan.reset_fences(bq.device, [fence]))
 
     # Inputs that must outlive the GPU submit (vertex/index for BLAS, instance

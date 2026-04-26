@@ -187,7 +187,7 @@ function acquire_next_image!(win::RenderWindow)
     dev = ctx.device
     fi = win.current_frame
 
-    unwrap(Vulkan.wait_for_fences(dev, [win.in_flight[fi]], true, typemax(UInt64)))
+    wait_for_fences!(ctx.default_bq, [win.in_flight[fi]])
     unwrap(Vulkan.reset_fences(dev, [win.in_flight[fi]]))
 
     # Reclaim batch from previous frame in this slot — GPU is done (fence waited above)
