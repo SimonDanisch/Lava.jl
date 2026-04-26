@@ -8,8 +8,8 @@ import .SPIRVTestUtils: check, check_not, compile_and_disasm
 @testset "Ray Query - Phase A1 constants" begin
     @test Lava.Op.OpRayQueryInitializeKHR == UInt16(4473)
     @test Lava.Op.OpRayQueryProceedKHR == UInt16(4477)
-    @test Lava.Op.OpRayQueryConfirmIntersectionKHR == UInt16(4474)
-    @test Lava.Op.OpRayQueryTerminateKHR == UInt16(4475)
+    @test Lava.Op.OpRayQueryTerminateKHR == UInt16(4474)
+    @test Lava.Op.OpRayQueryConfirmIntersectionKHR == UInt16(4476)
     @test Lava.Op.OpRayQueryGetIntersectionTypeKHR == UInt16(4479)
     @test Lava.Op.OpRayQueryGetIntersectionTKHR == UInt16(6018)
     @test Lava.Op.OpRayQueryGetIntersectionInstanceIdKHR == UInt16(6020)
@@ -100,4 +100,67 @@ end
         ctx.ray_query_available = saved
     end
     check(d, "OpRayQueryInitializeKHR")
+end
+
+@testset "Ray Query - Phase A5 control flow + getters" begin
+    ctx = Lava.vk_context()
+    saved = ctx.ray_query_available
+    ctx.ray_query_available = true
+    local d
+    try
+        function full_kernel(out)
+            Lava.lava_ray_query_init(Ray(o=Point3f(0, 0, 0), d=Vec3f(0, 0, 1), t_min=0f0, t_max=1f3))
+            while Lava.lava_ray_query_proceed()
+                kind = Lava.lava_ray_query_get_type(false)  # candidate
+                if kind == UInt32(0)  # candidate triangle
+                    Lava.lava_ray_query_confirm()
+                end
+            end
+            committed = Lava.lava_ray_query_get_type(true)
+            thit = Lava.lava_ray_query_get_t(true)
+            inst = Lava.lava_ray_query_get_instance_id(true)
+            cust = Lava.lava_ray_query_get_instance_custom_index(true)
+            prim = Lava.lava_ray_query_get_primitive_index(true)
+            bx, by = Lava.lava_ray_query_get_barycentrics(true)
+            @inbounds out[1] = thit
+            @inbounds out[2] = Float32(inst) + Float32(cust) + Float32(prim)
+            @inbounds out[3] = bx + by
+            @inbounds out[4] = Float32(committed)
+            return nothing
+        end
+        d, _ = compile_and_disasm(full_kernel, Tuple{Lava.LavaDeviceArray{Float32,1}};
+                                  stage=:compute, enable_ray_query=true)
+    finally
+        ctx.ray_query_available = saved
+    end
+    for op in ("OpRayQueryProceedKHR",
+               "OpRayQueryConfirmIntersectionKHR",
+               "OpRayQueryGetIntersectionTypeKHR",
+               "OpRayQueryGetIntersectionTKHR",
+               "OpRayQueryGetIntersectionInstanceIdKHR",
+               "OpRayQueryGetIntersectionInstanceCustomIndexKHR",
+               "OpRayQueryGetIntersectionPrimitiveIndexKHR",
+               "OpRayQueryGetIntersectionBarycentricsKHR")
+        check(d, op)
+    end
+end
+
+@testset "Ray Query - Phase A5 terminate" begin
+    ctx = Lava.vk_context()
+    saved = ctx.ray_query_available
+    ctx.ray_query_available = true
+    local d
+    try
+        function term_kernel(out)
+            Lava.lava_ray_query_init(Ray(o=Point3f(0, 0, 0), d=Vec3f(0, 0, 1), t_min=0f0, t_max=1f3))
+            Lava.lava_ray_query_terminate()
+            @inbounds out[1] = 1f0
+            return nothing
+        end
+        d, _ = compile_and_disasm(term_kernel, Tuple{Lava.LavaDeviceArray{Float32,1}};
+                                  stage=:compute, enable_ray_query=true)
+    finally
+        ctx.ray_query_available = saved
+    end
+    check(d, "OpRayQueryTerminateKHR")
 end

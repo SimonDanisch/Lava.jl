@@ -5887,6 +5887,26 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return emit_rt_terminate_ray!(state, inst)
         elseif fn_name == "lava_ray_query_init"
             return emit_ray_query_init!(state, inst)
+        elseif fn_name == "lava_ray_query_proceed"
+            return emit_ray_query_proceed!(state, inst)
+        elseif fn_name == "lava_ray_query_confirm"
+            return emit_ray_query_confirm!(state, inst)
+        elseif fn_name == "lava_ray_query_terminate"
+            return emit_ray_query_terminate!(state, inst)
+        elseif fn_name == "lava_ray_query_get_type"
+            return emit_ray_query_get_type!(state, inst)
+        elseif fn_name == "lava_ray_query_get_t"
+            return emit_ray_query_get_t!(state, inst)
+        elseif fn_name == "lava_ray_query_get_instance_id"
+            return emit_ray_query_get_instance_id!(state, inst)
+        elseif fn_name == "lava_ray_query_get_instance_custom_index"
+            return emit_ray_query_get_instance_custom_index!(state, inst)
+        elseif fn_name == "lava_ray_query_get_primitive_index"
+            return emit_ray_query_get_primitive_index!(state, inst)
+        elseif fn_name == "lava_ray_query_get_barycentrics_x"
+            return emit_ray_query_get_barycentrics_x!(state, inst)
+        elseif fn_name == "lava_ray_query_get_barycentrics_y"
+            return emit_ray_query_get_barycentrics_y!(state, inst)
         end
 
         # Check for graphics intrinsics → I/O stores/loads, emit_vertex, etc.

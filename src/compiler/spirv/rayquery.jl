@@ -158,3 +158,99 @@ function emit_ray_query_init!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     push!(mod.functions, tmax_id)
     return nothing
 end
+
+# Helper: emit a no-result ray-query op that takes only the implicit query variable.
+# word count = 1 (opcode word) + 1 (query var) = 2.
+function emit_rq_no_arg!(state::SPIRVEmitterState, opcode::UInt16)
+    mod = state.mod
+    qvar = get_or_create_ray_query_var!(state)
+    push!(mod.functions, (UInt32(2) << 16) | UInt32(opcode))
+    push!(mod.functions, qvar)
+    return nothing
+end
+
+function emit_ray_query_proceed!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    mod = state.mod
+    qvar = get_or_create_ray_query_var!(state)
+    bool_ty = emit_type_bool!(mod)
+    res_id = fresh_id!(mod)
+    # OpRayQueryProceedKHR %result_type %result_id %query -- word count = 4
+    push!(mod.functions, (UInt32(4) << 16) | UInt32(Op.OpRayQueryProceedKHR))
+    push!(mod.functions, bool_ty)
+    push!(mod.functions, res_id)
+    push!(mod.functions, qvar)
+    state.value_map[inst] = res_id
+    return nothing
+end
+
+emit_ray_query_confirm!(state::SPIRVEmitterState, ::LLVM.CallInst) =
+    emit_rq_no_arg!(state, Op.OpRayQueryConfirmIntersectionKHR)
+
+emit_ray_query_terminate!(state::SPIRVEmitterState, ::LLVM.CallInst) =
+    emit_rq_no_arg!(state, Op.OpRayQueryTerminateKHR)
+
+# Helper: emit a GetIntersection op that returns a scalar result.
+# Instruction layout: opcode %result_type %result_id %query %committed -- word count = 5.
+function emit_rq_get_scalar!(state::SPIRVEmitterState, inst::LLVM.CallInst,
+                              opcode::UInt16, result_ty::UInt32)
+    mod = state.mod
+    qvar = get_or_create_ray_query_var!(state)
+    committed_id = get_value_id!(state, LLVM.operands(inst)[1])
+    res_id = fresh_id!(mod)
+    push!(mod.functions, (UInt32(5) << 16) | UInt32(opcode))
+    push!(mod.functions, result_ty)
+    push!(mod.functions, res_id)
+    push!(mod.functions, qvar)
+    push!(mod.functions, committed_id)
+    state.value_map[inst] = res_id
+    return nothing
+end
+
+emit_ray_query_get_type!(state, inst) =
+    emit_rq_get_scalar!(state, inst, Op.OpRayQueryGetIntersectionTypeKHR,
+                        emit_type_int!(state.mod, UInt32(32), UInt32(0)))
+
+emit_ray_query_get_t!(state, inst) =
+    emit_rq_get_scalar!(state, inst, Op.OpRayQueryGetIntersectionTKHR,
+                        emit_type_float!(state.mod, UInt32(32)))
+
+emit_ray_query_get_instance_id!(state, inst) =
+    emit_rq_get_scalar!(state, inst, Op.OpRayQueryGetIntersectionInstanceIdKHR,
+                        emit_type_int!(state.mod, UInt32(32), UInt32(0)))
+
+emit_ray_query_get_instance_custom_index!(state, inst) =
+    emit_rq_get_scalar!(state, inst, Op.OpRayQueryGetIntersectionInstanceCustomIndexKHR,
+                        emit_type_int!(state.mod, UInt32(32), UInt32(0)))
+
+emit_ray_query_get_primitive_index!(state, inst) =
+    emit_rq_get_scalar!(state, inst, Op.OpRayQueryGetIntersectionPrimitiveIndexKHR,
+                        emit_type_int!(state.mod, UInt32(32), UInt32(0)))
+
+# Helper: emit OpRayQueryGetIntersectionBarycentricsKHR and extract one component.
+# The op returns a vec2 float; we extract component 0 (x) or 1 (y) via OpCompositeExtract.
+function emit_rq_barycentric_component!(state::SPIRVEmitterState, inst::LLVM.CallInst,
+                                        component::UInt32)
+    mod = state.mod
+    qvar = get_or_create_ray_query_var!(state)
+    committed_id = get_value_id!(state, LLVM.operands(inst)[1])
+    f32_ty  = emit_type_float!(mod, UInt32(32))
+    vec2_ty = emit_type_vector!(mod, f32_ty, UInt32(2))
+    vec_id  = fresh_id!(mod)
+    # OpRayQueryGetIntersectionBarycentricsKHR %vec2 %vec_id %query %committed -- word count = 5
+    push!(mod.functions, (UInt32(5) << 16) | UInt32(Op.OpRayQueryGetIntersectionBarycentricsKHR))
+    push!(mod.functions, vec2_ty)
+    push!(mod.functions, vec_id)
+    push!(mod.functions, qvar)
+    push!(mod.functions, committed_id)
+    # OpCompositeExtract %f32 %res_id %vec_id <literal index>
+    res_id = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpCompositeExtract, f32_ty, res_id, vec_id, component)
+    state.value_map[inst] = res_id
+    return nothing
+end
+
+emit_ray_query_get_barycentrics_x!(state, inst) =
+    emit_rq_barycentric_component!(state, inst, UInt32(0))
+
+emit_ray_query_get_barycentrics_y!(state, inst) =
+    emit_rq_barycentric_component!(state, inst, UInt32(1))

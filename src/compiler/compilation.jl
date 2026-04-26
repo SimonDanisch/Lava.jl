@@ -1068,6 +1068,48 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
 end
 
 """
+Fix call instructions where the call-site return type is `i8` but the callee is
+defined to return `i1`. Julia emits these when a `Bool`-returning `llvmcall` stub
+is wrapped by a thunk that uses `i8` at ABI boundaries. The LLVM AlwaysInliner
+refuses to inline across such a type mismatch, so we fix the call site first:
+replace `%v = call i8 @f()` with `%v1 = call i1 @f(); %v = zext i1 %v1 to i8`.
+"""
+function fix_bool_call_mismatches!(mod::LLVM.Module)
+    i1_ty  = LLVM.Int1Type()
+    i8_ty  = LLVM.Int8Type()
+    to_fix = Tuple{LLVM.CallInst, LLVM.Function}[]
+
+    for fn in LLVM.functions(mod)
+        for bb in LLVM.blocks(fn)
+            for inst in LLVM.instructions(bb)
+                inst isa LLVM.CallInst || continue
+                called = LLVM.called_operand(inst)
+                called isa LLVM.Function || continue
+                # Check: call site returns i8 but definition returns i1
+                LLVM.value_type(inst) == i8_ty || continue
+                def_ret = LLVM.return_type(LLVM.function_type(called))
+                def_ret == i1_ty || continue
+                push!(to_fix, (inst, called))
+            end
+        end
+    end
+
+    for (call_inst, callee) in to_fix
+        # Build replacement: call i1 @callee(); zext i1 to i8
+        LLVM.@dispose builder=LLVM.IRBuilder() begin
+            LLVM.position!(builder, call_inst)
+            fn_ty = LLVM.FunctionType(i1_ty, LLVM.LLVMType[])
+            new_call = LLVM.call!(builder, fn_ty, callee)
+            zext_val = LLVM.zext!(builder, new_call, i8_ty)
+            LLVM.replace_uses!(call_inst, zext_val)
+            LLVM.erase!(call_inst)
+        end
+    end
+
+    return nothing
+end
+
+"""
 Force-inline all internal functions into the entry function.
 
 Marks all non-entry, non-declaration functions as `alwaysinline`, runs the
@@ -1090,6 +1132,11 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function)
         delete!(attrs, LLVM.EnumAttribute("noinline"))
         push!(attrs, LLVM.EnumAttribute("alwaysinline"))
     end
+
+    # Fix i1/i8 call-site mismatches before running the inliner so that
+    # Bool-returning llvmcall thunks (e.g. lava_ray_query_proceed wrappers)
+    # are eligible for inlining.
+    fix_bool_call_mismatches!(mod)
 
     # Run inliner
     LLVM.run!(LLVM.AlwaysInlinerPass(), mod)
