@@ -195,6 +195,12 @@ AS-scratch alignment is the caller's responsibility — see
 """
 function vk_alloc(bq::BatchQueue, nbytes::Integer;
                   extra_usage::UInt32=UInt32(0), unified::Bool=false)
+    # Refuse allocation on a lost device — Vulkan calls would either error or
+    # (worse) succeed against a torn-down driver state and produce garbage BDAs.
+    device_lost(bq.ctx::VkContext) && throw(LavaError(
+        "vk_alloc",
+        "Vulkan device is lost — cannot allocate new buffers",
+        "Call Lava.vk_reset_device!() to reinitialize, or restart Julia."))
     if TRACK_ALLOCS[]
         _record_alloc_site!(Int(nbytes))
     end
@@ -269,9 +275,20 @@ function try_vk_alloc(bq::BatchQueue, nbytes::Integer;
             mapped_ptr = Ptr{UInt8}(unwrap(Vulkan.map_memory(dev, memory, 0, nbytes)))
         end
     catch e
-        if e isa Vulkan.VulkanError || (e isa LavaError && occursin("memory", e.operation))
+        # Only swallow honest OOM — every other VulkanError must propagate so
+        # the caller sees the real cause (DEVICE_LOST, INVALID_OPAQUE_CAPTURE_ADDRESS,
+        # MEMORY_MAP_FAILED, …).  Otherwise vk_alloc's GC-retry would loop and
+        # eventually throw a misleading "Out of GPU memory".
+        if e isa Vulkan.VulkanError &&
+           (e.code == Vulkan.ERROR_OUT_OF_DEVICE_MEMORY ||
+            e.code == Vulkan.ERROR_OUT_OF_HOST_MEMORY)
             empty!(VALIDATION_MESSAGES)
             return nothing
+        end
+        # DEVICE_LOST during alloc is a hard fault — mark + propagate so the
+        # subsequent dispatcher gate fires cleanly.
+        if e isa Vulkan.VulkanError && e.code == Vulkan.ERROR_DEVICE_LOST
+            mark_device_lost!(ctx)
         end
         rethrow()
     end
@@ -699,6 +716,12 @@ with non-default usage flags bypass the pool via `vk_alloc`.
 """
 function pool_alloc(bq::BatchQueue, nbytes::Integer; extra_usage::UInt32=UInt32(0))
     ctx = bq.ctx::VkContext
+    # Even pure free-list reuse must refuse a dead device — the pool blocks
+    # belong to the old (broken) ctx and would hand back garbage BDAs.
+    device_lost(ctx) && throw(LavaError(
+        "pool_alloc",
+        "Vulkan device is lost — cannot allocate new buffers",
+        "Call Lava.vk_reset_device!() to reinitialize, or restart Julia."))
     nbytes = max(Int(nbytes), POOL_MIN_SIZE)
     if TRACK_ALLOCS[]
         _record_alloc_site!(nbytes)
