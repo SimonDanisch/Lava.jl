@@ -39,7 +39,9 @@ export tess_coord, tess_coord_uvw, set_tess_level_outer!, set_tess_level_inner!
 export sample_texture_2d, GfxTexture2D
 
 # Ray tracing exports
-export GeometryType, TrianglesGeometry, AABBsGeometry, AABB, Ray
+export GeometryType, TrianglesGeometry, AABBsGeometry, AABB
+# Re-export Raycore.Ray so `using Lava` users get Ray without ambiguity
+export Ray
 export HardwareAccel, RTRay, RTHitResult, ASBuildContext, as_build
 export trace_closest_hits!, trace_closest_hits_indirect!, RayTracingPipeline, trace_rays!, trace_rays_indirect!
 export set_anyhit_pipeline!, trace_closest_hits_anyhit!, trace_closest_hits_anyhit_indirect!
@@ -50,6 +52,7 @@ export batch_trace_indirect, set_custom_anyhit!
 import Serialization
 using Vulkan
 using GPUCompiler
+using Raycore: Ray
 using LLVM
 using LLVM: API
 using GPUArrays
@@ -132,7 +135,6 @@ include("graphics/api.jl")           # GraphicsPipeline, draw!, blit!, present_f
 
 # ---- Phase 2: Ray Tracing ----
 include("raytracing/geometry_types.jl")  # GeometryType hierarchy + AABB struct
-include("raytracing/ray.jl")             # Ray struct for inline ray-query intrinsics
 include("raytracing/acceleration.jl")  # BLAS/TLAS build
 include("raytracing/pipeline.jl")      # RT pipeline + SBT + dispatch
 include("raytracing/shaders.jl")       # High-level RayTracingPipeline API

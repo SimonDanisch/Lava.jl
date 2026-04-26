@@ -24,14 +24,6 @@ end
     @test a.max == Point3f(1, 2, 3)
 end
 
-@testset "Ray struct" begin
-    r = Ray(Point3f(0, 0, 0), Vec3f(0, 0, 1), 0f0, 1f3)
-    @test r.origin == Point3f(0, 0, 0)
-    @test r.direction == Vec3f(0, 0, 1)
-    @test r.tmin == 0f0
-    @test r.tmax == 1f3
-end
-
 @testset "pack_geometry! :: TrianglesGeometry byte layout" begin
     buf = zeros(UInt8, 128)
     geom = TrianglesGeometry(; vertex_format=UInt32(103),    # VK_FORMAT_R32G32B32_SFLOAT
