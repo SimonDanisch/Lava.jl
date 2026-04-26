@@ -464,18 +464,30 @@ end
 #     Use these from any site that doesn't need extra recovery.
 
 """
+    mark_if_lost!(result)            # falls back to the global VkContext
     mark_if_lost!(bq::BatchQueue, result)
+    mark_if_lost!(ctx::VkContext, result)
 
-Marks `bq.ctx.device_lost = true` iff `result` is `ERROR_DEVICE_LOST`.
+Mark `ctx.device_lost = true` iff `result` is a Vulkan `ERROR_DEVICE_LOST`.
 Does not throw.  Single source of truth for the "VkResult → device_lost
-flag" mapping.  Pair every Vulkan call that may fail with this, followed
-either by the throw of one of the wrappers below or by your own recovery.
+flag" mapping — pair every fallible Vulkan call with this, followed either
+by your own recovery or by the throw of one of the wrappers below.
+
+The bq/ctx-less form uses `VK_CONTEXT_REF[]` so it can be called from sites
+that don't have a queue/ctx in scope (texture upload, bind_*_memory, etc).
+With exactly one VkContext per process, that's unambiguous.
 """
-@inline function mark_if_lost!(bq::BatchQueue, result)
+@inline function mark_if_lost!(ctx::VkContext, result)
     iserror(result) || return
     e = unwrap_error(result)::Vulkan.VulkanError
-    e.code == Vulkan.ERROR_DEVICE_LOST && mark_device_lost!(bq.ctx::VkContext)
+    e.code == Vulkan.ERROR_DEVICE_LOST && mark_device_lost!(ctx)
     return
+end
+@inline mark_if_lost!(bq::BatchQueue, result) = mark_if_lost!(bq.ctx::VkContext, result)
+@inline function mark_if_lost!(result)
+    ctx = VK_CONTEXT_REF[]
+    ctx === nothing && return
+    return mark_if_lost!(ctx, result)
 end
 
 device_lost_hint(call) =
