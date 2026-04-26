@@ -293,7 +293,11 @@ struct LavaGPUKernel
     workgroup_size::NTuple{3,Int}
     push_info::PushConstantInfo
     ir::String
+    enable_ray_query::Bool
 end
+# Backward-compat constructor for disk-cache deserialization (old entries lack the field).
+LavaGPUKernel(spirv_bytes, entry_name, workgroup_size, push_info, ir) =
+    LavaGPUKernel(spirv_bytes, entry_name, workgroup_size, push_info, ir, false)
 
 # ── Unified introspection result ──
 
@@ -590,7 +594,7 @@ so the cache keys it off of Julia's `MethodInstance` (type-based) and gets
 proper world-age tracking for free.
 """
 function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob;
-                                    enable_ray_query::Bool = false,
+                                    enable_ray_query::Bool = job.config.params.enable_ray_query,
                                     validate::Bool = true)
     workgroup_size = job.config.params.workgroup_size
     GPUCompiler.JuliaContext() do ctx
@@ -640,7 +644,7 @@ function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob;
             validate_spirv(spirv_bytes, ir, source_map)
         end
 
-        return LavaGPUKernel(spirv_bytes, wrapper_name, workgroup_size, push_info, ir)
+        return LavaGPUKernel(spirv_bytes, wrapper_name, workgroup_size, push_info, ir, enable_ray_query)
     end
 end
 
@@ -662,7 +666,7 @@ function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
               "Either run on a device that supports ray_query (e.g. RADV, " *
               "lavapipe) or call lava_compile_gpu without enable_ray_query.")
     end
-    config = lava_compiler_config(; workgroup_size)
+    config = lava_compiler_config(; workgroup_size, enable_ray_query)
     source = GPUCompiler.methodinstance(typeof(f), tt)
     job = GPUCompiler.CompilerJob(source, config)
     return lava_compile_gpu_from_job(job; enable_ray_query, validate)

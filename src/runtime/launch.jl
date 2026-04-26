@@ -110,7 +110,8 @@ Example:
 """
 function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
                        ndrange::Union{Integer, NTuple{3,<:Integer}},
-                       workgroup_size::NTuple{3,Int} = (64, 1, 1))
+                       workgroup_size::NTuple{3,Int} = (64, 1, 1),
+                       tlas=nothing)  # Union{Nothing, HWTLAS} — declared later in raytracing/hwtlas.jl
     validate_launch_args(args)
     if ndrange isa Integer
         ndrange_3d = (Int(ndrange), 1, 1)
@@ -137,8 +138,17 @@ function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
     # Kernel ABI: kernel signature types are POST-adapt (LavaDeviceArray, not Ptr{T}).
     tt = Tuple{map(arg_sigtype, converted_args)...}
 
+    enable_ray_query = tlas !== nothing
     compiled, pipeline, offsets, byval_sizes =
-        get_compiled_kernel_and_pipeline(bq.ctx::VkContext, converted_f, tt, workgroup_size)
+        get_compiled_kernel_and_pipeline(bq.ctx::VkContext, converted_f, tt, workgroup_size;
+                                         enable_ray_query)
+
+    # Loud error: kernel needs TLAS but none was provided at launch.
+    if pipeline.needs_tlas_descriptor && tlas === nothing
+        error("kernel was compiled with enable_ray_query=true but launch_kernel was " *
+              "called without a tlas keyword. Pass tlas=<HWTLAS> to bind the " *
+              "acceleration structure to descriptor set 0, binding 0.")
+    end
 
     # GPUCompiler prepends typeof(f) as the LLVM entry's first param; the entry
     # wrapper allocates a BDA slot for it unless it's a ghost type.
@@ -153,7 +163,7 @@ function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
     if DISPATCH_LOGGING_ENABLED[]
         LAST_DISPATCH_INFO[] = "compute f=$(nameof(typeof(converted_f))) groups=$groups"
     end
-    vk_dispatch!(bq, pipeline, arg_buf.address, groups)
+    vk_dispatch!(bq, pipeline, arg_buf.address, groups; tlas)
     return nothing
 end
 
@@ -355,7 +365,8 @@ function lava_disk_cache_store(source::Core.MethodInstance, workgroup_size, kern
         workgroup_size = workgroup_size,
         kernel = LavaGPUKernel(
             kernel.spirv_bytes, kernel.entry_name, kernel.workgroup_size,
-            kernel.push_info, ""  # don't cache the LLVM IR string (large, session-specific)
+            kernel.push_info, "",  # don't cache the LLVM IR string (large, session-specific)
+            kernel.enable_ray_query
         ),
     )
     try
@@ -398,7 +409,8 @@ Create session-dependent Vulkan objects (VkPipeline) from cached SPIR-V bytes.
 """
 function link_kernel(ctx::VkContext, compiled::LavaGPUKernel)
     pipeline = get_compute_pipeline(ctx, compiled.spirv_bytes, compiled.entry_name;
-                                    push_constant_size=compiled.push_info.push_size)
+                                    push_constant_size=compiled.push_info.push_size,
+                                    needs_tlas_descriptor=compiled.enable_ray_query)
     offsets = Int[p.first for p in compiled.push_info.arg_layout]
     byval_sizes = compiled.push_info.byval_llvm_sizes
     return LavaLinkedKernel(compiled, pipeline, offsets, byval_sizes)
@@ -415,6 +427,8 @@ compile so subsequent sessions can short-circuit via `lava_disk_cache_load`
 in `link_kernel` (see below).
 """
 function lava_kernel_compile(job::GPUCompiler.CompilerJob)
+    # enable_ray_query is read from the job's LavaCompilerParams,
+    # where it was set by lava_compiler_config(; enable_ray_query).
     compiled = lava_compile_gpu_from_job(job)
     lava_disk_cache_store(job.source, job.config.params.workgroup_size, compiled)
     return compiled
@@ -448,8 +462,10 @@ hashes by `(objectid(MethodInstance), world, cfg)` — type-based, so
 different closure instances of the same type share one compiled kernel,
 and world-age tracking means Revise edits invalidate correctly.
 """
-function get_compiled_kernel_and_pipeline(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workgroup_size)
-    config = lava_compiler_config(; workgroup_size)
+function get_compiled_kernel_and_pipeline(ctx::VkContext, @nospecialize(f), @nospecialize(tt),
+                                          workgroup_size;
+                                          enable_ray_query::Bool=false)
+    config = lava_compiler_config(; workgroup_size, enable_ray_query)
     source = GPUCompiler.methodinstance(typeof(f), tt)
     linked = GPUCompiler.cached_compilation(LINKED_KERNEL_CACHE, source, config,
                                              lava_kernel_compile, LavaLinker(ctx))

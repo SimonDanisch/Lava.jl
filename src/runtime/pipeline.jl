@@ -86,28 +86,46 @@ struct LavaComputePipeline
     pipeline_layout::Vulkan.PipelineLayout
     pipeline::Vulkan.Pipeline
     push_constant_size::UInt32
+    needs_tlas_descriptor::Bool
+    descriptor_set_layout::Union{Nothing, Vulkan.DescriptorSetLayout}
 end
 
 const PIPELINE_CACHE = Dict{UInt64, LavaComputePipeline}()
 const PIPELINE_INSERTION_ORDER = UInt64[]
 const MAX_PIPELINE_CACHE_SIZE = Ref(1024)
 
+# Descriptor set cache for compute pipelines with TLAS (set=0, binding=0).
+# Keyed by (ds_layout handle, tlas Julia objectid).
+# Mirrors the RT_DESC_CACHE pattern from raytracing/pipeline.jl.
+const COMPUTE_TLAS_DESC_CACHE = Dict{Tuple{UInt64, UInt64}, Tuple{Vulkan.DescriptorPool, Vulkan.DescriptorSet, WeakRef}}()
+const MAX_COMPUTE_TLAS_DESC_CACHE_SIZE = 32
+
 # Register cleanup callback for vk_reset_device!
 push!(RESET_CALLBACKS, function()
     empty!(PIPELINE_CACHE)
     empty!(PIPELINE_INSERTION_ORDER)
+    for (_, (pool, _, _)) in COMPUTE_TLAS_DESC_CACHE
+        try
+            pool.destructor()
+        catch
+            safe_fin_log("Lava COMPUTE_TLAS_DESC_CACHE reset: descriptor pool destructor failed\n")
+        end
+    end
+    empty!(COMPUTE_TLAS_DESC_CACHE)
 end)
 
 """
     get_compute_pipeline(spirv_bytes::Vector{UInt8}, entry_name::String;
-                         push_constant_size::Integer=8) -> LavaComputePipeline
+                         push_constant_size::Integer=8,
+                         needs_tlas_descriptor::Bool=false) -> LavaComputePipeline
 
 Get or create a compute pipeline from SPIR-V binary.
 Validates SPIR-V before creating the shader module.
 """
 function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_name::String;
-                               push_constant_size::Integer=8)
-    cache_key = hash((spirv_bytes, entry_name, push_constant_size))
+                               push_constant_size::Integer=8,
+                               needs_tlas_descriptor::Bool=false)
+    cache_key = hash((spirv_bytes, entry_name, push_constant_size, needs_tlas_descriptor))
     cached = get(PIPELINE_CACHE, cache_key, nothing)
     if cached !== nothing
         return cached
@@ -132,11 +150,23 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
         Vulkan.PushConstantRange[]
     end
 
-    layout = Vulkan.PipelineLayout(
-        dev,
-        Vulkan.DescriptorSetLayout[],
-        push_ranges
-    )
+    # Descriptor set layout: binding 0 = TLAS (only when needs_tlas_descriptor)
+    ds_layout = nothing
+    ds_layouts = Vulkan.DescriptorSetLayout[]
+    if needs_tlas_descriptor
+        ds_layout = Vulkan.DescriptorSetLayout(
+            dev,
+            [Vulkan.DescriptorSetLayoutBinding(
+                UInt32(0),
+                Vulkan.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+                Vulkan.SHADER_STAGE_COMPUTE_BIT;
+                descriptor_count = UInt32(1)
+            )]
+        )
+        push!(ds_layouts, ds_layout)
+    end
+
+    layout = Vulkan.PipelineLayout(dev, ds_layouts, push_ranges)
 
     # Create compute pipeline
     stage = Vulkan.PipelineShaderStageCreateInfo(
@@ -149,7 +179,8 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
 
     pipeline = create_compute_pipeline(dev, ci)
 
-    result = LavaComputePipeline(shader_mod, layout, pipeline, UInt32(push_constant_size))
+    result = LavaComputePipeline(shader_mod, layout, pipeline, UInt32(push_constant_size),
+                                  needs_tlas_descriptor, ds_layout)
     PIPELINE_CACHE[cache_key] = result
     push!(PIPELINE_INSERTION_ORDER, cache_key)
     while length(PIPELINE_INSERTION_ORDER) > MAX_PIPELINE_CACHE_SIZE[]
@@ -161,6 +192,63 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
         # naturally and GC runs the destructor.
     end
     return result
+end
+
+"""
+    get_compute_tlas_descriptor_set(dev, pipeline, tlas) -> Vulkan.DescriptorSet
+
+Get or create a descriptor set that binds `tlas.accel` to set=0, binding=0
+for a compute pipeline compiled with `needs_tlas_descriptor=true`.
+
+Caches by (ds_layout handle, tlas objectid) so re-dispatch of the same
+pipeline+TLAS pair is allocation-free.
+
+`tlas` is a `LavaTLAS` — declared later in raytracing/acceleration.jl.
+"""
+function get_compute_tlas_descriptor_set(dev::Vulkan.Device, pipeline::LavaComputePipeline,
+                                          tlas)  # LavaTLAS — declared later in raytracing/acceleration.jl
+    ds_layout = pipeline.descriptor_set_layout::Vulkan.DescriptorSetLayout
+    key = (UInt64(ds_layout.vks), objectid(tlas))
+    cached = get(COMPUTE_TLAS_DESC_CACHE, key, nothing)
+    if cached !== nothing
+        return cached[2]
+    end
+
+    # Evict stale (GC'd tlas) entries before adding new ones.
+    if length(COMPUTE_TLAS_DESC_CACHE) >= MAX_COMPUTE_TLAS_DESC_CACHE_SIZE
+        stale = Tuple{UInt64, UInt64}[]
+        for (k, (_, _, wr)) in COMPUTE_TLAS_DESC_CACHE
+            wr.value === nothing && push!(stale, k)
+        end
+        for k in stale
+            pool, _, _ = COMPUTE_TLAS_DESC_CACHE[k]
+            try pool.destructor() catch; safe_fin_log("COMPUTE_TLAS evict: pool destructor failed\n") end
+            delete!(COMPUTE_TLAS_DESC_CACHE, k)
+        end
+    end
+
+    desc_pool = Vulkan.DescriptorPool(dev, UInt32(1), [
+        Vulkan.DescriptorPoolSize(
+            Vulkan.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, UInt32(1)),
+    ])
+    desc_sets = @vk_checked "vkAllocateDescriptorSets (compute TLAS)" Vulkan.allocate_descriptor_sets(dev,
+        Vulkan.DescriptorSetAllocateInfo(desc_pool, [ds_layout]))
+    desc_set = desc_sets[1]
+
+    as_write = Vulkan.WriteDescriptorSetAccelerationStructureKHR([tlas.accel])
+    write_ds = Vulkan.WriteDescriptorSet(
+        desc_set, UInt32(0), UInt32(0),
+        Vulkan.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+        Vulkan.DescriptorImageInfo[],
+        Vulkan.DescriptorBufferInfo[],
+        Vulkan.BufferView[];
+        descriptor_count=UInt32(1),
+        next=as_write,
+    )
+    Vulkan.update_descriptor_sets(dev, [write_ds], [])
+
+    COMPUTE_TLAS_DESC_CACHE[key] = (desc_pool, desc_set, WeakRef(tlas))
+    return desc_set
 end
 
 function create_compute_pipeline(dev::Vulkan.Device, ci::Vulkan.ComputePipelineCreateInfo)

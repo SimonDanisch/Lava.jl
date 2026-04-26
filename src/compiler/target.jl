@@ -9,8 +9,10 @@
 
 struct LavaCompilerParams <: GPUCompiler.AbstractCompilerParams
     workgroup_size::NTuple{3,Int}
+    enable_ray_query::Bool
 end
-LavaCompilerParams() = LavaCompilerParams((64, 1, 1))
+LavaCompilerParams() = LavaCompilerParams((64, 1, 1), false)
+LavaCompilerParams(workgroup_size::NTuple{3,Int}) = LavaCompilerParams(workgroup_size, false)
 
 const LavaCompilerConfig = GPUCompiler.CompilerConfig{GPUCompiler.SPIRVCompilerTarget, LavaCompilerParams}
 const LavaCompilerJob = GPUCompiler.CompilerJob{GPUCompiler.SPIRVCompilerTarget, LavaCompilerParams}
@@ -139,13 +141,15 @@ GPUCompiler's SPIRVCompilerTarget with:
 - always_inline=true (SPIR-V requires all functions inlined for compute)
 - kernel=true (entry point is a kernel, not a regular function)
 """
-function lava_compiler_config(; workgroup_size::NTuple{3,Int} = (64, 1, 1), kwargs...)
-    h = hash((workgroup_size, kwargs))
+function lava_compiler_config(; workgroup_size::NTuple{3,Int} = (64, 1, 1),
+                               enable_ray_query::Bool = false,
+                               kwargs...)
+    h = hash((workgroup_size, enable_ray_query, kwargs))
     config = get(COMPILER_CONFIGS, h, nothing)
     if config !== nothing
         return config
     end
-    config = lava_full_compiler_config(; workgroup_size, kwargs...)
+    config = lava_full_compiler_config(; workgroup_size, enable_ray_query, kwargs...)
     COMPILER_CONFIGS[h] = config
     return config
 end
@@ -155,12 +159,13 @@ end
         name = nothing,
         always_inline = true,
         workgroup_size::NTuple{3,Int} = (64, 1, 1),
+        enable_ray_query::Bool = false,
         kwargs...)
     target = GPUCompiler.SPIRVCompilerTarget(;
         backend = :llvm,       # gives spirv64-unknown-unknown-unknown triple
         validate = false,      # we validate after our custom SPIR-V emitter
         supports_fp64 = true,  # AMD RX 7900 XTX supports Float64
     )
-    params = LavaCompilerParams(workgroup_size)
+    params = LavaCompilerParams(workgroup_size, enable_ray_query)
     GPUCompiler.CompilerConfig(target, params; kernel, name, always_inline)
 end
