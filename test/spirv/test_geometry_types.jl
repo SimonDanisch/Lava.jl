@@ -50,3 +50,17 @@ end
     @test reinterpret(UInt64, buf[81:88])[1] == UInt64(0)             # transform addr @ q+56
     @test reinterpret(UInt32, buf[89:92])[1] == UInt32(1)             # geo_flags @ p+88 (OPAQUE)
 end
+
+@testset "pack_geometry! :: AABBsGeometry byte layout" begin
+    buf = zeros(UInt8, 128)
+    geom = AABBsGeometry(; aabb_addr=UInt64(0xCAFEBABEDEADBEEF),
+                         aabb_stride=UInt64(24))
+    Lava.pack_geometry!(buf, 0, geom; geo_flags=UInt32(1))
+
+    @test reinterpret(Int32,  buf[1:4])[1]   == Lava.VK_STYPE_GEO    # sType @ 0
+    @test reinterpret(UInt32, buf[17:20])[1] == UInt32(1)             # geometryType = AABBS @ 16
+    @test reinterpret(Int32,  buf[25:28])[1] == Lava.VK_STYPE_AABB   # sType @ q+0
+    @test reinterpret(UInt64, buf[41:48])[1] == UInt64(0xCAFEBABEDEADBEEF)  # aabb_addr @ q+16
+    @test reinterpret(UInt64, buf[49:56])[1] == UInt64(24)            # aabb_stride @ q+24
+    @test reinterpret(UInt32, buf[89:92])[1] == UInt32(1)             # geo_flags @ p+88
+end

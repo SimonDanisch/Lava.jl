@@ -412,6 +412,7 @@ const VK_STYPE_SIZES = Int32(1000150020) # BUILD_SIZES_INFO (VK_STRUCTURE_TYPE_A
 const VK_STYPE_GEO = Int32(1000150006)   # GEOMETRY
 const VK_STYPE_TRI = Int32(1000150005)   # GEOMETRY_TRIANGLES_DATA
 const VK_STYPE_INST = Int32(1000150004)  # GEOMETRY_INSTANCES_DATA
+const VK_STYPE_AABB = Int32(1000150003)  # GEOMETRY_AABBS_DATA
 
 """Pack VkAccelerationStructureGeometryKHR (96 bytes, correct C layout) into `buf`.
 
@@ -437,6 +438,21 @@ function pack_geometry!(buf::Vector{UInt8}, offset::Int,
     unsafe_store!(Ptr{UInt32}(q + 44), geom.index_type)              # indexType @ 44
     unsafe_store!(Ptr{UInt64}(q + 48), geom.index_addr)              # indexData @ 48
     unsafe_store!(Ptr{UInt64}(q + 56), geom.transform_addr)          # transformData @ 56
+    unsafe_store!(Ptr{UInt32}(p + 88), geo_flags)                    # flags @ 88
+    return nothing
+end
+
+function pack_geometry!(buf::Vector{UInt8}, offset::Int,
+                        geom::AABBsGeometry; geo_flags::UInt32=UInt32(0))
+    p = pointer(buf, offset + 1)
+    q = p + 24  # geometry union start
+    unsafe_store!(Ptr{Int32}(p), VK_STYPE_GEO)                      # sType @ 0
+    unsafe_store!(Ptr{Ptr{Nothing}}(p + 8), C_NULL)                   # pNext @ 8
+    unsafe_store!(Ptr{UInt32}(p + 16), UInt32(1))                    # geometryType = AABBS @ 16
+    unsafe_store!(Ptr{Int32}(q), VK_STYPE_AABB)                      # sType @ q+0
+    unsafe_store!(Ptr{Ptr{Nothing}}(q + 8), C_NULL)                   # pNext @ q+8
+    unsafe_store!(Ptr{UInt64}(q + 16), geom.aabb_addr)               # data @ q+16
+    unsafe_store!(Ptr{UInt64}(q + 24), geom.aabb_stride)             # stride @ q+24
     unsafe_store!(Ptr{UInt32}(p + 88), geo_flags)                    # flags @ 88
     return nothing
 end
