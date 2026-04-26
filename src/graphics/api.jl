@@ -384,7 +384,7 @@ function present_frame!(bq::BatchQueue, win::RenderWindow)
         Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT, Vulkan.AccessFlag(0))
 
     # End command buffer
-    unwrap(Vulkan.end_command_buffer(cmd))
+    throw_if_error(bq, "vkEndCommandBuffer", Vulkan.end_command_buffer(cmd))
 
     fi = win.current_frame
 

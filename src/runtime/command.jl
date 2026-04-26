@@ -121,9 +121,10 @@ function ensure_active_batch!(bq::BatchQueue)
     batch = bq.active_batch
     if batch !== nothing
         if !batch.recording
-            unwrap(Vulkan.begin_command_buffer(batch.cmd_buf, Vulkan.CommandBufferBeginInfo(
-                flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-            )))
+            throw_if_error(bq, "vkBeginCommandBuffer",
+                Vulkan.begin_command_buffer(batch.cmd_buf, Vulkan.CommandBufferBeginInfo(
+                    flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+                )))
             batch.recording = true
             # Fresh open on reused batch — assign the timeline value it will
             # signal, so record_buffer_access! can write it into buf.last_write.
@@ -140,9 +141,10 @@ function ensure_active_batch!(bq::BatchQueue)
 
     bq.active_batch = batch
 
-    unwrap(Vulkan.begin_command_buffer(batch.cmd_buf, Vulkan.CommandBufferBeginInfo(
-        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-    )))
+    throw_if_error(bq, "vkBeginCommandBuffer",
+        Vulkan.begin_command_buffer(batch.cmd_buf, Vulkan.CommandBufferBeginInfo(
+            flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+        )))
     batch.recording = true
     batch.signal_value = bq.next_timeline + 1
     return batch
@@ -170,7 +172,8 @@ function alloc_cmd_buf(bq::BatchQueue)
     alloc_info = Vulkan.CommandBufferAllocateInfo(
         bq.cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1
     )
-    return unwrap(Vulkan.allocate_command_buffers(bq.device, alloc_info))[1]
+    return throw_if_error(bq, "vkAllocateCommandBuffers",
+        Vulkan.allocate_command_buffers(bq.device, alloc_info))[1]
 end
 
 """Reclaim a completed batch: clear pinned set, return to free pool."""
@@ -209,14 +212,15 @@ function maybe_split_cb!(batch::CommandBatch, bq::BatchQueue)
     batch.segment_dispatches < threshold && return
 
     # Seal current CB
-    unwrap(Vulkan.end_command_buffer(batch.cmd_buf))
+    throw_if_error(bq, "vkEndCommandBuffer", Vulkan.end_command_buffer(batch.cmd_buf))
     push!(batch.sealed_cmd_bufs, batch.cmd_buf)
 
     # Start fresh CB segment
     batch.cmd_buf = alloc_cmd_buf(bq)
-    unwrap(Vulkan.begin_command_buffer(batch.cmd_buf, Vulkan.CommandBufferBeginInfo(
-        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-    )))
+    throw_if_error(bq, "vkBeginCommandBuffer",
+        Vulkan.begin_command_buffer(batch.cmd_buf, Vulkan.CommandBufferBeginInfo(
+            flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+        )))
     batch.segment_dispatches = 0
     # recording stays true; dispatch_count stays (for barrier logic + total tracking)
 end
@@ -453,7 +457,6 @@ end
 # DEVICE_LOST regardless of which low-level call surfaced the error.
 
 """
-    mark_if_lost!(result)            # uses the global VkContext
     mark_if_lost!(bq::BatchQueue, result)
     mark_if_lost!(ctx::VkContext, result)
 
@@ -469,18 +472,12 @@ own recovery before throwing (`submit!`, `flush!`).  Otherwise prefer
     return
 end
 @inline mark_if_lost!(bq::BatchQueue, result) = mark_if_lost!(bq.ctx::VkContext, result)
-@inline function mark_if_lost!(result)
-    ctx = VK_CONTEXT_REF[]
-    ctx === nothing && return
-    return mark_if_lost!(ctx, result)
-end
 
 device_lost_hint(call) =
     "Vulkan device is lost during $(call). " *
     "Call Lava.vk_reset_device!() to reinitialize, or restart Julia."
 
 """
-    throw_if_error(result)                                # uses global ctx
     throw_if_error(bq::BatchQueue, result)
     throw_if_error(ctx::VkContext, result)
     throw_if_error(ctx_or_bq, call::String, result)       # adds a call name
@@ -503,11 +500,6 @@ to get the device-lost handling for free.  The wrappers below
 end
 @inline throw_if_error(ctx::VkContext, result) = throw_if_error(ctx, "Vulkan call", result)
 @inline throw_if_error(bq::BatchQueue, args...) = throw_if_error(bq.ctx::VkContext, args...)
-@inline function throw_if_error(result)
-    ctx = VK_CONTEXT_REF[]
-    ctx === nothing && return unwrap(result)
-    return throw_if_error(ctx, result)
-end
 
 """
     queue_submit!(bq, submits; fence=Vulkan.Fence(C_NULL))
@@ -568,7 +560,7 @@ function submit!(bq::BatchQueue)
     @assert batch.bq === bq "batch.bq desync: batch was not bound to this BatchQueue"
     Threads.atomic_add!(FLUSH_COUNTER, 1)
 
-    unwrap(Vulkan.end_command_buffer(batch.cmd_buf))
+    throw_if_error(bq, "vkEndCommandBuffer", Vulkan.end_command_buffer(batch.cmd_buf))
 
     n_sealed = length(batch.sealed_cmd_bufs)
     all_cmd_bufs = Vector{Vulkan.CommandBuffer}(undef, n_sealed + 1)

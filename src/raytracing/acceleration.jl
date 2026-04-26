@@ -569,16 +569,17 @@ function as_build(f; bq::BatchQueue=vk_context().default_bq)
     end
 
     cmd = bq.as_cmd_buf
-    unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
-        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    )))
+    throw_if_error(bq, "vkBeginCommandBuffer",
+        Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
+            flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        )))
 
     ctx = ASBuildContext(bq, Any[])
     result = try
         f(ctx)
     catch
         # Reset command buffer so it's reusable
-        unwrap(Vulkan.end_command_buffer(cmd))
+        throw_if_error(bq, "vkEndCommandBuffer", Vulkan.end_command_buffer(cmd))
         empty!(ctx.preserves)
         rethrow()
     end
@@ -597,7 +598,7 @@ function as_build(f; bq::BatchQueue=vk_context().default_bq)
                        Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
     )
 
-    unwrap(Vulkan.end_command_buffer(cmd))
+    throw_if_error(bq, "vkEndCommandBuffer", Vulkan.end_command_buffer(cmd))
 
     fence = bq.as_fence
     submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
