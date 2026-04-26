@@ -196,6 +196,22 @@ module Op
     # Geometry shader
     const OpEmitVertex              = UInt16(218)
     const OpEndPrimitive            = UInt16(219)
+    # VK_KHR_ray_query opcodes (SPV_KHR_ray_query)
+    const OpTypeRayQueryKHR                               = UInt16(4472)
+    const OpRayQueryInitializeKHR                         = UInt16(4473)
+    const OpRayQueryConfirmIntersectionKHR                = UInt16(4474)
+    const OpRayQueryTerminateKHR                          = UInt16(4475)
+    const OpRayQueryGenerateIntersectionKHR               = UInt16(4476)
+    const OpRayQueryProceedKHR                            = UInt16(4477)
+    const OpRayQueryGetIntersectionTypeKHR                = UInt16(4479)
+    const OpRayQueryGetIntersectionTKHR                   = UInt16(6018)
+    const OpRayQueryGetIntersectionInstanceCustomIndexKHR = UInt16(6019)
+    const OpRayQueryGetIntersectionInstanceIdKHR          = UInt16(6020)
+    const OpRayQueryGetIntersectionPrimitiveIndexKHR      = UInt16(6023)
+    const OpRayQueryGetIntersectionBarycentricsKHR        = UInt16(6024)
+    # Intersection-kind operand to GetIntersection* (and related ops)
+    const RayQueryCandidateIntersectionKHR = UInt32(0)
+    const RayQueryCommittedIntersectionKHR = UInt32(1)
 end
 
 # ---- Capabilities ----
@@ -232,6 +248,7 @@ module Cap
     const GroupNonUniformShuffleRelative = UInt32(66)
     const GroupNonUniformClustered      = UInt32(67)
     const GroupNonUniformQuad           = UInt32(68)
+    const RayQueryKHR                   = UInt32(4472)
 end
 
 # ---- Storage Classes ----
