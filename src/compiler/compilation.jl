@@ -589,7 +589,9 @@ Run the full LLVM → SPIR-V pipeline on a pre-built `CompilerJob`.  This is the
 so the cache keys it off of Julia's `MethodInstance` (type-based) and gets
 proper world-age tracking for free.
 """
-function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob; validate::Bool = true)
+function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob;
+                                    enable_ray_query::Bool = false,
+                                    validate::Bool = true)
     workgroup_size = job.config.params.workgroup_size
     GPUCompiler.JuliaContext() do ctx
         local mod, meta
@@ -621,7 +623,8 @@ function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob; validate::Bool 
         write(joinpath(_dbg_dir, "kernel_$(_kidx)_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).ll"), ir)
 
         # ── Stage 2: Custom SPIR-V emission ──
-        spirv_bytes, source_map = emit_spirv_from_llvm(mod, wrapper_name, workgroup_size)
+        spirv_bytes, source_map = emit_spirv_from_llvm(mod, wrapper_name, workgroup_size;
+                                                        enable_ray_query)
 
         # ── Stage 2.5: SPIR-V optimization (optional, helps NVIDIA) ──
         if SPIRV_OPT_ENABLED[]
@@ -651,11 +654,18 @@ don't want to construct a job manually.
 """
 function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
                            workgroup_size::NTuple{3,Int} = (64, 1, 1),
+                           enable_ray_query::Bool = false,
                            validate::Bool = true)
+    if enable_ray_query && !vk_context().ray_query_available
+        error("lava_compile_gpu: enable_ray_query=true requested, but the " *
+              "active Vulkan device does not support VK_KHR_ray_query. " *
+              "Either run on a device that supports ray_query (e.g. RADV, " *
+              "lavapipe) or call lava_compile_gpu without enable_ray_query.")
+    end
     config = lava_compiler_config(; workgroup_size)
     source = GPUCompiler.methodinstance(typeof(f), tt)
     job = GPUCompiler.CompilerJob(source, config)
-    return lava_compile_gpu_from_job(job; validate)
+    return lava_compile_gpu_from_job(job; enable_ray_query, validate)
 end
 
 # ── RT Shader Compilation ──
@@ -1097,7 +1107,8 @@ Emit SPIR-V binary from an LLVM module. Handles type mapping, instruction emissi
 entry point setup, and serialization.
 """
 function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
-                                workgroup_size::NTuple{3,Int})
+                                workgroup_size::NTuple{3,Int};
+                                enable_ray_query::Bool=false)
     # Build pointee type map (opaque pointer → typed pointer recovery)
     ptm = build_pointee_type_map(llvm_mod)
 
@@ -1110,6 +1121,9 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
     require_capability!(spirv_mod, Cap.Shader)
     require_capability!(spirv_mod, Cap.VariablePointers)
     require_extension!(spirv_mod, "SPV_KHR_variable_pointers")
+    if enable_ray_query
+        setup_ray_query_capabilities!(spirv_mod)
+    end
 
     # Build struct pointer member type map (resolves ptr members in structs)
     build_struct_ptr_member_types!(type_ctx, llvm_mod)

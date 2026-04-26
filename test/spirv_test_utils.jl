@@ -136,9 +136,10 @@ function compile_and_disasm(@nospecialize(f), @nospecialize(tt);
                             workgroup_size::NTuple{3,Int}=(64,1,1),
                             config=nothing,
                             payload_type::Symbol=:f32,
+                            enable_ray_query::Bool=false,
                             validate::Bool=true)
     if stage == :compute
-        result = Lava.lava_compile_gpu(f, tt; workgroup_size, validate)
+        result = Lava.lava_compile_gpu(f, tt; workgroup_size, enable_ray_query, validate)
         bytes = result.spirv_bytes
     elseif stage in (:vertex, :fragment, :geometry, :tess_control, :tess_eval)
         result = Lava.lava_compile_gfx_shader(f, tt; stage, config, validate)

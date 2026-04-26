@@ -227,6 +227,9 @@ mutable struct VkContext
     # Alignment (bytes) for BDAs passed as `pScratchData` in AS builds.
     # Picked by `bda_alignment_for(ctx, scratch=true)`.
     as_scratch_align::UInt64
+    # Whether VK_KHR_ray_query is available on this device.
+    # Set to true by B1 (device extension probe). False until proven otherwise.
+    ray_query_available::Bool
 
     # Inner constructor: two-phase init via `new()` so we can hand a live
     # `ctx` reference to `BatchQueue(...)` while finishing the ctx's own
@@ -249,7 +252,8 @@ mutable struct VkContext
                        device_lost::Bool,
                        memory_properties::Vulkan.PhysicalDeviceMemoryProperties,
                        max_wg_dims::NTuple{3, Int},
-                       as_scratch_align::UInt64)
+                       as_scratch_align::UInt64,
+                       ray_query_available::Bool=false)
         ctx = new()
         ctx.instance = instance
         ctx.physical_device = physical_device
@@ -267,6 +271,7 @@ mutable struct VkContext
         ctx.memory_properties = memory_properties
         ctx.max_wg_dims = max_wg_dims
         ctx.as_scratch_align = as_scratch_align
+        ctx.ray_query_available = ray_query_available
         # Now build the default BatchQueue with the live ctx.  Sets the
         # remaining field; no nullable slot, no post-hoc mutation.
         ctx.default_bq = BatchQueue(device, primary_queue, queue_family_index, ctx)

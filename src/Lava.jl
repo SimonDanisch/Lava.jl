@@ -94,6 +94,7 @@ include("compiler/compilation.jl")
 # Planned files consolidated into emit.jl (4431 lines) and compilation.jl:
 #   sourcemap.jl, intrinsics.jl, control_flow.jl, decorations.jl, compute.jl
 include("compiler/spirv/raytracing.jl")    # RT stages, OpTraceRayKHR, payload handling
+include("compiler/spirv/rayquery.jl")     # VK_KHR_ray_query capabilities + emission
 include("compiler/spirv/graphics.jl")     # Graphics stages, I/O variables, emit_vertex
 
 # ---- Device functions ----
