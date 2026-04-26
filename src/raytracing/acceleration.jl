@@ -527,6 +527,18 @@ function query_as_build_sizes(dev::Vulkan.Device, geom::GeometryType;
     return query_as_build_sizes_impl(dev, geo_buf, as_type, build_flags, max_primitive_count)
 end
 
+# Typed keyword overload: accepts geom::GeometryType as a kwarg.
+# Covers both TrianglesGeometry and AABBsGeometry (and any future subtypes).
+function query_as_build_sizes(dev::Vulkan.Device;
+        as_type::UInt32,
+        build_flags::UInt32=UInt32(0), max_primitive_count::UInt32=UInt32(0),
+        geom::GeometryType,
+        geo_flags::UInt32=UInt32(0))
+    geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
+    pack_geometry!(geo_buf, 0, geom; geo_flags)
+    return query_as_build_sizes_impl(dev, geo_buf, as_type, build_flags, max_primitive_count)
+end
+
 # Legacy keyword-dispatch overload; used by build_tlas (:instances path).
 function query_as_build_sizes(dev::Vulkan.Device; as_type::UInt32,
         build_flags::UInt32=UInt32(0), max_primitive_count::UInt32=UInt32(0),

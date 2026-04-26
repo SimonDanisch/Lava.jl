@@ -64,3 +64,16 @@ end
     @test reinterpret(UInt64, buf[49:56])[1] == UInt64(24)            # aabb_stride @ q+24
     @test reinterpret(UInt32, buf[89:92])[1] == UInt32(1)             # geo_flags @ p+88
 end
+
+@testset "AABB BLAS - query_as_build_sizes returns nonzero" begin
+    dev = Lava.vk_context().device
+    geom = AABBsGeometry(; aabb_addr=UInt64(0), aabb_stride=UInt64(24))
+    sizes = Lava.query_as_build_sizes(dev;
+        as_type = UInt32(1),
+        build_flags = UInt32(0),
+        geom = geom,
+        geo_flags = UInt32(1),
+        max_primitive_count = UInt32(1000))
+    @test sizes.acceleration_structure_size > 0
+    @test sizes.build_scratch_size > 0
+end
