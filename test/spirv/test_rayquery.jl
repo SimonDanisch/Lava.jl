@@ -164,3 +164,13 @@ end
     end
     check(d, "OpRayQueryTerminateKHR")
 end
+
+@testset "Ray Query - Phase B1 device probe" begin
+    ctx = Lava.vk_context()
+    @test hasfield(typeof(ctx), :ray_query_available)
+    # Soft check: if RT pipeline is available, ray_query almost certainly is too
+    # (RADV, lavapipe, NV, AMDGPU-Windows all support it).
+    if ctx.rt_pipeline_properties !== nothing
+        @test ctx.ray_query_available == true
+    end
+end

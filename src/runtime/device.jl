@@ -505,6 +505,7 @@ function init_vulkan!()
 
     # Check for RT extension support
     has_rt = has_rt_extensions(phys_dev)
+    has_ray_query = has_rt && has_extension(phys_dev, "VK_KHR_ray_query")
 
     # Check for workgroup memory explicit layout (needed for mixed-type shared memory structs)
     has_wg_explicit = has_extension(phys_dev, "VK_KHR_workgroup_memory_explicit_layout")
@@ -520,6 +521,9 @@ function init_vulkan!()
             "VK_KHR_ray_tracing_pipeline",
             "VK_KHR_deferred_host_operations",
         ])
+    end
+    if has_ray_query
+        push!(extensions, "VK_KHR_ray_query")
     end
     if has_wg_explicit
         push!(extensions, "VK_KHR_workgroup_memory_explicit_layout")
@@ -666,6 +670,13 @@ function init_vulkan!()
         )
         feature_chain = rt_features
     end
+    if has_ray_query
+        rq_features = Vulkan.PhysicalDeviceRayQueryFeaturesKHR(
+            true;   # ray_query
+            next=feature_chain
+        )
+        feature_chain = rq_features
+    end
 
     # Enable shader int64, float64, geometry/tessellation shaders, wide lines
     core_features = Vulkan.PhysicalDeviceFeatures(
@@ -751,6 +762,7 @@ function init_vulkan!()
         false,        # device_lost (fresh context)
         mem_props, max_wg,
         as_scratch_align,
+        has_ray_query,
     )
     return ctx
 end
