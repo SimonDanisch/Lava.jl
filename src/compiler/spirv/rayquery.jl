@@ -73,6 +73,13 @@ function emit_compute_tlas_descriptor!(state::SPIRVEmitterState)
 
     state.rt_tlas_var_id = var_id
     push!(state.entry_interface_ids, var_id)
+
+    # Eagerly allocate the per-function rayQuery OpVariable so it lands in
+    # the entry block preamble regardless of whether the first lava_ray_query_init
+    # is reached through a conditional path. Without this the SPIR-V optimizer
+    # can sink the OpVariable out of the entry block, causing validation failure.
+    get_or_create_ray_query_var!(state)
+
     return var_id
 end
 

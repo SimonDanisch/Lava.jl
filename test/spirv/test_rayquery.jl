@@ -165,6 +165,39 @@ end
     check(d, "OpRayQueryTerminateKHR")
 end
 
+@testset "Ray Query - Phase A6 OpVariable survives optimizer sink (init in conditional)" begin
+    ctx = Lava.vk_context()
+    saved = ctx.ray_query_available
+    ctx.ray_query_available = true
+    local d
+    try
+        function conditional_init_kernel(out)
+            i = Lava.lava_global_invocation_id_x()
+            if i > UInt32(0)  # always true at runtime, but optimizer may not know
+                ray = Ray(o=Point3f(0, 0, 0), d=Vec3f(0, 0, 1), t_min=0f0, t_max=1f3)
+                Lava.lava_ray_query_init(ray)
+                while Lava.lava_ray_query_proceed()
+                    Lava.lava_ray_query_confirm()
+                end
+                committed = Lava.lava_ray_query_get_type(true)
+                @inbounds out[1] = (committed == UInt32(1)) ? Lava.lava_ray_query_get_t(true) : -1f0
+            else
+                @inbounds out[1] = -2f0
+            end
+            return nothing
+        end
+        d, _ = compile_and_disasm(conditional_init_kernel,
+                                   Tuple{Lava.LavaDeviceArray{Float32,1}};
+                                   stage=:compute, enable_ray_query=true)
+    finally
+        ctx.ray_query_available = saved
+    end
+    # Validation is run inside compile_and_disasm: if the OpVariable was sunk
+    # out of the entry block the validator throws before we get here.
+    check(d, "OpRayQueryInitializeKHR")
+    check(d, "OpVariable")
+end
+
 @testset "Ray Query - Phase B1 device probe" begin
     ctx = Lava.vk_context()
     @test hasfield(typeof(ctx), :ray_query_available)
