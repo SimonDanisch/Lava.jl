@@ -70,6 +70,22 @@ mutable struct SPIRVEmitterState
     # Set true when OpIgnoreIntersectionKHR/OpTerminateRayKHR is emitted (block terminators).
     # Suppresses the redundant OpReturn from the trailing `ret void`.
     rt_block_terminated::Bool
+    # ── Ray-query state (compute kernels with enable_ray_query=true) ──
+    # Cached OpTypeRayQueryKHR id, allocated lazily.
+    ray_query_type_id::Union{Nothing, UInt32}
+    # Function-local rayQuery OpVariable id, allocated lazily on first use.
+    # Reset to nothing per function (currently only the entry function uses this).
+    current_ray_query_var::Union{Nothing, UInt32}
+    # OpVariable Function instructions buffered for the entry function.
+    # They are injected right after the entry block's first OpLabel, alongside
+    # alloca preamble words, so they satisfy the SPIR-V spec's requirement that
+    # all Function-storage OpVariable instructions precede any other instruction
+    # in the entry block.
+    entry_function_locals::Vector{UInt32}
+    # Additional interface IDs for OpEntryPoint gathered outside emit_globals!.
+    # The compute TLAS descriptor variable (for ray-query kernels) is pushed here
+    # and merged into the interface_ids list before emit_entry_point! is called.
+    entry_interface_ids::Vector{UInt32}
     # ── Graphics shader state (set by emit_spirv_from_llvm_gfx, unused for compute/RT) ──
     gfx_io::Any  # GfxIOState or nothing
     # ── PSB conversion cache ──
@@ -121,6 +137,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{LLVM.Value, Tuple{UInt32, Vector{UInt32}, UInt32, LLVM.ArrayType}}(),
         Dict{LLVM.Value, UInt32}(),
         nothing, nothing, nothing, :none, nothing, false,
+        nothing, nothing, UInt32[], UInt32[],  # ray-query state
         nothing,  # gfx_io
         Dict{Tuple{UInt32, UInt32}, UInt32}(), UInt32(0),
         Dict{LLVM.Value, Int64}(),
@@ -546,6 +563,12 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
             state.value_map[gv] = unwrapped_id
         end
         state.mod.functions = real_buf
+    end
+    # For the entry function, also inject any function-local OpVariable words
+    # accumulated in state.entry_function_locals (e.g. rayQuery variables).
+    # These must live in the same Function-scope preamble section as allocas.
+    if is_entry && !isempty(state.entry_function_locals)
+        append!(preamble_words, state.entry_function_locals)
     end
 
     # Emit basic blocks in reverse post-order (dominators before dominated blocks).

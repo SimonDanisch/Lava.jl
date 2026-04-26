@@ -1141,6 +1141,13 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
     # Emit global variables (if any — needed for builtin inputs, etc.)
     interface_ids = emit_globals!(state, llvm_mod)
 
+    # For ray-query compute kernels: emit the TLAS descriptor variable and
+    # merge its id into the interface list for OpEntryPoint.
+    if enable_ray_query
+        emit_compute_tlas_descriptor!(state)
+        append!(interface_ids, state.entry_interface_ids)
+    end
+
     # Check if entry function has parameters
     fn_ty = LLVM.function_type(entry_fn)
     n_params = length(collect(LLVM.parameters(fn_ty)))

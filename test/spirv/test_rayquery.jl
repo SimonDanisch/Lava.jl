@@ -59,3 +59,24 @@ end
         ctx.ray_query_available = saved
     end
 end
+
+@testset "Ray Query - Phase A3 type and TLAS descriptor declared" begin
+    ctx = Lava.vk_context()
+    saved = ctx.ray_query_available
+    ctx.ray_query_available = true
+    local d
+    try
+        function noop_kernel3(out)
+            @inbounds out[1] = 1.0f0
+            return nothing
+        end
+        d, _ = compile_and_disasm(noop_kernel3, Tuple{Lava.LavaDeviceArray{Float32,1}};
+                                  stage=:compute, enable_ray_query=true)
+    finally
+        ctx.ray_query_available = saved
+    end
+    check(d, "OpTypeAccelerationStructureKHR")
+    check(d, "OpTypeRayQueryKHR")
+    check(d, "DescriptorSet 0")
+    check(d, "Binding 0")
+end
