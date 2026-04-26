@@ -31,3 +31,30 @@ end
     @test r.tmin == 0f0
     @test r.tmax == 1f3
 end
+
+@testset "pack_geometry! :: TrianglesGeometry byte layout" begin
+    buf = zeros(UInt8, 128)
+    geom = TrianglesGeometry(; vertex_format=UInt32(103),    # VK_FORMAT_R32G32B32_SFLOAT
+                              vertex_addr=UInt64(0xCAFEBABE),
+                              vertex_stride=UInt64(12),
+                              max_vertex=UInt32(2),
+                              index_type=UInt32(1),           # VK_INDEX_TYPE_UINT32
+                              index_addr=UInt64(0xDEADBEEF),
+                              transform_addr=UInt64(0))
+    Lava.pack_geometry!(buf, 0, geom; geo_flags=UInt32(1))   # OPAQUE_BIT
+
+    # Outer VkAccelerationStructureGeometryKHR header
+    @test reinterpret(Int32,  buf[1:4])[1]   == Lava.VK_STYPE_GEO     # sType @ 0
+    @test reinterpret(UInt32, buf[17:20])[1] == UInt32(0)             # geometryType @ 16 = TRIANGLES
+
+    # Triangles sub-struct (VkAccelerationStructureGeometryTrianglesDataKHR) at offset 24
+    @test reinterpret(Int32,  buf[25:28])[1] == Lava.VK_STYPE_TRI     # sType @ q+0
+    @test reinterpret(UInt32, buf[41:44])[1] == UInt32(103)           # vertexFormat @ q+16
+    @test reinterpret(UInt64, buf[49:56])[1] == UInt64(0xCAFEBABE)    # vertex data addr @ q+24
+    @test reinterpret(UInt64, buf[57:64])[1] == UInt64(12)            # vertexStride @ q+32
+    @test reinterpret(UInt32, buf[65:68])[1] == UInt32(2)             # maxVertex @ q+40
+    @test reinterpret(UInt32, buf[69:72])[1] == UInt32(1)             # indexType @ q+44
+    @test reinterpret(UInt64, buf[73:80])[1] == UInt64(0xDEADBEEF)    # index data addr @ q+48
+    @test reinterpret(UInt64, buf[81:88])[1] == UInt64(0)             # transform addr @ q+56
+    @test reinterpret(UInt32, buf[89:92])[1] == UInt32(1)             # geo_flags @ p+88 (OPAQUE)
+end

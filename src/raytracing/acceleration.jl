@@ -455,7 +455,7 @@ function pack_geometry!(buf::Vector{UInt8}, offset::Int;
     unsafe_store!(Ptr{Int32}(p), VK_STYPE_GEO)           # sType @ 0
     unsafe_store!(Ptr{Ptr{Nothing}}(p + 8), C_NULL)         # pNext @ 8
 
-    q = p + 24  # geometry union start
+    q = p + 24  # geometry union start (only used by the :instances branch)
     if geometry_type == :triangles
         geom = TrianglesGeometry(vertex_format, vertex_addr, vertex_stride,
                                  max_vertex, index_type, index_addr, transform_addr)
@@ -508,7 +508,7 @@ function query_as_build_sizes(dev::Vulkan.Device, geom::GeometryType;
         geo_flags::UInt32=UInt32(0))
     geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
     pack_geometry!(geo_buf, 0, geom; geo_flags)
-    return _query_as_build_sizes_impl(dev, geo_buf, as_type, build_flags, max_primitive_count)
+    return query_as_build_sizes_impl(dev, geo_buf, as_type, build_flags, max_primitive_count)
 end
 
 # Legacy keyword-dispatch overload; used by build_tlas (:instances path).
@@ -517,10 +517,10 @@ function query_as_build_sizes(dev::Vulkan.Device; as_type::UInt32,
         kwargs...)
     geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
     pack_geometry!(geo_buf, 0; kwargs...)
-    return _query_as_build_sizes_impl(dev, geo_buf, as_type, build_flags, max_primitive_count)
+    return query_as_build_sizes_impl(dev, geo_buf, as_type, build_flags, max_primitive_count)
 end
 
-function _query_as_build_sizes_impl(dev::Vulkan.Device, geo_buf::Vector{UInt8},
+function query_as_build_sizes_impl(dev::Vulkan.Device, geo_buf::Vector{UInt8},
         as_type::UInt32, build_flags::UInt32, max_primitive_count::UInt32)
 
     bgi_buf = zeros(UInt8, 80)
@@ -660,7 +660,7 @@ function build_as_on_gpu(ctx::ASBuildContext, accel::Vulkan.AccelerationStructur
                          geo_flags::UInt32=UInt32(0))
     geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
     pack_geometry!(geo_buf, 0, geom; geo_flags)
-    _build_as_on_gpu_impl(ctx, accel, scratch_addr, geo_buf, as_type, build_flags, primitive_count)
+    build_as_on_gpu_impl(ctx, accel, scratch_addr, geo_buf, as_type, build_flags, primitive_count)
 end
 
 # Legacy keyword-dispatch overload; used by the `:instances` path in build_tlas.
@@ -671,15 +671,15 @@ function build_as_on_gpu(ctx::ASBuildContext, accel::Vulkan.AccelerationStructur
                          kwargs...)
     geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
     pack_geometry!(geo_buf, 0; kwargs...)
-    _build_as_on_gpu_impl(ctx, accel, scratch_addr, geo_buf, as_type, build_flags, primitive_count)
+    build_as_on_gpu_impl(ctx, accel, scratch_addr, geo_buf, as_type, build_flags, primitive_count)
 end
 
-function _build_as_on_gpu_impl(ctx::ASBuildContext, accel::Vulkan.AccelerationStructureKHR,
-                                scratch_addr::UInt64, geo_buf::Vector{UInt8},
-                                as_type::UInt32, build_flags::UInt32, primitive_count::UInt32)
+function build_as_on_gpu_impl(ctx::ASBuildContext, accel::Vulkan.AccelerationStructureKHR,
+                               scratch_addr::UInt64, geo_buf::Vector{UInt8},
+                               as_type::UInt32, build_flags::UInt32, primitive_count::UInt32)
     cmd = as_cmd_buf(ctx)
 
-    # geo_buf is already packed by the caller
+    # packed by caller so typed and legacy dispatch paths share this body
 
     # Pack build geometry info (80 bytes)
     bgi_buf = zeros(UInt8, 80)

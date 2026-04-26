@@ -131,7 +131,7 @@ include("graphics/textures.jl")      # LavaTexture2D, LavaSampler, descriptor se
 include("graphics/api.jl")           # GraphicsPipeline, draw!, blit!, present_frame!
 
 # ---- Phase 2: Ray Tracing ----
-include("raytracing/geometry_types.jl")  # GeometryType hierarchy + AABB/Ray structs
+include("raytracing/geometry_types.jl")  # GeometryType hierarchy + AABB struct
 include("raytracing/ray.jl")             # Ray struct for inline ray-query intrinsics
 include("raytracing/acceleration.jl")  # BLAS/TLAS build
 include("raytracing/pipeline.jl")      # RT pipeline + SBT + dispatch
