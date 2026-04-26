@@ -314,7 +314,8 @@ Must be called inside `as_build()`.
 """
 function build_tlas(ctx::ASBuildContext, blas_list::Vector{LavaBLAS};
                     transforms::Union{Nothing, Vector{NTuple{12,Float32}}}=nothing,
-                    custom_indices::Union{Nothing, Vector{UInt32}}=nothing)
+                    custom_indices::Union{Nothing, Vector{UInt32}}=nothing,
+                    masks::Union{Nothing, Vector{UInt8}}=nothing)
     bq = ctx.bq
     dev = as_device(ctx)
     n_instances = length(blas_list)
@@ -325,6 +326,7 @@ function build_tlas(ctx::ASBuildContext, blas_list::Vector{LavaBLAS};
         pack_as_instance!(instance_data, offset, blas_list[i].address;
             transform=transforms === nothing ? nothing : transforms[i],
             custom_index=custom_indices === nothing ? UInt32(0) : custom_indices[i],
+            mask=masks === nothing ? UInt8(0xff) : masks[i],
         )
     end
 
@@ -590,18 +592,6 @@ VulkanCore.jl alignment bug in VkAccelerationStructureGeometryKHR.
 function query_as_build_sizes(dev::Vulkan.Device, geom::GeometryType;
         as_type::UInt32,
         build_flags::UInt32=UInt32(0), max_primitive_count::UInt32=UInt32(0),
-        geo_flags::UInt32=UInt32(0))
-    geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
-    pack_geometry!(geo_buf, 0, geom; geo_flags)
-    return query_as_build_sizes_impl(dev, geo_buf, as_type, build_flags, max_primitive_count)
-end
-
-# Typed keyword overload: accepts geom::GeometryType as a kwarg.
-# Covers both TrianglesGeometry and AABBsGeometry (and any future subtypes).
-function query_as_build_sizes(dev::Vulkan.Device;
-        as_type::UInt32,
-        build_flags::UInt32=UInt32(0), max_primitive_count::UInt32=UInt32(0),
-        geom::GeometryType,
         geo_flags::UInt32=UInt32(0))
     geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
     pack_geometry!(geo_buf, 0, geom; geo_flags)

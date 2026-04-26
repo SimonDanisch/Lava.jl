@@ -44,6 +44,7 @@ end
         include(joinpath(@__DIR__, "test_handwritten_rt.jl"))
         include(joinpath(@__DIR__, "test_rayquery_vs_cpu.jl"))
         include(joinpath(@__DIR__, "test_aabb_blas_overlap.jl"))
+        include(joinpath(@__DIR__, "test_instance_masks.jl"))
     end
 
     # ── Tier 3b: Struct Broadcast Regression Tests ──

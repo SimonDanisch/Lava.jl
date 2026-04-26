@@ -76,6 +76,7 @@ mutable struct HWTLAS{Tri} <: Raycore.AbstractAccel
     instance_blas_indices::Vector{Int}
     instance_transforms::Vector{NTuple{12,Float32}}
     instance_custom_indices::Vector{UInt32}
+    instance_masks::Vector{UInt8}
 
     # Handle management
     handle_to_range::Dict{Raycore.TLASHandle, UnitRange{Int}}
@@ -108,7 +109,7 @@ function HWTLAS{Tri}(backend::LavaBackend; bq::BatchQueue=backend.bq) where {Tri
     HWTLAS{Tri}(
         backend, bq,
         LavaBLAS[], Vector{Tri}[], UInt32[],
-        Int[], NTuple{12,Float32}[], UInt32[],
+        Int[], NTuple{12,Float32}[], UInt32[], UInt8[],
         Dict{Raycore.TLASHandle, UnitRange{Int}}(),
         Set{Raycore.TLASHandle}(),
         UInt32(1),
@@ -298,18 +299,27 @@ Internal: add N instances of `blas_idx` to the HWTLAS.
 `instance_ids` (if given) supplies the per-instance interface override that
 the HW closest-hit shader reads via `gl_InstanceCustomIndexEXT`.  When
 `nothing`, every instance gets `0` (inherit from triangle metadata).
+
+`instance_masks` (if given) supplies per-instance Vulkan cullMask values.
+When `nothing`, every instance gets `0xff` (visible to all ray queries).
 """
 function hwtlas_add_instances!(hwtlas::HWTLAS, blas_idx::Int, transforms;
-                                instance_ids::Union{Nothing, AbstractVector{<:Integer}}=nothing)
+                                instance_ids::Union{Nothing, AbstractVector{<:Integer}}=nothing,
+                                instance_masks::Union{Nothing, AbstractVector{UInt8}}=nothing)
     if instance_ids !== nothing && length(instance_ids) != length(transforms)
         throw(ArgumentError("instance_ids length $(length(instance_ids)) != transforms length $(length(transforms))"))
     end
+    if instance_masks !== nothing && length(instance_masks) != length(transforms)
+        throw(ArgumentError("instance_masks length $(length(instance_masks)) != transforms length $(length(transforms))"))
+    end
     start_idx = length(hwtlas.instance_blas_indices) + 1
     for (i, transform) in enumerate(transforms)
-        iid = instance_ids === nothing ? UInt32(0) : UInt32(instance_ids[i])
+        iid  = instance_ids    === nothing ? UInt32(0)  : UInt32(instance_ids[i])
+        mask = instance_masks  === nothing ? UInt8(0xff) : UInt8(instance_masks[i])
         push!(hwtlas.instance_blas_indices, blas_idx)
         push!(hwtlas.instance_transforms, mat4_to_vk_transform(transform))
         push!(hwtlas.instance_custom_indices, iid)
+        push!(hwtlas.instance_masks, mask)
     end
     end_idx = length(hwtlas.instance_blas_indices)
 
@@ -320,16 +330,21 @@ function hwtlas_add_instances!(hwtlas::HWTLAS, blas_idx::Int, transforms;
 end
 
 function Base.push!(hwtlas::HWTLAS, mesh::GeometryBasics.Mesh, transform::Mat4f=Mat4f(I);
-                    instance_id::UInt32=UInt32(0))
+                    instance_id::UInt32=UInt32(0), instance_mask::UInt8=UInt8(0xff))
     blas_idx = hwtlas_add_geometry!(hwtlas, mesh)
     return hwtlas_add_instances!(hwtlas, blas_idx, (transform,);
-                                  instance_ids=UInt32[instance_id])
+                                  instance_ids=UInt32[instance_id],
+                                  instance_masks=UInt8[instance_mask])
 end
 
 function Base.push!(hwtlas::HWTLAS, mesh::GeometryBasics.Mesh, transforms::AbstractVector{Mat4f};
-                    instance_ids::Union{Nothing, AbstractVector{<:Integer}}=nothing)
+                    instance_ids::Union{Nothing, AbstractVector{<:Integer}}=nothing,
+                    instance_mask::UInt8=UInt8(0xff))
     blas_idx = hwtlas_add_geometry!(hwtlas, mesh)
-    return hwtlas_add_instances!(hwtlas, blas_idx, transforms; instance_ids)
+    # Single mask applies to all transforms (same geometry type); per-transform
+    # masks are a future feature if needed.
+    masks = fill(instance_mask, length(transforms))
+    return hwtlas_add_instances!(hwtlas, blas_idx, transforms; instance_ids, instance_masks=masks)
 end
 
 """
@@ -343,7 +358,7 @@ this call.  Use the compute-rayQuery path (`lava_launch!` with `tlas=hwtlas`)
 instead.
 """
 function Base.push!(hwtlas::HWTLAS{Tri}, blas::LavaBLAS, transform::Mat4f=Mat4f(I);
-                    instance_id::UInt32=UInt32(0)) where {Tri}
+                    instance_id::UInt32=UInt32(0), instance_mask::UInt8=UInt8(0xff)) where {Tri}
     # Register the pre-built BLAS — no triangles.
     push!(hwtlas.blas_list, blas)
     push!(hwtlas.blas_triangles, Tri[])
@@ -354,7 +369,8 @@ function Base.push!(hwtlas::HWTLAS{Tri}, blas::LavaBLAS, transform::Mat4f=Mat4f(
 
     hwtlas.dirty = true
     return hwtlas_add_instances!(hwtlas, blas_idx, (transform,);
-                                  instance_ids=UInt32[instance_id])
+                                  instance_ids=UInt32[instance_id],
+                                  instance_masks=UInt8[instance_mask])
 end
 
 """
@@ -423,7 +439,8 @@ function rebuild_hw_tlas!(hwtlas::HWTLAS{Tri}) where {Tri}
     hw_tlas = as_build() do ctx
         build_tlas(ctx, blas_refs;
                    transforms=hwtlas.instance_transforms,
-                   custom_indices=hwtlas.instance_custom_indices)
+                   custom_indices=hwtlas.instance_custom_indices,
+                   masks=hwtlas.instance_masks)
     end
 
     all_tris = reduce(vcat, hwtlas.blas_triangles)::Vector{Tri}
@@ -496,6 +513,7 @@ function Raycore.sync!(hwtlas::HWTLAS)
         hwtlas.instance_blas_indices  = [hwtlas.instance_blas_indices[i]  for i in keep_inst]
         hwtlas.instance_transforms    = [hwtlas.instance_transforms[i]    for i in keep_inst]
         hwtlas.instance_custom_indices = [hwtlas.instance_custom_indices[i] for i in keep_inst]
+        hwtlas.instance_masks         = [hwtlas.instance_masks[i]         for i in keep_inst]
 
         # After removing instances, some BLAS may be unreferenced.
         still_used = Set(hwtlas.instance_blas_indices)
