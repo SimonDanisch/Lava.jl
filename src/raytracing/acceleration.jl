@@ -194,11 +194,12 @@ function build_blas(ctx::ASBuildContext, vertices::Vector{NTuple{3,Float32}}, in
     build_flags = UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
     geo_flags = opaque ? UInt32(Vulkan.GEOMETRY_OPAQUE_BIT_KHR) : UInt32(0)
 
-    sizes = query_as_build_sizes(dev;
+    geom = TrianglesGeometry(; vertex_format=vfmt, vertex_addr, vertex_stride=vstride,
+                               max_vertex, index_type=itype, index_addr,
+                               transform_addr=UInt64(0))
+
+    sizes = query_as_build_sizes(dev, geom;
         as_type=UInt32(1), build_flags,
-        geometry_type=:triangles,
-        vertex_format=vfmt, vertex_addr, vertex_stride=vstride,
-        max_vertex, index_type=itype, index_addr,
         geo_flags, max_primitive_count=n_triangles)
 
     storage = LavaArray{UInt8,1}(undef, (max(Int(sizes.acceleration_structure_size), 16),);
@@ -211,20 +212,17 @@ function build_blas(ctx::ASBuildContext, vertices::Vector{NTuple{3,Float32}}, in
                                       bq, extra_usage=AS_SCRATCH_USAGE, scratch=true)
     scratch_addr = bda_address(scratch_arr)
 
-    # Build inputs (vertex + index) must outlive the BLAS — the driver may
+    # Build inputs (vertex + index) must outlive the BLAS -- the driver may
     # retain VAs into them.  Kept as LavaArrays so their own last_write
     # tracks in-flight access and their vk_free! is timeline-gated.
     blas_preserves = LavaArray[vertex_arr, index_arr]
-    # Scratch is submit-lifetime only — pushed into ctx.preserves so as_build's
+    # Scratch is submit-lifetime only -- pushed into ctx.preserves so as_build's
     # fence-wait (or the ctx-scoped drain) keeps it alive until the submit
     # completes, then its own finalizer frees it.
     push!(ctx.preserves, scratch_arr)
 
-    build_as_on_gpu(ctx, accel, scratch_addr;
+    build_as_on_gpu(ctx, accel, scratch_addr, geom;
         as_type=UInt32(1), build_flags,
-        geometry_type=:triangles,
-        vertex_format=vfmt, vertex_addr, vertex_stride=vstride,
-        max_vertex, index_type=itype, index_addr,
         geo_flags, primitive_count=n_triangles)
 
     addr_info = Vulkan.AccelerationStructureDeviceAddressInfoKHR(accel)
@@ -423,14 +421,34 @@ C layout:
   24: geometry union (64 bytes)
   88: flags (4)  |  92: pad (4)
 """
+function pack_geometry!(buf::Vector{UInt8}, offset::Int,
+                        geom::TrianglesGeometry; geo_flags::UInt32=UInt32(0))
+    p = pointer(buf, offset + 1)
+    q = p + 24  # geometry union start
+    unsafe_store!(Ptr{Int32}(p), VK_STYPE_GEO)                      # sType @ 0
+    unsafe_store!(Ptr{Ptr{Nothing}}(p + 8), C_NULL)                   # pNext @ 8
+    unsafe_store!(Ptr{UInt32}(p + 16), UInt32(0))                    # geometryType = TRIANGLES @ 16
+    unsafe_store!(Ptr{Int32}(q), VK_STYPE_TRI)                       # sType @ 0
+    unsafe_store!(Ptr{Ptr{Nothing}}(q + 8), C_NULL)                   # pNext @ 8
+    unsafe_store!(Ptr{UInt32}(q + 16), geom.vertex_format)           # vertexFormat @ 16
+    unsafe_store!(Ptr{UInt64}(q + 24), geom.vertex_addr)             # vertexData @ 24
+    unsafe_store!(Ptr{UInt64}(q + 32), geom.vertex_stride)           # vertexStride @ 32
+    unsafe_store!(Ptr{UInt32}(q + 40), geom.max_vertex)              # maxVertex @ 40
+    unsafe_store!(Ptr{UInt32}(q + 44), geom.index_type)              # indexType @ 44
+    unsafe_store!(Ptr{UInt64}(q + 48), geom.index_addr)              # indexData @ 48
+    unsafe_store!(Ptr{UInt64}(q + 56), geom.transform_addr)          # transformData @ 56
+    unsafe_store!(Ptr{UInt32}(p + 88), geo_flags)                    # flags @ 88
+    return nothing
+end
+
+# Legacy Symbol-dispatch method; used by the `:instances` path in build_tlas.
+# The instances path is not being migrated in this task -- left intact.
 function pack_geometry!(buf::Vector{UInt8}, offset::Int;
         geometry_type::Symbol,
-        # For triangles:
         vertex_format::UInt32=UInt32(0), vertex_addr::UInt64=UInt64(0),
         vertex_stride::UInt64=UInt64(0), max_vertex::UInt32=UInt32(0),
         index_type::UInt32=UInt32(0), index_addr::UInt64=UInt64(0),
         transform_addr::UInt64=UInt64(0),
-        # For instances:
         instance_addr::UInt64=UInt64(0),
         geo_flags::UInt32=UInt32(0))
     p = pointer(buf, offset + 1)
@@ -439,20 +457,12 @@ function pack_geometry!(buf::Vector{UInt8}, offset::Int;
 
     q = p + 24  # geometry union start
     if geometry_type == :triangles
-        unsafe_store!(Ptr{UInt32}(p + 16), UInt32(0))       # geometryType = TRIANGLES @ 16
-        # Triangles sub-struct within union
-        unsafe_store!(Ptr{Int32}(q), VK_STYPE_TRI)                  # sType @ 0
-        unsafe_store!(Ptr{Ptr{Nothing}}(q + 8), C_NULL)              # pNext @ 8
-        unsafe_store!(Ptr{UInt32}(q + 16), vertex_format)            # vertexFormat @ 16
-        unsafe_store!(Ptr{UInt64}(q + 24), vertex_addr)              # vertexData @ 24
-        unsafe_store!(Ptr{UInt64}(q + 32), vertex_stride)            # vertexStride @ 32
-        unsafe_store!(Ptr{UInt32}(q + 40), max_vertex)               # maxVertex @ 40
-        unsafe_store!(Ptr{UInt32}(q + 44), index_type)               # indexType @ 44
-        unsafe_store!(Ptr{UInt64}(q + 48), index_addr)               # indexData @ 48
-        unsafe_store!(Ptr{UInt64}(q + 56), transform_addr)           # transformData @ 56
+        geom = TrianglesGeometry(vertex_format, vertex_addr, vertex_stride,
+                                 max_vertex, index_type, index_addr, transform_addr)
+        pack_geometry!(buf, offset, geom; geo_flags)
+        return nothing
     elseif geometry_type == :instances
-        unsafe_store!(Ptr{UInt32}(p + 16), UInt32(2))       # geometryType = INSTANCES (VK_GEOMETRY_TYPE_INSTANCES_KHR=2) @ 16
-        # Instances sub-struct within union
+        unsafe_store!(Ptr{UInt32}(p + 16), UInt32(2))       # geometryType = INSTANCES @ 16
         unsafe_store!(Ptr{Int32}(q), VK_STYPE_INST)                 # sType @ 0
         unsafe_store!(Ptr{Ptr{Nothing}}(q + 8), C_NULL)              # pNext @ 8
         unsafe_store!(Ptr{UInt32}(q + 16), UInt32(0))                # arrayOfPointers @ 16
@@ -492,11 +502,26 @@ end
 Calls vkGetAccelerationStructureBuildSizesKHR directly via ccall to work around
 VulkanCore.jl alignment bug in VkAccelerationStructureGeometryKHR.
 """
+function query_as_build_sizes(dev::Vulkan.Device, geom::GeometryType;
+        as_type::UInt32,
+        build_flags::UInt32=UInt32(0), max_primitive_count::UInt32=UInt32(0),
+        geo_flags::UInt32=UInt32(0))
+    geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
+    pack_geometry!(geo_buf, 0, geom; geo_flags)
+    return _query_as_build_sizes_impl(dev, geo_buf, as_type, build_flags, max_primitive_count)
+end
+
+# Legacy keyword-dispatch overload; used by build_tlas (:instances path).
 function query_as_build_sizes(dev::Vulkan.Device; as_type::UInt32,
         build_flags::UInt32=UInt32(0), max_primitive_count::UInt32=UInt32(0),
         kwargs...)
     geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
     pack_geometry!(geo_buf, 0; kwargs...)
+    return _query_as_build_sizes_impl(dev, geo_buf, as_type, build_flags, max_primitive_count)
+end
+
+function _query_as_build_sizes_impl(dev::Vulkan.Device, geo_buf::Vector{UInt8},
+        as_type::UInt32, build_flags::UInt32, max_primitive_count::UInt32)
 
     bgi_buf = zeros(UInt8, 80)
 
@@ -629,15 +654,32 @@ Always records into `ctx.cmd_buf`. The ASBuildContext (created by `as_build()`)
 manages the full lifecycle: begin CB, record builds, submit, wait.
 """
 function build_as_on_gpu(ctx::ASBuildContext, accel::Vulkan.AccelerationStructureKHR,
+                         scratch_addr::UInt64, geom::GeometryType;
+                         as_type::UInt32, build_flags::UInt32=UInt32(0),
+                         primitive_count::UInt32=UInt32(0),
+                         geo_flags::UInt32=UInt32(0))
+    geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
+    pack_geometry!(geo_buf, 0, geom; geo_flags)
+    _build_as_on_gpu_impl(ctx, accel, scratch_addr, geo_buf, as_type, build_flags, primitive_count)
+end
+
+# Legacy keyword-dispatch overload; used by the `:instances` path in build_tlas.
+function build_as_on_gpu(ctx::ASBuildContext, accel::Vulkan.AccelerationStructureKHR,
                          scratch_addr::UInt64;
                          as_type::UInt32, build_flags::UInt32=UInt32(0),
                          primitive_count::UInt32=UInt32(0),
                          kwargs...)
-    cmd = as_cmd_buf(ctx)
-
-    # Pack geometry (96 bytes, correct C layout)
     geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
     pack_geometry!(geo_buf, 0; kwargs...)
+    _build_as_on_gpu_impl(ctx, accel, scratch_addr, geo_buf, as_type, build_flags, primitive_count)
+end
+
+function _build_as_on_gpu_impl(ctx::ASBuildContext, accel::Vulkan.AccelerationStructureKHR,
+                                scratch_addr::UInt64, geo_buf::Vector{UInt8},
+                                as_type::UInt32, build_flags::UInt32, primitive_count::UInt32)
+    cmd = as_cmd_buf(ctx)
+
+    # geo_buf is already packed by the caller
 
     # Pack build geometry info (80 bytes)
     bgi_buf = zeros(UInt8, 80)
@@ -728,11 +770,12 @@ function build_blas_pooled(all_vertices::Vector{Vector{NTuple{3,Float32}}},
         n_tris = UInt32(length(all_indices[i]) ÷ 3)
         max_vertex = UInt32(length(all_vertices[i]) - 1)
 
-        sizes = query_as_build_sizes(dev;
+        # Addresses are 0 for size queries; only counts and formats matter.
+        geom_i = TrianglesGeometry(; vertex_format=vfmt, vertex_addr=UInt64(0),
+                                     vertex_stride=vstride, max_vertex,
+                                     index_type=itype, index_addr=UInt64(0))
+        sizes = query_as_build_sizes(dev, geom_i;
             as_type=UInt32(1), build_flags,
-            geometry_type=:triangles,
-            vertex_format=vfmt, vertex_addr=UInt64(0), vertex_stride=vstride,
-            max_vertex, index_type=itype, index_addr=UInt64(0),
             geo_flags, max_primitive_count=n_tris)
 
         vertex_offsets[i] = input_cursor
@@ -810,14 +853,13 @@ function build_blas_pooled(all_vertices::Vector{Vector{NTuple{3,Float32}}},
             for i in 1:n_blas
                 n_tris = UInt32(length(all_indices[i]) ÷ 3)
                 max_vertex = UInt32(length(all_vertices[i]) - 1)
-                build_as_on_gpu(as_ctx, hw_blas_list[i].accel, scratch_addr;
-                    as_type=UInt32(1), build_flags,
-                    geometry_type=:triangles,
-                    vertex_format=vfmt,
+                geom_i = TrianglesGeometry(; vertex_format=vfmt,
                     vertex_addr=input_base_addr + vertex_offsets[i],
-                    vertex_stride=vstride,
-                    max_vertex, index_type=itype,
-                    index_addr=input_base_addr + index_offsets[i],
+                    vertex_stride=vstride, max_vertex,
+                    index_type=itype,
+                    index_addr=input_base_addr + index_offsets[i])
+                build_as_on_gpu(as_ctx, hw_blas_list[i].accel, scratch_addr, geom_i;
+                    as_type=UInt32(1), build_flags,
                     geo_flags, primitive_count=n_tris)
                 # Barrier between builds: shared scratch buffer must be drained before reuse.
                 if i < n_blas
@@ -979,12 +1021,12 @@ function build_hw_accel_from_tlas(tlas;
         n_tris = UInt32(length(all_indices[i]) ÷ 3)
         max_vertex = UInt32(length(all_vertices[i]) - 1)
 
-        # Query sizes — addresses don't matter for size queries
-        sizes = query_as_build_sizes(dev;
+        # Query sizes -- addresses don't matter for size queries
+        geom_i = TrianglesGeometry(; vertex_format=vfmt, vertex_addr=UInt64(0),
+                                     vertex_stride=vstride, max_vertex,
+                                     index_type=itype, index_addr=UInt64(0))
+        sizes = query_as_build_sizes(dev, geom_i;
             as_type=UInt32(1), build_flags,
-            geometry_type=:triangles,
-            vertex_format=vfmt, vertex_addr=UInt64(0), vertex_stride=vstride,
-            max_vertex, index_type=itype, index_addr=UInt64(0),
             geo_flags, max_primitive_count=n_tris)
 
         # Input pool layout: vertex data then index data, 16-byte aligned
@@ -1070,14 +1112,13 @@ function build_hw_accel_from_tlas(tlas;
                 n_tris = UInt32(length(all_indices[i]) ÷ 3)
                 max_vertex = UInt32(length(all_vertices[i]) - 1)
 
-                build_as_on_gpu(as_ctx, hw_blas_list[i].accel, scratch_addr;
-                    as_type=UInt32(1), build_flags,
-                    geometry_type=:triangles,
-                    vertex_format=vfmt,
+                geom_i = TrianglesGeometry(; vertex_format=vfmt,
                     vertex_addr=input_base_addr + vertex_offsets[i],
-                    vertex_stride=vstride,
-                    max_vertex, index_type=itype,
-                    index_addr=input_base_addr + index_offsets[i],
+                    vertex_stride=vstride, max_vertex,
+                    index_type=itype,
+                    index_addr=input_base_addr + index_offsets[i])
+                build_as_on_gpu(as_ctx, hw_blas_list[i].accel, scratch_addr, geom_i;
+                    as_type=UInt32(1), build_flags,
                     geo_flags, primitive_count=n_tris)
                 # Barrier between builds: shared scratch buffer must be drained before reuse.
                 if i < n_blas
