@@ -51,4 +51,18 @@ using GeometryBasics: Point3f, Vec3f, Vec4f
 
     # The handle is preserved (in-place refit).
     @test tlas.allow_update == true
+
+    # Verify the kernel wrote the shifted transforms into the instance buffer
+    # (catches kernel regressions in the integration context). The Frame 1
+    # write should land translation column = (100 + 5*(i-1), 0, 0) for grain i.
+    instances_cpu = Array(instances_gpu)
+    for i in 1:n
+        # Each grain has 2 records (physics @ 2i-1, rendering @ 2i); both share transform.
+        expected_tx = Float32(100f0 + 5f0 * (i - 1))
+        @test instances_cpu[2i - 1].transform[4] == expected_tx
+        @test instances_cpu[2i].transform[4]     == expected_tx
+        # Translation y and z should be 0 (column 8 = ty, column 12 = tz).
+        @test instances_cpu[2i - 1].transform[8]  == 0f0
+        @test instances_cpu[2i - 1].transform[12] == 0f0
+    end
 end
