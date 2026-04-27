@@ -94,24 +94,10 @@ const PIPELINE_CACHE = Dict{UInt64, LavaComputePipeline}()
 const PIPELINE_INSERTION_ORDER = UInt64[]
 const MAX_PIPELINE_CACHE_SIZE = Ref(1024)
 
-# Descriptor set cache for compute pipelines with TLAS (set=0, binding=0).
-# Keyed by (ds_layout handle, tlas Julia objectid).
-# Mirrors the RT_DESC_CACHE pattern from raytracing/pipeline.jl.
-const COMPUTE_TLAS_DESC_CACHE = Dict{Tuple{UInt64, UInt64}, Tuple{Vulkan.DescriptorPool, Vulkan.DescriptorSet, WeakRef}}()
-const MAX_COMPUTE_TLAS_DESC_CACHE_SIZE = 32
-
 # Register cleanup callback for vk_reset_device!
 push!(RESET_CALLBACKS, function()
     empty!(PIPELINE_CACHE)
     empty!(PIPELINE_INSERTION_ORDER)
-    for (_, (pool, _, _)) in COMPUTE_TLAS_DESC_CACHE
-        try
-            pool.destructor()
-        catch
-            safe_fin_log("Lava COMPUTE_TLAS_DESC_CACHE reset: descriptor pool destructor failed\n")
-        end
-    end
-    empty!(COMPUTE_TLAS_DESC_CACHE)
 end)
 
 """
@@ -195,38 +181,27 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
 end
 
 """
-    get_compute_tlas_descriptor_set(dev, pipeline, tlas) -> Vulkan.DescriptorSet
+    alloc_compute_tlas_descriptor_set(dev, pipeline, tlas) -> (DescriptorPool, DescriptorSet)
 
-Get or create a descriptor set that binds `tlas.accel` to set=0, binding=0
-for a compute pipeline compiled with `needs_tlas_descriptor=true`.
+Allocate a fresh descriptor pool and descriptor set that binds `tlas.accel`
+to set=0, binding=0 for a compute pipeline compiled with
+`needs_tlas_descriptor=true`. The caller MUST `pin!(batch, pool)` so the
+pool stays alive until the dispatch retires; once the batch is reclaimed
+the pool's destructor frees it.
 
-Caches by (ds_layout handle, tlas objectid) so re-dispatch of the same
-pipeline+TLAS pair is allocation-free.
+We deliberately do NOT cache here. A previous version keyed a cache by
+`(ds_layout, objectid(LavaTLAS))`, but `Raycore.sync!` produces a new
+LavaTLAS each rebuild → cache misses → unbounded growth → eviction with
+WeakRef-based TLAS-GC detection that lags Julia GC → pools destroyed
+while their descriptor sets were still in flight on the GPU. Per-dispatch
+allocation is microseconds and removes the entire class of bug.
 
 `tlas` is a `LavaTLAS` — declared later in raytracing/acceleration.jl.
 """
-function get_compute_tlas_descriptor_set(dev::Vulkan.Device, pipeline::LavaComputePipeline,
-                                          tlas)  # LavaTLAS — declared later in raytracing/acceleration.jl
+function alloc_compute_tlas_descriptor_set(dev::Vulkan.Device,
+                                            pipeline::LavaComputePipeline,
+                                            tlas)  # LavaTLAS — declared later
     ds_layout = pipeline.descriptor_set_layout::Vulkan.DescriptorSetLayout
-    key = (UInt64(ds_layout.vks), objectid(tlas))
-    cached = get(COMPUTE_TLAS_DESC_CACHE, key, nothing)
-    if cached !== nothing
-        return cached[2]
-    end
-
-    # Evict stale (GC'd tlas) entries before adding new ones.
-    if length(COMPUTE_TLAS_DESC_CACHE) >= MAX_COMPUTE_TLAS_DESC_CACHE_SIZE
-        stale = Tuple{UInt64, UInt64}[]
-        for (k, (_, _, wr)) in COMPUTE_TLAS_DESC_CACHE
-            wr.value === nothing && push!(stale, k)
-        end
-        for k in stale
-            pool, _, _ = COMPUTE_TLAS_DESC_CACHE[k]
-            try pool.destructor() catch; safe_fin_log("COMPUTE_TLAS evict: pool destructor failed\n") end
-            delete!(COMPUTE_TLAS_DESC_CACHE, k)
-        end
-    end
-
     desc_pool = Vulkan.DescriptorPool(dev, UInt32(1), [
         Vulkan.DescriptorPoolSize(
             Vulkan.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, UInt32(1)),
@@ -247,8 +222,7 @@ function get_compute_tlas_descriptor_set(dev::Vulkan.Device, pipeline::LavaCompu
     )
     Vulkan.update_descriptor_sets(dev, [write_ds], [])
 
-    COMPUTE_TLAS_DESC_CACHE[key] = (desc_pool, desc_set, WeakRef(tlas))
-    return desc_set
+    return desc_pool, desc_set
 end
 
 function create_compute_pipeline(dev::Vulkan.Device, ci::Vulkan.ComputePipelineCreateInfo)

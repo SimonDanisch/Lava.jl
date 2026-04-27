@@ -385,9 +385,10 @@ end
             hw_tlas = tlas::HWTLAS  # caller already verified non-nothing
             lava_tlas = hw_tlas.hw_tlas::LavaTLAS
             dev = bq.ctx.device
-            desc_set = get_compute_tlas_descriptor_set(dev, pipeline, lava_tlas)
+            desc_pool, desc_set = alloc_compute_tlas_descriptor_set(dev, pipeline, lava_tlas)
             Vulkan.cmd_bind_descriptor_sets(cmd, Vulkan.PIPELINE_BIND_POINT_COMPUTE,
                 pipeline.pipeline_layout, UInt32(0), [desc_set], UInt32[])
+            pin!(batch, desc_pool)
             pin!(batch, lava_tlas.accel)
             pin!(batch, lava_tlas.storage)
             # Pin every BLAS the TLAS references.  rayQuery walks the TLAS into
@@ -448,9 +449,10 @@ and populated by a prepare-indirect kernel.
             hw_tlas = tlas::HWTLAS  # caller already verified non-nothing
             lava_tlas = hw_tlas.hw_tlas::LavaTLAS
             dev = bq.ctx.device
-            desc_set = get_compute_tlas_descriptor_set(dev, pipeline, lava_tlas)
+            desc_pool, desc_set = alloc_compute_tlas_descriptor_set(dev, pipeline, lava_tlas)
             Vulkan.cmd_bind_descriptor_sets(cmd, Vulkan.PIPELINE_BIND_POINT_COMPUTE,
                 pipeline.pipeline_layout, UInt32(0), [desc_set], UInt32[])
+            pin!(batch, desc_pool)
             pin!(batch, lava_tlas.accel)
             pin!(batch, lava_tlas.storage)
             # Pin every BLAS the TLAS references.  rayQuery walks the TLAS into
