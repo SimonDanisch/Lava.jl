@@ -31,19 +31,22 @@ end
 
 Top-level acceleration structure wrapping a VkAccelerationStructureKHR.
 Destroyed automatically via finalizer when GC'd (unless device was lost).
+
+When built with `allow_update=true`, `update_scratch_size` is the scratch
+buffer size to allocate for `MODE_UPDATE_KHR` refit calls (queried at build
+time). `instance_buf` holds the GPU instance buffer when the TLAS was built
+from a `LavaArray{LavaInstanceRecord, 1}` (refit needs to keep this pinned
+across calls).
 """
 mutable struct LavaTLAS
     accel::Vulkan.AccelerationStructureKHR
-    # AS backing storage.  LavaArray's last_write handles cross-queue sync
-    # and the vk_free! timeline-gated defer path.
     storage::LavaArray{UInt8, 1}
-    # BLASes this TLAS references.  Field ownership transitively pins their
-    # storage so as long as the TLAS is alive (or pinned in batch.pinned), every
-    # referenced BLAS stays alive.
     blases::Vector{LavaBLAS}
-    # Build-time inputs (instance buffer).  LavaArrays — each tracks its own
-    # last_write via its VkManagedBuffer.
     preserves::Vector{LavaArray}
+    # Refit support:
+    allow_update::Bool
+    update_scratch_size::UInt64
+    instance_buf::Union{Nothing, LavaArray}   # pinned across refits when set
 end
 
 # ── Timeline-aware destruction for AS objects ──────────────────────────────
@@ -360,7 +363,8 @@ function build_tlas(ctx::ASBuildContext, blas_list::Vector{LavaBLAS};
         primitive_count=UInt32(n_instances))
 
     unique_blas = unique(blas_list)
-    tlas = LavaTLAS(accel, storage, unique_blas, tlas_preserves)
+    tlas = LavaTLAS(accel, storage, unique_blas, tlas_preserves,
+                    false, UInt64(0), nothing)
     finalizer(unsafe_free!, tlas)
     return tlas
 end
