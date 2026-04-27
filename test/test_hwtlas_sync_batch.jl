@@ -46,3 +46,20 @@ end
 
     @test_throws ErrorException Raycore.sync!(tlas)
 end
+
+@testset "HWTLAS sync! errors on mixed mode (push! + push_instances!)" begin
+    aabb = Lava.AABB(Point3f(-1f0,-1f0,-1f0), Point3f(1f0,1f0,1f0))
+    blas = as_build() do ctx; build_blas_aabb(ctx, [aabb]); end
+
+    instance_buf = Lava.LavaArray{LavaInstanceRecord}(undef, 4; extra_usage=AS_INPUT_USAGE)
+
+    backend = Lava.LavaBackend()
+    tlas = Lava.HWTLAS(backend)
+
+    # per-mesh mode: push a pre-built BLAS directly (no transform = default Mat4f(I))
+    push!(tlas, blas; instance_id=UInt32(0), instance_mask=UInt8(0x01))
+    # batch mode: also register an instance batch
+    Raycore.push_instances!(tlas, blas, instance_buf; n=4, instance_mask=UInt8(0x02))
+
+    @test_throws ErrorException Raycore.sync!(tlas)
+end

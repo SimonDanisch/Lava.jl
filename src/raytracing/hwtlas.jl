@@ -99,8 +99,9 @@ mutable struct HWTLAS{Tri} <: Raycore.AbstractAccel
     instance_masks::Vector{UInt8}
 
     # Instance batches -- N instances of one BLAS each, transforms in a GPU buffer.
-    # Distinct from the per-mesh-instance API which stores transforms in
-    # `instance_transforms` (CPU-side). Both can coexist in one HWTLAS.
+    # An HWTLAS uses EITHER per-mesh push! (CPU instance_transforms) OR
+    # push_instances! (GPU instance_buf), not both. Mixed mode errors loudly
+    # in rebuild_hw_tlas!. To switch modes, build a fresh HWTLAS.
     instance_batches::Vector{InstanceBatch}
 
     # Handle management
@@ -483,6 +484,9 @@ end
 
 function rebuild_hw_tlas!(hwtlas::HWTLAS{Tri}) where {Tri}
     if !isempty(hwtlas.instance_batches)
+        isempty(hwtlas.instance_blas_indices) || error(
+            "HWTLAS: cannot mix instance batches with per-mesh push! instances. " *
+            "Use either push_instances! (batch mode) or push! (per-mesh mode), not both.")
         return rebuild_hw_tlas_from_batch!(hwtlas)
     end
     return rebuild_hw_tlas_from_per_instance!(hwtlas)
