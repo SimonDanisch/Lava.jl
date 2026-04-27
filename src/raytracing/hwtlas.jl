@@ -482,6 +482,13 @@ function _reuse_or_alloc(prev, data::AbstractArray{T}) where T
 end
 
 function rebuild_hw_tlas!(hwtlas::HWTLAS{Tri}) where {Tri}
+    if !isempty(hwtlas.instance_batches)
+        return rebuild_hw_tlas_from_batch!(hwtlas)
+    end
+    return rebuild_hw_tlas_from_per_instance!(hwtlas)
+end
+
+function rebuild_hw_tlas_from_per_instance!(hwtlas::HWTLAS{Tri}) where {Tri}
     n_inst = length(hwtlas.instance_blas_indices)
     blas_refs = [hwtlas.blas_list[hwtlas.instance_blas_indices[i]] for i in 1:n_inst]
 
@@ -498,7 +505,7 @@ function rebuild_hw_tlas!(hwtlas::HWTLAS{Tri}) where {Tri}
     all_tris = reduce(vcat, hwtlas.blas_triangles)::Vector{Tri}
     per_inst_offsets = collect(per_instance_tri_offsets)
 
-    # Reuse the previous HardwareAccel when we have one — keeps the same
+    # Reuse the previous HardwareAccel when we have one -- keeps the same
     # RayTracingPipeline + SBT alive across sync! rebuild cycles.
     hw_accel = if hwtlas.hw_accel isa HardwareAccel
         accel_prev = hwtlas.hw_accel
@@ -517,6 +524,41 @@ function rebuild_hw_tlas!(hwtlas::HWTLAS{Tri}) where {Tri}
     # off_gpu is keyed by gl_InstanceID (one entry per instance).
     off_cpu = collect(per_instance_tri_offsets)
     off_gpu = _reuse_or_alloc(hwtlas.off_gpu, off_cpu)
+
+    return (hw_tlas, hw_accel, tri_gpu, off_gpu)
+end
+
+function rebuild_hw_tlas_from_batch!(hwtlas::HWTLAS{Tri}) where {Tri}
+    length(hwtlas.instance_batches) == 1 || error(
+        "HWTLAS: multiple instance_batches not yet supported (got $(length(hwtlas.instance_batches))). " *
+        "Push exactly one batch per HWTLAS for now.")
+    batch = hwtlas.instance_batches[1]
+
+    hw_tlas = as_build() do ctx
+        build_tlas(ctx, batch.instance_buf, batch.n; allow_update=true)
+    end
+
+    # Single-batch HWTLAS doesn't need triangle/offset buffers (Hikari renders
+    # via the rendering instances directly; physics queries don't need them
+    # either -- primitive_index / instance_id come from the rayQuery).
+    # Supply empty buffers; consumers that read tri_gpu / off_gpu
+    # against a batch HWTLAS will see zero-length arrays.
+    all_tris = Tri[]
+    per_inst_offsets = UInt32[]
+
+    hw_accel = if hwtlas.hw_accel isa HardwareAccel
+        accel_prev = hwtlas.hw_accel
+        accel_prev.tlas = hw_tlas
+        accel_prev.triangle_data = all_tris
+        accel_prev.blas_offsets = UInt32[]
+        accel_prev.per_instance_tri_offsets = per_inst_offsets
+        accel_prev
+    else
+        HardwareAccel(hw_tlas, all_tris, UInt32[], per_inst_offsets; bq=hwtlas.bq)
+    end
+
+    tri_gpu = _reuse_or_alloc(hwtlas.tri_gpu, all_tris)
+    off_gpu = _reuse_or_alloc(hwtlas.off_gpu, per_inst_offsets)
 
     return (hw_tlas, hw_accel, tri_gpu, off_gpu)
 end
@@ -612,7 +654,7 @@ function Raycore.sync!(hwtlas::HWTLAS)
     end
 
     n_inst = length(hwtlas.instance_blas_indices)
-    if n_inst == 0
+    if n_inst == 0 && isempty(hwtlas.instance_batches)
         old_hw_tlas = hwtlas.hw_tlas
         old_tri_gpu = hwtlas.tri_gpu
         old_off_gpu = hwtlas.off_gpu
