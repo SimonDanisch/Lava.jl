@@ -463,6 +463,7 @@ function refit_tlas!(ctx::ASBuildContext, tlas::LavaTLAS,
     bq = ctx.bq
     dev = as_device(ctx)
     n_instances = Int(n)
+    @assert n_instances <= length(instance_buf) "n=$n_instances exceeds instance buffer length $(length(instance_buf))"
 
     inst_addr = bda_address(instance_buf)
     build_flags = UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR) |
@@ -485,16 +486,23 @@ function refit_tlas!(ctx::ASBuildContext, tlas::LavaTLAS,
     fptr = Vulkan.function_pointer(dev, "vkCmdBuildAccelerationStructuresKHR")
     cmd = as_cmd_buf(ctx)
 
-    # Pre-barrier (same as build).
+    # Pre-barrier: cover both prior AS builds AND prior compute/transfer writes
+    # to instance_buf. The latter is the per-frame hot path where a compute
+    # kernel writes instance records and refit reads them; without this,
+    # compute writes are not guaranteed visible to the AS-build read.
     pre_barrier = Vulkan.MemoryBarrier(
         C_NULL,
-        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+        Vulkan.ACCESS_SHADER_WRITE_BIT |
+        Vulkan.ACCESS_TRANSFER_WRITE_BIT,
         Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
         Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
     )
     Vulkan.cmd_pipeline_barrier(
         cmd, [pre_barrier], [], [];
-        src_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        src_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                       Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                       Vulkan.PIPELINE_STAGE_TRANSFER_BIT,
         dst_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
     )
 
