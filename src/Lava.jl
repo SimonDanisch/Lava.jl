@@ -38,6 +38,9 @@ export geom_input, geom_input_position
 export tess_coord, tess_coord_uvw, set_tess_level_outer!, set_tess_level_inner!
 export sample_texture_2d, GfxTexture2D
 
+# Compute kernels
+export write_grain_instances_kernel, quat_to_rot3x3, build_4x3
+
 # Ray tracing exports
 export LavaInstanceRecord, identity_transform
 export GeometryType, TrianglesGeometry, AABBsGeometry, AABB
@@ -145,6 +148,9 @@ include("raytracing/pipeline.jl")      # RT pipeline + SBT + dispatch
 include("raytracing/shaders.jl")       # High-level RayTracingPipeline API
 include("raytracing/raycore_compat.jl") # HardwareAccel + trace_closest_hits!
 include("raytracing/hwtlas.jl")         # Lava.HWTLAS — concrete AbstractAccel
+
+# ---- Compute kernels ----
+include("kernels/instance_writer.jl")   # write_grain_instances_kernel + helpers
 
 # ---- Default settings ----
 # Disable scalar indexing by default (GPU arrays should not be accessed element-by-element)
