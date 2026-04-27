@@ -318,7 +318,8 @@ Must be called inside `as_build()`.
 function build_tlas(ctx::ASBuildContext, blas_list::Vector{LavaBLAS};
                     transforms::Union{Nothing, Vector{NTuple{12,Float32}}}=nothing,
                     custom_indices::Union{Nothing, Vector{UInt32}}=nothing,
-                    masks::Union{Nothing, Vector{UInt8}}=nothing)
+                    masks::Union{Nothing, Vector{UInt8}}=nothing,
+                    allow_update::Bool=false)
     bq = ctx.bq
     dev = as_device(ctx)
     n_instances = length(blas_list)
@@ -336,6 +337,9 @@ function build_tlas(ctx::ASBuildContext, blas_list::Vector{LavaBLAS};
     inst_arr = LavaArray(instance_data; bq, extra_usage=AS_INPUT_USAGE)
     inst_addr = inst_arr.buf[].address
     build_flags = UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
+    if allow_update
+        build_flags |= UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)
+    end
 
     geo_buf_inst = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
     pack_geometry!(geo_buf_inst, 0; geometry_type=:instances, instance_addr=inst_addr)
@@ -364,7 +368,63 @@ function build_tlas(ctx::ASBuildContext, blas_list::Vector{LavaBLAS};
 
     unique_blas = unique(blas_list)
     tlas = LavaTLAS(accel, storage, unique_blas, tlas_preserves,
-                    false, UInt64(0), nothing)
+                    allow_update, sizes.update_scratch_size, nothing)
+    finalizer(unsafe_free!, tlas)
+    return tlas
+end
+
+"""
+    build_tlas(ctx::ASBuildContext, instance_buf::LavaArray{LavaInstanceRecord, 1},
+               n::Integer; allow_update::Bool=false) -> LavaTLAS
+
+Build a TLAS from a GPU-resident instance buffer. `instance_buf[1:n]` must
+be valid `LavaInstanceRecord`s (typically written by `write_grain_instances_kernel`).
+No CPU-side packing pass -- the buffer's device address is fed to the Vulkan
+build directly. When `allow_update=true`, the TLAS is buildable for in-place
+refit via `refit_tlas!`.
+"""
+function build_tlas(ctx::ASBuildContext, instance_buf::LavaArray{LavaInstanceRecord, 1},
+                    n::Integer; allow_update::Bool=false)
+    bq = ctx.bq
+    dev = as_device(ctx)
+    n_instances = Int(n)
+    @assert n_instances <= length(instance_buf) "n=$n_instances exceeds instance buffer length $(length(instance_buf))"
+
+    inst_addr = bda_address(instance_buf)
+    build_flags = UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
+    if allow_update
+        build_flags |= UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)
+    end
+
+    geo_buf_inst = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
+    pack_geometry!(geo_buf_inst, 0; geometry_type=:instances, instance_addr=inst_addr)
+    sizes = query_as_build_sizes_impl(dev, geo_buf_inst, UInt32(0), build_flags, UInt32(n_instances))
+
+    storage = LavaArray{UInt8,1}(undef, (max(Int(sizes.acceleration_structure_size), 16),);
+                                  bq, extra_usage=AS_STORAGE_USAGE)
+    accel = Vulkan.AccelerationStructureKHR(dev, Vulkan.AccelerationStructureCreateInfoKHR(
+        storage.buf[].buffer, UInt64(0), sizes.acceleration_structure_size,
+        Vulkan.ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR))
+
+    scratch_arr = LavaArray{UInt8,1}(undef, (max(Int(sizes.build_scratch_size), 16),);
+                                      bq, extra_usage=AS_SCRATCH_USAGE, scratch=true)
+    scratch_addr = bda_address(scratch_arr)
+
+    # instance_buf must outlive the TLAS -- pin it on the TLAS itself for refit too.
+    tlas_preserves = LavaArray[instance_buf]
+    push!(ctx.preserves, scratch_arr)
+
+    build_as_on_gpu(ctx, accel, scratch_addr;
+        as_type=UInt32(0), build_flags,
+        geometry_type=:instances,
+        instance_addr=inst_addr,
+        primitive_count=UInt32(n_instances))
+
+    # No referenced BLASes known at this layer -- the instance buffer carries them
+    # by device address. Pinning is the caller's responsibility (HWTLAS pins them
+    # on the higher-level handle).
+    tlas = LavaTLAS(accel, storage, LavaBLAS[], tlas_preserves,
+                    allow_update, sizes.update_scratch_size, instance_buf)
     finalizer(unsafe_free!, tlas)
     return tlas
 end
