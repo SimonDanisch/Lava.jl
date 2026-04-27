@@ -438,6 +438,97 @@ function build_tlas(ctx::ASBuildContext, instance_buf::LavaArray{LavaInstanceRec
     return tlas
 end
 
+"""
+    refit_tlas!(ctx::ASBuildContext, tlas::LavaTLAS,
+                instance_buf::LavaArray{LavaInstanceRecord, 1}, n::Integer)
+
+Update a TLAS in place via `MODE_UPDATE_KHR`. Reuses `tlas.accel`'s storage
+(no new allocation), uses the cached `tlas.update_scratch_size`, and reads
+fresh instance data from `instance_buf[1:n]`.
+
+The TLAS must have been built with `allow_update=true`. The instance count
+`n` MUST equal the count used at build time -- `MODE_UPDATE_KHR` cannot
+change topology.
+
+Errors loudly on misuse.
+"""
+function refit_tlas!(ctx::ASBuildContext, tlas::LavaTLAS,
+                     instance_buf::LavaArray{LavaInstanceRecord, 1}, n::Integer)
+    tlas.allow_update || error(
+        "refit_tlas!: TLAS was built with allow_update=false; cannot refit. " *
+        "Rebuild the TLAS via build_tlas(...; allow_update=true).")
+    tlas.update_scratch_size > 0 || error(
+        "refit_tlas!: cached update_scratch_size is 0; the TLAS is not refit-capable.")
+
+    bq = ctx.bq
+    dev = as_device(ctx)
+    n_instances = Int(n)
+
+    inst_addr = bda_address(instance_buf)
+    build_flags = UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR) |
+                  UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)
+
+    # Allocate update scratch (cached size, not full build scratch).
+    scratch_arr = LavaArray{UInt8,1}(undef, (max(Int(tlas.update_scratch_size), 16),);
+                                      bq, extra_usage=AS_SCRATCH_USAGE, scratch=true)
+    scratch_addr = bda_address(scratch_arr)
+    push!(ctx.preserves, scratch_arr)
+
+    # Re-pack the geometry buffer (instance addr unchanged but spec requires it
+    # in the BuildGeometryInfo for UPDATE too).
+    geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
+    pack_geometry!(geo_buf, 0; geometry_type=:instances, instance_addr=inst_addr)
+
+    bgi_buf = zeros(UInt8, 80)
+    c_range = VkBRI(UInt32(n_instances), UInt32(0), UInt32(0), UInt32(0))
+
+    fptr = Vulkan.function_pointer(dev, "vkCmdBuildAccelerationStructuresKHR")
+    cmd = as_cmd_buf(ctx)
+
+    # Pre-barrier (same as build).
+    pre_barrier = Vulkan.MemoryBarrier(
+        C_NULL,
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+    )
+    Vulkan.cmd_pipeline_barrier(
+        cmd, [pre_barrier], [], [];
+        src_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        dst_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+    )
+
+    GC.@preserve geo_buf bgi_buf c_range begin
+        geo_ptr = pointer(geo_buf)
+        # mode=UPDATE, src=dst=tlas.accel for in-place refit.
+        pack_build_geometry_info!(bgi_buf, 0;
+            as_type=UInt32(0),                           # TOP_LEVEL
+            mode=UInt32(1),                               # MODE_UPDATE_KHR
+            build_flags,
+            src_as=tlas.accel.vks,
+            dst_as=tlas.accel.vks,
+            geometry_count=UInt32(1),
+            p_geometries=Ptr{Nothing}(geo_ptr),
+            scratch_addr)
+
+        c_ranges = [c_range]
+        pp_ranges = Ref(pointer(c_ranges))
+
+        GC.@preserve c_ranges pp_ranges begin
+            ccall(fptr, Cvoid,
+                (Ptr{Nothing}, UInt32,
+                 Ptr{Nothing},
+                 Ptr{Ptr{VkBRI}}),
+                cmd.vks, UInt32(1),
+                pointer(bgi_buf),
+                pp_ranges)
+        end
+    end
+
+    push!(ctx.preserves, (geo_buf, bgi_buf, c_range))
+    return tlas
+end
+
 # ── Internal helpers ──
 
 """Pack a VkAccelerationStructureInstanceKHR into `buf` at byte `offset`.
