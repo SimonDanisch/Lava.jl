@@ -21,6 +21,26 @@ const Mat4f = SMatrix{4, 4, Float32, 16}
 # the other `unsafe_free!` methods so the method table is easy to audit.
 
 # ============================================================================
+# InstanceBatch struct
+# ============================================================================
+
+"""
+    InstanceBatch
+
+A batch of N TLAS instances all referencing the same BLAS, with instance
+records read from a GPU-resident `LavaArray{LavaInstanceRecord, 1}` at
+sync! / refit time. Returned `handle` lets callers track the batch in
+`HWTLAS.handle_to_range` for delete!/refit.
+"""
+struct InstanceBatch
+    blas::LavaBLAS
+    instance_buf::LavaArray{LavaInstanceRecord, 1}
+    n::Int
+    instance_mask::UInt8
+    handle::Raycore.TLASHandle
+end
+
+# ============================================================================
 # HWTLAS struct
 # ============================================================================
 
@@ -78,6 +98,11 @@ mutable struct HWTLAS{Tri} <: Raycore.AbstractAccel
     instance_custom_indices::Vector{UInt32}
     instance_masks::Vector{UInt8}
 
+    # Instance batches -- N instances of one BLAS each, transforms in a GPU buffer.
+    # Distinct from the per-mesh-instance API which stores transforms in
+    # `instance_transforms` (CPU-side). Both can coexist in one HWTLAS.
+    instance_batches::Vector{InstanceBatch}
+
     # Handle management
     handle_to_range::Dict{Raycore.TLASHandle, UnitRange{Int}}
     deleted_handles::Set{Raycore.TLASHandle}
@@ -110,6 +135,7 @@ function HWTLAS{Tri}(backend::LavaBackend; bq::BatchQueue=backend.bq) where {Tri
         backend, bq,
         LavaBLAS[], Vector{Tri}[], UInt32[],
         Int[], NTuple{12,Float32}[], UInt32[], UInt8[],
+        InstanceBatch[],          # new
         Dict{Raycore.TLASHandle, UnitRange{Int}}(),
         Set{Raycore.TLASHandle}(),
         UInt32(1),
@@ -371,6 +397,32 @@ function Base.push!(hwtlas::HWTLAS{Tri}, blas::LavaBLAS, transform::Mat4f=Mat4f(
     return hwtlas_add_instances!(hwtlas, blas_idx, (transform,);
                                   instance_ids=UInt32[instance_id],
                                   instance_masks=UInt8[instance_mask])
+end
+
+"""
+    Raycore.push_instances!(tlas::HWTLAS, blas::LavaBLAS,
+                            instance_buf::LavaArray{LavaInstanceRecord, 1};
+                            n::Integer, instance_mask::UInt8) -> Raycore.TLASHandle
+
+Register an N-instance batch in the TLAS. All N instances reference the
+same `blas`; per-instance transforms / custom_indices live in `instance_buf`
+and are written by a GPU compute kernel (see `write_grain_instances_kernel`).
+
+Returns one `TLASHandle` for the whole batch. Subsequent `sync!` builds
+the underlying `LavaTLAS` with `allow_update=true` so per-frame refits
+via `Raycore.refit_tlas!(::HWTLAS)` work.
+"""
+function Raycore.push_instances!(tlas::HWTLAS, blas::LavaBLAS,
+                                  instance_buf::LavaArray{LavaInstanceRecord, 1};
+                                  n::Integer, instance_mask::UInt8 = UInt8(0xff))
+    n_int = Int(n)
+    n_int <= length(instance_buf) || error(
+        "push_instances!: n=$n_int exceeds instance_buf length $(length(instance_buf))")
+    handle = Raycore.TLASHandle(tlas.next_handle_id)
+    tlas.next_handle_id += UInt32(1)
+    push!(tlas.instance_batches, InstanceBatch(blas, instance_buf, n_int, instance_mask, handle))
+    tlas.dirty = true
+    return handle
 end
 
 """

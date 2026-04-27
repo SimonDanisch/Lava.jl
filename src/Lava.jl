@@ -47,7 +47,7 @@ export GeometryType, TrianglesGeometry, AABBsGeometry, AABB
 # Re-export Raycore.Ray so `using Lava` users get Ray without ambiguity
 export Ray
 export HardwareAccel, RTRay, RTHitResult, ASBuildContext, as_build
-export refit_tlas!
+export refit_tlas!, push_instances!
 export trace_closest_hits!, trace_closest_hits_indirect!, RayTracingPipeline, trace_rays!, trace_rays_indirect!
 export set_anyhit_pipeline!, trace_closest_hits_anyhit!, trace_closest_hits_anyhit_indirect!
 export lava_rt_ignore_intersection, lava_rt_terminate_ray

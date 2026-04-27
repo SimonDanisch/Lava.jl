@@ -438,6 +438,8 @@ function build_tlas(ctx::ASBuildContext, instance_buf::LavaArray{LavaInstanceRec
     return tlas
 end
 
+const VkBRI = Vulkan.VulkanCore.LibVulkan.VkAccelerationStructureBuildRangeInfoKHR
+
 """
     refit_tlas!(ctx::ASBuildContext, tlas::LavaTLAS,
                 instance_buf::LavaArray{LavaInstanceRecord, 1}, n::Integer)
@@ -638,8 +640,6 @@ const AS_STORAGE_USAGE = UInt32(
 const AS_SCRATCH_USAGE = UInt32(
     Vulkan.BUFFER_USAGE_STORAGE_BUFFER_BIT |
     Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
-
-const VkBRI = Vulkan.VulkanCore.LibVulkan.VkAccelerationStructureBuildRangeInfoKHR
 
 # VulkanCore.jl alignment bug: VkDeviceOrHostAddressConstKHR is NTuple{8,UInt8} (alignment 1)
 # but in C it's a union of uint64_t/void* (alignment 8). This causes misaligned fields in:
