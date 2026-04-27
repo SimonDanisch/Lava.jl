@@ -390,6 +390,17 @@ end
                 pipeline.pipeline_layout, UInt32(0), [desc_set], UInt32[])
             pin!(batch, lava_tlas.accel)
             pin!(batch, lava_tlas.storage)
+            # Pin every BLAS the TLAS references.  rayQuery walks the TLAS into
+            # its BLASes and reads their storage; without pinning each BLAS
+            # storage, `Raycore.sync!`-driven BLAS swaps can free a BLAS whose
+            # GPU memory the GPU is still using through this dispatch.  Pinning
+            # the storage updates its `last_write` to this batch's signal,
+            # which makes the next `unsafe_free!(blas)` correctly defer until
+            # the dispatch has retired.
+            for blas in lava_tlas.blases
+                pin!(batch, blas.accel)
+                pin!(batch, blas.storage)
+            end
         end
 
         push_constants_bda!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_bda)
@@ -442,6 +453,17 @@ and populated by a prepare-indirect kernel.
                 pipeline.pipeline_layout, UInt32(0), [desc_set], UInt32[])
             pin!(batch, lava_tlas.accel)
             pin!(batch, lava_tlas.storage)
+            # Pin every BLAS the TLAS references.  rayQuery walks the TLAS into
+            # its BLASes and reads their storage; without pinning each BLAS
+            # storage, `Raycore.sync!`-driven BLAS swaps can free a BLAS whose
+            # GPU memory the GPU is still using through this dispatch.  Pinning
+            # the storage updates its `last_write` to this batch's signal,
+            # which makes the next `unsafe_free!(blas)` correctly defer until
+            # the dispatch has retired.
+            for blas in lava_tlas.blases
+                pin!(batch, blas.accel)
+                pin!(batch, blas.storage)
+            end
         end
 
         push_constants_bda!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_bda)
