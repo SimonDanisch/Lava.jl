@@ -1,5 +1,6 @@
 using Test, Lava
-using Lava: LavaInstanceRecord, identity_transform, build_tlas, as_build, build_blas_aabb, AS_INPUT_USAGE
+using Lava: LavaInstanceRecord, build_tlas, as_build, build_blas_aabb, AS_INPUT_USAGE
+using GeometryBasics: Point3f
 
 @testset "build_tlas(LavaArray{LavaInstanceRecord}, n; allow_update=true)" begin
     # Build a 1-AABB BLAS (unit cube) once.

@@ -382,6 +382,15 @@ be valid `LavaInstanceRecord`s (typically written by `write_grain_instances_kern
 No CPU-side packing pass -- the buffer's device address is fed to the Vulkan
 build directly. When `allow_update=true`, the TLAS is buildable for in-place
 refit via `refit_tlas!`.
+
+`instance_buf` must be allocated with `extra_usage = AS_INPUT_USAGE` so the
+driver can read it as an AS build input; omitting that flag will cause Vulkan
+validation errors at build time.
+
+The caller is responsible for keeping all BLASes referenced by `instance_buf`
+alive for the lifetime of the returned TLAS. The instance records store BLASes
+only by device address, and the TLAS holds no Julia-side references to them.
+(HWTLAS pins them at the higher level when used through `Raycore.push_instances!`.)
 """
 function build_tlas(ctx::ASBuildContext, instance_buf::LavaArray{LavaInstanceRecord, 1},
                     n::Integer; allow_update::Bool=false)
