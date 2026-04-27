@@ -39,6 +39,7 @@ export tess_coord, tess_coord_uvw, set_tess_level_outer!, set_tess_level_inner!
 export sample_texture_2d, GfxTexture2D
 
 # Ray tracing exports
+export LavaInstanceRecord, identity_transform
 export GeometryType, TrianglesGeometry, AABBsGeometry, AABB
 # Re-export Raycore.Ray so `using Lava` users get Ray without ambiguity
 export Ray
@@ -137,6 +138,7 @@ include("graphics/api.jl")           # GraphicsPipeline, draw!, blit!, present_f
 
 # ---- Phase 2: Ray Tracing ----
 include("raytracing/geometry_types.jl")  # GeometryType hierarchy + AABB struct
+include("raytracing/instance_record.jl") # LavaInstanceRecord — 64-byte TLAS instance struct
 include("raytracing/acceleration.jl")  # BLAS/TLAS build
 include("raytracing/pipeline.jl")      # RT pipeline + SBT + dispatch
 include("raytracing/shaders.jl")       # High-level RayTracingPipeline API
