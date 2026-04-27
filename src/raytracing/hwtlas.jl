@@ -227,7 +227,42 @@ end
 Raycore.world_bound(hwtlas::HWTLAS)    = hwtlas.root_aabb
 Raycore.n_geometries(hwtlas::HWTLAS)   = length(hwtlas.blas_list)
 Raycore.n_instances(hwtlas::HWTLAS)    = length(hwtlas.instance_blas_indices)
-Raycore.refit_tlas!(hwtlas::HWTLAS)    = nothing
+"""
+    Raycore.refit_tlas!(hwtlas::HWTLAS) -> hwtlas
+
+In-place TLAS refit using `MODE_UPDATE_KHR`. Reads fresh instance records
+from each registered batch's GPU instance buffer (typically just-written by
+the user's compute kernel).
+
+Requirements:
+- HWTLAS must have at least one instance batch registered via `push_instances!`.
+- HWTLAS must be clean (no `push!` / `delete!` since last `sync!`).
+- Underlying `LavaTLAS` must have been built with `allow_update=true` (set
+  automatically by `sync!` for batch HWTLASes).
+
+Errors loudly on misuse.
+"""
+function Raycore.refit_tlas!(hwtlas::HWTLAS)
+    isempty(hwtlas.instance_batches) && error(
+        "refit_tlas!: HWTLAS has no instance batches. Use sync! to rebuild " *
+        "for HWTLASes built via per-mesh push! API.")
+    !hwtlas.dirty || error(
+        "refit_tlas!: HWTLAS topology has changed since last sync! " *
+        "(dirty=true). Call sync! to rebuild instead of refitting.")
+    hwtlas.hw_tlas !== nothing || error(
+        "refit_tlas!: HWTLAS has not been sync!'d yet. Call sync! before refit.")
+    hwtlas.hw_tlas.allow_update || error(
+        "refit_tlas!: underlying LavaTLAS was built with allow_update=false. " *
+        "This indicates a bug -- sync! should set allow_update=true on batch HWTLASes.")
+    length(hwtlas.instance_batches) == 1 || error(
+        "refit_tlas!: multiple instance_batches not yet supported.")
+
+    batch = hwtlas.instance_batches[1]
+    as_build() do ctx
+        Lava.refit_tlas!(ctx, hwtlas.hw_tlas, batch.instance_buf, batch.n)
+    end
+    return hwtlas
+end
 
 # RayMakie compat: hwtlas.instances -> lightweight length-only view
 struct HWTLASInstances
