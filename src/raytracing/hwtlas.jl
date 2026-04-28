@@ -235,6 +235,30 @@ end
 Raycore.world_bound(hwtlas::HWTLAS)    = hwtlas.root_aabb
 Raycore.n_geometries(hwtlas::HWTLAS)   = length(hwtlas.blas_list)
 Raycore.n_instances(hwtlas::HWTLAS)    = length(hwtlas.instance_blas_indices)
+
+"""
+    Raycore.instance_buffer(hwtlas::HWTLAS, handle::Raycore.TLASHandle) -> LavaArray{LavaInstanceRecord, 1}
+
+Return the GPU instance buffer for the batch registered under `handle`. The
+caller can write new instance records into the returned LavaArray (typically
+via a compute kernel) and then call `Raycore.refit_tlas!(hwtlas)` to commit
+the change to the underlying LavaTLAS via MODE_UPDATE_KHR.
+
+Errors if the handle is not a batch handle. Per-mesh push! handles (those
+stored in `hwtlas.handle_to_range` for the legacy CPU instance path) have
+no associated GPU buffer and will error.
+"""
+function Raycore.instance_buffer(hwtlas::HWTLAS, handle::Raycore.TLASHandle)
+    for batch in hwtlas.instance_batches
+        batch.handle === handle && return batch.instance_buf
+    end
+    error(
+        "instance_buffer: handle does not refer to an instance batch. " *
+        "Either it's invalid, deleted, or it refers to a per-mesh push! " *
+        "instance (which has no GPU buffer). Use the value returned by " *
+        "push!(hwtlas, mesh_or_blas, instance_buf::LavaArray; ...).")
+end
+
 """
     Raycore.refit_tlas!(hwtlas::HWTLAS) -> hwtlas
 
