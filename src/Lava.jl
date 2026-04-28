@@ -59,6 +59,8 @@ export batch_trace_indirect, set_custom_anyhit!
 export ConvexShape, UnitCube, support
 # P4.2 GJK overlap test
 export gjk, GJKResult
+# P4.3 EPA penetration recovery
+export epa, EPAResult
 
 import Serialization
 using Vulkan
@@ -156,6 +158,7 @@ include("raytracing/raycore_compat.jl") # HardwareAccel + trace_closest_hits!
 include("raytracing/hwtlas.jl")         # Lava.HWTLAS — concrete AbstractAccel
 include("raytracing/convex_shape.jl")   # ConvexShape abstract + UnitCube + support (P4)
 include("raytracing/gjk.jl")            # GJK overlap test + GJKResult (P4.2)
+include("raytracing/epa.jl")            # EPA penetration recovery + EPAResult (P4.3)
 
 # ---- Compute kernels ----
 include("kernels/instance_writer.jl")   # write_grain_instances_kernel + helpers
