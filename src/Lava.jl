@@ -39,7 +39,9 @@ export tess_coord, tess_coord_uvw, set_tess_level_outer!, set_tess_level_inner!
 export sample_texture_2d, GfxTexture2D
 
 # Compute kernels
-export write_grain_instances_kernel, write_meshscatter_instances_kernel, quat_to_rot3x3, build_4x3
+export write_grain_instances_kernel, write_meshscatter_instances_kernel,
+       write_meshscatter_instances_pervec_kernel,
+       quat_to_rot3x3, build_4x3, build_4x3_pervec
 
 # Ray tracing exports
 export LavaInstanceRecord, identity_transform
