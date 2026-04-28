@@ -125,6 +125,10 @@ mutable struct HWTLAS{Tri} <: Raycore.AbstractAccel
     hw_accel::Union{Nothing, HardwareAccel{Vector{Tri}}}
     tri_gpu::Union{Nothing, LavaArray{Tri, 1}}
     off_gpu::Union{Nothing, LavaArray{UInt32, 1}}
+    # Combined instance buffer: concatenation of every batch's instance_buf.
+    # Allocated/grown in rebuild_hw_tlas_from_batch! and reused across syncs +
+    # refits.  Stays `nothing` for HWTLASes that use the per-mesh push! path.
+    combined_instance_buf::Union{Nothing, LavaArray{LavaInstanceRecord, 1}}
 
     # GPU-adapted form, owned by sync!.  Consumers read this via
     # `hwtlas.static_tlas` or `Adapt.adapt(backend, hwtlas)` per dispatch.
@@ -150,6 +154,7 @@ function HWTLAS{Tri}(backend::LavaBackend; bq::BatchQueue=backend.bq) where {Tri
         UInt32(1),
         Raycore.Bounds3(),
         nothing, nothing, nothing, nothing,
+        nothing,                  # combined_instance_buf (P3-fu4)
         nothing,
         true,
     )
@@ -286,12 +291,18 @@ function Raycore.refit_tlas!(hwtlas::HWTLAS)
     hwtlas.hw_tlas.allow_update || error(
         "refit_tlas!: underlying LavaTLAS was built with allow_update=false. " *
         "This indicates a bug -- sync! should set allow_update=true on batch HWTLASes.")
-    length(hwtlas.instance_batches) == 1 || error(
-        "refit_tlas!: multiple instance_batches not yet supported.")
+    hwtlas.combined_instance_buf !== nothing || error(
+        "refit_tlas!: combined_instance_buf is nothing -- this HWTLAS has not " *
+        "been sync!'d via the batch path.")
 
-    batch = hwtlas.instance_batches[1]
+    # Re-run the GPU-side concat copy from each batch's instance_buf into the
+    # combined buffer (the user's compute kernel just wrote new records into
+    # one or more batch.instance_buf), then issue MODE_UPDATE_KHR refit on
+    # the combined buffer.  For a single-batch HWTLAS this is one memcpy +
+    # one Vulkan refit; for K batches it is K memcpys + one refit.
+    combined, total_n = _concat_batch_instances!(hwtlas)
     as_build() do ctx
-        Lava.refit_tlas!(ctx, hwtlas.hw_tlas, batch.instance_buf, batch.n)
+        Lava.refit_tlas!(ctx, hwtlas.hw_tlas, combined, total_n)
     end
     return hwtlas
 end
@@ -657,33 +668,65 @@ function rebuild_hw_tlas_from_per_instance!(hwtlas::HWTLAS{Tri}) where {Tri}
     return (hw_tlas, hw_accel, tri_gpu, off_gpu)
 end
 
+# Allocate-or-reuse a combined LavaArray{LavaInstanceRecord} that fits all
+# `total` records, then GPU-copy each batch's instance_buf into the right
+# offset.  The combined buffer is what build_tlas / refit_tlas! sees.
+function _concat_batch_instances!(hwtlas::HWTLAS{Tri}) where {Tri}
+    total = 0
+    for batch in hwtlas.instance_batches
+        total += batch.n
+    end
+    combined = hwtlas.combined_instance_buf
+    if combined === nothing || length(combined) < total
+        combined = LavaArray{LavaInstanceRecord, 1}(undef, total;
+                                                       extra_usage=AS_INPUT_USAGE)
+        hwtlas.combined_instance_buf = combined
+    end
+    inst_offset = 0
+    for batch in hwtlas.instance_batches
+        # GPU->GPU copy at the right offset.  copyto! on LavaArray uses
+        # vkCmdCopyBuffer (no CPU staging).
+        Base.copyto!(combined, inst_offset + 1, batch.instance_buf, 1, batch.n)
+        inst_offset += batch.n
+    end
+    return combined, total
+end
+
 function rebuild_hw_tlas_from_batch!(hwtlas::HWTLAS{Tri}) where {Tri}
-    length(hwtlas.instance_batches) == 1 || error(
-        "HWTLAS: multiple instance_batches not yet supported (got $(length(hwtlas.instance_batches))). " *
-        "Push exactly one batch per HWTLAS for now.")
-    batch = hwtlas.instance_batches[1]
+    isempty(hwtlas.instance_batches) && error(
+        "rebuild_hw_tlas_from_batch!: no instance_batches to build.")
+
+    combined, total_n = _concat_batch_instances!(hwtlas)
 
     hw_tlas = as_build() do ctx
-        build_tlas(ctx, batch.instance_buf, batch.n; allow_update=true)
+        build_tlas(ctx, combined, total_n; allow_update=true)
     end
 
-    # Populate triangle metadata from the batch. All N instances reference the
-    # same BLAS, so all offsets are 0 -- every instance starts at triangle 0.
-    # When triangles is empty (rayQuery-only callers), tri_gpu is empty too;
-    # the per_inst_offsets array is always allocated so off_gpu is sized
-    # uniformly (N entries, all zero).
-    all_tris = batch.triangles
-    per_inst_offsets = zeros(UInt32, batch.n)
+    # Concatenate triangle metadata across batches.  Each batch's instances all
+    # reference one BLAS, so all instances of batch i share the same offset
+    # into all_tris (= the running tri_offset where batch i's triangles begin).
+    all_tris = Tri[]
+    per_inst_offsets = UInt32[]
+    blas_offsets = UInt32[]
+    tri_offset = UInt32(0)
+    for batch in hwtlas.instance_batches
+        push!(blas_offsets, tri_offset)
+        append!(all_tris, batch.triangles)
+        for _ in 1:batch.n
+            push!(per_inst_offsets, tri_offset)
+        end
+        tri_offset += UInt32(length(batch.triangles))
+    end
 
     hw_accel = if hwtlas.hw_accel isa HardwareAccel
         accel_prev = hwtlas.hw_accel
         accel_prev.tlas = hw_tlas
         accel_prev.triangle_data = all_tris
-        accel_prev.blas_offsets = UInt32[0]
+        accel_prev.blas_offsets = blas_offsets
         accel_prev.per_instance_tri_offsets = per_inst_offsets
         accel_prev
     else
-        HardwareAccel(hw_tlas, all_tris, UInt32[0], per_inst_offsets; bq=hwtlas.bq)
+        HardwareAccel(hw_tlas, all_tris, blas_offsets, per_inst_offsets; bq=hwtlas.bq)
     end
 
     tri_gpu = _reuse_or_alloc(hwtlas.tri_gpu, all_tris)

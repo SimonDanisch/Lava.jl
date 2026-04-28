@@ -32,19 +32,33 @@ using GeometryBasics: Point3f, Vec3f, Vec4f
     @test tlas.hw_tlas.update_scratch_size > 0
 end
 
-@testset "HWTLAS sync! errors on multiple batches" begin
-    aabb = Lava.AABB(Point3f(-1f0,-1f0,-1f0), Point3f(1f0,1f0,1f0))
+@testset "HWTLAS sync! supports multiple batches (P3-fu4)" begin
+    # P3-fu4 lifted the single-batch guard.  Multiple batches concatenate into
+    # a combined instance buffer and the TLAS spans them all.
+    aabb = Lava.AABB(Point3f(-1f0, -1f0, -1f0), Point3f(1f0, 1f0, 1f0))
     blas = as_build() do ctx; build_blas_aabb(ctx, [aabb]); end
 
-    instance_buf1 = Lava.LavaArray{LavaInstanceRecord}(undef, 4; extra_usage=AS_INPUT_USAGE)
-    instance_buf2 = Lava.LavaArray{LavaInstanceRecord}(undef, 4; extra_usage=AS_INPUT_USAGE)
+    n_a = 4; n_b = 6
+    instance_buf1 = Lava.LavaArray{LavaInstanceRecord}(undef, n_a; extra_usage=AS_INPUT_USAGE)
+    instance_buf2 = Lava.LavaArray{LavaInstanceRecord}(undef, n_b; extra_usage=AS_INPUT_USAGE)
 
     backend = Lava.LavaBackend()
     tlas = Lava.HWTLAS(backend)
-    push!(tlas, blas, instance_buf1; n=4, instance_mask=UInt8(0x02))
-    push!(tlas, blas, instance_buf2; n=4, instance_mask=UInt8(0x04))
+    h1 = push!(tlas, blas, instance_buf1; n=n_a, instance_mask=UInt8(0x02))
+    h2 = push!(tlas, blas, instance_buf2; n=n_b, instance_mask=UInt8(0x04))
 
-    @test_throws ErrorException Raycore.sync!(tlas)
+    Raycore.sync!(tlas)
+    @test tlas.dirty == false
+    @test tlas.hw_tlas !== nothing
+    @test tlas.hw_tlas.allow_update == true
+
+    # The combined instance buffer holds n_a + n_b records.
+    @test tlas.combined_instance_buf !== nothing
+    @test length(tlas.combined_instance_buf) >= n_a + n_b
+
+    # Refit on the multi-batch HWTLAS works too.
+    Raycore.refit_tlas!(tlas)
+    @test tlas.dirty == false   # refit does not toggle dirty
 end
 
 # Note: the "errors on mixed mode" testset was removed in P3.4b.
