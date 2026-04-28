@@ -41,8 +41,8 @@ end
     Lava.vk_flush!(bq)
 
     tlas = Lava.HWTLAS(backend)
-    Raycore.push_instances!(tlas, blas, instance_buf; n = 2 * N,
-                            instance_mask = UInt8(0x02))
+    push!(tlas, blas, instance_buf; n = 2 * N,
+          instance_mask = UInt8(0x02))
     Raycore.sync!(tlas)
 
     shift_kernel = shift_positions_x_kernel!(backend)

@@ -5,7 +5,7 @@ using GeometryBasics: Point3f
 # Triangle type used by the default HWTLAS.
 const Tri = Raycore.Triangle{UInt32}
 
-@testset "push_instances! triangles kwarg -- batch path populates tri_gpu/off_gpu" begin
+@testset "push!(hwtlas, blas, instance_buf) triangles kwarg -- batch path populates tri_gpu/off_gpu" begin
     aabb = Lava.AABB(Point3f(-1f0,-1f0,-1f0), Point3f(1f0,1f0,1f0))
     blas = as_build() do ctx; build_blas_aabb(ctx, [aabb]); end
 
@@ -19,9 +19,9 @@ const Tri = Raycore.Triangle{UInt32}
     n_tris_per_blas = 12
     dummy_triangles = [Raycore.empty_triangle(Tri) for _ in 1:n_tris_per_blas]
 
-    handle = Raycore.push_instances!(tlas, blas, instance_buf;
-                                      n=n, instance_mask=UInt8(0x04),
-                                      triangles=dummy_triangles)
+    handle = push!(tlas, blas, instance_buf;
+                   n=n, instance_mask=UInt8(0x04),
+                   triangles=dummy_triangles)
     @test handle isa Raycore.TLASHandle
     @test tlas.instance_batches[1].triangles === dummy_triangles
 
@@ -37,7 +37,7 @@ const Tri = Raycore.Triangle{UInt32}
     @test all(==(UInt32(0)), Array(tlas.off_gpu))
 end
 
-@testset "push_instances! default triangles kwarg -- off_gpu sized, tri_gpu empty" begin
+@testset "push!(hwtlas, blas, instance_buf) default triangles kwarg -- off_gpu sized, tri_gpu empty" begin
     aabb = Lava.AABB(Point3f(-1f0,-1f0,-1f0), Point3f(1f0,1f0,1f0))
     blas = as_build() do ctx; build_blas_aabb(ctx, [aabb]); end
 
@@ -47,7 +47,7 @@ end
     tlas = Lava.HWTLAS(backend)
 
     # No triangles supplied -- rayQuery-only backward-compat path.
-    Raycore.push_instances!(tlas, blas, instance_buf; n=n, instance_mask=UInt8(0x02))
+    push!(tlas, blas, instance_buf; n=n, instance_mask=UInt8(0x02))
     @test isempty(tlas.instance_batches[1].triangles)
 
     Raycore.sync!(tlas)

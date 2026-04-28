@@ -104,9 +104,12 @@ mutable struct HWTLAS{Tri} <: Raycore.AbstractAccel
     instance_masks::Vector{UInt8}
 
     # Instance batches -- N instances of one BLAS each, transforms in a GPU buffer.
-    # An HWTLAS uses EITHER per-mesh push! (CPU instance_transforms) OR
-    # push_instances! (GPU instance_buf), not both. Mixed mode errors loudly
-    # in rebuild_hw_tlas!. To switch modes, build a fresh HWTLAS.
+    # An HWTLAS uses EITHER per-mesh push! with CPU transforms (populates
+    # instance_transforms) OR push! with a LavaArray instance_buf (GPU-resident
+    # batch mode, populates instance_batches). Mixed mode errors loudly in
+    # rebuild_hw_tlas!. To switch modes, build a fresh HWTLAS.
+    # TODO(P3.4d): migrate per-mesh push!(mesh, transform) to also use batch path;
+    # then per-instance arrays can be removed.
     instance_batches::Vector{InstanceBatch{Tri}}
 
     # Handle management
@@ -240,7 +243,7 @@ from each registered batch's GPU instance buffer (typically just-written by
 the user's compute kernel).
 
 Requirements:
-- HWTLAS must have at least one instance batch registered via `push_instances!`.
+- HWTLAS must have at least one instance batch registered via `push!(hwtlas, blas, instance_buf)`.
 - HWTLAS must be clean (no `push!` / `delete!` since last `sync!`).
 - Underlying `LavaTLAS` must have been built with `allow_update=true` (set
   automatically by `sync!` for batch HWTLASes).
@@ -249,8 +252,8 @@ Errors loudly on misuse.
 """
 function Raycore.refit_tlas!(hwtlas::HWTLAS)
     isempty(hwtlas.instance_batches) && error(
-        "refit_tlas!: HWTLAS has no instance batches. Use sync! to rebuild " *
-        "for HWTLASes built via per-mesh push! API.")
+        "refit_tlas!: HWTLAS has no instance batches. Call push!(hwtlas, blas, instance_buf) " *
+        "to register a GPU-resident batch, then sync! before refitting.")
     !hwtlas.dirty || error(
         "refit_tlas!: HWTLAS topology has changed since last sync! " *
         "(dirty=true). Call sync! to rebuild instead of refitting.")
@@ -441,14 +444,17 @@ function Base.push!(hwtlas::HWTLAS{Tri}, blas::LavaBLAS, transform::Mat4f=Mat4f(
 end
 
 """
-    Raycore.push_instances!(tlas::HWTLAS{Tri}, blas::LavaBLAS,
-                            instance_buf::LavaArray{LavaInstanceRecord, 1};
-                            n::Integer, instance_mask::UInt8,
-                            triangles::Vector{Tri}) -> Raycore.TLASHandle
+    push!(tlas::HWTLAS{Tri}, blas::LavaBLAS,
+          instance_buf::LavaArray{LavaInstanceRecord, 1};
+          n::Integer, instance_mask::UInt8,
+          triangles::Vector{Tri}) -> Raycore.TLASHandle
 
 Register an N-instance batch in the TLAS. All N instances reference the
 same `blas`; per-instance transforms / custom_indices live in `instance_buf`
 and are written by a GPU compute kernel (see `write_grain_instances_kernel`).
+
+`n` defaults to `length(instance_buf)`. Pass a smaller value when the buffer
+is pre-allocated larger than the current live instance count.
 
 `triangles` supplies the BLAS's per-triangle metadata for Hikari's path tracer
 (`tri_gpu` / `off_gpu` lookup). Pass empty (the default) for rayQuery-only
@@ -458,17 +464,51 @@ Returns one `TLASHandle` for the whole batch. Subsequent `sync!` builds
 the underlying `LavaTLAS` with `allow_update=true` so per-frame refits
 via `Raycore.refit_tlas!(::HWTLAS)` work.
 """
-function Raycore.push_instances!(tlas::HWTLAS{Tri}, blas::LavaBLAS,
-                                  instance_buf::LavaArray{LavaInstanceRecord, 1};
-                                  n::Integer, instance_mask::UInt8 = UInt8(0xff),
-                                  triangles::Vector{Tri} = Tri[]) where {Tri}
+function Base.push!(tlas::HWTLAS{Tri}, blas::LavaBLAS,
+                    instance_buf::LavaArray{LavaInstanceRecord, 1};
+                    n::Integer = length(instance_buf),
+                    instance_mask::UInt8 = UInt8(0xff),
+                    triangles::Vector{Tri} = Tri[]) where {Tri}
     n_int = Int(n)
     n_int <= length(instance_buf) || error(
-        "push_instances!: n=$n_int exceeds instance_buf length $(length(instance_buf))")
+        "push!: n=$n_int exceeds instance_buf length $(length(instance_buf))")
     handle = Raycore.TLASHandle(tlas.next_handle_id)
     tlas.next_handle_id += UInt32(1)
     push!(tlas.instance_batches, InstanceBatch{Tri}(blas, instance_buf, n_int, instance_mask, handle, triangles))
     tlas.dirty = true
+    return handle
+end
+
+"""
+    push!(hwtlas::HWTLAS{Tri}, mesh::GeometryBasics.Mesh,
+          instance_buf::LavaArray{LavaInstanceRecord, 1};
+          n::Integer, instance_mask::UInt8) -> Raycore.TLASHandle
+
+Build a BLAS from `mesh` (or reuse a cached one) and register an N-instance
+batch backed by the GPU-resident `instance_buf`. The per-instance transforms
+and custom_indices are read from `instance_buf` at `sync!` / `refit_tlas!`
+time -- typically written by a compute kernel such as
+`write_grain_instances_kernel`.
+
+`n` defaults to `length(instance_buf)`. Pass a smaller value when the buffer
+is pre-allocated larger than the current live instance count.
+
+Returns one `TLASHandle` for the whole batch.
+"""
+function Base.push!(hwtlas::HWTLAS{Tri}, mesh::GeometryBasics.Mesh,
+                    instance_buf::LavaArray{LavaInstanceRecord, 1};
+                    n::Integer = length(instance_buf),
+                    instance_mask::UInt8 = UInt8(0xff)) where {Tri}
+    n_int = Int(n)
+    n_int <= length(instance_buf) || error(
+        "push!: n=$n_int exceeds instance_buf length $(length(instance_buf))")
+    blas_idx = hwtlas_add_geometry!(hwtlas, mesh)
+    blas = hwtlas.blas_list[blas_idx]
+    triangles = hwtlas.blas_triangles[blas_idx]
+    handle = Raycore.TLASHandle(hwtlas.next_handle_id)
+    hwtlas.next_handle_id += UInt32(1)
+    push!(hwtlas.instance_batches, InstanceBatch{Tri}(blas, instance_buf, n_int, instance_mask, handle, triangles))
+    hwtlas.dirty = true
     return handle
 end
 
@@ -531,8 +571,9 @@ end
 function rebuild_hw_tlas!(hwtlas::HWTLAS{Tri}) where {Tri}
     if !isempty(hwtlas.instance_batches)
         isempty(hwtlas.instance_blas_indices) || error(
-            "HWTLAS: cannot mix instance batches with per-mesh push! instances. " *
-            "Use either push_instances! (batch mode) or push! (per-mesh mode), not both.")
+            "HWTLAS: cannot mix GPU-buffer batch push! (instance_batches) with " *
+            "CPU-transform push! (instance_blas_indices). Use one mode per HWTLAS. " *
+            "To switch modes, build a fresh HWTLAS.")
         return rebuild_hw_tlas_from_batch!(hwtlas)
     end
     return rebuild_hw_tlas_from_per_instance!(hwtlas)

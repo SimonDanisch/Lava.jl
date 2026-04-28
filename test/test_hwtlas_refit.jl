@@ -21,7 +21,7 @@ using GeometryBasics: Point3f, Vec3f, Vec4f
     Lava.vk_flush!(bq)
 
     tlas = Lava.HWTLAS(backend)
-    Raycore.push_instances!(tlas, blas, instance_buf; n=2*n, instance_mask=UInt8(0x02))
+    push!(tlas, blas, instance_buf; n=2*n, instance_mask=UInt8(0x02))
     Raycore.sync!(tlas)
 
     # Refit cycle: write new positions, refit, no errors.

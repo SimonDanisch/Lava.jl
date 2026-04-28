@@ -23,7 +23,7 @@ using GeometryBasics: Point3f, Vec3f, Vec4f
     Lava.vk_flush!(bq)
 
     tlas = Lava.HWTLAS(backend)
-    Raycore.push_instances!(tlas, blas, instance_buf; n=2*n, instance_mask=UInt8(0x02))
+    push!(tlas, blas, instance_buf; n=2*n, instance_mask=UInt8(0x02))
     Raycore.sync!(tlas)
 
     @test tlas.dirty == false
@@ -41,25 +41,16 @@ end
 
     backend = Lava.LavaBackend()
     tlas = Lava.HWTLAS(backend)
-    Raycore.push_instances!(tlas, blas, instance_buf1; n=4, instance_mask=UInt8(0x02))
-    Raycore.push_instances!(tlas, blas, instance_buf2; n=4, instance_mask=UInt8(0x04))
+    push!(tlas, blas, instance_buf1; n=4, instance_mask=UInt8(0x02))
+    push!(tlas, blas, instance_buf2; n=4, instance_mask=UInt8(0x04))
 
     @test_throws ErrorException Raycore.sync!(tlas)
 end
 
-@testset "HWTLAS sync! errors on mixed mode (push! + push_instances!)" begin
-    aabb = Lava.AABB(Point3f(-1f0,-1f0,-1f0), Point3f(1f0,1f0,1f0))
-    blas = as_build() do ctx; build_blas_aabb(ctx, [aabb]); end
-
-    instance_buf = Lava.LavaArray{LavaInstanceRecord}(undef, 4; extra_usage=AS_INPUT_USAGE)
-
-    backend = Lava.LavaBackend()
-    tlas = Lava.HWTLAS(backend)
-
-    # per-mesh mode: push a pre-built BLAS directly (no transform = default Mat4f(I))
-    push!(tlas, blas; instance_id=UInt32(0), instance_mask=UInt8(0x01))
-    # batch mode: also register an instance batch
-    Raycore.push_instances!(tlas, blas, instance_buf; n=4, instance_mask=UInt8(0x02))
-
-    @test_throws ErrorException Raycore.sync!(tlas)
-end
+# Note: the "errors on mixed mode" testset was removed in P3.4b.
+# The new GPU-buffer push!(hwtlas, blas, instance_buf) overload replaces
+# Raycore.push_instances!, so there is no separate "push_instances!" path to mix
+# with the CPU-transform push! path. Mixed-mode is still detected in
+# rebuild_hw_tlas! (CPU-transform push! populates instance_blas_indices;
+# GPU-buffer push! populates instance_batches; mixing both still errors).
+# A dedicated test for that guard lives in test_hwtlas_mixed_mode.jl if needed.
