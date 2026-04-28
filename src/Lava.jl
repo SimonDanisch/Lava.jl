@@ -57,6 +57,8 @@ export HWTLAS, HWAdaptedAccel, PrecomputedHitsAccel
 export batch_trace_indirect, set_custom_anyhit!
 # P4 narrow-phase convex shapes
 export ConvexShape, UnitCube, support
+# P4.2 GJK overlap test
+export gjk, GJKResult
 
 import Serialization
 using Vulkan
@@ -153,6 +155,7 @@ include("raytracing/shaders.jl")       # High-level RayTracingPipeline API
 include("raytracing/raycore_compat.jl") # HardwareAccel + trace_closest_hits!
 include("raytracing/hwtlas.jl")         # Lava.HWTLAS — concrete AbstractAccel
 include("raytracing/convex_shape.jl")   # ConvexShape abstract + UnitCube + support (P4)
+include("raytracing/gjk.jl")            # GJK overlap test + GJKResult (P4.2)
 
 # ---- Compute kernels ----
 include("kernels/instance_writer.jl")   # write_grain_instances_kernel + helpers
