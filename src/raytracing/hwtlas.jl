@@ -751,8 +751,9 @@ function trace_closest_hits_indirect!(results, rays, accel::HWAdaptedAccel, n_bu
     trace_closest_hits_indirect!(results, rays, accel.hwtlas.hw_accel, n_buf; cull_mask=cull_mask)
 end
 
-function batch_trace_indirect(results, rays, accel::HWAdaptedAccel, n_buf)
-    trace_closest_hits_indirect!(results, rays, accel.hwtlas.hw_accel, n_buf)
+function batch_trace_indirect(results, rays, accel::HWAdaptedAccel, n_buf;
+                               cull_mask::UInt32 = UInt32(0xFF))
+    trace_closest_hits_indirect!(results, rays, accel.hwtlas.hw_accel, n_buf; cull_mask=cull_mask)
     Tri = eltype(eltype(accel.hwtlas.blas_triangles))
     empty = Raycore.empty_triangle(Tri)
     return PrecomputedHitsAccel(results, accel.hwtlas.tri_gpu, accel.hwtlas.off_gpu, empty)
