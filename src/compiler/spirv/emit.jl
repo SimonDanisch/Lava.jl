@@ -1157,7 +1157,11 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                     # Must load as i64 first, then OpConvertUToPtr.
                     load_as_int_then_convert_to_ptr = true
                     spirv_load_ty = emit_type_int!(state.mod, UInt32(64), UInt32(0))
-                elseif eff_load_ty != pointee_ty && eff_load_ty isa LLVM.IntegerType && pointee_ty isa LLVM.IntegerType
+                elseif eff_load_ty != pointee_ty && pointee_ty isa LLVM.IntegerType &&
+                       (eff_load_ty isa LLVM.IntegerType || eff_load_ty isa LLVM.FloatingPointType)
+                    # Bitcast pointer to match load type. Covers int-int width
+                    # mismatches and float/double loads from [N x i64]-packed
+                    # MVector allocas.
                     val_spirv_ty = map_type!(state.type_ctx, eff_load_ty)
                     new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
                     cast_id = fresh_id!(state.mod)
@@ -1916,8 +1920,12 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
                     int_id = fresh_id!(state.mod)
                     encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, i64_spirv, int_id, val_id)
                     val_id = int_id
-                elseif val_ty != pointee_ty && val_ty isa LLVM.IntegerType && pointee_ty isa LLVM.IntegerType
-                    # Bitcast pointer to match value type
+                elseif val_ty != pointee_ty && pointee_ty isa LLVM.IntegerType &&
+                       (val_ty isa LLVM.IntegerType || val_ty isa LLVM.FloatingPointType)
+                    # Bitcast pointer to match value type. Covers int-int width
+                    # mismatches and the MVector{N, T<:AbstractFloat} case where
+                    # Julia/LLVM packs the alloca as [N x i64] but writes typed
+                    # float/double values at GEP-derived offsets.
                     val_spirv_ty = map_type!(state.type_ctx, val_ty)
                     new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
                     cast_id = fresh_id!(state.mod)
@@ -4778,6 +4786,23 @@ function emit_conversion!(state::SPIRVEmitterState, inst::LLVM.Instruction, opco
         emit_type_int!(state.mod, spirv_int_width(LLVM.width(llvm_ty)), UInt32(0))
     else
         map_type!(state.type_ctx, llvm_ty)
+    end
+    # OpUConvert/OpSConvert require an integer-or-vector input.  When LLVM
+    # generates a `zext`/`sext` chain whose source is a float (because an
+    # adjacent bitcast got fused or the type-punned load-analysis assigned
+    # the source to `%float`), insert an OpBitcast to the matching integer
+    # type so the conversion sees an integer source.
+    if opcode in (Op.OpUConvert, Op.OpSConvert)
+        src_llvm_ty = LLVM.value_type(ops[1])
+        if src_llvm_ty isa LLVM.FloatingPointType
+            fp_width = src_llvm_ty isa LLVM.LLVMHalf ? 16 :
+                       src_llvm_ty isa LLVM.LLVMFloat ? 32 :
+                       src_llvm_ty isa LLVM.LLVMDouble ? 64 : 32
+            int_ty = emit_type_int!(state.mod, UInt32(fp_width), UInt32(0))
+            bitcast_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpBitcast, int_ty, bitcast_id, src)
+            src = bitcast_id
+        end
     end
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, opcode, result_ty, result_id, src)
