@@ -150,21 +150,32 @@ end
 # Vulkan backend, with outputs matching the CPU path.  Per the "never
 # crash-loop GPU tests" project rule, we do not retry on failure.
 #
-# CURRENTLY GATED: the GPU compile fails because `epa()` (in raytracing/epa.jl,
-# from P4.3) contains three `error("EPA ... = \$EPA_MAX_X")` calls inside
-# overflow-guard branches.  The Julia/SPIR-V lowering can't compile string
-# interpolation (`print_to_string` -> `IOBuffer` -> `_string_n` -> heap
-# allocation), so even though those branches are unreachable in practice,
-# their *presence* in the IR fails the InvalidIRError check.  Fixing this
-# is an epa.jl change (replace the 3 sites with non-allocating overflow
-# handling -- e.g. return a non-converged EPAResult) and is out of scope
-# for P4.4.  The CPU testsets above prove the kernel composition itself is
-# correct; a fresh follow-up issue should make epa.jl GPU-clean and re-enable
-# this @testset.
+# STATUS: STILL GATED, but for a different reason than before.
+#
+# History:
+#   1. Originally gated because epa() contained three `error("EPA ... = $...")`
+#      sites; the SPIR-V backend can't lower string interpolation
+#      (`ijl_alloc_string`).  FIXED: those three sites now do
+#      `return EPAResult(..., false)` allocation-free.
+#   2. With (1) fixed the LLVM-side InvalidIRError is gone and the kernel
+#      now compiles all the way to SPIR-V emission.  But spirv-val rejects
+#      the emitted module:
+#
+#        error: line 7572: OpStore Pointer <id> '%2146' type does not match
+#               Object <id> '%6629' type.
+#
+#      Source-mapped to macros.jl:332 (inside KernelAbstractions' @inbounds
+#      indexing expansion); the failing line stores an `OpFSub %float` into
+#      a `_ptr_Function_ulong` slot, i.e. the SPIR-V emit pass picked the
+#      wrong storage type for one of the EPA scratch MVectors.  This is a
+#      Lava SPIR-V-emit bug, NOT an epa.jl bug, and is independent of the
+#      string-interp fix above.
+#
+# Re-gating with @test_skip + this comment so the next pass has the full
+# context.  The CPU testsets (41 passing assertions) prove the kernel
+# composition is correct; the gate only hides the SPIR-V-emit type-mismatch.
 # ---------------------------------------------------------------------------
 @testset "narrow_phase_kernel — Lava backend (GPU smoke)" begin
-    # Skipped pending epa.jl GPU-cleanup (see comment block above).  Keeping
-    # the @testset shell so the next pass that lifts the gate has a place to
-    # drop assertions in.
-    @test_skip false   # placeholder asserting "GPU smoke test pending"
+    # Skipped pending Lava SPIR-V emit fix (see comment block above).
+    @test_skip false   # placeholder asserting "GPU smoke test pending emit fix"
 end

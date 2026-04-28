@@ -386,7 +386,9 @@ function epa(A::ConvexShape, B::ConvexShape,
                         n_edges -= 1
                     else
                         if n_edges >= EPA_MAX_EDGES
-                            error("EPA silhouette edge count exceeded EPA_MAX_EDGES=$EPA_MAX_EDGES -- increase bound or check geometry")
+                            # Silhouette buffer exhausted: bail with the best-known closest-face data
+                            # and converged=false.  Allocation-free path so the kernel compiles to SPIR-V.
+                            return EPAResult(face_n[idx], face_d[idx], Vec3f(0f0), iter, false)
                         end
                         n_edges += 1
                         edges[n_edges] = (Int32(a), Int32(b))
@@ -411,7 +413,9 @@ function epa(A::ConvexShape, B::ConvexShape,
 
         # Add the new vertex.
         if n_verts >= EPA_MAX_VERTS
-            error("EPA polytope exceeded EPA_MAX_VERTS=$EPA_MAX_VERTS -- increase bound or check geometry")
+            # Vertex storage exhausted: return the closest-face data so far, converged=false.
+            # No string interpolation -- keeps the GPU lowering allocation-free.
+            return EPAResult(face_n[idx], face_d[idx], Vec3f(0f0), iter, false)
         end
         n_verts += 1
         verts_m[n_verts]  = m_new
@@ -423,7 +427,9 @@ function epa(A::ConvexShape, B::ConvexShape,
         # canonicalize the outward direction relative to `interior`.
         @inbounds for ei in 1:n_edges
             if n_faces >= EPA_MAX_FACES
-                error("EPA polytope exceeded EPA_MAX_FACES=$EPA_MAX_FACES -- increase bound or check geometry")
+                # Face storage exhausted: return the closest-face data so far, converged=false.
+                # Allocation-free; required for the SPIR-V lowering.
+                return EPAResult(face_n[idx], face_d[idx], Vec3f(0f0), iter, false)
             end
             # Slot reuse: scan for a dead face slot first; only grow if none.
             slot = 0
