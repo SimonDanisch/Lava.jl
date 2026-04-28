@@ -390,7 +390,7 @@ validation errors at build time.
 The caller is responsible for keeping all BLASes referenced by `instance_buf`
 alive for the lifetime of the returned TLAS. The instance records store BLASes
 only by device address, and the TLAS holds no Julia-side references to them.
-(HWTLAS pins them at the higher level when used through `Raycore.push_instances!`.)
+(HWTLAS pins them at the higher level when used through `push!(hwtlas, blas, instance_buf)`.)
 """
 function build_tlas(ctx::ASBuildContext, instance_buf::LavaArray{LavaInstanceRecord, 1},
                     n::Integer; allow_update::Bool=false)
