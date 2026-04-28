@@ -568,6 +568,20 @@ function Raycore.update_transform_at!(hwtlas::HWTLAS, handle::Raycore.TLASHandle
 end
 
 function Base.delete!(hwtlas::HWTLAS, handle::Raycore.TLASHandle)::Bool
+    # Batch-handle path (P2.1+): the handle was returned by push!(hwtlas, ..., instance_buf::LavaArray).
+    # Removing the batch from instance_batches is enough; the next sync! rebuild
+    # won't include it.  Dropping the InstanceBatch releases its reference to
+    # the LavaArray instance buffer; if the user still holds a reference, the
+    # buffer survives, otherwise it gets timeline-gated freed via the LavaArray
+    # finalizer.
+    for (i, batch) in enumerate(hwtlas.instance_batches)
+        if batch.handle === handle
+            deleteat!(hwtlas.instance_batches, i)
+            hwtlas.dirty = true
+            return true
+        end
+    end
+    # Per-mesh push! handle path: mark for compaction in sync!.
     haskey(hwtlas.handle_to_range, handle) || return false
     handle in hwtlas.deleted_handles && return false
     push!(hwtlas.deleted_handles, handle)
