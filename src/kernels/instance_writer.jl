@@ -70,3 +70,34 @@ scale `radius`, translation `positions[i]`. Custom index = `i - 1`.
     @inbounds instances[2i - 1] = LavaInstanceRecord(T, cim_phys, sof, aabb_blas_addr)
     @inbounds instances[2i]     = LavaInstanceRecord(T, cim_rend, sof, tri_blas_addr)
 end
+
+"""
+    write_meshscatter_instances_kernel(positions, rotations, scale, blas_addr,
+                                        instance_mask, instances)
+
+One thread per instance. Reads `positions[i]` and `rotations[i]` (as a
+unit quaternion `Vec4f(x, y, z, w)`), writes ONE `LavaInstanceRecord` into
+`instances[i]` referencing `blas_addr` with the supplied `instance_mask` and
+uniform scale.
+
+Used by RayMakie's meshscatter recipe for GPU-resident positions/rotations.
+For the dual-record (physics + render) demo case, use
+`write_grain_instances_kernel` instead.
+"""
+@kernel function write_meshscatter_instances_kernel(
+        @Const(positions),
+        @Const(rotations),
+        scale::Float32,
+        blas_addr::UInt64,
+        instance_mask::UInt8,
+        instances)
+    i = @index(Global)
+    @inbounds p = positions[i]
+    @inbounds q = rotations[i]
+    rot9 = quat_to_rot3x3(q)
+    T = build_4x3(rot9, scale, p)
+    cidx = UInt32(i - 1)
+    cim = (cidx & 0x00FFFFFF) | (UInt32(instance_mask) << 24)
+    sof = UInt32(0)
+    @inbounds instances[i] = LavaInstanceRecord(T, cim, sof, blas_addr)
+end
