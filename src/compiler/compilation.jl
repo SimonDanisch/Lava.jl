@@ -1524,9 +1524,12 @@ function emit_constant_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariable
     gv_value_ty = LLVM.global_value_type(gv)
     gv_name = LLVM.name(gv)
 
-    # Must be an array type
-    if !(gv_value_ty isa LLVM.ArrayType)
-        @warn "Skipping non-array constant global: $gv_name (type: $gv_value_ty)"
+    # Must be an aggregate type Julia can lower as a constant composite.
+    # Arrays cover lookup-table / polynomial-coefficient globals; structs
+    # cover constant return values (e.g. an immutable result struct that
+    # multiple branches share, like an EPA cap-out / "no contact" sentinel).
+    if !(gv_value_ty isa LLVM.ArrayType || gv_value_ty isa LLVM.StructType)
+        @warn "Skipping non-aggregate constant global: $gv_name (type: $gv_value_ty)"
         return
     end
 
@@ -1537,7 +1540,7 @@ function emit_constant_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariable
         return
     end
 
-    # Map the array type to SPIR-V
+    # Map the aggregate type to SPIR-V
     arr_spirv_ty = map_type!(state.type_ctx, gv_value_ty)
 
     # Build the composite constant recursively

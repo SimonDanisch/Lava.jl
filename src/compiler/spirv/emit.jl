@@ -1159,9 +1159,35 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                     spirv_load_ty = emit_type_int!(state.mod, UInt32(64), UInt32(0))
                 elseif eff_load_ty != pointee_ty && pointee_ty isa LLVM.IntegerType &&
                        (eff_load_ty isa LLVM.IntegerType || eff_load_ty isa LLVM.FloatingPointType)
-                    # Bitcast pointer to match load type. Covers int-int width
-                    # mismatches and float/double loads from [N x i64]-packed
-                    # MVector allocas.
+                    # Choose between widening and narrowing strategies.
+                    pointee_w = LLVM.width(pointee_ty)
+                    eff_w = eff_load_ty isa LLVM.IntegerType ? LLVM.width(eff_load_ty) :
+                            eff_load_ty isa LLVM.LLVMHalf   ? 16 :
+                            eff_load_ty isa LLVM.LLVMFloat  ? 32 :
+                            eff_load_ty isa LLVM.LLVMDouble ? 64 : pointee_w
+                    if eff_w > pointee_w && eff_load_ty isa LLVM.IntegerType
+                        # Widening load (e.g. load i32 from a 1-byte uchar field
+                        # plus padding).  Bitcasting the pointer to a wider type
+                        # would read past the field's actual size.  Some drivers
+                        # (RADV/ACO) reject this with an "Unimplemented intrinsic
+                        # @store_deref" assertion at pipeline-creation time.
+                        # Instead, load the pointee's true size and zero-extend
+                        # to the requested width — padding bytes were already
+                        # undefined, so zero-extension matches LLVM's semantics.
+                        small_w = UInt32(spirv_int_width(pointee_w))
+                        small_ty = emit_type_int!(state.mod, small_w, UInt32(0))
+                        small_id = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, Op.OpLoad, small_ty, small_id, ptr_id)
+                        wide_w = UInt32(spirv_int_width(eff_w))
+                        wide_ty = emit_type_int!(state.mod, wide_w, UInt32(0))
+                        ext_id = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, Op.OpUConvert, wide_ty, ext_id, small_id)
+                        state.value_map[inst] = ext_id
+                        return
+                    end
+                    # Narrowing or equal-width path: bitcast pointer to match
+                    # load type.  Covers int-int width mismatches and
+                    # float/double loads from [N x i64]-packed MVector allocas.
                     val_spirv_ty = map_type!(state.type_ctx, eff_load_ty)
                     new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
                     cast_id = fresh_id!(state.mod)
