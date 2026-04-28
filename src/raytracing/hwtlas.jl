@@ -25,19 +25,24 @@ const Mat4f = SMatrix{4, 4, Float32, 16}
 # ============================================================================
 
 """
-    InstanceBatch
+    InstanceBatch{Tri}
 
 A batch of N TLAS instances all referencing the same BLAS, with instance
 records read from a GPU-resident `LavaArray{LavaInstanceRecord, 1}` at
 sync! / refit time. Returned `handle` lets callers track the batch in
 `HWTLAS.handle_to_range` for delete!/refit.
+
+`triangles` holds the per-triangle metadata for the BLAS (typically
+`Vector{Triangle{UInt32}}`). Pass an empty vector for rayQuery-only
+callers that don't need Hikari's per-triangle TriangleMeta lookup.
 """
-struct InstanceBatch
+struct InstanceBatch{Tri}
     blas::LavaBLAS
     instance_buf::LavaArray{LavaInstanceRecord, 1}
     n::Int
     instance_mask::UInt8
     handle::Raycore.TLASHandle
+    triangles::Vector{Tri}
 end
 
 # ============================================================================
@@ -102,7 +107,7 @@ mutable struct HWTLAS{Tri} <: Raycore.AbstractAccel
     # An HWTLAS uses EITHER per-mesh push! (CPU instance_transforms) OR
     # push_instances! (GPU instance_buf), not both. Mixed mode errors loudly
     # in rebuild_hw_tlas!. To switch modes, build a fresh HWTLAS.
-    instance_batches::Vector{InstanceBatch}
+    instance_batches::Vector{InstanceBatch{Tri}}
 
     # Handle management
     handle_to_range::Dict{Raycore.TLASHandle, UnitRange{Int}}
@@ -136,7 +141,7 @@ function HWTLAS{Tri}(backend::LavaBackend; bq::BatchQueue=backend.bq) where {Tri
         backend, bq,
         LavaBLAS[], Vector{Tri}[], UInt32[],
         Int[], NTuple{12,Float32}[], UInt32[], UInt8[],
-        InstanceBatch[],          # new
+        InstanceBatch{Tri}[],     # new
         Dict{Raycore.TLASHandle, UnitRange{Int}}(),
         Set{Raycore.TLASHandle}(),
         UInt32(1),
@@ -436,27 +441,33 @@ function Base.push!(hwtlas::HWTLAS{Tri}, blas::LavaBLAS, transform::Mat4f=Mat4f(
 end
 
 """
-    Raycore.push_instances!(tlas::HWTLAS, blas::LavaBLAS,
+    Raycore.push_instances!(tlas::HWTLAS{Tri}, blas::LavaBLAS,
                             instance_buf::LavaArray{LavaInstanceRecord, 1};
-                            n::Integer, instance_mask::UInt8) -> Raycore.TLASHandle
+                            n::Integer, instance_mask::UInt8,
+                            triangles::Vector{Tri}) -> Raycore.TLASHandle
 
 Register an N-instance batch in the TLAS. All N instances reference the
 same `blas`; per-instance transforms / custom_indices live in `instance_buf`
 and are written by a GPU compute kernel (see `write_grain_instances_kernel`).
 
+`triangles` supplies the BLAS's per-triangle metadata for Hikari's path tracer
+(`tri_gpu` / `off_gpu` lookup). Pass empty (the default) for rayQuery-only
+callers -- those don't need per-triangle metadata.
+
 Returns one `TLASHandle` for the whole batch. Subsequent `sync!` builds
 the underlying `LavaTLAS` with `allow_update=true` so per-frame refits
 via `Raycore.refit_tlas!(::HWTLAS)` work.
 """
-function Raycore.push_instances!(tlas::HWTLAS, blas::LavaBLAS,
+function Raycore.push_instances!(tlas::HWTLAS{Tri}, blas::LavaBLAS,
                                   instance_buf::LavaArray{LavaInstanceRecord, 1};
-                                  n::Integer, instance_mask::UInt8 = UInt8(0xff))
+                                  n::Integer, instance_mask::UInt8 = UInt8(0xff),
+                                  triangles::Vector{Tri} = Tri[]) where {Tri}
     n_int = Int(n)
     n_int <= length(instance_buf) || error(
         "push_instances!: n=$n_int exceeds instance_buf length $(length(instance_buf))")
     handle = Raycore.TLASHandle(tlas.next_handle_id)
     tlas.next_handle_id += UInt32(1)
-    push!(tlas.instance_batches, InstanceBatch(blas, instance_buf, n_int, instance_mask, handle))
+    push!(tlas.instance_batches, InstanceBatch{Tri}(blas, instance_buf, n_int, instance_mask, handle, triangles))
     tlas.dirty = true
     return handle
 end
@@ -577,23 +588,23 @@ function rebuild_hw_tlas_from_batch!(hwtlas::HWTLAS{Tri}) where {Tri}
         build_tlas(ctx, batch.instance_buf, batch.n; allow_update=true)
     end
 
-    # Single-batch HWTLAS doesn't need triangle/offset buffers (Hikari renders
-    # via the rendering instances directly; physics queries don't need them
-    # either -- primitive_index / instance_id come from the rayQuery).
-    # Supply empty buffers; consumers that read tri_gpu / off_gpu
-    # against a batch HWTLAS will see zero-length arrays.
-    all_tris = Tri[]
-    per_inst_offsets = UInt32[]
+    # Populate triangle metadata from the batch. All N instances reference the
+    # same BLAS, so all offsets are 0 -- every instance starts at triangle 0.
+    # When triangles is empty (rayQuery-only callers), tri_gpu is empty too;
+    # the per_inst_offsets array is always allocated so off_gpu is sized
+    # uniformly (N entries, all zero).
+    all_tris = batch.triangles
+    per_inst_offsets = zeros(UInt32, batch.n)
 
     hw_accel = if hwtlas.hw_accel isa HardwareAccel
         accel_prev = hwtlas.hw_accel
         accel_prev.tlas = hw_tlas
         accel_prev.triangle_data = all_tris
-        accel_prev.blas_offsets = UInt32[]
+        accel_prev.blas_offsets = UInt32[0]
         accel_prev.per_instance_tri_offsets = per_inst_offsets
         accel_prev
     else
-        HardwareAccel(hw_tlas, all_tris, UInt32[], per_inst_offsets; bq=hwtlas.bq)
+        HardwareAccel(hw_tlas, all_tris, UInt32[0], per_inst_offsets; bq=hwtlas.bq)
     end
 
     tri_gpu = _reuse_or_alloc(hwtlas.tri_gpu, all_tris)
