@@ -61,6 +61,8 @@ export ConvexShape, UnitCube, support
 export gjk, GJKResult
 # P4.3 EPA penetration recovery
 export epa, EPAResult
+# P4.4 narrow-phase kernel composing gjk + epa
+export narrow_phase_kernel, NO_CONTACT
 
 import Serialization
 using Vulkan
@@ -162,6 +164,7 @@ include("raytracing/epa.jl")            # EPA penetration recovery + EPAResult (
 
 # ---- Compute kernels ----
 include("kernels/instance_writer.jl")   # write_grain_instances_kernel + helpers
+include("kernels/narrow_phase.jl")      # narrow_phase_kernel composing gjk + epa (P4.4)
 
 # ---- Default settings ----
 # Disable scalar indexing by default (GPU arrays should not be accessed element-by-element)
