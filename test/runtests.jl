@@ -52,6 +52,14 @@ end
         include(joinpath(@__DIR__, "test_struct_broadcast.jl"))
     end
 
+    # ── Narrow phase (CPU) -- ConvexShape / GJK / EPA ──
+    # Pure-CPU reference implementations for the P4 narrow-phase pipeline; no GPU.
+    @testset "Narrow phase (CPU)" begin
+        include(joinpath(@__DIR__, "test_convex_shape.jl"))
+        include(joinpath(@__DIR__, "test_gjk.jl"))
+        include(joinpath(@__DIR__, "test_epa.jl"))
+    end
+
     # ── Tier 3c: Atomics & Batched Dispatch ──
     @testset "Tier 3c: Atomics & Dispatch" begin
         include(joinpath(@__DIR__, "test_atomics_and_dispatch.jl"))

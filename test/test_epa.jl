@@ -30,6 +30,9 @@ const ID = translation_transform(0, 0, 0)
 
 @testset "EPAResult type fields" begin
     @test fieldnames(EPAResult) == (:normal, :depth, :contact, :iterations, :converged)
+    # GPU portability: EPAResult must be isbits so it can be returned from a
+    # @kernel and stored in a device-side struct without Box/heap pointers.
+    @test isbitstype(EPAResult)
     cube = UnitCube()
     T_B  = translation_transform(1.9, 0, 0)
     g    = gjk(cube, cube, ID, T_B)
@@ -184,6 +187,10 @@ end
     r    = epa(cube, cube, ID, T_B, g.simplex; max_iters=1)
     @test r isa EPAResult
     @test r.iterations >= 1
+    # Cap-out must report converged=false; depth must be a non-negative best
+    # estimate, not a sentinel.
+    @test r.converged == false
+    @test r.depth >= 0f0
     # Cap-out flag is consistent: if not converged, normal should still be
     # finite (we want a usable best-estimate, not garbage).
     @test all(isfinite, r.normal)

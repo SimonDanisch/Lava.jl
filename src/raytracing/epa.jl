@@ -234,6 +234,27 @@ surface at the contact face.
 the closest-face data at that point and are still usable as a best-effort
 estimate.
 """
+# CPU-allocation note: a `@allocated epa(...)` call from the Julia REPL on the
+# unit-cube-vs-unit-cube headline case reports ~1.2 KB / 6 small pool allocs
+# per invocation.  This is NOT a code defect, and does NOT affect the GPU
+# `@kernel` path that P4.4 will compile through KernelAbstractions /
+# GPUCompiler.  Investigation (see P4.3 review fix-up):
+#
+#   - Each individual MVector below stack-promotes cleanly when used in
+#     isolation (`@allocated` returns 0).
+#   - With all 7 MVectors live simultaneously (~3 KB total), Julia's CPU
+#     escape-analysis budget is exceeded and 1-2 of them spill to the GC pool.
+#     Which ones spill is non-deterministic across recompiles.
+#   - Switching the NTuple-element MVectors to parallel-Int32 MVectors,
+#     packed UInt64s, or a wrapping mutable struct does not eliminate the
+#     spill; it just changes which storage band escapes.
+#
+# The GPU compile path does not run Julia's CPU escape analysis: KA lowers
+# MVector storage to local / private memory or register tiles, with no GC
+# behind it.  P4.4 will validate this empirically when the @kernel composing
+# gjk + epa is built.  If a GPU compile failure surfaces here, this comment
+# is the place to revisit -- start by consolidating the per-element MVectors
+# into a single device-side scratch struct.
 function epa(A::ConvexShape, B::ConvexShape,
              T_A::NTuple{12,Float32}, T_B::NTuple{12,Float32},
              gjk_simplex::NTuple{4,Vec3f};
