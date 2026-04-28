@@ -110,26 +110,37 @@ function set_anyhit_pipeline!(accel::HardwareAccel, anyhit_func, raygen_func)
 end
 
 """
-    trace_closest_hits!(results, rays, accel::HardwareAccel, n_rays::Integer)
+    trace_closest_hits!(results, rays, accel::HardwareAccel, n_rays::Integer;
+                        cull_mask::UInt32 = UInt32(0xFF))
 
 Trace `n_rays` rays against the hardware acceleration structure.
 Results are written to `results` buffer (one RTHitResult per ray).
 
 `results` and `rays` can be `LavaArray{RTHitResult}`/`LavaArray{RTRay}`,
 or any type accepted by `trace_rays!`.
+
+`cull_mask` is ANDed against each instance's instance_mask in the TLAS.
+An instance is visible to a ray only when `(cull_mask & instance_mask) != 0`.
+Default `0xFF` matches all instances (backward-compatible).
 """
-function trace_closest_hits!(results, rays, accel::HardwareAccel, n_rays::Integer)
-    trace_rays!(accel.bq, accel.rt_pipeline, accel.tlas, rays, results;
+function trace_closest_hits!(results, rays, accel::HardwareAccel, n_rays::Integer;
+                              cull_mask::UInt32 = UInt32(0xFF))
+    trace_rays!(accel.bq, accel.rt_pipeline, accel.tlas, rays, results, cull_mask;
                 width=Int(n_rays), height=1)
 end
 
 """
-    trace_closest_hits_indirect!(results, rays, accel::HardwareAccel, n_rays::LavaArray{Int32})
+    trace_closest_hits_indirect!(results, rays, accel::HardwareAccel, n_rays::LavaArray{Int32};
+                                  cull_mask::UInt32 = UInt32(0xFF))
 
-Indirect RT trace — reads ray count from GPU buffer. No CPU readback.
+Indirect RT trace -- reads ray count from GPU buffer. No CPU readback.
+
+`cull_mask` is ANDed against each instance's instance_mask in the TLAS.
+Default `0xFF` matches all instances (backward-compatible).
 """
-function trace_closest_hits_indirect!(results, rays, accel::HardwareAccel, n_rays::LavaArray{Int32})
-    trace_rays_indirect!(accel.bq, accel.rt_pipeline, accel.tlas, rays, results; n_rays=n_rays)
+function trace_closest_hits_indirect!(results, rays, accel::HardwareAccel, n_rays::LavaArray{Int32};
+                                       cull_mask::UInt32 = UInt32(0xFF))
+    trace_rays_indirect!(accel.bq, accel.rt_pipeline, accel.tlas, rays, results, cull_mask; n_rays=n_rays)
 end
 
 """
@@ -137,6 +148,11 @@ end
 
 RT trace with any-hit shader. `extra_args` are passed after (rays, results) to the
 raygen and any-hit functions via the shared BDA arg buffer.
+
+TODO(P3-followup): cull_mask plumbing for the anyhit variants is deferred.
+The anyhit raygen functions have separate signatures (extra_args at position 3+);
+adding cull_mask requires coordinated changes to those raygen signatures.
+For now cull_mask is hardcoded 0xFF inside the respective raygen functions.
 """
 function trace_closest_hits_anyhit!(results, rays, accel::HardwareAccel, n_rays::Integer, extra_args...)
     pipeline = accel.anyhit_pipeline
@@ -148,7 +164,9 @@ end
 """
     trace_closest_hits_anyhit_indirect!(results, rays, accel, n_rays_buf, extra_args...)
 
-Indirect RT trace with any-hit shader — reads ray count from GPU buffer.
+Indirect RT trace with any-hit shader -- reads ray count from GPU buffer.
+
+TODO(P3-followup): cull_mask plumbing deferred -- see trace_closest_hits_anyhit!.
 """
 function trace_closest_hits_anyhit_indirect!(results, rays, accel::HardwareAccel, n_rays::LavaArray{Int32}, extra_args...)
     pipeline = accel.anyhit_pipeline
@@ -159,7 +177,8 @@ end
 # ── Built-in RT Shaders ──
 
 function hw_raygen(rays::LavaDeviceArray{RTRay,1},
-                   results::LavaDeviceArray{RTHitResult,1})
+                   results::LavaDeviceArray{RTHitResult,1},
+                   cull_mask::UInt32)
     lid = lava_rt_launch_id_x()
 
     ray = rays[lid + 1]
@@ -170,7 +189,7 @@ function hw_raygen(rays::LavaDeviceArray{RTRay,1},
 
     lava_rt_trace_ray(
         UInt32(0),    # flags
-        UInt32(0xFF), # cull mask
+        cull_mask,    # cull mask (caller-supplied; default 0xFF matches all instances)
         UInt32(0),    # sbt offset
         UInt32(0),    # sbt stride
         UInt32(0),    # miss index

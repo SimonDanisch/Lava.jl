@@ -741,12 +741,14 @@ end
 # C4 — Trace dispatch
 # ============================================================================
 
-function trace_closest_hits!(results, rays, accel::HWAdaptedAccel, n)
-    trace_closest_hits!(results, rays, accel.hwtlas.hw_accel, n)
+function trace_closest_hits!(results, rays, accel::HWAdaptedAccel, n;
+                              cull_mask::UInt32 = UInt32(0xFF))
+    trace_closest_hits!(results, rays, accel.hwtlas.hw_accel, n; cull_mask=cull_mask)
 end
 
-function trace_closest_hits_indirect!(results, rays, accel::HWAdaptedAccel, n_buf)
-    trace_closest_hits_indirect!(results, rays, accel.hwtlas.hw_accel, n_buf)
+function trace_closest_hits_indirect!(results, rays, accel::HWAdaptedAccel, n_buf;
+                                       cull_mask::UInt32 = UInt32(0xFF))
+    trace_closest_hits_indirect!(results, rays, accel.hwtlas.hw_accel, n_buf; cull_mask=cull_mask)
 end
 
 function batch_trace_indirect(results, rays, accel::HWAdaptedAccel, n_buf)
