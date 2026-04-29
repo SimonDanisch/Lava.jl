@@ -309,12 +309,13 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
         # (idx * (stride / sz)) when stride is a multiple of sz, and into a
         # cheap shift when stride == 1.
         sz_log2 = trailing_zeros(sz)
-        for site in info.accesses
-            LLVM.position!(builder, site.inst)
-            i64 = LLVM.Int64Type()
+        i64 = LLVM.Int64Type()
+        zero32 = LLVM.ConstantInt(LLVM.Int32Type(), 0)
+
+        # Helper: build the byte-offset expression for an access site.
+        function build_byte_offset(site::AccessSite)
             byte_offset_expr = LLVM.ConstantInt(i64, site.byte_offset)
             for (dyn, stride) in site.dyn_index_chain
-                # Convert dyn to i64 if narrower / wider
                 dyn_i64 = if LLVM.value_type(dyn) isa LLVM.IntegerType &&
                              LLVM.width(LLVM.value_type(dyn)) < 64
                     LLVM.sext!(builder, dyn, i64)
@@ -332,31 +333,100 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
                     byte_offset_expr = LLVM.add!(builder, byte_offset_expr, scaled)
                 end
             end
-            # element_idx = byte_offset >>> log2(sz) (arithmetic / signed shift).
-            # LLVM uses signed arithmetic for byte-offset GEPs (Julia's 1-based
-            # indexing adjustment via `gep, ptr, -1` is signed); negative
-            # intermediate offsets must propagate as negative to ensure the
-            # final index is correct after combining with positive offsets
-            # from other GEPs in the chain.  `ashr` preserves sign.
+            return byte_offset_expr
+        end
+
+        # Helper: emit `gep T, new_alloca, [0, byte_offset >> log2(sz)]`.
+        function emit_gep_at_byte_offset(byte_offset_expr)
             idx_value = if sz_log2 == 0
                 byte_offset_expr
             else
                 shift_const = LLVM.ConstantInt(i64, sz_log2)
                 LLVM.ashr!(builder, byte_offset_expr, shift_const)
             end
-            # Emit gep T, new_alloca, [0, idx_value]
-            zero = LLVM.ConstantInt(LLVM.Int32Type(), 0)
-            new_gep = LLVM.gep!(builder, new_arr_ty, new_alloca,
-                                LLVM.Value[zero, idx_value])
-            # If the access type differs from T (heterogeneous case), the load/store
-            # at that site reads/writes a wider scalar than T.  In LLVM IR with
-            # opaque pointers the load/store doesn't carry the pointer's pointed-to
-            # type, so we just leave the load/store pointing at the new GEP — the
-            # SPIR-V emitter's existing OpBitcast-pointer-on-mismatch path covers
-            # the load/store typing at emit time.  (No LLVM bitcast needed because
-            # opaque pointers don't propagate type info through the GEP.)
-            ptr_op_idx = site.is_load ? 1 : 2   # 1-based: load ptr at op 1, store ptr at op 2
-            API.LLVMSetOperand(site.inst, UInt32(ptr_op_idx - 1), new_gep)
+            return LLVM.gep!(builder, new_arr_ty, new_alloca, LLVM.Value[zero32, idx_value])
+        end
+
+        # Strategy:
+        # - When access size == sz (T's size): rewrite the load/store pointer
+        #   to a fresh GEP at the right byte offset.
+        # - When access size > sz (wider, e.g. i64 store on [N x i32] alloca):
+        #   DECOMPOSE into multiple T-sized accesses.  This avoids OpBitcast
+        #   on Function-storage pointers, which is invalid SPIR-V under logical
+        #   addressing.
+        for site in info.accesses
+            LLVM.position!(builder, site.inst)
+            access_sz = Int(API.LLVMABISizeOfType(dl, site.access_type))
+            byte_offset_expr = build_byte_offset(site)
+
+            if access_sz == sz
+                # Same-size: rewrite pointer in place.
+                new_gep = emit_gep_at_byte_offset(byte_offset_expr)
+                ptr_op_idx = site.is_load ? 1 : 2
+                API.LLVMSetOperand(site.inst, UInt32(ptr_op_idx - 1), new_gep)
+            else
+                # Wider access: decompose into n_parts T-sized accesses.
+                @assert access_sz % sz == 0
+                n_parts = access_sz ÷ sz
+                t_bw = sz * 8   # bit width of T (only int handled for now)
+                @assert site.access_type isa LLVM.IntegerType
+                @assert T isa LLVM.IntegerType   # decomposition currently only for int → int
+                t_ty = T
+
+                # Compute n_parts byte offsets and matching GEPs.
+                geps = LLVM.Value[]
+                for p in 0:(n_parts - 1)
+                    p_off = if p == 0
+                        byte_offset_expr
+                    else
+                        LLVM.add!(builder, byte_offset_expr, LLVM.ConstantInt(i64, p * sz))
+                    end
+                    push!(geps, emit_gep_at_byte_offset(p_off))
+                end
+
+                if site.is_load
+                    # Load each T-sized chunk, zext + shift + or to assemble the wide value.
+                    wide_ty = site.access_type
+                    parts = LLVM.Value[]
+                    for g in geps
+                        v = LLVM.load!(builder, t_ty, g)
+                        push!(parts, v)
+                    end
+                    # Combine: result = sum(parts[i] zext to wide << (i*t_bw))
+                    combined = LLVM.zext!(builder, parts[1], wide_ty)
+                    for i in 2:n_parts
+                        ext = LLVM.zext!(builder, parts[i], wide_ty)
+                        shift_const = LLVM.ConstantInt(wide_ty, (i - 1) * t_bw)
+                        shifted = LLVM.shl!(builder, ext, shift_const)
+                        combined = LLVM.or!(builder, combined, shifted)
+                    end
+                    LLVM.replace_uses!(site.inst, combined)
+                    LLVM.erase!(site.inst)
+                else
+                    # Store: split the wide value into n_parts T-chunks, store each.
+                    val = LLVM.operands(site.inst)[1]   # value being stored
+                    wide_ty = site.access_type
+                    for i in 1:n_parts
+                        chunk = if i == 1 && t_bw == LLVM.width(wide_ty)
+                            val   # no truncation needed
+                        else
+                            shifted = if i == 1
+                                val
+                            else
+                                shift_const = LLVM.ConstantInt(wide_ty, (i - 1) * t_bw)
+                                LLVM.lshr!(builder, val, shift_const)
+                            end
+                            if LLVM.width(wide_ty) > t_bw
+                                LLVM.trunc!(builder, shifted, t_ty)
+                            else
+                                shifted
+                            end
+                        end
+                        LLVM.store!(builder, chunk, geps[i])
+                    end
+                    LLVM.erase!(site.inst)
+                end
+            end
         end
     end
 

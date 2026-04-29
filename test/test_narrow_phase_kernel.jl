@@ -152,30 +152,34 @@ end
 #
 # STATUS: STILL GATED, but for a different reason than before.
 #
-# History:
-#   1. Originally gated because epa() contained three `error("EPA ... = $...")`
-#      sites; the SPIR-V backend can't lower string interpolation
-#      (`ijl_alloc_string`).  FIXED: those three sites now do
-#      `return EPAResult(..., false)` allocation-free.
-#   2. With (1) fixed the LLVM-side InvalidIRError is gone and the kernel
-#      now compiles all the way to SPIR-V emission.  But spirv-val rejects
-#      the emitted module:
-#
-#        error: line 7572: OpStore Pointer <id> '%2146' type does not match
-#               Object <id> '%6629' type.
-#
-#      Source-mapped to macros.jl:332 (inside KernelAbstractions' @inbounds
-#      indexing expansion); the failing line stores an `OpFSub %float` into
-#      a `_ptr_Function_ulong` slot, i.e. the SPIR-V emit pass picked the
-#      wrong storage type for one of the EPA scratch MVectors.  This is a
-#      Lava SPIR-V-emit bug, NOT an epa.jl bug, and is independent of the
-#      string-interp fix above.
-#
-# Re-gating with @test_skip + this comment so the next pass has the full
-# context.  The CPU testsets (41 passing assertions) prove the kernel
-# composition is correct; the gate only hides the SPIR-V-emit type-mismatch.
+# GPU smoke test: dispatch narrow_phase_kernel on the Lava backend with a
+# single overlapping pair and assert the result matches the CPU baseline.
+# Was @test_skip'd while the SPIR-V emit had several type-pun bugs around
+# byte-packed MVector allocas; the unified retype_uniform_typed_allocas! pass
+# now retypes the allocas to match their access pattern, and wider accesses
+# get decomposed to T-sized chunks rather than relying on (invalid under
+# logical addressing) Function-pointer OpBitcasts.
 # ---------------------------------------------------------------------------
 @testset "narrow_phase_kernel — Lava backend (GPU smoke)" begin
-    # Skipped pending Lava SPIR-V emit fix (see comment block above).
-    @test_skip false   # placeholder asserting "GPU smoke test pending emit fix"
+    using Lava: LavaArray, LavaBackend, EPAResult
+    using GeometryBasics: Vec3f
+    tx_(x, y, z) = (1f0, 0f0, 0f0, Float32(x),
+                    0f0, 1f0, 0f0, Float32(y),
+                    0f0, 0f0, 1f0, Float32(z))
+    transforms = LavaArray([tx_(0, 0, 0), tx_(1.9, 0, 0)])
+    pairs      = LavaArray([(Int32(1), Int32(2))])
+    sentinel   = EPAResult(Vec3f(99, 99, 99), 99f0, Vec3f(88, 88, 88), 77, false)
+    results    = LavaArray([sentinel])
+    Lava.narrow_phase_kernel(LavaBackend())(transforms, pairs, Lava.UnitCube(), results;
+                                            ndrange=1)
+    Lava.vk_flush!(Lava.vk_context().default_bq)
+    r = Array(results)[1]
+    # Two unit cubes overlapping by 0.1 along +X: depth 0.1, normal (1,0,0),
+    # contact on the +X face of cube A at (1, 1, 1) corner-ish.
+    @test r.converged == true
+    @test isapprox(r.normal[1], 1f0;  atol=1f-3)
+    @test isapprox(r.normal[2], 0f0;  atol=1f-3)
+    @test isapprox(r.normal[3], 0f0;  atol=1f-3)
+    @test isapprox(r.depth,     0.1f0; atol=1f-3)
+    @test isapprox(r.contact[1], 1f0;  atol=1f-2)
 end
