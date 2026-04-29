@@ -2946,13 +2946,47 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     # Decompose the flat index into OpAccessChain indices using div/mod.
                     flat_idx_i32 = ensure_index_i32!(state, ops[2])
                     ac_indices = decompose_flat_index_for_composite!(state, base_pointee, source_ty, flat_idx_i32)
-                    result_id = fresh_id!(state.mod)
-                    word_count = UInt32(4 + length(ac_indices))
-                    push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
-                    push!(state.mod.functions, result_ptr_ty)
-                    push!(state.mod.functions, result_id)
-                    push!(state.mod.functions, base_id)
-                    append!(state.mod.functions, ac_indices)
+                    # Compute the actual element type reached after stepping through
+                    # `ac_indices`.  When the alloca was `[N x ulong]` (byte-packed
+                    # MVector storage) but the GEP wants i32 / float, the chain ends
+                    # at `ulong` while the caller expects `result_ptr_ty` pointing to
+                    # the narrower type.  Emit OpAccessChain with the alloca's actual
+                    # element type, then OpBitcast the pointer to match source_ty.
+                    actual_leaf_ty = base_pointee
+                    for _ in ac_indices
+                        if actual_leaf_ty isa LLVM.ArrayType
+                            actual_leaf_ty = LLVM.eltype(actual_leaf_ty)
+                        elseif actual_leaf_ty isa LLVM.StructType
+                            # Conservative: stop walking; the OpAccessChain emit
+                            # below would already need to be more careful for
+                            # struct-typed allocas.
+                            break
+                        end
+                    end
+                    use_bitcast = actual_leaf_ty != source_ty &&
+                        !(actual_leaf_ty isa LLVM.StructType) &&
+                        !(actual_leaf_ty isa LLVM.ArrayType)
+                    if use_bitcast
+                        actual_leaf_spirv = map_type!(state.type_ctx, actual_leaf_ty)
+                        actual_ptr_ty = map_pointer_type!(state.type_ctx, actual_leaf_spirv, sc)
+                        ac_id = fresh_id!(state.mod)
+                        word_count = UInt32(4 + length(ac_indices))
+                        push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                        push!(state.mod.functions, actual_ptr_ty)
+                        push!(state.mod.functions, ac_id)
+                        push!(state.mod.functions, base_id)
+                        append!(state.mod.functions, ac_indices)
+                        result_id = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, Op.OpBitcast, result_ptr_ty, result_id, ac_id)
+                    else
+                        result_id = fresh_id!(state.mod)
+                        word_count = UInt32(4 + length(ac_indices))
+                        push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+                        push!(state.mod.functions, result_ptr_ty)
+                        push!(state.mod.functions, result_id)
+                        push!(state.mod.functions, base_id)
+                        append!(state.mod.functions, ac_indices)
+                    end
                 else
                     # Simple scalar or no decomposition possible: use base pointer directly;
                     # load/store handlers resolve type mismatches.
