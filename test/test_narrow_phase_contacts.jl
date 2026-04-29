@@ -161,3 +161,54 @@ end
         end
     end
 end
+
+# ---------------------------------------------------------------------------
+# GPU smoke test on the Lava backend.
+#
+# Per the project "never crash-loop GPU tests" rule, this is a single
+# minimal run (one overlapping pair) and any failure is investigated, not
+# retried.  Mirrors the CPU "single overlapping pair lands in BOTH grain
+# slot lists" testset to confirm GPU compaction matches CPU.
+# ---------------------------------------------------------------------------
+@testset "narrow_phase_contacts_kernel — Lava backend (GPU smoke)" begin
+    using Lava: LavaArray, LavaBackend, ContactRecord, narrow_phase_contacts_kernel
+    using GeometryBasics: Vec3f
+    max_contacts = Int32(4)
+    n_grains     = 2
+    transforms = LavaArray([tx(0,0,0), tx(1.9, 0, 0)])
+    pairs      = LavaArray([(Int32(1), Int32(2))])
+    counters   = LavaArray(zeros(UInt32, n_grains))
+    sentinel   = ContactRecord(typemax(UInt32), typemax(UInt32),
+                               Vec3f(0f0, 0f0, 0f0),
+                               Vec3f(0f0, 0f0, 0f0),
+                               0f0)
+    contacts   = LavaArray(fill(sentinel, n_grains * Int(max_contacts)))
+
+    narrow_phase_contacts_kernel(LavaBackend())(
+        transforms, pairs, Lava.UnitCube(),
+        counters, contacts, max_contacts;
+        ndrange = 1)
+    Lava.vk_flush!(Lava.vk_context().default_bq)
+
+    cs = Array(counters)
+    rs = Array(contacts)
+
+    @test cs[1] == UInt32(1)
+    @test cs[2] == UInt32(1)
+
+    # Slot 1 of each grain holds the contact record; both copies carry
+    # the same (i, j) pair indices.
+    for r in (rs[1], rs[max_contacts + 1])
+        @test r.i == UInt32(1)
+        @test r.j == UInt32(2)
+        @test r.depth ≈ 0.1f0 atol=1f-3
+        @test r.n_hat[1] ≈ 1f0 atol=1f-3
+        @test abs(r.n_hat[2]) < 1f-3
+        @test abs(r.n_hat[3]) < 1f-3
+    end
+
+    # Untouched slots still hold the sentinel.
+    for k in (2, 3, 4, max_contacts + 2, max_contacts + 3, max_contacts + 4)
+        @test rs[k].i == typemax(UInt32)
+    end
+end
