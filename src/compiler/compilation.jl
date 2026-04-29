@@ -944,6 +944,9 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # alloca [N x i64] → [3N x float]), eliminating the per-access type-pun
     # fixups the emitter would otherwise need.
     retype_uniform_typed_allocas!(mod, LLVM.datalayout(mod))
+    if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
+        write("/tmp/lava_ir_2_post_retype.ll", string(mod))
+    end
     verify_ir!("retype_allocas")
 
     # ── Structured control flow ──

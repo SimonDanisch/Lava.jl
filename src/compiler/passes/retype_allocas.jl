@@ -227,15 +227,25 @@ function pick_uniform_type(accesses::Vector{AccessSite}, total_bytes::Int, dl::L
     end
     smallest_sz > 0 || return nothing
 
-    # Prefer integer over float when sizes are equal — keeps the alloca
-    # type-stable and avoids bitcasts when an i32 access happens to coexist
-    # with a float access of identical size.  (Values still get OpBitcasted
-    # to whatever the access wants at the access site.)
+    # When sizes are equal, prefer the type that appears MOST FREQUENTLY in
+    # the access pattern.  For an MVector{N, Vec3f} where most accesses are
+    # float (component reads/writes) and only a few are i32 (from LLVM's
+    # bitcast-store optimization), picking float minimizes the number of
+    # OpBitcast pointer cast sites at the SPIR-V emit.
+    type_counts = Dict{LLVM.LLVMType, Int}()
     for a in accesses
         sz_a = Int(API.LLVMABISizeOfType(dl, a.access_type))
-        if sz_a == smallest_sz && a.access_type isa LLVM.IntegerType &&
-           !(smallest_T isa LLVM.IntegerType)
-            smallest_T = a.access_type
+        if sz_a == smallest_sz
+            type_counts[a.access_type] = get(type_counts, a.access_type, 0) + 1
+        end
+    end
+    if !isempty(type_counts)
+        best_count = maximum(values(type_counts))
+        for (T, cnt) in type_counts
+            if cnt == best_count
+                smallest_T = T
+                break
+            end
         end
     end
 
@@ -322,12 +332,17 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
                     byte_offset_expr = LLVM.add!(builder, byte_offset_expr, scaled)
                 end
             end
-            # element_idx = byte_offset >> log2(sz)
+            # element_idx = byte_offset >>> log2(sz) (arithmetic / signed shift).
+            # LLVM uses signed arithmetic for byte-offset GEPs (Julia's 1-based
+            # indexing adjustment via `gep, ptr, -1` is signed); negative
+            # intermediate offsets must propagate as negative to ensure the
+            # final index is correct after combining with positive offsets
+            # from other GEPs in the chain.  `ashr` preserves sign.
             idx_value = if sz_log2 == 0
                 byte_offset_expr
             else
                 shift_const = LLVM.ConstantInt(i64, sz_log2)
-                LLVM.lshr!(builder, byte_offset_expr, shift_const)
+                LLVM.ashr!(builder, byte_offset_expr, shift_const)
             end
             # Emit gep T, new_alloca, [0, idx_value]
             zero = LLVM.ConstantInt(LLVM.Int32Type(), 0)
@@ -345,8 +360,11 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
         end
     end
 
-    # Erase the old GEPs (no longer used) and the old alloca
-    for gep in info.geps
+    # Erase the old GEPs in REVERSE BFS order (children first, then parents).
+    # Forward order leaves parent GEPs with their child-GEP uses still attached,
+    # so parents never reach `isempty(uses)` and stay in the IR — leaving the
+    # OLD alloca live with zombie users that confuse downstream analysis.
+    for gep in reverse(info.geps)
         if isempty(LLVM.uses(gep))
             LLVM.erase!(gep)
         end
