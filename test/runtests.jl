@@ -59,6 +59,7 @@ end
         include(joinpath(@__DIR__, "test_gjk.jl"))
         include(joinpath(@__DIR__, "test_epa.jl"))
         include(joinpath(@__DIR__, "test_narrow_phase_kernel.jl"))
+        include(joinpath(@__DIR__, "test_contact_record.jl"))
     end
 
     # ── Tier 3c: Atomics & Batched Dispatch ──

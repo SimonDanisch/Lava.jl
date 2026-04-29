@@ -17,6 +17,28 @@
 # out of scope for P4.4.
 
 """
+    ContactRecord
+
+Per-contact record produced by the narrow-phase pipeline and consumed by the
+XPBD solver (P5).  Layout mirrors the design spec section 3.4:
+
+- `i`, `j`: 1-based grain indices for the contact pair.
+- `n_hat`: contact normal pointing from B (j) toward A (i), unit length.
+- `p`: contact point on A's surface in world space.
+- `depth`: penetration depth (>= 0) along `n_hat`.
+
+Tightly packed (no padding) at 36 bytes; `isbitstype` so it can live in a
+GPU-resident `LavaArray`.
+"""
+struct ContactRecord
+    i::UInt32
+    j::UInt32
+    n_hat::Vec3f
+    p::Vec3f
+    depth::Float32
+end
+
+"""
     NO_CONTACT
 
 Sentinel `EPAResult` written into the result slot for pairs that do not
