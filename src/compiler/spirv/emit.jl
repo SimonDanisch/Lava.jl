@@ -1193,6 +1193,22 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                     cast_id = fresh_id!(state.mod)
                     encode_instruction!(state.mod.functions, Op.OpBitcast, new_ptr_ty, cast_id, ptr_id)
                     ptr_id = cast_id
+                elseif eff_load_ty != pointee_ty && pointee_ty isa LLVM.ArrayType &&
+                       !(eff_load_ty isa LLVM.PointerType) && !(eff_load_ty isa LLVM.ArrayType) &&
+                       !(eff_load_ty isa LLVM.StructType)
+                    # Loading a scalar (int / float / vector) directly from an
+                    # alloca pointer typed as an array — happens when SROA folds
+                    # the leading `gep T, ptr %alloca, 0` away and leaves a bare
+                    # `load T, ptr %alloca`.  Without intervention the emitter
+                    # produces `OpLoad %scalar %alloca`, which spirv-val rejects
+                    # because the pointer's pointee type is the array.
+                    # Bitcast the pointer to a scalar pointer of the load type
+                    # (matches the existing int-int / float/int branches above).
+                    val_spirv_ty = map_type!(state.type_ctx, eff_load_ty)
+                    new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
+                    cast_id = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpBitcast, new_ptr_ty, cast_id, ptr_id)
+                    ptr_id = cast_id
                 end
             end
         end
@@ -1952,6 +1968,17 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
                     # mismatches and the MVector{N, T<:AbstractFloat} case where
                     # Julia/LLVM packs the alloca as [N x i64] but writes typed
                     # float/double values at GEP-derived offsets.
+                    val_spirv_ty = map_type!(state.type_ctx, val_ty)
+                    new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
+                    cast_id = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpBitcast, new_ptr_ty, cast_id, ptr_id)
+                    ptr_id = cast_id
+                elseif val_ty != pointee_ty && pointee_ty isa LLVM.ArrayType &&
+                       !(val_ty isa LLVM.PointerType) && !(val_ty isa LLVM.ArrayType) &&
+                       !(val_ty isa LLVM.StructType)
+                    # Storing a scalar directly into an array-typed alloca pointer
+                    # (SROA folded the leading `gep T, ptr %alloca, 0` away).
+                    # Bitcast the pointer to scalar — symmetric with the load fix.
                     val_spirv_ty = map_type!(state.type_ctx, val_ty)
                     new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
                     cast_id = fresh_id!(state.mod)
