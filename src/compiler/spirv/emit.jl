@@ -1910,8 +1910,11 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
     # Also skip for PSB stores — those use fix_psb_ptr_type_for_store! instead
     # (bitcasting the pointer to match the LLVM store type, not the other way around).
     is_psb = is_psb_pointer(ptr)
+    val_was_bitcasted = false
     if !is_psb && ptr_id == orig_ptr_id && store_val_bitcast_to === nothing
-        val_id = bitcast_store_value_if_needed!(state, ptr, value, val_id)
+        new_val_id = bitcast_store_value_if_needed!(state, ptr, value, val_id)
+        val_was_bitcasted = (new_val_id != val_id)
+        val_id = new_val_id
     end
 
     # PhysicalStorageBuffer stores MUST have Aligned memory operand
@@ -1963,11 +1966,15 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
                     encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, i64_spirv, int_id, val_id)
                     val_id = int_id
                 elseif val_ty != pointee_ty && pointee_ty isa LLVM.IntegerType &&
-                       (val_ty isa LLVM.IntegerType || val_ty isa LLVM.FloatingPointType)
+                       (val_ty isa LLVM.IntegerType || val_ty isa LLVM.FloatingPointType) &&
+                       !val_was_bitcasted
                     # Bitcast pointer to match value type. Covers int-int width
                     # mismatches and the MVector{N, T<:AbstractFloat} case where
                     # Julia/LLVM packs the alloca as [N x i64] but writes typed
                     # float/double values at GEP-derived offsets.
+                    # Skip when bitcast_store_value_if_needed! already converted
+                    # the value to match pointee_ty — would otherwise generate
+                    # a contradictory pointer bitcast.
                     val_spirv_ty = map_type!(state.type_ctx, val_ty)
                     new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
                     cast_id = fresh_id!(state.mod)
@@ -1975,7 +1982,8 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
                     ptr_id = cast_id
                 elseif val_ty != pointee_ty && pointee_ty isa LLVM.ArrayType &&
                        !(val_ty isa LLVM.PointerType) && !(val_ty isa LLVM.ArrayType) &&
-                       !(val_ty isa LLVM.StructType)
+                       !(val_ty isa LLVM.StructType) &&
+                       !val_was_bitcasted
                     # Storing a scalar directly into an array-typed alloca pointer
                     # (SROA folded the leading `gep T, ptr %alloca, 0` away).
                     # Bitcast the pointer to scalar — symmetric with the load fix.

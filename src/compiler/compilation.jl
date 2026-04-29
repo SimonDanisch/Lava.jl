@@ -936,6 +936,16 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     combine_chained_geps!(mod)
     verify_ir!("combine_geps")
 
+    # ── Retype uniformly-typed Function allocas ──
+    # Run BEFORE structurize_cfg, while the IR is still simple — structurize
+    # inserts pointer PHIs for cross-block dataflow that the conservative
+    # version of this pass bails on.  Retyping here aligns the alloca's
+    # storage type with its uniform access pattern (e.g. MVector{N, Vec3f}
+    # alloca [N x i64] → [3N x float]), eliminating the per-access type-pun
+    # fixups the emitter would otherwise need.
+    retype_uniform_typed_allocas!(mod, LLVM.datalayout(mod))
+    verify_ir!("retype_allocas")
+
     # ── Structured control flow ──
     # SPIR-V requires structured CF. Run the full structurize pipeline.
     if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
