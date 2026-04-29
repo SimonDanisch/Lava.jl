@@ -1039,23 +1039,25 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # the emitter can't handle the type mismatch. Convert to byte GEPs:
     #   gep i8, ptr %alloca, i64 (%dynamic * 4)
     # so lower_byte_gep_chain_on_allocas! can apply shift/mask extraction.
-    convert_typepunned_geps_to_byte_geps!(mod)
+    if get(ENV, "LAVA_DISABLE_BYTE_PUN_PASSES", "") != "1"
+        convert_typepunned_geps_to_byte_geps!(mod)
 
-    # ── Lower byte-offset GEP chains on MArray allocas ──
-    # After InstCombine splits flattened byte-offset GEPs back into chains:
-    #   %gep1 = gep i8, ptr %alloca_[16xi64], %dynamic
-    #   %gep2 = gep i8, ptr %gep1, -4
-    #   store i32 %val, ptr %gep2
-    # Lower to proper element-level access with shift/mask (no integer divide).
-    lower_byte_gep_chain_on_allocas!(mod)
+        # ── Lower byte-offset GEP chains on MArray allocas ──
+        # After InstCombine splits flattened byte-offset GEPs back into chains:
+        #   %gep1 = gep i8, ptr %alloca_[16xi64], %dynamic
+        #   %gep2 = gep i8, ptr %gep1, -4
+        #   store i32 %val, ptr %gep2
+        # Lower to proper element-level access with shift/mask (no integer divide).
+        lower_byte_gep_chain_on_allocas!(mod)
 
-    # ── Lower PHI-chained typepunned loads on array allocas ──
-    # When byte-offset GEPs flow through PHI chains (from StructurizeCFG) before being
-    # loaded, lower_byte_gep_chain_on_allocas! can't handle them (it requires direct
-    # GEP→load). This pass "lifts" the load to each leaf GEP site with shift/mask
-    # extraction and creates parallel value PHI chains.
-    # Critical for MVector{32,UInt32} stored as [16 x i64] in BVH stack traversal.
-    lower_phi_typepunned_loads!(mod)
+        # ── Lower PHI-chained typepunned loads on array allocas ──
+        # When byte-offset GEPs flow through PHI chains (from StructurizeCFG) before being
+        # loaded, lower_byte_gep_chain_on_allocas! can't handle them (it requires direct
+        # GEP→load). This pass "lifts" the load to each leaf GEP site with shift/mask
+        # extraction and creates parallel value PHI chains.
+        # Critical for MVector{32,UInt32} stored as [16 x i64] in BVH stack traversal.
+        lower_phi_typepunned_loads!(mod)
+    end
     verify_ir!("lower_phi_typepun")
 
     # ── Lift byte-offset GEPs on workgroup globals ──
