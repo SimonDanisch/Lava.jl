@@ -68,10 +68,9 @@ end
 @testset "AABB BLAS - query_as_build_sizes returns nonzero" begin
     dev = Lava.vk_context().device
     geom = AABBsGeometry(; aabb_addr=UInt64(0), aabb_stride=UInt64(24))
-    sizes = Lava.query_as_build_sizes(dev;
+    sizes = Lava.query_as_build_sizes(dev, geom;
         as_type = UInt32(1),
         build_flags = UInt32(0),
-        geom = geom,
         geo_flags = UInt32(1),
         max_primitive_count = UInt32(1000))
     @test sizes.acceleration_structure_size > 0
