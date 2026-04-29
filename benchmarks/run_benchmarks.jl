@@ -8,6 +8,7 @@
 
 using Dates
 import KernelAbstractions as KA
+import GeometryBasics
 
 const SIZES = [10_000, 100_000, 1_000_000, 10_000_000]
 const SORT_SIZES = [1_000, 10_000, 100_000, 1_000_000]
@@ -155,6 +156,26 @@ function run_all_benchmarks()
             push!(results, bench_gpu("amdgpu_saxpy", N) do
                 _saxpy_bench!(ROCBackend())(a_r, b_r, α; ndrange=N)
                 AMDGPU.synchronize()
+            end)
+        end
+    end
+
+    # ── Grain instances (MVector + Vec3f + dual TLAS instance write) ──
+    # Exercises the MVector{N, Vec3f} and LavaInstanceRecord-write paths.
+    # This is the load-bearing benchmark for the alloca-retyping pass: if the
+    # retype rewrites Function-storage MVector allocas, this kernel's compile
+    # and runtime perf should stay within ~5% of baseline.
+    println("\n▶ Grain instances: write_grain_instances_kernel (Vec3f + Vec4f)")
+    let
+        for N in (10_000, 100_000, 1_000_000)
+            positions = Lava.LavaArray([GeometryBasics.Point3f(Float32(i), 0f0, 0f0) for i in 1:N])
+            quats     = Lava.LavaArray([GeometryBasics.Vec4f(0f0, 0f0, 0f0, 1f0) for _ in 1:N])
+            instances = Lava.LavaArray{Lava.LavaInstanceRecord}(undef, 2 * N;
+                            extra_usage=Lava.AS_INPUT_USAGE)
+            push!(results, bench_gpu("lava_grain_instances", N) do
+                Lava.write_grain_instances_kernel(Lava.LavaBackend())(
+                    positions, quats, 1f0, UInt64(0), UInt64(0), instances; ndrange=N)
+                KA.synchronize(Lava.LavaBackend())
             end)
         end
     end
