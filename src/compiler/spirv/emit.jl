@@ -2788,9 +2788,77 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
     end
     result_ptr_ty = map_pointer_type!(state.type_ctx, result_pointee_spirv, sc)
 
+    # Chain-folding for multi-index GEPs whose base came from an array-element
+    # OpAccessChain.  LLVM expresses `arr[i-1].x` as two GEPs:
+    #     %2 = gep [1 x [3 x float]], @arr, i64 i      ; element advance (one entry)
+    #     %3 = gep [1 x [3 x float]], %2,  i64 -1, 0, 1 ; back-step + drill into Vec3f.y
+    # The first GEP hits the array-eltype-match branch below and stores its
+    # element index in `array_element_origin`.  The second GEP has multiple
+    # indices, so it would otherwise fall into the multi-index path below
+    # which treats the leading `-1` as a deeper-level index — producing an OOB
+    # OpAccessChain into the inner [1 x …] wrapper.  Instead, fold:
+    #     OpAccessChain @arr (prev_idx + first_idx) *trailing_idx
+    # The trailing indices descend through the GEP's source type as usual.
+    if n_indices > 1 && (sc == SC.Function || sc == SC.Private || sc == SC.Workgroup) &&
+       haskey(state.array_element_origin, base_ptr)
+        arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
+        new_first_i32 = ensure_index_i32!(state, ops[2])
+        u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+        combined_idx = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, combined_idx, prev_idx_id, new_first_i32)
+        all_indices = vcat(static_path, [combined_idx])
+        for i in 3:length(ops)
+            push!(all_indices, ensure_index_i32!(state, ops[i]))
+        end
+        result_id = fresh_id!(state.mod)
+        word_count = UInt32(4 + length(all_indices))
+        push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+        push!(state.mod.functions, result_ptr_ty)
+        push!(state.mod.functions, result_id)
+        push!(state.mod.functions, arr_base_id)
+        append!(state.mod.functions, all_indices)
+        state.value_map[inst] = result_id
+        set_pointee_type!(state.type_ctx.ptm, inst, result_pointee; priority=3)
+        if result_pointee isa LLVM.PointerType
+            state.spirv_ptr_element_type[inst] = result_pointee_spirv
+        end
+        return
+    end
+
     if n_indices == 1
         # Single index: getelementptr T, ptr %base, i64 %idx → base + idx * sizeof(T)
         #
+        # Prefer chain-folding when the base pointer is itself the result of an
+        # array-element OpAccessChain.  Without this, a chained GEP like
+        #   %3 = gep [1 x [3 x float]], %2, -1
+        # where PTM[%2] is the inner [1 x [3 x float]] gets size-matched against
+        # `source_ty` in the array-eltype branch below and emits an OpAccessChain
+        # that indexes the inner 1-array with -1 (out of bounds), instead of
+        # combining the indices on the outer array.
+        if haskey(state.array_element_origin, base_ptr) &&
+           (sc == SC.Function || sc == SC.Private || sc == SC.Workgroup)
+            arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
+            new_idx_i32 = ensure_index_i32!(state, ops[2])
+            u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+            combined_idx = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, combined_idx, prev_idx_id, new_idx_i32)
+            result_id = fresh_id!(state.mod)
+            all_indices = vcat(static_path, [combined_idx])
+            word_count = UInt32(4 + length(all_indices))
+            push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+            push!(state.mod.functions, result_ptr_ty)
+            push!(state.mod.functions, result_id)
+            push!(state.mod.functions, arr_base_id)
+            append!(state.mod.functions, all_indices)
+            state.value_map[inst] = result_id
+            set_pointee_type!(state.type_ctx.ptm, inst, source_ty; priority=5)
+            state.array_element_origin[inst] = (arr_base_id, static_path, combined_idx, arr_type)
+            if result_pointee isa LLVM.PointerType
+                state.spirv_ptr_element_type[inst] = result_pointee_spirv
+            end
+            return
+        end
+
         # Check if the base pointer's actual pointee type is an array whose element type
         # matches source_ty. This happens with shared memory globals: the variable is
         # `ptr → [N x T]` but LLVM generates `gep T, ptr @global, i64 %idx`.
