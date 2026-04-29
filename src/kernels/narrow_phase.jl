@@ -100,3 +100,77 @@ Element types:
         @inbounds results[k] = NO_CONTACT
     end
 end
+
+"""
+    narrow_phase_contacts_kernel(transforms, pairs, shape,
+                                  counters, contacts, max_contacts)
+
+Fused narrow-phase + per-grain compaction kernel.  For each pair index `k`,
+runs `gjk(shape, shape, T_A, T_B)`; on overlap runs `epa(...)` and atomically
+inserts a `ContactRecord` into BOTH grain `i`'s and grain `j`'s slot list.
+
+Layout:
+- `counters::AbstractVector{UInt32}` of length `n_grains`.  Each slot is the
+  per-grain attempted contact count; the live count is `min(counter, max)`.
+- `contacts::AbstractVector{ContactRecord}` of length `n_grains * max`,
+  laid out grain-major: grain `g`'s slots occupy
+  `(g-1)*max + 1 ... g*max`.
+- `max_contacts::Int32` is the per-grain slot limit (typ. 12).
+
+Both copies of the contact carry the same `(i, j)` pair indices (the
+record's orientation is *pair-indexed*, not self/other) — the XPBD solver
+matches by checking `rec.i == self_grain ? own_A : own_B`.
+
+Counter overflow: if a grain's counter exceeds `max_contacts`, those extra
+contacts are dropped (no out-of-bounds writes).  Overshooting counters are
+fine for read-side consumers, which clamp via `min(counter, max)`.
+
+Preconditions (kernel; violations → wrong output, not errors):
+- `length(counters) >= max(grain id in pairs)`.
+- `length(contacts) >= length(counters) * max_contacts`.
+
+Element types:
+- `transforms`:  `AbstractVector{NTuple{12, Float32}}`.
+- `pairs`:       `AbstractVector{NTuple{2, Int32}}` (1-based grain indices).
+- `shape`:       `ConvexShape` subtype.
+- `counters`:    `AbstractVector{UInt32}`, **must be zero-initialised**.
+- `contacts`:    `AbstractVector{ContactRecord}` of length
+                 `length(counters) * max_contacts`.
+- `max_contacts`: `Int32`.
+"""
+@kernel function narrow_phase_contacts_kernel(
+        @Const(transforms),
+        @Const(pairs),
+        shape,
+        counters,
+        contacts,
+        max_contacts::Int32)
+    k = @index(Global)
+    @inbounds pair = pairs[k]
+    i = pair[1]
+    j = pair[2]
+    @inbounds T_A = transforms[i]
+    @inbounds T_B = transforms[j]
+    g = gjk(shape, shape, T_A, T_B)
+    if g.overlap
+        r = epa(shape, shape, T_A, T_B, g.simplex)
+        if r.depth > 0f0
+            rec = ContactRecord(UInt32(i), UInt32(j),
+                                r.normal, r.contact, r.depth)
+            # Atomic slot allocation for grain i.  @atomic returns the new
+            # (post-increment) value, which is the 1-based slot we own.
+            slot_i = Atomix.@atomic counters[i] += UInt32(1)
+            if slot_i <= max_contacts % UInt32
+                idx_i = (Int32(i) - Int32(1)) * max_contacts + Int32(slot_i)
+                @inbounds contacts[idx_i] = rec
+            end
+            # Same for grain j.  Both copies carry identical (i, j) pair
+            # indices; orientation is preserved.
+            slot_j = Atomix.@atomic counters[j] += UInt32(1)
+            if slot_j <= max_contacts % UInt32
+                idx_j = (Int32(j) - Int32(1)) * max_contacts + Int32(slot_j)
+                @inbounds contacts[idx_j] = rec
+            end
+        end
+    end
+end

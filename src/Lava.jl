@@ -63,8 +63,8 @@ export gjk, GJKResult
 export epa, EPAResult
 # P4.4 narrow-phase kernel composing gjk + epa
 export narrow_phase_kernel, NO_CONTACT
-# P4.5 contact record + per-grain contact buffer
-export ContactRecord
+# P4.5 contact record + per-grain contact buffer + fused narrow-phase
+export ContactRecord, narrow_phase_contacts_kernel
 
 import Serialization
 using Vulkan
