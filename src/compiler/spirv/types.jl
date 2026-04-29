@@ -1267,6 +1267,36 @@ function find_ptr_member_type_in_hierarchy(ctx::SPIRVTypeContext, ty::LLVM.LLVMT
 end
 
 """
+    trace_pointer_to_alloca(ptr) -> Bool
+
+Recursively check whether a pointer value ultimately comes from an alloca
+(i.e. should retain Function storage class).  Walks through GEPs, BitCasts,
+and PHIs.  PHIs with a mix of alloca and non-alloca incoming values return
+true if at least one path reaches an alloca (Function-class wins — matches
+`is_psb_pointer`'s "any alloca → not PSB" rule).
+"""
+function trace_pointer_to_alloca(ptr::LLVM.Value, visited::Set{LLVM.Value}=Set{LLVM.Value}())
+    ptr in visited && return false   # cycle without alloca → not Function
+    push!(visited, ptr)
+    ptr isa LLVM.AllocaInst && return true
+    if ptr isa LLVM.GetElementPtrInst
+        base = LLVM.operands(ptr)[1]
+        return trace_pointer_to_alloca(base, visited)
+    end
+    if ptr isa LLVM.BitCastInst
+        src = LLVM.operands(ptr)[1]
+        return trace_pointer_to_alloca(src, visited)
+    end
+    if ptr isa LLVM.PHIInst
+        for (val, _) in LLVM.incoming(ptr)
+            trace_pointer_to_alloca(val, visited) && return true
+        end
+        return false
+    end
+    return false
+end
+
+"""
     map_pointer_type_for_value!(ctx::SPIRVTypeContext, ptr_value::LLVM.Value) -> UInt32
 
 Map a pointer value to its SPIR-V pointer type, using the PointeeTypeMap for type recovery.
@@ -1314,8 +1344,15 @@ function map_pointer_type_for_value!(ctx::SPIRVTypeContext, ptr_value::LLVM.Valu
 
     # Override: In Vulkan SPIR-V, function parameters and GEP results in addrspace 0
     # should be PhysicalStorageBuffer (device memory), not Function.
-    # Only allocas genuinely produce Function storage class pointers.
-    if sc == SC.Function && !(ptr_value isa LLVM.AllocaInst)
+    # Only allocas (and GEPs/PHIs that ultimately come from allocas) produce
+    # Function storage class pointers.  Without the alloca-trace, a GEP into
+    # an MVector alloca gets flipped to PSB here, then mismatches the PHI's
+    # target SC (which `get_pointer_storage_class` derives correctly via
+    # `is_psb_pointer`'s alloca trace).  The mismatch triggers an invalid
+    # cross-SC OpBitcast at the PHI emit site.
+    if sc == SC.Function && !(ptr_value isa LLVM.AllocaInst) && trace_pointer_to_alloca(ptr_value)
+        # Stays Function: pointer chain bottoms out at an alloca.
+    elseif sc == SC.Function && !(ptr_value isa LLVM.AllocaInst)
         sc = SC.PhysicalStorageBuffer
     end
 
