@@ -63,7 +63,8 @@ end
         Lava.vk_flush!(bq)
 
         t0 = time()
-        Raycore.refit_tlas!(tlas)
+        tlas.transforms_dirty = true
+        Raycore.sync!(tlas)
         push!(refit_times, time() - t0)
 
         if f % 100 == 0

@@ -1050,7 +1050,15 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
     # - actual_load_ty: non-pointer type mismatch (load this type, bitcast to load_ty)
     # - ptr_load_override: SPIR-V type ID for pointer loads where struct member type
     #   differs from usage-inferred type (load this type, bitcast to result_ty)
+    _orig_ptr_id_for_resolve = ptr_id
     ptr_id, actual_load_ty, ptr_load_override = resolve_struct_field_load!(state, ptr, ptr_id, load_ty, result_ty)
+    # If resolve_struct_field_load! emitted an OpAccessChain that drilled the
+    # pointer to the load type, the subsequent Workgroup/Function pointer-bitcast
+    # logic must NOT re-cast: the new ptr_id already has element type matching
+    # `load_ty` (or `actual_load_ty`), and emitting `OpBitcast %_ptr_Workgroup_T %x`
+    # where %x is already typed `_ptr_Workgroup_T` is illegal on logical pointers
+    # in Vulkan (spec: "Instruction may not have a logical pointer operand").
+    did_drill_for_load = (ptr_id != _orig_ptr_id_for_resolve)
 
     # Determine if we need to load a different type and bitcast
     needs_bitcast = actual_load_ty !== nothing && actual_load_ty != load_ty
@@ -1144,11 +1152,15 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
     else
         sc = get_pointer_storage_class(ptr)
         load_as_int_then_convert_to_ptr = false
-        if sc == SC.Workgroup || sc == SC.Function
+        if (sc == SC.Workgroup || sc == SC.Function) && !did_drill_for_load
             # For Workgroup/Function loads: if load type doesn't match pointer's pointee type,
             # bitcast the POINTER to match the load type. This happens when:
             # - byte-offset GEPs produce i8* but the actual field may be i64
             # - GEP chains access sub-elements (e.g. i32 within [16 x i64])
+            # Skipped when resolve_struct_field_load! already drilled the pointer
+            # to a typed sub-element via OpAccessChain — re-bitcasting that result
+            # would emit an identity OpBitcast on a logical pointer, which Vulkan
+            # rejects (VUID-StandaloneSpirv-Logical pointer-OpBitcast).
             pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
             if pointee_ty !== nothing
                 eff_load_ty = needs_bitcast ? actual_load_ty : load_ty
@@ -1954,7 +1966,13 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
         #   GEPs that the lift pass couldn't fully resolve
         # We must NOT truncate the value — that loses data. Instead, OpBitcast the pointer.
         sc = get_pointer_storage_class(ptr)
-        if sc == SC.Workgroup || sc == SC.Function
+        # Skip the Workgroup/Function pointer-bitcast logic when
+        # resolve_struct_field_store! already drilled the pointer via OpAccessChain
+        # to a typed sub-element. Re-bitcasting the drilled pointer would emit an
+        # identity OpBitcast on a logical pointer (Vulkan rejects it as a spec
+        # violation: "Instruction may not have a logical pointer operand").
+        store_did_drill = (ptr_id != orig_ptr_id)
+        if (sc == SC.Workgroup || sc == SC.Function) && !store_did_drill
             pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
             if pointee_ty !== nothing
                 val_ty = LLVM.value_type(value)

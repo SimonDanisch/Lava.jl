@@ -20,7 +20,7 @@ using GeometryBasics: Point3f
     @test length(tlas.instance_batches) == 0
     @test tlas.dirty == true
 
-    # Deleting again returns false (handle is gone, not in handle_to_range either).
+    # Deleting again returns false (handle is gone from handle_to_batch_idx).
     @test delete!(tlas, handle) == false
 end
 

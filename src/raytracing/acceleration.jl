@@ -47,6 +47,14 @@ mutable struct LavaTLAS
     allow_update::Bool
     update_scratch_size::UInt64
     instance_buf::Union{Nothing, LavaArray}   # pinned across refits when set
+    # Per-TLAS RT descriptor sets, keyed by descriptor-set-layout Vulkan handle
+    # (UInt64).  Lazily populated by `get_rt_descriptor_set` and destroyed in
+    # `destroy_now!` so each VkAccelerationStructureKHR / descriptor set pair
+    # has a lifetime tied to *this* LavaTLAS object — no global cache, no
+    # objectid-keyed reuse-after-free.  Each entry holds (DescriptorPool,
+    # DescriptorSet) where the pool exclusively owns the set so destroying
+    # the pool destroys the set.
+    desc_sets::Dict{UInt64, Tuple{Vulkan.DescriptorPool, Vulkan.DescriptorSet}}
 end
 
 # ── Timeline-aware destruction for AS objects ──────────────────────────────
@@ -96,6 +104,22 @@ function unsafe_free!(as::Union{LavaBLAS, LavaTLAS})
 end
 
 function destroy_now!(as::Union{LavaBLAS, LavaTLAS})
+    # TLAS-only: destroy any RT descriptor pools we lazily created for this
+    # AS.  The pool owns the descriptor set; destroying it invalidates the set.
+    # Doing this BEFORE `as.accel.destructor()` keeps the spec-required order
+    # "free descriptors that reference an AS, then destroy the AS" obvious;
+    # in practice both happen synchronously after the storage timeline is
+    # signalled so there is no in-flight dispatch left to read either.
+    if as isa LavaTLAS
+        for (_, (pool, _)) in as.desc_sets
+            try
+                pool.destructor()
+            catch
+                safe_fin_log("Lava LavaTLAS destroy_now!: descriptor pool destructor failed\n")
+            end
+        end
+        empty!(as.desc_sets)
+    end
     as.accel.destructor()     # vkDestroyAccelerationStructureKHR — let
                               # Julia's finalizer logger surface any failure
     # Release storage + preserves through DataRef's refcount path.
@@ -368,7 +392,8 @@ function build_tlas(ctx::ASBuildContext, blas_list::Vector{LavaBLAS};
 
     unique_blas = unique(blas_list)
     tlas = LavaTLAS(accel, storage, unique_blas, tlas_preserves,
-                    allow_update, sizes.update_scratch_size, nothing)
+                    allow_update, sizes.update_scratch_size, nothing,
+                    Dict{UInt64, Tuple{Vulkan.DescriptorPool, Vulkan.DescriptorSet}}())
     finalizer(unsafe_free!, tlas)
     return tlas
 end
@@ -433,7 +458,8 @@ function build_tlas(ctx::ASBuildContext, instance_buf::LavaArray{LavaInstanceRec
     # by device address. Pinning is the caller's responsibility (HWTLAS pins them
     # on the higher-level handle).
     tlas = LavaTLAS(accel, storage, LavaBLAS[], tlas_preserves,
-                    allow_update, sizes.update_scratch_size, instance_buf)
+                    allow_update, sizes.update_scratch_size, instance_buf,
+                    Dict{UInt64, Tuple{Vulkan.DescriptorPool, Vulkan.DescriptorSet}}())
     finalizer(unsafe_free!, tlas)
     return tlas
 end
@@ -1451,16 +1477,26 @@ function build_hw_accel_from_tlas(tlas;
     return (hw_tlas, typed_prims, blas_offsets, per_instance_tri_offsets)
 end
 
-"""Convert a 4×4 matrix to VkTransformMatrixKHR (3×4 row-major) NTuple{12,Float32}.
-Works with SMatrix{4,4}, Mat4f, or any indexable 4×4 matrix."""
-function mat4_to_vk_transform(m)
-    # VkTransformMatrixKHR = 3 rows × 4 cols, row-major
+"""Convert a 4×4 matrix to a `Mat3x4f` (Vulkan row-major 3×4 layout).
+Works with SMatrix{4,4}, Mat4f, or any indexable 4×4 matrix.
+
+The returned `Mat3x4f` (= `SMatrix{4, 3, Float32, 12}`) is byte-identical to
+`VkTransformMatrixKHR.matrix` (`float[12]`), so passing it as a kernel argument
+or storing it into `LavaInstanceRecord.transform` is a memcpy, not a layout
+transform."""
+function mat4_to_vk_transform(m)::Mat3x4f
+    # Vulkan row-major 3×4:
     # Row 0: m[1,1], m[1,2], m[1,3], m[1,4]
     # Row 1: m[2,1], m[2,2], m[2,3], m[2,4]
     # Row 2: m[3,1], m[3,2], m[3,3], m[3,4]
-    return (Float32(m[1,1]), Float32(m[1,2]), Float32(m[1,3]), Float32(m[1,4]),
-            Float32(m[2,1]), Float32(m[2,2]), Float32(m[2,3]), Float32(m[2,4]),
-            Float32(m[3,1]), Float32(m[3,2]), Float32(m[3,3]), Float32(m[3,4]))
+    # SMatrix{4,3} ctor reads column-major, but our rows ARE the SMatrix's
+    # columns (the byte-equivalence trick), so we just hand the rows over in
+    # order.
+    return Mat3x4f(
+        Float32(m[1,1]), Float32(m[1,2]), Float32(m[1,3]), Float32(m[1,4]),
+        Float32(m[2,1]), Float32(m[2,2]), Float32(m[2,3]), Float32(m[2,4]),
+        Float32(m[3,1]), Float32(m[3,2]), Float32(m[3,3]), Float32(m[3,4]),
+    )
 end
 
 """Download GPU array to CPU Vector, or return as-is if already a CPU collection."""

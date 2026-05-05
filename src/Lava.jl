@@ -44,7 +44,7 @@ export write_grain_instances_kernel, write_meshscatter_instances_kernel,
        quat_to_rot3x3, build_4x3, build_4x3_pervec
 
 # Ray tracing exports
-export LavaInstanceRecord, identity_transform
+export LavaInstanceRecord, identity_transform, Mat3x4f
 export GeometryType, TrianglesGeometry, AABBsGeometry, AABB
 # Re-export Raycore.Ray so `using Lava` users get Ray without ambiguity
 export Ray

@@ -171,55 +171,25 @@ function create_rt_pipeline(ctx::VkContext,
     )
 end
 
-# Descriptor set cache: keyed by (ds_layout handle, tlas Julia objectid).
-# Also stores a WeakRef to the TLAS so we can detect when it's been GC'd
-# and clean up stale descriptor pools.
-const RT_DESC_CACHE = Dict{Tuple{UInt64, UInt64}, Tuple{Vulkan.DescriptorPool, Vulkan.DescriptorSet, WeakRef}}()
-const MAX_RT_DESC_CACHE_SIZE = 32
+"""
+    get_rt_descriptor_set(pipeline, tlas) -> Vulkan.DescriptorSet
 
-push!(RESET_CALLBACKS, function()
-    # Destroy all descriptor pools on device reset.  A destructor failure
-    # here is almost always "device already torn down" — log via
-    # jl_safe_printf so we never lose the signal without blocking the reset.
-    for (key, (pool, ds, wr)) in RT_DESC_CACHE
-        try
-            pool.destructor()
-        catch
-            safe_fin_log("Lava RT_DESC_CACHE reset: descriptor pool destructor failed\n")
-        end
-    end
-    empty!(RT_DESC_CACHE)
-end)
+Look up (or lazily allocate) the RT descriptor set that binds `tlas.accel` for
+the layout used by `pipeline`.  The pool + set are stored on `tlas.desc_sets`,
+keyed by descriptor-set-layout Vulkan handle, so their lifetime tracks the
+LavaTLAS exactly: `destroy_now!(tlas)` destroys the pool, releasing the set.
 
-function evict_stale_rt_desc_cache!()
-    stale_keys = Tuple{UInt64, UInt64}[]
-    for (key, (pool, ds, wr)) in RT_DESC_CACHE
-        if wr.value === nothing
-            push!(stale_keys, key)
-        end
-    end
-    for key in stale_keys
-        pool, ds, wr = RT_DESC_CACHE[key]
-        try
-            pool.destructor()
-        catch
-            safe_fin_log("Lava RT_DESC_CACHE evict: descriptor pool destructor failed\n")
-        end
-        delete!(RT_DESC_CACHE, key)
-    end
-end
-
+The previous implementation used a global cache keyed by `objectid(tlas)`,
+which broke after a freed LavaTLAS was GC'd and a new LavaTLAS reused that
+objectid: the cache returned a descriptor set bound to the destroyed
+VkAccelerationStructureKHR.  Per-TLAS storage eliminates that hazard
+entirely — no global cache, no objectid keying, no eviction policy.
+"""
 function get_rt_descriptor_set(pipeline::LavaRTPipeline, tlas::LavaTLAS)
-    key = (UInt64(pipeline.descriptor_set_layout.vks),
-           objectid(tlas))
-    cached = get(RT_DESC_CACHE, key, nothing)
+    layout_handle = UInt64(pipeline.descriptor_set_layout.vks)
+    cached = get(tlas.desc_sets, layout_handle, nothing)
     if cached !== nothing
         return cached[2]
-    end
-
-    # Evict stale entries before adding new ones
-    if length(RT_DESC_CACHE) >= MAX_RT_DESC_CACHE_SIZE
-        evict_stale_rt_desc_cache!()
     end
 
     dev = pipeline.ctx.device
@@ -243,7 +213,7 @@ function get_rt_descriptor_set(pipeline::LavaRTPipeline, tlas::LavaTLAS)
     )
     Vulkan.update_descriptor_sets(dev, [write_ds], [])
 
-    RT_DESC_CACHE[key] = (desc_pool, desc_set, WeakRef(tlas))
+    tlas.desc_sets[layout_handle] = (desc_pool, desc_set)
     return desc_set
 end
 

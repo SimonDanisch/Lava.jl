@@ -2,18 +2,19 @@
 # Lava.HWTLAS — concrete hardware-accelerated TLAS living in Lava
 # ============================================================================
 #
-# This is the Lava-native implementation of Raycore.AbstractAccel.  It fuses
-# the previously split Raycore.HWTLAS (backend-agnostic stubs) and
-# RaycoreLavaExt (Lava-specific bindings) into one concrete, fully-typed type.
-#
-# Phase C of the Raycore HWTLAS release cleanup.  Raycore.HWTLAS continues to
-# exist until Phase E; both coexist temporarily.
+# Single GPU-resident-instances code path: every push! produces an
+# `InstanceBatch{Tri}` that owns a `LavaArray{LavaInstanceRecord, 1}`.
+# Mutations (update_transform!/update_transforms!) write GPU-side via
+# compute kernels and flag `transforms_dirty`.  `sync!` decides
+# rebuild-vs-refit from the dirty flags.
 
 import Raycore
 import Adapt
 using GeometryBasics
 using StaticArrays: SVector, SMatrix
 using Base: @propagate_inbounds
+import KernelAbstractions
+const KA = KernelAbstractions
 
 const Mat4f = SMatrix{4, 4, Float32, 16}
 
@@ -30,7 +31,7 @@ const Mat4f = SMatrix{4, 4, Float32, 16}
 A batch of N TLAS instances all referencing the same BLAS, with instance
 records read from a GPU-resident `LavaArray{LavaInstanceRecord, 1}` at
 sync! / refit time. Returned `handle` lets callers track the batch in
-`HWTLAS.handle_to_range` for delete!/refit.
+`HWTLAS.handle_to_batch_idx` for delete!/refit.
 
 `triangles` holds the per-triangle metadata for the BLAS (typically
 `Vector{Triangle{UInt32}}`). Pass an empty vector for rayQuery-only
@@ -58,6 +59,14 @@ per-primitive triangle type, typically `Raycore.Triangle{UInt32}`).
 Build geometry with `push!(hwtlas, mesh, transform)`, then call
 `Raycore.sync!(hwtlas)` to upload and build the Vulkan AS.  The adapted form
 lives in `hwtlas.static_tlas` as a `HWAdaptedAccel{HWTLAS{Tri}}`.
+
+# Mutation contract
+
+`update_transform!` / `update_transforms!` write directly to the batch's
+GPU-resident `instance_buf` via a compute kernel and flag
+`transforms_dirty`.  The next `sync!` decides between full rebuild
+(topology change, `dirty=true`) and `MODE_UPDATE_KHR` refit
+(`transforms_dirty=true`).  No CPU-side staging.
 
 # Adapted-form invariant
 
@@ -97,24 +106,12 @@ mutable struct HWTLAS{Tri} <: Raycore.AbstractAccel
     blas_triangles::Vector{Vector{Tri}}
     blas_offsets::Vector{UInt32}
 
-    # Instances
-    instance_blas_indices::Vector{Int}
-    instance_transforms::Vector{NTuple{12,Float32}}
-    instance_custom_indices::Vector{UInt32}
-    instance_masks::Vector{UInt8}
-
     # Instance batches -- N instances of one BLAS each, transforms in a GPU buffer.
-    # An HWTLAS uses EITHER per-mesh push! with CPU transforms (populates
-    # instance_transforms) OR push! with a LavaArray instance_buf (GPU-resident
-    # batch mode, populates instance_batches). Mixed mode errors loudly in
-    # rebuild_hw_tlas!. To switch modes, build a fresh HWTLAS.
-    # TODO(P3.4d): migrate per-mesh push!(mesh, transform) to also use batch path;
-    # then per-instance arrays can be removed.
+    # Every push! produces one batch; per-mesh push! batches simply have n=1.
     instance_batches::Vector{InstanceBatch{Tri}}
 
-    # Handle management
-    handle_to_range::Dict{Raycore.TLASHandle, UnitRange{Int}}
-    deleted_handles::Set{Raycore.TLASHandle}
+    # Handle management: handle -> index into instance_batches.
+    handle_to_batch_idx::Dict{Raycore.TLASHandle, Int}
     next_handle_id::UInt32
 
     # Bounding box (CPU-side, updated on push!)
@@ -127,7 +124,7 @@ mutable struct HWTLAS{Tri} <: Raycore.AbstractAccel
     off_gpu::Union{Nothing, LavaArray{UInt32, 1}}
     # Combined instance buffer: concatenation of every batch's instance_buf.
     # Allocated/grown in rebuild_hw_tlas_from_batch! and reused across syncs +
-    # refits.  Stays `nothing` for HWTLASes that use the per-mesh push! path.
+    # refits.
     combined_instance_buf::Union{Nothing, LavaArray{LavaInstanceRecord, 1}}
 
     # GPU-adapted form, owned by sync!.  Consumers read this via
@@ -135,7 +132,11 @@ mutable struct HWTLAS{Tri} <: Raycore.AbstractAccel
     # `nothing` until first sync!.
     static_tlas::Any   # Union{Nothing, HWAdaptedAccel{HWTLAS{Tri}}}
 
+    # Topology dirty: a push!/delete! changed the batch list, full rebuild needed.
     dirty::Bool
+    # Transforms dirty: a kernel just wrote new records into a batch's
+    # instance_buf, refit (MODE_UPDATE_KHR) is enough.
+    transforms_dirty::Bool
 end
 
 """
@@ -147,16 +148,15 @@ function HWTLAS{Tri}(backend::LavaBackend; bq::BatchQueue=backend.bq) where {Tri
     HWTLAS{Tri}(
         backend, bq,
         LavaBLAS[], Vector{Tri}[], UInt32[],
-        Int[], NTuple{12,Float32}[], UInt32[], UInt8[],
-        InstanceBatch{Tri}[],     # new
-        Dict{Raycore.TLASHandle, UnitRange{Int}}(),
-        Set{Raycore.TLASHandle}(),
+        InstanceBatch{Tri}[],
+        Dict{Raycore.TLASHandle, Int}(),
         UInt32(1),
         Raycore.Bounds3(),
         nothing, nothing, nothing, nothing,
-        nothing,                  # combined_instance_buf (P3-fu4)
+        nothing,                  # combined_instance_buf
         nothing,
-        true,
+        true,                     # dirty
+        false,                    # transforms_dirty
     )
 end
 
@@ -239,72 +239,22 @@ end
 
 Raycore.world_bound(hwtlas::HWTLAS)    = hwtlas.root_aabb
 Raycore.n_geometries(hwtlas::HWTLAS)   = length(hwtlas.blas_list)
-Raycore.n_instances(hwtlas::HWTLAS)    = length(hwtlas.instance_blas_indices)
+Raycore.n_instances(hwtlas::HWTLAS)    = sum(b.n for b in hwtlas.instance_batches; init=0)
 
 """
     Raycore.instance_buffer(hwtlas::HWTLAS, handle::Raycore.TLASHandle) -> LavaArray{LavaInstanceRecord, 1}
 
 Return the GPU instance buffer for the batch registered under `handle`. The
 caller can write new instance records into the returned LavaArray (typically
-via a compute kernel) and then call `Raycore.refit_tlas!(hwtlas)` to commit
+via a compute kernel) and then call `Raycore.sync!(hwtlas)` to commit
 the change to the underlying LavaTLAS via MODE_UPDATE_KHR.
 
-Errors if the handle is not a batch handle. Per-mesh push! handles (those
-stored in `hwtlas.handle_to_range` for the legacy CPU instance path) have
-no associated GPU buffer and will error.
+Errors if the handle is not registered.
 """
 function Raycore.instance_buffer(hwtlas::HWTLAS, handle::Raycore.TLASHandle)
-    for batch in hwtlas.instance_batches
-        batch.handle === handle && return batch.instance_buf
-    end
-    error(
-        "instance_buffer: handle does not refer to an instance batch. " *
-        "Either it's invalid, deleted, or it refers to a per-mesh push! " *
-        "instance (which has no GPU buffer). Use the value returned by " *
-        "push!(hwtlas, mesh_or_blas, instance_buf::LavaArray; ...).")
-end
-
-"""
-    Raycore.refit_tlas!(hwtlas::HWTLAS) -> hwtlas
-
-In-place TLAS refit using `MODE_UPDATE_KHR`. Reads fresh instance records
-from each registered batch's GPU instance buffer (typically just-written by
-the user's compute kernel).
-
-Requirements:
-- HWTLAS must have at least one instance batch registered via `push!(hwtlas, blas, instance_buf)`.
-- HWTLAS must be clean (no `push!` / `delete!` since last `sync!`).
-- Underlying `LavaTLAS` must have been built with `allow_update=true` (set
-  automatically by `sync!` for batch HWTLASes).
-
-Errors loudly on misuse.
-"""
-function Raycore.refit_tlas!(hwtlas::HWTLAS)
-    isempty(hwtlas.instance_batches) && error(
-        "refit_tlas!: HWTLAS has no instance batches. Call push!(hwtlas, blas, instance_buf) " *
-        "to register a GPU-resident batch, then sync! before refitting.")
-    !hwtlas.dirty || error(
-        "refit_tlas!: HWTLAS topology has changed since last sync! " *
-        "(dirty=true). Call sync! to rebuild instead of refitting.")
-    hwtlas.hw_tlas !== nothing || error(
-        "refit_tlas!: HWTLAS has not been sync!'d yet. Call sync! before refit.")
-    hwtlas.hw_tlas.allow_update || error(
-        "refit_tlas!: underlying LavaTLAS was built with allow_update=false. " *
-        "This indicates a bug -- sync! should set allow_update=true on batch HWTLASes.")
-    hwtlas.combined_instance_buf !== nothing || error(
-        "refit_tlas!: combined_instance_buf is nothing -- this HWTLAS has not " *
-        "been sync!'d via the batch path.")
-
-    # Re-run the GPU-side concat copy from each batch's instance_buf into the
-    # combined buffer (the user's compute kernel just wrote new records into
-    # one or more batch.instance_buf), then issue MODE_UPDATE_KHR refit on
-    # the combined buffer.  For a single-batch HWTLAS this is one memcpy +
-    # one Vulkan refit; for K batches it is K memcpys + one refit.
-    combined, total_n = _concat_batch_instances!(hwtlas)
-    as_build() do ctx
-        Lava.refit_tlas!(ctx, hwtlas.hw_tlas, combined, total_n)
-    end
-    return hwtlas
+    idx = get(hwtlas.handle_to_batch_idx, handle, nothing)
+    idx === nothing && error("instance_buffer: invalid or deleted handle.")
+    return hwtlas.instance_batches[idx].instance_buf
 end
 
 # RayMakie compat: hwtlas.instances -> lightweight length-only view
@@ -315,8 +265,11 @@ Base.isempty(x::HWTLASInstances) = x.n == 0
 Base.length(x::HWTLASInstances) = x.n
 
 function Base.getproperty(hwtlas::HWTLAS, s::Symbol)
-    s === :instances ? HWTLASInstances(length(getfield(hwtlas, :instance_blas_indices))) :
-                       getfield(hwtlas, s)
+    if s === :instances
+        n = sum(b.n for b in getfield(hwtlas, :instance_batches); init=0)
+        return HWTLASInstances(n)
+    end
+    return getfield(hwtlas, s)
 end
 
 # ============================================================================
@@ -335,7 +288,7 @@ function Raycore.wait_for_gpu!(hwtlas::HWTLAS)
 end
 
 # ============================================================================
-# C2 — Mutation API
+# Mutation API
 # ============================================================================
 
 function hwtlas_add_geometry!(hwtlas::HWTLAS{Tri}, mesh::GeometryBasics.Mesh) where {Tri}
@@ -375,7 +328,6 @@ function hwtlas_add_geometry!(hwtlas::HWTLAS{Tri}, mesh::GeometryBasics.Mesh) wh
         blas_indices[i+1] = UInt32(i)
     end
 
-    # Inline of build_hw_blas (RaycoreLavaExt lines 46-50)
     hw_blas = as_build() do ctx
         build_blas(ctx, blas_vertices, blas_indices)
     end
@@ -398,58 +350,51 @@ function hwtlas_add_geometry!(hwtlas::HWTLAS{Tri}, mesh::GeometryBasics.Mesh) wh
     return blas_idx
 end
 
-"""
-Internal: add N instances of `blas_idx` to the HWTLAS.
-
-`instance_ids` (if given) supplies the per-instance interface override that
-the HW closest-hit shader reads via `gl_InstanceCustomIndexEXT`.  When
-`nothing`, every instance gets `0` (inherit from triangle metadata).
-
-`instance_masks` (if given) supplies per-instance Vulkan cullMask values.
-When `nothing`, every instance gets `0xff` (visible to all ray queries).
-"""
-function hwtlas_add_instances!(hwtlas::HWTLAS, blas_idx::Int, transforms;
-                                instance_ids::Union{Nothing, AbstractVector{<:Integer}}=nothing,
-                                instance_masks::Union{Nothing, AbstractVector{UInt8}}=nothing)
-    if instance_ids !== nothing && length(instance_ids) != length(transforms)
-        throw(ArgumentError("instance_ids length $(length(instance_ids)) != transforms length $(length(transforms))"))
-    end
-    if instance_masks !== nothing && length(instance_masks) != length(transforms)
-        throw(ArgumentError("instance_masks length $(length(instance_masks)) != transforms length $(length(transforms))"))
-    end
-    start_idx = length(hwtlas.instance_blas_indices) + 1
-    for (i, transform) in enumerate(transforms)
-        iid  = instance_ids    === nothing ? UInt32(0)  : UInt32(instance_ids[i])
-        mask = instance_masks  === nothing ? UInt8(0xff) : UInt8(instance_masks[i])
-        push!(hwtlas.instance_blas_indices, blas_idx)
-        push!(hwtlas.instance_transforms, mat4_to_vk_transform(transform))
-        push!(hwtlas.instance_custom_indices, iid)
-        push!(hwtlas.instance_masks, mask)
-    end
-    end_idx = length(hwtlas.instance_blas_indices)
-
+# Internal: register an InstanceBatch for `blas` with `n` instances initially
+# populated from the CPU-side `records` Vector.  Returns the new handle.
+function _register_batch!(hwtlas::HWTLAS{Tri}, blas::LavaBLAS,
+                          records::Vector{LavaInstanceRecord},
+                          triangles::Vector{Tri},
+                          instance_mask::UInt8) where {Tri}
+    n = length(records)
+    instance_buf = LavaArray{LavaInstanceRecord, 1}(undef, n; extra_usage=AS_INPUT_USAGE)
+    Base.copyto!(instance_buf, records)
     handle = Raycore.TLASHandle(hwtlas.next_handle_id)
     hwtlas.next_handle_id += UInt32(1)
-    hwtlas.handle_to_range[handle] = start_idx:end_idx
+    push!(hwtlas.instance_batches,
+          InstanceBatch{Tri}(blas, instance_buf, n, instance_mask, handle, triangles))
+    hwtlas.handle_to_batch_idx[handle] = lastindex(hwtlas.instance_batches)
+    hwtlas.dirty = true
     return handle
 end
 
-function Base.push!(hwtlas::HWTLAS, mesh::GeometryBasics.Mesh, transform::Mat4f=Mat4f(I);
-                    instance_id::UInt32=UInt32(0), instance_mask::UInt8=UInt8(0xff))
-    blas_idx = hwtlas_add_geometry!(hwtlas, mesh)
-    return hwtlas_add_instances!(hwtlas, blas_idx, (transform,);
-                                  instance_ids=UInt32[instance_id],
-                                  instance_masks=UInt8[instance_mask])
+function Base.push!(hwtlas::HWTLAS{Tri}, mesh::GeometryBasics.Mesh, transform::Mat4f=Mat4f(I);
+                    instance_id::UInt32=UInt32(0), instance_mask::UInt8=UInt8(0xff)) where {Tri}
+    blas_idx  = hwtlas_add_geometry!(hwtlas, mesh)
+    blas      = hwtlas.blas_list[blas_idx]
+    triangles = hwtlas.blas_triangles[blas_idx]
+    record    = LavaInstanceRecord(mat4_to_vk_transform(transform), blas.address;
+                                   custom_index=instance_id, mask=instance_mask)
+    return _register_batch!(hwtlas, blas, [record], triangles, instance_mask)
 end
 
-function Base.push!(hwtlas::HWTLAS, mesh::GeometryBasics.Mesh, transforms::AbstractVector{Mat4f};
+function Base.push!(hwtlas::HWTLAS{Tri}, mesh::GeometryBasics.Mesh, transforms::AbstractVector{Mat4f};
                     instance_ids::Union{Nothing, AbstractVector{<:Integer}}=nothing,
-                    instance_mask::UInt8=UInt8(0xff))
-    blas_idx = hwtlas_add_geometry!(hwtlas, mesh)
-    # Single mask applies to all transforms (same geometry type); per-transform
-    # masks are a future feature if needed.
-    masks = fill(instance_mask, length(transforms))
-    return hwtlas_add_instances!(hwtlas, blas_idx, transforms; instance_ids, instance_masks=masks)
+                    instance_mask::UInt8=UInt8(0xff)) where {Tri}
+    if instance_ids !== nothing && length(instance_ids) != length(transforms)
+        throw(ArgumentError("instance_ids length $(length(instance_ids)) != transforms length $(length(transforms))"))
+    end
+    blas_idx  = hwtlas_add_geometry!(hwtlas, mesh)
+    blas      = hwtlas.blas_list[blas_idx]
+    triangles = hwtlas.blas_triangles[blas_idx]
+    addr      = blas.address
+    records = Vector{LavaInstanceRecord}(undef, length(transforms))
+    @inbounds for i in eachindex(transforms)
+        iid = instance_ids === nothing ? UInt32(0) : UInt32(instance_ids[i])
+        records[i] = LavaInstanceRecord(mat4_to_vk_transform(transforms[i]), addr;
+                                        custom_index=iid, mask=instance_mask)
+    end
+    return _register_batch!(hwtlas, blas, records, triangles, instance_mask)
 end
 
 """
@@ -472,10 +417,9 @@ function Base.push!(hwtlas::HWTLAS{Tri}, blas::LavaBLAS, transform::Mat4f=Mat4f(
              hwtlas.blas_offsets[end] + UInt32(length(hwtlas.blas_triangles[end-1]))
     push!(hwtlas.blas_offsets, offset)
 
-    hwtlas.dirty = true
-    return hwtlas_add_instances!(hwtlas, blas_idx, (transform,);
-                                  instance_ids=UInt32[instance_id],
-                                  instance_masks=UInt8[instance_mask])
+    record = LavaInstanceRecord(mat4_to_vk_transform(transform), blas.address;
+                                custom_index=instance_id, mask=instance_mask)
+    return _register_batch!(hwtlas, blas, [record], Tri[], instance_mask)
 end
 
 """
@@ -496,8 +440,7 @@ is pre-allocated larger than the current live instance count.
 callers -- those don't need per-triangle metadata.
 
 Returns one `TLASHandle` for the whole batch. Subsequent `sync!` builds
-the underlying `LavaTLAS` with `allow_update=true` so per-frame refits
-via `Raycore.refit_tlas!(::HWTLAS)` work.
+the underlying `LavaTLAS` with `allow_update=true` so per-frame refits work.
 """
 function Base.push!(tlas::HWTLAS{Tri}, blas::LavaBLAS,
                     instance_buf::LavaArray{LavaInstanceRecord, 1};
@@ -510,6 +453,7 @@ function Base.push!(tlas::HWTLAS{Tri}, blas::LavaBLAS,
     handle = Raycore.TLASHandle(tlas.next_handle_id)
     tlas.next_handle_id += UInt32(1)
     push!(tlas.instance_batches, InstanceBatch{Tri}(blas, instance_buf, n_int, instance_mask, handle, triangles))
+    tlas.handle_to_batch_idx[handle] = lastindex(tlas.instance_batches)
     tlas.dirty = true
     return handle
 end
@@ -521,9 +465,8 @@ end
 
 Build a BLAS from `mesh` (or reuse a cached one) and register an N-instance
 batch backed by the GPU-resident `instance_buf`. The per-instance transforms
-and custom_indices are read from `instance_buf` at `sync!` / `refit_tlas!`
-time -- typically written by a compute kernel such as
-`write_grain_instances_kernel`.
+and custom_indices are read from `instance_buf` at `sync!` time -- typically
+written by a compute kernel such as `write_meshscatter_instances_kernel`.
 
 `n` defaults to `length(instance_buf)`. Pass a smaller value when the buffer
 is pre-allocated larger than the current live instance count.
@@ -543,71 +486,106 @@ function Base.push!(hwtlas::HWTLAS{Tri}, mesh::GeometryBasics.Mesh,
     handle = Raycore.TLASHandle(hwtlas.next_handle_id)
     hwtlas.next_handle_id += UInt32(1)
     push!(hwtlas.instance_batches, InstanceBatch{Tri}(blas, instance_buf, n_int, instance_mask, handle, triangles))
+    hwtlas.handle_to_batch_idx[handle] = lastindex(hwtlas.instance_batches)
     hwtlas.dirty = true
     return handle
+end
+
+# ============================================================================
+# GPU update kernel + update_transform!/update_transforms!
+# ============================================================================
+
+"""
+    update_instance_records_kernel!(records, transforms, blas_address, cim, sof)
+
+One thread per instance.  Reads transforms[i] (any indexable 4×4-ish matrix),
+packs the upper 3×4 row-major into a `Mat3x4f`, and writes
+`records[i] = LavaInstanceRecord(T, cim, sof, blas_address)`.
+
+`cim` packs custom_index (low 24 bits) and mask (high 8 bits); `sof` packs
+sbt_offset (low 24 bits) and flags (high 8 bits).
+"""
+KA.@kernel function update_instance_records_kernel!(
+        records,
+        @Const(transforms),
+        blas_address::UInt64,
+        cim::UInt32,
+        sof::UInt32)
+    i = @index(Global, Linear)
+    @inbounds m = transforms[i]
+    # Pack row-major 3×4 floats into the Mat3x4f tuple ordering. The
+    # NTuple{12,Float32} -> LavaInstanceRecord constructor handles the
+    # Mat3x4f conversion (which is byte-identical, no transpose).
+    T = (
+        Float32(m[1,1]), Float32(m[1,2]), Float32(m[1,3]), Float32(m[1,4]),
+        Float32(m[2,1]), Float32(m[2,2]), Float32(m[2,3]), Float32(m[2,4]),
+        Float32(m[3,1]), Float32(m[3,2]), Float32(m[3,3]), Float32(m[3,4]),
+    )
+    @inbounds records[i] = LavaInstanceRecord(T, cim, sof, blas_address)
+end
+
+"""
+    Raycore.update_transforms!(hwtlas::HWTLAS, handle::TLASHandle,
+                               transforms::AbstractVector{<:AbstractMatrix})
+
+Bulk update every instance in `handle`'s batch. `length(transforms)` must
+equal the batch size. Writes new records into the batch's GPU-resident
+`instance_buf` via a compute kernel and flags `transforms_dirty`. The next
+`sync!` issues a `MODE_UPDATE_KHR` refit (no rebuild).
+"""
+function Raycore.update_transforms!(hwtlas::HWTLAS, handle::Raycore.TLASHandle,
+                                    transforms::AbstractVector{<:AbstractMatrix})
+    haskey(hwtlas.handle_to_batch_idx, handle) || error("Invalid handle")
+    batch = hwtlas.instance_batches[hwtlas.handle_to_batch_idx[handle]]
+    length(transforms) == batch.n || error(
+        "Transform count $(length(transforms)) != batch.n $(batch.n)")
+    backend = KA.get_backend(batch.instance_buf)
+    backend_transforms = Adapt.adapt(backend, transforms)
+    cim = (UInt32(0) & 0x00FFFFFF) | (UInt32(batch.instance_mask) << 24)
+    sof = UInt32(0)
+    update_instance_records_kernel!(backend)(
+        batch.instance_buf, backend_transforms,
+        batch.blas.address, cim, sof;
+        ndrange = batch.n)
+    hwtlas.transforms_dirty = true
+    return nothing
 end
 
 """
     update_transform!(hwtlas::HWTLAS, handle::TLASHandle, transform::Mat4f)
 
-Update every instance belonging to `handle` to the same transform.
-Marks the HWTLAS dirty so the next `sync!` repacks the instance buffer.
+Set every instance in `handle`'s batch to the same transform. Returns true
+if the handle was valid (matches the previous return semantics).
 """
 function Raycore.update_transform!(hwtlas::HWTLAS, handle::Raycore.TLASHandle, transform::Mat4f)
-    r = get(hwtlas.handle_to_range, handle, nothing)
-    r === nothing && return false
-    vk_tr = mat4_to_vk_transform(transform)
-    for i in r
-        hwtlas.instance_transforms[i] = vk_tr
-    end
-    hwtlas.dirty = true
+    haskey(hwtlas.handle_to_batch_idx, handle) || return false
+    batch = hwtlas.instance_batches[hwtlas.handle_to_batch_idx[handle]]
+    Raycore.update_transforms!(hwtlas, handle, fill(transform, batch.n))
     return true
 end
 
-"""
-    update_transform_at!(hwtlas::HWTLAS, handle::TLASHandle, i::Integer, transform::Mat4f)
-
-Update the i-th instance (1-based) within `handle`'s instance range.
-"""
-function Raycore.update_transform_at!(hwtlas::HWTLAS, handle::Raycore.TLASHandle, i::Integer, transform::Mat4f)
-    r = get(hwtlas.handle_to_range, handle, nothing)
-    r === nothing && return false
-    1 <= i <= length(r) || throw(BoundsError(1:length(r), i))
-    hwtlas.instance_transforms[first(r) + i - 1] = mat4_to_vk_transform(transform)
-    hwtlas.dirty = true
-    return true
-end
+# ============================================================================
+# delete!
+# ============================================================================
 
 function Base.delete!(hwtlas::HWTLAS, handle::Raycore.TLASHandle)::Bool
-    # Batch-handle path (P2.1+): the handle was returned by push!(hwtlas, ..., instance_buf::LavaArray).
-    # Removing the batch from instance_batches is enough; the next sync! rebuild
-    # won't include it.  Dropping the InstanceBatch releases its reference to
-    # the LavaArray instance buffer; if the user still holds a reference, the
-    # buffer survives, otherwise it gets timeline-gated freed via the LavaArray
-    # finalizer.
-    for (i, batch) in enumerate(hwtlas.instance_batches)
-        if batch.handle === handle
-            deleteat!(hwtlas.instance_batches, i)
-            hwtlas.dirty = true
-            return true
-        end
+    idx = get(hwtlas.handle_to_batch_idx, handle, nothing)
+    idx === nothing && return false
+    deleteat!(hwtlas.instance_batches, idx)
+    delete!(hwtlas.handle_to_batch_idx, handle)
+    # Reindex other handles whose batch index shifted left by one.
+    for (h, j) in hwtlas.handle_to_batch_idx
+        j > idx && (hwtlas.handle_to_batch_idx[h] = j - 1)
     end
-    # Per-mesh push! handle path: mark for compaction in sync!.
-    haskey(hwtlas.handle_to_range, handle) || return false
-    handle in hwtlas.deleted_handles && return false
-    push!(hwtlas.deleted_handles, handle)
     hwtlas.dirty = true
     return true
 end
 
 # ============================================================================
-# C3 — rebuild helpers + sync!
+# Rebuild / refit helpers + sync!
 # ============================================================================
 
 # Try to reuse `prev` as the GPU sink for `data` via capacity-aware resize+copyto.
-# If `prev` has a matching element type, the in-place path keeps the same LavaArray
-# identity (and the same backing VkManagedBuffer whenever `data` still fits the
-# buffer's existing capacity). Otherwise allocate fresh.
 function _reuse_or_alloc(prev, data::AbstractArray{T}) where T
     if prev isa LavaArray{T}
         resize!(prev, length(data))
@@ -615,57 +593,6 @@ function _reuse_or_alloc(prev, data::AbstractArray{T}) where T
         return prev
     end
     return LavaArray(data)
-end
-
-function rebuild_hw_tlas!(hwtlas::HWTLAS{Tri}) where {Tri}
-    if !isempty(hwtlas.instance_batches)
-        isempty(hwtlas.instance_blas_indices) || error(
-            "HWTLAS: cannot mix GPU-buffer batch push! (instance_batches) with " *
-            "CPU-transform push! (instance_blas_indices). Use one mode per HWTLAS. " *
-            "To switch modes, build a fresh HWTLAS.")
-        return rebuild_hw_tlas_from_batch!(hwtlas)
-    end
-    return rebuild_hw_tlas_from_per_instance!(hwtlas)
-end
-
-function rebuild_hw_tlas_from_per_instance!(hwtlas::HWTLAS{Tri}) where {Tri}
-    n_inst = length(hwtlas.instance_blas_indices)
-    blas_refs = [hwtlas.blas_list[hwtlas.instance_blas_indices[i]] for i in 1:n_inst]
-
-    # Per-instance triangle-array offset, indexed by gl_InstanceID (0-based).
-    per_instance_tri_offsets = UInt32[hwtlas.blas_offsets[bi] for bi in hwtlas.instance_blas_indices]
-
-    hw_tlas = as_build() do ctx
-        build_tlas(ctx, blas_refs;
-                   transforms=hwtlas.instance_transforms,
-                   custom_indices=hwtlas.instance_custom_indices,
-                   masks=hwtlas.instance_masks)
-    end
-
-    all_tris = reduce(vcat, hwtlas.blas_triangles)::Vector{Tri}
-    per_inst_offsets = collect(per_instance_tri_offsets)
-
-    # Reuse the previous HardwareAccel when we have one -- keeps the same
-    # RayTracingPipeline + SBT alive across sync! rebuild cycles.
-    hw_accel = if hwtlas.hw_accel isa HardwareAccel
-        accel_prev = hwtlas.hw_accel
-        accel_prev.tlas = hw_tlas
-        accel_prev.triangle_data = all_tris
-        accel_prev.blas_offsets = hwtlas.blas_offsets
-        accel_prev.per_instance_tri_offsets = per_inst_offsets
-        accel_prev
-    else
-        HardwareAccel(hw_tlas, all_tris, hwtlas.blas_offsets, per_inst_offsets; bq=hwtlas.bq)
-    end
-
-    # Grow-and-overwrite on the previous LavaArray when the eltype matches.
-    tri_gpu = _reuse_or_alloc(hwtlas.tri_gpu, all_tris)
-
-    # off_gpu is keyed by gl_InstanceID (one entry per instance).
-    off_cpu = collect(per_instance_tri_offsets)
-    off_gpu = _reuse_or_alloc(hwtlas.off_gpu, off_cpu)
-
-    return (hw_tlas, hw_accel, tri_gpu, off_gpu)
 end
 
 # Allocate-or-reuse a combined LavaArray{LavaInstanceRecord} that fits all
@@ -692,10 +619,58 @@ function _concat_batch_instances!(hwtlas::HWTLAS{Tri}) where {Tri}
     return combined, total
 end
 
-function rebuild_hw_tlas_from_batch!(hwtlas::HWTLAS{Tri}) where {Tri}
-    isempty(hwtlas.instance_batches) && error(
-        "rebuild_hw_tlas_from_batch!: no instance_batches to build.")
+# Compact `blas_list` / `blas_triangles` / `blas_offsets` to drop entries
+# no longer referenced by any live batch.  Returns the dropped BLASes so the
+# caller can `unsafe_free!` them after the rebuild.
+function _compact_blas_list!(hwtlas::HWTLAS{Tri}) where {Tri}
+    n_blas = length(hwtlas.blas_list)
+    n_blas == 0 && return LavaBLAS[]
+    used = Set{Int}()
+    # Identify each BLAS by reference identity (===) since multiple batches
+    # may share the same LavaBLAS object.
+    for batch in hwtlas.instance_batches
+        for (i, blas) in enumerate(hwtlas.blas_list)
+            blas === batch.blas && push!(used, i)
+        end
+    end
+    length(used) == n_blas && return LavaBLAS[]
 
+    dropped = LavaBLAS[]
+    new_blas       = LavaBLAS[]
+    new_triangles  = Vector{Tri}[]
+    new_offsets    = UInt32[]
+    running_offset = UInt32(0)
+    for i in 1:n_blas
+        if i in used
+            push!(new_blas, hwtlas.blas_list[i])
+            push!(new_triangles, hwtlas.blas_triangles[i])
+            push!(new_offsets, running_offset)
+            running_offset += UInt32(length(hwtlas.blas_triangles[i]))
+        else
+            push!(dropped, hwtlas.blas_list[i])
+        end
+    end
+    hwtlas.blas_list      = new_blas
+    hwtlas.blas_triangles = new_triangles
+    hwtlas.blas_offsets   = new_offsets
+    return dropped
+end
+
+function rebuild_hw_tlas_from_batch!(hwtlas::HWTLAS{Tri}) where {Tri}
+    # Drop unused BLASes (deleted batches may have left some unreferenced).
+    dropped_blases = _compact_blas_list!(hwtlas)
+
+    if isempty(hwtlas.instance_batches)
+        # Caller (sync!) handles the empty path before us; assert defensively.
+        return (nothing, nothing, nothing, nothing, dropped_blases)
+    end
+
+    # Rebuild always starts with a fresh combined buffer: the previous one
+    # (if any) is now solely owned by the soon-to-be-freed `hw_tlas.preserves`.
+    # Reusing it across builds shares a single LavaArray identity between
+    # multiple TLAS preserves lists, and the older TLAS's `unsafe_free!` would
+    # then free the buffer out from under the live TLAS.
+    hwtlas.combined_instance_buf = nothing
     combined, total_n = _concat_batch_instances!(hwtlas)
 
     hw_tlas = as_build() do ctx
@@ -732,111 +707,39 @@ function rebuild_hw_tlas_from_batch!(hwtlas::HWTLAS{Tri}) where {Tri}
     tri_gpu = _reuse_or_alloc(hwtlas.tri_gpu, all_tris)
     off_gpu = _reuse_or_alloc(hwtlas.off_gpu, per_inst_offsets)
 
-    return (hw_tlas, hw_accel, tri_gpu, off_gpu)
+    return (hw_tlas, hw_accel, tri_gpu, off_gpu, dropped_blases)
 end
 
 """
     Raycore.sync!(hwtlas::HWTLAS)
 
-Rebuild the hardware TLAS (and any needed BLASes) if dirty.
-Does NOT call KA.synchronize — uses Lava's timeline-based deferred free path.
-No-op on the topology if already up-to-date (fast path, allocation-free).
+Single commit boundary. Decides between full rebuild (topology change) and
+in-place refit (transforms-only update) from the dirty flags. No-op when
+nothing changed.
 
-After this returns:
-- The hardware AS reflects all prior push!/delete! calls.
-- `hwtlas.static_tlas` is the fresh adapted form.
-- Old LavaTLAS/LavaArray objects that were replaced have been passed to
-  `unsafe_free!` for timeline-gated destruction.
+Does NOT call KA.synchronize — uses Lava's timeline-based deferred free path.
 """
 function Raycore.sync!(hwtlas::HWTLAS)
     # True no-op when nothing changed and static_tlas is already built.
-    if !hwtlas.dirty && hwtlas.static_tlas !== nothing
+    if !hwtlas.dirty && !hwtlas.transforms_dirty && hwtlas.static_tlas !== nothing
         return hwtlas
     end
 
-    # First sync! on a freshly-built HWTLAS with no mutations.
-    if !hwtlas.dirty
-        hwtlas.static_tlas = HWAdaptedAccel(hwtlas)
-        return hwtlas
-    end
-
-    # BLASes evicted by this rebuild — released after the rebuild.
-    dropped_blases = LavaBLAS[]
-
-    # Compact: deleted handles leave orphan entries in instance arrays.
-    if !isempty(hwtlas.deleted_handles)
-        deleted_inst_idx = BitSet()
-        for h in hwtlas.deleted_handles
-            r = get(hwtlas.handle_to_range, h, nothing)
-            r === nothing && continue
-            for i in r
-                push!(deleted_inst_idx, i)
-            end
-            delete!(hwtlas.handle_to_range, h)
-        end
-
-        keep_inst = [i for i in eachindex(hwtlas.instance_blas_indices) if !(i in deleted_inst_idx)]
-        hwtlas.instance_blas_indices  = [hwtlas.instance_blas_indices[i]  for i in keep_inst]
-        hwtlas.instance_transforms    = [hwtlas.instance_transforms[i]    for i in keep_inst]
-        hwtlas.instance_custom_indices = [hwtlas.instance_custom_indices[i] for i in keep_inst]
-        hwtlas.instance_masks         = [hwtlas.instance_masks[i]         for i in keep_inst]
-
-        # After removing instances, some BLAS may be unreferenced.
-        still_used = Set(hwtlas.instance_blas_indices)
-        if length(still_used) < length(hwtlas.blas_list)
-            old_to_new = Dict{Int,Int}()
-            new_blas    = LavaBLAS[]
-            new_tris    = Vector{eltype(hwtlas.blas_triangles)}()
-            new_offsets = UInt32[]
-            running_offset = UInt32(0)
-            for (old_idx, blas) in enumerate(hwtlas.blas_list)
-                if old_idx in still_used
-                    push!(new_blas, blas)
-                    push!(new_tris, hwtlas.blas_triangles[old_idx])
-                    push!(new_offsets, running_offset)
-                    running_offset += UInt32(length(hwtlas.blas_triangles[old_idx]))
-                    old_to_new[old_idx] = length(new_blas)
-                else
-                    push!(dropped_blases, blas)
-                end
-            end
-            hwtlas.blas_list      = new_blas
-            hwtlas.blas_triangles = new_tris
-            hwtlas.blas_offsets   = new_offsets
-            hwtlas.instance_blas_indices = [old_to_new[i] for i in hwtlas.instance_blas_indices]
-        end
-
-        # Rebuild handle_to_range against the compacted indices.
-        sorted_deleted = sort(collect(deleted_inst_idx))
-        shift_of(i) = begin
-            s = 0
-            for d in sorted_deleted
-                d < i && (s += 1)
-            end
-            s
-        end
-        new_range = Dict{Raycore.TLASHandle, UnitRange{Int}}()
-        for (h, r) in hwtlas.handle_to_range
-            lo = first(r) - shift_of(first(r))
-            hi = last(r)  - shift_of(last(r))
-            new_range[h] = lo:hi
-        end
-        hwtlas.handle_to_range = new_range
-        empty!(hwtlas.deleted_handles)
-    end
-
-    n_inst = length(hwtlas.instance_blas_indices)
-    if n_inst == 0 && isempty(hwtlas.instance_batches)
+    # Empty-topology path: drop the prior AS without rebuilding.
+    if hwtlas.dirty && isempty(hwtlas.instance_batches)
+        # Even with no batches we may still have unreferenced BLASes (e.g.,
+        # the user delete!'d every handle).  Compact + free.
+        dropped_blases = _compact_blas_list!(hwtlas)
         old_hw_tlas = hwtlas.hw_tlas
         old_tri_gpu = hwtlas.tri_gpu
         old_off_gpu = hwtlas.off_gpu
-        hwtlas.hw_tlas   = nothing
-        hwtlas.hw_accel  = nothing
-        hwtlas.tri_gpu   = nothing
-        hwtlas.off_gpu   = nothing
-        hwtlas.dirty     = false
+        hwtlas.hw_tlas    = nothing
+        hwtlas.hw_accel   = nothing
+        hwtlas.tri_gpu    = nothing
+        hwtlas.off_gpu    = nothing
+        hwtlas.dirty            = false
+        hwtlas.transforms_dirty = false
         hwtlas.static_tlas = HWAdaptedAccel(hwtlas)
-        # No KA.synchronize — Lava uses timeline-gated deferred free.
         unsafe_free!(old_hw_tlas)
         unsafe_free!(old_tri_gpu)
         unsafe_free!(old_off_gpu)
@@ -846,32 +749,62 @@ function Raycore.sync!(hwtlas::HWTLAS)
         return hwtlas
     end
 
-    hw_tlas, hw_accel, tri_gpu, off_gpu = rebuild_hw_tlas!(hwtlas)
+    if hwtlas.dirty
+        # Topology change: full rebuild (also handles the "first sync after
+        # construct" case since the constructor leaves dirty=true).
+        hw_tlas, hw_accel, tri_gpu, off_gpu, dropped_blases =
+            rebuild_hw_tlas_from_batch!(hwtlas)
 
-    old_hw_tlas = hwtlas.hw_tlas
-    # tri_gpu/off_gpu get reused-in-place when sizes permit — do NOT release
-    # unless the backend returned a different object (couldn't reuse).
-    old_tri_gpu = hwtlas.tri_gpu === tri_gpu ? nothing : hwtlas.tri_gpu
-    old_off_gpu = hwtlas.off_gpu === off_gpu ? nothing : hwtlas.off_gpu
+        old_hw_tlas = hwtlas.hw_tlas
+        # tri_gpu / off_gpu get reused-in-place when sizes permit -- do NOT
+        # release unless the rebuild returned a different object.
+        old_tri_gpu = hwtlas.tri_gpu === tri_gpu ? nothing : hwtlas.tri_gpu
+        old_off_gpu = hwtlas.off_gpu === off_gpu ? nothing : hwtlas.off_gpu
 
-    hwtlas.hw_tlas   = hw_tlas
-    hwtlas.hw_accel  = hw_accel
-    hwtlas.tri_gpu   = tri_gpu
-    hwtlas.off_gpu   = off_gpu
-    hwtlas.dirty     = false
-    hwtlas.static_tlas = HWAdaptedAccel(hwtlas)
-    # No KA.synchronize — Lava uses timeline-gated deferred free.
-    unsafe_free!(old_hw_tlas)
-    unsafe_free!(old_tri_gpu)
-    unsafe_free!(old_off_gpu)
-    for blas in dropped_blases
-        unsafe_free!(blas)
+        hwtlas.hw_tlas   = hw_tlas
+        hwtlas.hw_accel  = hw_accel
+        hwtlas.tri_gpu   = tri_gpu
+        hwtlas.off_gpu   = off_gpu
+        hwtlas.dirty            = false
+        hwtlas.transforms_dirty = false
+        hwtlas.static_tlas = HWAdaptedAccel(hwtlas)
+        unsafe_free!(old_hw_tlas)
+        unsafe_free!(old_tri_gpu)
+        unsafe_free!(old_off_gpu)
+        for blas in dropped_blases
+            unsafe_free!(blas)
+        end
+        return hwtlas
     end
+
+    # Transforms-only path: MODE_UPDATE_KHR refit.
+    if hwtlas.transforms_dirty
+        if hwtlas.hw_tlas === nothing || !hwtlas.hw_tlas.allow_update
+            # Defensive: if the prior build wasn't refit-capable, fall back to
+            # full rebuild.  Should not happen on normal use since
+            # rebuild_hw_tlas_from_batch! always sets allow_update=true.
+            hwtlas.dirty = true
+            return Raycore.sync!(hwtlas)
+        end
+        combined, total_n = _concat_batch_instances!(hwtlas)
+        as_build() do ctx
+            Lava.refit_tlas!(ctx, hwtlas.hw_tlas, combined, total_n)
+        end
+        hwtlas.transforms_dirty = false
+        # static_tlas wraps the same hw_tlas — reuse, just make sure it
+        # exists (first-sync edge case).
+        hwtlas.static_tlas === nothing && (hwtlas.static_tlas = HWAdaptedAccel(hwtlas))
+        return hwtlas
+    end
+
+    # Both flags false but static_tlas was nothing — first sync on a fresh
+    # HWTLAS with no batches yet.
+    hwtlas.static_tlas = HWAdaptedAccel(hwtlas)
     return hwtlas
 end
 
 # ============================================================================
-# C4 — Trace dispatch
+# Trace dispatch
 # ============================================================================
 
 function trace_closest_hits!(results, rays, accel::HWAdaptedAccel, n;

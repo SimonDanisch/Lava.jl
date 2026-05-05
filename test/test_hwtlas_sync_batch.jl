@@ -57,14 +57,7 @@ end
     @test length(tlas.combined_instance_buf) >= n_a + n_b
 
     # Refit on the multi-batch HWTLAS works too.
-    Raycore.refit_tlas!(tlas)
+    tlas.transforms_dirty = true
+    Raycore.sync!(tlas)
     @test tlas.dirty == false   # refit does not toggle dirty
 end
-
-# Note: the "errors on mixed mode" testset was removed in P3.4b.
-# The new GPU-buffer push!(hwtlas, blas, instance_buf) overload replaces
-# Raycore.push_instances!, so there is no separate "push_instances!" path to mix
-# with the CPU-transform push! path. Mixed-mode is still detected in
-# rebuild_hw_tlas! (CPU-transform push! populates instance_blas_indices;
-# GPU-buffer push! populates instance_batches; mixing both still errors).
-# A dedicated test for that guard lives in test_hwtlas_mixed_mode.jl if needed.
