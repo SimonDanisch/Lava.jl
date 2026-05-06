@@ -61,6 +61,9 @@ translation(dx, dy, dz) = SMatrix{4,4,Float32,16}(
     dx, dy, dz, 1,
 )
 
+"""Translation as `Mat3x4f` (Vulkan row-major 3×4) for `update_transform!`."""
+vk_translation(dx, dy, dz) = Lava.mat4_to_vk_transform(translation(dx, dy, dz))
+
 """Downward ray hits a z=0 triangle translated by `offset` iff the ray's
 xy point lies inside the translated triangle; returns the analytic t."""
 function analytic_hit(ray_ox, ray_oy, ray_oz, offset::NTuple{3,Float32})
@@ -161,7 +164,7 @@ end
                        Float32(-0.05 * iter))
             offsets[i] = new_off
             @assert Raycore.update_transform!(hwtlas, handles[i],
-                                              translation(new_off...))
+                                              vk_translation(new_off...))
         end
         Raycore.sync!(hwtlas)
         @test assert_hits_match(trace_rays_cpu(hwtlas, offsets), offsets)
@@ -207,7 +210,7 @@ end
     for _ in 1:4
         for i in 1:N
             offsets[i] = (Float32(2i), Float32(0.1), 0f0)
-            Raycore.update_transform!(hwtlas, handles[i], translation(offsets[i]...))
+            Raycore.update_transform!(hwtlas, handles[i], vk_translation(offsets[i]...))
         end
         Raycore.sync!(hwtlas)
         _ = trace_rays_cpu(hwtlas, offsets)
@@ -227,7 +230,7 @@ end
             offsets[i] = (Float32(2i + 0.01 * iter),
                           Float32(0.2 * cospi(iter / 7)),
                           Float32(-0.05 * sinpi(iter / 9)))
-            Raycore.update_transform!(hwtlas, handles[i], translation(offsets[i]...))
+            Raycore.update_transform!(hwtlas, handles[i], vk_translation(offsets[i]...))
         end
         Raycore.sync!(hwtlas)
         hits = trace_rays_cpu(hwtlas, offsets)
@@ -270,7 +273,7 @@ end
     # Drive update_transforms! 20 times; sync! must take the refit path
     # (same hw_tlas identity) every time.
     for iter in 1:20
-        new_xfs = [translation(Float32(2i + 0.05 * iter), 0f0, 0f0) for i in 1:N]
+        new_xfs = Lava.LavaArray([vk_translation(Float32(2i + 0.05 * iter), 0f0, 0f0) for i in 1:N])
         Raycore.update_transforms!(hwtlas, multi_handle, new_xfs)
         @test hwtlas.transforms_dirty == true
         @test hwtlas.dirty == false
@@ -291,8 +294,7 @@ end
     h = push!(hwtlas, unit_triangle_mesh(), init_xfs; instance_mask=UInt8(0xff))
     Raycore.sync!(hwtlas)
 
-    # Build a LavaArray of Mat4f (GPU-resident transforms vector).
-    new_xfs_cpu = [translation(Float32(2i + 5f0), 0f0, 0f0) for i in 1:N]
+    new_xfs_cpu = [vk_translation(Float32(2i + 5f0), 0f0, 0f0) for i in 1:N]
     new_xfs_gpu = Lava.LavaArray(new_xfs_cpu)
     Raycore.update_transforms!(hwtlas, h, new_xfs_gpu)
     @test hwtlas.transforms_dirty == true
@@ -311,7 +313,7 @@ end
     h_b = push!(hwtlas, unit_triangle_mesh(), translation(20f0, 0f0, 0f0))
     Raycore.sync!(hwtlas)
 
-    new_xfs = [translation(Float32(2i + 1f0), 0f0, 0f0) for i in 1:N]
+    new_xfs = Lava.LavaArray([vk_translation(Float32(2i + 1f0), 0f0, 0f0) for i in 1:N])
     Raycore.update_transforms!(hwtlas, h_a, new_xfs)
     # Delete BEFORE syncing the refit -- topology change wins.
     @test Raycore.delete!(hwtlas, h_a) == true
@@ -347,10 +349,10 @@ end
     n_frames = 50
     for frame in 1:n_frames
         # Move every instance: x_i = 2i + 0.05*frame, y = small oscillation.
-        new_xfs = [translation(Float32(2i + 0.05 * frame),
-                                Float32(0.1 * sinpi(frame / 7)),
-                                0f0)
-                   for i in 1:N]
+        new_xfs = Lava.LavaArray([vk_translation(Float32(2i + 0.05 * frame),
+                                               Float32(0.1 * sinpi(frame / 7)),
+                                               0f0)
+                                  for i in 1:N])
         new_offsets = [(Float32(2i + 0.05 * frame),
                         Float32(0.1 * sinpi(frame / 7)),
                         0f0)

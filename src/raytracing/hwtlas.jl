@@ -42,6 +42,7 @@ struct InstanceBatch{Tri}
     instance_buf::LavaArray{LavaInstanceRecord, 1}
     n::Int
     instance_mask::UInt8
+    custom_index::UInt32      # low 24 bits of gl_InstanceCustomIndexEXT (mi_idx / instance_id)
     handle::Raycore.TLASHandle
     triangles::Vector{Tri}
 end
@@ -134,9 +135,17 @@ mutable struct HWTLAS{Tri} <: Raycore.AbstractAccel
 
     # Topology dirty: a push!/delete! changed the batch list, full rebuild needed.
     dirty::Bool
-    # Transforms dirty: a kernel just wrote new records into a batch's
-    # instance_buf, refit (MODE_UPDATE_KHR) is enough.
+    # Transforms dirty: update_transforms! queued at least one pending update;
+    # refit (MODE_UPDATE_KHR) is enough once they are flushed in sync!.
     transforms_dirty::Bool
+
+    # Queued transform updates: handle → arguments for the per-batch kernel.
+    # Populated by update_transforms!; consumed (and cleared) by sync!.
+    # Last write wins per handle (Dict key). Value is one of:
+    #   AbstractVector{<:AbstractMatrix}                    — CPU matrix path
+    #   (LavaArray{Point3f,1}, LavaArray{Vec4f,1}, Float32, UInt32)   — GPU uniform scale
+    #   (LavaArray{Point3f,1}, LavaArray{Vec4f,1}, LavaArray{Vec3f,1}, UInt32) — GPU per-vec scale
+    pending_updates::Dict{Raycore.TLASHandle, Any}
 end
 
 """
@@ -157,6 +166,7 @@ function HWTLAS{Tri}(backend::LavaBackend; bq::BatchQueue=backend.bq) where {Tri
         nothing,
         true,                     # dirty
         false,                    # transforms_dirty
+        Dict{Raycore.TLASHandle, Any}(),  # pending_updates
     )
 end
 
@@ -362,7 +372,7 @@ function _register_batch!(hwtlas::HWTLAS{Tri}, blas::LavaBLAS,
     handle = Raycore.TLASHandle(hwtlas.next_handle_id)
     hwtlas.next_handle_id += UInt32(1)
     push!(hwtlas.instance_batches,
-          InstanceBatch{Tri}(blas, instance_buf, n, instance_mask, handle, triangles))
+          InstanceBatch{Tri}(blas, instance_buf, n, instance_mask, UInt32(0), handle, triangles))
     hwtlas.handle_to_batch_idx[handle] = lastindex(hwtlas.instance_batches)
     hwtlas.dirty = true
     return handle
@@ -446,13 +456,14 @@ function Base.push!(tlas::HWTLAS{Tri}, blas::LavaBLAS,
                     instance_buf::LavaArray{LavaInstanceRecord, 1};
                     n::Integer = length(instance_buf),
                     instance_mask::UInt8 = UInt8(0xff),
+                    custom_index::UInt32 = UInt32(0),
                     triangles::Vector{Tri} = Tri[]) where {Tri}
     n_int = Int(n)
     n_int <= length(instance_buf) || error(
         "push!: n=$n_int exceeds instance_buf length $(length(instance_buf))")
     handle = Raycore.TLASHandle(tlas.next_handle_id)
     tlas.next_handle_id += UInt32(1)
-    push!(tlas.instance_batches, InstanceBatch{Tri}(blas, instance_buf, n_int, instance_mask, handle, triangles))
+    push!(tlas.instance_batches, InstanceBatch{Tri}(blas, instance_buf, n_int, instance_mask, custom_index, handle, triangles))
     tlas.handle_to_batch_idx[handle] = lastindex(tlas.instance_batches)
     tlas.dirty = true
     return handle
@@ -476,7 +487,8 @@ Returns one `TLASHandle` for the whole batch.
 function Base.push!(hwtlas::HWTLAS{Tri}, mesh::GeometryBasics.Mesh,
                     instance_buf::LavaArray{LavaInstanceRecord, 1};
                     n::Integer = length(instance_buf),
-                    instance_mask::UInt8 = UInt8(0xff)) where {Tri}
+                    instance_mask::UInt8 = UInt8(0xff),
+                    custom_index::UInt32 = UInt32(0)) where {Tri}
     n_int = Int(n)
     n_int <= length(instance_buf) || error(
         "push!: n=$n_int exceeds instance_buf length $(length(instance_buf))")
@@ -485,7 +497,7 @@ function Base.push!(hwtlas::HWTLAS{Tri}, mesh::GeometryBasics.Mesh,
     triangles = hwtlas.blas_triangles[blas_idx]
     handle = Raycore.TLASHandle(hwtlas.next_handle_id)
     hwtlas.next_handle_id += UInt32(1)
-    push!(hwtlas.instance_batches, InstanceBatch{Tri}(blas, instance_buf, n_int, instance_mask, handle, triangles))
+    push!(hwtlas.instance_batches, InstanceBatch{Tri}(blas, instance_buf, n_int, instance_mask, custom_index, handle, triangles))
     hwtlas.handle_to_batch_idx[handle] = lastindex(hwtlas.instance_batches)
     hwtlas.dirty = true
     return handle
@@ -495,16 +507,6 @@ end
 # GPU update kernel + update_transform!/update_transforms!
 # ============================================================================
 
-"""
-    update_instance_records_kernel!(records, transforms, blas_address, cim, sof)
-
-One thread per instance.  Reads transforms[i] (any indexable 4×4-ish matrix),
-packs the upper 3×4 row-major into a `Mat3x4f`, and writes
-`records[i] = LavaInstanceRecord(T, cim, sof, blas_address)`.
-
-`cim` packs custom_index (low 24 bits) and mask (high 8 bits); `sof` packs
-sbt_offset (low 24 bits) and flags (high 8 bits).
-"""
 KA.@kernel function update_instance_records_kernel!(
         records,
         @Const(transforms),
@@ -512,43 +514,34 @@ KA.@kernel function update_instance_records_kernel!(
         cim::UInt32,
         sof::UInt32)
     i = @index(Global, Linear)
-    @inbounds m = transforms[i]
-    # Pack row-major 3×4 floats into the Mat3x4f tuple ordering. The
-    # NTuple{12,Float32} -> LavaInstanceRecord constructor handles the
-    # Mat3x4f conversion (which is byte-identical, no transpose).
-    T = (
-        Float32(m[1,1]), Float32(m[1,2]), Float32(m[1,3]), Float32(m[1,4]),
-        Float32(m[2,1]), Float32(m[2,2]), Float32(m[2,3]), Float32(m[2,4]),
-        Float32(m[3,1]), Float32(m[3,2]), Float32(m[3,3]), Float32(m[3,4]),
-    )
-    @inbounds records[i] = LavaInstanceRecord(T, cim, sof, blas_address)
+    @inbounds records[i] = LavaInstanceRecord(transforms[i], cim, sof, blas_address)
 end
 
 """
     Raycore.update_transforms!(hwtlas::HWTLAS, handle::TLASHandle,
-                               transforms::AbstractVector{<:AbstractMatrix})
+                               transforms::LavaArray{Mat3x4f, 1})
 
-Bulk update every instance in `handle`'s batch. `length(transforms)` must
-equal the batch size. Writes new records into the batch's GPU-resident
-`instance_buf` via a compute kernel and flags `transforms_dirty`. The next
-`sync!` issues a `MODE_UPDATE_KHR` refit (no rebuild).
+Queue a bulk transform update for every instance in `handle`'s batch.
+`transforms` must be a GPU-resident `LavaArray{Mat3x4f}`.
+`length(transforms)` must equal the batch size. The actual kernel dispatch
+happens in the next `sync!`, which issues a `MODE_UPDATE_KHR` refit after
+applying all pending updates.
 """
 function Raycore.update_transforms!(hwtlas::HWTLAS, handle::Raycore.TLASHandle,
-                                    transforms::AbstractVector{<:AbstractMatrix})
+                                    transforms::LavaArray{Mat3x4f, 1})
     haskey(hwtlas.handle_to_batch_idx, handle) || error("Invalid handle")
     batch = hwtlas.instance_batches[hwtlas.handle_to_batch_idx[handle]]
     length(transforms) == batch.n || error(
         "Transform count $(length(transforms)) != batch.n $(batch.n)")
-    backend = KA.get_backend(batch.instance_buf)
-    backend_transforms = Adapt.adapt(backend, transforms)
-    cim = (UInt32(0) & 0x00FFFFFF) | (UInt32(batch.instance_mask) << 24)
-    sof = UInt32(0)
-    update_instance_records_kernel!(backend)(
-        batch.instance_buf, backend_transforms,
-        batch.blas.address, cim, sof;
-        ndrange = batch.n)
+    hwtlas.pending_updates[handle] = transforms
     hwtlas.transforms_dirty = true
     return nothing
+end
+
+# CPU-array overload: upload to GPU then delegate.
+function Raycore.update_transforms!(hwtlas::HWTLAS, handle::Raycore.TLASHandle,
+                                    transforms::AbstractVector{Mat3x4f})
+    Raycore.update_transforms!(hwtlas, handle, LavaArray(collect(transforms)))
 end
 
 """
@@ -557,11 +550,20 @@ end
 Set every instance in `handle`'s batch to the same transform. Returns true
 if the handle was valid (matches the previous return semantics).
 """
-function Raycore.update_transform!(hwtlas::HWTLAS, handle::Raycore.TLASHandle, transform::Mat4f)
+function Raycore.update_transform!(hwtlas::HWTLAS, handle::Raycore.TLASHandle, transform::Mat3x4f)
     haskey(hwtlas.handle_to_batch_idx, handle) || return false
     batch = hwtlas.instance_batches[hwtlas.handle_to_batch_idx[handle]]
-    Raycore.update_transforms!(hwtlas, handle, fill(transform, batch.n))
+    Raycore.update_transforms!(hwtlas, handle, LavaArray(fill(transform, batch.n)))
     return true
+end
+
+function _apply_pending_update!(batch::InstanceBatch, transforms::LavaArray{Mat3x4f, 1})
+    backend = KA.get_backend(batch.instance_buf)
+    cim = (batch.custom_index & 0x00FFFFFF) | (UInt32(batch.instance_mask) << 24)
+    update_instance_records_kernel!(backend)(
+        batch.instance_buf, transforms,
+        batch.blas.address, cim, UInt32(0);
+        ndrange = batch.n)
 end
 
 # ============================================================================
@@ -739,6 +741,7 @@ function Raycore.sync!(hwtlas::HWTLAS)
         hwtlas.off_gpu    = nothing
         hwtlas.dirty            = false
         hwtlas.transforms_dirty = false
+        empty!(hwtlas.pending_updates)
         hwtlas.static_tlas = HWAdaptedAccel(hwtlas)
         unsafe_free!(old_hw_tlas)
         unsafe_free!(old_tri_gpu)
@@ -749,9 +752,26 @@ function Raycore.sync!(hwtlas::HWTLAS)
         return hwtlas
     end
 
+    # Apply any queued transform updates to instance bufs before reading them.
+    had_pending = !isempty(hwtlas.pending_updates)
+    if had_pending
+        for (handle, update) in hwtlas.pending_updates
+            idx = get(hwtlas.handle_to_batch_idx, handle, nothing)
+            idx === nothing && continue  # handle was deleted before sync!
+            _apply_pending_update!(hwtlas.instance_batches[idx], update)
+        end
+        empty!(hwtlas.pending_updates)
+    end
+
     if hwtlas.dirty
         # Topology change: full rebuild (also handles the "first sync after
         # construct" case since the constructor leaves dirty=true).
+        # _concat_batch_instances! does vkCmdCopyBuffer from each instance_buf;
+        # build_as_on_gpu_impl only barriers on AS-to-AS (not SHADER_WRITE).
+        # If we just dispatched pending kernels, flush so their writes are
+        # visible to the GPU-GPU copies. Rare path (topology + transform
+        # update in the same frame).
+        had_pending && vk_flush!(hwtlas.bq)
         hw_tlas, hw_accel, tri_gpu, off_gpu, dropped_blases =
             rebuild_hw_tlas_from_batch!(hwtlas)
 

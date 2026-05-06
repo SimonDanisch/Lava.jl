@@ -1,10 +1,16 @@
-# GPU compute kernels for writing TLAS instance records from grain state.
+# GPU compute kernels and primitives for writing TLAS instance records from
+# grain state.
 #
 # write_grain_instances_kernel: one thread per grain, writes 2 instance records
 #   (physics @ index 2i-1 with mask=0x02, rendering @ index 2i with mask=0x04).
 #   Both records reference different BLASes via the supplied device addresses.
 #
 # All math is GPU-side; positions/quats live in LavaArrays and never touch CPU.
+#
+# `quat_to_rot3x3`, `build_4x3`, and `build_4x3_pervec` are kept as inline
+# primitives because RayMakie's meshscatter recipe broadcasts over them to
+# build per-instance Mat3x4f transforms — the higher-level wrappers / kernel
+# variants for that have moved to RayMakie.
 
 """
     quat_to_rot3x3(q::Vec4f) -> NTuple{9, Float32}
@@ -34,6 +40,20 @@ transform suitable for VkAccelerationStructureInstanceKHR.
     (rot9[1] * scale, rot9[2] * scale, rot9[3] * scale, p[1],
      rot9[4] * scale, rot9[5] * scale, rot9[6] * scale, p[2],
      rot9[7] * scale, rot9[8] * scale, rot9[9] * scale, p[3])
+end
+
+"""
+    build_4x3_pervec(rot9::NTuple{9, Float32}, sc::Vec3f, p::Point3f) -> NTuple{12, Float32}
+
+Variant of `build_4x3` that applies a per-axis (Vec3f) scale instead of a
+uniform Float32 scale.  Each row of the rotation matrix gets multiplied by
+the corresponding axis scale; translation is unchanged.
+"""
+@inline function build_4x3_pervec(rot9::NTuple{9, Float32}, sc::Vec3f, p::Point3f)
+    sx, sy, sz = sc[1], sc[2], sc[3]
+    (rot9[1] * sx, rot9[2] * sy, rot9[3] * sz, p[1],
+     rot9[4] * sx, rot9[5] * sy, rot9[6] * sz, p[2],
+     rot9[7] * sx, rot9[8] * sy, rot9[9] * sz, p[3])
 end
 
 """
@@ -69,85 +89,4 @@ scale `radius`, translation `positions[i]`. Custom index = `i - 1`.
     sof = UInt32(0)  # sbt_offset = 0, flags = 0
     @inbounds instances[2i - 1] = LavaInstanceRecord(T, cim_phys, sof, aabb_blas_addr)
     @inbounds instances[2i]     = LavaInstanceRecord(T, cim_rend, sof, tri_blas_addr)
-end
-
-"""
-    write_meshscatter_instances_kernel(positions, rotations, scale, blas_addr,
-                                        instance_mask, custom_index, instances)
-
-One thread per instance. Reads `positions[i]` and `rotations[i]` (as a
-unit quaternion `Vec4f(x, y, z, w)`), writes ONE `LavaInstanceRecord` into
-`instances[i]` referencing `blas_addr` with the supplied `instance_mask` and
-uniform scale.
-
-`custom_index` is written into the low 24 bits of `gl_InstanceCustomIndexEXT`
-for every instance.  Pass `UInt32(0)` for physics-only visibility (the default
-from the old behavior when no material override is needed) or pass a 1-based
-`media_interfaces` index so all instances inherit the same material via
-`resolve_mi_idx` in the VolPath integrator.
-
-Used by RayMakie's meshscatter recipe for GPU-resident positions/rotations.
-For the dual-record (physics + render) demo case, use
-`write_grain_instances_kernel` instead.
-"""
-@kernel function write_meshscatter_instances_kernel(
-        @Const(positions),
-        @Const(rotations),
-        scale::Float32,
-        blas_addr::UInt64,
-        instance_mask::UInt8,
-        custom_index::UInt32,
-        instances)
-    i = @index(Global)
-    @inbounds p = positions[i]
-    @inbounds q = rotations[i]
-    rot9 = quat_to_rot3x3(q)
-    T = build_4x3(rot9, scale, p)
-    cim = (custom_index & 0x00FFFFFF) | (UInt32(instance_mask) << 24)
-    sof = UInt32(0)
-    @inbounds instances[i] = LavaInstanceRecord(T, cim, sof, blas_addr)
-end
-
-"""
-    build_4x3_pervec(rot9::NTuple{9, Float32}, sc::Vec3f, p::Point3f) -> NTuple{12, Float32}
-
-Variant of `build_4x3` that applies a per-axis (Vec3f) scale instead of a
-uniform Float32 scale.  Each row of the rotation matrix gets multiplied by
-the corresponding axis scale; translation is unchanged.
-"""
-@inline function build_4x3_pervec(rot9::NTuple{9, Float32}, sc::Vec3f, p::Point3f)
-    sx, sy, sz = sc[1], sc[2], sc[3]
-    (rot9[1] * sx, rot9[2] * sy, rot9[3] * sz, p[1],
-     rot9[4] * sx, rot9[5] * sy, rot9[6] * sz, p[2],
-     rot9[7] * sx, rot9[8] * sy, rot9[9] * sz, p[3])
-end
-
-"""
-    write_meshscatter_instances_pervec_kernel(positions, rotations, scales, blas_addr,
-                                                instance_mask, custom_index, instances)
-
-Per-instance Vec3f scale variant of `write_meshscatter_instances_kernel`.
-Reads `scales[i]::Vec3f` and applies per-axis scaling instead of the uniform
-Float32 scale of the scalar variant.
-
-Used by RayMakie's meshscatter recipe when `markersize` is a `LavaArray{Vec3f}`
-(per-instance).
-"""
-@kernel function write_meshscatter_instances_pervec_kernel(
-        @Const(positions),
-        @Const(rotations),
-        @Const(scales),
-        blas_addr::UInt64,
-        instance_mask::UInt8,
-        custom_index::UInt32,
-        instances)
-    i = @index(Global)
-    @inbounds p = positions[i]
-    @inbounds q = rotations[i]
-    @inbounds sc = scales[i]
-    rot9 = quat_to_rot3x3(q)
-    T = build_4x3_pervec(rot9, sc, p)
-    cim = (custom_index & 0x00FFFFFF) | (UInt32(instance_mask) << 24)
-    sof = UInt32(0)
-    @inbounds instances[i] = LavaInstanceRecord(T, cim, sof, blas_addr)
 end
