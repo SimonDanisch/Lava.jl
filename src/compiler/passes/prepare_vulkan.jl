@@ -4881,3 +4881,260 @@ function compute_gep_byte_offset(src_ty::LLVM.LLVMType, operands, dl::LLVM.DataL
     end
     return offset
 end
+
+"""
+    fix_workgroup_alignment!(mod::LLVM.Module, dl::LLVM.DataLayout)
+
+Fix alignment metadata on all addrspace(3) (Workgroup/shared memory) loads and stores.
+
+Julia/GPUCompiler emits `align 1` for all shared-memory accesses regardless of the
+element type. For Float32 this is wrong: the elements ARE 4-byte aligned (element
+accesses into a [N x float] global are always at multiples of 4). Leaving align=1 in
+the LLVM IR causes drivers like lavapipe/mesa to generate masked-gather instructions
+(MGATHER) for what should be plain vector loads, crashing their LLVM JIT.
+
+The fix is conservative: we use `ABI size of the loaded/stored type` as the alignment,
+which is always a safe lower bound for element-level Workgroup accesses. Non-power-of-2
+types (exotic composites) are left untouched.
+"""
+function fix_workgroup_alignment!(mod::LLVM.Module, dl::LLVM.DataLayout)
+    for fn in LLVM.functions(mod)
+        isempty(LLVM.blocks(fn)) && continue
+        for bb in LLVM.blocks(fn)
+            for inst in LLVM.instructions(bb)
+                if inst isa LLVM.LoadInst
+                    ptr = LLVM.operands(inst)[1]
+                    pt = LLVM.value_type(ptr)
+                    pt isa LLVM.PointerType || continue
+                    LLVM.addrspace(pt) == 3 || continue
+                    elem_ty = LLVM.value_type(inst)
+                    sz = Int(LLVM.API.LLVMABISizeOfType(dl, elem_ty))
+                    sz > 0 || continue
+                    is_pow2 = sz & (sz - 1) == 0
+                    is_pow2 || continue
+                    current = Int(LLVM.alignment(inst))
+                    current < sz && LLVM.alignment!(inst, sz)
+                elseif inst isa LLVM.StoreInst
+                    ops = LLVM.operands(inst)
+                    ptr = ops[2]
+                    pt = LLVM.value_type(ptr)
+                    pt isa LLVM.PointerType || continue
+                    LLVM.addrspace(pt) == 3 || continue
+                    val_ty = LLVM.value_type(ops[1])
+                    sz = Int(LLVM.API.LLVMABISizeOfType(dl, val_ty))
+                    sz > 0 || continue
+                    is_pow2 = sz & (sz - 1) == 0
+                    is_pow2 || continue
+                    current = Int(LLVM.alignment(inst))
+                    current < sz && LLVM.alignment!(inst, sz)
+                end
+            end
+        end
+    end
+end
+
+"""
+    propagate_psb_alignment!(mod::LLVM.Module, dl::LLVM.DataLayout)
+
+Propagate alignment metadata for `addrspace(1)` (PhysicalStorageBuffer) loads and stores.
+
+GPUCompiler emits `align 1` for all addrspace(1) accesses after SROA splits struct loads
+into individual field loads — it can't track alignment across `inttoptr` boundaries.
+But Julia's ABI guarantees specific invariants we can use:
+
+1. **Loaded i64 used via `inttoptr` is 8-aligned**: Julia stores `Ptr{T}` values at
+   8-byte-aligned locations and the values themselves are 8-byte aligned (a `Ptr` is
+   just a `UInt64` address with the layout invariant).  When we see
+   `%p = inttoptr i64 (load i64, ...) to ptr`, `%p` is at least 8-aligned at runtime.
+
+2. **GEPs preserve alignment via `gcd`**: `getelementptr T, ptr %base, i64 %idx` produces
+   a pointer whose alignment is `gcd(align(base), sizeof(T)*idx_alignment)`.  For a
+   constant offset K, `gcd(align(base), K)`.  For runtime indices, conservatively
+   `gcd(align(base), sizeof(T))`.
+
+3. **Load/store can use `min(pointer_align, type_natural_align)`**: e.g. a `float`
+   load through an 8-aligned pointer is 4-aligned (limited by float's natural align).
+
+The pass walks each function in program order (which is dataflow order for SSA),
+records `inferred_align[ptr]` for each pointer, then upgrades load/store alignment
+metadata.  Only upgrades when `current < new_align`.
+
+Without this, lavapipe's mesa-LLVM JIT generates `MGATHER<unknown-size, align 1>`
+for vectorized PSB loads (X86 ISel can't select align-1 gathers).  RADV/NVIDIA
+work fine without it but benefit from the more accurate alignment annotations.
+"""
+function propagate_psb_alignment!(mod::LLVM.Module, dl::LLVM.DataLayout)
+    for fn in LLVM.functions(mod)
+        isempty(LLVM.blocks(fn)) && continue
+        # Map pointer values → inferred minimum alignment (in bytes, power of 2)
+        ptr_align = Dict{LLVM.Value, Int}()
+
+        # Function parameters: pointer args may have explicit `align N` attribute
+        for (i, param) in enumerate(LLVM.parameters(fn))
+            pt = LLVM.value_type(param)
+            pt isa LLVM.PointerType || continue
+            for attr in collect(LLVM.parameter_attributes(fn, i))
+                if attr isa LLVM.EnumAttribute && LLVM.kind(attr) == LLVM.kind(LLVM.EnumAttribute("align", 0))
+                    a = Int(LLVM.value(attr))
+                    a > 0 && (ptr_align[param] = a)
+                    break
+                end
+            end
+        end
+
+        for bb in LLVM.blocks(fn)
+            for inst in LLVM.instructions(bb)
+                if inst isa LLVM.IntToPtrInst
+                    src = LLVM.operands(inst)[1]
+                    pt = LLVM.value_type(inst)
+                    pt isa LLVM.PointerType || continue
+                    # Loaded i64 used as a pointer: Julia ABI says the loaded value
+                    # is at least 8-byte aligned (Ptr{T} values always are). This is
+                    # the key invariant that lets us recover alignment information.
+                    if src isa LLVM.LoadInst
+                        ptr_align[inst] = max(get(ptr_align, inst, 1), 8)
+                    elseif src isa LLVM.ExtractValueInst
+                        agg = LLVM.operands(src)[1]
+                        if agg isa LLVM.LoadInst
+                            ptr_align[inst] = max(get(ptr_align, inst, 1), 8)
+                        end
+                    elseif src isa LLVM.Argument
+                        # Function parameter as integer (rare): no info
+                    end
+                elseif inst isa LLVM.LoadInst
+                    # `load ptr, ...` directly yields a typed pointer value. When the
+                    # source pointer is in PSB (addrspace 1) and the loaded TYPE is a
+                    # pointer, the loaded pointer represents a Julia `Ptr{T}` value,
+                    # which is 8-byte aligned by ABI.
+                    loaded_ty = LLVM.value_type(inst)
+                    if loaded_ty isa LLVM.PointerType
+                        ptr_op = LLVM.operands(inst)[1]
+                        src_pt = LLVM.value_type(ptr_op)
+                        if src_pt isa LLVM.PointerType && LLVM.addrspace(src_pt) == 1
+                            ptr_align[inst] = max(get(ptr_align, inst, 1), 8)
+                        end
+                    end
+                elseif inst isa LLVM.GetElementPtrInst
+                    pt = LLVM.value_type(inst)
+                    pt isa LLVM.PointerType || continue
+                    base = LLVM.operands(inst)[1]
+                    base_align = get(ptr_align, base, 0)
+                    base_align == 0 && continue
+                    # Compute the offset's contribution to alignment
+                    src_ty_ref = LLVM.API.LLVMGetGEPSourceElementType(inst)
+                    src_ty = LLVM.LLVMType(src_ty_ref)
+                    elem_size = Int(LLVM.API.LLVMABISizeOfType(dl, src_ty))
+                    ops = LLVM.operands(inst)
+                    # First index: stride = sizeof(src_ty)
+                    offset_align = elem_size > 0 ? elem_size : 1
+                    if length(ops) >= 2
+                        idx0 = ops[2]
+                        if idx0 isa LLVM.ConstantInt
+                            n = convert(Int64, idx0)
+                            offset_align = n == 0 ? typemax(Int) : (1 << trailing_zeros(abs(n))) * elem_size
+                        end
+                    end
+                    # Subsequent indices walk into struct/array fields
+                    cur_ty = src_ty
+                    inner_offset_align = typemax(Int)
+                    for k in 3:length(ops)
+                        idx = ops[k]
+                        if cur_ty isa LLVM.StructType
+                            idx isa LLVM.ConstantInt || break
+                            field_idx = convert(Int, idx)
+                            field_off = Int(LLVM.API.LLVMOffsetOfElement(dl, cur_ty, field_idx))
+                            inner_offset_align = field_off == 0 ?
+                                inner_offset_align :
+                                min(inner_offset_align, 1 << trailing_zeros(field_off))
+                            cur_ty = LLVM.LLVMType(LLVM.API.LLVMStructGetTypeAtIndex(cur_ty, field_idx))
+                        elseif cur_ty isa LLVM.ArrayType
+                            elem_ty = LLVM.eltype(cur_ty)
+                            esz = Int(LLVM.API.LLVMABISizeOfType(dl, elem_ty))
+                            if idx isa LLVM.ConstantInt
+                                n = convert(Int64, idx)
+                                inner_offset_align = n == 0 ?
+                                    inner_offset_align :
+                                    min(inner_offset_align, (1 << trailing_zeros(abs(n))) * esz)
+                            else
+                                inner_offset_align = min(inner_offset_align, esz > 0 ? esz : 1)
+                            end
+                            cur_ty = elem_ty
+                        else
+                            break
+                        end
+                    end
+                    combined = min(offset_align, inner_offset_align)
+                    # Result alignment is gcd of base and offset alignment, both pow2
+                    result_align = combined == typemax(Int) ? base_align : min(base_align, combined)
+                    result_align > 0 && (ptr_align[inst] = result_align)
+                elseif inst isa LLVM.PHIInst
+                    # Conservative: alignment is min over all incoming values
+                    pt = LLVM.value_type(inst)
+                    pt isa LLVM.PointerType || continue
+                    n = LLVM.API.LLVMCountIncoming(inst)
+                    n == 0 && continue
+                    min_a = typemax(Int)
+                    saw_unknown = false
+                    for k in 0:(n-1)
+                        v = LLVM.Value(LLVM.API.LLVMGetIncomingValue(inst, k))
+                        a = get(ptr_align, v, 0)
+                        if a == 0
+                            saw_unknown = true
+                            break
+                        end
+                        min_a = min(min_a, a)
+                    end
+                    !saw_unknown && min_a > 0 && (ptr_align[inst] = min_a)
+                elseif inst isa LLVM.SelectInst
+                    pt = LLVM.value_type(inst)
+                    pt isa LLVM.PointerType || continue
+                    ops = LLVM.operands(inst)
+                    a1 = get(ptr_align, ops[2], 0)
+                    a2 = get(ptr_align, ops[3], 0)
+                    if a1 > 0 && a2 > 0
+                        ptr_align[inst] = min(a1, a2)
+                    end
+                end
+
+                # Upgrade load/store alignment based on inferred pointer alignment.
+                # Apply to addrspace 0 and 1 — both end up in PSB after SPIR-V emission
+                # (loaded pointer values land in addrspace 0; explicit BDA arithmetic
+                # uses addrspace 1).
+                if inst isa LLVM.LoadInst
+                    ptr = LLVM.operands(inst)[1]
+                    pt = LLVM.value_type(ptr)
+                    pt isa LLVM.PointerType || continue
+                    as = LLVM.addrspace(pt)
+                    (as == 0 || as == 1) || continue
+                    p_align = get(ptr_align, ptr, 0)
+                    p_align == 0 && continue
+                    elem_ty = LLVM.value_type(inst)
+                    nat_size = Int(LLVM.API.LLVMABISizeOfType(dl, elem_ty))
+                    nat_size > 0 || continue
+                    is_pow2 = nat_size & (nat_size - 1) == 0
+                    is_pow2 || continue
+                    new_align = min(p_align, nat_size)
+                    current = Int(LLVM.alignment(inst))
+                    current < new_align && LLVM.alignment!(inst, new_align)
+                elseif inst isa LLVM.StoreInst
+                    ops = LLVM.operands(inst)
+                    ptr = ops[2]
+                    pt = LLVM.value_type(ptr)
+                    pt isa LLVM.PointerType || continue
+                    as = LLVM.addrspace(pt)
+                    (as == 0 || as == 1) || continue
+                    p_align = get(ptr_align, ptr, 0)
+                    p_align == 0 && continue
+                    val_ty = LLVM.value_type(ops[1])
+                    nat_size = Int(LLVM.API.LLVMABISizeOfType(dl, val_ty))
+                    nat_size > 0 || continue
+                    is_pow2 = nat_size & (nat_size - 1) == 0
+                    is_pow2 || continue
+                    new_align = min(p_align, nat_size)
+                    current = Int(LLVM.alignment(inst))
+                    current < new_align && LLVM.alignment!(inst, new_align)
+                end
+            end
+        end
+    end
+end

@@ -1189,7 +1189,8 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                         small_w = UInt32(spirv_int_width(pointee_w))
                         small_ty = emit_type_int!(state.mod, small_w, UInt32(0))
                         small_id = fresh_id!(state.mod)
-                        encode_instruction!(state.mod.functions, Op.OpLoad, small_ty, small_id, ptr_id)
+                        small_align = get_alignment_for_type(pointee_ty)
+                        encode_instruction!(state.mod.functions, Op.OpLoad, small_ty, small_id, ptr_id, UInt32(0x02), small_align)
                         wide_w = UInt32(spirv_int_width(eff_w))
                         wide_ty = emit_type_int!(state.mod, wide_w, UInt32(0))
                         ext_id = fresh_id!(state.mod)
@@ -1238,7 +1239,12 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                 end
             end
         end
-        encode_instruction!(state.mod.functions, Op.OpLoad, spirv_load_ty, load_id, ptr_id)
+        if sc == SC.Workgroup || sc == SC.Function
+            wg_load_align = get_alignment_for_type(needs_bitcast ? actual_load_ty : load_ty)
+            encode_instruction!(state.mod.functions, Op.OpLoad, spirv_load_ty, load_id, ptr_id, UInt32(0x02), wg_load_align)
+        else
+            encode_instruction!(state.mod.functions, Op.OpLoad, spirv_load_ty, load_id, ptr_id)
+        end
         if load_as_int_then_convert_to_ptr
             # Convert loaded i64 to the typed PSB pointer
             int_id = load_id
@@ -2026,7 +2032,12 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
                 end
             end
         end
-        encode_instruction!(state.mod.functions, Op.OpStore, ptr_id, val_id)
+        if sc == SC.Workgroup || sc == SC.Function
+            wg_store_align = get_alignment_for_type(store_ty)
+            encode_instruction!(state.mod.functions, Op.OpStore, ptr_id, val_id, UInt32(0x02), wg_store_align)
+        else
+            encode_instruction!(state.mod.functions, Op.OpStore, ptr_id, val_id)
+        end
     end
 end
 
@@ -4346,15 +4357,45 @@ function infer_inner_ptr_pointee(gep_or_load::LLVM.Instruction)
 end
 
 """
-Emit a PSB pointer element access using manual byte-offset arithmetic.
-OpPtrAccessChain on PSB struct pointers is broken on AMD RADV — all threads
-read element[0]. Instead, convert ptr→u64, add idx*stride, convert u64→ptr.
+Emit a PSB pointer element access.
+
+For scalar element types (float / int / vector) we emit `OpInBoundsPtrAccessChain`,
+which preserves the pointer's element type through to the consuming `OpLoad`/`OpStore`.
+This matters for drivers that do their own SPIR-V→LLVM lowering and vectorization
+(notably Mesa's lavapipe): if the address is computed via `OpConvertPtrToU` /
+arithmetic / `OpConvertUToPtr`, NIR loses the load's element type by the time the
+LLVM vectorizer kicks in, producing `MGATHER<unknown-size, align 1>` nodes that
+the X86 ISel can't select and crash.
+
+For struct element types we still emit manual byte-offset arithmetic — the original
+RADV bug (all threads reading element[0]) is for `OpPtrAccessChain` *on struct
+pointers*, where ArrayStride decoration interacts badly with the struct's own
+member offsets. Scalar `ptr<float, PSB>` etc. use the natural element stride and
+don't trip that bug.
+
 Returns the result SPIR-V ID.
 """
 function emit_psb_ptr_arithmetic!(state::SPIRVEmitterState, base_id::UInt32,
                                      idx_id::UInt32, result_ptr_ty::UInt32,
                                      element_ty::LLVM.LLVMType;
                                      idx_llvm_ty::Union{LLVM.LLVMType, Nothing}=nothing)
+    # Scalar (incl. vector / float / int) → OpPtrAccessChain.
+    # Struct/array → byte arithmetic (original RADV-safe path).
+    # OpPtrAccessChain is permitted in Vulkan with the PhysicalStorageBufferAddresses
+    # capability; OpInBoundsPtrAccessChain would also work but additionally requires
+    # the `Addresses` capability (Kernel-mode-only).
+    # The base pointer type also needs an ArrayStride decoration (required by
+    # VUID-StandaloneSpirv-OpPtrAccessChain-04706 for PSB pointers).
+    is_scalar = !(element_ty isa LLVM.StructType) && !(element_ty isa LLVM.ArrayType)
+    if is_scalar
+        ensure_array_stride_decoration!(state, result_ptr_ty, element_ty)
+        result_id = fresh_id!(state.mod)
+        # OpPtrAccessChain result_type result_id base element
+        encode_instruction!(state.mod.functions, Op.OpPtrAccessChain,
+                            result_ptr_ty, result_id, base_id, idx_id)
+        return result_id
+    end
+
     stride = UInt64(compute_type_size(element_ty, state.data_layout))
     u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
 
