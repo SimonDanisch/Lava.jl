@@ -1081,6 +1081,20 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     decompose_typepun_gep_loads!(mod, dl)
     verify_ir!("final")
 
+    # ── Fix Workgroup (shared memory) load/store alignment ──
+    # Julia/GPUCompiler emits `align 1` for all addrspace(3) accesses regardless of
+    # element type. Correct to natural type alignment so downstream tools and drivers
+    # see accurate alignment metadata.
+    fix_workgroup_alignment!(mod, dl)
+
+    # ── Propagate PSB alignment from BDA loads ──
+    # GPUCompiler emits `align 1` for all addrspace(1) accesses after SROA splits
+    # struct loads into individual field loads. The wrapper sets `align 8` on the
+    # initial BDA load, but that doesn't propagate through inttoptr → field load.
+    # Walk the IR and propagate alignment using Julia ABI invariants (loaded i64
+    # used via inttoptr is 8-aligned, GEPs preserve via gcd).
+    propagate_psb_alignment!(mod, dl)
+
     return nothing
 end
 
