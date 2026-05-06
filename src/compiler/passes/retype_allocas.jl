@@ -266,6 +266,14 @@ function pick_uniform_type(accesses::Vector{AccessSite}, total_bytes::Int, dl::L
             debug && @info "retype: pick BAIL offset_not_aligned" off=a.byte_offset sz
             return nothing
         end
+        # Decomposition (a_sz > sz) is only implemented for int→int: the rewrite
+        # uses shift/or/trunc operations that require integer types.  If either the
+        # chosen element type T or the wider access type is a float/half/double,
+        # bail so the existing SPIR-V emitter fallback handles it instead.
+        if a_sz > sz && (!(smallest_T isa LLVM.IntegerType) || !(a.access_type isa LLVM.IntegerType))
+            debug && @info "retype: pick BAIL decomp_requires_int" a_ty=string(a.access_type) t_ty=string(smallest_T)
+            return nothing
+        end
     end
 
     # We require sz to be a power of 2 so the byte-offset → element-idx divide

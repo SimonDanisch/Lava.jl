@@ -199,10 +199,35 @@ KA.argconvert(::KA.Kernel{LavaBackend}, a::LavaArray{T,N}) where {T,N} =
 KA.argconvert(::KA.Kernel{LavaBackend}, x) = x
 
 # ── Kernel call (main entry point) ──
+#
+# `find_tlas_in_args` scans the kernel's pre-adapt arg tuple for any value
+# that holds a live HWTLAS reference, so callers can write
+#   `kernel(accel, args...; ndrange=...)`
+# with `accel::HWAdaptedAccel` (or any value carrying one) and have
+# `enable_ray_query=true` + the TLAS descriptor binding wired automatically
+# at compile + dispatch.  This keeps the SW/HW swap a single-arg change at
+# the call site — Hikari's `Raycore.closest_hit(accel, ray)` polymorphism
+# falls through unchanged.
+@inline find_tlas_in_args(args::Tuple) = _find_tlas(args, nothing)
+@inline _find_tlas(::Tuple{}, acc) = acc
+@inline _find_tlas(args::Tuple, acc) = _find_tlas(Base.tail(args), _maybe_tlas(first(args), acc))
+# `HWAdaptedAccel` is declared in raytracing/hwtlas.jl (loaded after this file);
+# loose-typed dispatch + a runtime field check keeps the include order intact.
+@inline function _maybe_tlas(x, acc)
+    if hasfield(typeof(x), :hwtlas)
+        h = getfield(x, :hwtlas)
+        h !== nothing && return h
+    end
+    return acc
+end
 
 function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=nothing)
     validate_launch_args(args)
     bq = obj.backend.bq
+
+    # Auto-discover TLAS for ray-query kernels — extract BEFORE Adapt strips
+    # hwtlas (kernel form has hwtlas=nothing).
+    tlas = find_tlas_in_args(args)
 
     # GPU-resident ndrange → indirect dispatch (no CPU readback)
     if ndrange isa LavaArray
@@ -211,7 +236,7 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
         pin_leaves!(batch, args)
         adaptor = LavaAdaptor(batch)
         converted_args = map(a -> Adapt.adapt(adaptor, a), args)
-        ka_launch_indirect!(obj, converted_args, ndrange, workgroupsize, args, adaptor)
+        ka_launch_indirect!(obj, converted_args, ndrange, workgroupsize, args, adaptor; tlas)
         return nothing
     end
 
@@ -237,7 +262,7 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     converted_args = map(a -> Adapt.adapt(adaptor, a), args)
     all_args = (converted_f, ka_ctx, converted_args...)
 
-    ka_launch!(bq, converted_f, all_args, block_dims, ws_3d)
+    ka_launch!(bq, converted_f, all_args, block_dims, ws_3d; tlas)
 
     return nothing
 end
@@ -316,15 +341,21 @@ Internal launch function for KA kernels. Compiles and dispatches the GPU functio
 """
 const DBG_LAUNCH_COUNT = Ref(0)
 
-function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple, block_dims::NTuple{3,Int}, workgroup_size::NTuple{3,Int})
+function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple, block_dims::NTuple{3,Int}, workgroup_size::NTuple{3,Int};
+                    tlas=nothing)
     DBG_LAUNCH_COUNT[] += 1
     _n = DBG_LAUNCH_COUNT[]
     # Build type tuple for compilation (excludes f — GPUCompiler prepends typeof(f)).
     # all_args are already post-adapt (LavaDeviceArray, not Ptr{T}).
     tt = Tuple{map(arg_sigtype, Base.tail(all_args))...}
 
-    # Compile + pipeline + offsets (cached, single lookup)
-    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(bq.ctx::VkContext, f, tt, workgroup_size)
+    # Compile + pipeline + offsets (cached, single lookup).  When `tlas` was
+    # auto-discovered from kernel args (e.g. an HWAdaptedAccel was passed),
+    # enable ray_query so the SPIR-V emitter binds the TLAS descriptor and
+    # accepts OpRayQueryInitializeKHR / Proceed / Get*KHR.
+    enable_ray_query = tlas !== nothing
+    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(
+        bq.ctx::VkContext, f, tt, workgroup_size; enable_ray_query)
 
     # Compute total size: base layout + inline struct data
     inline_extra = compute_inline_extra_from_byval(byval_sizes)
@@ -345,7 +376,7 @@ function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple, block_dim
     if DISPATCH_LOGGING_ENABLED[]
         LAST_DISPATCH_INFO[] = "ka f=$(dispatch_name(f, all_args)) groups=$block_dims"
     end
-    vk_dispatch!(bq, pipeline, arg_buf.address, block_dims)
+    vk_dispatch!(bq, pipeline, arg_buf.address, block_dims; tlas)
 
     return nothing
 end
@@ -448,7 +479,8 @@ the work item count (1-element Int32 array). The prepare-indirect kernel writes
 group counts to an indirect buffer, then vk_dispatch_indirect! dispatches the main kernel.
 """
 function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, original_args, adaptor::LavaAdaptor;
-                             bq::BatchQueue=obj.backend.bq)
+                             bq::BatchQueue=obj.backend.bq,
+                             tlas=nothing)
     # Respect static workgroup size from @kernel definition
     ws = if workgroupsize !== nothing
         workgroupsize isa Integer ? (workgroupsize,) : workgroupsize
@@ -482,7 +514,9 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
 
     # Kernel ABI is post-adapt: LavaDeviceArray etc.
     tt = Tuple{map(arg_sigtype, Base.tail(all_args))...}
-    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(bq.ctx::VkContext, converted_f, tt, ws_3d)
+    enable_ray_query = tlas !== nothing
+    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(
+        bq.ctx::VkContext, converted_f, tt, ws_3d; enable_ray_query)
 
     inline_extra = compute_inline_extra_from_byval(byval_sizes)
     total_size = compiled.push_info.arg_buffer_size + inline_extra
@@ -502,7 +536,7 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
     if DISPATCH_LOGGING_ENABLED[]
         LAST_DISPATCH_INFO[] = "indirect f=$(dispatch_name(obj.f, all_args))"
     end
-    vk_dispatch_indirect!(bq, pipeline, arg_buf.address, indirect_view)
+    vk_dispatch_indirect!(bq, pipeline, arg_buf.address, indirect_view; tlas)
 
     end # GC.@preserve
 

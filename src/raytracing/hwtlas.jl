@@ -183,33 +183,41 @@ HWTLAS(backend::LavaBackend; bq::BatchQueue=backend.bq) =
 # ============================================================================
 
 """
-    HWAdaptedAccel{H<:HWTLAS} <: Raycore.AbstractAdaptedAccel
+    HWAdaptedAccel{H, T, O, Tri} <: Raycore.AbstractAdaptedAccel
 
-GPU-adapted form of `HWTLAS`.  Dispatches ray tracing to hardware.
+GPU-adapted form of `HWTLAS`.  Carries the kernel-side data needed by
+`Raycore.closest_hit(::HWAdaptedAccel, ray)` / `any_hit` (which lower to
+`OpRayQueryInitializeKHR` etc.):
+
+  * `triangles` — flat array of all BLAS triangles, concatenated.
+  * `offsets`   — per-instance offset into `triangles`, indexed by `gl_InstanceID + 1`.
+  * `empty`     — sentinel triangle returned on miss.
+  * `hwtlas`    — CPU-side `HWTLAS` reference for callers that need it
+                  (descriptor binding, sync, RT pipeline path); `nothing` in
+                  the kernel-form produced by `Adapt.adapt`.
+
+Constructed by `sync!(hwtlas)` from the live HWTLAS state.  The kernel-form
+(returned by `Adapt.adapt(LavaAdaptor, accel)`) drops `hwtlas` (Nothing) and
+adapts the array fields to `LavaDeviceArray`.
 """
-struct HWAdaptedAccel{H<:HWTLAS} <: Raycore.AbstractAdaptedAccel
+struct HWAdaptedAccel{H, T, O, Tri} <: Raycore.AbstractAdaptedAccel
     hwtlas::H
-end
-
-# ============================================================================
-# PrecomputedHitsAccel (struct defined here so adapt_structure can reference it)
-# ============================================================================
-
-"""
-    PrecomputedHitsAccel{R,T,O,Tri} <: Raycore.AbstractAdaptedAccel
-
-Wraps a batch-traced result buffer plus the GPU triangle + offset arrays for
-CPU-side `closest_hit` dispatch after `batch_trace_indirect`.
-
-`empty` is a sentinel triangle returned on ray miss (instead of indexing
-into `triangles[1]` which is UB when the geometry is empty).
-"""
-struct PrecomputedHitsAccel{R, T, O, Tri} <: Raycore.AbstractAdaptedAccel
-    results::R
     triangles::T
     offsets::O
     empty::Tri
 end
+
+"""Build the CPU-form HWAdaptedAccel from a synced HWTLAS."""
+function HWAdaptedAccel(hwtlas::HWTLAS{Tri}) where Tri
+    HWAdaptedAccel{HWTLAS{Tri}, typeof(hwtlas.tri_gpu), typeof(hwtlas.off_gpu), Tri}(
+        hwtlas, hwtlas.tri_gpu, hwtlas.off_gpu, Raycore.empty_triangle(Tri))
+end
+
+# pin_leaves! stops at HWTLAS — its LavaArray contents (`tri_gpu` / `off_gpu`)
+# are already directly exposed as fields on HWAdaptedAccel, so the walker pins
+# them via that path.  Without this stop, the @generated walker recurses into
+# HWTLAS → BatchQueue → ctx → BatchQueue → … and blows the stack.
+@inline pin_leaves!(::CommandBatch, ::HWTLAS) = nothing
 
 # ============================================================================
 # Adapt.adapt_structure
@@ -218,28 +226,33 @@ end
 """
     Adapt.adapt_structure(to, hwtlas::HWTLAS) -> HWAdaptedAccel
 
-Ensure `sync!` has run then return `hwtlas.static_tlas`.  Cheap on a clean
-HWTLAS — do NOT cache the return across mutations.
+Ensure `sync!` has run, then return the cached `hwtlas.static_tlas` — the
+CPU-form HWAdaptedAccel that still holds the live `HWTLAS` reference plus
+the GPU triangle/offset arrays.  Hikari's CPU dispatch code reaches through
+`accel.hwtlas` for descriptor binding / sync helpers; that path must keep
+working after `Adapt.adapt(::LavaBackend, hwtlas)`.
+
+Kernel-form adaptation (drop `hwtlas`, strip arrays to LavaDeviceArray) only
+fires when the adaptor is a `LavaAdaptor` — see the specialised method below.
 """
 function Adapt.adapt_structure(to, hwtlas::HWTLAS{Tri}) where Tri
     Raycore.sync!(hwtlas)
-    # `static_tlas` is typed `::Any` in the struct body (forward-reference to
-    # HWAdaptedAccel{HWTLAS{Tri}}); narrow via return-assertion so callers see
-    # a concrete type and the dispatch hot path stays type-stable.
-    return hwtlas.static_tlas::HWAdaptedAccel{HWTLAS{Tri}}
+    return hwtlas.static_tlas::HWAdaptedAccel
 end
 
 """
-    Adapt.adapt_structure(to, p::PrecomputedHitsAccel) -> PrecomputedHitsAccel
-
-Adapt all array fields to the target context; copy `empty` verbatim.
+Kernel-form adaptation: drops `hwtlas` (so the kernel sees a Nothing-typed
+field, which is bitstype) and walks the array fields through the adaptor so
+`LavaArray` becomes `LavaDeviceArray` for the BDA arg buffer.  The auto-
+discovered TLAS binding is wired by `lava_launch!`/`ka_launch!` from the
+pre-adapt `HWAdaptedAccel.hwtlas` field.
 """
-function Adapt.adapt_structure(to, p::PrecomputedHitsAccel)
-    PrecomputedHitsAccel(
-        Adapt.adapt(to, p.results),
-        Adapt.adapt(to, p.triangles),
-        Adapt.adapt(to, p.offsets),
-        p.empty,
+function Adapt.adapt_structure(to::LavaAdaptor, accel::HWAdaptedAccel)
+    HWAdaptedAccel(
+        nothing,
+        Adapt.adapt(to, accel.triangles),
+        Adapt.adapt(to, accel.offsets),
+        accel.empty,
     )
 end
 
@@ -824,67 +837,53 @@ function Raycore.sync!(hwtlas::HWTLAS)
 end
 
 # ============================================================================
-# Trace dispatch
+# Inline ray query closest_hit / any_hit on HWAdaptedAccel
 # ============================================================================
+#
+# Polymorphic with the SW path's `Raycore.closest_hit(::StaticTLAS, ray)`:
+# same return tuple shape `(hit, primitive, t, bary, inst_custom_idx)`.  A
+# kernel written against `Raycore.closest_hit(accel, ray)` runs unchanged on
+# either backend; multiple dispatch picks the right traversal.
+#
+# Lowers to OpRayQueryInitializeKHR/Proceed/Get*KHR via the lava_ray_query_*
+# intrinsics.  The kernel must be compiled with `enable_ray_query=true`
+# (auto-set when a `tlas=` kwarg is passed to `lava_launch!`) so the SPIR-V
+# emitter binds the TLAS descriptor at set 0 binding 0.
 
-function trace_closest_hits!(results, rays, accel::HWAdaptedAccel, n;
-                              cull_mask::UInt32 = UInt32(0xFF))
-    trace_closest_hits!(results, rays, accel.hwtlas.hw_accel, n; cull_mask=cull_mask)
-end
-
-function trace_closest_hits_indirect!(results, rays, accel::HWAdaptedAccel, n_buf;
-                                       cull_mask::UInt32 = UInt32(0xFF))
-    trace_closest_hits_indirect!(results, rays, accel.hwtlas.hw_accel, n_buf; cull_mask=cull_mask)
-end
-
-function batch_trace_indirect(results, rays, accel::HWAdaptedAccel, n_buf;
-                               cull_mask::UInt32 = UInt32(0xFF))
-    trace_closest_hits_indirect!(results, rays, accel.hwtlas.hw_accel, n_buf; cull_mask=cull_mask)
-    Tri = eltype(eltype(accel.hwtlas.blas_triangles))
-    empty = Raycore.empty_triangle(Tri)
-    return PrecomputedHitsAccel(results, accel.hwtlas.tri_gpu, accel.hwtlas.off_gpu, empty)
-end
-
-function set_custom_anyhit!(accel::HWAdaptedAccel, anyhit_fn, raygen_fn)
-    hw = accel.hwtlas.hw_accel
-    hw === nothing && error("HWTLAS not synced")
-    set_anyhit_pipeline!(hw, anyhit_fn, raygen_fn)
-end
-
-# RT shader intrinsics forwarded from HWAdaptedAccel -> Lava intrinsics
-rt_primitive_id(::HWAdaptedAccel)          = lava_rt_primitive_id()
-rt_instance_custom_index(::HWAdaptedAccel) = lava_rt_instance_custom_index()
-rt_instance_id(::HWAdaptedAccel)           = lava_rt_instance_id()
-rt_launch_id_x(::HWAdaptedAccel)           = lava_rt_launch_id_x()
-rt_global_invocation_id_x(::HWAdaptedAccel) = lava_global_invocation_id_x()
-rt_ignore_intersection(::HWAdaptedAccel)   = lava_rt_ignore_intersection()
-rt_terminate_ray(::HWAdaptedAccel)         = lava_rt_terminate_ray()
-rt_payload_store!(::HWAdaptedAccel, val, slot) = lava_rt_payload_store_f32_at(val, slot)
-rt_payload_load(::HWAdaptedAccel, slot)    = lava_rt_payload_load_f32_at(slot)
-
-function rt_trace_ray!(::HWAdaptedAccel, flags, mask, sbt_offset, sbt_stride, miss_idx,
-                       ox, oy, oz, tmin, dx, dy, dz, tmax)
-    lava_rt_trace_ray(flags, mask, sbt_offset, sbt_stride, miss_idx,
-                       ox, oy, oz, tmin, dx, dy, dz, tmax)
-end
-
-@propagate_inbounds function Raycore.closest_hit(accel::PrecomputedHitsAccel, ray)
-    tid = lava_global_invocation_id_x() + UInt32(1)
-    result = accel.results[tid]
-
-    if result.hit == UInt32(0)
+@inline function _hw_rq_collect(accel::HWAdaptedAccel)
+    while lava_ray_query_proceed()
+        # Opaque triangles auto-commit; no any-hit decision here.
+    end
+    kind = lava_ray_query_get_type(true)  # committed
+    if kind != UInt32(1)  # not RayQueryCommittedIntersectionTriangleKHR
         return (false, accel.empty, 0f0, SVector{3,Float32}(1f0, 0f0, 0f0), UInt32(0))
     end
+    t = lava_ray_query_get_t(true)
+    inst_id = lava_ray_query_get_instance_id(true)
+    inst_custom_idx = lava_ray_query_get_instance_custom_index(true)
+    prim_idx = lava_ray_query_get_primitive_index(true)
+    bx, by = lava_ray_query_get_barycentrics(true)
 
-    # `accel.offsets` is keyed by gl_InstanceID (0-based).  `result.instance_id`
-    # is that builtin; `result.instance_custom_index` carries the interface
-    # override and is forwarded as the 5th return value.
-    tri_idx = Int(accel.offsets[result.instance_id + UInt32(1)]) +
-              Int(result.primitive_id) + 1
-    tri = accel.triangles[tri_idx]
+    @inbounds tri_idx = Int(accel.offsets[inst_id + UInt32(1)]) + Int(prim_idx) + 1
+    @inbounds tri = accel.triangles[tri_idx]
 
-    w = 1f0 - result.bary_u - result.bary_v
-    bary = SVector{3,Float32}(w, result.bary_u, result.bary_v)
+    bary = SVector{3,Float32}(1f0 - bx - by, bx, by)
+    return (true, tri, t, bary, inst_custom_idx)
+end
 
-    return (true, tri, result.t, bary, result.instance_custom_index)
+@propagate_inbounds function Raycore.closest_hit(accel::HWAdaptedAccel, ray::Raycore.AbstractRay)
+    o = ray.o; d = ray.d
+    lava_ray_query_init(UInt32(0), UInt32(0xFF),
+        Float32(o[1]), Float32(o[2]), Float32(o[3]), Float32(ray.t_min),
+        Float32(d[1]), Float32(d[2]), Float32(d[3]), Float32(ray.t_max))
+    return _hw_rq_collect(accel)
+end
+
+@propagate_inbounds function Raycore.any_hit(accel::HWAdaptedAccel, ray::Raycore.AbstractRay)
+    o = ray.o; d = ray.d
+    # SPIR-V RayFlagsTerminateOnFirstHitKHR = 4 — exit traversal at first commit.
+    lava_ray_query_init(UInt32(4), UInt32(0xFF),
+        Float32(o[1]), Float32(o[2]), Float32(o[3]), Float32(ray.t_min),
+        Float32(d[1]), Float32(d[2]), Float32(d[3]), Float32(ray.t_max))
+    return _hw_rq_collect(accel)
 end

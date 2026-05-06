@@ -52,8 +52,7 @@ export refit_tlas!
 export trace_closest_hits!, trace_closest_hits_indirect!, RayTracingPipeline, trace_rays!, trace_rays_indirect!
 export set_anyhit_pipeline!, trace_closest_hits_anyhit!, trace_closest_hits_anyhit_indirect!
 export lava_rt_ignore_intersection, lava_rt_terminate_ray
-export HWTLAS, HWAdaptedAccel, PrecomputedHitsAccel
-export batch_trace_indirect, set_custom_anyhit!
+export HWTLAS, HWAdaptedAccel
 # P4 narrow-phase convex shapes
 export ConvexShape, UnitCube, support
 # P4.2 GJK overlap test

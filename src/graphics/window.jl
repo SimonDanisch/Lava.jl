@@ -190,7 +190,11 @@ function acquire_next_image!(win::RenderWindow)
     wait_for_fences!(ctx.default_bq, [win.in_flight[fi]])
     unwrap(Vulkan.reset_fences(dev, [win.in_flight[fi]]))
 
-    # Reclaim batch from previous frame in this slot — GPU is done (fence waited above)
+    # Reclaim batch from previous frame in this slot — GPU is done (fence waited above).
+    # Push it back to its OWNING bq's free list, not to ctx.default_bq.  Mixing
+    # foreign batches into another queue's free list breaks the invariant that
+    # every batch in `bq.free_batches` has `batch.bq === bq`, which `submit!`
+    # checks via `@assert batch.bq === bq`.
     old_batch = win.frame_batches[fi]
     if old_batch !== nothing
         old_batch.recording = false
@@ -198,7 +202,7 @@ function acquire_next_image!(win::RenderWindow)
         old_batch.last_was_rt = false
         empty!(old_batch.pinned)
         empty!(old_batch.wait_semaphores)
-        push!(ctx.default_bq.free_batches, old_batch)
+        push!((old_batch.bq::BatchQueue).free_batches, old_batch)
         win.frame_batches[fi] = nothing
     end
 
@@ -242,7 +246,9 @@ Handle window resize by recreating the swapchain.
 function Base.resize!(win::RenderWindow)
     ctx = win.ctx
     Vulkan.device_wait_idle(ctx.device)
-    # Reclaim in-flight frame batches before recreating swapchain
+    # Reclaim in-flight frame batches before recreating swapchain — push back to
+    # the OWNING bq's free list (frame batches are recorded on present_bq, not
+    # default_bq; mixing breaks the `batch.bq === bq` invariant in submit!).
     for i in eachindex(win.frame_batches)
         batch = win.frame_batches[i]
         if batch !== nothing
@@ -251,7 +257,7 @@ function Base.resize!(win::RenderWindow)
             batch.last_was_rt = false
             empty!(batch.pinned)
             empty!(batch.wait_semaphores)
-            push!(ctx.default_bq.free_batches, batch)
+            push!((batch.bq::BatchQueue).free_batches, batch)
             win.frame_batches[i] = nothing
         end
     end
@@ -267,7 +273,8 @@ function Base.close(win::RenderWindow)
     win.handle.handle == C_NULL && return
     ctx = win.ctx
     Vulkan.device_wait_idle(ctx.device)
-    # Reclaim any in-flight frame batches (GPU is idle after device_wait_idle)
+    # Reclaim any in-flight frame batches — push back to the OWNING bq's free
+    # list (see `acquire_next_image!` for the invariant).
     for i in eachindex(win.frame_batches)
         batch = win.frame_batches[i]
         if batch !== nothing
@@ -276,7 +283,7 @@ function Base.close(win::RenderWindow)
             batch.last_was_rt = false
             empty!(batch.pinned)
             empty!(batch.wait_semaphores)
-            push!(ctx.default_bq.free_batches, batch)
+            push!((batch.bq::BatchQueue).free_batches, batch)
             win.frame_batches[i] = nothing
         end
     end

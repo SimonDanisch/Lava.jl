@@ -2990,7 +2990,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                 # PSB pointer arithmetic: use manual byte-offset instead of OpPtrAccessChain
                 # (OpPtrAccessChain on PSB struct pointers is broken on AMD RADV)
                 result_id = emit_psb_ptr_arithmetic!(state, base_id, idx, result_ptr_ty, source_ty;
-                    idx_llvm_ty=LLVM.value_type(ops[2]))
+                    idx_llvm_ty=LLVM.value_type(ops[2]), base_pointee=base_pointee)
                 # Track pointer alignment from element stride.
                 # E.g., stride=6 (array of {i16,i16,i16}) → ptr alignment = gcd(base, 6) = 2
                 # Downstream stores of i32/float at these addresses need byte decomposition.
@@ -3277,7 +3277,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     first_idx = get_value_id!(state, ops[2])
                     elem_ptr_id = emit_psb_ptr_arithmetic!(state, base_id, first_idx,
                         map_pointer_type!(state.type_ctx, map_type!(state.type_ctx, source_ty), sc),
-                        source_ty; idx_llvm_ty=LLVM.value_type(ops[2]))
+                        source_ty; idx_llvm_ty=LLVM.value_type(ops[2]), base_pointee=base_pointee)
                     # Track stride alignment on the result pointer (inherits from element)
                     elem_stride = compute_type_size(source_ty, state.data_layout)
                     if elem_stride > 0
@@ -3299,7 +3299,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     first_idx = get_value_id!(state, ops[2])
                     elem_ptr_id = emit_psb_ptr_arithmetic!(state, base_id, first_idx,
                         map_pointer_type!(state.type_ctx, map_type!(state.type_ctx, source_ty), sc),
-                        source_ty; idx_llvm_ty=LLVM.value_type(ops[2]))
+                        source_ty; idx_llvm_ty=LLVM.value_type(ops[2]), base_pointee=base_pointee)
                     elem_stride = compute_type_size(source_ty, state.data_layout)
                     if elem_stride > 0
                         stride_align = UInt32(1 << trailing_zeros(elem_stride))
@@ -4378,7 +4378,8 @@ Returns the result SPIR-V ID.
 function emit_psb_ptr_arithmetic!(state::SPIRVEmitterState, base_id::UInt32,
                                      idx_id::UInt32, result_ptr_ty::UInt32,
                                      element_ty::LLVM.LLVMType;
-                                     idx_llvm_ty::Union{LLVM.LLVMType, Nothing}=nothing)
+                                     idx_llvm_ty::Union{LLVM.LLVMType, Nothing}=nothing,
+                                     base_pointee::Union{LLVM.LLVMType, Nothing}=nothing)
     # Scalar (incl. vector / float / int) → OpPtrAccessChain.
     # Struct/array → byte arithmetic (original RADV-safe path).
     # OpPtrAccessChain is permitted in Vulkan with the PhysicalStorageBufferAddresses
@@ -4386,8 +4387,15 @@ function emit_psb_ptr_arithmetic!(state::SPIRVEmitterState, base_id::UInt32,
     # the `Addresses` capability (Kernel-mode-only).
     # The base pointer type also needs an ArrayStride decoration (required by
     # VUID-StandaloneSpirv-OpPtrAccessChain-04706 for PSB pointers).
+    #
+    # SPIR-V VUID: OpPtrAccessChain's result type must match the base pointer's
+    # type structure (same pointee).  LLVM opaque pointers allow `gep i64, ptr
+    # %f32_ptr, idx`, but emitting that as `OpPtrAccessChain Ptr<i64>, %f32_ptr`
+    # is invalid.  Detect mismatch via base_pointee and fall through to byte
+    # arithmetic (ConvertPtrToU/UToPtr is type-agnostic).
+    type_mismatch = base_pointee !== nothing && base_pointee != element_ty
     is_scalar = !(element_ty isa LLVM.StructType) && !(element_ty isa LLVM.ArrayType)
-    if is_scalar
+    if is_scalar && !type_mismatch
         ensure_array_stride_decoration!(state, result_ptr_ty, element_ty)
         result_id = fresh_id!(state.mod)
         # OpPtrAccessChain result_type result_id base element
