@@ -299,12 +299,21 @@ Vulkan SPIR-V requires OpAccessChain indices to be 32-bit integers.
 If the source value is i64, inserts an OpUConvert to truncate to i32.
 """
 function ensure_index_i32!(state::SPIRVEmitterState, val::LLVM.Value)
-    id = get_value_id!(state, val)
-
-    # Check if the LLVM type is i64 (or wider) — if so, truncate to i32
     ty = LLVM.value_type(val)
+    # Compile-time literal: emit a fresh u32 OpConstant directly.  Going
+    # through `get_value_id! + OpUConvert` would produce a runtime UConvert,
+    # which is fine for array element indices but breaks `OpAccessChain` for
+    # struct *member* indices (SPIR-V VUID-OpAccessChain — those must be
+    # OpConstantInt, not derived ops).  Single peephole keeps both paths
+    # correct: array elem indices still work because OpConstant is also a
+    # valid runtime value.
+    if val isa LLVM.ConstantInt && ty isa LLVM.IntegerType
+        return emit_constant_u32!(state.mod, UInt32(convert(Int64, val) & 0xFFFFFFFF))
+    end
+
+    id = get_value_id!(state, val)
     if ty isa LLVM.IntegerType && LLVM.width(ty) > 32
-        # Insert OpUConvert: i64 → i32
+        # Runtime index wider than i32 — truncate via OpUConvert.
         u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
         conv_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, id)
@@ -2863,8 +2872,25 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
     # OpAccessChain into the inner [1 x …] wrapper.  Instead, fold:
     #     OpAccessChain @arr (prev_idx + first_idx) *trailing_idx
     # The trailing indices descend through the GEP's source type as usual.
+    #
+    # Guard: the IAdd-fold is only correct when the GEP's `source_ty` *equals*
+    # the recorded array's element type — i.e. ops[2] is another step along
+    # the same axis as the prior outer-array OpAccessChain.  When source_ty
+    # is a *sub-element* of arr_eltype (e.g. `gep [3 x float], %elem, 0, 1`
+    # where `%elem` is a struct whose member 0 is `[3 x float]` — typical of
+    # a Workgroup `[N x struct]` accessed through SROA-decomposed members),
+    # folding into the outer index is wrong: the trailing indices then drill
+    # through arr_eltype, not through source_ty, and the resulting AccessChain
+    # type-mismatches.  Fall through to the zero-prefix multi-index path,
+    # which uses `find_zero_index_path` to navigate arr_eltype → source_ty.
+    aeo_eltype_match = if haskey(state.array_element_origin, base_ptr)
+        _, _, _, arr_ty_check = state.array_element_origin[base_ptr]
+        arr_ty_check isa LLVM.ArrayType && LLVM.eltype(arr_ty_check) == source_ty
+    else
+        false
+    end
     if n_indices > 1 && (sc == SC.Function || sc == SC.Private || sc == SC.Workgroup) &&
-       haskey(state.array_element_origin, base_ptr)
+       aeo_eltype_match
         arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
         new_first_i32 = ensure_index_i32!(state, ops[2])
         u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
