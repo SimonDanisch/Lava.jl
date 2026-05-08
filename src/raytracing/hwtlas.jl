@@ -557,11 +557,19 @@ function Raycore.update_transforms!(hwtlas::HWTLAS, handle::Raycore.TLASHandle,
     Raycore.update_transforms!(hwtlas, handle, LavaArray(collect(transforms)))
 end
 
-"""
-    update_transform!(hwtlas::HWTLAS, handle::TLASHandle, transform::Mat4f)
+# Mat4f convenience: mirrors Raycore's TLAS overloads — accept the natural
+# homogeneous 4×4 form and convert at the boundary.
+function Raycore.update_transforms!(hwtlas::HWTLAS, handle::Raycore.TLASHandle,
+                                    transforms::AbstractVector{Mat4f})
+    Raycore.update_transforms!(hwtlas, handle, map(Raycore.mat4_to_mat3x4, transforms))
+end
 
-Set every instance in `handle`'s batch to the same transform. Returns true
-if the handle was valid (matches the previous return semantics).
+"""
+    update_transform!(hwtlas::HWTLAS, handle::TLASHandle, transform)
+
+Set every instance in `handle`'s batch to the same transform. Accepts
+`Mat3x4f` (canonical) or `Mat4f` (auto-converted). Returns true if the
+handle was valid.
 """
 function Raycore.update_transform!(hwtlas::HWTLAS, handle::Raycore.TLASHandle, transform::Mat3x4f)
     haskey(hwtlas.handle_to_batch_idx, handle) || return false
@@ -569,6 +577,9 @@ function Raycore.update_transform!(hwtlas::HWTLAS, handle::Raycore.TLASHandle, t
     Raycore.update_transforms!(hwtlas, handle, LavaArray(fill(transform, batch.n)))
     return true
 end
+
+Raycore.update_transform!(hwtlas::HWTLAS, handle::Raycore.TLASHandle, transform::Mat4f) =
+    Raycore.update_transform!(hwtlas, handle, Raycore.mat4_to_mat3x4(transform))
 
 function _apply_pending_update!(batch::InstanceBatch, transforms::LavaArray{Mat3x4f, 1})
     backend = KA.get_backend(batch.instance_buf)
