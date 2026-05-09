@@ -83,7 +83,7 @@ function vk_reduce_sum(A::LavaArray{Float32})
     nblocks = min(cld(n, wgsize), 2048)
     total_threads = Int32(nblocks * wgsize)
     ndr = Int(total_threads)
-    _vk_reduce_fadd_kernel!(LavaBackend(), wgsize)(out, A, total_threads; ndrange=ndr)
+    _vk_reduce_fadd_kernel!(KA.get_backend(A), wgsize)(out, A, total_threads; ndrange=ndr)
     bq = ctx.default_bq
     vk_flush!(bq)
     # out is mapped — read directly.
@@ -132,7 +132,7 @@ function mapreducedim_ak!(f::F, op::OP, R::LavaArray{T}, A;
             return R
         end
         # Fallback: AK.mapreduce to scalar
-        result = AK.mapreduce(f, op, A, LavaBackend();
+        result = AK.mapreduce(f, op, A, KA.get_backend(A);
                               init=init_val, neutral=init_val,
                               block_size=64, switch_below=0)
         # Write scalar result into R
@@ -152,7 +152,7 @@ function mapreducedim_ak!(f::F, op::OP, R::LavaArray{T}, A;
             else
                 R
             end
-            AK.mapreduce(f, op, A_arr, LavaBackend();
+            AK.mapreduce(f, op, A_arr, KA.get_backend(R_temp);
                          init=init_val, neutral=init_val,
                          dims=rdim, temp=R_temp, block_size=64)
         elseif size(A_arr) == size(R)
@@ -199,12 +199,12 @@ function multi_dim_reduce!(f::F, op::OP, R::LavaArray{T}, A::LavaArray,
             end
             if new_sz == size(R)
                 # Last reduction — write directly into R
-                AK.mapreduce(map_fn, op, current, LavaBackend();
+                AK.mapreduce(map_fn, op, current, KA.get_backend(R);
                              init=init_val, neutral=init_val, dims=d, temp=R, block_size=64)
             else
                 temp = LavaArray{T}(undef, new_sz)
                 fill!(temp, init_val)
-                AK.mapreduce(map_fn, op, current, LavaBackend();
+                AK.mapreduce(map_fn, op, current, KA.get_backend(temp);
                              init=init_val, neutral=init_val, dims=d, temp=temp, block_size=64)
                 current = temp
             end
