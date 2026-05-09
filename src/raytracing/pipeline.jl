@@ -26,6 +26,9 @@ struct LavaRTPipeline
     push_constant_size::UInt32
     # Stage flags for push constants and descriptor sets
     stage_flags::Vulkan.ShaderStageFlag
+    # Context this pipeline was built against (for descriptor-set creation,
+    # SBT uploads, etc. — no global lookups needed).
+    ctx::VkContext
 end
 
 """
@@ -41,12 +44,12 @@ Layout:
   - Descriptor set 0, binding 0: AccelerationStructure (TLAS)
   - Push constant: BDA pointer (8 bytes by default)
 """
-function create_rt_pipeline(raygen_spirv::Vector{UInt8},
+function create_rt_pipeline(ctx::VkContext,
+                            raygen_spirv::Vector{UInt8},
                             miss_spirv::Vector{UInt8},
                             chit_spirv::Vector{UInt8};
                             anyhit_spirv::Union{Nothing, Vector{UInt8}}=nothing,
                             push_constant_size::Integer=8)
-    ctx = vk_context()
     dev = ctx.device
     rt_props = ctx.rt_pipeline_properties
     rt_props === nothing && throw(LavaError(
@@ -55,11 +58,11 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
         "Ensure VK_KHR_ray_tracing_pipeline is available"))
 
     # Create shader modules
-    raygen_mod = _create_shader_module(dev, raygen_spirv)
+    raygen_mod = create_shader_module(dev, raygen_spirv)
     check_validation_errors!("vkCreateShaderModule (raygen)")
-    miss_mod = _create_shader_module(dev, miss_spirv)
+    miss_mod = create_shader_module(dev, miss_spirv)
     check_validation_errors!("vkCreateShaderModule (miss)")
-    chit_mod = _create_shader_module(dev, chit_spirv)
+    chit_mod = create_shader_module(dev, chit_spirv)
     check_validation_errors!("vkCreateShaderModule (closest-hit)")
     shader_modules = [raygen_mod, miss_mod, chit_mod]
 
@@ -76,7 +79,7 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
     ]
 
     if has_anyhit
-        anyhit_mod = _create_shader_module(dev, anyhit_spirv)
+        anyhit_mod = create_shader_module(dev, anyhit_spirv)
         check_validation_errors!("vkCreateShaderModule (any-hit)")
         push!(stages, Vulkan.PipelineShaderStageCreateInfo(
             Vulkan.SHADER_STAGE_ANY_HIT_BIT_KHR, anyhit_mod, "main"))
@@ -150,12 +153,12 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
         Int32(-1);  # base_pipeline_index
     )
 
-    pipelines, _ = unwrap(Vulkan.create_ray_tracing_pipelines_khr(dev, [rt_ci]))
+    pipelines, _ = @vk_checked "vkCreateRayTracingPipelinesKHR" Vulkan.create_ray_tracing_pipelines_khr(dev, [rt_ci])
     pipeline = pipelines[1]
 
     # Build SBT (still 3 groups — any-hit is part of the hit group, not a separate group)
     sbt_buf, raygen_region, miss_region, hit_region, callable_region =
-        _build_sbt(dev, pipeline, rt_props, 3)
+        build_sbt(ctx, pipeline, rt_props, 3)
 
     return LavaRTPipeline(
         pipeline, layout, ds_layout,
@@ -164,32 +167,38 @@ function create_rt_pipeline(raygen_spirv::Vector{UInt8},
         raygen_region, miss_region, hit_region, callable_region,
         UInt32(push_constant_size),
         all_stage_flags,
+        ctx,
     )
 end
 
-# Descriptor set cache: (pipeline ds_layout handle, tlas accel handle) → (pool, descriptor_set)
-# Kept alive as long as the pipeline and TLAS objects exist (GC-safe via Vulkan.jl handles).
-const _rt_desc_cache = Dict{Tuple{UInt64, UInt64}, Tuple{Vulkan.DescriptorPool, Vulkan.DescriptorSet}}()
+"""
+    get_rt_descriptor_set(pipeline, tlas) -> Vulkan.DescriptorSet
 
-# In-flight descriptor pools to keep alive until vk_flush!()
-const _inflight_rt_desc_pools = Vulkan.DescriptorPool[]
+Look up (or lazily allocate) the RT descriptor set that binds `tlas.accel` for
+the layout used by `pipeline`.  The pool + set are stored on `tlas.desc_sets`,
+keyed by descriptor-set-layout Vulkan handle, so their lifetime tracks the
+LavaTLAS exactly: `destroy_now!(tlas)` destroys the pool, releasing the set.
 
+The previous implementation used a global cache keyed by `objectid(tlas)`,
+which broke after a freed LavaTLAS was GC'd and a new LavaTLAS reused that
+objectid: the cache returned a descriptor set bound to the destroyed
+VkAccelerationStructureKHR.  Per-TLAS storage eliminates that hazard
+entirely — no global cache, no objectid keying, no eviction policy.
+"""
 function get_rt_descriptor_set(pipeline::LavaRTPipeline, tlas::LavaTLAS)
-    # Cache key: use raw Vulkan handle values for identity
-    key = (UInt64(pipeline.descriptor_set_layout.vks),
-           UInt64(tlas.accel.vks))
-    cached = get(_rt_desc_cache, key, nothing)
+    layout_handle = UInt64(pipeline.descriptor_set_layout.vks)
+    cached = get(tlas.desc_sets, layout_handle, nothing)
     if cached !== nothing
         return cached[2]
     end
 
-    dev = vk_device()
+    dev = pipeline.ctx.device
     desc_pool = Vulkan.DescriptorPool(dev, UInt32(1), [
         Vulkan.DescriptorPoolSize(
             Vulkan.DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, UInt32(1)),
     ])
-    desc_sets = unwrap(Vulkan.allocate_descriptor_sets(dev,
-        Vulkan.DescriptorSetAllocateInfo(desc_pool, [pipeline.descriptor_set_layout])))
+    desc_sets = @vk_checked "vkAllocateDescriptorSets (RT)" Vulkan.allocate_descriptor_sets(dev,
+        Vulkan.DescriptorSetAllocateInfo(desc_pool, [pipeline.descriptor_set_layout]))
     desc_set = desc_sets[1]
 
     as_write = Vulkan.WriteDescriptorSetAccelerationStructureKHR([tlas.accel])
@@ -204,7 +213,7 @@ function get_rt_descriptor_set(pipeline::LavaRTPipeline, tlas::LavaTLAS)
     )
     Vulkan.update_descriptor_sets(dev, [write_ds], [])
 
-    _rt_desc_cache[key] = (desc_pool, desc_set)
+    tlas.desc_sets[layout_handle] = (desc_pool, desc_set)
     return desc_set
 end
 
@@ -214,22 +223,25 @@ end
 Record an RT trace dispatch into the batched command buffer.
 `push_bda` is the BDA address of the argument buffer.
 """
-function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
+function rt_dispatch!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::LavaTLAS,
                       push_bda::UInt64, width::Integer, height::Integer;
                       depth::Integer=1)
-    ctx = vk_context()
-    last_dispatch_info[] = "rt_trace w=$width h=$height"
+    LAST_DISPATCH_INFO[] = "rt_trace w=$width h=$height"
 
-    record_dispatch!(ctx;
+    record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
         extra_dst_access=Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
         is_rt=true,
         info="rt_trace w=$width h=$height"
-    ) do cmd
+    ) do batch
+        cmd = batch.cmd_buf
         desc_set = get_rt_descriptor_set(pipeline, tlas)
         Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline.pipeline)
+        pin!(batch, pipeline)
         Vulkan.cmd_bind_descriptor_sets(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR,
             pipeline.pipeline_layout, UInt32(0), [desc_set], UInt32[])
+        pin!(batch, tlas.accel)
+        pin!(batch, tlas.storage)
         push_constants_bda!(cmd, pipeline.pipeline_layout, pipeline.stage_flags, push_bda)
         Vulkan.cmd_trace_rays_khr(cmd,
             pipeline.raygen_region, pipeline.miss_region,
@@ -239,54 +251,59 @@ function rt_dispatch!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
 end
 
 """
-    rt_dispatch_indirect!(pipeline, tlas, push_bda, indirect_buf; indirect_offset=0)
+    rt_dispatch_indirect!(pipeline, tlas, push_bda, indirect::LavaArray{UInt32,1})
 
 Record an indirect RT trace dispatch. The `indirect_buf` must contain a
 VkTraceRaysIndirectCommandKHR (3×UInt32), written by a previous GPU kernel.
 """
-function rt_dispatch_indirect!(pipeline::LavaRTPipeline, tlas::LavaTLAS,
-                               push_bda::UInt64, indirect_buf;
-                               indirect_offset::Integer=0)
-    ctx = vk_context()
-    last_dispatch_info[] = "rt_indirect"
+function rt_dispatch_indirect!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::LavaTLAS,
+                               push_bda::UInt64, indirect::LavaArray{UInt32,1})
+    LAST_DISPATCH_INFO[] = "rt_indirect"
 
-    record_dispatch!(ctx;
+    record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
         extra_dst_access=Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT,
         is_rt=true,
         info="rt_indirect"
-    ) do cmd
+    ) do batch
+        cmd = batch.cmd_buf
         desc_set = get_rt_descriptor_set(pipeline, tlas)
         Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline.pipeline)
+        pin!(batch, pipeline)
         Vulkan.cmd_bind_descriptor_sets(cmd, Vulkan.PIPELINE_BIND_POINT_RAY_TRACING_KHR,
             pipeline.pipeline_layout, UInt32(0), [desc_set], UInt32[])
+        pin!(batch, tlas.accel)
+        pin!(batch, tlas.storage)
         push_constants_bda!(cmd, pipeline.pipeline_layout, pipeline.stage_flags, push_bda)
 
-        indirect_address = indirect_buf isa VkIndirectBuffer ? indirect_buf.address : indirect_buf.address
+        # bda_address(indirect) includes the view's element offset, so the
+        # address we pass to Vulkan points exactly at the 3-UInt32 command.
         Vulkan.cmd_trace_rays_indirect_khr(cmd,
             pipeline.raygen_region, pipeline.miss_region,
             pipeline.hit_region, pipeline.callable_region,
-            UInt64(indirect_address + indirect_offset))
+            bda_address(indirect))
+        pin!(batch, indirect)
     end
 end
 
 # ── Internal helpers ──
 
-function _create_shader_module(dev, spirv_bytes::Vector{UInt8})
+function create_shader_module(dev, spirv_bytes::Vector{UInt8})
     @assert length(spirv_bytes) % 4 == 0 "SPIR-V must be 4-byte aligned"
     code_u32 = reinterpret(UInt32, spirv_bytes)
     return Vulkan.ShaderModule(dev, length(spirv_bytes), code_u32)
 end
 
 """Build the shader binding table for a 3-group RT pipeline (raygen, miss, chit)."""
-function _build_sbt(dev, pipeline::Vulkan.Pipeline, rt_props::RTPipelineProperties,
+function build_sbt(ctx::VkContext, pipeline::Vulkan.Pipeline, rt_props::RTPipelineProperties,
                     n_groups::Int)
+    dev = ctx.device
     handle_size = rt_props.shader_group_handle_size
     base_align = rt_props.shader_group_base_alignment
 
     # Each group entry must be aligned to shader_group_handle_alignment
     # but stride must be multiple of shader_group_handle_alignment
-    handle_size_aligned = _align_up(handle_size, rt_props.shader_group_handle_alignment)
+    handle_size_aligned = align_up(handle_size, rt_props.shader_group_handle_alignment)
 
     # Get all group handles
     total_handle_data = handle_size * n_groups
@@ -297,19 +314,19 @@ function _build_sbt(dev, pipeline::Vulkan.Pipeline, rt_props::RTPipelineProperti
     # SBT layout:
     # [raygen region | miss region | hit region]
     # Each region is base_align-aligned
-    raygen_stride = _align_up(handle_size_aligned, base_align)
+    raygen_stride = align_up(handle_size_aligned, base_align)
     miss_stride = handle_size_aligned
     hit_stride = handle_size_aligned
 
     raygen_size = raygen_stride  # exactly 1 raygen entry
-    miss_size = _align_up(miss_stride, base_align)  # 1 miss entry, region aligned
-    hit_size = _align_up(hit_stride, base_align)  # 1 hit entry, region aligned
+    miss_size = align_up(miss_stride, base_align)  # 1 miss entry, region aligned
+    hit_size = align_up(hit_stride, base_align)  # 1 hit entry, region aligned
 
-    total_sbt_size = _align_up(raygen_size, base_align) +
-                     _align_up(miss_size, base_align) +
-                     _align_up(hit_size, base_align)
+    total_sbt_size = align_up(raygen_size, base_align) +
+                     align_up(miss_size, base_align) +
+                     align_up(hit_size, base_align)
 
-    sbt_buf = vk_alloc(total_sbt_size;
+    sbt_buf = vk_alloc(ctx.default_bq, total_sbt_size;
         extra_usage=UInt32(Vulkan.BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR))
 
     # Upload SBT data via staging
@@ -319,12 +336,12 @@ function _build_sbt(dev, pipeline::Vulkan.Pipeline, rt_props::RTPipelineProperti
     # Raygen (group 0)
     raygen_offset = offset
     copyto!(sbt_data, offset + 1, handles, 1, handle_size)
-    offset = raygen_offset + _align_up(raygen_size, base_align)
+    offset = raygen_offset + align_up(raygen_size, base_align)
 
     # Miss (group 1)
     miss_offset = offset
     copyto!(sbt_data, offset + 1, handles, handle_size + 1, handle_size)
-    offset = miss_offset + _align_up(miss_size, base_align)
+    offset = miss_offset + align_up(miss_size, base_align)
 
     # Hit (group 2)
     hit_offset = offset
@@ -354,4 +371,4 @@ function _build_sbt(dev, pipeline::Vulkan.Pipeline, rt_props::RTPipelineProperti
     return sbt_buf, raygen_region, miss_region, hit_region, callable_region
 end
 
-_align_up(x, align) = ((x + align - 1) ÷ align) * align
+align_up(x, align) = ((x + align - 1) ÷ align) * align

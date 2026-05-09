@@ -1,17 +1,18 @@
 module Lava
 
-export LavaArray, LavaBackend, LavaBuffer, LavaDeviceArray
+export LavaArray, LavaBackend, LavaDeviceArray, alloc_index_buffer
+export BatchQueue
 export CompilationResult, lava_compile, optimize_spirv
 # Debugging & diagnostics
-export vk_reset_device!, dump_state, gpu_memory_usage
+export vk_reset_device!, dump_state, gpu_memory_usage, allocate_batch_queue!
 export set_dispatch_logging!, get_dispatch_log
 
 # Graphics exports
 export GraphicsPipeline, Rasterizer, TrianglePipeline, LinePipeline
 export RenderWindow, LavaFramebuffer, WindowTarget, OffscreenTarget
 export CompiledGraphicsPipeline, LavaGfxShader
-export draw!, blit!, present_frame!, acquire_next_image!, readback_framebuffer
-export vk_begin_pass!, vk_draw_in_pass!, vk_end_pass!
+export draw!, blit!, present_frame!, acquire_next_image!, readback_framebuffer, readback_window
+export vk_begin_pass!, vk_draw_in_pass!, vk_draw_indexed_in_pass!, vk_end_pass!
 export pack_gfx_args, ensure_compiled!, transition_image!
 export LavaTexture2D, LavaTexture1D, LavaSampler, SampledTexture, LavaTexture
 export TextureBindings, bind_textures
@@ -19,7 +20,7 @@ export TextureBindings, bind_textures
 export ShaderStage, VertexStage, FragmentStage, GeometryStage, TessControlStage, TessEvalStage
 export BlendMode, Opaque, AlphaBlend, Additive, Premultiplied
 export CullFace, NoCull, CullBack, CullFront
-export Topology, TriangleList, TriangleStrip, LineList, LineStrip, PointList, PatchList
+export Topology, TriangleList, TriangleStrip, LineList, LineStrip, PointList, PatchList, LineListAdjacency
 export DepthMode, DepthLess, DepthLessEq, DepthGreater, DepthAlways, DepthOff
 export GeometryConfig, TessConfig
 export TessSpacing, EqualSpacing, FractionalEvenSpacing, FractionalOddSpacing
@@ -28,21 +29,45 @@ export TessDomain, TessTriangles, TessQuads, TessIsolines
 # Graphics device intrinsics
 export vertex_index, instance_index
 export frag_coord, frag_coord_x, frag_coord_y, frag_coord_xy
+export dFdx, dFdy
 export front_facing
 export set_position!, set_point_size!
-export gfx_output, gfx_input
+export gfx_output, gfx_input, gfx_output_flat, gfx_input_flat
 export emit_vertex!, end_primitive!, invocation_id, primitive_id_in
+export geom_input, geom_input_position
 export tess_coord, tess_coord_uvw, set_tess_level_outer!, set_tess_level_inner!
-export sample_texture_2d
+export sample_texture_2d, GfxTexture2D
+
+# Compute kernels
+export write_grain_instances_kernel,
+       quat_to_rot3x3, build_4x3, build_4x3_pervec
 
 # Ray tracing exports
-export HardwareAccel, RTRay, RTHitResult
+export LavaInstanceRecord, identity_transform, Mat3x4f
+export GeometryType, TrianglesGeometry, AABBsGeometry, AABB
+# Re-export Raycore.Ray so `using Lava` users get Ray without ambiguity
+export Ray
+export HardwareAccel, RTRay, RTHitResult, ASBuildContext, as_build
+export refit_tlas!
 export trace_closest_hits!, trace_closest_hits_indirect!, RayTracingPipeline, trace_rays!, trace_rays_indirect!
 export set_anyhit_pipeline!, trace_closest_hits_anyhit!, trace_closest_hits_anyhit_indirect!
 export lava_rt_ignore_intersection, lava_rt_terminate_ray
+export HWTLAS, HWAdaptedAccel
+# P4 narrow-phase convex shapes
+export ConvexShape, UnitCube, support
+# P4.2 GJK overlap test
+export gjk, GJKResult
+# P4.3 EPA penetration recovery
+export epa, EPAResult
+# P4.4 narrow-phase kernel composing gjk + epa
+export narrow_phase_kernel, NO_CONTACT
+# P4.5 contact record + per-grain contact buffer + fused narrow-phase
+export ContactRecord, narrow_phase_contacts_kernel
 
+import Serialization
 using Vulkan
 using GPUCompiler
+using Raycore: Ray
 using LLVM
 using LLVM: API
 using GPUArrays
@@ -52,6 +77,7 @@ using Adapt
 using Atomix
 using SPIRV_Tools_jll
 using LinearAlgebra
+using StaticArrays
 using GeometryBasics
 import GLFW
 
@@ -70,6 +96,8 @@ include("compiler/spirv/emit.jl")
 
 # ---- LLVM passes ----
 include("compiler/passes/lift_geps.jl")
+include("compiler/passes/retype_allocas.jl")
+include("compiler/passes/cfg_utils.jl")
 include("compiler/passes/structurize_cfg.jl")
 include("compiler/passes/prepare_vulkan.jl")
 include("compiler/passes/lower_intrinsics.jl")
@@ -82,6 +110,7 @@ include("compiler/compilation.jl")
 # Planned files consolidated into emit.jl (4431 lines) and compilation.jl:
 #   sourcemap.jl, intrinsics.jl, control_flow.jl, decorations.jl, compute.jl
 include("compiler/spirv/raytracing.jl")    # RT stages, OpTraceRayKHR, payload handling
+include("compiler/spirv/rayquery.jl")     # VK_KHR_ray_query capabilities + emission
 include("compiler/spirv/graphics.jl")     # Graphics stages, I/O variables, emit_vertex
 
 # ---- Device functions ----
@@ -89,6 +118,7 @@ include("compiler/spirv/graphics.jl")     # Graphics stages, I/O variables, emit
 include("device/math.jl")
 include("device/quirks.jl")
 include("device/rt_intrinsics.jl")  # RT builtins + trace_ray intrinsic
+include("device/ray_query_intrinsics.jl")  # lava_ray_query_init
 include("device/gfx_intrinsics.jl")  # Graphics builtins + shader I/O intrinsics
 # atomics.jl is included after lavaarray.jl (needs LavaDeviceArray)
 
@@ -102,8 +132,10 @@ include("runtime/intrinsics.jl")
 # ---- Array interface (before launch.jl because it references LavaArray) ----
 include("array/lavaarray.jl")
 include("device/atomics.jl")  # needs LavaDeviceArray from lavaarray.jl
+include("device/subgroup.jl") # subgroup / group-non-uniform intrinsics
+include("array/pin_leaves.jl") # @generated walker that pins LavaArray leaves per batch
 
-# ---- Launch API (depends on LavaArray and LavaBuffer) ----
+# ---- Launch API (depends on LavaArray / LavaDeviceArray) ----
 include("runtime/launch.jl")
 # runtime/sync.jl — sync handled via vk_flush!() in launch.jl
 
@@ -120,10 +152,20 @@ include("graphics/textures.jl")      # LavaTexture2D, LavaSampler, descriptor se
 include("graphics/api.jl")           # GraphicsPipeline, draw!, blit!, present_frame!
 
 # ---- Phase 2: Ray Tracing ----
+include("raytracing/geometry_types.jl")  # GeometryType hierarchy + AABB struct
+include("raytracing/instance_record.jl") # LavaInstanceRecord — 64-byte TLAS instance struct
 include("raytracing/acceleration.jl")  # BLAS/TLAS build
 include("raytracing/pipeline.jl")      # RT pipeline + SBT + dispatch
 include("raytracing/shaders.jl")       # High-level RayTracingPipeline API
 include("raytracing/raycore_compat.jl") # HardwareAccel + trace_closest_hits!
+include("raytracing/hwtlas.jl")         # Lava.HWTLAS — concrete AbstractAccel
+include("raytracing/convex_shape.jl")   # ConvexShape abstract + UnitCube + support (P4)
+include("raytracing/gjk.jl")            # GJK overlap test + GJKResult (P4.2)
+include("raytracing/epa.jl")            # EPA penetration recovery + EPAResult (P4.3)
+
+# ---- Compute kernels ----
+include("kernels/instance_writer.jl")   # write_grain_instances_kernel + helpers
+include("kernels/narrow_phase.jl")      # narrow_phase_kernel composing gjk + epa (P4.4)
 
 # ---- Default settings ----
 # Disable scalar indexing by default (GPU arrays should not be accessed element-by-element)
@@ -137,12 +179,20 @@ GPUArraysCore.allowscalar(false)
 Return current GPU memory usage statistics.
 """
 function gpu_memory_usage()
+    ctx = VK_CONTEXT_REF[]
+    bq_deferred = 0
+    n_arg_slabs = 0
+    if ctx !== nothing
+        bq = ctx.default_bq
+        bq_deferred = length(bq.deferred_frees) + length(bq.deferred_as_frees)
+        n_arg_slabs = length(bq.arg_slabs)
+    end
     (live_bytes = GPU_LIVE_BYTES[],
-     live_buffers = length(_live_buffers),
-     deferred_frees = length(DEFERRED_FREES),
-     arg_slabs = length(_arg_slabs),
-     pipelines_cached = length(_pipeline_cache),
-     kernels_cached = length(_kernel_cache))
+     LIVE_BUFFERS = length(LIVE_BUFFERS),
+     deferred_frees = bq_deferred,
+     ARG_SLABS = n_arg_slabs,
+     pipelines_cached = length(PIPELINE_CACHE),
+     kernels_cached = length(LINKED_KERNEL_CACHE))
 end
 
 """
@@ -151,26 +201,30 @@ end
 Print a comprehensive summary of Lava.jl runtime state for debugging.
 """
 function dump_state(; io::IO=stdout)
-    ctx = _vk_context[]
+    ctx = VK_CONTEXT_REF[]
     println(io, "=== Lava.jl State ===")
     println(io, "Device: ", ctx === nothing ? "not initialized" : ctx.device_name)
-    println(io, "Device lost: ", _device_lost[])
+    println(io, "Device lost: ", device_lost())
     mem = gpu_memory_usage()
     live_mb = mem.live_bytes ÷ (1024 * 1024)
-    println(io, "GPU memory: $(live_mb) MiB in $(mem.live_buffers) buffers ($(mem.deferred_frees) deferred)")
-    println(io, "Pipelines cached: $(mem.pipelines_cached) (max $(_max_pipeline_cache_size[]))")
-    println(io, "Kernels cached: $(mem.kernels_cached) (max $(_max_kernel_cache_size[]))")
-    println(io, "Arg slabs: $(mem.arg_slabs) (slab_idx=$(_arg_slab_idx[]), offset=$(_arg_slab_offset[]))")
+    println(io, "GPU memory: $(live_mb) MiB in $(mem.LIVE_BUFFERS) buffers ($(mem.deferred_frees) deferred)")
+    println(io, "Pipelines cached: $(mem.pipelines_cached) (max $(MAX_PIPELINE_CACHE_SIZE[]))")
+    println(io, "Kernels cached: $(mem.kernels_cached)")
     if ctx !== nothing
-        println(io, "Free batches: $(length(ctx.free_batches))")
-        println(io, "Free cmd bufs: $(length(ctx.free_cmd_bufs))")
-        println(io, "CB split threshold: $(cb_split_threshold[])")
+        bq = ctx.default_bq
+        println(io, "Arg slabs: $(length(bq.arg_slabs)) (slab_idx=$(bq.arg_slab_idx), offset=$(bq.arg_slab_offset))")
+    end
+    if ctx !== nothing
+        bq = ctx.default_bq
+        println(io, "Free batches: $(length(bq.free_batches))")
+        println(io, "Free cmd bufs: $(length(bq.free_cmd_bufs))")
+        println(io, "CB split threshold: $(CB_SPLIT_THRESHOLD[])")
     end
     println(io, "Flushes: $(FLUSH_COUNTER[])")
     println(io, "Total dispatches: $(TOTAL_DISPATCH_COUNTER[])")
-    println(io, "Dispatch logging: $(dispatch_logging_enabled[])")
-    if !isempty(dispatch_log)
-        println(io, "Last dispatch: ", last(dispatch_log))
+    println(io, "Dispatch logging: $(DISPATCH_LOGGING_ENABLED[])")
+    if !isempty(DISPATCH_LOG)
+        println(io, "Last dispatch: ", last(DISPATCH_LOG))
     end
     return nothing
 end
@@ -179,13 +233,21 @@ function __init__()
     # Reset runtime counters that should not survive precompilation.
     # These Ref values get serialized into the pkgimage — a device crash
     # during precompilation would permanently poison all future sessions.
-    _device_lost[] = false
     FLUSH_COUNTER[] = 0
     TOTAL_DISPATCH_COUNTER[] = 0
-    last_dispatch_info[] = ""
-    prev_dispatch_info[] = ""
-    empty!(dispatch_log)
-    _init_pipeline_thread!()
+    LAST_DISPATCH_INFO[] = ""
+    PREV_DISPATCH_INFO[] = ""
+    empty!(DISPATCH_LOG)
+    init_pipeline_thread!()
+
+    # Mark device as lost during shutdown so GC finalizers don't call into
+    # the Vulkan driver after it's been torn down. The atexit hook runs
+    # before Julia's global finalizer sweep.
+    atexit() do
+        ctx = VK_CONTEXT_REF[]
+        ctx === nothing || mark_device_lost!(ctx)
+        VK_CONTEXT_REF[] = nothing
+    end
 end
 
 end # module Lava

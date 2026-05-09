@@ -51,6 +51,9 @@ module Op
     const OpLoad                    = UInt16(61)
     const OpStore                   = UInt16(62)
     const OpAccessChain             = UInt16(65)
+    const OpInBoundsAccessChain     = UInt16(66)
+    const OpPtrAccessChain          = UInt16(67)
+    const OpInBoundsPtrAccessChain  = UInt16(70)
     const OpDecorate                = UInt16(71)
     const OpMemberDecorate          = UInt16(72)
     const OpConvertFToU             = UInt16(109)
@@ -123,6 +126,9 @@ module Op
     const OpShiftRightLogical       = UInt16(194)
     const OpShiftRightArithmetic    = UInt16(195)
     const OpShiftLeftLogical        = UInt16(196)
+    const OpDPdx                    = UInt16(207)
+    const OpDPdy                    = UInt16(208)
+    const OpFwidth                  = UInt16(209)
     const OpControlBarrier          = UInt16(224)
     const OpMemoryBarrier           = UInt16(225)
     const OpAtomicLoad              = UInt16(227)
@@ -140,6 +146,37 @@ module Op
     const OpAtomicAnd               = UInt16(240)
     const OpAtomicOr                = UInt16(241)
     const OpAtomicXor               = UInt16(242)
+    # Float atomics (SPV_EXT_shader_atomic_float_add / _min_max)
+    const OpAtomicFAddEXT           = UInt16(6035)
+    const OpAtomicFMinEXT           = UInt16(5614)
+    const OpAtomicFMaxEXT           = UInt16(5615)
+    # Subgroup / group-non-uniform ops (Vulkan 1.1 core)
+    const OpGroupNonUniformElect                = UInt16(333)
+    const OpGroupNonUniformAll                  = UInt16(334)
+    const OpGroupNonUniformAny                  = UInt16(335)
+    const OpGroupNonUniformBroadcast            = UInt16(337)
+    const OpGroupNonUniformBroadcastFirst       = UInt16(338)
+    const OpGroupNonUniformBallot               = UInt16(339)
+    const OpGroupNonUniformShuffle              = UInt16(345)
+    const OpGroupNonUniformShuffleXor           = UInt16(346)
+    const OpGroupNonUniformShuffleUp            = UInt16(347)
+    const OpGroupNonUniformShuffleDown          = UInt16(348)
+    const OpGroupNonUniformIAdd                 = UInt16(349)
+    const OpGroupNonUniformFAdd                 = UInt16(350)
+    const OpGroupNonUniformIMul                 = UInt16(351)
+    const OpGroupNonUniformFMul                 = UInt16(352)
+    const OpGroupNonUniformSMin                 = UInt16(353)
+    const OpGroupNonUniformUMin                 = UInt16(354)
+    const OpGroupNonUniformFMin                 = UInt16(355)
+    const OpGroupNonUniformSMax                 = UInt16(356)
+    const OpGroupNonUniformUMax                 = UInt16(357)
+    const OpGroupNonUniformFMax                 = UInt16(358)
+    const OpGroupNonUniformBitwiseAnd           = UInt16(359)
+    const OpGroupNonUniformBitwiseOr            = UInt16(360)
+    const OpGroupNonUniformBitwiseXor           = UInt16(361)
+    const OpGroupNonUniformLogicalAnd           = UInt16(362)
+    const OpGroupNonUniformLogicalOr            = UInt16(363)
+    const OpGroupNonUniformLogicalXor           = UInt16(364)
     const OpConvertPtrToU           = UInt16(117)
     const OpConvertUToPtr           = UInt16(120)
     const OpCompositeExtract        = UInt16(81)
@@ -162,6 +199,22 @@ module Op
     # Geometry shader
     const OpEmitVertex              = UInt16(218)
     const OpEndPrimitive            = UInt16(219)
+    # VK_KHR_ray_query opcodes (SPV_KHR_ray_query)
+    const OpTypeRayQueryKHR                               = UInt16(4472)
+    const OpRayQueryInitializeKHR                         = UInt16(4473)
+    const OpRayQueryTerminateKHR                          = UInt16(4474)
+    const OpRayQueryGenerateIntersectionKHR               = UInt16(4475)
+    const OpRayQueryConfirmIntersectionKHR                = UInt16(4476)
+    const OpRayQueryProceedKHR                            = UInt16(4477)
+    const OpRayQueryGetIntersectionTypeKHR                = UInt16(4479)
+    const OpRayQueryGetIntersectionTKHR                   = UInt16(6018)
+    const OpRayQueryGetIntersectionInstanceCustomIndexKHR = UInt16(6019)
+    const OpRayQueryGetIntersectionInstanceIdKHR          = UInt16(6020)
+    const OpRayQueryGetIntersectionPrimitiveIndexKHR      = UInt16(6023)
+    const OpRayQueryGetIntersectionBarycentricsKHR        = UInt16(6024)
+    # Intersection-kind operand to GetIntersection* (and related ops)
+    const RayQueryCandidateIntersectionKHR = UInt32(0)
+    const RayQueryCommittedIntersectionKHR = UInt32(1)
 end
 
 # ---- Capabilities ----
@@ -171,6 +224,7 @@ module Cap
     const Float64                       = UInt32(10)
     const Int8                          = UInt32(39)
     const Int64                         = UInt32(11)
+    const Int64Atomics                  = UInt32(12)
     const Int16                         = UInt32(22)
     const StorageBuffer16BitAccess      = UInt32(4433)
     const VulkanMemoryModel             = UInt32(5345)
@@ -184,6 +238,20 @@ module Cap
     const WorkgroupMemoryExplicitLayoutKHR = UInt32(4428)
     const WorkgroupMemoryExplicitLayout8BitAccessKHR = UInt32(4429)
     const WorkgroupMemoryExplicitLayout16BitAccessKHR = UInt32(4430)
+    # Float atomic ops (VK_EXT_shader_atomic_float / SPV_EXT_shader_atomic_float_add)
+    const AtomicFloat32AddEXT           = UInt32(6033)
+    const AtomicFloat64AddEXT           = UInt32(6034)
+    const AtomicFloat16AddEXT           = UInt32(6095)
+    # Subgroup ops (Vulkan 1.1 core)
+    const GroupNonUniform               = UInt32(61)
+    const GroupNonUniformVote           = UInt32(62)
+    const GroupNonUniformArithmetic     = UInt32(63)
+    const GroupNonUniformBallot         = UInt32(64)
+    const GroupNonUniformShuffle        = UInt32(65)
+    const GroupNonUniformShuffleRelative = UInt32(66)
+    const GroupNonUniformClustered      = UInt32(67)
+    const GroupNonUniformQuad           = UInt32(68)
+    const RayQueryKHR                   = UInt32(4472)
 end
 
 # ---- Storage Classes ----
@@ -225,7 +293,7 @@ module Dec
     const DescriptorSet     = UInt32(34)
     const Offset            = UInt32(35)
     const Restrict          = UInt32(42)
-    const Aliased           = UInt32(43)
+    const Aliased           = UInt32(20)
 end
 
 # ---- Built-in Variables ----
@@ -359,6 +427,17 @@ module FuncControl
     const DontInline = UInt32(2)
 end
 
+# ---- Group Operation (for OpGroupNonUniform* reductions/scans) ----
+module GroupOp
+    const Reduce              = UInt32(0)
+    const InclusiveScan       = UInt32(1)
+    const ExclusiveScan       = UInt32(2)
+    const ClusteredReduce     = UInt32(3)
+    const PartitionedReduceNV         = UInt32(6)
+    const PartitionedInclusiveScanNV  = UInt32(7)
+    const PartitionedExclusiveScanNV  = UInt32(8)
+end
+
 # ================================================================
 # SPIR-V Module Builder
 # ================================================================
@@ -411,7 +490,7 @@ mutable struct SPIRVModule
     declared_extensions::Set{String}
 
     # Source mapping: SPIR-V result ID → (julia_file, julia_line)
-    # Populated during emission by _record_source_location!()
+    # Populated during emission by record_source_location!()
     source_locations::Dict{UInt32, Tuple{String, Int}}
 end
 

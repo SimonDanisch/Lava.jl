@@ -49,10 +49,25 @@ draw!(pipeline, framebuffer; vertices=mesh, uniforms=params)
 ```
 
 ```julia
-# Hardware Ray Tracing: Julia materials on RT hardware
-hw = HardwareAccel(scene.accel)
-trace_closest_hits!(hits, rays, hw)
+# Hardware Ray Tracing: Julia-side TLAS with mesh-update support
+using Raycore: RTRay, RTHitResult
+using GeometryBasics, StaticArrays, LinearAlgebra
+
+hwtlas = HWTLAS(LavaBackend())
+push!(hwtlas, mesh, SMatrix{4,4,Float32}(I); instance_id=UInt32(1))
+Raycore.sync!(hwtlas)
+
+rays = LavaArray([RTRay(0,0,5, 0, 0,0,-1, 1f3)])
+hits = LavaArray(fill(RTHitResult(0,0,0,0,0,0,0,0), 1))
+trace_closest_hits!(hits, rays, hwtlas.hw_accel, 1)
 ```
+
+`HWTLAS` is the recommended high-level entry point. It owns the Vulkan TLAS
++ BLAS lifecycle, supports incremental geometry updates via `push!` /
+`delete!` / `update_transform!`, and implements the `Raycore.AbstractAccel`
+contract so the same code works against software and hardware backends.
+`HardwareAccel` remains available as a lower-level handle for advanced
+users who need direct control of the pipeline/SBT.
 
 ## Benchmarks — AMD RX 7900 XTX
 

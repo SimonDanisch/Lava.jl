@@ -10,7 +10,7 @@
 # ── 3D Builtin Variables ──
 # Each produces a load from `<3 x i32>` global, extracting one component.
 
-const _BUILTIN_3D = (
+const BUILTIN_3D = (
     :lava_global_invocation_id => :__spirv_BuiltInGlobalInvocationId,
     :lava_local_invocation_id  => :__spirv_BuiltInLocalInvocationId,
     :lava_workgroup_id         => :__spirv_BuiltInWorkgroupId,
@@ -18,7 +18,7 @@ const _BUILTIN_3D = (
     :lava_workgroup_size       => :__spirv_BuiltInWorkgroupSize,
 )
 
-for (jl_name, spirv_name) in _BUILTIN_3D
+for (jl_name, spirv_name) in BUILTIN_3D
     gvar = "@$spirv_name"
     ir = """
         $gvar = external addrspace(7) global <3 x i32>
@@ -71,4 +71,4 @@ end
 end
 
 # Register barrier intrinsic so GPUCompiler doesn't complain
-push!(known_intrinsics, "llvm.spv.group.memory.barrier.with.group.sync")
+push!(KNOWN_INTRINSICS, "llvm.spv.group.memory.barrier.with.group.sync")

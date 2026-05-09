@@ -2,8 +2,28 @@
 #
 # These test that our SPIR-V emitter handles production-grade nested structs,
 # complex control flow, and atomic patterns. No GPU dispatch — compilation only.
+#
+# Requires Hikari + Raycore — skipped if not available (e.g. CI without [sources]).
 
 using Test
+
+# Guard: skip entire file if Hikari/Raycore aren't loadable. `return` at
+# toplevel of an `include`d file is NOT an early exit in Julia, so wrap the
+# rest of the file in an `if` instead.
+const _can_load_hikari_raycore = try
+    Base.require(Main, :Hikari)
+    Base.require(Main, :Raycore)
+    true
+catch
+    false
+end
+
+if !_can_load_hikari_raycore
+    @testset "Real Kernel Compilation" begin
+        @test_broken false  # mark as known-skipped
+    end
+else
+
 if !@isdefined(SPIRVTestUtils)
     include(joinpath(@__DIR__, "..", "spirv_test_utils.jl"))
 end
@@ -201,7 +221,7 @@ using StaticArrays
                 # Create a VPShadowRayWorkItem and write it
                 ray = Raycore.Ray(Point3f(val, 0.0f0, 0.0f0),
                                   Vec3f(0.0f0, 0.0f0, 1.0f0),
-                                  1000.0f0, 0.0f0)
+                                  0.0f0, 1000.0f0, 0.0f0)
                 lambda = Hikari.SampledWavelengths{4}(
                     NTuple{4, Float32}((400.0f0, 500.0f0, 600.0f0, 700.0f0)),
                     NTuple{4, Float32}((0.25f0, 0.25f0, 0.25f0, 0.25f0)))
@@ -228,6 +248,64 @@ using StaticArrays
         end
     end
 
+    # ── Test 7: vp_sample_surface_direct_lighting_kernel! with Conductor{PiecewiseLinearSpectrum{56}} ──
+    # Regression test for retype_allocas bug: LLVM emits a float access (f32/f64) wider than the
+    # alloca's chosen integer element type (e.g. T=i8), hitting the decomposition branch that
+    # only handled int→int.  Fix: pick_uniform_type bails when decomp would involve non-integer types.
+    @testset "vp_sample_surface_direct_lighting_kernel! — Conductor PiecewiseLinearSpectrum" begin
+        using KernelAbstractions
+
+        T_mat_eval_wq = Lava.LavaDeviceArray{Hikari.VPMaterialEvalWorkItem, 1}
+        T_size         = Lava.LavaDeviceArray{Int32, 1}
+        T_in_q  = Hikari.WorkQueue{Hikari.VPMaterialEvalWorkItem, T_mat_eval_wq, T_size}
+        T_out_q = Hikari.WorkQueue{Hikari.VPShadowRayWorkItem,
+                                    Lava.LavaDeviceArray{Hikari.VPShadowRayWorkItem, 1}, T_size}
+        T_mats  = Raycore.StaticMultiTypeSet{Tuple{
+            Lava.LavaDeviceArray{Hikari.Emissive{Hikari.RGBSpectrum}, 1},
+            Lava.LavaDeviceArray{Hikari.Conductor{Hikari.PiecewiseLinearSpectrum{56}, Hikari.PiecewiseLinearSpectrum{56}, Float32, Hikari.RGBSpectrum}, 1},
+            Lava.LavaDeviceArray{Hikari.CoatedDiffuse{Hikari.RGBSpectrum, Float32, Float32, Float32, Hikari.RGBSpectrum, Float32}, 1},
+            Lava.LavaDeviceArray{Hikari.Dielectric{Hikari.RGBSpectrum, Hikari.RGBSpectrum, Float32, Float32, Float32}, 1},
+            Lava.LavaDeviceArray{Hikari.Diffuse{Hikari.RGBSpectrum, Float32}, 1},
+        }, Tuple{}}
+        T_lights = Raycore.StaticMultiTypeSet{Tuple{
+            Lava.LavaDeviceArray{Hikari.DiffuseAreaLight{Hikari.RGBSpectrum}, 1},
+        }, Tuple{}}
+        T_rgb_table = Hikari.RGBToSpectrumTable{
+            Lava.LavaDeviceArray{Float32, 1},
+            Lava.LavaDeviceArray{Float32, 5},
+            Lava.LavaDeviceArray{Float32, 1}}
+
+        ws = 256
+        kernel_obj = Hikari.workqueue_map_kernel!(Lava.LavaBackend(), ws)
+        iterspace, _ = KernelAbstractions.partition(kernel_obj, (1024 * 1024 * ws,), (ws,))
+        ctx = KernelAbstractions.mkcontext(kernel_obj, (1024 * 1024 * ws,), iterspace)
+
+        tt = Tuple{
+            typeof(ctx),
+            typeof(Hikari.vp_sample_surface_direct_lighting_kernel!),
+            T_in_q, T_out_q, T_mats, T_lights,
+            T_rgb_table,
+            Lava.LavaDeviceArray{Hikari.LightBVHNode, 1},
+            Lava.LavaDeviceArray{Int32, 1},
+            Int32, Int32, Int32,
+            Lava.LavaDeviceArray{Float32, 1},
+            Lava.LavaDeviceArray{Point{2, Float32}, 1},
+            Hikari.PerspectiveCamera,
+            Int32, Bool,
+        }
+
+        d, bytes = compile_and_disasm(Hikari.gpu_workqueue_map_kernel!, tt;
+                                       workgroup_size=(ws, 1, 1))
+        @test !isempty(bytes)
+        @testset "vendor safety" begin
+            check_vendor_safety(d)
+        end
+        @testset "spirv-opt roundtrip" begin
+            opt = spirv_opt_roundtrip(bytes)
+            @test !isempty(opt)
+        end
+    end
+
 end
 
-
+end  # if _can_load_hikari_raycore

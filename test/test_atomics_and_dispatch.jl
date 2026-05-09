@@ -32,15 +32,19 @@ using Atomix
         @test !occursin("MakeAvailable", d)
     end
 
-    @testset "monotonic cmpxchg (f32 CAS) → Relaxed" begin
-        function f32_cas_add(counter)
+    @testset "monotonic f32 atomic → hardware OpAtomicFAddEXT" begin
+        function f32_fadd(counter)
             Atomix.@atomic counter[1] += 1.0f0
             return nothing
         end
-        result = Lava.lava_compile_gpu(f32_cas_add,
+        result = Lava.lava_compile_gpu(f32_fadd,
             Tuple{Lava.LavaDeviceArray{Float32,1}}; workgroup_size=(64,1,1), validate=true)
         d = Lava.disassemble_spirv(result.spirv_bytes)
-        @test occursin("OpAtomicCompareExchange", d)
+        # Float32 atomics use VK_EXT_shader_atomic_float's OpAtomicFAddEXT —
+        # no more CAS loop (the previous emulation went through cmpxchg).
+        @test occursin("OpAtomicFAddEXT", d)
+        @test occursin("AtomicFloat32AddEXT", d)
+        @test !occursin("OpAtomicCompareExchange", d)
         @test !occursin("MakeVisible", d)
         @test !occursin("MakeAvailable", d)
     end
@@ -77,7 +81,7 @@ end
         N = 4096
         counter = Lava.LavaArray(Int32[0])
         atomic_counter_i32!(Lava.LavaBackend())(counter; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(counter)[1] == Int32(N)
     end
 
@@ -89,7 +93,7 @@ end
         N = 4096
         counter = Lava.LavaArray(UInt32[0])
         atomic_counter_u32!(Lava.LavaBackend())(counter; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(counter)[1] == UInt32(N)
     end
 
@@ -101,7 +105,7 @@ end
         N = 1024
         counter = Lava.LavaArray(Float32[0])
         atomic_counter_f32!(Lava.LavaBackend())(counter; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(counter)[1] ≈ Float32(N)
     end
 
@@ -116,7 +120,7 @@ end
         counter = Lava.LavaArray(Int32[0])
         results = Lava.LavaArray(zeros(Int32, N))
         atomic_unique!(Lava.LavaBackend())(counter, results; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
 
         r = Array(results)
         @test Array(counter)[1] == Int32(N)
@@ -164,7 +168,7 @@ end
         siblings_d = Lava.LavaArray(siblings_h)
 
         refit_pattern!(Lava.LavaBackend())(data, flags, results, parents_d, siblings_d; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
 
         r = Array(results)
         expected = Float32[(2k - 1) * 10 + (2k) * 10 for k in 1:P]
@@ -183,7 +187,7 @@ end
         b = Lava.LavaArray(Float32[10, 20, 30, 40])
         c = a .+ b
         d = c .* Float32(2)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Array(d) == Float32[22, 44, 66, 88]
     end
 
@@ -191,18 +195,18 @@ end
         before = Lava.FLUSH_COUNTER[]
         a = Lava.LavaArray(Float32[1, 2, 3])
         _ = a .+ Float32(1)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Lava.FLUSH_COUNTER[] > before
     end
 
     @testset "dispatch counter increments" begin
-        Lava.dispatch_logging_enabled[] = true
+        Lava.DISPATCH_LOGGING_ENABLED[] = true
         before = Lava.TOTAL_DISPATCH_COUNTER[]
         a = Lava.LavaArray(Float32[1, 2, 3])
         _ = a .+ Float32(1)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Lava.TOTAL_DISPATCH_COUNTER[] > before
-        Lava.dispatch_logging_enabled[] = false
+        Lava.DISPATCH_LOGGING_ENABLED[] = false
     end
 
     @testset "KA.synchronize flushes GPU work" begin
@@ -218,7 +222,7 @@ end
 
     @testset "empty flush is no-op" begin
         before = Lava.FLUSH_COUNTER[]
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test Lava.FLUSH_COUNTER[] == before
     end
 
@@ -237,7 +241,7 @@ end
         B = Lava.LavaArray(zeros(Float32, N))
         write_val!(Lava.LavaBackend())(A, 42.0f0; ndrange=N)
         read_add!(Lava.LavaBackend())(B, A; ndrange=N)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test all(Array(B) .== 43.0f0)
     end
 
@@ -250,20 +254,20 @@ end
         A = Lava.LavaArray(zeros(Float32, 1024))
         fill_index!(Lava.LavaBackend())(A; ndrange=1024)
         GC.gc()
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         result = Array(A)
         @test result[1] == 1.0f0
         @test result[1024] == 1024.0f0
     end
 
     @testset "dispatch log records entries" begin
-        Lava.dispatch_logging_enabled[] = true
-        empty!(Lava.dispatch_log)
+        Lava.DISPATCH_LOGGING_ENABLED[] = true
+        empty!(Lava.DISPATCH_LOG)
         a = Lava.LavaArray(Float32[1, 2, 3])
         _ = a .+ Float32(1)
-        Lava.vk_flush!()
-        @test !isempty(Lava.dispatch_log)
-        Lava.dispatch_logging_enabled[] = false
+        Lava.vk_flush!(Lava.vk_context())
+        @test !isempty(Lava.DISPATCH_LOG)
+        Lava.DISPATCH_LOGGING_ENABLED[] = false
     end
 end
 
@@ -278,14 +282,14 @@ end
         for _ in 1:10
             a = a .+ Float32(1)
         end
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test all(Array(a) .== 11.0f0)
     end
 
     @testset "interleaved compute and reduction" begin
         a = Lava.LavaArray(Float32[1, 2, 3, 4, 5, 6, 7, 8])
         b = a .* Float32(2)
-        Lava.vk_flush!()
+        Lava.vk_flush!(Lava.vk_context())
         @test sum(b) ≈ 72.0f0
     end
 
@@ -295,5 +299,154 @@ end
         b = a .+ Float32(1)
         KernelAbstractions.synchronize(Lava.LavaBackend())
         @test all(Array(b) .== 2.0f0)
+    end
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# Tier 3: GPU Execution — Atomix with CartesianIndex + Float32 subtract
+# ═══════════════════════════════════════════════════════════════════════
+
+@testset "KA @private (Scratchpad)" begin
+    @kernel function private_accum!(A)
+        I = @index(Global)
+        priv = @private Float32 (4,)
+        @inbounds for k in 1:4
+            priv[k] = Float32(I * k)
+        end
+        @inbounds A[I] = priv[1] + priv[4]
+    end
+
+    a = Lava.LavaArray(zeros(Float32, 64))
+    private_accum!(Lava.LavaBackend(), 64)(a; ndrange=64)
+    Lava.vk_flush!(Lava.vk_context())
+    result = Array(a)
+    @test result[1] == 1f0 + 4f0
+    @test result[10] == 10f0 + 40f0
+end
+
+@testset "Int64/UInt64 atomics" begin
+    @testset "Int64 atomic add" begin
+        @kernel function atomic_add_i64!(counter)
+            Atomix.@atomic counter[1] += Int64(1)
+        end
+        N = 2048
+        c = Lava.LavaArray(Int64[0])
+        atomic_add_i64!(Lava.LavaBackend())(c; ndrange=N)
+        Lava.vk_flush!(Lava.vk_context())
+        @test Array(c)[1] == Int64(N)
+    end
+
+    @testset "UInt64 atomic add" begin
+        @kernel function atomic_add_u64!(counter)
+            Atomix.@atomic counter[1] += UInt64(1)
+        end
+        N = 1024
+        c = Lava.LavaArray(UInt64[0])
+        atomic_add_u64!(Lava.LavaBackend())(c; ndrange=N)
+        Lava.vk_flush!(Lava.vk_context())
+        @test Array(c)[1] == UInt64(N)
+    end
+end
+
+@testset "Float64 atomics" begin
+    @testset "Float64 atomic add" begin
+        @kernel function atomic_add_f64!(counter)
+            Atomix.@atomic counter[1] += 1.0
+        end
+        N = 1024
+        c = Lava.LavaArray(Float64[0.0])
+        atomic_add_f64!(Lava.LavaBackend())(c; ndrange=N)
+        Lava.vk_flush!(Lava.vk_context())
+        @test Array(c)[1] ≈ Float64(N)
+    end
+
+    @testset "Float64 atomic subtract" begin
+        @kernel function atomic_sub_f64!(counter)
+            Atomix.@atomic counter[1] -= 1.0
+        end
+        N = 1024
+        c = Lava.LavaArray(Float64[Float64(N)])
+        atomic_sub_f64!(Lava.LavaBackend())(c; ndrange=N)
+        Lava.vk_flush!(Lava.vk_context())
+        @test Array(c)[1] ≈ 0.0
+    end
+end
+
+@testset "Atomix CartesianIndex and Float32 subtract" begin
+
+    @testset "Float32 atomic subtract" begin
+        @kernel function atomic_sub_f32!(counter)
+            Atomix.@atomic counter[1] -= 1.0f0
+        end
+
+        N = 1024
+        counter = Lava.LavaArray(Float32[Float32(N)])
+        atomic_sub_f32!(Lava.LavaBackend())(counter; ndrange=N)
+        Lava.vk_flush!(Lava.vk_context())
+        @test Array(counter)[1] ≈ 0.0f0
+    end
+
+    @testset "Atomix with CartesianIndex on 3D array" begin
+        @kernel function atomic_add_3d!(A, idx_array)
+            i = @index(Global)
+            @inbounds ci = idx_array[i]
+            Atomix.@atomic A[ci] += 1.0f0
+        end
+
+        dims = (4, 4, 4)
+        A = Lava.LavaArray(zeros(Float32, dims))
+        # All threads write to the same CartesianIndex
+        target = CartesianIndex(2, 3, 1)
+        N = 512
+        idx_array = Lava.LavaArray(fill(target, N))
+        atomic_add_3d!(Lava.LavaBackend())(A, idx_array; ndrange=N)
+        Lava.vk_flush!(Lava.vk_context())
+        result = Array(A)
+        @test result[2, 3, 1] ≈ Float32(N)
+        @test sum(result) ≈ Float32(N)  # only one cell was touched
+    end
+
+    @testset "Atomix subtract with CartesianIndex on 2D array" begin
+        @kernel function atomic_sub_2d!(A, idx_array, val)
+            i = @index(Global)
+            @inbounds ci = idx_array[i]
+            Atomix.@atomic A[ci] -= val
+        end
+
+        dims = (8, 8)
+        N = 256
+        target = CartesianIndex(4, 5)
+        A = Lava.LavaArray(fill(Float32(N), dims))
+        idx_array = Lava.LavaArray(fill(target, N))
+        atomic_sub_2d!(Lava.LavaBackend())(A, idx_array, 1.0f0; ndrange=N)
+        Lava.vk_flush!(Lava.vk_context())
+        result = Array(A)
+        @test result[4, 5] ≈ 0.0f0
+        # All other cells untouched
+        result[4, 5] = Float32(N)
+        @test all(result .== Float32(N))
+    end
+
+    @testset "Atomix with N integer indices on 2D array (no CartesianIndex)" begin
+        # `@atomic A[i, j] += v` expands to modifyindex_atomic!(A, ..., i, j) —
+        # requires the Vararg{Integer,N} override, not the CartesianIndex one.
+        @kernel function atomic_add_ij!(A, is, js)
+            k = @index(Global, Linear)
+            @inbounds i = is[k]
+            @inbounds j = js[k]
+            Atomix.@atomic A[i, j] += UInt32(1)
+        end
+
+        dims = (6, 5)
+        A = Lava.LavaArray(zeros(UInt32, dims))
+        # All threads hit (3, 4) with Int32 indices like the solar kernel does.
+        N = 1024
+        is = Lava.LavaArray(fill(Int32(3), N))
+        js = Lava.LavaArray(fill(Int32(4), N))
+        atomic_add_ij!(Lava.LavaBackend())(A, is, js; ndrange=N)
+        Lava.vk_flush!(Lava.vk_context())
+        result = Array(A)
+        @test result[3, 4] == UInt32(N)
+        @test sum(result) == UInt32(N)
     end
 end

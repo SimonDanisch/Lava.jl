@@ -12,6 +12,7 @@ struct LavaTexture2D{T} <: AbstractLavaTexture{T, 2}
     width::Int
     height::Int
     format::Vulkan.Format
+    ctx::VkContext
 end
 
 """1D texture backed by VkImage."""
@@ -21,6 +22,7 @@ struct LavaTexture1D{T} <: AbstractLavaTexture{T, 1}
     view::Vulkan.ImageView
     width::Int
     format::Vulkan.Format
+    ctx::VkContext
 end
 
 """Reusable sampler configuration."""
@@ -29,6 +31,7 @@ struct LavaSampler
     filter::Symbol
     wrap::Symbol
     anisotropy::Float32
+    ctx::VkContext
 end
 
 """Combined texture + sampler, ready for binding."""
@@ -39,8 +42,7 @@ end
 
 # ── Sampler Construction ──
 
-function LavaSampler(; filter::Symbol=:linear, wrap::Symbol=:repeat, anisotropy::Real=0.0f0)
-    ctx = vk_context()
+function LavaSampler(; ctx::VkContext=vk_context(), filter::Symbol=:linear, wrap::Symbol=:repeat, anisotropy::Real=0.0f0)
     dev = ctx.device
 
     vk_filter = filter == :nearest ? Vulkan.FILTER_NEAREST :
@@ -66,16 +68,14 @@ function LavaSampler(; filter::Symbol=:linear, wrap::Symbol=:repeat, anisotropy:
         false,
     )
 
-    LavaSampler(sampler, filter, wrap, Float32(anisotropy))
+    LavaSampler(sampler, filter, wrap, Float32(anisotropy), ctx)
 end
 
 # ── Texture Construction ──
 
 """Create a 2D texture from a matrix of data."""
-function LavaTexture2D(data::Matrix{T}; filter=:linear, wrap=:repeat) where T
-    ctx = vk_context()
+function LavaTexture2D(data::Matrix{T}; ctx::VkContext=vk_context(), filter=:linear, wrap=:repeat) where T
     dev = ctx.device
-    phys = ctx.physical_device
 
     h, w = size(data)
     format = julia_to_vk_format(T)
@@ -91,7 +91,7 @@ function LavaTexture2D(data::Matrix{T}; filter=:linear, wrap=:repeat) where T
         Vulkan.IMAGE_LAYOUT_UNDEFINED,
     )
 
-    memory = alloc_image_memory(dev, phys, image)
+    memory = alloc_image_memory(ctx, image)
 
     view = Vulkan.ImageView(dev, image, Vulkan.IMAGE_VIEW_TYPE_2D, format,
         Vulkan.ComponentMapping(
@@ -100,7 +100,7 @@ function LavaTexture2D(data::Matrix{T}; filter=:linear, wrap=:repeat) where T
         Vulkan.ImageSubresourceRange(Vulkan.IMAGE_ASPECT_COLOR_BIT,
             UInt32(0), UInt32(1), UInt32(0), UInt32(1)))
 
-    tex = LavaTexture2D{T}(image, memory, view, w, h, format)
+    tex = LavaTexture2D{T}(image, memory, view, w, h, format, ctx)
 
     # Upload data
     upload_texture_data!(tex, data)
@@ -110,33 +110,26 @@ end
 
 """Upload pixel data to a texture via staging buffer."""
 function upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}) where T
-    ctx = vk_context()
+    ctx = tex.ctx
+    bq = ctx.default_bq
     dev = ctx.device
 
-    # Create staging buffer
+    # Use staging buffer for upload
     bytes = reinterpret(UInt8, vec(collect(data)))
-    staging = vk_alloc(length(bytes);
-        usage=Vulkan.BUFFER_USAGE_TRANSFER_SRC_BIT,
-        host_visible=true)
-    upload!(staging, bytes)
+    nbytes = length(bytes)
+    staging_buf, _, mapped_ptr, _ = get_staging(bq, nbytes)
+    unsafe_copyto!(Ptr{UInt8}(mapped_ptr), pointer(bytes), nbytes)
 
-    # Flush pending commands first
-    vk_flush!()
+    # Record image upload into the active batch.  Staging buffer is owned
+    # by `bq.staging`; no pin required (the field holds a strong ref).
+    batch = ensure_active_batch!(bq)
+    cmd = batch.cmd_buf
 
-    # Use dedicated transfer command buffer for texture upload
-    # (don't interfere with dispatch batches)
-    cmd = ctx.xfer_cmd_buf
-    fence = ctx.xfer_fence
-    unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(;
-        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
-
-    # Transition to TRANSFER_DST
     transition_image!(cmd, tex.image,
         Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         Vulkan.PIPELINE_STAGE_TOP_OF_PIPE_BIT, Vulkan.PIPELINE_STAGE_TRANSFER_BIT,
         Vulkan.AccessFlag(0), Vulkan.ACCESS_TRANSFER_WRITE_BIT)
 
-    # Copy buffer to image
     region = Vulkan.BufferImageCopy(
         UInt64(0), UInt32(0), UInt32(0),
         Vulkan.ImageSubresourceLayers(Vulkan.IMAGE_ASPECT_COLOR_BIT,
@@ -144,22 +137,19 @@ function upload_texture_data!(tex::LavaTexture2D{T}, data::Matrix{T}) where T
         Vulkan.Offset3D(0, 0, 0),
         Vulkan.Extent3D(UInt32(tex.width), UInt32(tex.height), UInt32(1)),
     )
-    Vulkan.cmd_copy_buffer_to_image(cmd, staging.buffer, tex.image,
+    Vulkan.cmd_copy_buffer_to_image(cmd, staging_buf, tex.image,
         Vulkan.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, [region])
 
-    # Transition to SHADER_READ_ONLY
     transition_image!(cmd, tex.image,
         Vulkan.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, Vulkan.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         Vulkan.PIPELINE_STAGE_TRANSFER_BIT, Vulkan.PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
         Vulkan.ACCESS_TRANSFER_WRITE_BIT, Vulkan.ACCESS_SHADER_READ_BIT)
 
-    # Submit using dedicated transfer fence
-    unwrap(Vulkan.end_command_buffer(cmd))
-    submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=fence))
-    unwrap(Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64)))
-    unwrap(Vulkan.reset_fences(dev, [fence]))
-    flush_deferred_frees!()
+    # Pin the texture so the batch keeps it alive until the fence.
+    pin!(batch, tex)
+    # Flush now — upload!(tex) is a synchronous API (caller expects the texture
+    # to be ready on return).
+    flush!(bq, dev)
 end
 
 # ── Format Mapping ──
@@ -180,19 +170,21 @@ struct TextureBindings
     layout::Vulkan.DescriptorSetLayout
     pool::Vulkan.DescriptorPool
     set::Vulkan.DescriptorSet
+    textures::Vector{Any}  # Keep texture + sampler refs alive while descriptor set is in use
 end
 
 """Create a descriptor set binding combined image samplers."""
 function bind_textures(textures::Vector{<:SampledTexture})
-    ctx = vk_context()
+    isempty(textures) && error("bind_textures: cannot bind an empty texture list")
+    ctx = textures[1].texture.ctx
     dev = ctx.device
 
     n = length(textures)
     bindings = [Vulkan.DescriptorSetLayoutBinding(
         UInt32(i - 1),
         Vulkan.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        UInt32(1),
-        Vulkan.SHADER_STAGE_FRAGMENT_BIT | Vulkan.SHADER_STAGE_VERTEX_BIT,
+        Vulkan.SHADER_STAGE_FRAGMENT_BIT | Vulkan.SHADER_STAGE_VERTEX_BIT;
+        descriptor_count=UInt32(1),
     ) for i in 1:n]
 
     layout = Vulkan.DescriptorSetLayout(dev, bindings)
@@ -201,7 +193,7 @@ function bind_textures(textures::Vector{<:SampledTexture})
         [Vulkan.DescriptorPoolSize(Vulkan.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, UInt32(n))])
 
     alloc_info = Vulkan.DescriptorSetAllocateInfo(pool, [layout])
-    sets = unwrap(Vulkan.allocate_descriptor_sets(dev, alloc_info))
+    sets = @vk_checked "vkAllocateDescriptorSets (textures)" Vulkan.allocate_descriptor_sets(dev, alloc_info)
     dset = sets[1]
 
     # Write descriptors
@@ -213,14 +205,17 @@ function bind_textures(textures::Vector{<:SampledTexture})
             Vulkan.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         )
         push!(writes, Vulkan.WriteDescriptorSet(
-            dset, UInt32(i - 1), UInt32(0), UInt32(1),
+            dset, UInt32(i - 1), UInt32(0),
             Vulkan.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            [img_info], [], [],
+            [img_info],
+            Vulkan.DescriptorBufferInfo[],
+            Vulkan.BufferView[];
+            descriptor_count=UInt32(1),
         ))
     end
     Vulkan.update_descriptor_sets(dev, writes, [])
 
-    TextureBindings(layout, pool, dset)
+    TextureBindings(layout, pool, dset, Any[textures...])
 end
 
 # Convenience

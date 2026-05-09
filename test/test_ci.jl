@@ -213,6 +213,36 @@ end
         @test all(Array(output) .≈ 64.0f0)
     end
 
+    @testset "Barrier deadlock fix" begin
+        # Regression test: error paths must not skip barriers.
+        # replace_unreachable! converts trap+unreachable to early returns,
+        # which can skip @synchronize() calls. fix_barrier_skipping_paths!
+        # redirects these paths through the barrier-containing continuation.
+        # Without the fix, this deadlocks on lavapipe (software Vulkan).
+
+        @kernel function barrier_error_kernel(A, kill_idx)
+            i = @index(Global)
+            @synchronize()
+            if i == kill_idx[1]
+                error("dead")
+            end
+            @synchronize()
+            A[i] = Int32(i)
+        end
+
+        backend = Lava.LavaBackend()
+        A = LavaArray(zeros(Int32, 128))
+        kill = LavaArray(Int32[64])
+        barrier_error_kernel(backend)(A, kill; ndrange=128, workgroupsize=128)
+        KernelAbstractions.synchronize(backend)
+        result = Array(A)
+
+        # Dead thread falls through and writes its value
+        @test result[64] == Int32(64)
+        # All other threads write correctly
+        @test all(result[i] == Int32(i) for i in 1:128 if i != 64)
+    end
+
     @testset "Struct Broadcast" begin
         include(joinpath(@__DIR__, "test_struct_broadcast.jl"))
     end
@@ -223,6 +253,10 @@ end
 
     @testset "Memory Safety" begin
         include(joinpath(@__DIR__, "test_gpu_memory_safety.jl"))
+    end
+
+    @testset "Graphics Pipeline" begin
+        include(joinpath(@__DIR__, "test_graphics_pipeline.jl"))
     end
 
     # ── Tier 4: GPUArrays Subset ────────────────────────────────────────

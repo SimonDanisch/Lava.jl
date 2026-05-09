@@ -35,7 +35,8 @@ struct TriangleStrip <: Topology end
 struct LineList      <: Topology end
 struct LineStrip     <: Topology end
 struct PointList     <: Topology end
-struct PatchList     <: Topology end  # for tessellation
+struct PatchList          <: Topology end  # for tessellation
+struct LineListAdjacency  <: Topology end  # for geometry shader line processing
 
 # ── Depth Test ──
 

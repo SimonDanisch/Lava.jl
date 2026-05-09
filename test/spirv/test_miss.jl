@@ -11,7 +11,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
 
     @testset "basic miss" begin
         function basic_miss()
-            Lava._lava_rt_payload_store_f32(-1.0f0)
+            Lava.lava_rt_payload_store_f32(-1.0f0)
             return nothing
         end
         d, _ = compile_and_disasm(basic_miss, Tuple{};
@@ -28,8 +28,8 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
     @testset "miss with multi-field payload" begin
         function miss_multi()
             # Write sentinel values to all payload fields
-            Lava._lava_rt_payload_store_f32_at(-1.0f0, UInt32(0))
-            Lava._lava_rt_payload_store_f32_at(0.0f0, UInt32(1))
+            Lava.lava_rt_payload_store_f32_at(-1.0f0, UInt32(0))
+            Lava.lava_rt_payload_store_f32_at(0.0f0, UInt32(1))
             return nothing
         end
         d, _ = compile_and_disasm(miss_multi, Tuple{};

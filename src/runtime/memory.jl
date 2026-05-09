@@ -11,41 +11,121 @@ A GPU buffer with a known device address (BDA).
 When `mapped_ptr` is non-null, the buffer is in BAR memory (host-visible + device-local)
 and can be read/written directly from the CPU without staging copies.
 """
+mutable struct PoolBlock
+    buffer::Vulkan.Buffer
+    memory::Vulkan.DeviceMemory
+    base_address::UInt64       # BDA of the start of this block
+    capacity::Int              # Total bytes in this block
+    bump::Int                  # Next free byte offset (bump pointer for initial carving)
+    live_count::Int            # Number of live sub-allocations
+end
+
+# Debug instrumentation for iter6 cross-scene cascade investigation.
+# All off by default — opt-in via the *_ENABLED Refs.
+
+# Per-finalizer destruction trace
+const FREE_DEBUG_ENABLED = Ref{Bool}(false)
+const FREE_DEBUG_LOG = NamedTuple[]
+
+# Per-allocation trace
+const ALLOC_DEBUG_ENABLED = Ref{Bool}(false)
+const ALLOC_DEBUG_LOG = NamedTuple[]
+
+# When enabled, vk_free! scans every live BatchQueue's arg/indirect slabs for
+# any UInt64 == buf.address.  Hits are logged + zeroed so the GPU faults on a
+# clean null reference instead of corrupting random memory.  Optionally
+# throws a LavaError instead of just logging (DESTROY_FREED_BDAS_THROWS[]).
+const FREED_BDA_SCAN_ENABLED = Ref{Bool}(false)
+const FREED_BDA_SCAN_LOG = NamedTuple[]
+const DESTROY_FREED_BDAS_THROWS = Ref{Bool}(false)
+
+# Pre-submit unknown-BDA scan: scans the active arg slab region for any
+# BDA-shaped UInt64 that isn't in LIVE_BUFFERS or any pool block / slab.
+# Optionally throws a LavaError instead of just warning.
+const PRESUBMIT_SCAN_ENABLED = Ref{Bool}(false)
+const PRESUBMIT_SCAN_THROWS = Ref{Bool}(false)
+
+# When true, pack_arg!(::VkManagedBuffer, ...) asserts the buffer's state ==
+# ALIVE before packing its BDA.  Catches use-after-free where a stale buffer
+# reference makes it through to a kernel arg.
+const PACK_ARG_ASSERT_LIVE = Ref{Bool}(false)
+
+# When set to a non-zero target BDA, every submit! scans the active arg slab
+# for the target value and logs (submit_idx, offsets) to SLAB_DUMP_LOG.  Used
+# to track when a known-stale address enters/leaves the arg slab.
+const SLAB_DUMP_TARGET = Ref{UInt64}(UInt64(0))
+const SLAB_DUMP_LOG = NamedTuple[]
+
+"""
+    scan_arg_slabs_for_bda!(buf) -> Int
+
+Scan every live BatchQueue's `arg_slabs` (and `indirect_slabs`) for any
+UInt64 word matching `buf.address`.  For each hit, append a record to
+`FREED_BDA_SCAN_LOG` and overwrite the slot with 0 so the GPU faults
+cleanly on a null reference instead of touching the freed memory.
+Returns the number of hits found.
+
+Defined AFTER VkManagedBuffer + BatchQueue (forward-call from vk_free!).
+Cost is ~`(slab_size_bytes / 8)` UInt64 reads per live slab — for 4 MiB
+slabs that's ~512 K reads, fast enough for debug.
+"""
+function scan_arg_slabs_for_bda! end
+
+# Buffer lifecycle states (atomic CAS transitions).  Every VkManagedBuffer
+# starts ALIVE.  `unsafe_free!` transitions ALIVE → DEFERRED (queued on a
+# bq's deferred_frees list) or ALIVE → DEAD (destroyed immediately).
+# `destroy_buffer!` transitions {ALIVE, DEFERRED} → DEAD.  Any call on a
+# DEAD buffer is a no-op.  Using an `@atomic` field with CAS guarantees
+# idempotent double-free protection across main + finalizer threads.
+const BUF_STATE_ALIVE    = UInt8(0)
+const BUF_STATE_DEFERRED = UInt8(1)
+const BUF_STATE_DEAD     = UInt8(2)
+
+
 mutable struct VkManagedBuffer
     buffer::Vulkan.Buffer
     memory::Vulkan.DeviceMemory
     address::UInt64     # BDA for PhysicalStorageBuffer access
     mapped_ptr::Ptr{UInt8}  # Non-null for unified/BAR memory
     size::Int
-    device_gen::UInt64  # Device generation at creation time (for safe finalizer cleanup)
+    pool_offset::Int    # Byte offset within pool block (0 for non-pooled)
+    pool_block::Union{Nothing, PoolBlock}  # Back-reference for pool free (nothing = non-pooled)
+    # Cross-queue synchronization: records which BatchQueue last wrote to
+    # this buffer, at which timeline value. Consumed by sync_access! to
+    # auto-insert semaphore waits when a dispatch on a different queue
+    # takes this buffer as an argument. Nothing = never written.
+    # Typed as Any so BatchQueue (defined later) doesn't force a cyclic include.
+    # @atomic so the finalizer thread (vk_free!) and main thread (record /
+    # sync_access!) can read/write it safely.
+    @atomic last_write::Union{Nothing, Tuple{Any, UInt64}}
+    # Lifecycle state — see BUF_STATE_* constants above.  @atomic CAS is the
+    # single point where double-free / use-after-free is ruled out.
+    @atomic state::UInt8
+    # Owning VkContext — so upload!/download!/vk_free! don't need the global.
+    # Loose type because VkContext is declared in device.jl, included first.
+    ctx::Any
 end
 
 # Strong references to keep Vulkan handles alive until explicit free
-const _live_buffers = Set{VkManagedBuffer}()
+const LIVE_BUFFERS = Set{VkManagedBuffer}()
 
-# Deferred free list: buffers whose GC finalizer fired while a command buffer
-# was recording or executing. Destroying them immediately would free GPU memory
-# that the in-flight command buffer still references via BDA → DEVICE_LOST.
-# Processed after vk_flush!() completes (GPU is idle, safe to destroy).
-const DEFERRED_FREES = VkManagedBuffer[]
+# Poison value for freed buffer addresses — enables use-after-free detection
+# on the GPU side (a shader dereffing a freed BDA traps with this value).
+# The CPU-side use-after-free gate is `buf.state`.
+#
+# Poison = 0: no valid GPU BDA is ever 0, so this is unambiguous.  Pointer
+# arithmetic on null (ptr + N*sizeof(T)) keeps the result in the unmapped
+# low-VA region, which faults clearly.  Detection is also trivial — scan
+# arg buffer slots for `== 0`.
+const BDA_POISON = UInt64(0)
 
-# Deferred free warning threshold: warn if more than this many buffers
-# are deferred in a single flush cycle (suggests missing keep_data_alive! calls).
-const _deferred_free_warn_threshold = Ref(100)
-
-# Poison value for freed buffer addresses — enables use-after-free detection.
-const _BDA_POISON = 0xDEAD_DEAD_DEAD_DEAD
-
-# Register cleanup callback for vk_reset_device!
-push!(_reset_callbacks, function()
-    empty!(DEFERRED_FREES)
-    empty!(_live_buffers)
+# Register cleanup callback for vk_reset_device!.  Indirect slabs are per-BQ now
+# and die with the old ctx, so only the global memory stats need resetting.
+push!(RESET_CALLBACKS, function()
+    empty!(LIVE_BUFFERS)
     GPU_LIVE_BYTES[] = 0
     GPU_BYTES_SINCE_LAST_GC[] = 0
-    STAGING_BUF[] = nothing
-    empty!(_indirect_slabs)
-    _indirect_slab_idx[] = 1
-    _indirect_slab_offset[] = 0
+    # Per-BQ staging, indirect, and arg slabs die with the old ctx.
 end)
 
 # ── GPU memory pressure tracking ──
@@ -73,42 +153,72 @@ Two tiers (with separate timers so incremental GC doesn't starve full GC):
 - >256 MiB new allocs: incremental GC (rate-limited to every 100ms)
 - >512 MiB new allocs: full GC (rate-limited to every 2s)
 
-Called from `vk_alloc` / `vk_alloc_unified` before each allocation.
+Called from `vk_alloc` before each allocation.
 """
 function maybe_collect()
     since_gc = GPU_BYTES_SINCE_LAST_GC[]
     since_gc < 256 * 1024 * 1024 && return  # <256 MiB new allocs: no pressure
     t = time()
-    # Full GC has its own timer — incremental GC must not starve it
+    # Full GC has its own timer — incremental GC must not starve it.
+    # atomic_xchg! is the ONLY safe reset: a plain `[]=0` would lose any
+    # atomic_add! that races with our read → the bytes-since counter would
+    # drift negative (effectively) and future GCs would never fire.
     if since_gc > 512 * 1024 * 1024 && (t - GPU_LAST_FULL_GC_TIME[]) > 2.0
         GPU_LAST_FULL_GC_TIME[] = t
         GPU_LAST_INCR_GC_TIME[] = t
-        GPU_BYTES_SINCE_LAST_GC[] = 0
+        Threads.atomic_xchg!(GPU_BYTES_SINCE_LAST_GC, 0)
         GC.gc(true)
     elseif (t - GPU_LAST_INCR_GC_TIME[]) > 0.1
         GPU_LAST_INCR_GC_TIME[] = t
-        GPU_BYTES_SINCE_LAST_GC[] = 0
+        Threads.atomic_xchg!(GPU_BYTES_SINCE_LAST_GC, 0)
         GC.gc(false)
     end
     return
 end
 
 """
-    vk_alloc(nbytes::Integer; extra_usage=nothing) -> VkManagedBuffer
+    vk_alloc(bq::BatchQueue, nbytes; extra_usage=UInt32(0), unified=false) -> VkManagedBuffer
 
-Allocate a device-local buffer with BDA support.
-Optional `extra_usage` adds additional `VkBufferUsageFlags` (e.g. for SBT buffers).
+Allocate a GPU buffer with BDA support.  Takes the queue the allocation is
+recorded against — `sweep_retired_batches!` and `drain_deferred_frees!` run
+only on that queue's timeline, ready for the multi-queue refactor.
+
+* `extra_usage` — additional `VkBufferUsageFlags` bits (e.g. INDIRECT_BUFFER,
+  INDEX_BUFFER, AS_BUILD_INPUT).
+* `unified=true` — pick BAR memory (device-local + host-visible + coherent,
+  falling back to host-visible only) and map it.  The returned
+  `VkManagedBuffer.mapped_ptr` is non-null.  Use for arg/indirect slabs or
+  any buffer you want to write from the CPU without staging.
+
+AS-scratch alignment is the caller's responsibility — see
+`bda_alignment_for(ctx, scratch::Bool)`, used in `LavaArray(...; scratch=true)`.
 """
-function vk_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0))
+function vk_alloc(bq::BatchQueue, nbytes::Integer;
+                  extra_usage::UInt32=UInt32(0), unified::Bool=false)
+    # Refuse allocation on a lost device — Vulkan calls would either error or
+    # (worse) succeed against a torn-down driver state and produce garbage BDAs.
+    device_lost(bq.ctx::VkContext) && throw(LavaError(
+        "vk_alloc",
+        "Vulkan device is lost — cannot allocate new buffers",
+        "Call Lava.vk_reset_device!() to reinitialize, or restart Julia."))
+    if TRACK_ALLOCS[]
+        _record_alloc_site!(Int(nbytes))
+    end
+    # Phase 7 P2: reclaim retired in-flight batches on THIS queue before
+    # allocating.  Multi-queue: each caller only drains its own queue's
+    # timeline — no implicit reach for `ctx.default_bq` here.
+    sweep_retired_batches!(bq)
+    drain_deferred_frees!(bq)
+    drain_deferred_as_frees!(bq)
     maybe_collect()
-    result = _try_vk_alloc(nbytes; extra_usage)
+    result = try_vk_alloc(bq, nbytes; extra_usage, unified)
     if result !== nothing
         return result
     end
-    # OOM — aggressive GC + flush deferred frees, then retry once
     GC.gc(true)
-    flush_deferred_frees!()
-    result = _try_vk_alloc(nbytes; extra_usage)
+    drain_deferred_frees!(bq)
+    drain_deferred_as_frees!(bq)
+    result = try_vk_alloc(bq, nbytes; extra_usage, unified)
     if result !== nothing
         @info "Lava: GPU allocation succeeded after GC retry" bytes=nbytes
         return result
@@ -116,14 +226,16 @@ function vk_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0))
     live_mb = GPU_LIVE_BYTES[] ÷ (1024 * 1024)
     req_mb = nbytes ÷ (1024 * 1024)
     throw(LavaError("memory allocation",
-        "Out of GPU memory. Requested $(req_mb) MiB ($(nbytes) bytes), currently $(live_mb) MiB live in $(length(_live_buffers)) buffers.",
+        "Out of GPU memory. Requested $(req_mb) MiB ($(nbytes) bytes), currently $(live_mb) MiB live in $(length(LIVE_BUFFERS)) buffers.",
         "Free unused LavaArrays, reduce problem size, or check for memory leaks with Lava.gpu_memory_usage()."))
 end
 
 """Attempt GPU buffer allocation, returning nothing on OOM."""
-function _try_vk_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0))
-    dev = vk_device()
-    nbytes = max(nbytes, 16)  # Vulkan requires non-zero size
+function try_vk_alloc(bq::BatchQueue, nbytes::Integer;
+                      extra_usage::UInt32=UInt32(0), unified::Bool=false)
+    ctx = bq.ctx::VkContext
+    dev = ctx.device
+    nbytes = max(nbytes, 16)
 
     usage = Vulkan.BUFFER_USAGE_STORAGE_BUFFER_BIT |
             Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
@@ -133,49 +245,66 @@ function _try_vk_alloc(nbytes::Integer; extra_usage::UInt32=UInt32(0))
         usage |= Vulkan.BufferUsageFlag(extra_usage)
     end
 
-    local buf, memory
+    local buf, memory, mem_type_idx
+    mapped_ptr = Ptr{UInt8}(0)
     try
-        buf = Vulkan.Buffer(
-            dev, nbytes,
-            usage,
-            Vulkan.SHARING_MODE_EXCLUSIVE,
-            UInt32[]
-        )
-
+        buf = Vulkan.Buffer(dev, nbytes, usage, Vulkan.SHARING_MODE_EXCLUSIVE, UInt32[])
         mem_reqs = Vulkan.get_buffer_memory_requirements(dev, buf)
-        mem_type_idx = _find_memory_type(
-            mem_reqs.memory_type_bits,
-            Vulkan.MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-        )
 
-        alloc_flags = Vulkan.MemoryAllocateFlagsInfo(
-            UInt32(0);  # device_mask (0 = all devices)
-            flags=Vulkan.MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
-        )
-        memory = Vulkan.DeviceMemory(
-            dev, mem_reqs.size, mem_type_idx;
-            next=alloc_flags
-        )
+        if unified
+            preferred = Vulkan.MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                        Vulkan.MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT
+            mem_type_idx = find_memory_type_optional(ctx, mem_reqs.memory_type_bits, preferred)
+            if mem_type_idx === nothing
+                mem_type_idx = find_memory_type(ctx, mem_reqs.memory_type_bits,
+                    Vulkan.MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT)
+            end
+        else
+            mem_type_idx = find_memory_type(ctx, mem_reqs.memory_type_bits,
+                Vulkan.MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        end
+
+        alloc_flags = Vulkan.MemoryAllocateFlagsInfo(UInt32(0);
+            flags=Vulkan.MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT)
+        memory = Vulkan.DeviceMemory(dev, mem_reqs.size, mem_type_idx; next=alloc_flags)
         unwrap(Vulkan.bind_buffer_memory(dev, buf, memory, 0))
+
+        if unified
+            mapped_ptr = Ptr{UInt8}(unwrap(Vulkan.map_memory(dev, memory, 0, nbytes)))
+        end
     catch e
-        # Catch Vulkan OOM errors — let other errors propagate
-        if e isa Vulkan.VulkanError || (e isa LavaError && occursin("memory", e.operation))
-            # Drain validation messages from the failed allocation — they are expected
-            # and should not leak into the next check_validation_errors!() call.
-            empty!(_validation_messages)
+        # Only swallow honest OOM — every other VulkanError must propagate so
+        # the caller sees the real cause (DEVICE_LOST, INVALID_OPAQUE_CAPTURE_ADDRESS,
+        # MEMORY_MAP_FAILED, …).  Otherwise vk_alloc's GC-retry would loop and
+        # eventually throw a misleading "Out of GPU memory".
+        if e isa Vulkan.VulkanError &&
+           (e.code == Vulkan.ERROR_OUT_OF_DEVICE_MEMORY ||
+            e.code == Vulkan.ERROR_OUT_OF_HOST_MEMORY)
+            empty!(VALIDATION_MESSAGES)
             return nothing
+        end
+        # DEVICE_LOST during alloc is a hard fault — mark + propagate so the
+        # subsequent dispatcher gate fires cleanly.
+        if e isa Vulkan.VulkanError && e.code == Vulkan.ERROR_DEVICE_LOST
+            mark_device_lost!(ctx)
         end
         rethrow()
     end
 
-    # Query BDA
     addr_info = Vulkan.BufferDeviceAddressInfo(buf)
     address = Vulkan.get_buffer_device_address(dev, addr_info)
 
-    result = VkManagedBuffer(buf, memory, address, Ptr{UInt8}(0), Int(nbytes), _device_generation[])
-    push!(_live_buffers, result)
+    result = VkManagedBuffer(buf, memory, address, mapped_ptr, Int(nbytes), 0, nothing, nothing, BUF_STATE_ALIVE, ctx)
+    push!(LIVE_BUFFERS, result)
     Threads.atomic_add!(GPU_LIVE_BYTES, nbytes)
     Threads.atomic_add!(GPU_BYTES_SINCE_LAST_GC, nbytes)
+    if ALLOC_DEBUG_ENABLED[]
+        push!(ALLOC_DEBUG_LOG,
+              (kind=:direct, addr=address, size=Int(nbytes), pool=false,
+               mtype=Int(mem_type_idx), unified=unified, usage=UInt32(usage)))
+    end
     return result
 end
 
@@ -190,447 +319,673 @@ finalizers freeing GPU memory that the in-flight command buffer still
 references via BDA addresses.
 """
 function vk_free!(buf::VkManagedBuffer)
-    if buf.address == _BDA_POISON
-        @warn "Lava: double-free detected on VkManagedBuffer (address already poisoned)" maxlog=1
-        return
+    # Atomic CAS ALIVE → DEFERRED (optimistic — we haven't yet decided we'll
+    # defer; we just need to claim the buffer so no other thread races us).
+    # If someone else already transitioned this buffer out of ALIVE, we bail
+    # out silently — the work has already been done (or is being done).
+    _, ok = @atomicreplace buf.state BUF_STATE_ALIVE => BUF_STATE_DEFERRED
+    ok || return  # already DEFERRED or DEAD — nothing to do
+
+    delete!(LIVE_BUFFERS, buf)
+
+    if FREE_DEBUG_ENABLED[]
+        ctx_dbg = buf.ctx
+        active_dbg = false
+        try
+            bqd = ctx_dbg.default_bq
+            active_dbg = (bqd.active_batch !== nothing) && bqd.active_batch.recording
+        catch; end
+        push!(FREE_DEBUG_LOG,
+              (addr=buf.address, size=buf.size,
+               pool=buf.pool_block !== nothing,
+               lw=@atomic(:acquire, buf.last_write),
+               active=active_dbg))
     end
-    buf.size == 0 && return  # Already freed
 
-    delete!(_live_buffers, buf)
-
-    # Defer destruction while GPU may be using this buffer.
-    # GC finalizers can fire at any point — if a command buffer is recording,
-    # the buffer's BDA address may be embedded in a dispatch's arg buffer.
-    # Destroying it now would make the GPU read freed memory → page fault.
-    ctx = _vk_context[]
-    if ctx !== nothing
-        batch = ctx.active_batch
-        if (batch !== nothing && batch.recording) || !isempty(ctx.in_flight)
-            push!(DEFERRED_FREES, buf)
-            return
+    # Defer destruction if the GPU still has work in flight that references
+    # this buffer. The per-queue timeline semaphore tells us precisely:
+    # buf.last_write = (bq, val) means the last dispatch recorded against
+    # this buffer will signal `bq.timeline_sem` to `val` when done. If the
+    # current counter is already >= val, the GPU is done and free is safe.
+    # Otherwise the buffer stays in DEFERRED state on that BQ's deferred-free
+    # list; it will be destroyed next time the BQ sweeps completed batches.
+    lw = @atomic :acquire buf.last_write
+    if lw !== nothing
+        bq = lw[1]::BatchQueue
+        val = lw[2]::UInt64
+        if !device_lost(bq.ctx::VkContext)
+            # query_timeline rethrows on healthy-device failure.  We are
+            # inside a finalizer-reachable path: a throw here is logged by
+            # Julia's finalizer machinery rather than propagating.
+            current = query_timeline(bq)
+            # Defer destruction if EITHER:
+            #   (a) GPU still has in-flight work that references this buffer
+            #       (current < val — last submitted dispatch still pending), OR
+            #   (b) the BQ has an active recording batch — even if all submits
+            #       have completed, the recording batch may have captured this
+            #       buffer's BDA via a runtime-pinned reference that pin_leaves!
+            #       didn't catch (e.g. a closure capture in a kernel that takes
+            #       the buffer indirectly). Destroying mid-recording, then
+            #       letting the recording submit, races the freed BDA against
+            #       the dispatch and trips a RADV GPUVM PERMISSION_FAULT.
+            #       The window from finalizer-pause to next batch retirement is
+            #       short, so deferring is cheap; reclaiming the buffer happens
+            #       via `drain_deferred_frees!` at the next flush/submit boundary.
+            active = (bq.active_batch !== nothing) && bq.active_batch.recording
+            if current < val || active
+                # Finalizer-thread push into the deferred list — SpinLock so
+                # the main thread's drain doesn't race.
+                lock(bq.deferred_frees_lock) do
+                    push!(bq.deferred_frees, buf)
+                end
+                return     # state stays DEFERRED; drain_deferred_frees! will transition to DEAD
+            end
         end
     end
 
-    _destroy_buffer!(buf)
+    # Pre-destroy safety scan: if `buf.address` still appears in any live arg
+    # slab, that's a use-after-free waiting to happen.  Log it and zero the
+    # slot so the GPU faults on a null reference (BDA_POISON) instead of
+    # corrupting whatever memory is mapped at the old address.
+    if FREED_BDA_SCAN_ENABLED[]
+        hits = scan_arg_slabs_for_bda!(buf)
+        if hits > 0 && DESTROY_FREED_BDAS_THROWS[]
+            throw(LavaError("vk_free!",
+                "destroying buffer at 0x$(string(buf.address, base=16, pad=16)) but its BDA still appears $(hits)× in live arg slabs",
+                "an unpinned reference is leaking — see FREED_BDA_SCAN_LOG"))
+        end
+    end
+
+    destroy_buffer!(buf)
 end
 
-"""Actually destroy a buffer's Vulkan resources. Called from vk_free! or flush_deferred_frees!."""
-function _destroy_buffer!(buf::VkManagedBuffer)
-    # After DEVICE_LOST, all Vulkan handles are invalid — skip destruction to avoid segfault.
-    # Also skip if the buffer was created on an old device (before vk_reset_device!).
-    if _device_lost[] || buf.device_gen != _device_generation[]
+"""Actually destroy a buffer's Vulkan resources. Called from `vk_free!` or
+`drain_deferred_frees!`.  Atomic CAS ({ALIVE, DEFERRED} → DEAD) ensures the
+Vulkan destructor fires exactly once even under racing callers."""
+function destroy_buffer!(buf::VkManagedBuffer)
+    # Transition {ALIVE, DEFERRED} → DEAD.  First try DEFERRED (the common
+    # path — vk_free! or drain always goes through DEFERRED now); fall back
+    # to ALIVE for the rare direct-destroy path (e.g. dropping a buffer we
+    # never pushed into deferred_frees).
+    _, ok = @atomicreplace buf.state BUF_STATE_DEFERRED => BUF_STATE_DEAD
+    if !ok
+        _, ok = @atomicreplace buf.state BUF_STATE_ALIVE => BUF_STATE_DEAD
+    end
+    ok || return  # was already DEAD; idempotent
+
+    # Pooled chunk: return to pool, don't destroy the shared VkBuffer
+    if buf.pool_block !== nothing
+        return_to_pool!(buf)
+        return
+    end
+
+    # Check if the Vulkan device/context is still valid.
+    # During Julia shutdown, finalizers fire after the device may be destroyed.
+    # Finalizers cannot do context switches, so we only check simple flags here.
+    ctx = buf.ctx::VkContext
+    if device_lost(ctx)
+        # Device is gone — just poison the handle, don't call Vulkan APIs
         buf.mapped_ptr = Ptr{UInt8}(0)
-        buf.address = _BDA_POISON
+        buf.address = BDA_POISON
         Threads.atomic_sub!(GPU_LIVE_BYTES, buf.size)
         buf.size = 0
         return
     end
-    # Unmap if this was a unified/BAR buffer
     if buf.mapped_ptr != Ptr{UInt8}(0)
-        Vulkan.unmap_memory(vk_device(), buf.memory)
+        try
+            Vulkan.unmap_memory(ctx.device, buf.memory)
+        catch
+            # unmap may fail if the driver released the memory first — log it
+            # loudly (finalizer-safe via jl_safe_printf) so we can notice driver
+            # misbehaviour, but don't propagate (finalizers must not throw).
+            safe_fin_log("Lava destroy_buffer!: unmap_memory failed\n")
+        end
         buf.mapped_ptr = Ptr{UInt8}(0)
     end
-    # Explicitly destroy in correct order: buffer before memory.
-    # Vulkan.jl handles are refcounted — calling destructor() sets refcount to 0,
-    # so the GC finalizer's second call will be a no-op (refcount underflows, iszero → false).
-    buf.buffer.destructor()
-    buf.memory.destructor()
-    buf.address = _BDA_POISON  # Poison BDA so use-after-free is detectable
+    try
+        buf.buffer.destructor()
+        buf.memory.destructor()
+    catch
+        safe_fin_log("Lava destroy_buffer!: Vulkan destructor failed\n")
+    end
+    buf.address = BDA_POISON
     Threads.atomic_sub!(GPU_LIVE_BYTES, buf.size)
     buf.size = 0
 end
 
+# Scanner method — reachable now that VkManagedBuffer + BatchQueue are defined.
+function scan_arg_slabs_for_bda!(buf::VkManagedBuffer)
+    target = buf.address
+    target == UInt64(0) && return 0
+    hits = 0
+    ctx = buf.ctx
+    bq = try ctx.default_bq catch; nothing end
+    bq === nothing && return 0
+    for (kind, slabs) in ((:arg, bq.arg_slabs), (:indirect, bq.indirect_slabs))
+        for (i, slab) in enumerate(slabs)
+            mb = slab.buf[]::VkManagedBuffer
+            mb.mapped_ptr == Ptr{UInt8}(0) && continue
+            n = mb.size ÷ 8
+            p = Ptr{UInt64}(mb.mapped_ptr)
+            for k in 0:(n-1)
+                v = unsafe_load(p, k+1)
+                if v == target
+                    push!(FREED_BDA_SCAN_LOG,
+                          (slab=kind, idx=i, offset=k*8, freed_bda=target,
+                           buf_size=buf.size))
+                    unsafe_store!(p, UInt64(0), k+1)
+                    hits += 1
+                end
+            end
+        end
+    end
+    return hits
+end
+
+"""
+    scan_slabs_for_unknown_bdas() -> Vector{NamedTuple}
+
+Walk every UInt64 in every live arg/indirect slab.  Report any value that
+LOOKS like a BDA (in the upper half of the address space, i.e. high bit
+of bit 63 set OR top 16 bits = 0xffff) but is NOT the address of any
+buffer in `LIVE_BUFFERS` and is NOT 0.  Useful for catching stale BDAs
+that pin_leaves! / pack_args_direct! missed.
+
+Call this RIGHT BEFORE submit to catch problems before they reach the GPU.
+"""
+function scan_slabs_for_unknown_bdas(bq)
+    bq === nothing && return NamedTuple[]
+    live = Set{UInt64}()
+    for buf in LIVE_BUFFERS
+        push!(live, buf.address)
+    end
+    pool_ranges = Tuple{UInt64,UInt64}[]
+    for blk in POOL_BLOCKS
+        push!(pool_ranges, (blk.base_address, blk.base_address + UInt64(blk.capacity)))
+    end
+    # Slabs themselves are valid arenas — the arg slab packs nested structs
+    # by writing pointers to within the slab itself (a "byval-inline" arg's
+    # outer arg pointer is `slab_base + inline_offset`).  Whitelist any value
+    # that lands inside a known slab's address range.
+    slab_ranges = Tuple{UInt64,UInt64}[]
+    for slabs in (bq.arg_slabs, bq.indirect_slabs)
+        for slab in slabs
+            mb = slab.buf[]::VkManagedBuffer
+            push!(slab_ranges, (mb.address, mb.address + UInt64(mb.size)))
+        end
+    end
+    @inline function in_known_range(addr)
+        for (lo, hi) in pool_ranges
+            lo <= addr < hi && return true
+        end
+        for (lo, hi) in slab_ranges
+            lo <= addr < hi && return true
+        end
+        return false
+    end
+    results = NamedTuple[]
+    for (kind, slabs) in ((:arg, bq.arg_slabs), (:indirect, bq.indirect_slabs))
+        for (i, slab) in enumerate(slabs)
+            mb = slab.buf[]::VkManagedBuffer
+            mb.mapped_ptr == Ptr{UInt8}(0) && continue
+            n_bytes = if kind == :arg && i == bq.arg_slab_idx
+                bq.arg_slab_offset
+            else
+                Int(mb.size)
+            end
+            n = n_bytes ÷ 8
+            p = Ptr{UInt64}(mb.mapped_ptr)
+            for k in 0:(n-1)
+                v = unsafe_load(p, k+1)
+                # Look only for "0xffff8…" sign-extended BDA-shaped values
+                # whose 48-bit form is in the high half (bit 47 set).
+                v < UInt64(0xffff800000000000) && continue
+                v == typemax(UInt64) && continue  # 0xff..ff often appears in scratch
+                v in live && continue
+                in_known_range(v) && continue
+                push!(results, (slab=kind, idx=i, offset=k*8, val=v))
+            end
+        end
+    end
+    return results
+end
+
+"""
+    drain_deferred_frees!(bq::BatchQueue)
+
+Destroy any buffers in `bq.deferred_frees` whose `last_write` timeline value
+has been reached. Safe to call at any time; it only destroys buffers the
+GPU is definitely done with. Called at natural sync points: after a flush
+completes, and from `sweep_retired!`.
+"""
+function drain_deferred_frees!(bq::BatchQueue)
+    isempty(bq.deferred_frees) && return
+    ctx = bq.ctx::VkContext
+    # Device-lost shortcut: empty under the lock so no finalizer-thread push
+    # survives past our empty!().
+    if device_lost(ctx)
+        lock(bq.deferred_frees_lock) do
+            empty!(bq.deferred_frees)
+        end
+        return
+    end
+    current = query_timeline(bq)
+    # Hold the lock for the full sweep.  Finalizer-thread pushes are rare
+    # (GC pauses only) and the drain body is short; SpinLock contention is
+    # negligible.  destroy_buffer! may run Vulkan destructors inside the
+    # critical section — that's fine under SpinLock (no yield points).
+    lock(bq.deferred_frees_lock) do
+        i = 1
+        while i <= length(bq.deferred_frees)
+            buf = bq.deferred_frees[i]::VkManagedBuffer
+            lw = @atomic :acquire buf.last_write
+            if lw === nothing || (lw[1]::BatchQueue === bq && lw[2]::UInt64 <= current)
+                destroy_buffer!(buf)
+                deleteat!(bq.deferred_frees, i)
+            else
+                i += 1
+            end
+        end
+    end
+    return nothing
+end
+
 """Process deferred buffer frees after GPU is idle. Called from vk_flush!()."""
-function flush_deferred_frees!()
-    isempty(DEFERRED_FREES) && return
-    n = length(DEFERRED_FREES)
-    # Deferred frees mean GC finalizers fired during recording — safely handled (Layer 2),
-    # but many deferred frees suggest Layer 1 (keep_data_alive!) is missing on a dispatch path.
-    threshold = _deferred_free_warn_threshold[]
-    if n > threshold
-        @warn "Lava: flushing $n deferred buffer frees (threshold=$threshold) — frequent GC during recording may indicate missing keep_data_alive!() calls"
-    else
-        @debug "Lava: flushing $n deferred buffer frees"
+# ── Memory Pool: sub-allocate from large VkBuffer blocks ──
+# Eliminates per-array VkBuffer create/destroy overhead (~30μs each).
+# All sub-allocations share the parent block's VkBuffer handle.
+# Free = return to free list (zero Vulkan API calls).
+
+const POOL_BLOCK_SIZE = 64 * 1024 * 1024  # 64 MiB per block
+const POOL_LARGE_THRESHOLD = POOL_BLOCK_SIZE  # Allocs above this bypass the pool
+const POOL_MIN_SIZE = 16  # Minimum allocation size (Vulkan requires non-zero)
+const POOL_NUM_SIZE_CLASSES = 24  # 2^4=16 to 2^27=128MiB
+
+# Free lists: index i holds reusable VkManagedBuffer objects of size 2^(i+3) bytes
+const POOL_BLOCKS = PoolBlock[]
+const POOL_FREE_LISTS = [VkManagedBuffer[] for _ in 1:POOL_NUM_SIZE_CLASSES]
+
+push!(RESET_CALLBACKS, function()
+    # Destroy all pool blocks on device reset.  The reset callback runs after
+    # the device has been marked lost or torn down, so destructor failures are
+    # expected (driver may have released the handles already).  Log via
+    # jl_safe_printf — we never want to silently lose a destructor error.
+    for block in POOL_BLOCKS
+        try
+            block.buffer.destructor()
+            block.memory.destructor()
+        catch
+            safe_fin_log("Lava POOL_BLOCKS reset: destructor failed (ok during vk_reset_device!)\n")
+        end
     end
-    for buf in DEFERRED_FREES
-        _destroy_buffer!(buf)
+    empty!(POOL_BLOCKS)
+    for fl in POOL_FREE_LISTS
+        empty!(fl)
     end
-    empty!(DEFERRED_FREES)
+end)
+
+"""Size class index for a given byte size. Returns 1 for 16B, 2 for 32B, etc."""
+@inline function size_class_idx(nbytes::Int)
+    nbytes = max(nbytes, POOL_MIN_SIZE)
+    # Round up to next power of 2
+    rounded = nextpow(2, nbytes)
+    return trailing_zeros(rounded) - 3  # 16=2^4 → idx 1, 32=2^5 → idx 2, etc.
+end
+
+"""Rounded-up allocation size for a given byte count."""
+@inline size_class_bytes(nbytes::Int) = nextpow(2, max(nbytes, POOL_MIN_SIZE))
+
+"""Allocate a new pool block (one large VkBuffer)."""
+function alloc_pool_block(bq::BatchQueue)
+    buf_result = try_vk_alloc(bq, POOL_BLOCK_SIZE)
+    if buf_result === nothing
+        GC.gc(true)
+        drain_deferred_frees!(bq)
+        drain_deferred_as_frees!(bq)
+        buf_result = try_vk_alloc(bq, POOL_BLOCK_SIZE)
+        buf_result === nothing && error("Lava: cannot allocate pool block ($(POOL_BLOCK_SIZE ÷ 1024÷1024) MiB)")
+    end
+    # Extract Vulkan handles from the VkManagedBuffer, then remove it from LIVE_BUFFERS
+    # (the pool block manages its own lifetime, not the per-chunk tracking)
+    block = PoolBlock(buf_result.buffer, buf_result.memory, buf_result.address,
+                      POOL_BLOCK_SIZE, 0, 0)
+    delete!(LIVE_BUFFERS, buf_result)
+    # Don't subtract from GPU_LIVE_BYTES — the block IS live memory.
+    # Individual chunks don't add to GPU_LIVE_BYTES since the block already accounts for it.
+    push!(POOL_BLOCKS, block)
+    if ALLOC_DEBUG_ENABLED[]
+        push!(ALLOC_DEBUG_LOG, (kind=:pool_block, addr=buf_result.address,
+                                size=POOL_BLOCK_SIZE, pool=true))
+    end
+    return block
+end
+
+# Diagnostic: track allocation call sites during recording.
+# Set TRACK_ALLOCS[] = true to record stack traces of every allocation while the
+# active batch is recording. Used to find per-frame allocations leaking into the
+# render loop. Reads are merged into ALLOC_TRACE; query via dump_alloc_trace().
+const TRACK_ALLOCS = Ref(false)
+const ALLOC_TRACE = Dict{Symbol, Int}()
+const ALLOC_TRACE_LOCK = ReentrantLock()
+
+function _record_alloc_site!(nbytes::Int)
+    bt = stacktrace(backtrace())
+    # Capture full stack as a single key (truncated to first 6 user frames)
+    user_frames = String[]
+    for f in bt
+        s = string(f.file)
+        # Skip Lava infra and Base
+        if occursin("memory.jl", s) || occursin("lavaarray.jl", s) ||
+           occursin("launch.jl", s) || occursin("ka_backend.jl", s) ||
+           occursin("KernelAbstractions", s) || occursin("Base.jl", s) ||
+           occursin("/Base/", s) || occursin("Adapt/src", s) ||
+           occursin("gpuarrays", s) || occursin("dict.jl", s) ||
+           occursin("./", s) && length(s) < 30
+            continue
+        end
+        push!(user_frames, "$(basename(s)):$(f.line) ($(f.func))")
+        length(user_frames) >= 4 && break
+    end
+    site = Symbol(isempty(user_frames) ? "unknown" : join(user_frames, " <- "))
+    lock(ALLOC_TRACE_LOCK) do
+        ALLOC_TRACE[site] = get(ALLOC_TRACE, site, 0) + 1
+    end
+end
+
+function dump_alloc_trace()
+    lock(ALLOC_TRACE_LOCK) do
+        sorted = sort(collect(ALLOC_TRACE), by=x->x[2], rev=true)
+        for (site, count) in sorted
+            println("  $count × $site")
+        end
+    end
+end
+
+function clear_alloc_trace!()
+    lock(ALLOC_TRACE_LOCK) do
+        empty!(ALLOC_TRACE)
+    end
+end
+
+"""
+    pool_alloc(bq::BatchQueue, nbytes; extra_usage=UInt32(0)) -> VkManagedBuffer
+
+Allocate GPU memory on `bq`.  Small device-local allocations come from the
+sub-allocation pool (zero Vulkan API calls); large allocations or those
+with non-default usage flags bypass the pool via `vk_alloc`.
+"""
+function pool_alloc(bq::BatchQueue, nbytes::Integer; extra_usage::UInt32=UInt32(0))
+    ctx = bq.ctx::VkContext
+    # Even pure free-list reuse must refuse a dead device — the pool blocks
+    # belong to the old (broken) ctx and would hand back garbage BDAs.
+    device_lost(ctx) && throw(LavaError(
+        "pool_alloc",
+        "Vulkan device is lost — cannot allocate new buffers",
+        "Call Lava.vk_reset_device!() to reinitialize, or restart Julia."))
+    nbytes = max(Int(nbytes), POOL_MIN_SIZE)
+    if TRACK_ALLOCS[]
+        _record_alloc_site!(nbytes)
+    end
+    sweep_retired_batches!(bq)
+
+    if nbytes > POOL_LARGE_THRESHOLD || extra_usage != UInt32(0)
+        return vk_alloc(bq, nbytes; extra_usage)
+    end
+
+    alloc_size = size_class_bytes(nbytes)
+    idx = size_class_idx(nbytes)
+    idx = clamp(idx, 1, POOL_NUM_SIZE_CLASSES)
+
+    # Try the free list first. If empty, run GC (which drains LavaArray
+    # finalizers → `return_to_pool!`) and re-check, so we reuse whatever
+    # just got freed before burning a new 64-MiB pool block. Without this
+    # retry the pool grows monotonically on heavy sim workloads — GC fires
+    # sporadically, finalizers enqueue async, and each allocation that
+    # races past GC cuts a new block even when thousands of matching
+    # buffers are about to return to the free list.
+    @inline function try_reuse_or_bump()
+        fl = POOL_FREE_LISTS[idx]
+        if !isempty(fl)
+            buf = pop!(fl)
+            block = buf.pool_block::PoolBlock
+            block.live_count += 1
+            buf.address = block.base_address + UInt64(buf.pool_offset)
+            buf.size = alloc_size
+            buf.ctx = ctx
+            @atomic :release buf.state = BUF_STATE_ALIVE
+            return buf
+        end
+        for block in POOL_BLOCKS
+            if block.bump + alloc_size <= block.capacity
+                byte_offset = block.bump
+                block.bump += alloc_size
+                block.live_count += 1
+                return VkManagedBuffer(
+                    block.buffer, block.memory,
+                    block.base_address + UInt64(byte_offset),
+                    Ptr{UInt8}(0),
+                    alloc_size,
+                    byte_offset, block, nothing, BUF_STATE_ALIVE, ctx)
+            end
+        end
+        return nothing
+    end
+
+    buf = try_reuse_or_bump()
+    buf === nothing || return buf
+    # Free list empty + every block full → we are about to cut a new 64-MiB
+    # block. Before we do, force a full GC so pending LavaArray finalizers
+    # run and return their backing chunks to the free list. `maybe_collect`
+    # is rate-limited and may skip, so hit it with `GC.gc(false)` directly —
+    # the cost of an incremental GC is much cheaper than a 64 MiB Vulkan
+    # alloc we didn't need.
+    GC.gc(false)
+    buf = try_reuse_or_bump()
+    buf === nothing || return buf
+    GC.gc(true)  # still nothing? run a full GC to drain any deferred finalizers.
+    buf = try_reuse_or_bump()
+    buf === nothing || return buf
+
+    block = alloc_pool_block(bq)
+    byte_offset = block.bump
+    block.bump += alloc_size
+    block.live_count += 1
+    return VkManagedBuffer(
+        block.buffer, block.memory,
+        block.base_address + UInt64(byte_offset),
+        Ptr{UInt8}(0),
+        alloc_size,
+        byte_offset, block, nothing, BUF_STATE_ALIVE, ctx)
+end
+
+"""Return a pooled chunk to the free list. Keeps VkManagedBuffer object for reuse."""
+function return_to_pool!(buf::VkManagedBuffer)
+    block = buf.pool_block
+    block === nothing && return
+    alloc_size = buf.size
+    alloc_size == 0 && return
+    idx = size_class_idx(alloc_size)
+    idx = clamp(idx, 1, POOL_NUM_SIZE_CLASSES)
+    block.live_count -= 1
+    # Poison address to detect use-after-free, but keep pool_block + pool_offset
+    # so pool_alloc can restore the address from block.base_address + pool_offset
+    buf.address = BDA_POISON
+    buf.mapped_ptr = Ptr{UInt8}(0)
+    buf.size = 0
+    @atomic :release buf.last_write = nothing  # clear scheduling state so a re-use starts fresh
+    # Keep buf.pool_block and buf.pool_offset intact for reuse
+    push!(POOL_FREE_LISTS[idx], buf)
 end
 
 # ── Staging buffer for CPU↔GPU transfers ──
 
-const STAGING_BUF = Ref{Union{Nothing, Tuple{Vulkan.Buffer, Vulkan.DeviceMemory, Ptr{Nothing}, Int}}}(nothing)
+"""
+    get_staging(bq::BatchQueue, nbytes::Integer)
+        -> (buf::Vulkan.Buffer, memory::Vulkan.DeviceMemory, mapped_ptr::Ptr, size::Int)
 
-"""Get or grow the staging buffer to at least `nbytes`."""
-function get_staging(nbytes::Integer)
-    existing = STAGING_BUF[]
-    if existing !== nothing && existing[4] >= nbytes
-        return existing
+Return `bq`'s staging buffer, growing it to at least `nbytes` if needed.
+Backed by a `VkManagedBuffer` whose lifetime follows the normal
+timeline-gated free path when re-allocated.
+"""
+function get_staging(bq::BatchQueue, nbytes::Integer)
+    existing = bq.staging
+    if existing !== nothing && (existing::VkManagedBuffer).size >= nbytes
+        buf = existing::VkManagedBuffer
+        return (buf.buffer, buf.memory, buf.mapped_ptr, buf.size)
     end
 
-    dev = vk_device()
-
-    # Free old staging buffer — use handle destructors to avoid double-free from GC
+    # Release the old staging buffer through vk_free! — that routes through
+    # the per-BQ deferred queue so in-flight transfers complete first.
     if existing !== nothing
-        old_buf, old_mem, _, _ = existing
-        Vulkan.unmap_memory(dev, old_mem)
-        old_buf.destructor()
-        old_mem.destructor()
+        vk_free!(existing::VkManagedBuffer)
+        bq.staging = nothing
     end
 
-    # Allocate new (round up to power of 2)
+    ctx = bq.ctx::VkContext
+    dev = bq.device
     alloc_size = max(65536, nextpow(2, nbytes))
-    buf = Vulkan.Buffer(
+    vkbuf = Vulkan.Buffer(
         dev, alloc_size,
         Vulkan.BUFFER_USAGE_TRANSFER_SRC_BIT |
         Vulkan.BUFFER_USAGE_TRANSFER_DST_BIT,
         Vulkan.SHARING_MODE_EXCLUSIVE,
-        UInt32[]
+        UInt32[],
     )
-
-    mem_reqs = Vulkan.get_buffer_memory_requirements(dev, buf)
-    mem_type_idx = _find_memory_type(
-        mem_reqs.memory_type_bits,
+    mem_reqs = Vulkan.get_buffer_memory_requirements(dev, vkbuf)
+    mem_type_idx = find_memory_type(
+        ctx, mem_reqs.memory_type_bits,
         Vulkan.MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-        Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT
+        Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT,
     )
     memory = Vulkan.DeviceMemory(dev, mem_reqs.size, mem_type_idx)
-    unwrap(Vulkan.bind_buffer_memory(dev, buf, memory, 0))
+    throw_if_error(ctx, "vkBindBufferMemory",
+        Vulkan.bind_buffer_memory(dev, vkbuf, memory, 0))
+    mapped_ptr = Ptr{UInt8}(throw_if_error(ctx, "vkMapMemory",
+        Vulkan.map_memory(dev, memory, 0, alloc_size)))
 
-    # Map permanently
-    mapped_ptr = unwrap(Vulkan.map_memory(dev, memory, 0, alloc_size))
-
-    result = (buf, memory, mapped_ptr, Int(alloc_size))
-    STAGING_BUF[] = result
-    return result
+    managed = VkManagedBuffer(vkbuf, memory, UInt64(0),   # no BDA needed for staging
+                              mapped_ptr, Int(alloc_size),
+                              0, nothing, nothing, BUF_STATE_ALIVE, ctx)
+    push!(LIVE_BUFFERS, managed)
+    Threads.atomic_add!(GPU_LIVE_BYTES, managed.size)
+    Threads.atomic_add!(GPU_BYTES_SINCE_LAST_GC, managed.size)
+    bq.staging = managed
+    return (vkbuf, memory, mapped_ptr, Int(alloc_size))
 end
 
 """
-    upload!(dst::VkManagedBuffer, host_data::Vector{UInt8}; offset::Int=0)
+    copy_buffer!(direction, managed, host_ptr, nbytes; offset=0)
 
-Upload host data to a device-local buffer via staging.
+Unified CPU↔GPU buffer copy — single entry point for every host-visible
+transfer path.  `direction` is `:upload` (host → GPU) or `:download` (GPU → host).
+
+Fast path (BAR memory): direct memcpy via `managed.mapped_ptr` after
+`wait_for_write(managed)` drains any in-flight writer.  No staging, no batch.
+
+Slow path (device-local): allocate staging, record `cmd_copy_buffer!` into
+the active batch, flush, and memcpy between staging and host.  For downloads
+we route the copy through the queue that last wrote `managed` so the copy
+piggy-backs on producer dispatches (one fence wait instead of two).  For
+uploads we use the buffer's ctx default queue.
+
+The caller is responsible for keeping `host_ptr`'s backing array alive
+(typically via `GC.@preserve`).
 """
+function copy_buffer!(direction::Symbol, managed::VkManagedBuffer,
+                     host_ptr::Ptr{UInt8}, nbytes::Integer; offset::Integer=0)
+    nbytes == 0 && return
+    @assert direction === :upload || direction === :download  "direction must be :upload or :download"
+    buf_offset = managed.pool_offset + Int(offset)
+
+    # BAR fast-path: host-visible mapped memory — direct memcpy, no staging.
+    if managed.mapped_ptr != Ptr{UInt8}(0)
+        # wait_for_write reads buf.last_write, which is only populated by
+        # sync_access! at submit time — so a dispatch that is recorded but
+        # not yet submitted is invisible to it. Flush the active batch of
+        # the buffer's ctx first so any pending writer actually lands before
+        # we memcpy. (wait_for_write still matters for cross-queue writers
+        # and already-in-flight batches.)
+        bq = (managed.ctx::VkContext).default_bq
+        if bq.active_batch !== nothing
+            flush!(bq, bq.device)
+        end
+        wait_for_write(managed)
+        if direction === :upload
+            unsafe_copyto!(managed.mapped_ptr + offset, host_ptr, nbytes)
+        else
+            unsafe_copyto!(host_ptr, managed.mapped_ptr + offset, nbytes)
+        end
+        return
+    end
+
+    # Device-local: route through staging + batched copy.  Pinning `managed`
+    # triggers sync_access!'s cross-queue semaphore wait whenever the buffer
+    # was last written on a different BatchQueue.
+    bq = if direction === :upload
+        (managed.ctx::VkContext).default_bq
+    else
+        lw = @atomic :acquire managed.last_write
+        lw !== nothing ? (lw[1]::BatchQueue) : (managed.ctx::VkContext).default_bq
+    end
+    staging_buf, _, mapped_ptr, _ = get_staging(bq, nbytes)
+    if direction === :upload
+        unsafe_copyto!(Ptr{UInt8}(mapped_ptr), host_ptr, nbytes)
+        cmd_copy_buffer!(bq, staging_buf, managed, nbytes; dst_off=buf_offset)
+        flush!(bq, bq.device)
+    else
+        cmd_copy_buffer!(bq, managed, staging_buf, nbytes; src_off=buf_offset)
+        flush!(bq, bq.device)
+        unsafe_copyto!(host_ptr, Ptr{UInt8}(mapped_ptr), nbytes)
+    end
+    return
+end
+
+"""Upload host data to a device-local buffer (BAR direct or via staging)."""
 function upload!(dst::VkManagedBuffer, host_data::Vector{UInt8}; offset::Int=0)
-    nbytes = length(host_data)
-    nbytes == 0 && return
-
-    # Fast path: if buffer is in BAR memory (mapped), write directly via mapped ptr.
-    if dst.mapped_ptr != Ptr{UInt8}(0)
-        ctx = vk_context()
-        if has_active_recording(ctx)
-            vk_flush!()
-        end
-        unsafe_copyto!(dst.mapped_ptr + offset, pointer(host_data), nbytes)
-        return
-    end
-
-    staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
-    unsafe_copyto!(Ptr{UInt8}(mapped_ptr), pointer(host_data), nbytes)
-
-    _one_shot_copy(staging_buf, 0, dst.buffer, offset, nbytes)
+    GC.@preserve host_data copy_buffer!(:upload, dst, pointer(host_data), length(host_data); offset)
 end
 
-"""
-    download!(host_data::Vector{UInt8}, src::VkManagedBuffer; offset::Int=0)
-
-Download data from a device-local buffer to host via staging.
-"""
+"""Download data from a device-local buffer to a host byte vector."""
 function download!(host_data::Vector{UInt8}, src::VkManagedBuffer; offset::Int=0)
-    nbytes = length(host_data)
-    nbytes == 0 && return
-
-    # Fast path: if buffer is in BAR memory (mapped), just flush and read directly.
-    # Saves one fence wait by avoiding the staging copy command.
-    if src.mapped_ptr != Ptr{UInt8}(0)
-        ctx = vk_context()
-        if has_active_recording(ctx)
-            vk_flush!()
-        end
-        unsafe_copyto!(pointer(host_data), src.mapped_ptr + offset, nbytes)
-        return
-    end
-
-    staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
-    _one_shot_copy(src.buffer, offset, staging_buf, 0, nbytes)
-    unsafe_copyto!(pointer(host_data), Ptr{UInt8}(mapped_ptr), nbytes)
+    GC.@preserve host_data copy_buffer!(:download, src, pointer(host_data), length(host_data); offset)
 end
 
-"""
-    upload_typed!(dst::VkManagedBuffer, data::AbstractVector{T}; offset::Int=0)
-
-Upload a typed array to a device-local buffer.
-"""
+"""Upload a typed array to a device-local buffer."""
 function upload_typed!(dst::VkManagedBuffer, data::AbstractVector{T}; offset::Int=0) where T
     bytes = Vector{UInt8}(reinterpret(UInt8, vec(collect(data))))
     upload!(dst, bytes; offset)
 end
 
-"""
-    download_typed!(data::AbstractVector{T}, src::VkManagedBuffer; offset::Int=0)
-
-Download data from a device-local buffer into a typed array.
-"""
+"""Download data from a device-local buffer into a typed array."""
 function download_typed!(data::AbstractVector{T}, src::VkManagedBuffer; offset::Int=0) where T
-    nbytes = length(data) * sizeof(T)
-    nbytes == 0 && return
-
-    # Fast path: BAR memory — direct CPU read, no staging copy
-    if src.mapped_ptr != Ptr{UInt8}(0)
-        ctx = vk_context()
-        if has_active_recording(ctx)
-            vk_flush!()
-        end
-        GC.@preserve data begin
-            unsafe_copyto!(Ptr{UInt8}(pointer(data)), src.mapped_ptr + offset, nbytes)
-        end
-        return
-    end
-
-    # Device-local: append copy to active batch if possible (one fence wait instead of two)
-    staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
-    ctx = vk_context()
-    if has_active_recording(ctx)
-        # Defined in command.jl (included after memory.jl)
-        _append_copy_and_flush!(ctx, src.buffer, offset, staging_buf, nbytes)
-    else
-        _one_shot_copy(src.buffer, offset, staging_buf, 0, nbytes)
-    end
-    GC.@preserve data begin
-        unsafe_copyto!(Ptr{UInt8}(pointer(data)), Ptr{UInt8}(mapped_ptr), nbytes)
-    end
-end
-
-# ── Internal helpers ──
-
-function _one_shot_copy(src::Vulkan.Buffer, src_offset::Integer,
-                        dst::Vulkan.Buffer, dst_offset::Integer,
-                        nbytes::Integer)
-    _device_lost[] && throw(LavaError("buffer copy", "Vulkan device lost",
-        "Call Lava.vk_reset_device!() to reinitialize, or restart Julia session."))
-    ctx = vk_context()
-    dev = ctx.device
-
-    # Use dedicated transfer command buffer + fence to avoid interfering with
-    # the dispatch command buffer state on NVIDIA.
-    cmd = ctx.xfer_cmd_buf
-    fence = ctx.xfer_fence
-
-    # Auto-flush pending dispatches before memory transfer to ensure data is written
-    if has_active_recording(ctx)
-        vk_flush!()
-    end
-
-    unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(
-        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-    )))
-
-    region = Vulkan.BufferCopy(UInt64(src_offset), UInt64(dst_offset), UInt64(nbytes))
-    Vulkan.cmd_copy_buffer(cmd, src, dst, [region])
-
-    unwrap(Vulkan.end_command_buffer(cmd))
-
-    # Submit and wait using the dedicated transfer fence
-    submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    submit_result = Vulkan.queue_submit(ctx.queue, [submit_info]; fence=fence)
-    if iserror(submit_result)
-        _device_lost[] = true
-        unwrap(submit_result)
-    end
-    fence_result = Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64))
-    if iserror(fence_result)
-        _device_lost[] = true
-        unwrap(fence_result)
-    end
-    unwrap(Vulkan.reset_fences(dev, [fence]))
+    GC.@preserve data copy_buffer!(:download, src, Ptr{UInt8}(pointer(data)),
+                                    length(data) * sizeof(T); offset)
 end
 
 """
-    VkMappedBuffer
+    bda_alignment_for(ctx::VkContext, scratch::Bool) -> UInt64
 
-A host-visible, device-accessible buffer with a permanently mapped pointer.
-Used for kernel argument buffers — write directly via memcpy, no staging needed.
+Required BDA alignment.  AS-build scratch buffers must be aligned to
+`minAccelerationStructureScratchOffsetAlignment` (cached on ctx).
+Everything else defaults to 1 (Vulkan already guarantees the per-usage
+minimum alignment via `vkGetBufferDeviceAddress`).
 """
-mutable struct VkMappedBuffer
-    buffer::Vulkan.Buffer
-    memory::Vulkan.DeviceMemory
-    address::UInt64     # BDA
-    mapped_ptr::Ptr{UInt8}
-    size::Int
+@inline function bda_alignment_for(ctx::VkContext, scratch::Bool)
+    return scratch ? ctx.as_scratch_align : UInt64(1)
 end
 
-"""
-    vk_alloc_mapped(nbytes::Integer) -> VkMappedBuffer
+# VkMappedBuffer / VkIndirectBuffer / alloc_indirect_slab / vk_alloc_mapped /
+# vk_alloc_unified: deleted.  Every GPU buffer allocation goes through
+# `vk_alloc(bq, nbytes; extra_usage, unified)` now.  Slab pools (arg buffer
+# + indirect dispatch) live on top of `LavaArray`s declared in
+# `array/lavaarray.jl` and allocated via `runtime/launch.jl`.
 
-Allocate a host-visible, device-accessible buffer with BDA support.
-Permanently mapped — write directly to `mapped_ptr`.
-On AMD RDNA, uses resizable BAR memory (device-local + host-visible).
-Falls back to host-visible only if BAR is unavailable.
-"""
-function vk_alloc_mapped(nbytes::Integer)
-    dev = vk_device()
-    nbytes = max(nbytes, 16)
+# Indirect buffer slab size — 256 KB of UInt32 storage, enough for ~1000
+# 12-byte indirect dispatches.
+const INDIRECT_SLAB_SIZE = 256 * 1024
 
-    buf = Vulkan.Buffer(
-        dev, nbytes,
-        Vulkan.BUFFER_USAGE_STORAGE_BUFFER_BIT |
-        Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-        Vulkan.BUFFER_USAGE_TRANSFER_SRC_BIT |
-        Vulkan.BUFFER_USAGE_TRANSFER_DST_BIT,
-        Vulkan.SHARING_MODE_EXCLUSIVE,
-        UInt32[]
-    )
-
-    mem_reqs = Vulkan.get_buffer_memory_requirements(dev, buf)
-
-    # Try device-local + host-visible (BAR memory, fastest)
-    preferred_flags = Vulkan.MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                      Vulkan.MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                      Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT
-    mem_type_idx = _find_memory_type_optional(mem_reqs.memory_type_bits, preferred_flags)
-
-    # Fall back to host-visible + coherent only
-    if mem_type_idx === nothing
-        fallback_flags = Vulkan.MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                         Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT
-        mem_type_idx = _find_memory_type(mem_reqs.memory_type_bits, fallback_flags)
-    end
-
-    alloc_flags = Vulkan.MemoryAllocateFlagsInfo(
-        UInt32(0);
-        flags=Vulkan.MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
-    )
-    memory = Vulkan.DeviceMemory(dev, mem_reqs.size, mem_type_idx; next=alloc_flags)
-    unwrap(Vulkan.bind_buffer_memory(dev, buf, memory, 0))
-
-    addr_info = Vulkan.BufferDeviceAddressInfo(buf)
-    address = Vulkan.get_buffer_device_address(dev, addr_info)
-
-    mapped_ptr = Ptr{UInt8}(unwrap(Vulkan.map_memory(dev, memory, 0, nbytes)))
-
-    result = VkMappedBuffer(buf, memory, address, mapped_ptr, Int(nbytes))
-    return result
-end
-
-"""
-    vk_alloc_unified(nbytes::Integer) -> VkManagedBuffer
-
-Allocate a unified (BAR) buffer as VkManagedBuffer with `mapped_ptr` set.
-Used by `KA.allocate(; unified=true)` for host-readable GPU buffers.
-"""
-function vk_alloc_unified(nbytes::Integer)
-    maybe_collect()
-    mapped = vk_alloc_mapped(max(nbytes, 16))
-    managed = VkManagedBuffer(mapped.buffer, mapped.memory, mapped.address,
-                               mapped.mapped_ptr, Int(mapped.size), _device_generation[])
-    push!(_live_buffers, managed)
-    Threads.atomic_add!(GPU_LIVE_BYTES, managed.size)
-    Threads.atomic_add!(GPU_BYTES_SINCE_LAST_GC, managed.size)
-    return managed
-end
-
-# ── Indirect dispatch buffer pool ──
-
-"""
-    VkIndirectBuffer — A sub-allocation within an indirect buffer slab.
-    Has INDIRECT_BUFFER_BIT + STORAGE_BUFFER_BIT + SHADER_DEVICE_ADDRESS_BIT.
-"""
-struct VkIndirectBuffer
-    buffer::Vulkan.Buffer  # Parent slab's VkBuffer (for cmd_dispatch_indirect)
-    buffer_offset::UInt64  # Byte offset within parent slab
-    address::UInt64        # BDA of this sub-allocation
-    mapped_ptr::Ptr{UInt8}
-    size::Int
-end
-
-# Indirect buffer slab: similar to arg buffer slabs but with INDIRECT_BUFFER_BIT.
-# Each indirect dispatch needs 12 bytes (3×UInt32), aligned to 256 bytes.
-const INDIRECT_SLAB_SIZE = 256 * 1024  # 256KB — holds ~1000 indirect dispatches
-const _indirect_slabs = VkMappedBuffer[]  # Reuse VkMappedBuffer as slab backing
-const _indirect_slab_idx = Ref(1)
-const _indirect_slab_offset = Ref(0)
-
-# Legacy compat
-const _indirect_buffers = VkIndirectBuffer[]
-const _indirect_buffer_idx = Ref(0)
-
-function _alloc_indirect_slab(min_size::Int=INDIRECT_SLAB_SIZE)
-    dev = vk_device()
-    nbytes = max(min_size, INDIRECT_SLAB_SIZE)
-
-    buf = Vulkan.Buffer(
-        dev, nbytes,
-        Vulkan.BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-        Vulkan.BUFFER_USAGE_STORAGE_BUFFER_BIT |
-        Vulkan.BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-        Vulkan.BUFFER_USAGE_TRANSFER_DST_BIT,
-        Vulkan.SHARING_MODE_EXCLUSIVE,
-        UInt32[]
-    )
-
-    mem_reqs = Vulkan.get_buffer_memory_requirements(dev, buf)
-
-    preferred = Vulkan.MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                Vulkan.MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT
-    mem_type_idx = _find_memory_type_optional(mem_reqs.memory_type_bits, preferred)
-    if mem_type_idx === nothing
-        fallback = Vulkan.MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                   Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT
-        mem_type_idx = _find_memory_type(mem_reqs.memory_type_bits, fallback)
-    end
-
-    alloc_flags = Vulkan.MemoryAllocateFlagsInfo(
-        UInt32(0); flags=Vulkan.MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT)
-    memory = Vulkan.DeviceMemory(dev, mem_reqs.size, mem_type_idx; next=alloc_flags)
-    unwrap(Vulkan.bind_buffer_memory(dev, buf, memory, 0))
-
-    addr_info = Vulkan.BufferDeviceAddressInfo(buf)
-    address = Vulkan.get_buffer_device_address(dev, addr_info)
-    mapped_ptr = Ptr{UInt8}(unwrap(Vulkan.map_memory(dev, memory, 0, nbytes)))
-
-    return VkMappedBuffer(buf, memory, address, mapped_ptr, Int(nbytes))
-end
-
-"""Get or create an indirect dispatch buffer from the slab pool."""
-function _get_indirect_buffer()
-    alloc_size = 256  # 12 bytes needed, aligned to 256
-
-    # Ensure slab exists and has space
-    while length(_indirect_slabs) < _indirect_slab_idx[]
-        push!(_indirect_slabs, _alloc_indirect_slab())
-    end
-    slab = _indirect_slabs[_indirect_slab_idx[]]
-    if _indirect_slab_offset[] + alloc_size > slab.size
-        _indirect_slab_idx[] += 1
-        _indirect_slab_offset[] = 0
-        while length(_indirect_slabs) < _indirect_slab_idx[]
-            push!(_indirect_slabs, _alloc_indirect_slab())
-        end
-        slab = _indirect_slabs[_indirect_slab_idx[]]
-    end
-
-    offset = _indirect_slab_offset[]
-    _indirect_slab_offset[] = offset + alloc_size
-
-    return VkIndirectBuffer(
-        slab.buffer,
-        UInt64(offset),
-        slab.address + UInt64(offset),
-        slab.mapped_ptr + offset,
-        alloc_size
-    )
-end
-
-"""Reset indirect buffer slab allocator after flush."""
-function reset_indirect_buffer_pool!()
-    _indirect_slab_idx[] = 1
-    _indirect_slab_offset[] = 0
-end
-
-function _find_memory_type_optional(type_bits::UInt32, required_flags)
-    ctx = vk_context()
-    mem_props = Vulkan.get_physical_device_memory_properties(ctx.physical_device)
+function find_memory_type_optional(ctx::VkContext, type_bits::UInt32, required_flags)
+    mem_props = ctx.memory_properties
     for i in 0:(mem_props.memory_type_count - 1)
         if (type_bits & (UInt32(1) << i)) != 0
             mt = mem_props.memory_types[i + 1]
@@ -642,9 +997,8 @@ function _find_memory_type_optional(type_bits::UInt32, required_flags)
     return nothing
 end
 
-function _find_memory_type(type_bits::UInt32, required_flags)
-    ctx = vk_context()
-    mem_props = Vulkan.get_physical_device_memory_properties(ctx.physical_device)
+function find_memory_type(ctx::VkContext, type_bits::UInt32, required_flags)
+    mem_props = ctx.memory_properties
 
     for i in 0:(mem_props.memory_type_count - 1)
         if (type_bits & (UInt32(1) << i)) != 0

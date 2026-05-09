@@ -8,11 +8,30 @@ import Adapt
 
 # ── Adapt.jl integration ──
 
-"""LavaAdaptor: converts LavaArray → Ptr{T} for GPU kernel compilation.
-Used by argconvert to recursively adapt Broadcasted objects containing LavaArray."""
-struct LavaAdaptor end
+# LavaAdaptor struct is declared in array/lavaarray.jl (needed earlier by
+# ka_backend.jl method signatures).  This file defines the Adapt rules.
+#
+# The adaptor is the single place LavaArray → LavaDeviceArray (pointer strip)
+# happens during kernel-arg conversion, so it is also the single place buffer-
+# lifetime pinning fires.  Adapt.jl's recursion handles wrapper structs,
+# Broadcasted, NamedTuple — every LavaArray anywhere inside lands here.
 
-Adapt.adapt_storage(::LavaAdaptor, a::LavaArray{T,N}) where {T,N} = LavaDeviceArray{T,N}(Ptr{T}(bda_address(a)), a.dims)
+"""
+    adapt_storage(::LavaAdaptor, ::LavaArray) → LavaDeviceArray
+
+Pure strip: wrap the GPU buffer address in a device-visible struct. **No pin
+side effect**. Callers must separately invoke `pin_leaves!(batch, args...)`
+before submitting a command buffer that uses the stripped result — otherwise
+the underlying `VkManagedBuffer` can be GC'd before the GPU reads from it.
+
+(AMDGPU's adapt is also pure; they get away without an explicit pin pass
+because `@roc` uses `GC.@preserve vars...` lexically around a synchronous
+dispatch. Lava's dispatches are batched and submitted later, so `@preserve`
+isn't enough — hence the explicit `pin_leaves!` step.)
+"""
+function Adapt.adapt_storage(::LavaAdaptor, a::LavaArray{T,N}) where {T,N}
+    return LavaDeviceArray{T,N}(Ptr{T}(bda_address(a)), a.dims)
+end
 Adapt.adapt_storage(::LavaAdaptor, x) = x  # Scalars pass through
 
 # Type-based adapt: Array → LavaArray (used by GPUArrays test suite's compare())
@@ -83,17 +102,19 @@ function Base.copyto!(dest::LavaArray{T}, doffs::Integer,
     n == 0 && return dest
     bytes = Vector{UInt8}(undef, n * sizeof(T))
     unsafe_copyto!(Ptr{UInt8}(pointer(bytes)), Ptr{UInt8}(pointer(src, soffs)), n * sizeof(T))
-    # upload! → _one_shot_copy auto-flushes pending dispatches and does its own submit+wait
-    upload!(dest.buf[], bytes; offset=(dest.offset + Int(doffs) - 1) * sizeof(T))
+    # upload! records into the active batch and flushes; sync_access! takes care
+    # of any prior cross-queue writer to `dest.buf[]` via timeline semaphore.
+    upload!(dest.buf[], bytes; offset=dest.offset + (Int(doffs) - 1) * sizeof(T))
     return dest
 end
 
 function Base.copyto!(dest::Array{T}, doffs::Integer,
                       src::LavaArray{T}, soffs::Integer, n::Integer) where T
     n == 0 && return dest
-    # download! → _one_shot_copy auto-flushes pending dispatches and does its own submit+wait
+    # download! records a copy into the active batch of whichever queue last
+    # wrote `src.buf[]` and flushes — sync_access! inserts any cross-queue wait.
     bytes = Vector{UInt8}(undef, n * sizeof(T))
-    download!(bytes, src.buf[]; offset=(src.offset + Int(soffs) - 1) * sizeof(T))
+    download!(bytes, src.buf[]; offset=src.offset + (Int(soffs) - 1) * sizeof(T))
     unsafe_copyto!(Ptr{UInt8}(pointer(dest, doffs)), Ptr{UInt8}(pointer(bytes)), n * sizeof(T))
     return dest
 end
@@ -101,11 +122,14 @@ end
 function Base.copyto!(dest::LavaArray{T}, doffs::Integer,
                       src::LavaArray{T}, soffs::Integer, n::Integer) where T
     n == 0 && return dest
-    # Direct GPU→GPU copy via vkCmdCopyBuffer (no CPU staging roundtrip)
-    src_offset = (src.offset + Int(soffs) - 1) * sizeof(T)
-    dst_offset = (dest.offset + Int(doffs) - 1) * sizeof(T)
+    # Direct GPU→GPU copy via vkCmdCopyBuffer (no CPU staging roundtrip).
+    src_offset = src.buf[].pool_offset + src.offset + (Int(soffs) - 1) * sizeof(T)
+    dst_offset = dest.buf[].pool_offset + dest.offset + (Int(doffs) - 1) * sizeof(T)
     nbytes = n * sizeof(T)
-    _one_shot_copy(src.buf[].buffer, src_offset, dest.buf[].buffer, dst_offset, nbytes)
+    bq = (dest.buf[].ctx::VkContext).default_bq
+    cmd_copy_buffer!(bq, src.buf[], dest.buf[], nbytes;
+                     src_off=src_offset, dst_off=dst_offset)
+    flush!(bq, bq.device)
     return dest
 end
 
@@ -124,28 +148,73 @@ function Base.fill!(a::LavaArray{T}, val) where T
 end
 
 # ── resize! ──
+#
+# Capacity-aware resize for LavaArrays, both 1-D (standard Base.resize! shape)
+# and N-D (non-standard but the natural extension; textures are 2-D/3-D and
+# `copyto_texture!` needs it).  Invariants:
+#
+# * The backing VkManagedBuffer is pool-allocated with rounded-up capacity.
+#   If the new element count still fits, we just update `dims` — no Vulkan
+#   alloc, no copy.  Elements beyond old length are left undefined, matching
+#   `Base.resize!(::Vector, n)` semantics.
+# * On genuine growth, allocate a fresh pool chunk, copy the first min(old,new)
+#   elements, and retire the old DataRef via `GPUArrays.unsafe_free!`.  The
+#   retirement enters `bq.deferred_frees` gated on the batch timeline — the
+#   caller does NOT need a `synchronize` to make it safe w.r.t. in-flight work.
+# * Throws on a freed DataRef (surfaces caller bugs; no self-heal).
 
-function Base.resize!(a::LavaArray{T,1}, n::Integer) where T
-    n < 0 && throw(ArgumentError("new size must be non-negative"))
+function Base.resize!(a::LavaArray{T,N}, new_dims::Dims{N}) where {T,N}
+    all(>=(0), new_dims) || throw(ArgumentError("new size must be non-negative"))
+    a.buf.freed && throw(ArgumentError(
+        "resize!(::LavaArray{$T,$N}): the backing DataRef was already freed. " *
+        "This array was unsafe_free!'d elsewhere — typically an HW-accel rebuild " *
+        "that released state, or a cached slot whose owner was torn down."))
+    Tuple(a.dims) == new_dims && return a
     old_len = length(a)
-    n == old_len && return a
-    new_buf = vk_alloc(max(Int(n) * sizeof(T), 16))
-    if old_len > 0 && n > 0
-        copy_len = min(old_len, Int(n)) * sizeof(T)
-        _one_shot_copy(a.buf[].buffer, a.offset * sizeof(T), new_buf.buffer, 0, copy_len)
+    new_len = prod(new_dims)
+
+    buf = a.buf[]
+    capacity_bytes = buf.size - a.offset
+    if new_len * sizeof(T) <= capacity_bytes
+        a.dims = new_dims
+        return a
     end
-    new_ref = GPUArrays.DataRef(new_buf) do buf
-        vk_free!(buf)
+
+    ctx = buf.ctx::VkContext
+    bq = ctx.default_bq
+    new_buf = pool_alloc(bq, max(new_len * sizeof(T), 16))
+    if old_len > 0 && new_len > 0
+        copy_len = min(old_len, new_len) * sizeof(T)
+        src_off = buf.pool_offset + a.offset
+        cmd_copy_buffer!(bq, buf, new_buf, copy_len;
+                         src_off=src_off, dst_off=new_buf.pool_offset)
+        # The copy pinned `buf` into the currently-recording batch. `vk_free!`
+        # decides whether to defer destruction by inspecting `buf.last_write`,
+        # but `last_write` is only populated by `sync_access!` at submit time
+        # — between record-pin and submit it reads stale, so `vk_free!` would
+        # free-immediately and the DEAD buffer would trip `sync_access!`'s
+        # ALIVE assertion when the batch eventually submits.  Flushing here
+        # closes that window: the copy submits + completes, `last_write` is
+        # set, then `unsafe_free!` below correctly sees the buffer as in-use
+        # and routes through `deferred_frees`.  Only fires in the slow grow
+        # path (capacity exceeded) — within-capacity resizes are zero-sync.
+        flush!(bq, bq.device)
+    end
+    new_ref = GPUArrays.DataRef(new_buf) do b
+        vk_free!(b)
     end
     old_ref = a.buf
     a.buf = new_ref
-    a.dims = (Int(n),)
+    a.dims = new_dims
     a.offset = 0
-    # Free old buffer — DataRef uses explicit refcounting, not GC finalizers,
-    # so we must release the old ref to avoid leaking VkDeviceMemory.
     GPUArrays.unsafe_free!(old_ref)
     return a
 end
+
+# Variadic / scalar dispatch forwarders (N-D and 1-D calling conventions).
+Base.resize!(a::LavaArray{T,N}, new_dims::Vararg{Integer,N}) where {T,N} =
+    resize!(a, Dims{N}(Int.(new_dims)))
+Base.resize!(a::LavaArray{T,1}, n::Integer) where T = resize!(a, (Int(n),))
 
 # ── append! ──
 
@@ -170,29 +239,29 @@ end
 import LinearAlgebra
 
 # Float16/Float32: accumulate in Float64 to avoid overflow entirely (no rescaling needed)
-function _lava_norm_p2_widen(v::LavaArray{T}) where T
+function lava_norm_p2_widen(v::LavaArray{T}) where T
     s = sum(x -> Float64(abs(x))^2, v; init=Float64(0))
     return typeof(float(LinearAlgebra.norm(zero(T))))(sqrt(s))
 end
 
-function _lava_norm_p1_widen(v::LavaArray{T}) where T
+function lava_norm_p1_widen(v::LavaArray{T}) where T
     s = sum(x -> Float64(abs(x)), v; init=Float64(0))
     return typeof(float(LinearAlgebra.norm(zero(T))))(s)
 end
 
-function _lava_norm_pp_widen(v::LavaArray{T}, spp::Float64) where T
+function lava_norm_pp_widen(v::LavaArray{T}, spp::Float64) where T
     # Use exp2(p*log2(x)) instead of x^p to avoid ^ operator dispatch issues on GPU
     s = sum(x -> exp2(spp * log2(Float64(abs(x)))), v; init=Float64(0))
     return typeof(float(LinearAlgebra.norm(zero(T))))(exp2(inv(spp) * log2(s)))
 end
 
 # Float64: rescale by inv_maxabs to avoid overflow
-function _lava_norm_p2_rescale(v::LavaArray{T}, inv_maxabs::Float64, maxabs::Float64) where T
+function lava_norm_p2_rescale(v::LavaArray{T}, inv_maxabs::Float64, maxabs::Float64) where T
     s = sum(x -> (abs(x) * inv_maxabs)^2, v; init=Float64(0))
     return typeof(float(LinearAlgebra.norm(zero(T))))(maxabs * sqrt(s))
 end
 
-function _lava_norm_pp_rescale(v::LavaArray{T}, inv_maxabs::Float64, maxabs::Float64, spp::Float64) where T
+function lava_norm_pp_rescale(v::LavaArray{T}, inv_maxabs::Float64, maxabs::Float64, spp::Float64) where T
     # Use exp2(p*log2(x)) instead of x^p to avoid ^ operator dispatch issues on GPU
     s = sum(x -> exp2(spp * log2(abs(x) * inv_maxabs)), v; init=Float64(0))
     return typeof(float(LinearAlgebra.norm(zero(T))))(maxabs * exp2(inv(spp) * log2(s)))
@@ -211,9 +280,9 @@ function LinearAlgebra.norm(v::LavaArray{T}, p::Real=2) where T
 
     # Float16/Float32/ComplexF16/ComplexF32: accumulate in Float64 (no overflow possible)
     if RT === Float32 || RT === Float16
-        p == 2 && return _lava_norm_p2_widen(v)
-        p == 1 && return _lava_norm_p1_widen(v)
-        return _lava_norm_pp_widen(v, Float64(p))
+        p == 2 && return lava_norm_p2_widen(v)
+        p == 1 && return lava_norm_p1_widen(v)
+        return lava_norm_pp_widen(v, Float64(p))
     end
 
     # Float64/ComplexF64: rescale by max to avoid overflow
@@ -227,7 +296,7 @@ function LinearAlgebra.norm(v::LavaArray{T}, p::Real=2) where T
     end
 
     inv_maxabs = 1.0 / maxabs
-    p == 2 && return _lava_norm_p2_rescale(v, inv_maxabs, maxabs)
+    p == 2 && return lava_norm_p2_rescale(v, inv_maxabs, maxabs)
     p == 1 && return convert(RT, sum(abs, v; init=Float64(0)))
-    return _lava_norm_pp_rescale(v, inv_maxabs, maxabs, Float64(p))
+    return lava_norm_pp_rescale(v, inv_maxabs, maxabs, Float64(p))
 end

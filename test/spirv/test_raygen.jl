@@ -16,14 +16,14 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
             sx = Lava.lava_rt_launch_size_x()
 
             # Trace a ray
-            Lava._lava_rt_payload_store_f32(0.0f0)
-            Lava._lava_rt_trace_ray(
+            Lava.lava_rt_payload_store_f32(0.0f0)
+            Lava.lava_rt_trace_ray(
                 UInt32(0), UInt32(0xFF),  # flags, cull_mask
                 UInt32(0), UInt32(0), UInt32(0),  # sbt offset/stride/miss
                 0.0f0, 0.0f0, -1.0f0, 0.001f0,   # origin, tmin
                 0.0f0, 0.0f0, 1.0f0, 100.0f0     # direction, tmax
             )
-            result = Lava._lava_rt_payload_load_f32()
+            result = Lava.lava_rt_payload_load_f32()
             @inbounds output[ix + iy * sx + UInt32(1)] = result
             return nothing
         end

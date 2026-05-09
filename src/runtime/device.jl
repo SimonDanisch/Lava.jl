@@ -24,7 +24,7 @@ end
     CommandBatch
 
 A single recording batch that may span multiple Vulkan command buffers.
-When the number of dispatches in the current CB segment exceeds `cb_split_threshold`,
+When the number of dispatches in the current CB segment exceeds `CB_SPLIT_THRESHOLD`,
 the CB is sealed and a fresh one is started. At flush time, all sealed CBs + the
 active CB are submitted in a single `vkQueueSubmit` call.
 
@@ -33,69 +33,275 @@ while keeping submission count minimal (single submit per flush).
 """
 mutable struct CommandBatch
     cmd_buf::Vulkan.CommandBuffer       # Currently recording CB segment
-    fence::Vulkan.Fence                 # Single fence for the whole batch
     recording::Bool
     dispatch_count::Int                 # Total dispatches across all segments (for barriers)
     segment_dispatches::Int             # Dispatches in current CB segment (for split threshold)
     last_was_rt::Bool
-    data_refs::Vector{Any}
+    # All objects this batch keeps alive until the fence is reached.  IdSet
+    # so each object is pinned (and sync-tracked) at most once per batch.
+    # Populated by `pin!` during arg packing and from dispatch entry points.
+    pinned::Base.IdSet{Any}
     dispatch_log::Vector{String}
     sealed_cmd_bufs::Vector{Vulkan.CommandBuffer}  # Completed CB segments awaiting submit
+
+    # Timeline value this batch will signal on its queue's `timeline_sem`.
+    # Assigned at record time so `sync_access!` can store it into `buf.last_write`.
+    signal_value::UInt64
+    # Cross-queue dependencies, built up by `sync_access!(::VkManagedBuffer)` at submit.
+    wait_semaphores::Vector{Tuple{Vulkan.Semaphore, UInt64, Vulkan.PipelineStageFlag2}}
+    # Back-reference to the owning BatchQueue.  Set post-construction (chicken/
+    # egg: init_batch runs inside BatchQueue's constructor).  Always non-nothing
+    # after the BatchQueue is fully built; checked via `batch.bq`.
+    # Loose type because BatchQueue is declared above but the reverse dep still
+    # makes `CommandBatch.bq::BatchQueue` fragile in the struct body.
+    bq::Any
+end
+
+"""
+    BatchQueue
+
+An independent command submission channel owning a Vulkan queue, command pool,
+and batch state. Multiple `BatchQueue`s can record and submit independently
+(e.g., primary queue for graphics/present, compute queue for async RT).
+
+Create with `BatchQueue(device, queue, queue_family_index)`.
+"""
+mutable struct BatchQueue
+    device::Vulkan.Device
+    queue::Vulkan.Queue
+    family_index::UInt32
+    cmd_pool::Vulkan.CommandPool
+    active_batch::Union{Nothing, CommandBatch}
+    in_flight::Vector{CommandBatch}
+    free_batches::Vector{CommandBatch}
+    free_cmd_bufs::Vector{Vulkan.CommandBuffer}
+    # Dedicated AS-build command buffer + fence — allocated from this BQ's
+    # own cmd_pool and submitted on this BQ's queue.  Keeping them on the
+    # BQ (not the VkContext) means AS build, submit and queue are locked
+    # together by construction.
+    as_cmd_buf::Vulkan.CommandBuffer
+    as_fence::Vulkan.Fence
+
+    # ── Explicit-queue refactor additions ────────────────────────────────
+    # One timeline semaphore per queue.  Each submit signals next_timeline+1.
+    timeline_sem::Vulkan.Semaphore
+    next_timeline::UInt64
+    # Buffers queued for destruction once their last_write timeline value
+    # is reached. Drained by drain_deferred_frees! at natural sync points.
+    # Loose type (VkManagedBuffer is declared later in memory.jl).
+    #
+    # Cross-thread: finalizer threads push into this list via `vk_free!`;
+    # the main thread iterates + drains via `drain_deferred_frees!`.  The
+    # `deferred_frees_lock` below guards both operations on `deferred_frees`
+    # AND `deferred_as_frees`.  SpinLock because contention is near-zero
+    # (finalizer pushes at GC pauses, drain happens at sync points).
+    deferred_frees::Vector{Any}
+    # LavaBLAS / LavaTLAS queued for destruction once their `last_use`
+    # timeline value is reached. Drained by `drain_deferred_as_frees!`.
+    # Loose type — Lava AS types are declared later in raytracing/acceleration.jl.
+    deferred_as_frees::Vector{Any}
+    # Guards `deferred_frees` AND `deferred_as_frees`.  Acquired on every
+    # push from finalizer threads and on every drain from the main thread.
+    deferred_frees_lock::Base.Threads.SpinLock
+    # Per-BQ argument-buffer slab pool.  Each submit bump-allocates from
+    # the current slab; `reset_arg_buffer_pool!(bq)` (called from
+    # reclaim_batch! once in_flight is empty) rewinds the bump pointer.
+    # Element type is `LavaArray{UInt8,1}` (unified/BAR memory); kept loose
+    # because LavaArray is declared later in array/lavaarray.jl.
+    arg_slabs::Vector{Any}
+    arg_slab_idx::Int
+    arg_slab_offset::Int
+    arg_alloc_count::Int
+    # Per-BQ indirect-dispatch buffer slab pool.  Element type is
+    # `LavaArray{UInt32,1}` (unified + INDIRECT_BUFFER_BIT).  Reset by
+    # `reset_indirect_buffer_pool!(bq)`.
+    indirect_slabs::Vector{Any}
+    indirect_slab_idx::Int
+    indirect_slab_offset::Int
+    # Per-BQ staging buffer for CPU↔GPU transfers. A single VkManagedBuffer
+    # that grows as needed via get_staging!. Reused across transfers.
+    # Loose type — VkManagedBuffer is declared later in memory.jl.
+    staging::Union{Nothing, Any}
+    # Back-reference to owning VkContext. Set post-construction by
+    # init_vulkan!/allocate_batch_queue!. `nothing` only during the brief
+    # window of default_bq construction before VkContext exists.
+    # Loose type — VkContext is declared below.
+    ctx::Any
+    # Single-writer invariant: only this thread may record into or submit
+    # from this BatchQueue.  Captured at construction from `Threads.threadid()`.
+    # Every dispatch-recording / sweep / slab-alloc entry point asserts that
+    # it is running on this thread — an accidental cross-thread call trips
+    # the assert immediately instead of silently corrupting state.
+    owning_thread::Int
+end
+
+function init_batch(cb::Vulkan.CommandBuffer)
+    pinned = Base.IdSet{Any}()
+    sizehint!(pinned, 128)
+    waits = Tuple{Vulkan.Semaphore, UInt64, Vulkan.PipelineStageFlag2}[]
+    return CommandBatch(cb, false, 0, 0, false, pinned, String[],
+        Vulkan.CommandBuffer[],
+        UInt64(0),                       # signal_value (assigned at record time)
+        waits,
+        nothing,                         # bq (set after BatchQueue is fully built)
+    )
+end
+
+function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32, ctx;
+                    n_initial_batches::Int=2)
+    cmd_pool = Vulkan.CommandPool(device, qf_idx;
+        flags=Vulkan.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
+    batches = CommandBatch[]
+    for _ in 1:n_initial_batches
+        alloc_info = Vulkan.CommandBufferAllocateInfo(cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1)
+        cb = unwrap(Vulkan.allocate_command_buffers(device, alloc_info))[1]
+        push!(batches, init_batch(cb))
+    end
+    # Dedicated AS-build command buffer + fence (same pool as this bq).
+    as_alloc = Vulkan.CommandBufferAllocateInfo(cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 1)
+    as_cmd_buf = unwrap(Vulkan.allocate_command_buffers(device, as_alloc))[1]
+    as_fence = Vulkan.Fence(device)
+    # Per-queue timeline semaphore for cross-queue ordering.
+    type_info = Vulkan.SemaphoreTypeCreateInfo(Vulkan.SEMAPHORE_TYPE_TIMELINE, UInt64(0))
+    timeline_sem = unwrap(Vulkan.create_semaphore(device,
+        Vulkan.SemaphoreCreateInfo(; next=type_info)))
+    bq = BatchQueue(device, queue, qf_idx, cmd_pool, nothing,
+                    CommandBatch[], batches, Vulkan.CommandBuffer[],
+                    as_cmd_buf, as_fence,
+                    timeline_sem, UInt64(0),
+                    Any[], Any[],    # deferred_frees, deferred_as_frees
+                    Base.Threads.SpinLock(),  # deferred_frees_lock
+                    Any[], 1, 0, 0,  # arg_slabs: idx=1, offset=0, count=0
+                    Any[], 1, 0,     # indirect_slabs: idx=1, offset=0
+                    nothing,         # staging (lazy)
+                    ctx,             # owning VkContext (required)
+                    Threads.threadid())  # owning_thread
+    # Plug the back-reference into every pre-allocated batch so `batch.bq`
+    # is non-nothing as soon as the bq is returned.  Future batches allocated
+    # lazily (alloc_cmd_buf → init_batch) must set .bq themselves.
+    for b in batches
+        b.bq = bq
+    end
+    return bq
 end
 
 """
     VkContext
 
-Persistent Vulkan context holding device, queue, command pool, and batch-based
-command buffer management for compute/graphics/RT dispatch.
+Persistent Vulkan context. Batch-based command recording goes through
+`default_bq::BatchQueue` (the primary queue). Use `BatchQueue(...)` to
+create additional independent queues (e.g., for async compute/RT).
 """
 mutable struct VkContext
     instance::Vulkan.Instance
     physical_device::Vulkan.PhysicalDevice
     device::Vulkan.Device
-    queue::Vulkan.Queue
     queue_family_index::UInt32
-    cmd_pool::Vulkan.CommandPool
     device_name::String
-    # Batch-based dispatch (replaces single cmd_buf/fence)
-    active_batch::Union{Nothing, CommandBatch}   # Currently recording
-    in_flight::Vector{CommandBatch}              # Submitted, not yet completed
-    free_batches::Vector{CommandBatch}           # Completed, reusable
-    free_cmd_bufs::Vector{Vulkan.CommandBuffer}  # Spare CBs for multi-CB splitting
-    # Dedicated transfer command buffer + fence (separate from dispatch recording)
-    # Prevents command buffer state corruption when _one_shot_copy runs between
-    # dispatch recording and flush (NVIDIA validation: "active VkCommandBuffer")
-    xfer_cmd_buf::Vulkan.CommandBuffer
-    xfer_fence::Vulkan.Fence
-    # Dedicated AS build command buffer + fence (separate from dispatch batches)
-    # Prevents vkBeginCommandBuffer on active cmd_buf and vkQueueSubmit with in-use fence
-    # when _build_as_on_gpu runs during dispatch recording.
-    as_cmd_buf::Vulkan.CommandBuffer
-    as_fence::Vulkan.Fence
+    # Primary batch queue — all global API functions delegate here.  Always
+    # non-nothing after the inner constructor returns (BatchQueue is built
+    # using `new()`-based two-phase init to break the chicken-and-egg with
+    # BatchQueue.ctx).
+    default_bq::BatchQueue
+    # Secondary compute queue (async RT) — same family, separate queue object
+    compute_queue::Vulkan.Queue
     # Ray tracing (nothing if not available)
     rt_pipeline_properties::Union{Nothing, RTPipelineProperties}
     # Debug messenger (nothing if validation layers not available)
-    debug_messenger::Any  # Union{Nothing, Vulkan.DebugUtilsMessengerEXT}
+    debug_messenger::Any
+    # Queue allocation: next available index + total requested from device
+    next_queue_index::Int
+    max_queue_count::Int
+    # Async compute family (distinct from primary). RADV family 1: 4 queues,
+    # compute+transfer. Used by the explicit-queue refactor for upload_bq.
+    async_queue_family_index::Union{Nothing, UInt32}
+    async_queue_count::Int
+    # Per-device state (was previously a global Ref).
+    # Set to `true` after vkQueueSubmit returns DEVICE_LOST. Finalizers
+    # holding a ref to the context check this to skip Vulkan calls on
+    # invalid handles.
+    device_lost::Bool
+    # Cached physical-device properties (avoid re-querying on every alloc/dispatch).
+    memory_properties::Vulkan.PhysicalDeviceMemoryProperties
+    max_wg_dims::NTuple{3, Int}
+    # Alignment (bytes) for BDAs passed as `pScratchData` in AS builds.
+    # Picked by `bda_alignment_for(ctx, scratch=true)`.
+    as_scratch_align::UInt64
+    # Whether VK_KHR_ray_query is available on this device.
+    # Set to true by B1 (device extension probe). False until proven otherwise.
+    ray_query_available::Bool
+
+    # Inner constructor: two-phase init via `new()` so we can hand a live
+    # `ctx` reference to `BatchQueue(...)` while finishing the ctx's own
+    # field assignments.  There is no public ctor that can leave `default_bq`
+    # unset.  `primary_queue` is the raw `Vulkan.Queue` for the default bq;
+    # everything else maps directly to a field.
+    function VkContext(instance::Vulkan.Instance,
+                       physical_device::Vulkan.PhysicalDevice,
+                       device::Vulkan.Device,
+                       queue_family_index::UInt32,
+                       device_name::String,
+                       primary_queue::Vulkan.Queue,
+                       compute_queue::Vulkan.Queue,
+                       rt_pipeline_properties::Union{Nothing, RTPipelineProperties},
+                       debug_messenger::Any,
+                       next_queue_index::Int,
+                       max_queue_count::Int,
+                       async_queue_family_index::Union{Nothing, UInt32},
+                       async_queue_count::Int,
+                       device_lost::Bool,
+                       memory_properties::Vulkan.PhysicalDeviceMemoryProperties,
+                       max_wg_dims::NTuple{3, Int},
+                       as_scratch_align::UInt64,
+                       ray_query_available::Bool=false)
+        ctx = new()
+        ctx.instance = instance
+        ctx.physical_device = physical_device
+        ctx.device = device
+        ctx.queue_family_index = queue_family_index
+        ctx.device_name = device_name
+        ctx.compute_queue = compute_queue
+        ctx.rt_pipeline_properties = rt_pipeline_properties
+        ctx.debug_messenger = debug_messenger
+        ctx.next_queue_index = next_queue_index
+        ctx.max_queue_count = max_queue_count
+        ctx.async_queue_family_index = async_queue_family_index
+        ctx.async_queue_count = async_queue_count
+        ctx.device_lost = device_lost
+        ctx.memory_properties = memory_properties
+        ctx.max_wg_dims = max_wg_dims
+        ctx.as_scratch_align = as_scratch_align
+        ctx.ray_query_available = ray_query_available
+        # Now build the default BatchQueue with the live ctx.  Sets the
+        # remaining field; no nullable slot, no post-hoc mutation.
+        ctx.default_bq = BatchQueue(device, primary_queue, queue_family_index, ctx)
+        return ctx
+    end
 end
 
 # Ring buffer of recent validation messages for context on DEVICE_LOST
-const _validation_messages = String[]
-const _max_validation_messages = 50
+const VALIDATION_MESSAGES = String[]
+const MAX_VALIDATION_MESSAGES = 50
 
-const _vk_context = Ref{Union{Nothing, VkContext}}(nothing)
+const VK_CONTEXT_REF = Ref{Union{Nothing, VkContext}}(nothing)
 
-# Set to true after DEVICE_LOST — prevents finalizers from calling Vulkan on invalid handles
-const _device_lost = Ref(false)
+"""
+    device_lost(ctx::VkContext)  ->  Bool
 
-# Device generation counter — incremented on each vk_reset_device!().
-# VkManagedBuffer records the generation at creation time. If a GC finalizer
-# fires after a device reset, the buffer's generation won't match the current
-# one and destruction is skipped (the old device cleaned up its own resources).
-const _device_generation = Ref{UInt64}(0)
+Whether this context's device has been marked lost. Prefer passing `ctx`
+explicitly; the no-arg form looks up the current default context.
+"""
+device_lost(ctx::VkContext) = ctx.device_lost
+device_lost() = let ctx = VK_CONTEXT_REF[]
+    ctx === nothing ? false : ctx.device_lost
+end
+
+"""Mark `ctx`'s device as lost. All subsequent finalizers will skip Vulkan calls."""
+mark_device_lost!(ctx::VkContext) = (ctx.device_lost = true; nothing)
 
 # Callbacks for vk_reset_device! — registered by later-included files (pipeline.jl,
 # command.jl, launch.jl, memory.jl) to clear their module-level caches.
-const _reset_callbacks = Function[]
+const RESET_CALLBACKS = Function[]
 
 """
     vk_context() -> VkContext
@@ -103,16 +309,15 @@ const _reset_callbacks = Function[]
 Get or create the global Vulkan context. Lazily initializes on first call.
 """
 function vk_context()
-    ctx = _vk_context[]
+    ctx = VK_CONTEXT_REF[]
     if ctx === nothing
-        ctx = _init_vulkan!()
-        _vk_context[] = ctx
+        ctx = init_vulkan!()
+        VK_CONTEXT_REF[] = ctx
     end
     return ctx
 end
 
 vk_device() = vk_context().device
-vk_queue() = vk_context().queue
 
 """
     vk_reset_device!()
@@ -125,15 +330,16 @@ kernels, arg buffers).
 GPU buffers no longer exist. You must reallocate all GPU data.
 """
 function vk_reset_device!()
-    _device_generation[] += 1  # Invalidate old VkManagedBuffer handles
-    _device_lost[] = false
-    _vk_context[] = nothing
+    # Drop the context ref; a fresh one will be created lazily. Pre-reset
+    # VkManagedBuffers hold a strong ref to the OLD ctx whose `device_lost`
+    # is already true, so their finalizers will skip Vulkan calls.
+    VK_CONTEXT_REF[] = nothing
     # Don't destroy old Vulkan handles — they're invalid after DEVICE_LOST.
     # GC will eventually try to destroy them; _destroy_buffer! skips when
-    # _device_lost was true (and we set it false only after clearing context).
-    empty!(_validation_messages)
+    # DEVICE_LOST was true (and we set it false only after clearing context).
+    empty!(VALIDATION_MESSAGES)
     # Run cleanup callbacks registered by other modules
-    for cb in _reset_callbacks
+    for cb in RESET_CALLBACKS
         try
             cb()
         catch e
@@ -146,38 +352,49 @@ function vk_reset_device!()
     return nothing
 end
 
-"""Check if a recording is active (any batch is recording)."""
-function has_active_recording(ctx::VkContext)
-    batch = ctx.active_batch
-    return batch !== nothing && batch.recording
-end
+"""
+    has_active_recording(bq::BatchQueue) -> Bool
 
-function _init_vulkan!()
-    # Create instance
+Whether `bq` has an open/recording CommandBatch.  Used by transfer paths
+to decide "should I flush `bq` before doing my own submit/CPU write?"
+Always takes the queue explicitly — no implicit default_bq lookup.
+"""
+has_active_recording(bq::BatchQueue) = bq.active_batch !== nothing
+
+function init_vulkan!()
+    # Create instance — target Vulkan 1.4 (device supports 1.4.335 on RADV).
+    # Bumping API version unlocks 1.3/1.4 core features we enable below.
     app_info = Vulkan.ApplicationInfo(
-        v"0.1.0", v"0.1.0", v"1.3.0";
+        v"0.1.0", v"0.1.0", v"1.4.0";
         application_name="Lava.jl",
         engine_name="Lava"
     )
-    # Try with validation layers, fall back without
+    # Validation layers: opt-in via LAVA_VALIDATION=1 (default: off)
+    want_validation = get(ENV, "LAVA_VALIDATION", "0") != "0"
     layers = String[]
-    available_layers = unwrap(Vulkan.enumerate_instance_layer_properties())
-    for l in available_layers
-        name = String(filter(!=('\0'), collect(l.layer_name)))
-        if name == "VK_LAYER_KHRONOS_validation"
-            push!(layers, "VK_LAYER_KHRONOS_validation")
-            break
+    if want_validation
+        available_layers = unwrap(Vulkan.enumerate_instance_layer_properties())
+        for l in available_layers
+            name = String(filter(!=('\0'), collect(l.layer_name)))
+            if name == "VK_LAYER_KHRONOS_validation"
+                push!(layers, "VK_LAYER_KHRONOS_validation")
+                break
+            end
         end
     end
 
-    # Instance extensions for surface/window support
-    inst_extensions = String[
-        "VK_KHR_surface",
-    ]
-    # Debug utils for validation message capture (works even without validation layers
-    # for driver-level error reporting)
+    # Collect all available instance extensions (driver + layer-provided)
+    inst_extensions = String["VK_KHR_surface"]
     available_ext = unwrap(Vulkan.enumerate_instance_extension_properties())
     ext_names = Set(String(filter(!=('\0'), collect(e.extension_name))) for e in available_ext)
+    # Also collect extensions provided by the validation layer
+    has_validation = !isempty(layers)
+    if has_validation
+        layer_ext = unwrap(Vulkan.enumerate_instance_extension_properties(; layer_name="VK_LAYER_KHRONOS_validation"))
+        for e in layer_ext
+            push!(ext_names, String(filter(!=('\0'), collect(e.extension_name))))
+        end
+    end
     has_debug_utils = "VK_EXT_debug_utils" in ext_names
     if has_debug_utils
         push!(inst_extensions, "VK_EXT_debug_utils")
@@ -198,16 +415,59 @@ function _init_vulkan!()
         push!(inst_extensions, "VK_EXT_metal_surface")
     end
 
-    instance = Vulkan.Instance(
-        layers,
-        inst_extensions;
-        application_info=app_info
-    )
+    # Extended validation: opt-in via env vars, all require VK_EXT_validation_features.
+    #   LAVA_GPU_AV=1    → shader instrumentation (OOB descriptor access, ray query misuse);
+    #                      does NOT cover plain BDA ranges in current layers.
+    #   LAVA_SYNC_VAL=1  → synchronization validation (reads before writes, missing barriers,
+    #                      cross-submit hazards).  Catches shadow-ownership UAFs.
+    #   LAVA_BEST=1      → best-practices warnings (perf hints).
+    # All are very slow; use one or a combination as needed for triage.
+    gpu_assisted = false
+    sync_val     = false
+    want_gpu_av  = get(ENV, "LAVA_GPU_AV",  "0") != "0"
+    want_sync_val= get(ENV, "LAVA_SYNC_VAL","0") != "0"
+    want_best    = get(ENV, "LAVA_BEST",    "0") != "0"
+    validation_features_reqs = Vulkan.ValidationFeatureEnableEXT[]
+    if want_gpu_av
+        push!(validation_features_reqs,
+              Vulkan.VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT)
+        push!(validation_features_reqs,
+              Vulkan.VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_RESERVE_BINDING_SLOT_EXT)
+    end
+    if want_sync_val
+        push!(validation_features_reqs,
+              Vulkan.VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT)
+    end
+    if want_best
+        push!(validation_features_reqs,
+              Vulkan.VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT)
+    end
+    if !isempty(validation_features_reqs) && has_validation && "VK_EXT_validation_features" in ext_names
+        push!(inst_extensions, "VK_EXT_validation_features")
+        validation_features = Vulkan.ValidationFeaturesEXT(validation_features_reqs, [])
+        instance = Vulkan.Instance(
+            layers,
+            inst_extensions;
+            application_info=app_info,
+            next=validation_features
+        )
+        gpu_assisted = want_gpu_av
+        sync_val     = want_sync_val
+    else
+        instance = Vulkan.Instance(
+            layers,
+            inst_extensions;
+            application_info=app_info
+        )
+        if has_validation && (want_gpu_av || want_sync_val || want_best)
+            @warn "Vulkan validation layers active but VK_EXT_validation_features not available; extended validation disabled."
+        end
+    end
 
     # Set up debug messenger to capture validation/driver error messages
     debug_messenger = nothing
     if has_debug_utils
-        debug_messenger = _setup_debug_messenger(instance)
+        debug_messenger = setup_debug_messenger(instance)
     end
 
     # Pick physical device (prefer discrete GPU)
@@ -217,21 +477,39 @@ function _init_vulkan!()
         "No Vulkan-capable GPU found",
         "Ensure Vulkan drivers are installed"))
 
-    phys_dev = _pick_physical_device(phys_devs)
+    phys_dev = pick_physical_device(phys_devs)
     props = Vulkan.get_physical_device_properties(phys_dev)
     dev_name = String(filter(!=('\0'), collect(props.device_name)))
 
     # Find queue family (prefer graphics+compute for graphics pipeline support)
-    qf_idx = _find_graphics_compute_queue_family(phys_dev)
+    qf_idx = find_graphics_compute_queue_family(phys_dev)
 
     # Create logical device with required features
-    queue_ci = [Vulkan.DeviceQueueCreateInfo(qf_idx, [1.0f0])]
+    qf_props = Vulkan.get_physical_device_queue_family_properties(phys_dev)
+    max_queues = qf_props[qf_idx + 1].queue_count
+    n_queues = min(4, Int(max_queues))
+    queue_priorities = ones(Float32, n_queues)
+    queue_ci = [Vulkan.DeviceQueueCreateInfo(qf_idx, queue_priorities)]
+
+    # Additionally, request queues from any compute-capable family that
+    # isn't the primary one (RADV exposes graphics+compute on family 0 with
+    # 1 queue, and compute-only on family 1 with 4 queues). We need these
+    # for async upload/dispatch in the explicit-queue design.
+    async_qf_idx = find_async_compute_queue_family(phys_dev, qf_idx)
+    async_n_queues = 0
+    if async_qf_idx !== nothing
+        async_max = qf_props[async_qf_idx + 1].queue_count
+        async_n_queues = min(4, Int(async_max))
+        push!(queue_ci, Vulkan.DeviceQueueCreateInfo(async_qf_idx, ones(Float32, async_n_queues)))
+    end
 
     # Check for RT extension support
-    has_rt = _has_rt_extensions(phys_dev)
+    has_rt = has_rt_extensions(phys_dev)
+    has_ray_query = has_rt && has_extension(phys_dev, "VK_KHR_ray_query")
 
     # Check for workgroup memory explicit layout (needed for mixed-type shared memory structs)
-    has_wg_explicit = _has_extension(phys_dev, "VK_KHR_workgroup_memory_explicit_layout")
+    has_wg_explicit = has_extension(phys_dev, "VK_KHR_workgroup_memory_explicit_layout")
+    has_atomic_float = has_extension(phys_dev, "VK_EXT_shader_atomic_float")
 
     # Device extensions
     extensions = String[
@@ -244,8 +522,14 @@ function _init_vulkan!()
             "VK_KHR_deferred_host_operations",
         ])
     end
+    if has_ray_query
+        push!(extensions, "VK_KHR_ray_query")
+    end
     if has_wg_explicit
         push!(extensions, "VK_KHR_workgroup_memory_explicit_layout")
+    end
+    if has_atomic_float
+        push!(extensions, "VK_EXT_shader_atomic_float")
     end
 
     # Chain required features — all Vulkan 1.2 promoted features go in Vulkan12Features
@@ -293,7 +577,7 @@ function _init_vulkan!()
         false,  # shader_subgroup_extended_types
         false,  # separate_depth_stencil_layouts
         false,  # host_query_reset
-        false,  # timeline_semaphore
+        true,   # timeline_semaphore  ← REQUIRED for explicit-queue cross-queue sync
         true,   # buffer_device_address  ← REQUIRED (BDA)
         false,  # buffer_device_address_capture_replay
         false,  # buffer_device_address_multi_device
@@ -305,14 +589,36 @@ function _init_vulkan!()
         false;  # subgroup_broadcast_dynamic_id
         next=var_ptr_features
     )
-    # Dynamic rendering (Vulkan 1.3 core) — no VkRenderPass/VkFramebuffer boilerplate
-    dyn_rendering_features = Vulkan.PhysicalDeviceDynamicRenderingFeatures(
-        true;   # dynamic_rendering
-        next=vulkan12_features
+    # Vulkan 1.3 core features, bundled.  We turn on the set that's
+    # guaranteed by the 1.3 core spec and useful for a compute/RT backend:
+    #   - synchronization2        (REQUIRED: we use vkQueueSubmit2 / cmd_pipeline_barrier_2)
+    #   - dynamic_rendering       (no VkRenderPass/VkFramebuffer boilerplate)
+    #   - maintenance4            (relaxes shader requirements, e.g. storage-buffer layout)
+    #   - subgroup_size_control   (query/set subgroup size)
+    #   - compute_full_subgroups  (FULL_SUBGROUPS flag in pipeline create)
+    #   - pipeline_creation_cache_control (pipeline-cache hints in create)
+    #   - shader_demote_to_helper_invocation (OpDemoteToHelperInvocation in SPIR-V)
+    #   - shader_terminate_invocation         (OpTerminateInvocation in SPIR-V)
+    #   - shader_integer_dot_product          (OpSDot / OpUDot in SPIR-V)
+    #   - shader_zero_initialize_workgroup_memory (zero-init shared mem)
+    #   - private_data            (VkPrivateDataSlot for driver-side tagging)
+    vulkan13_features = Vulkan.PhysicalDeviceVulkan13Features(
+        :synchronization2,
+        :dynamic_rendering,
+        :maintenance4,
+        :subgroup_size_control,
+        :compute_full_subgroups,
+        :pipeline_creation_cache_control,
+        :shader_demote_to_helper_invocation,
+        :shader_terminate_invocation,
+        :shader_integer_dot_product,
+        :shader_zero_initialize_workgroup_memory,
+        :private_data;
+        next=vulkan12_features,
     )
 
     # Chain workgroup explicit layout if available
-    feature_chain = dyn_rendering_features
+    feature_chain = vulkan13_features
     if has_wg_explicit
         wg_explicit_features = Vulkan.PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR(
             true,   # workgroup_memory_explicit_layout
@@ -322,6 +628,26 @@ function _init_vulkan!()
             next=feature_chain
         )
         feature_chain = wg_explicit_features
+    end
+
+    # Chain atomic-float features (used by Lava native reductions via OpAtomicFAdd)
+    if has_atomic_float
+        atomic_float_features = Vulkan.PhysicalDeviceShaderAtomicFloatFeaturesEXT(
+            true,   # shader_buffer_float_32_atomics        — OpAtomicStore/Load/Exchange on f32 SSBO
+            true,   # shader_buffer_float_32_atomic_add     — REQUIRED: OpAtomicFAdd on f32 SSBO
+            false,  # shader_buffer_float_64_atomics
+            false,  # shader_buffer_float_64_atomic_add
+            true,   # shader_shared_float_32_atomics        — atomics on workgroup/shared memory
+            true,   # shader_shared_float_32_atomic_add
+            false,  # shader_shared_float_64_atomics
+            false,  # shader_shared_float_64_atomic_add
+            false,  # shader_image_float_32_atomics
+            false,  # shader_image_float_32_atomic_add
+            false,  # sparse_image_float_32_atomics
+            false;  # sparse_image_float_32_atomic_add
+            next=feature_chain
+        )
+        feature_chain = atomic_float_features
     end
 
     # Chain RT features if available
@@ -344,6 +670,13 @@ function _init_vulkan!()
         )
         feature_chain = rt_features
     end
+    if has_ray_query
+        rq_features = Vulkan.PhysicalDeviceRayQueryFeaturesKHR(
+            true;   # ray_query
+            next=feature_chain
+        )
+        feature_chain = rq_features
+    end
 
     # Enable shader int64, float64, geometry/tessellation shaders, wide lines
     core_features = Vulkan.PhysicalDeviceFeatures(
@@ -363,6 +696,9 @@ function _init_vulkan!()
     )
 
     queue = Vulkan.get_device_queue(device, qf_idx, 0)
+    # Second queue for async compute/RT (falls back to same queue if only 1 available)
+    compute_queue = n_queues >= 2 ?
+        Vulkan.get_device_queue(device, qf_idx, 1) : queue
 
     # Query RT pipeline properties
     rt_props = nothing
@@ -379,63 +715,83 @@ function _init_vulkan!()
         )
     end
 
-    # Command pool (resettable command buffers)
-    cmd_pool = Vulkan.CommandPool(
-        device, qf_idx;
-        flags=Vulkan.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
-    )
-
-    # Pre-allocate command buffers + fences:
-    # [1]: initial dispatch batch (compute/graphics/RT)
-    # [2]: transfer operations (_one_shot_copy staging downloads)
-    # [3]: dedicated AS builds (separate from dispatch batches — THE FIX)
-    # [4]: spare for free_batches pool
-    alloc_info = Vulkan.CommandBufferAllocateInfo(
-        cmd_pool, Vulkan.COMMAND_BUFFER_LEVEL_PRIMARY, 4
-    )
-    cmd_bufs = unwrap(Vulkan.allocate_command_buffers(device, alloc_info))
-    initial_cmd_buf = cmd_bufs[1]
-    xfer_cmd_buf = cmd_bufs[2]
-    as_cmd_buf = cmd_bufs[3]
-    spare_cmd_buf = cmd_bufs[4]
-
-    initial_fence = Vulkan.Fence(device)
-    xfer_fence = Vulkan.Fence(device)
-    as_fence = Vulkan.Fence(device)
-    spare_fence = Vulkan.Fence(device)
-
-    # Create initial batch in free pool
-    initial_batch = CommandBatch(initial_cmd_buf, initial_fence, false, 0, 0, false, Any[], String[], Vulkan.CommandBuffer[])
-    spare_batch = CommandBatch(spare_cmd_buf, spare_fence, false, 0, 0, false, Any[], String[], Vulkan.CommandBuffer[])
+    # Query AS scratch alignment once and cache on the context — used by
+    # `bda_alignment_for(::VkContext, scratch::Bool)` to pick the right
+    # alignment for `LavaArray(...; scratch=true)` allocations.  Vulkan has no
+    # usage flag for "AS scratch", so callers signal via the `scratch` kwarg.
+    as_scratch_align = UInt64(1)
+    if has_rt
+        as_props2 = Vulkan.get_physical_device_properties_2(phys_dev,
+            Vulkan.PhysicalDeviceAccelerationStructurePropertiesKHR)
+        as_scratch_align = max(UInt64(1),
+            UInt64(as_props2.next.min_acceleration_structure_scratch_offset_alignment))
+    end
 
     has_validation = !isempty(layers)
     if has_rt
-        @info "Lava: initialized Vulkan device with RT" device=dev_name queue_family=qf_idx handle_size=rt_props.shader_group_handle_size max_recursion=rt_props.max_ray_recursion_depth validation=has_validation debug_utils=has_debug_utils
+        @info "Lava: initialized Vulkan device with RT" device=dev_name queue_family=qf_idx handle_size=rt_props.shader_group_handle_size max_recursion=rt_props.max_ray_recursion_depth validation=has_validation gpu_assisted=gpu_assisted sync_val=sync_val debug_utils=has_debug_utils
     else
-        @info "Lava: initialized Vulkan device (no RT)" device=dev_name queue_family=qf_idx validation=has_validation debug_utils=has_debug_utils
+        @info "Lava: initialized Vulkan device (no RT)" device=dev_name queue_family=qf_idx validation=has_validation gpu_assisted=gpu_assisted sync_val=sync_val debug_utils=has_debug_utils
     end
-    if !has_validation
+    if !has_validation && want_validation
         @warn "Vulkan validation layers not found. Install vulkan-validationlayers for GPU error diagnostics."
     end
 
-    # Initialize zero-alloc Vulkan function pointers for hot paths
-    _cmd_pipeline_barrier_fptr[] = Vulkan.function_pointer(device, "vkCmdPipelineBarrier")
+    # Clear validation messages accumulated during device creation.
+    # GPU-assisted validation emits harmless "adjusting settings" warnings during
+    # vkCreateDevice that would otherwise block the first shader compilation.
+    clear_validation_messages!()
 
-    return VkContext(
-        instance, phys_dev, device, queue, qf_idx,
-        cmd_pool, dev_name,
-        nothing,  # active_batch
-        CommandBatch[],  # in_flight
-        CommandBatch[initial_batch, spare_batch],  # free_batches
-        Vulkan.CommandBuffer[],  # free_cmd_bufs
-        xfer_cmd_buf, xfer_fence,
-        as_cmd_buf, as_fence,
-        rt_props,
-        debug_messenger
+    # Initialize zero-alloc Vulkan function pointers for hot paths
+    CMD_PIPELINE_BARRIER_FPTR[] = Vulkan.function_pointer(device, "vkCmdPipelineBarrier")
+
+    mem_props = Vulkan.get_physical_device_memory_properties(phys_dev)
+    phys_props = Vulkan.get_physical_device_properties(phys_dev)
+    wgc = phys_props.limits.max_compute_work_group_count
+    max_wg = (Int(wgc[1]), Int(wgc[2]), Int(wgc[3]))
+
+    # VkContext's inner constructor builds its own default_bq via `new()`-
+    # based two-phase init.  Pass the raw primary queue and all other ctx
+    # fields; the ctor wires BatchQueue(device, queue, qfi, ctx) internally.
+    ctx = VkContext(
+        instance, phys_dev, device, qf_idx, dev_name,
+        queue, compute_queue,
+        rt_props, debug_messenger,
+        2, n_queues,  # next_queue_index=2 (0=primary, 1=compute), max=n_queues
+        async_qf_idx, async_n_queues,
+        false,        # device_lost (fresh context)
+        mem_props, max_wg,
+        as_scratch_align,
+        has_ray_query,
     )
+    return ctx
 end
 
-function _pick_physical_device(devs)
+"""
+    allocate_batch_queue!() -> BatchQueue
+
+Create a new independent BatchQueue on a separate Vulkan queue (if available).
+Falls back to a separate command pool on the primary queue if all queues are taken.
+Used by Screen for isolated graphics rendering.
+"""
+function allocate_batch_queue!()
+    ctx = vk_context()
+    allocate_batch_queue!(ctx)
+end
+
+function allocate_batch_queue!(ctx::VkContext)
+    idx = ctx.next_queue_index
+    if idx < ctx.max_queue_count
+        queue = Vulkan.get_device_queue(ctx.device, ctx.queue_family_index, UInt32(idx))
+        ctx.next_queue_index += 1
+    else
+        # All hardware queues taken — reuse primary queue with separate command pool
+        queue = ctx.default_bq.queue
+    end
+    return BatchQueue(ctx.device, queue, ctx.queue_family_index, ctx)
+end
+
+function pick_physical_device(devs)
     # Prefer discrete GPU
     for dev in devs
         props = Vulkan.get_physical_device_properties(dev)
@@ -447,7 +803,7 @@ function _pick_physical_device(devs)
     return first(devs)
 end
 
-function _find_graphics_compute_queue_family(phys_dev)
+function find_graphics_compute_queue_family(phys_dev)
     qf_props = Vulkan.get_physical_device_queue_family_properties(phys_dev)
     # Prefer graphics+compute (needed for graphics pipeline support)
     for (i, qfp) in enumerate(qf_props)
@@ -468,8 +824,27 @@ function _find_graphics_compute_queue_family(phys_dev)
         "Ensure your GPU supports Vulkan compute"))
 end
 
+"""
+Find a secondary queue family distinct from `primary_qf_idx` that supports
+compute + transfer. On RDNA/RADV the primary family is graphics+compute with
+1 queue; the async family is compute-only with 4 queues — ideal for the
+upload/dispatch split. Returns `nothing` if no such family exists.
+"""
+function find_async_compute_queue_family(phys_dev, primary_qf_idx::UInt32)
+    qf_props = Vulkan.get_physical_device_queue_family_properties(phys_dev)
+    for (i, qfp) in enumerate(qf_props)
+        family = UInt32(i - 1)
+        family == primary_qf_idx && continue
+        if (qfp.queue_flags & Vulkan.QUEUE_COMPUTE_BIT) != 0 &&
+           (qfp.queue_flags & Vulkan.QUEUE_TRANSFER_BIT) != 0
+            return family
+        end
+    end
+    return nothing
+end
+
 """Check if the physical device supports the RT extensions we need."""
-function _has_extension(phys_dev, ext_name::String)
+function has_extension(phys_dev, ext_name::String)
     available = unwrap(Vulkan.enumerate_device_extension_properties(phys_dev))
     for ext in available
         name = String(filter(!=('\0'), collect(ext.extension_name)))
@@ -478,7 +853,7 @@ function _has_extension(phys_dev, ext_name::String)
     return false
 end
 
-function _has_rt_extensions(phys_dev)
+function has_rt_extensions(phys_dev)
     available = unwrap(Vulkan.enumerate_device_extension_properties(phys_dev))
     names = Set{String}()
     for ext in available
@@ -491,7 +866,7 @@ end
 
 # ── Validation layer debug messenger ──
 
-function _debug_callback(
+function debug_callback(
     severity,
     type,
     p_callback_data::Ptr{Vulkan.VkCore.VkDebugUtilsMessengerCallbackDataEXT},
@@ -502,28 +877,51 @@ function _debug_callback(
     msg_ptr = data.pMessage
     message = msg_ptr == C_NULL ? "(no message)" : unsafe_string(msg_ptr)
 
-    # Store in ring buffer for context on DEVICE_LOST
-    if length(_validation_messages) >= _max_validation_messages
-        popfirst!(_validation_messages)
-    end
-    push!(_validation_messages, message)
-
-    # Print based on severity — errors are always printed immediately
-    is_error = (severity & Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0
-    is_warning = (severity & Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0
-    if is_error
+    # Distinguish *validation layer* output (opt-in via LAVA_VALIDATION=1) from
+    # *driver-general* output (always on with debug_utils). Per the Vulkan spec,
+    # the message-type bits classify the source:
+    #
+    #   VALIDATION (0x2) — VK_LAYER_KHRONOS_validation + driver spec checks
+    #   GENERAL    (0x1) — driver runtime notes (not spec checks)
+    #   PERFORMANCE (0x4), DEVICE_ADDRESS_BINDING (0x8) — self-explanatory
+    #
+    # Only VALIDATION-typed errors are captured as hard failures — that's the
+    # "validation is the knob" contract: when you don't opt into validation,
+    # nothing is a hard failure outside of what VkResult itself reports.
+    # Driver GENERAL chatter (e.g. lavapipe's SPIR-V linter running inside
+    # vkCreateRayTracingPipelinesKHR) is informational: the API call itself
+    # returns SUCCESS, and the driver is just being loud.
+    # NOTE: Vulkan.jl's flag-set types define `&` to return another flag-set,
+    # which compares `!= 0` *as always true* (a struct is never == an Int).
+    # Coerce to UInt32 first so the bitmask check is actually a bitmask check.
+    sev_u = UInt32(severity)
+    type_u = UInt32(type)
+    is_error = (sev_u & UInt32(Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)) != 0
+    is_warning = (sev_u & UInt32(Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)) != 0
+    is_validation = (type_u & UInt32(Vulkan.DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT)) != 0
+    is_setup_noise = contains(message, "adjusting settings") || contains(message, "VALIDATION-SETTINGS")
+    if is_error && is_validation && !is_setup_noise
+        if length(VALIDATION_MESSAGES) >= MAX_VALIDATION_MESSAGES
+            popfirst!(VALIDATION_MESSAGES)
+        end
+        push!(VALIDATION_MESSAGES, message)
         @error "Vulkan validation error" message
-    elseif is_warning
+    elseif is_error && !is_validation
+        # Driver-general error (e.g. chatty lavapipe SPIR-V notes). Log but
+        # don't capture — the authoritative signal is the VkResult of the
+        # surrounding API call, which @vk_checked already unwraps.
+        @warn "Vulkan driver note (type=$(type), not a validation error)" message
+    elseif is_warning || is_setup_noise
         @warn "Vulkan validation warning" message
     end
     # Return VK_FALSE — can't throw from @cfunction callback (would corrupt Vulkan state).
-    # Errors are collected in _validation_messages and checked after Vulkan calls.
+    # Errors are collected in VALIDATION_MESSAGES and checked after Vulkan calls.
     return UInt32(0)
 end
 
-function _setup_debug_messenger(instance::Vulkan.Instance)
+function setup_debug_messenger(instance::Vulkan.Instance)
     callback_ptr = @cfunction(
-        _debug_callback,
+        debug_callback,
         UInt32,
         (Vulkan.DebugUtilsMessageSeverityFlagEXT,
          Vulkan.DebugUtilsMessageTypeFlagEXT,
@@ -544,14 +942,14 @@ end
 
 Return recent validation layer messages. Useful for diagnosing DEVICE_LOST errors.
 """
-get_validation_messages() = copy(_validation_messages)
+get_validation_messages() = copy(VALIDATION_MESSAGES)
 
 """
     clear_validation_messages!()
 
 Clear the validation message buffer.
 """
-clear_validation_messages!() = empty!(_validation_messages)
+clear_validation_messages!() = empty!(VALIDATION_MESSAGES)
 
 """
     check_validation_errors!(context::String)
@@ -562,15 +960,17 @@ Call this after Vulkan operations that may trigger validation errors
 (shader module creation, pipeline creation, dispatch recording).
 """
 function check_validation_errors!(context::String)
-    isempty(_validation_messages) && return
-    # Check for actual errors (not just warnings)
-    # Validation messages containing "WARNING" are just warnings, not errors.
-    errors = filter(m -> !contains(m, "WARNING"), _validation_messages)
+    isempty(VALIDATION_MESSAGES) && return
+    # Separate true errors from warnings using the severity recorded by the callback.
+    # GPU-AV messages like "Unaligned pointer access" are errors, not warnings,
+    # even though their text may contain strings like "WARNING-Validation".
+    # We rely on the callback storing only ERROR-severity messages.
+    errors = copy(VALIDATION_MESSAGES)
     isempty(errors) && return
     n = min(length(errors), 5)
-    detail = join(["  [$i] $(first(errors[i], 300))" for i in 1:n], "\n")
+    detail = join(["  [$i] $(first(errors[i], 1000))" for i in 1:n], "\n")
     # Clear after reporting to avoid re-triggering
-    empty!(_validation_messages)
+    empty!(VALIDATION_MESSAGES)
     throw(LavaError(
         context,
         "Vulkan validation error(s):\n$detail",

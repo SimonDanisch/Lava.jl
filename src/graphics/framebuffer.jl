@@ -22,6 +22,8 @@ mutable struct LavaFramebuffer
     depth_memory::Union{Nothing, Vulkan.DeviceMemory}
     depth_view::Union{Nothing, Vulkan.ImageView}
     depth_format::Vulkan.Format
+    # Owning context — used for readback / ownership decisions.
+    ctx::VkContext
 end
 
 """
@@ -30,11 +32,10 @@ end
 Create an offscreen framebuffer with color and optional depth attachments.
 """
 function LavaFramebuffer(width::Integer, height::Integer;
+                          ctx::VkContext=vk_context(),
                           depth::Bool=true,
                           color_format::Vulkan.Format=Vulkan.FORMAT_B8G8R8A8_SRGB)
-    ctx = vk_context()
     dev = ctx.device
-    phys = ctx.physical_device
 
     # Create color image
     color_image = Vulkan.Image(dev,
@@ -47,7 +48,7 @@ function LavaFramebuffer(width::Integer, height::Integer;
         Vulkan.SHARING_MODE_EXCLUSIVE, UInt32[],
         Vulkan.IMAGE_LAYOUT_UNDEFINED,
     )
-    color_memory = alloc_image_memory(dev, phys, color_image)
+    color_memory = alloc_image_memory(ctx, color_image)
     color_view = Vulkan.ImageView(dev, color_image, Vulkan.IMAGE_VIEW_TYPE_2D, color_format,
         Vulkan.ComponentMapping(
             Vulkan.COMPONENT_SWIZZLE_IDENTITY, Vulkan.COMPONENT_SWIZZLE_IDENTITY,
@@ -73,7 +74,7 @@ function LavaFramebuffer(width::Integer, height::Integer;
             Vulkan.SHARING_MODE_EXCLUSIVE, UInt32[],
             Vulkan.IMAGE_LAYOUT_UNDEFINED,
         )
-        depth_mem = alloc_image_memory(dev, phys, depth_img)
+        depth_mem = alloc_image_memory(ctx, depth_img)
         depth_vw = Vulkan.ImageView(dev, depth_img, Vulkan.IMAGE_VIEW_TYPE_2D, depth_format,
             Vulkan.ComponentMapping(
                 Vulkan.COMPONENT_SWIZZLE_IDENTITY, Vulkan.COMPONENT_SWIZZLE_IDENTITY,
@@ -86,33 +87,18 @@ function LavaFramebuffer(width::Integer, height::Integer;
 
     LavaFramebuffer(Int(width), Int(height),
         color_image, color_memory, color_view, color_format,
-        depth_img, depth_mem, depth_vw, depth_format)
+        depth_img, depth_mem, depth_vw, depth_format,
+        ctx)
 end
 
 """Allocate device-local memory for an image."""
-function alloc_image_memory(dev::Vulkan.Device, phys::Vulkan.PhysicalDevice, image::Vulkan.Image)
-    mem_reqs = Vulkan.get_image_memory_requirements(dev, image)
-    mem_props = Vulkan.get_physical_device_memory_properties(phys)
-
-    type_idx = find_memory_type(mem_props, mem_reqs.memory_type_bits,
+function alloc_image_memory(ctx::VkContext, image::Vulkan.Image)
+    mem_reqs = Vulkan.get_image_memory_requirements(ctx.device, image)
+    type_idx = find_memory_type(ctx, mem_reqs.memory_type_bits,
                                   Vulkan.MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-
-    mem = Vulkan.DeviceMemory(dev, mem_reqs.size, type_idx)
-    unwrap(Vulkan.bind_image_memory(dev, image, mem, UInt64(0)))
+    mem = Vulkan.DeviceMemory(ctx.device, mem_reqs.size, type_idx)
+    unwrap(Vulkan.bind_image_memory(ctx.device, image, mem, UInt64(0)))
     return mem
-end
-
-"""Find a memory type index matching required bits and properties."""
-function find_memory_type(mem_props, type_bits::UInt32, required_flags)
-    for i in 0:Int(mem_props.memory_type_count) - 1
-        if (type_bits & (1 << i)) != 0
-            flags = mem_props.memory_types[i + 1].property_flags
-            if (flags & required_flags) == required_flags
-                return UInt32(i)
-            end
-        end
-    end
-    error("No suitable memory type found for image allocation")
 end
 
 Base.size(fb::LavaFramebuffer) = (fb.width, fb.height)
@@ -149,22 +135,19 @@ Returns a width x height matrix with element type matching the framebuffer forma
 - `FORMAT_R16G16B16A16_SFLOAT`: `NTuple{4, Float16}` (RGBA half)
 """
 function readback_framebuffer(fb::LavaFramebuffer)
-    ctx = vk_context()
+    ctx = fb.ctx
+    bq = ctx.default_bq
     dev = ctx.device
-
-    if has_active_recording(ctx)
-        vk_flush!()
-    end
 
     bpp = format_pixel_size(fb.color_format)
     T = format_element_type(fb.color_format)
     nbytes = fb.width * fb.height * bpp
-    staging_buf, _, mapped_ptr, _ = get_staging(nbytes)
+    staging_buf, _, mapped_ptr, _ = get_staging(bq, nbytes)
 
-    cmd = ctx.xfer_cmd_buf
-    fence = ctx.xfer_fence
-    unwrap(Vulkan.begin_command_buffer(cmd, Vulkan.CommandBufferBeginInfo(;
-        flags=Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)))
+    # Record image→buffer copy into the active batch.  flush! at the end
+    # blocks until the GPU finishes, then we read the mapped staging bytes.
+    batch = ensure_active_batch!(bq)
+    cmd = batch.cmd_buf
 
     transition_image!(cmd, fb.color_image,
         Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -181,15 +164,63 @@ function readback_framebuffer(fb::LavaFramebuffer)
     Vulkan.cmd_copy_image_to_buffer(cmd, fb.color_image,
         Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_buf, [region])
 
-    unwrap(Vulkan.end_command_buffer(cmd))
-
-    submit_info = Vulkan.SubmitInfo([], [], [cmd], [])
-    unwrap(Vulkan.queue_submit(ctx.queue, [submit_info]; fence=fence))
-    unwrap(Vulkan.wait_for_fences(dev, [fence], true, typemax(UInt64)))
-    unwrap(Vulkan.reset_fences(dev, [fence]))
-    flush_deferred_frees!()
+    pin!(batch, fb)
+    flush!(bq, dev)
 
     pixels = Matrix{T}(undef, fb.width, fb.height)
+    unsafe_copyto!(Ptr{UInt8}(pointer(pixels)), Ptr{UInt8}(mapped_ptr), nbytes)
+    return pixels
+end
+
+"""
+    readback_window(win::RenderWindow) -> Matrix{NTuple{4, UInt8}}
+
+Read back the current swapchain image to CPU memory.
+Must be called after rendering but BEFORE present_frame!.
+Returns a width x height matrix of BGRA byte tuples.
+"""
+function readback_window(win::RenderWindow)
+    ctx = win.ctx
+    bq = ctx.default_bq
+    dev = ctx.device
+
+    w, h = size(win)
+    bpp = format_pixel_size(win.format)
+    T = format_element_type(win.format)
+    nbytes = w * h * bpp
+    staging_buf, _, mapped_ptr, _ = get_staging(bq, nbytes)
+
+    image = win.images[win.current_image_idx + 1]
+
+    # Record image→buffer copy into the active batch, blocking flush at end.
+    batch = ensure_active_batch!(bq)
+    cmd = batch.cmd_buf
+
+    transition_image!(cmd, image,
+        Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, Vulkan.PIPELINE_STAGE_TRANSFER_BIT,
+        Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT, Vulkan.ACCESS_TRANSFER_READ_BIT)
+
+    region = Vulkan.BufferImageCopy(
+        UInt64(0), UInt32(0), UInt32(0),
+        Vulkan.ImageSubresourceLayers(Vulkan.IMAGE_ASPECT_COLOR_BIT,
+            UInt32(0), UInt32(0), UInt32(1)),
+        Vulkan.Offset3D(0, 0, 0),
+        Vulkan.Extent3D(UInt32(w), UInt32(h), UInt32(1)),
+    )
+    Vulkan.cmd_copy_image_to_buffer(cmd, image,
+        Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_buf, [region])
+
+    # Transition back to COLOR_ATTACHMENT_OPTIMAL so present_frame! can transition to PRESENT_SRC
+    transition_image!(cmd, image,
+        Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        Vulkan.PIPELINE_STAGE_TRANSFER_BIT, Vulkan.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        Vulkan.ACCESS_TRANSFER_READ_BIT, Vulkan.AccessFlag(0))
+
+    pin!(batch, win)
+    flush!(bq, dev)
+
+    pixels = Matrix{T}(undef, w, h)
     unsafe_copyto!(Ptr{UInt8}(pointer(pixels)), Ptr{UInt8}(mapped_ptr), nbytes)
     return pixels
 end

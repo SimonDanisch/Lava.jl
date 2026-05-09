@@ -11,7 +11,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
 
     @testset "ignore intersection" begin
         function anyhit_ignore()
-            Lava._lava_rt_ignore_intersection()
+            Lava.lava_rt_ignore_intersection()
             return nothing
         end
         d, _ = compile_and_disasm(anyhit_ignore, Tuple{};
@@ -27,7 +27,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
 
     @testset "terminate ray" begin
         function anyhit_terminate()
-            Lava._lava_rt_terminate_ray()
+            Lava.lava_rt_terminate_ray()
             return nothing
         end
         d, _ = compile_and_disasm(anyhit_terminate, Tuple{};

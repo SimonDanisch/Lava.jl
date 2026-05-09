@@ -24,9 +24,13 @@ mutable struct RenderWindow
     render_finished::Vector{Vulkan.Semaphore}
     in_flight::Vector{Vulkan.Fence}
     current_frame::Int  # index into sync arrays (1-based, wraps)
+    # Per-frame batch: reclaimed after fence wait in acquire_next_image!
+    frame_batches::Vector{Union{Nothing, CommandBatch}}
     # Current frame state
     current_image_idx::UInt32
     acquired::Bool
+    # Owning context — swapchain/surface are bound to a specific device.
+    ctx::VkContext
 end
 
 """
@@ -35,8 +39,8 @@ end
 Create a new window with Vulkan surface and swapchain.
 """
 function RenderWindow(width::Integer, height::Integer;
+                      ctx::VkContext=vk_context(),
                       title::String="Lava", vsync::Bool=true)
-    ctx = vk_context()
 
     # Initialize GLFW (no OpenGL context — we use Vulkan)
     GLFW.Init()
@@ -58,7 +62,9 @@ function RenderWindow(width::Integer, height::Integer;
         Vulkan.Extent2D(width, height),
         Vulkan.Semaphore[], Vulkan.Semaphore[], Vulkan.Fence[],
         1,  # current_frame
+        Union{Nothing, CommandBatch}[],  # frame_batches
         UInt32(0), false,
+        ctx,
     )
 
     create_swapchain!(win; vsync)
@@ -71,7 +77,7 @@ end
 Create or recreate the swapchain for the window.
 """
 function create_swapchain!(win::RenderWindow; vsync::Bool=true)
-    ctx = vk_context()
+    ctx = win.ctx
     dev = ctx.device
     phys = ctx.physical_device
 
@@ -166,6 +172,7 @@ function create_swapchain!(win::RenderWindow; vsync::Bool=true)
     win.image_available = [Vulkan.Semaphore(dev) for _ in 1:n]
     win.render_finished = [Vulkan.Semaphore(dev) for _ in 1:n]
     win.in_flight = [Vulkan.Fence(dev; flags=Vulkan.FENCE_CREATE_SIGNALED_BIT) for _ in 1:n]
+    win.frame_batches = Union{Nothing, CommandBatch}[nothing for _ in 1:n]
     win.current_frame = 1
 end
 
@@ -176,15 +183,32 @@ Acquire the next swapchain image. Returns the image index.
 Must be called before recording rendering commands.
 """
 function acquire_next_image!(win::RenderWindow)
-    ctx = vk_context()
+    ctx = win.ctx
     dev = ctx.device
     fi = win.current_frame
 
-    unwrap(Vulkan.wait_for_fences(dev, [win.in_flight[fi]], true, typemax(UInt64)))
+    wait_for_fences!(ctx.default_bq, [win.in_flight[fi]])
     unwrap(Vulkan.reset_fences(dev, [win.in_flight[fi]]))
 
-    idx, result = unwrap(Vulkan.acquire_next_image_khr(dev, win.swapchain,
-        typemax(UInt64); semaphore=win.image_available[fi]))
+    # Reclaim batch from previous frame in this slot — GPU is done (fence waited above).
+    # Push it back to its OWNING bq's free list, not to ctx.default_bq.  Mixing
+    # foreign batches into another queue's free list breaks the invariant that
+    # every batch in `bq.free_batches` has `batch.bq === bq`, which `submit!`
+    # checks via `@assert batch.bq === bq`.
+    old_batch = win.frame_batches[fi]
+    if old_batch !== nothing
+        old_batch.recording = false
+        old_batch.dispatch_count = 0
+        old_batch.last_was_rt = false
+        empty!(old_batch.pinned)
+        empty!(old_batch.wait_semaphores)
+        push!((old_batch.bq::BatchQueue).free_batches, old_batch)
+        win.frame_batches[fi] = nothing
+    end
+
+    idx, _ = throw_if_error(ctx, "vkAcquireNextImageKHR",
+        Vulkan.acquire_next_image_khr(dev, win.swapchain,
+            typemax(UInt64); semaphore=win.image_available[fi]))
 
     win.current_image_idx = idx
     win.acquired = true
@@ -198,16 +222,16 @@ Present the rendered frame to the screen.
 Must be called after recording and submitting rendering commands.
 """
 function present!(win::RenderWindow)
-    ctx = vk_context()
     win.acquired || error("Cannot present: no image acquired (call acquire_next_image! first)")
-
+    ctx = win.ctx
     fi = win.current_frame
     present_info = Vulkan.PresentInfoKHR(
         [win.render_finished[fi]],
         [win.swapchain],
         [win.current_image_idx],
     )
-    unwrap(Vulkan.queue_present_khr(ctx.queue, present_info))
+    throw_if_error(ctx, "vkQueuePresentKHR",
+        Vulkan.queue_present_khr(ctx.default_bq.queue, present_info))
 
     win.acquired = false
     # Advance to next frame-in-flight slot
@@ -220,19 +244,51 @@ end
 Handle window resize by recreating the swapchain.
 """
 function Base.resize!(win::RenderWindow)
-    ctx = vk_context()
+    ctx = win.ctx
     Vulkan.device_wait_idle(ctx.device)
+    # Reclaim in-flight frame batches before recreating swapchain — push back to
+    # the OWNING bq's free list (frame batches are recorded on present_bq, not
+    # default_bq; mixing breaks the `batch.bq === bq` invariant in submit!).
+    for i in eachindex(win.frame_batches)
+        batch = win.frame_batches[i]
+        if batch !== nothing
+            batch.recording = false
+            batch.dispatch_count = 0
+            batch.last_was_rt = false
+            empty!(batch.pinned)
+            empty!(batch.wait_semaphores)
+            push!((batch.bq::BatchQueue).free_batches, batch)
+            win.frame_batches[i] = nothing
+        end
+    end
     create_swapchain!(win)
 end
 
 function Base.isopen(win::RenderWindow)
-    !GLFW.WindowShouldClose(win.handle)
+    win.handle.handle != C_NULL && !GLFW.WindowShouldClose(win.handle)
 end
 
 function Base.close(win::RenderWindow)
-    ctx = vk_context()
+    # Idempotent -- safe to call multiple times
+    win.handle.handle == C_NULL && return
+    ctx = win.ctx
     Vulkan.device_wait_idle(ctx.device)
+    # Reclaim any in-flight frame batches — push back to the OWNING bq's free
+    # list (see `acquire_next_image!` for the invariant).
+    for i in eachindex(win.frame_batches)
+        batch = win.frame_batches[i]
+        if batch !== nothing
+            batch.recording = false
+            batch.dispatch_count = 0
+            batch.last_was_rt = false
+            empty!(batch.pinned)
+            empty!(batch.wait_semaphores)
+            push!((batch.bq::BatchQueue).free_batches, batch)
+            win.frame_batches[i] = nothing
+        end
+    end
     GLFW.DestroyWindow(win.handle)
+    win.handle = GLFW.Window(C_NULL)
 end
 
 Base.size(win::RenderWindow) = (Int(win.extent.width), Int(win.extent.height))

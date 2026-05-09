@@ -93,9 +93,15 @@ function build_raygen_shader()
     launch_size_var = Lava.emit_global_variable!(mod, ptr_uvec3_in_t, Lava.SC.Input)
     Lava.emit_decorate!(mod, launch_size_var, Lava.Dec.BuiltIn, Lava.BuiltIn.LaunchSizeKHR)
 
-    # Payload variable (RayPayloadKHR storage class, single f32)
+    # Payload variable (RayPayloadKHR storage class, single f32).
+    # Intentionally NO `Location` decoration: post-revision 16 of
+    # SPV_KHR_ray_tracing, ray payloads are matched by *pointer* (the
+    # Payload operand of OpTraceRayKHR is a pointer to the RayPayloadKHR
+    # OpVariable), not by integer location. Adding `Location` here is legal
+    # per spirv-val but triggers a warning in Mesa's spirv_to_nir validator
+    # (vtn_variables.c) whose allow-list was never updated for the ray-
+    # tracing storage classes.
     payload_var = Lava.emit_global_variable!(mod, ptr_f32_pay_t, Lava.SC.RayPayloadKHR)
-    Lava.emit_decorate!(mod, payload_var, Lava.Dec.Location, UInt32(0))
 
     # Push constant variable
     pc_var = Lava.emit_global_variable!(mod, ptr_pc_t, Lava.SC.PushConstant)
@@ -244,9 +250,8 @@ function build_closesthit_shader()
     hit_t_var = Lava.emit_global_variable!(mod, ptr_f32_in_t, Lava.SC.Input)
     Lava.emit_decorate!(mod, hit_t_var, Lava.Dec.BuiltIn, Lava.BuiltIn.RayTmaxKHR)
 
-    # Incoming payload (location 0)
+    # Incoming payload — no `Location` decoration (see raygen for rationale).
     payload_var = Lava.emit_global_variable!(mod, ptr_f32_pay_t, Lava.SC.IncomingRayPayloadKHR)
-    Lava.emit_decorate!(mod, payload_var, Lava.Dec.Location, UInt32(0))
 
     # Entry point
     func_id = Lava.fresh_id!(mod)
@@ -287,8 +292,8 @@ function build_miss_shader()
 
     c_m1f = Lava.emit_constant_f32!(mod, -1f0)
 
+    # No `Location` decoration — payload matching is via pointer.
     payload_var = Lava.emit_global_variable!(mod, ptr_f32_pay_t, Lava.SC.IncomingRayPayloadKHR)
-    Lava.emit_decorate!(mod, payload_var, Lava.Dec.Location, UInt32(0))
 
     func_id = Lava.fresh_id!(mod)
     Lava.emit_entry_point!(mod, Lava.ExecModel.MissKHR, func_id, "main",
@@ -355,8 +360,11 @@ end
         # Build triangle: (0,0,0), (1,0,0), (0,1,0)
         vertices = [(0f0, 0f0, 0f0), (1f0, 0f0, 0f0), (0f0, 1f0, 0f0)]
         indices = UInt32[0, 1, 2]
-        blas = Lava.build_blas(vertices, indices)
-        tlas = Lava.build_tlas([blas])
+        blas, tlas = Lava.as_build() do ctx
+            b = Lava.build_blas(ctx, vertices, indices)
+            t = Lava.build_tlas(ctx, [b])
+            (b, t)
+        end
 
         # Build shaders
         raygen_spirv = build_raygen_shader()
@@ -364,17 +372,17 @@ end
         miss_spirv = build_miss_shader()
 
         # Create output buffer (W*H float32 values)
-        output_buf = Lava.vk_alloc(W * H * sizeof(Float32))
+        output_buf = Lava.vk_alloc(ctx.default_bq, W * H * sizeof(Float32))
 
-        # Create RT pipeline (argument order: raygen, miss, chit)
-        pipeline = Lava.create_rt_pipeline(raygen_spirv, miss_spirv, chit_spirv;
+        # Create RT pipeline (argument order: ctx, raygen, miss, chit)
+        pipeline = Lava.create_rt_pipeline(ctx, raygen_spirv, miss_spirv, chit_spirv;
             push_constant_size=8)
 
         # Push constant: BDA of output buffer
         push_bda = output_buf.address
 
         # Dispatch
-        Lava.rt_dispatch!(pipeline, tlas, push_bda, W, H)
+        Lava.rt_dispatch!(Lava.vk_context().default_bq, pipeline, tlas, push_bda, W, H)
 
         # Read back results
         result_bytes = Vector{UInt8}(undef, W * H * sizeof(Float32))
@@ -414,8 +422,12 @@ end
         @test n_misses > 0
         println("RT test: $n_hits interior hits, $n_misses exterior misses, $n_edge edge cases out of $(W*H) rays")
 
-        # Explicit cleanup: ensure GPU is idle and destroy handles in correct order
-        # (children before parents) to prevent segfaults from GC finalizer ordering.
+        # Explicit cleanup: idle the device and finalize Vulkan handles in the
+        # correct order (children before parents). After the AS-storage refactor,
+        # LavaBLAS/LavaTLAS hold their backing memory via LavaArray fields
+        # (`storage`, `preserves`) whose own finalizers handle vk_free! with
+        # timeline-gated deferred destruction — so we only need to finalize the
+        # AccelerationStructureKHR handles here.
         Vulkan.device_wait_idle(ctx.device)
         finalize(pipeline.pipeline)
         finalize(pipeline.pipeline_layout)
@@ -424,10 +436,6 @@ end
             finalize(sm)
         end
         finalize(tlas.accel)
-        finalize(tlas.buffer)
-        finalize(tlas.memory)
         finalize(blas.accel)
-        finalize(blas.buffer)
-        finalize(blas.memory)
     end
 end
