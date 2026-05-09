@@ -24,12 +24,9 @@ UnsafeAtomics = "013be700-e6cd-48c3-b4a1-df204f14c38f"
 Vulkan = "9f14b124-c50e-4008-a7d4-969b3a6cd68a"
 
 [sources]
-# Raycore master is at 0.2.0 but not yet registered (registry has 0.1.x).
-# Drop this once Raycore 0.2 lands in the General registry.
 Raycore = {url = "https://github.com/JuliaGeometry/Raycore.jl", rev = "master"}
 
 [compat]
-Raycore = "0.2"
 SPIRV_LLVM_Backend_jll = "21.1.4"
 StaticArrays = "1.9.17"
 julia = "1.11"
