@@ -13,7 +13,7 @@ Once tagged it will be installable via `Pkg.add("Lava")`.
 
 ## System requirements
 
-* **Julia 1.11 or newer**
+* **Julia 1.12 or newer** (Lava itself supports 1.11, but the required Raycore dep is gated on 1.12)
 * A **Vulkan 1.2+ driver** with the `bufferDeviceAddress` and `variablePointers` features. Any recent NVIDIA, AMD, Intel, MoltenVK (macOS), or lavapipe ≥ 24.x driver qualifies.
 * For ray tracing: a driver exposing `VK_KHR_ray_tracing_pipeline` and `VK_KHR_acceleration_structure`. Software RT works via lavapipe's emulation, but RADV / NVIDIA give real hardware BVH traversal.
 * For graphics: an X11 or Wayland display server, and GLFW build dependencies — on Debian-likes:

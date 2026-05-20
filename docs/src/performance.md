@@ -6,7 +6,7 @@ Numbers below are on **AMD RX 7900 XTX / Ryzen 9 7900X** unless otherwise noted.
 
 Rendering uses [Hikari's](https://github.com/SimonDanisch/Hikari.jl) wavefront volumetric path tracer via [RayMakie](https://github.com/SimonDanisch/RayMakie.jl).
 
-![RayDemo benchmarks](../../benchmarks/7900xtx.png)
+![RayDemo benchmarks](assets/benchmarks/7900xtx.png)
 
 Headline:
 
@@ -18,9 +18,9 @@ Hardware ray tracing adds the biggest wins on geometry-dense scenes (Crown, Kill
 
 ## Compute benchmarks (AcceleratedKernels.jl)
 
-![AK 100M](../../benchmarks/ak_benchmarks_100m.png)
+![AK 100M](assets/benchmarks/ak_benchmarks_100m.png)
 
-![AK 10M](../../benchmarks/ak_benchmarks_10m.png)
+![AK 10M](assets/benchmarks/ak_benchmarks_10m.png)
 
 * Lava wins on compute-bound and dispatch-sensitive operations — up to **23× faster** on `map(sin, …)` at 10M elements.
 * AMDGPU wins on memory-bound sort/sortperm where its native HIP path has the edge.

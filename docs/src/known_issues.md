@@ -4,6 +4,17 @@ This page mirrors the canonical [`KNOWN_ISSUES.md`](https://github.com/SimonDani
 
 ```@eval
 using Markdown
-path = joinpath(dirname(pathof(Lava)), "..", "KNOWN_ISSUES.md")
-isfile(path) ? Markdown.parse(read(path, String)) : Markdown.parse("KNOWN_ISSUES.md not found.")
+candidates = (
+    joinpath(@__DIR__, "..", "..", "KNOWN_ISSUES.md"),
+    joinpath(@__DIR__, "..", "KNOWN_ISSUES.md"),
+)
+path = nothing
+for c in candidates
+    if isfile(c)
+        path = c; break
+    end
+end
+path === nothing ?
+    Markdown.parse("`KNOWN_ISSUES.md` could not be located.") :
+    Markdown.parse(read(path, String))
 ```

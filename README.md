@@ -27,7 +27,7 @@ Lava is not yet in the general registry. Once tagged it will be installable via 
 
 Requires:
 
-- Julia ≥ 1.11
+- Julia ≥ 1.12 (set by Raycore's hard dep on 1.12; Lava itself runs on 1.11, but its required Raycore dep does not)
 - A Vulkan 1.2+ driver with `bufferDeviceAddress` and `variablePointers` (any recent NVIDIA, AMD, Intel, MoltenVK, or lavapipe ≥ 24.x)
 - For graphics: an X11/Wayland display, GLFW dev libs (`xorg-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev` on Debian-likes)
 

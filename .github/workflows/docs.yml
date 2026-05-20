@@ -26,12 +26,13 @@ jobs:
           sudo apt-get install -y xvfb xorg-dev mesa-utils libgl1 \
             libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev
       - uses: serenity4/julia-lavapipe@v1
-      - name: Instantiate docs env
+      - name: Instantiate docs env (under xvfb — Lava's GLFW __init__ needs DISPLAY at precompile)
         run: |
-          julia --project=docs -e '
-            using Pkg
-            Pkg.develop(PackageSpec(path=pwd()))
-            Pkg.instantiate()'
+          DISPLAY=:0 xvfb-run -s '-screen 0 1024x768x24' \
+            julia --project=docs -e '
+              using Pkg
+              Pkg.develop(PackageSpec(path=pwd()))
+              Pkg.instantiate()'
       - name: Build & deploy docs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
