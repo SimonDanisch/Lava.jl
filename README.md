@@ -265,6 +265,14 @@ Run tests:
 using Pkg; Pkg.test("Lava")
 ```
 
+For a ~2-3 minute subset that exercises emitter, RT, atomics, graphics, disk
+cache, and the Phase-M alloc/free regressions (useful for CI-setup iteration
+or quick local sanity checks):
+
+```julia
+Pkg.test("Lava"; test_args=["fast"])     # or LAVA_FAST=1 julia --project test/runtests.jl
+```
+
 Headless CI uses `xvfb-run` — see [Installation](https://SimonDanisch.github.io/Lava.jl/dev/installation/) for the standard invocation.
 
 ## Debugging
