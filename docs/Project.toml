@@ -1,0 +1,6 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+Lava = "3a680b1f-cb25-4bee-9cf7-bc880b76dc8c"
+
+[compat]
+Documenter = "1"

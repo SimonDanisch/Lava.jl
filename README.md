@@ -1,5 +1,9 @@
 # Lava.jl
 
+[![CI](https://github.com/SimonDanisch/Lava.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/SimonDanisch/Lava.jl/actions/workflows/ci.yml)
+[![Dev docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://SimonDanisch.github.io/Lava.jl/dev/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+
 A Julia GPU backend that compiles Julia code to SPIR-V, targeting Vulkan. Lava.jl is three things at once:
 
 1. **A compute GPU backend** with full GPUArrays.jl + KernelAbstractions.jl interface. Set `device = LavaBackend()` and any KA-based GPU code runs on Vulkan.
@@ -11,6 +15,28 @@ A Julia GPU backend that compiles Julia code to SPIR-V, targeting Vulkan. Lava.j
 **Unified buffer model**: A single `LavaArray{T,N}` is usable across all shader stages. Compute kernels fill geometry, vertex shaders render it, ray tracing shaders trace against it. No copies, no format conversion.
 
 Cross-platform: NVIDIA, AMD, Intel, Apple (MoltenVK), software (lavapipe).
+
+## Installation
+
+```julia
+import Pkg
+Pkg.add(url="https://github.com/SimonDanisch/Lava.jl")
+```
+
+Lava is not yet in the general registry. Once tagged it will be installable via `Pkg.add("Lava")`.
+
+Requires:
+
+- Julia ≥ 1.11
+- A Vulkan 1.2+ driver with `bufferDeviceAddress` and `variablePointers` (any recent NVIDIA, AMD, Intel, MoltenVK, or lavapipe ≥ 24.x)
+- For graphics: an X11/Wayland display, GLFW dev libs (`xorg-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev` on Debian-likes)
+
+Verify your setup:
+
+```julia
+using Lava
+Lava.vk_context()        # prints device, queue family, RT capabilities
+```
 
 ## API Stability
 
@@ -254,6 +280,20 @@ vk_reset_device!()
 
 
 
+## Documentation
+
+- **[Dev docs](https://SimonDanisch.github.io/Lava.jl/dev/)** — full API reference, deeper guides for compute / graphics / ray tracing, plus design notes on the emitter and runtime.
+- **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** — actively tracked driver bugs and limitations.
+- **[RayDemo](https://github.com/SimonDanisch/RayDemo)** — end-to-end example scenes and benchmark scripts.
+
+## Contributing
+
+Bug reports and pull requests welcome. For driver-specific issues, please include `Lava.vk_context()` output and (where possible) a minimal reproducer using only `Lava` + `KernelAbstractions`. Test files in `test/mwe_*.jl` are the format we use.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
 ## Status
 
-Compute (GPUArrays + KernelAbstractions) works and is well tested. Graphics shaders and hardware ray tracing are functional. Multi-vendor CI, docs, and further performance work are ongoing.
+The **KernelAbstractions / GPUArrays compute path** is feature-complete and runs the GPUArrays test suite at ~99.7 % pass. The **graphics** and **ray tracing** paths are functional and exercised by the same Hikari path tracer that drives the benchmarks above; their public APIs are still evolving. Multi-vendor CI (currently lavapipe; NVIDIA/AMD self-hosted runners planned), additional documentation, and continued performance work are ongoing.

@@ -1,17 +1,22 @@
 name: CI
 on:
   push:
-    branches: [main, sd/ci]
+    branches: [main]
   pull_request:
+
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   test:
     name: Julia ${{ matrix.julia-version }} - Lavapipe
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        julia-version: ['1']
+        julia-version: ['1.11', '1']
     steps:
       - uses: actions/checkout@v4
       - uses: serenity4/julia-lavapipe@v1
