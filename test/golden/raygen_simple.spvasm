@@ -1,7 +1,7 @@
 ; SPIR-V
 ; Version: 1.4
 ; Generator: Khronos; 0
-; Bound: 53
+; Bound: 49
 ; Schema: 0
                OpCapability VulkanMemoryModel
                OpCapability PhysicalStorageBufferAddresses
@@ -25,6 +25,7 @@
                OpDecorate %ray_payload Location 0
                OpDecorate %tlas DescriptorSet 0
                OpDecorate %tlas Binding 0
+               OpDecorate %_ptr_PhysicalStorageBuffer_float ArrayStride 4
        %void = OpTypeVoid
       %ulong = OpTypeInt 64 0
        %uint = OpTypeInt 32 0
@@ -51,7 +52,6 @@
     %v3float = OpTypeVector %float 3
      %uint_1 = OpConstant %uint 1
 %ulong_18446744073709551615 = OpConstant %ulong 18446744073709551615
-    %ulong_4 = OpConstant %ulong 4
 %__spirv_BuiltInLaunchIdKHR = OpVariable %_ptr_Input_v3uint Input
          %10 = OpVariable %_ptr_PushConstant__struct_8 PushConstant
 %ray_payload = OpVariable %_ptr_RayPayloadKHR_float RayPayloadKHR
@@ -75,10 +75,7 @@
          %44 = OpIAdd %uint %31 %uint_1
          %45 = OpUConvert %ulong %44
          %47 = OpIAdd %ulong %45 %ulong_18446744073709551615
-         %48 = OpConvertPtrToU %ulong %29
-         %50 = OpIMul %ulong %47 %ulong_4
-         %51 = OpIAdd %ulong %48 %50
-         %52 = OpConvertUToPtr %_ptr_PhysicalStorageBuffer_float %51
-               OpStore %52 %42 Aligned 4
+         %48 = OpPtrAccessChain %_ptr_PhysicalStorageBuffer_float %29 %47
+               OpStore %48 %42 Aligned 4
                OpReturn
                OpFunctionEnd

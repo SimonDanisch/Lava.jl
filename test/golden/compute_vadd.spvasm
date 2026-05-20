@@ -1,7 +1,7 @@
 ; SPIR-V
 ; Version: 1.4
 ; Generator: Khronos; 0
-; Bound: 60
+; Bound: 50
 ; Schema: 0
                OpCapability VulkanMemoryModel
                OpCapability PhysicalStorageBufferAddresses
@@ -19,6 +19,7 @@
                OpDecorate %__spirv_BuiltInGlobalInvocationId BuiltIn GlobalInvocationId
                OpDecorate %_struct_8 Block
                OpMemberDecorate %_struct_8 0 Offset 0
+               OpDecorate %_ptr_PhysicalStorageBuffer_float ArrayStride 4
        %void = OpTypeVoid
       %ulong = OpTypeInt 64 0
        %uint = OpTypeInt 32 0
@@ -36,7 +37,6 @@
     %ulong_8 = OpConstant %ulong 8
    %ulong_16 = OpConstant %ulong 16
 %ulong_18446744073709551615 = OpConstant %ulong 18446744073709551615
-    %ulong_4 = OpConstant %ulong 4
 %__spirv_BuiltInGlobalInvocationId = OpVariable %_ptr_Input_v3uint Input
          %10 = OpVariable %_ptr_PushConstant__struct_8 PushConstant
        %main = OpFunction %void None %11
@@ -61,23 +61,12 @@
          %38 = OpCompositeExtract %uint %37 0
          %39 = OpUConvert %ulong %38
          %41 = OpIAdd %ulong %39 %ulong_18446744073709551615
-         %42 = OpConvertPtrToU %ulong %36
-         %44 = OpIMul %ulong %41 %ulong_4
-         %45 = OpIAdd %ulong %42 %44
-         %46 = OpConvertUToPtr %_ptr_PhysicalStorageBuffer_float %45
-         %47 = OpLoad %float %46 Aligned 4
-         %48 = OpIAdd %ulong %39 %ulong_18446744073709551615
-         %49 = OpConvertPtrToU %ulong %35
-         %50 = OpIMul %ulong %48 %ulong_4
-         %51 = OpIAdd %ulong %49 %50
-         %52 = OpConvertUToPtr %_ptr_PhysicalStorageBuffer_float %51
-         %53 = OpLoad %float %52 Aligned 4
-         %54 = OpFAdd %float %47 %53
-         %55 = OpIAdd %ulong %39 %ulong_18446744073709551615
-         %56 = OpConvertPtrToU %ulong %34
-         %57 = OpIMul %ulong %55 %ulong_4
-         %58 = OpIAdd %ulong %56 %57
-         %59 = OpConvertUToPtr %_ptr_PhysicalStorageBuffer_float %58
-               OpStore %59 %54 Aligned 4
+         %42 = OpPtrAccessChain %_ptr_PhysicalStorageBuffer_float %36 %41
+         %43 = OpLoad %float %42 Aligned 4
+         %45 = OpPtrAccessChain %_ptr_PhysicalStorageBuffer_float %35 %41
+         %46 = OpLoad %float %45 Aligned 4
+         %47 = OpFAdd %float %43 %46
+         %49 = OpPtrAccessChain %_ptr_PhysicalStorageBuffer_float %34 %41
+               OpStore %49 %47 Aligned 4
                OpReturn
                OpFunctionEnd

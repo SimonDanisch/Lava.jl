@@ -246,17 +246,26 @@ Requires Vulkan 1.2+ with `bufferDeviceAddress` and `variablePointers` features.
 ## Test Suite
 
 ```
-Total: 9,578 passed, 26 failed, 0 errors (27 test groups, 4 skipped)
+Total: 14,461 passed, 0 failed, 0 errors, 1 broken — 14m52s on RX 7900 XTX
 ```
 
-All groups 100% pass except:
-- `linalg/norm`: 673/696 (0.5/1.5-norm precision edge cases)
-- `statistics`: 75/78 (`mean(sin, Float16)` tree reduction order)
+Includes:
+
+- 319 SPIR-V emission pattern checks
+- Golden-file snapshots for every shader stage (re-bless with `LAVA_BLESS=1`)
+- 415 GPU execution tests + 1,776 struct broadcast regressions
+- 7,347-test [GPUArrays.jl](https://github.com/JuliaGPU/GPUArrays.jl) test suite, fully clean on this branch
+- 1,342 NVIDIA regression + stress checks (compute & RT)
+- HW TLAS stress / mesh update / UAF safety / non-blocking sync — 2,550 tests
+- Phase-M alloc/dispatch/free loop matrix — 6 progressively-harder regressions, all clean
 
 Run tests:
+
 ```julia
 using Pkg; Pkg.test("Lava")
 ```
+
+Headless CI uses `xvfb-run` — see [Installation](https://SimonDanisch.github.io/Lava.jl/dev/installation/) for the standard invocation.
 
 ## Debugging
 
