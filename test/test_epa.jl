@@ -3,24 +3,9 @@ using Lava: UnitCube, gjk, GJKResult, epa, EPAResult
 using GeometryBasics: Vec3f
 using LinearAlgebra: norm
 
-# ---------------------------------------------------------------------------
-# Small helpers (kept local to this file -- testset isolation is fine).
-# Mirrors the helpers in test_gjk.jl.
-# ---------------------------------------------------------------------------
-
-function translation_transform(x, y, z)
-    (1f0, 0f0, 0f0, Float32(x),
-     0f0, 1f0, 0f0, Float32(y),
-     0f0, 0f0, 1f0, Float32(z))
-end
-
-function rotation_z_transform(angle, tx=0f0, ty=0f0, tz=0f0)
-    c = Float32(cos(angle))
-    s = Float32(sin(angle))
-    (c,    -s,   0f0,  Float32(tx),
-     s,     c,   0f0,  Float32(ty),
-     0f0,  0f0,  1f0,  Float32(tz))
-end
+# Shared narrow-phase helpers — see test/narrow_phase_helpers.jl.
+isdefined(@__MODULE__, :translation_transform) ||
+    include(joinpath(@__DIR__, "narrow_phase_helpers.jl"))
 
 const ID = translation_transform(0, 0, 0)
 

@@ -19,7 +19,7 @@ ctx     = Lava.vk_context()
 bq      = ctx.default_bq
 
 hwtlas = Lava.HWTLAS(backend)
-mesh = GeometryBasics.normal_mesh(GeometryBasics.Tesselation(
+mesh = GeometryBasics.normal_mesh(GeometryBasics.Tessellation(
     GeometryBasics.Sphere(GeometryBasics.Point3f(0), 1f0), 8))
 push!(hwtlas, mesh, SMatrix{4,4,Float32}(I); instance_id=UInt32(1))
 Raycore.sync!(hwtlas)

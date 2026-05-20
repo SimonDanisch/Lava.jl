@@ -3,14 +3,10 @@ using Lava: UnitCube, EPAResult, narrow_phase_kernel, NO_CONTACT, gjk, epa
 using GeometryBasics: Vec3f
 using KernelAbstractions: CPU
 
-# ---------------------------------------------------------------------------
-# Helpers (local to file; mirror the helpers in test_gjk.jl / test_epa.jl).
-# ---------------------------------------------------------------------------
-function tx(x, y, z)
-    (1f0, 0f0, 0f0, Float32(x),
-     0f0, 1f0, 0f0, Float32(y),
-     0f0, 0f0, 1f0, Float32(z))
-end
+# Shared narrow-phase helpers — see test/narrow_phase_helpers.jl.  Provides
+# `tx` (alias for `translation_transform`) and the other transform builders.
+isdefined(@__MODULE__, :tx) ||
+    include(joinpath(@__DIR__, "narrow_phase_helpers.jl"))
 
 # Run the kernel on the given inputs on the KA.CPU backend and synchronize.
 function run_cpu_narrow_phase(transforms, pairs, shape)

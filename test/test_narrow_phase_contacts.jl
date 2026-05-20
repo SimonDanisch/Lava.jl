@@ -3,14 +3,9 @@ using Lava: UnitCube, ContactRecord, narrow_phase_contacts_kernel
 using GeometryBasics: Vec3f
 using KernelAbstractions: CPU
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-function tx(x, y, z)
-    (1f0, 0f0, 0f0, Float32(x),
-     0f0, 1f0, 0f0, Float32(y),
-     0f0, 0f0, 1f0, Float32(z))
-end
+# Shared narrow-phase helpers — see test/narrow_phase_helpers.jl.
+isdefined(@__MODULE__, :tx) ||
+    include(joinpath(@__DIR__, "narrow_phase_helpers.jl"))
 
 # Run the fused kernel on the KA.CPU backend.  `n_grains` is the number of
 # grains; the contact buffer is sized `n_grains * max_contacts`.  Returns

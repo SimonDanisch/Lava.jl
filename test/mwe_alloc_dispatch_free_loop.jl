@@ -41,7 +41,7 @@ for iter in 1:N_ITERS
     # Drop all refs — finalizer thread will free buffers eventually.
     bufs = nothing
     if Lava.device_lost(ctx)
-        crashed_at = iter
+        global crashed_at = iter
         break
     end
 end
