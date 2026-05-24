@@ -1,0 +1,48 @@
+name: CI (Windows)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  test-windows:
+    name: Julia ${{ matrix.julia-version }} - Lavapipe (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        julia-version: ['1']
+    env:
+      # Run the ~2-3 min subset on Windows.  The full GPUArrays suite +
+      # HW-TLAS stress runs on Linux CI; here we just want to catch
+      # Windows-specific path / DLL / GLFW regressions.
+      LAVA_FAST: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Mesa lavapipe (Windows)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/pal1000/mesa-dist-win/releases/download/25.2.0/mesa3d-25.2.0-release-msvc.7z"
+          Invoke-WebRequest -Uri $url -OutFile mesa.7z
+          7z x mesa.7z -omesa
+          $icd = (Resolve-Path "mesa\x64\lvp_icd.x86_64.json").Path
+          $dir = (Resolve-Path "mesa\x64").Path
+          echo "VK_DRIVER_FILES=$icd" >> $env:GITHUB_ENV
+          echo "VK_ICD_FILENAMES=$icd" >> $env:GITHUB_ENV
+          echo "$dir" >> $env:GITHUB_PATH
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia-version }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+
+      - name: Run fast-mode tests
+        run: julia --color=yes --project -e 'using Pkg; Pkg.test("Lava"; test_args=["fast"])'
