@@ -1431,6 +1431,33 @@ function has_alloca_type_mismatch_at_callsites(fn::LLVM.Function, mod::LLVM.Modu
     return false
 end
 
+"""
+Returns true when at least one caller of `fn` passes an argument at one
+of `ptr_param_idxs` that traces back to a unique source alloca. This
+identifies helpers whose pointer parameter is bound to caller-local
+storage — exactly the case where SPIR-V Logical addressing's strict
+type rules across function boundaries lose information that LLVM's
+opaque pointer model carried.
+"""
+function any_caller_passes_alloca_traced_arg(fn::LLVM.Function, mod::LLVM.Module,
+                                              ptr_param_idxs::Vector{Int})
+    for caller in LLVM.functions(mod)
+        isempty(LLVM.blocks(caller)) && continue
+        for bb in LLVM.blocks(caller), inst in LLVM.instructions(bb)
+            inst isa LLVM.CallInst || continue
+            callee = LLVM.called_operand(inst)
+            callee === fn || continue
+            ops = LLVM.operands(inst)
+            n_args = length(ops) - 1
+            for i in ptr_param_idxs
+                i <= n_args || continue
+                trace_alloca_allocated_type(ops[i]) === nothing || return true
+            end
+        end
+    end
+    return false
+end
+
 function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
                             force_inline_all::Bool=false)
     if force_inline_all
@@ -1488,35 +1515,40 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
             delete!(attrs, LLVM.EnumAttribute("alwaysinline"))
         end
 
-        # Detect cross-boundary pointer-type mismatch. When a noinline helper
-        # has a pointer param, and callers pass pointers to allocas of
-        # DIFFERENT LLVM types (e.g. one caller passes [21 x i64], another
-        # passes [5 x i64]), Lava's PTM picks one pointee type for the param
-        # and the OpFunctionCall mismatches at the other site. SPIR-V can't
-        # express this kind of type-punning across a function boundary in
-        # Logical addressing. Re-mark such helpers `alwaysinline` so the
-        # type-pun stays inside one OpFunction where Lava's PTM resolves it
-        # context-locally.
+        # Inline policy:
+        #   1. Helpers explicitly @noinline by the user normally survive as
+        #      separate OpFunctions (this is how Crown's giant kernel gets
+        #      split for AMDVLK's per-OpFunction complexity limit).
+        #   2. EXCEPT: when an explicitly-noinline helper has a pointer
+        #      parameter with caller/body type mismatch — SPIR-V's Logical
+        #      addressing can't express the type-pun across the function
+        #      boundary, so it must be force-inlined.
+        #   3. All other helpers (no explicit @noinline) get force-inlined.
+        #      Empirically required: value-typed and pointer-typed helpers
+        #      that survived as separate OpFunctions caused runtime
+        #      DEVICE_LOSTs on AMDVLK Windows (KillerooGold), even when
+        #      SPIR-V passed validation.
+        noinline_kind = LLVM.API.LLVMGetEnumAttributeKindForName("noinline", 8)
         for fn in LLVM.functions(mod)
             isempty(LLVM.blocks(fn)) && continue
             startswith(LLVM.name(fn), "llvm.") && continue
             fname = LLVM.name(fn)
             fn === entry_fn && continue
             any(p -> occursin(p, fname), must_inline_prefixes) && continue
-            # NOTE: do NOT skip wrapper_direct_callees here. Even kernels called
-            # directly from the wrapper must be force-inlined when their callers
-            # disagree on pointer-arg alloca types — the SPIR-V type mismatch is
-            # a hard validation error.
 
-            has_ptr_param = any(p -> LLVM.value_type(p) isa LLVM.PointerType,
-                                LLVM.parameters(fn))
-            has_ptr_param || continue
-
-            if has_alloca_type_mismatch_at_callsites(fn, mod)
-                attrs = LLVM.function_attributes(fn)
-                delete!(attrs, LLVM.EnumAttribute("noinline"))
-                push!(attrs, LLVM.EnumAttribute("alwaysinline"))
+            attrs = LLVM.function_attributes(fn)
+            has_noinline = any(a -> a isa LLVM.EnumAttribute && LLVM.kind(a) == noinline_kind,
+                                collect(attrs))
+            if has_noinline
+                # Check if type-pun forces inlining anyway.
+                if has_alloca_type_mismatch_at_callsites(fn, mod)
+                    delete!(attrs, LLVM.EnumAttribute("noinline"))
+                    push!(attrs, LLVM.EnumAttribute("alwaysinline"))
+                end
+                continue
             end
+
+            push!(attrs, LLVM.EnumAttribute("alwaysinline"))
         end
     end
 
