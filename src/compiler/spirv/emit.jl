@@ -2343,7 +2343,15 @@ function trace_to_non_alloca(ptr::LLVM.Value, visited::Set{LLVM.Value}=Set{LLVM.
         # All incoming values are non-alloca → PSB
         return true
     end
-    # Function parameter, inttoptr, etc. → PSB
+    # Function parameter: the alloca lives in the CALLER. Check call sites —
+    # if any caller passes an alloca-derived pointer, this param is
+    # Function-class (not PSB). Without this, helpers emitted via the
+    # multi-OpFunction walker would classify alloca-derived params as PSB
+    # and emit invalid byte-arithmetic on them.
+    if ptr isa LLVM.Argument
+        return !param_called_with_alloca_arg(ptr)
+    end
+    # inttoptr, etc. → PSB
     return true
 end
 
