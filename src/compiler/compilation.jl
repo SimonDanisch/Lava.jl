@@ -421,7 +421,9 @@ function lava_compile_gfx_full(@nospecialize(f), @nospecialize(tt);
         wrapper_name = push_info.wrapper_name
         wrapper_fn = LLVM.functions(mod)[wrapper_name]
 
-        run_llvm_passes!(mod, wrapper_fn)
+        # GFX shader emission doesn't have the multi-OpFunction walker yet;
+        # keep the old single-OpFunction behavior for now.
+        run_llvm_passes!(mod, wrapper_fn; force_inline_all=true)
         post_pass_ir = string(mod)
 
         spirv_bytes, source_map = emit_spirv_from_llvm_gfx(mod, wrapper_name, stage; config=config)
@@ -465,7 +467,9 @@ function lava_compile_rt_full(@nospecialize(f), @nospecialize(tt);
         wrapper_name = push_info.wrapper_name
         wrapper_fn = LLVM.functions(mod)[wrapper_name]
 
-        run_llvm_passes!(mod, wrapper_fn)
+        # RT shader emission doesn't have the multi-OpFunction walker yet;
+        # keep the old single-OpFunction behavior for now.
+        run_llvm_passes!(mod, wrapper_fn; force_inline_all=true)
         post_pass_ir = string(mod)
 
         spirv_bytes, source_map = emit_spirv_from_llvm_rt(mod, wrapper_name, stage;
@@ -595,7 +599,8 @@ proper world-age tracking for free.
 """
 function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob;
                                     enable_ray_query::Bool = job.config.params.enable_ray_query,
-                                    validate::Bool = true)
+                                    validate::Bool = true,
+                                    force_inline_all::Bool = false)
     workgroup_size = job.config.params.workgroup_size
     GPUCompiler.JuliaContext() do ctx
         local mod, meta
@@ -616,7 +621,7 @@ function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob;
         wrapper_fn = LLVM.functions(mod)[wrapper_name]
 
         # ── Stage 1: LLVM passes ──
-        run_llvm_passes!(mod, wrapper_fn)
+        run_llvm_passes!(mod, wrapper_fn; force_inline_all)
 
         # Save IR for debugging
         ir = string(mod)
@@ -659,7 +664,8 @@ don't want to construct a job manually.
 function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
                            workgroup_size::NTuple{3,Int} = (64, 1, 1),
                            enable_ray_query::Bool = false,
-                           validate::Bool = true)
+                           validate::Bool = true,
+                           force_inline_all::Bool = false)
     if enable_ray_query && !vk_context().ray_query_available
         error("lava_compile_gpu: enable_ray_query=true requested, but the " *
               "active Vulkan device does not support VK_KHR_ray_query. " *
@@ -669,7 +675,7 @@ function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
     config = lava_compiler_config(; workgroup_size, enable_ray_query)
     source = GPUCompiler.methodinstance(typeof(f), tt)
     job = GPUCompiler.CompilerJob(source, config)
-    return lava_compile_gpu_from_job(job; enable_ray_query, validate)
+    return lava_compile_gpu_from_job(job; enable_ray_query, validate, force_inline_all)
 end
 
 # ── RT Shader Compilation ──
@@ -728,8 +734,9 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
         wrapper_name = push_info.wrapper_name
         wrapper_fn = LLVM.functions(mod)[wrapper_name]
 
-        # LLVM passes (same as compute)
-        run_llvm_passes!(mod, wrapper_fn)
+        # LLVM passes (RT emit doesn't have the multi-OpFunction walker yet;
+        # keep the old single-OpFunction behavior for now.)
+        run_llvm_passes!(mod, wrapper_fn; force_inline_all=true)
 
         ir = string(mod)
         write("/tmp/lava_last_rt.ll", ir)
@@ -802,8 +809,9 @@ function lava_compile_gfx_shader(@nospecialize(f), @nospecialize(tt);
         wrapper_name = push_info.wrapper_name
         wrapper_fn = LLVM.functions(mod)[wrapper_name]
 
-        # LLVM passes (same as compute)
-        run_llvm_passes!(mod, wrapper_fn)
+        # LLVM passes (GFX emit doesn't have the multi-OpFunction walker yet;
+        # keep the old single-OpFunction behavior for now.)
+        run_llvm_passes!(mod, wrapper_fn; force_inline_all=true)
 
         ir = string(mod)
         write("/tmp/lava_last_gfx_$(stage).ll", ir)
@@ -823,7 +831,8 @@ end
 
 # ── Stage 1: LLVM Pass Pipeline ──
 
-function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
+function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
+                           force_inline_all::Bool=false)
     # ── CFG cleanup ──
     # Verify IR after each custom pass to catch corruption early.
     # Only in debug mode — verify is cheap but adds up across 30+ passes.
@@ -851,16 +860,27 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function)
     strip_noreturn!(mod)
     verify_ir!("pre_inline")
 
-    # ── Force-inline all internal functions ──
-    # GPU shaders are single-function programs. GPUCompiler generates helper
-    # functions (error throwing, boxing, etc.) that must be inlined into the
-    # entry function. After inlining, the error paths become dead code.
-    force_inline_all!(mod, entry_fn)
+    # ── Apply inline policy ──
+    # Default: respect Julia/GPUCompiler's inlining. Only Julia-marked
+    # alwaysinline (throw/box wrappers) get inlined; other helpers survive
+    # as their own functions and are emitted as separate OpFunctions.
+    # Pass `force_inline_all=true` for the old single-OpFunction behavior.
+    force_inline_all!(mod, entry_fn; force_inline_all)
     verify_ir!("force_inline")
 
     if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
         write("/tmp/lava_ir_1_postinline.ll", string(mod))
     end
+
+    # ── Outline oversized functions ──
+    # AMDVLK Windows segfaults on `vkCreateComputePipelines` if any OpFunction
+    # exceeds LLPC's per-function complexity limit (roughly 100-150 basic
+    # blocks for vp_trace_rays-class kernels). When Julia/GPUCompiler aggressively
+    # inlines a kernel into a single oversized function, run LLVM's LoopExtractor
+    # to peel out loops as separate helpers. The Step 6 multi-OpFunction walker
+    # emits the helpers as separate OpFunctions, keeping each one under the limit.
+    outline_oversized!(mod; force_inline_all)
+    verify_ir!("outline_oversized")
 
     # ── Fix barrier-skipping error paths ──
     # replace_unreachable! (pre-inlining) converts error paths to early returns.
@@ -1141,27 +1161,161 @@ function fix_bool_call_mismatches!(mod::LLVM.Module)
 end
 
 """
-Force-inline all internal functions into the entry function.
+Apply Lava's inline policy to the module.
 
-Marks all non-entry, non-declaration functions as `alwaysinline`, runs the
-AlwaysInliner pass, then removes dead functions with GlobalDCE.
-After this, only the entry function (and LLVM intrinsic declarations) remain.
+Default (`force_inline_all=false`): respect Julia/GPUCompiler's inlining
+decisions. Only functions Julia explicitly marked `alwaysinline` (typically
+compiler-generated throw/box wrappers from `lower_throw!` etc.) get inlined
+via the AlwaysInliner pass. Surviving helpers stay as their own functions
+and Step 6's emission walker emits each as a separate SPIR-V OpFunction.
+
+Escape hatch (`force_inline_all=true`): the original blanket-inline behavior
+— mark every non-entry, non-declaration function `alwaysinline` and collapse
+the whole module into a single OpFunction. Kept so any regression can be
+A/B compared against the old path with a single flag flip.
 """
-function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function)
-    entry_name = LLVM.name(entry_fn)
+function outline_oversized!(mod::LLVM.Module; force_inline_all::Bool=false)
+    # When force_inline_all is on we want everything in a single OpFunction
+    # by design; outlining would defeat that. Also a useful escape hatch when
+    # debugging whether outlining caused a regression.
+    force_inline_all && return nothing
 
-    for fn in LLVM.functions(mod)
-        fn_name = LLVM.name(fn)
+    # OPT-IN. Enable via env var:
+    #   LAVA_OUTLINE_ENABLED=1
+    # Outlining is structurally correct (Step 6 walker emits the helpers,
+    # FuncControl.DontInline keeps spirv-opt from collapsing them), but the
+    # PTM infers different pointee types for the helper's parameter (from
+    # uses inside the helper) vs the argument at the call site (from where
+    # the value was created). Without correct cross-boundary type coercion,
+    # this produces SPIR-V that fails spirv-val for any moderately-sized
+    # kernel where LoopExtractor or IROutliner finds something to extract.
+    # Leaving this off until the type coercion is solved keeps medium-sized
+    # Hikari/Makie kernels (which compiled fine as single OpFunctions) from
+    # regressing into validation failures.
+    get(ENV, "LAVA_OUTLINE_ENABLED", "0") == "1" || return nothing
 
-        # Skip entry function, declarations (no body), and LLVM intrinsics
-        fn_name == entry_name && continue
-        isempty(LLVM.blocks(fn)) && continue
-        startswith(fn_name, "llvm.") && continue
+    # AMDVLK chokes somewhere around 100-150 BBs in a single OpFunction. 50
+    # leaves comfortable margin and matches the threshold the spirv_bisect
+    # work used to characterize the chokepoint. Override via env var when
+    # tuning for a specific kernel.
+    threshold = parse(Int, get(ENV, "LAVA_OUTLINE_BB_THRESHOLD", "50"))
 
-        # Remove noinline, add alwaysinline
-        attrs = LLVM.function_attributes(fn)
-        delete!(attrs, LLVM.EnumAttribute("noinline"))
-        push!(attrs, LLVM.EnumAttribute("alwaysinline"))
+    function max_bbs_per_function(mod)
+        m = 0
+        for fn in LLVM.functions(mod)
+            isempty(LLVM.blocks(fn)) && continue
+            n = count(_ -> true, LLVM.blocks(fn))
+            m = max(m, n)
+        end
+        m
+    end
+
+    # Try multiple LLVM outlining passes in succession. Each pass is iterated
+    # to a fixed point because LLVM's outliners typically invalidate analyses
+    # after one extraction and bail rather than recomputing.
+    #
+    # Pass selection:
+    #   - LoopExtractorPass: extracts top-level loops (works well for loop-heavy
+    #     kernels). vp_trace_rays-class kernels are queue-dispatch dominated so
+    #     this only picks off a couple of small loops.
+    #   - IROutlinerPass: finds syntactically-similar code sequences and
+    #     factors them into a shared function (LLVM's `-Oz` optimizer uses this).
+    #     Useful for kernels with repeated patterns (queue push/pop, etc.).
+    function iterate_pass!(pass_ctor)
+        for _ in 1:8
+            max_bbs_per_function(mod) <= threshold && return true
+            before_n = count(_ -> true, LLVM.functions(mod))
+            LLVM.run!(pass_ctor(), mod)
+            after_n = count(_ -> true, LLVM.functions(mod))
+            after_n == before_n && return false
+        end
+        return false
+    end
+
+    iterate_pass!(LLVM.LoopExtractorPass)
+    iterate_pass!(LLVM.IROutlinerPass)
+
+    return nothing
+end
+
+function collect_reachable_callees(entry_fn::LLVM.Function)
+    visited = Set{LLVM.Function}()
+    order = LLVM.Function[]
+    function visit(fn::LLVM.Function)
+        fn in visited && return
+        push!(visited, fn)
+        for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+            inst isa LLVM.CallInst || continue
+            callee = LLVM.called_operand(inst)
+            callee isa LLVM.Function || continue
+            isempty(LLVM.blocks(callee)) && continue
+            startswith(LLVM.name(callee), "llvm.") && continue
+            visit(callee)
+        end
+        push!(order, fn)  # post-order: callees pushed before caller
+    end
+    visit(entry_fn)
+    return order
+end
+
+function strongly_connected_components(fns::Vector{LLVM.Function})
+    indices = Dict{LLVM.Function, Int}()
+    lowlinks = Dict{LLVM.Function, Int}()
+    on_stack = Set{LLVM.Function}()
+    stack = LLVM.Function[]
+    sccs = Vector{LLVM.Function}[]
+    next_index = Ref(0)
+    fnset = Set(fns)
+
+    function strongconnect(v::LLVM.Function)
+        indices[v] = next_index[]
+        lowlinks[v] = next_index[]
+        next_index[] += 1
+        push!(stack, v)
+        push!(on_stack, v)
+        for bb in LLVM.blocks(v), inst in LLVM.instructions(bb)
+            inst isa LLVM.CallInst || continue
+            w = LLVM.called_operand(inst)
+            w isa LLVM.Function || continue
+            w in fnset || continue
+            if !haskey(indices, w)
+                strongconnect(w)
+                lowlinks[v] = min(lowlinks[v], lowlinks[w])
+            elseif w in on_stack
+                lowlinks[v] = min(lowlinks[v], indices[w])
+            end
+        end
+        if lowlinks[v] == indices[v]
+            scc = LLVM.Function[]
+            while true
+                w = pop!(stack)
+                delete!(on_stack, w)
+                push!(scc, w)
+                w === v && break
+            end
+            push!(sccs, scc)
+        end
+    end
+
+    for v in fns
+        haskey(indices, v) || strongconnect(v)
+    end
+    return sccs
+end
+
+function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
+                            force_inline_all::Bool=false)
+    if force_inline_all
+        entry_name = LLVM.name(entry_fn)
+        for fn in LLVM.functions(mod)
+            fn_name = LLVM.name(fn)
+            fn_name == entry_name && continue
+            isempty(LLVM.blocks(fn)) && continue
+            startswith(fn_name, "llvm.") && continue
+            attrs = LLVM.function_attributes(fn)
+            delete!(attrs, LLVM.EnumAttribute("noinline"))
+            push!(attrs, LLVM.EnumAttribute("alwaysinline"))
+        end
     end
 
     # Fix i1/i8 call-site mismatches before running the inliner so that
@@ -1169,7 +1323,44 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function)
     # are eligible for inlining.
     fix_bool_call_mismatches!(mod)
 
-    # Run inliner
+    # When force_inline_all=false (the default), let GPUCompiler-marked
+    # helpers survive as separate SPIR-V OpFunctions so AMDVLK doesn't choke
+    # on oversized single-OpFunction kernels. Strip `alwaysinline` from every
+    # eligible function, EXCEPT:
+    #   (a) compiler-generated junk (throw/box/safepoint helpers) — these
+    #       reference symbols Lava's SPIR-V emitter can't handle outside the
+    #       entry function and Julia counts on them being inlined away.
+    #   (b) the wrapper's DIRECT callees (the original kernel functions called
+    #       from the BDA entry wrapper) — `emit_entry_wrapper!` passes OpUndef
+    #       for args; if the kernel survives as a separate function, spirv-opt
+    #       sees writes-to-undef-pointers and DCEs the entire computation.
+    # Indirect helpers (callees-of-callees) survive, providing the
+    # multi-OpFunction split that satisfies AMDVLK's per-OpFunction limit.
+    if !force_inline_all
+        must_inline_prefixes = ("julia_throw", "julia_box", "jl_box",
+                                "gpu_report_exception", "gpu_signal_exception",
+                                "julia.gc_", "julia.safepoint", "ijl_throw",
+                                "jl_throw")
+        wrapper_direct_callees = Set{String}()
+        for bb in LLVM.blocks(entry_fn), inst in LLVM.instructions(bb)
+            inst isa LLVM.CallInst || continue
+            callee = LLVM.called_operand(inst)
+            callee isa LLVM.Function || continue
+            isempty(LLVM.blocks(callee)) && continue
+            push!(wrapper_direct_callees, LLVM.name(callee))
+        end
+
+        for fn in LLVM.functions(mod)
+            isempty(LLVM.blocks(fn)) && continue
+            startswith(LLVM.name(fn), "llvm.") && continue
+            fname = LLVM.name(fn)
+            any(p -> occursin(p, fname), must_inline_prefixes) && continue
+            fname in wrapper_direct_callees && continue
+            attrs = LLVM.function_attributes(fn)
+            delete!(attrs, LLVM.EnumAttribute("alwaysinline"))
+        end
+    end
+
     LLVM.run!(LLVM.AlwaysInlinerPass(), mod)
 
     # Remove now-dead internal functions
@@ -1216,6 +1407,18 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
     # Find the entry function
     entry_fn = LLVM.functions(llvm_mod)[entry_name]
 
+    # Pre-allocate SPIR-V function IDs for every function with a body so that
+    # OpFunctionCall can forward-reference callees regardless of emission order.
+    # No effect today (single-function case after force_inline_all!), but enables
+    # the multi-function emission walker in Step 6 and avoids needing a strict
+    # topological sort. SPIR-V allows forward references to function IDs.
+    for fn in LLVM.functions(llvm_mod)
+        isempty(LLVM.blocks(fn)) && continue
+        get!(state.value_map, fn) do
+            fresh_id!(spirv_mod)
+        end
+    end
+
     # Emit global variables (if any — needed for builtin inputs, etc.)
     interface_ids = emit_globals!(state, llvm_mod)
 
@@ -1224,6 +1427,27 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
     if enable_ray_query
         emit_compute_tlas_descriptor!(state)
         append!(interface_ids, state.entry_interface_ids)
+    end
+
+    # Multi-OpFunction emission: walk the call graph from the entry function and
+    # emit every reachable helper as its own OpFunction BEFORE the entry. The
+    # function IDs were pre-allocated above so OpFunctionCall to forward
+    # references is well-defined; emission order here is for source-map locality.
+    # Surviving helpers exist only when force_inline_all=false (the new default);
+    # under the old escape hatch only the entry survives and this loop is a no-op.
+    let reachable = collect_reachable_callees(entry_fn),
+        sccs = strongly_connected_components(reachable)
+        for scc in sccs
+            if length(scc) > 1
+                names = join(LLVM.name.(scc), " -> ")
+                error("Mutual recursion is not supported in SPIR-V multi-OpFunction emission: cycle through $names")
+            end
+        end
+        for fn in reachable
+            fn === entry_fn && continue
+            isempty(LLVM.blocks(fn)) && continue
+            emit_function!(state, fn; is_entry=false)
+        end
     end
 
     # Check if entry function has parameters

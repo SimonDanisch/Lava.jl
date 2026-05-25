@@ -66,6 +66,57 @@ function build_pointee_type_map(mod::LLVM.Module)
         end
     end
 
+    # 3. Function parameters with the `byval(T)` attribute carry the pointee
+    # type directly. Needed once we emit helper OpFunctions whose only signal
+    # for the pointee is the byval annotation. Priority 4: above load/store/GEP,
+    # below alloca (which is authoritative for stack-local types).
+    byval_kind = LLVM.API.LLVMGetEnumAttributeKindForName("byval", Csize_t(5))
+    for fn in LLVM.functions(mod)
+        isempty(LLVM.blocks(fn)) && continue
+        for (i, param) in enumerate(LLVM.parameters(fn))
+            LLVM.value_type(param) isa LLVM.PointerType || continue
+            for attr in collect(LLVM.parameter_attributes(fn, i))
+                if attr isa LLVM.TypeAttribute && LLVM.kind(attr) == byval_kind
+                    set_pointee_type!(ptm, param, LLVM.value(attr); priority=4)
+                    break
+                end
+            end
+        end
+    end
+
+    # 4. Call-site propagation: if a call passes a pointer arg with a known
+    # pointee, propagate that pointee onto the callee's corresponding parameter.
+    # Needed for helper functions that only forward a pointer without
+    # dereferencing it inside the body. Iterate to a fixed point — most modules
+    # converge in 1-2 passes. Priority 2: lower than byval/GEP, same as load/store.
+    for iter in 1:10
+        changed = false
+        for fn in LLVM.functions(mod), bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+            inst isa LLVM.CallInst || continue
+            callee = LLVM.called_operand(inst)
+            callee isa LLVM.Function || continue
+            isempty(LLVM.blocks(callee)) && continue
+            params = collect(LLVM.parameters(callee))
+            ops = LLVM.operands(inst)
+            n_args = length(ops) - 1
+            for i in 1:min(n_args, length(params))
+                arg = ops[i]
+                param = params[i]
+                LLVM.value_type(param) isa LLVM.PointerType || continue
+                arg_pointee = get_pointee_type(ptm, arg)
+                arg_pointee === nothing && continue
+                existing = get(ptm.map, param, nothing)
+                # Don't overwrite a higher-priority entry (byval=4, alloca=5)
+                if existing === nothing || existing[2] < 2
+                    set_pointee_type!(ptm, param, arg_pointee; priority=2)
+                    changed = true
+                end
+            end
+        end
+        changed || break
+        @assert iter < 10 "call-site propagation failed to converge"
+    end
+
     return ptm
 end
 

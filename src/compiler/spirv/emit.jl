@@ -74,13 +74,14 @@ mutable struct SPIRVEmitterState
     # Cached OpTypeRayQueryKHR id, allocated lazily.
     ray_query_type_id::Union{Nothing, UInt32}
     # Function-local rayQuery OpVariable id, allocated lazily on first use.
-    # Reset to nothing per function (currently only the entry function uses this).
+    # Reset to nothing at the top of every emit_function! so each OpFunction
+    # that uses ray queries gets its own Function-storage OpVariable.
     current_ray_query_var::Union{Nothing, UInt32}
-    # OpVariable Function instructions buffered for the entry function.
-    # They are injected right after the entry block's first OpLabel, alongside
-    # alloca preamble words, so they satisfy the SPIR-V spec's requirement that
-    # all Function-storage OpVariable instructions precede any other instruction
-    # in the entry block.
+    # OpVariable Function instructions buffered for the function currently being
+    # emitted. They are injected right after the function's entry block's first
+    # OpLabel, alongside alloca preamble words, so they satisfy the SPIR-V spec
+    # requirement that all Function-storage OpVariable instructions precede any
+    # other instruction in a function. Cleared at the top of every emit_function!.
     entry_function_locals::Vector{UInt32}
     # Additional interface IDs for OpEntryPoint gathered outside emit_globals!.
     # The compute TLAS descriptor variable (for ray-query kernels) is pushed here
@@ -476,6 +477,22 @@ end
 Emit a single LLVM function as a SPIR-V function.
 """
 function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::Bool=false)
+    # Reset per-function caches that would otherwise leak between functions in
+    # multi-OpFunction emission. Defensive when only one function is emitted; load-
+    # bearing when more than one runs through here. Fields with LLVM-Value-keyed
+    # dicts are left alone — Values are unique per function so no collision.
+    empty!(state.deferred_phis)
+    empty!(state.psb_ptr_to_u64)
+    state.current_ray_query_var = nothing
+    empty!(state.entry_function_locals)
+
+    # Pre-scan: if the function uses ray-query intrinsics, eagerly allocate the
+    # per-function rayQuery OpVariable BEFORE block emission so it lands in
+    # entry_function_locals and gets injected at the start of the first block. Without
+    # this, the first lazy allocation happens deep inside a non-first block and
+    # would produce an OpVariable referenced before its definition.
+    prescan_function_for_rayquery!(state, fn)
+
     fn_ty = LLVM.function_type(fn)
     ret_ty = LLVM.return_type(fn_ty)
     ret_spirv = map_type!(state.type_ctx, ret_ty)
@@ -497,11 +514,15 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
         fresh_id!(state.mod)
     end
 
-    # Function control
-    fc = is_entry ? FuncControl.None : FuncControl.None
-    # TODO: Use DontInline for @noinline functions
-
-    # OpFunction
+    # OpFunction — set DontInline when the LLVM function has the noinline
+    # attribute (from Julia `@noinline` or otherwise). This tells spirv-opt's
+    # inliner to leave the function alone, preserving the call boundary the
+    # author asked for. Without it, spirv-opt's `-O` pipeline inlines small
+    # helpers and the multi-OpFunction split disappears at the SPIR-V level.
+    noinline_kind = LLVM.API.LLVMGetEnumAttributeKindForName("noinline", 8)
+    has_noinline = any(a -> a isa LLVM.EnumAttribute && LLVM.kind(a) == noinline_kind,
+                        collect(LLVM.function_attributes(fn)))
+    fc = (is_entry || !has_noinline) ? FuncControl.None : FuncControl.DontInline
     encode_instruction!(state.mod.functions, Op.OpFunction, ret_spirv, func_id, fc, func_type_id)
 
     # OpFunctionParameter for each parameter
@@ -591,7 +612,7 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
         # They are appended here, after block emission, so their IDs are defined before use.
         if !entry_label_emitted
             entry_label_emitted = true
-            if is_entry && !isempty(state.entry_function_locals)
+            if !isempty(state.entry_function_locals)
                 append!(preamble_words, state.entry_function_locals)
             end
             if !isempty(preamble_words)

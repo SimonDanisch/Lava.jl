@@ -601,6 +601,12 @@ const POOL_LARGE_THRESHOLD = POOL_BLOCK_SIZE  # Allocs above this bypass the poo
 const POOL_MIN_SIZE = 16  # Minimum allocation size (Vulkan requires non-zero)
 const POOL_NUM_SIZE_CLASSES = 24  # 2^4=16 to 2^27=128MiB
 
+# Debug-only: force every LavaArray onto its own VkBuffer (one vkGetBufferDeviceAddress
+# per array). GPU-AV's BDA OOB validation tracks ranges per VkBuffer, so with the pool
+# on it cannot see sub-pool overruns; with this flag on, each LavaArray's bounds are
+# checked individually. Slow — leave off in production.
+const POOL_DISABLED = Ref{Bool}(false)
+
 # Free lists: index i holds reusable VkManagedBuffer objects of size 2^(i+3) bytes
 const POOL_BLOCKS = PoolBlock[]
 const POOL_FREE_LISTS = [VkManagedBuffer[] for _ in 1:POOL_NUM_SIZE_CLASSES]
@@ -728,7 +734,7 @@ function pool_alloc(bq::BatchQueue, nbytes::Integer; extra_usage::UInt32=UInt32(
     end
     sweep_retired_batches!(bq)
 
-    if nbytes > POOL_LARGE_THRESHOLD || extra_usage != UInt32(0)
+    if POOL_DISABLED[] || nbytes > POOL_LARGE_THRESHOLD || extra_usage != UInt32(0)
         return vk_alloc(bq, nbytes; extra_usage)
     end
 
