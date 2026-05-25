@@ -1303,6 +1303,134 @@ function strongly_connected_components(fns::Vector{LLVM.Function})
     return sccs
 end
 
+"""
+Trace a pointer-typed LLVM value back to its source alloca. Returns the
+alloca's allocated type, or `nothing` if the source isn't a unique alloca.
+Walks through GEPs, bitcasts, addrspacecasts, and PHIs (PHIs return
+`nothing` if their inputs disagree — caller treats that as "uncertain
+type" and force-inlines).
+"""
+function trace_alloca_allocated_type(value::LLVM.Value,
+                                      visited::Set{LLVM.Value}=Set{LLVM.Value}())
+    value in visited && return nothing
+    push!(visited, value)
+    if value isa LLVM.AllocaInst
+        return LLVM.LLVMType(API.LLVMGetAllocatedType(value))
+    elseif value isa LLVM.GetElementPtrInst
+        return trace_alloca_allocated_type(LLVM.operands(value)[1], visited)
+    elseif value isa LLVM.BitCastInst || value isa LLVM.AddrSpaceCastInst
+        return trace_alloca_allocated_type(LLVM.operands(value)[1], visited)
+    elseif value isa LLVM.PHIInst
+        incoming_types = LLVM.LLVMType[]
+        for (val, _) in LLVM.incoming(value)
+            t = trace_alloca_allocated_type(val, visited)
+            t === nothing && return nothing
+            push!(incoming_types, t)
+        end
+        isempty(incoming_types) && return nothing
+        all(t -> t == incoming_types[1], incoming_types) || return nothing
+        return incoming_types[1]
+    else
+        return nothing
+    end
+end
+
+"""
+Collect the set of "pointee shapes" the helper's body uses for a pointer
+parameter. For a `getelementptr T, ptr %p, ...`, the helper's PTM
+inference picks T as the pointee. For a direct `load T, ptr %p`, the
+pointee is T. These types must match the caller's alloca type exactly,
+because SPIR-V's Logical addressing requires OpFunctionCall argument
+types to match the parameter type — no implicit coercion.
+"""
+function helper_gep_element_types(fn::LLVM.Function, param::LLVM.Argument)
+    types = Set{LLVM.LLVMType}()
+    for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+        if inst isa LLVM.GetElementPtrInst
+            ops = LLVM.operands(inst)
+            ops[1] === param || continue
+            src_ty = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(inst))
+            push!(types, src_ty)
+        elseif inst isa LLVM.LoadInst || inst isa LLVM.StoreInst
+            ptr_op = inst isa LLVM.LoadInst ? LLVM.operands(inst)[1] : LLVM.operands(inst)[2]
+            ptr_op === param || continue
+            loaded_ty = inst isa LLVM.LoadInst ? LLVM.value_type(inst) :
+                                                  LLVM.value_type(LLVM.operands(inst)[1])
+            push!(types, loaded_ty)
+        end
+    end
+    return types
+end
+
+"""
+True when `fn` has at least one pointer parameter whose helper-side usage
+indicates a type-pun across the function boundary. A type-pun is detected
+when:
+
+  * The helper's body accesses the pointer with a scalar element type T,
+    AND
+  * At least one caller passes an alloca whose innermost element type ≠ T,
+    OR multiple callers pass allocas with mismatching element types.
+
+Type-puns can't be expressed across an OpFunctionCall in SPIR-V Logical
+addressing. The fix is to force-inline the helper so the type-pun stays
+inside one OpFunction, where Lava's PTM resolves the pointer's type
+context-locally per access.
+"""
+function has_alloca_type_mismatch_at_callsites(fn::LLVM.Function, mod::LLVM.Module)
+    params = collect(LLVM.parameters(fn))
+    ptr_params = [(i, p) for (i, p) in enumerate(params) if LLVM.value_type(p) isa LLVM.PointerType]
+    isempty(ptr_params) && return false
+
+    # For each pointer param, find the helper's expected element type(s).
+    helper_types_per_param = Dict{Int, Set{LLVM.LLVMType}}()
+    for (i, p) in ptr_params
+        helper_types_per_param[i] = helper_gep_element_types(fn, p)
+    end
+
+    # Collect caller alloca types per param index — keeping the EXACT
+    # allocated type (no array unwrapping), since SPIR-V requires exact
+    # match at OpFunctionCall.
+    caller_types_per_param = Dict{Int, Set{LLVM.LLVMType}}()
+    for (i, _) in ptr_params
+        caller_types_per_param[i] = Set{LLVM.LLVMType}()
+    end
+    has_any_callsite = false
+    for caller in LLVM.functions(mod)
+        isempty(LLVM.blocks(caller)) && continue
+        for bb in LLVM.blocks(caller), inst in LLVM.instructions(bb)
+            inst isa LLVM.CallInst || continue
+            callee = LLVM.called_operand(inst)
+            callee === fn || continue
+            has_any_callsite = true
+            ops = LLVM.operands(inst)
+            n_args = length(ops) - 1
+            for (i, _) in ptr_params
+                i <= n_args || continue
+                t = trace_alloca_allocated_type(ops[i])
+                t === nothing && continue
+                push!(caller_types_per_param[i], t)
+            end
+        end
+    end
+    has_any_callsite || return false
+
+    # Mismatch if (a) callers disagree on the alloca's type for this param,
+    # or (b) the alloca's type doesn't match any pointee shape the helper
+    # uses internally — both are unrecoverable in Logical-addressing
+    # OpFunctionCall.
+    for (i, _) in ptr_params
+        caller_set = caller_types_per_param[i]
+        helper_set = helper_types_per_param[i]
+        length(caller_set) > 1 && return true
+        isempty(helper_set) && continue
+        for ct in caller_set
+            ct in helper_set || return true
+        end
+    end
+    return false
+end
+
 function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
                             force_inline_all::Bool=false)
     if force_inline_all
@@ -1358,6 +1486,37 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
             fname in wrapper_direct_callees && continue
             attrs = LLVM.function_attributes(fn)
             delete!(attrs, LLVM.EnumAttribute("alwaysinline"))
+        end
+
+        # Detect cross-boundary pointer-type mismatch. When a noinline helper
+        # has a pointer param, and callers pass pointers to allocas of
+        # DIFFERENT LLVM types (e.g. one caller passes [21 x i64], another
+        # passes [5 x i64]), Lava's PTM picks one pointee type for the param
+        # and the OpFunctionCall mismatches at the other site. SPIR-V can't
+        # express this kind of type-punning across a function boundary in
+        # Logical addressing. Re-mark such helpers `alwaysinline` so the
+        # type-pun stays inside one OpFunction where Lava's PTM resolves it
+        # context-locally.
+        for fn in LLVM.functions(mod)
+            isempty(LLVM.blocks(fn)) && continue
+            startswith(LLVM.name(fn), "llvm.") && continue
+            fname = LLVM.name(fn)
+            fn === entry_fn && continue
+            any(p -> occursin(p, fname), must_inline_prefixes) && continue
+            # NOTE: do NOT skip wrapper_direct_callees here. Even kernels called
+            # directly from the wrapper must be force-inlined when their callers
+            # disagree on pointer-arg alloca types — the SPIR-V type mismatch is
+            # a hard validation error.
+
+            has_ptr_param = any(p -> LLVM.value_type(p) isa LLVM.PointerType,
+                                LLVM.parameters(fn))
+            has_ptr_param || continue
+
+            if has_alloca_type_mismatch_at_callsites(fn, mod)
+                attrs = LLVM.function_attributes(fn)
+                delete!(attrs, LLVM.EnumAttribute("noinline"))
+                push!(attrs, LLVM.EnumAttribute("alwaysinline"))
+            end
         end
     end
 
