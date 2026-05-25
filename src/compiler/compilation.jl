@@ -1431,13 +1431,31 @@ function has_alloca_type_mismatch_at_callsites(fn::LLVM.Function, mod::LLVM.Modu
     return false
 end
 
+"""
+Debug knob: substrings of entry-function names that should be compiled
+with the `force_inline_all=true` escape hatch. When the entry_fn's name
+contains any of these substrings, all helpers get inlined into it,
+regardless of @noinline. Used to bisect multi-OpFunction miscompiles.
+
+Set from outside Lava via e.g.
+    push!(Lava.FORCE_INLINE_KERNEL_PATTERNS, "vp_trace_rays_kernel")
+"""
+const FORCE_INLINE_KERNEL_PATTERNS = String[]
+
 function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
                             force_inline_all::Bool=false)
+    entry_name = LLVM.name(entry_fn)
+    # Promote to force_inline_all if entry_fn matches any debug pattern
+    if !force_inline_all && !isempty(FORCE_INLINE_KERNEL_PATTERNS)
+        if any(p -> occursin(p, entry_name), FORCE_INLINE_KERNEL_PATTERNS)
+            force_inline_all = true
+        end
+    end
+
     if force_inline_all
-        entry_name = LLVM.name(entry_fn)
         for fn in LLVM.functions(mod)
             fn_name = LLVM.name(fn)
-            fn_name == entry_name && continue
+            fn === entry_fn && continue
             isempty(LLVM.blocks(fn)) && continue
             startswith(fn_name, "llvm.") && continue
             attrs = LLVM.function_attributes(fn)
@@ -1518,6 +1536,35 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
                 push!(attrs, LLVM.EnumAttribute("alwaysinline"))
             end
         end
+    end
+
+    # Force-inline any function that calls ray-query intrinsics. A ray query
+    # is a Function-scope OpVariable: the OpRayQueryInitializeKHR call and
+    # all subsequent OpRayQueryProceedKHR / Get... calls MUST reference the
+    # SAME variable, which means they must live in the same OpFunction.
+    # Without this, Julia's frontend can hoist (for example) a `while
+    # lava_ray_query_proceed() ... end` loop body into a separate function;
+    # each function then allocates its own ray query OpVariable, and Init
+    # initializes one variable while Proceed advances a different
+    # (uninitialized) variable → DEVICE_LOST at runtime.
+    rayquery_callers = Set{LLVM.Function}()
+    for fn in LLVM.functions(mod)
+        isempty(LLVM.blocks(fn)) && continue
+        for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+            inst isa LLVM.CallInst || continue
+            callee = LLVM.called_operand(inst)
+            callee isa LLVM.Function || continue
+            if startswith(LLVM.name(callee), "lava_ray_query_")
+                push!(rayquery_callers, fn)
+                break
+            end
+        end
+    end
+    for fn in rayquery_callers
+        fn === entry_fn && continue
+        attrs = LLVM.function_attributes(fn)
+        delete!(attrs, LLVM.EnumAttribute("noinline"))
+        push!(attrs, LLVM.EnumAttribute("alwaysinline"))
     end
 
     LLVM.run!(LLVM.AlwaysInlinerPass(), mod)
