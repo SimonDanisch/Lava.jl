@@ -138,6 +138,9 @@ include("array/pin_leaves.jl") # @generated walker that pins LavaArray leaves pe
 
 # ---- Launch API (depends on LavaArray / LavaDeviceArray) ----
 include("runtime/launch.jl")
+# Pipeline cache persistence — depends on lava_disk_cache_dir from launch.jl;
+# referenced by VkContext constructor (forward at include time, resolved at call time)
+include("runtime/pipeline_cache.jl")
 # runtime/sync.jl — sync handled via vk_flush!() in launch.jl
 
 # ---- KernelAbstractions backend ----

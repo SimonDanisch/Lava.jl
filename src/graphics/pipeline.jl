@@ -195,7 +195,8 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
         next=rendering_info,
     )
 
-    pipelines, _ = @vk_checked "vkCreateGraphicsPipelines" Vulkan.create_graphics_pipelines(dev, [ci])
+    pipelines, _ = @vk_checked "vkCreateGraphicsPipelines" Vulkan.create_graphics_pipelines(
+        dev, [ci]; pipeline_cache=vk_context().pipeline_cache)
     pipeline = pipelines[1]
 
     return CompiledGraphicsPipeline(

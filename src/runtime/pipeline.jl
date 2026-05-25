@@ -47,10 +47,12 @@ else
 init_pipeline_thread!() = nothing
 end
 
-function create_compute_pipeline_large_stack(device::Ptr{Cvoid}, create_info_ptr::Ptr{Cvoid},
+function create_compute_pipeline_large_stack(device::Ptr{Cvoid},
+                                               pipeline_cache::Ptr{Cvoid},
+                                               create_info_ptr::Ptr{Cvoid},
                                                p_pipelines::Ptr{Cvoid})
     args = Ref(_VkCreatePipelineArgs(
-        device, C_NULL, UInt32(1), UInt32(0),
+        device, pipeline_cache, UInt32(1), UInt32(0),
         create_info_ptr, C_NULL, p_pipelines,
         Int32(0), Int32(0),
     ))
@@ -163,7 +165,7 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
     ci = Vulkan.ComputePipelineCreateInfo(stage, layout, -1;
         flags=Vulkan.PIPELINE_CREATE_DISPATCH_BASE_BIT)
 
-    pipeline = create_compute_pipeline(dev, ci)
+    pipeline = create_compute_pipeline(dev, ci; pipeline_cache=ctx.pipeline_cache)
 
     result = LavaComputePipeline(shader_mod, layout, pipeline, UInt32(push_constant_size),
                                   needs_tlas_descriptor, ds_layout)
@@ -225,15 +227,26 @@ function alloc_compute_tlas_descriptor_set(dev::Vulkan.Device,
     return desc_pool, desc_set
 end
 
-function create_compute_pipeline(dev::Vulkan.Device, ci::Vulkan.ComputePipelineCreateInfo)
+function create_compute_pipeline(dev::Vulkan.Device, ci::Vulkan.ComputePipelineCreateInfo;
+                                   pipeline_cache=C_NULL)
+    # Resolve the raw handle for the LARGE_STACK ccall path. Vulkan.jl high-
+    # level wrappers carry the raw UInt64 (non-dispatchable handle) in `.vks`;
+    # ccall accepts a Ptr{Cvoid} of that value on 64-bit systems.
+    cache_handle = if pipeline_cache === C_NULL
+        C_NULL
+    else
+        raw = pipeline_cache.vks
+        raw isa Ptr ? raw : Ptr{Cvoid}(UInt(raw))
+    end
     if LARGE_STACK_PIPELINE
         ci_low = convert(Vulkan._ComputePipelineCreateInfo, ci)
         vk_ci_ref = Ref(ci_low.vks)
         pipeline_out = Ref(Ptr{Cvoid}(C_NULL))
 
-        GC.@preserve ci_low vk_ci_ref pipeline_out begin
+        GC.@preserve ci_low vk_ci_ref pipeline_out pipeline_cache begin
             vk_result = create_compute_pipeline_large_stack(
                 dev.vks,
+                cache_handle,
                 Ptr{Cvoid}(pointer_from_objref(vk_ci_ref)),
                 Ptr{Cvoid}(pointer_from_objref(pipeline_out)))
             vk_result != 0 && error("vkCreateComputePipelines failed with VkResult $vk_result")
@@ -244,7 +257,7 @@ function create_compute_pipeline(dev::Vulkan.Device, ci::Vulkan.ComputePipelineC
         destructor = x -> Vulkan._destroy_pipeline(parent, x)
         return Vulkan.Pipeline(raw_pipeline, destructor, dev)
     else
-        pipelines, _ = @vk_checked "vkCreateComputePipelines" Vulkan.create_compute_pipelines(dev, [ci])
+        pipelines, _ = @vk_checked "vkCreateComputePipelines" Vulkan.create_compute_pipelines(dev, [ci]; pipeline_cache)
         return pipelines[1]
     end
 end

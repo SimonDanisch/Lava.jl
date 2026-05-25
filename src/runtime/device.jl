@@ -233,6 +233,11 @@ mutable struct VkContext
     # Whether GPU-Assisted Validation is active on this instance. Captured
     # so callers can check (e.g. verify_gpu_av) without re-reading env vars.
     gpu_assisted::Bool
+    # Driver version (used to key the on-disk VkPipelineCache file).
+    driver_version::String
+    # Persistent VkPipelineCache. Seeded from disk on init, passed to every
+    # vkCreate*Pipelines call, snapshotted back on vk_reset_device! + atexit.
+    pipeline_cache::Vulkan.PipelineCache
 
     # Inner constructor: two-phase init via `new()` so we can hand a live
     # `ctx` reference to `BatchQueue(...)` while finishing the ctx's own
@@ -257,7 +262,8 @@ mutable struct VkContext
                        max_wg_dims::NTuple{3, Int},
                        as_scratch_align::UInt64,
                        ray_query_available::Bool=false,
-                       gpu_assisted::Bool=false)
+                       gpu_assisted::Bool=false,
+                       driver_version::AbstractString="unknown")
         ctx = new()
         ctx.instance = instance
         ctx.physical_device = physical_device
@@ -277,6 +283,12 @@ mutable struct VkContext
         ctx.as_scratch_align = as_scratch_align
         ctx.ray_query_available = ray_query_available
         ctx.gpu_assisted = gpu_assisted
+        ctx.driver_version = driver_version
+        # Seed a persistent VkPipelineCache from disk (if any). Driver
+        # validates the header — bad/stale data is silently ignored.
+        ctx.pipeline_cache = create_lava_pipeline_cache(
+            device, lava_pipeline_cache_path(device_name, driver_version))
+        _register_pipeline_cache_atexit!()
         # Now build the default BatchQueue with the live ctx.  Sets the
         # remaining field; no nullable slot, no post-hoc mutation.
         ctx.default_bq = BatchQueue(device, primary_queue, queue_family_index, ctx)
@@ -335,6 +347,11 @@ kernels, arg buffers).
 GPU buffers no longer exist. You must reallocate all GPU data.
 """
 function vk_reset_device!()
+    # Persist the VkPipelineCache before tearing the device down so the
+    # next session can skip AMDVLK's SPIR-V → ISA recompile.
+    let old = VK_CONTEXT_REF[]
+        old === nothing || save_pipeline_cache!(old)
+    end
     # Drop the context ref; a fresh one will be created lazily. Pre-reset
     # VkManagedBuffers hold a strong ref to the OLD ctx whose `device_lost`
     # is already true, so their finalizers will skip Vulkan calls.
@@ -769,6 +786,7 @@ function init_vulkan!()
         as_scratch_align,
         has_ray_query,
         gpu_assisted,
+        string(phys_props.driver_version),
     )
     return ctx
 end
