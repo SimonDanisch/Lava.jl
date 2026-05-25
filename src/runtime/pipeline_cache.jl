@@ -38,13 +38,32 @@ end
 Create a `VkPipelineCache` for `device`, seeded from `path` if it exists.
 Vulkan.jl's `PipelineCacheCreateInfo(initial_data::Ptr{Cvoid}; initial_data_size)`
 takes a raw pointer — the bytes vector is GC-pinned for the duration of the call.
+
+If creation with the seed data fails (e.g., the file is corrupt or from a
+different driver build that the validating loader doesn't auto-reject
+cleanly), fall back to an empty cache and delete the bad file so the next
+session starts fresh.
 """
 function create_lava_pipeline_cache(device::Vulkan.Device, path::String)
     initial = load_pipeline_cache_data(path)
-    return GC.@preserve initial begin
-        ptr = isempty(initial) ? C_NULL : Ptr{Cvoid}(pointer(initial))
-        ci = Vulkan.PipelineCacheCreateInfo(ptr; initial_data_size=UInt64(length(initial)))
-        Vulkan.PipelineCache(device, ci)
+    function _create_empty()
+        ci = Vulkan.PipelineCacheCreateInfo(Ptr{Cvoid}(C_NULL); initial_data_size=UInt64(0))
+        return Vulkan.PipelineCache(device, ci)
+    end
+    isempty(initial) && return _create_empty()
+    try
+        return GC.@preserve initial begin
+            ptr = Ptr{Cvoid}(pointer(initial))
+            ci = Vulkan.PipelineCacheCreateInfo(ptr; initial_data_size=UInt64(length(initial)))
+            Vulkan.PipelineCache(device, ci)
+        end
+    catch ex
+        @warn "Lava: pipeline cache create from disk failed; starting empty" path exception=ex
+        try
+            rm(path; force=true)
+        catch
+        end
+        return _create_empty()
     end
 end
 
@@ -83,13 +102,21 @@ function save_pipeline_cache!(ctx)
 end
 
 # atexit hook: persist on Julia shutdown. Single-shot (registered once).
+# Fully guarded — at shutdown the Vulkan device may already be torn down,
+# the loader DLL may be unloaded, the process may be in an unrecoverable
+# state. We never want a crash here to abort the host process or break
+# parent supervisors (MCP servers, IDE harnesses, etc.).
 const _PIPELINE_CACHE_ATEXIT_REGISTERED = Ref(false)
 function _register_pipeline_cache_atexit!()
     _PIPELINE_CACHE_ATEXIT_REGISTERED[] && return
     _PIPELINE_CACHE_ATEXIT_REGISTERED[] = true
     atexit() do
-        ctx = VK_CONTEXT_REF[]
-        ctx === nothing && return
-        save_pipeline_cache!(ctx)
+        try
+            ctx = VK_CONTEXT_REF[]
+            ctx === nothing && return
+            save_pipeline_cache!(ctx)
+        catch
+            # Best-effort: never propagate from atexit.
+        end
     end
 end
