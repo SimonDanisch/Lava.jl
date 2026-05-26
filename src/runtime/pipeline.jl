@@ -64,12 +64,16 @@ function create_compute_pipeline_large_stack(device::Ptr{Cvoid},
             C_NULL, LARGE_STACK_SIZE, PIPELINE_THREAD_CFUNC[], args_ptr,
             UInt32(0), thread_id)
         handle == C_NULL && error("CreateThread failed for vkCreateComputePipelines")
-        # 60 second timeout — AMD's Windows driver can hang on certain SPIR-V patterns
+        # 180 second timeout — AMD's Windows driver can hang on certain SPIR-V
+        # patterns AND can also just be very slow under accumulated session
+        # state. 60s was too tight: a trivial fill kernel hit the limit after
+        # ~800 prior compiles in the same session. 180s tolerates the
+        # slow-but-progressing case while still catching true infinite hangs.
         wait_result = ccall((:WaitForSingleObject, "kernel32"), UInt32,
-            (Ptr{Cvoid}, UInt32), handle, UInt32(60_000))
+            (Ptr{Cvoid}, UInt32), handle, UInt32(180_000))
         ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), handle)
         if wait_result == 0x00000102  # WAIT_TIMEOUT
-            error("vkCreateComputePipelines timed out after 60s — AMD Windows driver " *
+            error("vkCreateComputePipelines timed out after 180s — AMD Windows driver " *
                   "shader compiler hung. This is a known driver bug with certain " *
                   "large SPIR-V modules. Try reducing kernel complexity.")
         end
