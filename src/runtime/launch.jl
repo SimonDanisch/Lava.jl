@@ -432,8 +432,15 @@ function lava_kernel_compile(job::GPUCompiler.CompilerJob)
     # Try the disk cache first — same (specTypes, workgroup_size) yields the
     # same SPIR-V bytes across sessions, which lets the driver's persistent
     # VkPipelineCache match by bit-identical SPIR-V hash.
-    cached = lava_disk_cache_load(job.source, job.config.params.workgroup_size)
-    cached === nothing || return cached
+    #
+    # Opt-in via env var: empirically AMDVLK Windows crashes when fed
+    # previously-serialized SPIR-V (even byte-identical to a fresh compile).
+    # Other drivers are fine. We always WRITE to disk so the cache is ready
+    # if/when the load gets enabled; only the LOAD path is gated.
+    if get(ENV, "LAVA_LOAD_SPIRV_DISK_CACHE", "0") == "1"
+        cached = lava_disk_cache_load(job.source, job.config.params.workgroup_size)
+        cached === nothing || return cached
+    end
     compiled = lava_compile_gpu_from_job(job)
     lava_disk_cache_store(job.source, job.config.params.workgroup_size, compiled)
     return compiled
