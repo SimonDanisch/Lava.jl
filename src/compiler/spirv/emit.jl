@@ -3986,6 +3986,14 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                             append!(state.mod.functions, all_indices)
                             state.value_map[inst] = result_id
                             set_pointee_type!(state.type_ctx.ptm, inst, inner_elem_ty; priority=4)
+                            # Record array element origin so chained byte-offset GEPs can fold
+                            # additional offsets into the same array index. Without this, a
+                            # follow-up `gep i8, ptr %this, i64 %dyn*ELEM_SIZE` falls into the
+                            # struct-stride heuristic on inner_elem_ty and accesses the wrong
+                            # struct field (observed in broadcast-with-tuple kernels where the
+                            # iteration index is decomposed across two consecutive byte GEPs).
+                            static_path = UInt32[emit_constant_u32!(state.mod, UInt32(idx_val)) for idx_val in sub_path]
+                            state.array_element_origin[inst] = (base_id, static_path, dyn_idx_i32, sub_leaf)
                             return
                         end
                     elseif sub_path !== nothing && !(sub_leaf isa LLVM.ArrayType)
