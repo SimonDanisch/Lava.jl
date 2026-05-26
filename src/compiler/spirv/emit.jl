@@ -3716,6 +3716,15 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                         append!(state.mod.functions, idx_ids)
                         state.value_map[inst] = result_id
                         set_pointee_type!(state.type_ctx.ptm, inst, inner_elem_ty; priority=4)
+                        # Mirror of the struct-base fix: record chain origin so a
+                        # follow-up `gep i8, ptr %this, i64 %dyn*ELEM_SIZE` can
+                        # fold its additional offset into the same array index
+                        # instead of mis-routing into a sibling field.
+                        static_path = UInt32[zero_id]
+                        for idx_val in sub_path
+                            push!(static_path, emit_constant_u32!(state.mod, UInt32(idx_val)))
+                        end
+                        state.array_element_origin[inst] = (base_id, static_path, dyn_idx_i32, sub_leaf)
                         return
                     end
                 end

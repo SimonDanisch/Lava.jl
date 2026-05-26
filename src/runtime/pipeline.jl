@@ -64,19 +64,33 @@ function create_compute_pipeline_large_stack(device::Ptr{Cvoid},
             C_NULL, LARGE_STACK_SIZE, PIPELINE_THREAD_CFUNC[], args_ptr,
             UInt32(0), thread_id)
         handle == C_NULL && error("CreateThread failed for vkCreateComputePipelines")
-        # 180 second timeout — AMD's Windows driver can hang on certain SPIR-V
-        # patterns AND can also just be very slow under accumulated session
-        # state. 60s was too tight: a trivial fill kernel hit the limit after
-        # ~800 prior compiles in the same session. 180s tolerates the
-        # slow-but-progressing case while still catching true infinite hangs.
+        # 600 second timeout — AMD's Windows driver can be very slow under
+        # accumulated session state (~thousands of prior compiles). Real hangs
+        # are exceedingly rare; the failure mode is "slow but progressing".
+        # If we timeout-and-CloseHandle while the thread is still inside
+        # AMDVLK's compiler, the thread later crashes accessing freed
+        # _VkCreatePipelineArgs (observed: access violation in vkResetEvent
+        # after a Pkg.test Tier 4 broadcast Complex{Int32}). The crash kills
+        # the whole process. To avoid that, we TerminateThread on timeout —
+        # leaks the AMDVLK internal allocations but keeps Julia alive so
+        # the test/user can recover gracefully (or call vk_reset_device!).
         wait_result = ccall((:WaitForSingleObject, "kernel32"), UInt32,
-            (Ptr{Cvoid}, UInt32), handle, UInt32(180_000))
-        ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), handle)
+            (Ptr{Cvoid}, UInt32), handle, UInt32(600_000))
         if wait_result == 0x00000102  # WAIT_TIMEOUT
-            error("vkCreateComputePipelines timed out after 180s — AMD Windows driver " *
-                  "shader compiler hung. This is a known driver bug with certain " *
-                  "large SPIR-V modules. Try reducing kernel complexity.")
+            # Force-kill the leaked AMDVLK thread so it can't crash the
+            # process later when it accesses our freed args memory.
+            ccall((:TerminateThread, "kernel32"), Cint,
+                (Ptr{Cvoid}, UInt32), handle, UInt32(1))
+            ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), handle)
+            # Best-effort: mark the Lava context as device_lost so subsequent
+            # work doesn't try to use a driver in unknown state.
+            ctx = VK_CONTEXT_REF[]
+            ctx === nothing || mark_device_lost!(ctx)
+            error("vkCreateComputePipelines timed out after 600s — AMD Windows " *
+                  "driver shader compiler hung. Device marked DEVICE_LOST; " *
+                  "call Lava.vk_reset_device!() to recover.")
         end
+        ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), handle)
         wait_result != 0 && error("WaitForSingleObject failed: $wait_result")
         return args[].result
     end
