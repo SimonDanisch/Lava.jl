@@ -12,13 +12,13 @@
                OpExtension "SPV_KHR_physical_storage_buffer"
                OpExtension "SPV_KHR_variable_pointers"
                OpMemoryModel PhysicalStorageBuffer64 Vulkan
-               OpEntryPoint GLCompute %main "main" %__spirv_BuiltInGlobalInvocationId %10
+               OpEntryPoint GLCompute %main "main" %__spirv_BuiltInGlobalInvocationId %11
                OpExecutionMode %main LocalSize 64 1 1
                OpName %__spirv_BuiltInGlobalInvocationId "__spirv_BuiltInGlobalInvocationId"
                OpName %main "main"
                OpDecorate %__spirv_BuiltInGlobalInvocationId BuiltIn GlobalInvocationId
-               OpDecorate %_struct_8 Block
-               OpMemberDecorate %_struct_8 0 Offset 0
+               OpDecorate %_struct_9 Block
+               OpMemberDecorate %_struct_9 0 Offset 0
                OpDecorate %_ptr_PhysicalStorageBuffer_float ArrayStride 4
        %void = OpTypeVoid
       %ulong = OpTypeInt 64 0
@@ -26,9 +26,9 @@
      %v3uint = OpTypeVector %uint 3
       %float = OpTypeFloat 32
 %_ptr_Input_v3uint = OpTypePointer Input %v3uint
-  %_struct_8 = OpTypeStruct %ulong
-%_ptr_PushConstant__struct_8 = OpTypePointer PushConstant %_struct_8
-         %11 = OpTypeFunction %void
+  %_struct_9 = OpTypeStruct %ulong
+%_ptr_PushConstant__struct_9 = OpTypePointer PushConstant %_struct_9
+         %12 = OpTypeFunction %void
 %_ptr_PushConstant_ulong = OpTypePointer PushConstant %ulong
      %uint_0 = OpConstant %uint 0
 %_ptr_PhysicalStorageBuffer_ulong = OpTypePointer PhysicalStorageBuffer %ulong
@@ -38,10 +38,10 @@
    %ulong_16 = OpConstant %ulong 16
 %ulong_18446744073709551615 = OpConstant %ulong 18446744073709551615
 %__spirv_BuiltInGlobalInvocationId = OpVariable %_ptr_Input_v3uint Input
-         %10 = OpVariable %_ptr_PushConstant__struct_8 PushConstant
-       %main = OpFunction %void None %11
+         %11 = OpVariable %_ptr_PushConstant__struct_9 PushConstant
+       %main = OpFunction %void None %12
          %13 = OpLabel
-         %16 = OpAccessChain %_ptr_PushConstant_ulong %10 %uint_0
+         %16 = OpAccessChain %_ptr_PushConstant_ulong %11 %uint_0
          %17 = OpLoad %ulong %16
          %19 = OpConvertUToPtr %_ptr_PhysicalStorageBuffer_ulong %17
          %20 = OpLoad %ulong %19 Aligned 8
