@@ -429,11 +429,6 @@ in `link_kernel` (see below).
 function lava_kernel_compile(job::GPUCompiler.CompilerJob)
     # enable_ray_query is read from the job's LavaCompilerParams,
     # where it was set by lava_compiler_config(; enable_ray_query).
-    # Try the disk cache first — same (specTypes, workgroup_size) yields the
-    # same SPIR-V bytes across sessions, which lets the driver's persistent
-    # VkPipelineCache match by bit-identical SPIR-V hash.
-    cached = lava_disk_cache_load(job.source, job.config.params.workgroup_size)
-    cached === nothing || return cached
     compiled = lava_compile_gpu_from_job(job)
     lava_disk_cache_store(job.source, job.config.params.workgroup_size, compiled)
     return compiled
