@@ -1672,6 +1672,15 @@ function find_zero_index_path(from_ty::LLVM.LLVMType, target_ty::LLVM.LLVMType)
             LLVM.length(current) == 0 && return nothing
             push!(path, 0)
             current = LLVM.eltype(current)
+        elseif current isa LLVM.VectorType
+            # SROA/InstCombine folds `load <N x T>, ptr %v; extractelement 0`
+            # into `load T, ptr %v`.  In SPIR-V Logical addressing the scalar
+            # element of a vector pointer must be reached via OpAccessChain
+            # (you can't OpLoad a scalar from a vector pointer).  Treat vectors
+            # the same as arrays here so the caller emits the AccessChain.
+            LLVM.length(current) == 0 && return nothing
+            push!(path, 0)
+            current = LLVM.eltype(current)
         else
             return nothing  # Can't drill further, type not found
         end
@@ -1687,13 +1696,17 @@ Returns (path, leaf_type) or (nothing, nothing).
 function find_zero_index_path_to_leaf(from_ty::LLVM.LLVMType)
     path = Int[]
     current = from_ty
-    while current isa LLVM.StructType || current isa LLVM.ArrayType
+    while current isa LLVM.StructType || current isa LLVM.ArrayType || current isa LLVM.VectorType
         if current isa LLVM.StructType
             elems = LLVM.elements(current)
             isempty(elems) && return (nothing, nothing)
             push!(path, 0)
             current = first(elems)
         elseif current isa LLVM.ArrayType
+            LLVM.length(current) == 0 && return (nothing, nothing)
+            push!(path, 0)
+            current = LLVM.eltype(current)
+        else  # VectorType — same handling as array (SROA scalar-from-vector)
             LLVM.length(current) == 0 && return (nothing, nothing)
             push!(path, 0)
             current = LLVM.eltype(current)
