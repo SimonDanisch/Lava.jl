@@ -495,6 +495,21 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
 
     fn_ty = LLVM.function_type(fn)
     ret_ty = LLVM.return_type(fn_ty)
+    # SPIR-V Logical addressing requires every OpTypePointer to carry a
+    # StorageClass.  A pointer-return function can't be expressed as a
+    # standalone OpFunction — the storage class would need to flow from the
+    # call site, which Logical addressing doesn't permit.  The inline pass
+    # in `compilation.jl` force-inlines any ptr-return helper for exactly
+    # this reason; this guard is a sharp error message for the case where
+    # something slips through (e.g. a new GPUCompiler runtime stub).
+    if ret_ty isa LLVM.PointerType
+        error("emit_function!: function `$(LLVM.name(fn))` has pointer return " *
+              "type `$(string(ret_ty))` and survived as a non-inlined OpFunction. " *
+              "SPIR-V Logical addressing cannot express pointer returns across " *
+              "function boundaries — the function must be `alwaysinline`. " *
+              "If this is a new GPUCompiler/Julia runtime stub, extend the " *
+              "ptr-return-force-inline pass in `compilation.jl`.")
+    end
     ret_spirv = map_type!(state.type_ctx, ret_ty)
 
     # Map parameter types — use actual parameter values to resolve pointer types

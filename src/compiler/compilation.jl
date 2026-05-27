@@ -1487,6 +1487,7 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
                                 "gpu_report_exception", "gpu_signal_exception",
                                 "julia.gc_", "julia.safepoint", "ijl_throw",
                                 "jl_throw")
+
         wrapper_direct_callees = Set{String}()
         for bb in LLVM.blocks(entry_fn), inst in LLVM.instructions(bb)
             inst isa LLVM.CallInst || continue
@@ -1504,6 +1505,29 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
             fname in wrapper_direct_callees && continue
             attrs = LLVM.function_attributes(fn)
             delete!(attrs, LLVM.EnumAttribute("alwaysinline"))
+        end
+
+        # Structural rule (runs AFTER the strip pass above so it isn't undone):
+        # any function whose RETURN type is a pointer must be inlined into its
+        # callers.  SPIR-V Logical addressing has no concept of a contextless
+        # pointer crossing an OpFunction boundary — `OpTypePointer` always
+        # carries a `StorageClass`, and the storage class is determined by
+        # the call site, not the callee.  GPUCompiler/Julia inject several
+        # such helpers (`gpu_malloc`, `ijl_box_*` internal allocators, etc.)
+        # as part of allocation/exception paths.  If they survive non-inlined,
+        # `emit_function!` aborts with "function X has pointer return type"
+        # because the emitter has no way to pick a storage class.  Re-mark
+        # `alwaysinline` (and strip `noinline`) so the AlwaysInlinerPass below
+        # eats them and DCE removes the surrounding error path entirely.
+        for fn in LLVM.functions(mod)
+            isempty(LLVM.blocks(fn)) && continue
+            startswith(LLVM.name(fn), "llvm.") && continue
+            fn === entry_fn && continue
+            fn_ty = LLVM.function_type(fn)
+            LLVM.return_type(fn_ty) isa LLVM.PointerType || continue
+            attrs = LLVM.function_attributes(fn)
+            delete!(attrs, LLVM.EnumAttribute("noinline"))
+            push!(attrs, LLVM.EnumAttribute("alwaysinline"))
         end
 
         # Detect cross-boundary pointer-type mismatch. When a noinline helper
