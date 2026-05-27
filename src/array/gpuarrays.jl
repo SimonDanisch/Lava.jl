@@ -255,15 +255,24 @@ function lava_norm_pp_widen(v::LavaArray{T}, spp::Float64) where T
     return typeof(float(LinearAlgebra.norm(zero(T))))(exp2(inv(spp) * log2(s)))
 end
 
-# Float64: rescale by inv_maxabs to avoid overflow
-function lava_norm_p2_rescale(v::LavaArray{T}, inv_maxabs::Float64, maxabs::Float64) where T
-    s = sum(x -> (abs(x) * inv_maxabs)^2, v; init=Float64(0))
+# Float64: rescale by maxabs to avoid overflow.
+#
+# We deliberately DIVIDE by `maxabs` rather than pre-computing and multiplying
+# by `inv_maxabs = 1/maxabs`.  When `maxabs` is near `floatmax(Float64)`,
+# `1/maxabs` is a subnormal Float64 (~1.1e-308, below 2.2e-308 normal floor),
+# and SPIR-V implementations that default to flush-denormals-to-zero (lavapipe
+# and at least some Mesa builds on Intel/Arc) silently turn it into 0 inside
+# the kernel.  Then `abs(x) * 0 = 0`, `sum = 0`, and the rescaled norm collapses
+# to 0 — the exact failure observed in `linalg/norm` 2-norm with Float64 on
+# lavapipe.  Division avoids the subnormal intermediate.
+function lava_norm_p2_rescale(v::LavaArray{T}, maxabs::Float64) where T
+    s = sum(x -> (abs(x) / maxabs)^2, v; init=Float64(0))
     return typeof(float(LinearAlgebra.norm(zero(T))))(maxabs * sqrt(s))
 end
 
-function lava_norm_pp_rescale(v::LavaArray{T}, inv_maxabs::Float64, maxabs::Float64, spp::Float64) where T
+function lava_norm_pp_rescale(v::LavaArray{T}, maxabs::Float64, spp::Float64) where T
     # Use exp2(p*log2(x)) instead of x^p to avoid ^ operator dispatch issues on GPU
-    s = sum(x -> exp2(spp * log2(abs(x) * inv_maxabs)), v; init=Float64(0))
+    s = sum(x -> exp2(spp * log2(abs(x) / maxabs)), v; init=Float64(0))
     return typeof(float(LinearAlgebra.norm(zero(T))))(maxabs * exp2(inv(spp) * log2(s)))
 end
 
@@ -295,8 +304,7 @@ function LinearAlgebra.norm(v::LavaArray{T}, p::Real=2) where T
         return convert(RT, sqrt(s))
     end
 
-    inv_maxabs = 1.0 / maxabs
-    p == 2 && return lava_norm_p2_rescale(v, inv_maxabs, maxabs)
+    p == 2 && return lava_norm_p2_rescale(v, maxabs)
     p == 1 && return convert(RT, sum(abs, v; init=Float64(0)))
-    return lava_norm_pp_rescale(v, inv_maxabs, maxabs, Float64(p))
+    return lava_norm_pp_rescale(v, maxabs, Float64(p))
 end
