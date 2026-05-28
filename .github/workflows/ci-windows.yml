@@ -23,11 +23,6 @@ jobs:
       # HW-TLAS stress runs on Linux CI; here we just want to catch
       # Windows-specific path / DLL / GLFW regressions.
       LAVA_FAST: '1'
-      # Verbose Vulkan loader diagnostics — shows exactly which ICD JSONs the
-      # loader reads, whether VK_DRIVER_FILES is honoured, and why a driver DLL
-      # is rejected (missing dependency, arch mismatch, etc).  Dial back to
-      # `error,warn` once the driver is loading cleanly.
-      VK_LOADER_DEBUG: all
     steps:
       - uses: actions/checkout@v4
 
@@ -40,27 +35,37 @@ jobs:
           $icd = (Resolve-Path "mesa\x64\lvp_icd.x86_64.json").Path
           $dir = (Resolve-Path "mesa\x64").Path
           Write-Host "ICD JSON : $icd"
-          Write-Host "ICD dir  : $dir"
-          Write-Host "--- ICD JSON content ---"
-          Get-Content $icd
-          Write-Host "--- vulkan_lvp.dll present? ---"
-          Test-Path "$dir\vulkan_lvp.dll"
-          # Write env vars with explicit UTF-8 (no BOM) — pwsh `>>` can emit a
-          # BOM that breaks GitHub's GITHUB_ENV parser, silently dropping the
-          # variable (which is the classic "loader falls back to registry" bug).
-          "VK_ICD_FILENAMES=$icd" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "VK_DRIVER_FILES=$icd"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          # IMPORTANT: GitHub `windows-latest` runners execute with an ELEVATED
+          # (admin) token.  The Vulkan loader, by design, IGNORES all VK_*
+          # environment variables (VK_DRIVER_FILES / VK_ICD_FILENAMES / …) when
+          # the process is elevated — a privilege-escalation guard against
+          # untrusted ICD paths.  So pointing at the ICD via env vars silently
+          # fails and the loader falls back to the registry → "Found no drivers".
+          #
+          # The fix is to register the ICD where the elevated loader DOES look:
+          # HKLM\SOFTWARE\Khronos\Vulkan\Drivers, a DWORD named with the full
+          # path to the ICD JSON, value 0 (0 = enabled).
+          New-Item -Path "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers" -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers" `
+            -Name $icd -Value 0 -PropertyType DWORD -Force | Out-Null
+          Write-Host "Registered ICD in HKLM\SOFTWARE\Khronos\Vulkan\Drivers"
+
+          # The ICD JSON's library_path is relative (".\vulkan_lvp.dll"), so the
+          # DLL + its deps must be discoverable — put the mesa dir on PATH.
           "$dir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
-      - name: Verify Vulkan env propagated
+      - name: Verify Vulkan driver visible
         shell: pwsh
         run: |
-          Write-Host "VK_DRIVER_FILES  = $env:VK_DRIVER_FILES"
-          Write-Host "VK_ICD_FILENAMES = $env:VK_ICD_FILENAMES"
-          if (-not $env:VK_DRIVER_FILES) { Write-Error "VK_DRIVER_FILES not set in later step — GITHUB_ENV write failed" }
-          if (-not (Test-Path $env:VK_DRIVER_FILES)) { Write-Error "ICD JSON not found at VK_DRIVER_FILES" }
-          $mesaOnPath = ($env:PATH -split ';' | Select-String -Pattern 'mesa')
-          Write-Host "mesa on PATH     = $mesaOnPath"
+          # vulkaninfo ships in the mesa archive; confirm the loader now sees
+          # lavapipe before we spend time building Julia.
+          $vk = Join-Path (Resolve-Path "mesa\x64").Path "vulkaninfo.exe"
+          if (Test-Path $vk) {
+            & $vk --summary 2>&1 | Select-String -Pattern "deviceName|driverName|llvmpipe"
+          } else {
+            Write-Host "vulkaninfo.exe not in archive; skipping summary"
+          }
 
       - uses: julia-actions/setup-julia@v2
         with:
