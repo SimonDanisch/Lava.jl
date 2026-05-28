@@ -854,8 +854,9 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     replace_freeze!(mod)
     strip_assume!(mod)
 
-    # Remove trap/unreachable from error paths (GPUCompiler's lower_throw!)
-    GPUCompiler.rm_trap!(mod)
+    # Remove trap/unreachable from error paths (GPUCompiler's lower_throw!).
+    # Vendored locally (was GPUCompiler.rm_trap!, removed in GPUCompiler 1.13.3).
+    rm_trap!(mod)
     replace_unreachable!(mod)
     strip_noreturn!(mod)
     verify_ir!("pre_inline")

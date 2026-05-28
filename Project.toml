@@ -27,6 +27,12 @@ Vulkan = "9f14b124-c50e-4008-a7d4-969b3a6cd68a"
 Raycore = {url = "https://github.com/JuliaGeometry/Raycore.jl", rev = "master"}
 
 [compat]
+# Lava depends on a few GPUCompiler internals (rm_trap! was one, now vendored;
+# kernel_state_type, methodinstance, method_table, cached_compilation remain).
+# GPUCompiler removes/renames internals across PATCH releases (1.13.1 → 1.13.3
+# dropped rm_trap!), so pin to the 1.13.x line we've validated and bump
+# deliberately after testing a new minor.
+GPUCompiler = "~1.13"
 SPIRV_LLVM_Backend_jll = "21.1.4"
 StaticArrays = "1.9.17"
 julia = "1.12"

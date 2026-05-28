@@ -10,9 +10,35 @@
 # - `llvm.assume` calls (can cause validation failures when misplaced near merge blocks)
 #
 # Pass pipeline order (assembled in compilation.jl):
-#   GPUCompiler.rm_trap! -> replace_unreachable! -> replace_freeze!
+#   rm_trap! -> replace_unreachable! -> replace_freeze!
 #   -> strip_noreturn! -> strip_assume!
 #   (then SimplifyCFG -> structurize_cfg pipeline)
+
+"""
+    rm_trap!(mod::LLVM.Module)
+
+Remove `llvm.trap` intrinsic calls (and the declaration) from the module.
+
+SPIR-V has no `trap` and no way to abort a compute kernel, so the trap calls
+GPUCompiler emits on error paths (via `lower_throw!`) must be stripped before
+the SPIR-V emitter runs.
+
+This was historically `GPUCompiler.rm_trap!`, an internal helper. It was
+removed in GPUCompiler 1.13.3 (folded into `finish_ir!` /
+`lower_unreachable_control_flow!`), so we vendor the (tiny) logic here rather
+than depend on a GPUCompiler internal that changes between patch releases.
+"""
+function rm_trap!(mod::LLVM.Module)
+    fns = LLVM.functions(mod)
+    haskey(fns, "llvm.trap") || return mod
+    trap = fns["llvm.trap"]
+    for use in LLVM.uses(trap)
+        val = LLVM.user(use)
+        val isa LLVM.CallInst && LLVM.erase!(val)
+    end
+    LLVM.erase!(trap)
+    return mod
+end
 
 """
     replace_unreachable!(mod::LLVM.Module)
@@ -377,7 +403,7 @@ end
 Run the full CFG cleanup pipeline. Must be called BEFORE the structurize_cfg pipeline.
 
 Order:
-1. GPUCompiler.rm_trap!(mod) -- call this separately before this function
+1. rm_trap!(mod) -- call this separately before this function
 2. replace_unreachable! -- replace dead-end blocks with branches to exit
 3. replace_freeze! -- remove freeze instructions (no SPIR-V equivalent)
 4. strip_noreturn! -- prevent SimplifyCFG from reintroducing unreachable
