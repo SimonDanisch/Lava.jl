@@ -23,6 +23,11 @@ jobs:
       # HW-TLAS stress runs on Linux CI; here we just want to catch
       # Windows-specific path / DLL / GLFW regressions.
       LAVA_FAST: '1'
+      # Verbose Vulkan loader diagnostics — shows exactly which ICD JSONs the
+      # loader reads, whether VK_DRIVER_FILES is honoured, and why a driver DLL
+      # is rejected (missing dependency, arch mismatch, etc).  Dial back to
+      # `error,warn` once the driver is loading cleanly.
+      VK_LOADER_DEBUG: all
     steps:
       - uses: actions/checkout@v4
 
@@ -34,9 +39,28 @@ jobs:
           7z x mesa.7z -omesa
           $icd = (Resolve-Path "mesa\x64\lvp_icd.x86_64.json").Path
           $dir = (Resolve-Path "mesa\x64").Path
-          echo "VK_DRIVER_FILES=$icd" >> $env:GITHUB_ENV
-          echo "VK_ICD_FILENAMES=$icd" >> $env:GITHUB_ENV
-          echo "$dir" >> $env:GITHUB_PATH
+          Write-Host "ICD JSON : $icd"
+          Write-Host "ICD dir  : $dir"
+          Write-Host "--- ICD JSON content ---"
+          Get-Content $icd
+          Write-Host "--- vulkan_lvp.dll present? ---"
+          Test-Path "$dir\vulkan_lvp.dll"
+          # Write env vars with explicit UTF-8 (no BOM) — pwsh `>>` can emit a
+          # BOM that breaks GitHub's GITHUB_ENV parser, silently dropping the
+          # variable (which is the classic "loader falls back to registry" bug).
+          "VK_ICD_FILENAMES=$icd" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VK_DRIVER_FILES=$icd"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$dir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Verify Vulkan env propagated
+        shell: pwsh
+        run: |
+          Write-Host "VK_DRIVER_FILES  = $env:VK_DRIVER_FILES"
+          Write-Host "VK_ICD_FILENAMES = $env:VK_ICD_FILENAMES"
+          if (-not $env:VK_DRIVER_FILES) { Write-Error "VK_DRIVER_FILES not set in later step — GITHUB_ENV write failed" }
+          if (-not (Test-Path $env:VK_DRIVER_FILES)) { Write-Error "ICD JSON not found at VK_DRIVER_FILES" }
+          $mesaOnPath = ($env:PATH -split ';' | Select-String -Pattern 'mesa')
+          Write-Host "mesa on PATH     = $mesaOnPath"
 
       - uses: julia-actions/setup-julia@v2
         with:
