@@ -1,8 +1,9 @@
 # Lava.jl Master Test Runner
 #
-# 3-tier testing:
-#   Tier 1: Pattern checks on SPIR-V disassembly (no GPU needed)
-#   Tier 2: Golden file comparison (no GPU needed)
+# Tiered testing:
+#   Tier 1: Pattern checks on SPIR-V disassembly (no GPU needed) — semantic
+#           assertions via check/check_not/check_dag, robust across GPUCompiler
+#           and LLVM versions (unlike byte-exact golden files, which we dropped).
 #   Tier 3: GPU execution tests (requires Vulkan device)
 
 using Test
@@ -43,15 +44,6 @@ end
             endswith(f, ".jl") || continue
             @info "Running $(basename(f))..."
             include(f)
-        end
-    end
-
-    # ── Tier 2: Golden File Comparison ──
-    # Skipped in CI — SPIR-V IDs differ across platforms (LLVM CSE).
-    # Run locally with: LAVA_BLESS=1 julia --project test/runtests.jl
-    if get(ENV, "CI", "") != "true"
-        @testset "Tier 2: Golden Files" begin
-            include(joinpath(@__DIR__, "test_golden.jl"))
         end
     end
 
