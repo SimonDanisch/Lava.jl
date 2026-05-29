@@ -13,17 +13,22 @@ jobs:
   test-windows:
     name: Julia ${{ matrix.julia-version }} - Lavapipe (Windows)
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         julia-version: ['1']
-    # Windows lavapipe ships LLVM 20.1.8, newer than the Linux runner's
-    # 20.1.2 where the full Tier 4 GPUArrays suite segfaults at `indexing
-    # find`. Run the FULL suite here: if the segfault is an LLVM JIT bug fixed
-    # between 20.1.2 and 20.1.8, Windows gives us complete coverage (and tells
-    # us a Linux Mesa bump would fix it too); if it crashes here as well, it's
-    # purely the Azure CPU and we fall back to the fast subset.
+    env:
+      # Fast subset, same as Linux. We tried the full suite here hoping the
+      # newer Windows lavapipe (LLVM 20.1.8) would survive Tier 4 — it does
+      # NOT: it crashes at the exact same `indexing find` testset with
+      # EXCEPTION_ACCESS_VIOLATION inside vulkan_lvp.dll, identical to the
+      # Linux segfault on 20.1.2. So the Tier 4 crash is independent of LLVM
+      # version and OS — it's the lavapipe software rasterizer on the Azure CI
+      # CPU (both runners are Azure VMs). Not reproducible on real hardware
+      # (RADV passes 14748/1), local lavapipe, or a CI-exact container.
+      # Exhaustive Tier 4 correctness belongs on real-GPU runs.
+      LAVA_FAST: '1'
     steps:
       - uses: actions/checkout@v4
 
@@ -74,5 +79,5 @@ jobs:
       - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
 
-      - name: Run full test suite
-        run: julia --color=yes --project -e 'using Pkg; Pkg.test("Lava")'
+      - name: Run fast-mode tests
+        run: julia --color=yes --project -e 'using Pkg; Pkg.test("Lava"; test_args=["fast"])'
