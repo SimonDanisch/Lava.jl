@@ -13,16 +13,17 @@ jobs:
   test-windows:
     name: Julia ${{ matrix.julia-version }} - Lavapipe (Windows)
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         julia-version: ['1']
-    env:
-      # Run the ~2-3 min subset on Windows.  The full GPUArrays suite +
-      # HW-TLAS stress runs on Linux CI; here we just want to catch
-      # Windows-specific path / DLL / GLFW regressions.
-      LAVA_FAST: '1'
+    # Windows lavapipe ships LLVM 20.1.8, newer than the Linux runner's
+    # 20.1.2 where the full Tier 4 GPUArrays suite segfaults at `indexing
+    # find`. Run the FULL suite here: if the segfault is an LLVM JIT bug fixed
+    # between 20.1.2 and 20.1.8, Windows gives us complete coverage (and tells
+    # us a Linux Mesa bump would fix it too); if it crashes here as well, it's
+    # purely the Azure CPU and we fall back to the fast subset.
     steps:
       - uses: actions/checkout@v4
 
@@ -73,5 +74,5 @@ jobs:
       - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
 
-      - name: Run fast-mode tests
-        run: julia --color=yes --project -e 'using Pkg; Pkg.test("Lava"; test_args=["fast"])'
+      - name: Run full test suite
+        run: julia --color=yes --project -e 'using Pkg; Pkg.test("Lava")'
