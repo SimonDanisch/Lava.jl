@@ -57,9 +57,11 @@ Vulkan device.
 function disable_gpu_av()
     ENV["LAVA_VALIDATION"] = "0"
     ENV["LAVA_GPU_AV"]     = "0"
+    ENV["LAVA_SYNC_VAL"]   = "0"
+    ENV["LAVA_BEST"]       = "0"
     POOL_DISABLED[] = false
     vk_reset_device!()
-    @info "Lava: GPU-AV disabled" device=vk_context().device_name
+    @info "Lava: validation + GPU-AV disabled, pool re-enabled" device=vk_context().device_name
     return nothing
 end
 
@@ -141,5 +143,63 @@ function verify_gpu_av(; timeout::Float64=60.0)
     # The flush task may still be hung waiting on a fence the GPU never signals;
     # reset the device so subsequent code starts from a clean state.
     vk_reset_device!()
+    return true
+end
+
+"""
+    Lava.activate_all_debugging(; verify=true, pool_disabled=true)
+
+One call that turns on **every** validation facility Lava supports, in the
+correct configuration, and then *proves* the strongest one (GPU-AV) is
+actually catching errors on the current driver. Use this instead of poking
+the individual `LAVA_*` env vars / `enable_gpu_av` by hand — it removes the
+"I half-configured it and got a false-clean run" trap.
+
+Enables together, then resets the Vulkan device so they take effect:
+  * `VK_LAYER_KHRONOS_validation`  — core spec checks         (`LAVA_VALIDATION`)
+  * GPU-Assisted Validation        — shader OOB instrumentation (`LAVA_GPU_AV`)
+  * Synchronization validation     — races / missing barriers (`LAVA_SYNC_VAL`)
+  * Best-practices layer           — API-misuse warnings      (`LAVA_BEST`)
+  * Pool **disabled** (`pool_disabled=true`, the default here) — one
+    `VkBuffer` per `LavaArray` so GPU-AV sees *sub-pool* BDA out-of-bounds.
+    With the pool on, GPU-AV is blind to overruns that stay inside the shared
+    64 MiB block — i.e. exactly the bugs you reach for this function to find.
+
+`verify=true` (default) runs `verify_gpu_av()` after setup: a known
+out-of-bounds device write that the layer must report. This is the crucial
+guard — GPU-AV can *attach* (`gpu_assisted=true`) yet silently fail to
+instrument shaders on some driver/loader combos (observed on RADV / Mesa 26
+locally: the layer attaches but never fires, so the probe's OOB is not
+caught and **segfaults the process**). A segfault or thrown `LavaError` at
+the verify step is therefore a definitive "GPU-AV is non-functional on this
+driver" signal — do GPU-AV bug-hunting on a driver where this call returns
+cleanly. Pass `verify=false` to skip the probe (and keep the session alive)
+when you only want the non-instrumenting layers (core / sync / best).
+
+Expect 10-100× slowdown. Turn everything back off with `disable_gpu_av()`.
+
+Returns `true` if all layers activated and (when `verify=true`) GPU-AV was
+proven to fire; throws `LavaError` if a layer failed to attach.
+"""
+function activate_all_debugging(; verify::Bool=true, pool_disabled::Bool=true)
+    ENV["LAVA_VALIDATION"] = "1"
+    ENV["LAVA_GPU_AV"]     = "1"
+    ENV["LAVA_SYNC_VAL"]   = "1"
+    ENV["LAVA_BEST"]       = "1"
+    POOL_DISABLED[]        = pool_disabled
+    vk_reset_device!()
+    ctx = vk_context()
+    if !ctx.gpu_assisted
+        throw(LavaError("activate_all_debugging",
+            "validation instance created but gpu_assisted=false — GPU-AV did not attach",
+            "Check VK_EXT_validation_features support + VK_LAYER_KHRONOS_validation install on this driver/loader."))
+    end
+    @info "Lava: ALL debugging active" device=ctx.device_name validation=true gpu_av=true sync_val=true best_practices=true pool_disabled=pool_disabled
+    if verify
+        @info "Lava: proving GPU-AV actually fires (known-OOB probe; a segfault here means GPU-AV is non-functional on this driver)"
+        verify_gpu_av()
+    else
+        @warn "Lava: GPU-AV NOT verified (verify=false) — a clean run does not prove the layer is catching anything. Call verify_gpu_av() to confirm."
+    end
     return true
 end
