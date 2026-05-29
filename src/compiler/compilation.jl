@@ -187,6 +187,13 @@ end
 const SPIRV_OPT_ENABLED = Ref(true)  # enabled: cleans up StructurizeCFG's redundant phis
                                       # that RADV miscompiles for loops containing `continue`
 
+# Directory for the unconditional "last compiled kernel" debug dumps
+# (LLVM IR / SPIR-V / disasm).  Defaults to the OS temp dir — `/tmp` on Unix,
+# `%TEMP%` on Windows — so the writes are portable; hardcoded `/tmp/` crashed
+# on Windows where it doesn't exist.  Override with LAVA_DEBUG_DIR.
+lava_debug_dir() = get(ENV, "LAVA_DEBUG_DIR", tempdir())
+lava_debug_path(name::AbstractString) = joinpath(lava_debug_dir(), name)
+
 """
     dump_spirv_to_disk(spirv_bytes::Vector{UInt8}, post_pass_ir::AbstractString,
                        kernel_name::AbstractString;
@@ -382,8 +389,8 @@ function lava_compile_full(@nospecialize(f), @nospecialize(tt);
         spirv_bytes, source_map = emit_spirv_from_llvm(mod, wrapper_name, workgroup_size)
 
         # Validation
-        write("/tmp/lava_last.spv", spirv_bytes)
-        write("/tmp/lava_last.ll", post_pass_ir)
+        write(lava_debug_path("lava_last.spv"), spirv_bytes)
+        write(lava_debug_path("lava_last.ll"), post_pass_ir)
         dump_spirv_to_disk(spirv_bytes, post_pass_ir, wrapper_name; entry_name)
         if validate
             validate_spirv(spirv_bytes, post_pass_ir, source_map)
@@ -428,8 +435,8 @@ function lava_compile_gfx_full(@nospecialize(f), @nospecialize(tt);
 
         spirv_bytes, source_map = emit_spirv_from_llvm_gfx(mod, wrapper_name, stage; config=config)
 
-        write("/tmp/lava_last.spv", spirv_bytes)
-        write("/tmp/lava_last.ll", post_pass_ir)
+        write(lava_debug_path("lava_last.spv"), spirv_bytes)
+        write(lava_debug_path("lava_last.ll"), post_pass_ir)
         dump_spirv_to_disk(spirv_bytes, post_pass_ir, wrapper_name; entry_name)
         if validate
             validate_spirv(spirv_bytes, post_pass_ir, source_map)
@@ -475,8 +482,8 @@ function lava_compile_rt_full(@nospecialize(f), @nospecialize(tt);
         spirv_bytes, source_map = emit_spirv_from_llvm_rt(mod, wrapper_name, stage;
                                                 payload_type=payload_type)
 
-        write("/tmp/lava_last.spv", spirv_bytes)
-        write("/tmp/lava_last.ll", post_pass_ir)
+        write(lava_debug_path("lava_last.spv"), spirv_bytes)
+        write(lava_debug_path("lava_last.ll"), post_pass_ir)
         dump_spirv_to_disk(spirv_bytes, post_pass_ir, wrapper_name; entry_name)
         if validate
             validate_spirv(spirv_bytes, post_pass_ir, source_map)
@@ -739,13 +746,13 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
         run_llvm_passes!(mod, wrapper_fn; force_inline_all=true)
 
         ir = string(mod)
-        write("/tmp/lava_last_rt.ll", ir)
+        write(lava_debug_path("lava_last_rt.ll"), ir)
 
         # RT-specific SPIR-V emission
         spirv_bytes, source_map = emit_spirv_from_llvm_rt(mod, wrapper_name, stage;
                                                 payload_type=payload_type)
 
-        write("/tmp/lava_last.spv", spirv_bytes)
+        write(lava_debug_path("lava_last.spv"), spirv_bytes)
         dump_spirv_to_disk(spirv_bytes, ir, wrapper_name; entry_name)
 
         if validate
@@ -814,12 +821,12 @@ function lava_compile_gfx_shader(@nospecialize(f), @nospecialize(tt);
         run_llvm_passes!(mod, wrapper_fn; force_inline_all=true)
 
         ir = string(mod)
-        write("/tmp/lava_last_gfx_$(stage).ll", ir)
+        write(lava_debug_path("lava_last_gfx_$(stage).ll"), ir)
 
         # Graphics-specific SPIR-V emission
         spirv_bytes, source_map = emit_spirv_from_llvm_gfx(mod, wrapper_name, stage; config=config)
 
-        write("/tmp/lava_last_gfx_$(stage).spv", spirv_bytes)
+        write(lava_debug_path("lava_last_gfx_$(stage).spv"), spirv_bytes)
 
         if validate
             validate_spirv(spirv_bytes, ir, source_map)
@@ -843,7 +850,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
             LLVM.verify(mod)
         catch e
             ir = string(mod)
-            write("/tmp/lava_broken_$(label).ll", ir)
+            write(lava_debug_path("lava_broken_$(label).ll"), ir)
             error("LLVM IR verification failed after $label — dumped to /tmp/lava_broken_$(label).ll\n$(sprint(showerror, e))")
         end
     end
@@ -870,7 +877,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     verify_ir!("force_inline")
 
     if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
-        write("/tmp/lava_ir_1_postinline.ll", string(mod))
+        write(lava_debug_path("lava_ir_1_postinline.ll"), string(mod))
     end
 
     # ── Outline oversized functions ──
@@ -897,7 +904,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     LLVM.run!(LLVM.InstCombinePass(), mod)
 
     if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
-        write("/tmp/lava_ir_2_postsroa.ll", string(mod))
+        write(lava_debug_path("lava_ir_2_postsroa.ll"), string(mod))
     end
 
     # ── Fix inttoptr address spaces after SROA ──
@@ -966,18 +973,18 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # fixups the emitter would otherwise need.
     retype_uniform_typed_allocas!(mod, LLVM.datalayout(mod))
     if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
-        write("/tmp/lava_ir_2_post_retype.ll", string(mod))
+        write(lava_debug_path("lava_ir_2_post_retype.ll"), string(mod))
     end
     verify_ir!("retype_allocas")
 
     # ── Structured control flow ──
     # SPIR-V requires structured CF. Run the full structurize pipeline.
     if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
-        write("/tmp/lava_ir_3_pre_structurize.ll", string(mod))
+        write(lava_debug_path("lava_ir_3_pre_structurize.ll"), string(mod))
     end
     run_structurize_cfg_pipeline!(mod)
     if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
-        write("/tmp/lava_ir_4_post_structurize.ll", string(mod))
+        write(lava_debug_path("lava_ir_4_post_structurize.ll"), string(mod))
     end
     verify_ir!("structurize_cfg")
 
@@ -2165,7 +2172,7 @@ function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
                           source_map::Dict{UInt32, Tuple{String, Int}}=Dict{UInt32, Tuple{String, Int}}())
     spirv_val = SPIRV_Tools_jll.spirv_val()
     spirv_dis_cmd = SPIRV_Tools_jll.spirv_dis()
-    spv_path = "/tmp/lava_last.spv"
+    spv_path = lava_debug_path("lava_last.spv")
 
     # Write SPIR-V binary so spirv-val can read it
     write(spv_path, spirv_bytes)
@@ -2188,7 +2195,7 @@ function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
         ""
     end
     if !isempty(dis)
-        write("/tmp/lava_last.dis", dis)
+        write(lava_debug_path("lava_last.dis"), dis)
     end
 
     io = IOBuffer()
