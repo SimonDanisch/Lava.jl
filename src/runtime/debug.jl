@@ -97,51 +97,66 @@ function verify_gpu_av(; timeout::Float64=60.0)
             out[bad_idx] = Int32(0xBAD)
         end
     end
+    # Offset a few KB past a (pool-disabled) dedicated 16-byte buffer. GPU-AV
+    # tracks per-buffer address ranges and flags accesses *just past* a known
+    # buffer; a wild multi-hundred-GB offset belongs to no tracked buffer and
+    # is NOT instrumented (an earlier 1e11 offset is why this never fired).
+    bad_idx = 1000
     k = _lava_gpuav_check_kernel!(LavaBackend(), 1)
-    Base.invokelatest(k, arr, 100_000_000_000; ndrange=4)
-    # Submit on main thread. The validation callback fires asynchronously when
-    # the driver processes the submission — but that requires the host to be
-    # waiting on the semaphore (to pump the driver event loop). Lava's flush!
-    # does an infinite wait (command.jl:785), and on AMDVLK Windows the
-    # semaphore never signals after a GPU-AV-caught fault (vkWaitSemaphores
-    # ignores its finite timeout). So spawn the wait on a worker thread — it
-    # will hang there indefinitely, but its presence is enough to pump the
-    # driver, which fires our callback that pushes into VALIDATION_MESSAGES.
-    # Main thread polls the buffer; on success we call vk_reset_device! to
-    # tear down the hung worker.
-    bq = vk_context().default_bq
-    submit!(bq)
-    if !isempty(bq.in_flight)
-        target = maximum(b.signal_value for b in bq.in_flight)
-        Threads.@spawn try
-            Vulkan.wait_semaphores(bq.device,
-                Vulkan.SemaphoreWaitInfo([bq.timeline_sem], [target]),
-                typemax(UInt64))
-        catch
-        end
+    Base.invokelatest(k, arr, bad_idx; ndrange=4)
+    # GPU-AV reports the violation only once the dispatch is flushed AND the
+    # host waits for completion (so the driver processes the instrumented
+    # readback). A normal `KA.synchronize` does exactly that — submit + wait —
+    # and Lava surfaces any validation error captured during the wait by
+    # throwing from `vk_flush!`. So drive the readback with a real synchronize
+    # and inspect both the thrown error and VALIDATION_MESSAGES.
+    #
+    # (A previous version spawned a *detached* wait thread to dodge a flush
+    # hang seen on AMDVLK Windows after a GPU-AV fault. That detached wait
+    # never pumped the readback on RADV / lavapipe, so verify always saw 0
+    # messages and reported a false "GPU-AV is broken" — when in fact GPU-AV
+    # works fine and it was this plumbing that was wrong. The synchronize path
+    # below is verified on RADV and lavapipe; if AMDVLK Windows regresses with
+    # a hang, special-case it there rather than breaking the common path.)
+    matches(s) = occursin("Out of bounds access", s) || occursin("device address", s)
+    # Drive the flush+wait that makes GPU-AV surface its readback. After a
+    # GPU-AV-caught fault the GPU may never signal the timeline semaphore, so a
+    # direct `KA.synchronize` can block forever (observed: 30+ min on RADV).
+    # Run it on a detached task and poll, with a hard timeout, for the OOB
+    # message arriving via EITHER the synchronize exception OR the validation
+    # callback (VALIDATION_MESSAGES). Whichever fires first wins; a hung task
+    # is abandoned and cleaned up by the vk_reset_device! below.
+    task_err = Ref{String}("")
+    t = Threads.@spawn try
+        KA.synchronize(LavaBackend())
+    catch e
+        task_err[] = sprint(showerror, e)
     end
     caught_msg = ""
     deadline = time() + timeout
     while time() < deadline
-        for m in VALIDATION_MESSAGES
-            if occursin("Out of bounds access", m) || occursin("device address", m)
-                caught_msg = m
-                break
+        matches(task_err[]) && (caught_msg = task_err[])
+        if isempty(caught_msg)
+            for m in VALIDATION_MESSAGES
+                matches(m) && (caught_msg = m; break)
             end
         end
         isempty(caught_msg) || break
+        istaskdone(t) && isempty(caught_msg) && break  # synchronize returned w/o the OOB
         sleep(0.1)
     end
     if isempty(caught_msg)
         n = length(VALIDATION_MESSAGES)
+        vk_reset_device!()   # clear any half-flushed batch / abandon the hung task
         throw(LavaError("verify_gpu_av",
-            "GPU-AV did not fire on a known out-of-bounds write within $(timeout)s " *
-            "($(n) messages captured, none matching 'Out of bounds access').",
-            "Layer is silently broken: check Vulkan SDK install + VK_LAYER_KHRONOS_validation availability."))
+            "GPU-AV did not report a known out-of-bounds write within $(timeout)s " *
+            "($(n) validation messages captured, none matching 'Out of bounds access').",
+            "GPU-AV is not instrumenting on this driver/layer — check VK_EXT_validation_features " *
+            "support and that LAVA_GPU_AV was set before device creation."))
     end
     @info "Lava: GPU-AV verified working" sample=first(caught_msg, 240)
-    # The flush task may still be hung waiting on a fence the GPU never signals;
-    # reset the device so subsequent code starts from a clean state.
+    # The OOB left the batch queue in an errored state; reset so subsequent
+    # code starts clean.
     vk_reset_device!()
     return true
 end
