@@ -18,17 +18,6 @@ jobs:
       fail-fast: false
       matrix:
         julia-version: ['1']
-    env:
-      # Fast subset, same as Linux. We tried the full suite here hoping the
-      # newer Windows lavapipe (LLVM 20.1.8) would survive Tier 4 — it does
-      # NOT: it crashes at the exact same `indexing find` testset with
-      # EXCEPTION_ACCESS_VIOLATION inside vulkan_lvp.dll, identical to the
-      # Linux segfault on 20.1.2. So the Tier 4 crash is independent of LLVM
-      # version and OS — it's the lavapipe software rasterizer on the Azure CI
-      # CPU (both runners are Azure VMs). Not reproducible on real hardware
-      # (RADV passes 14748/1), local lavapipe, or a CI-exact container.
-      # Exhaustive Tier 4 correctness belongs on real-GPU runs.
-      LAVA_FAST: '1'
     steps:
       - uses: actions/checkout@v4
 
@@ -79,5 +68,9 @@ jobs:
       - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
 
-      - name: Run fast-mode tests
-        run: julia --color=yes --project -e 'using Pkg; Pkg.test("Lava"; test_args=["fast"])'
+      - name: Run CI-mode tests
+        # CI mode = fast subset + Tier 4 GPUArrays. The `indexing find` group
+        # crashes the process on Azure lavapipe (LLVM 20.1.8 here, same as the
+        # Linux runner) — skipped on llvmpipe via test_gpuarrays.jl's
+        # LAVAPIPE_CRASH_SKIP; everything else runs. See ci.yml for details.
+        run: julia --color=yes --project -e 'using Pkg; Pkg.test("Lava"; test_args=["ci"])'

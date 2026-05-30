@@ -25,10 +25,19 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
 #   Tier 1 SPIR-V emission, Tier 3 GPU execution, Tier 3c atomics & dispatch,
 #   Tier 3g graphics pipeline, Tier 3h kernel cache, Phase-M alloc/free MWE.
 # Skips the heavy ones: Tier 4 (GPUArrays, ~12 min) and the stress / per-vendor
-# suites.  Full runs are still the default in CI and locally.
-const FAST_MODE = "fast" in ARGS || get(ENV, "LAVA_FAST", "0") == "1"
-const FULL_MODE = !FAST_MODE
+# suites.  Full runs are still the default locally.
+#
+# ── CI mode (`ci`) ──
+# The fast subset PLUS the full Tier 4 GPUArrays correctness suite (~15-20 min).
+# This is what the lavapipe CI runs: the GPUArrays suite is the bulk of real
+# correctness coverage, and it runs on lavapipe with the few process-crashing
+# groups skipped (see test_gpuarrays.jl `LAVAPIPE_CRASH_SKIP`). The RADV-only /
+# per-vendor stress tiers stay FULL-only. Trigger with test_args=["ci"] or LAVA_CI=1.
+const CI_MODE   = "ci"   in ARGS || get(ENV, "LAVA_CI",   "0") == "1"
+const FAST_MODE = ("fast" in ARGS || get(ENV, "LAVA_FAST", "0") == "1") && !CI_MODE
+const FULL_MODE = !FAST_MODE && !CI_MODE
 FAST_MODE && @info "Lava: FAST mode — running essential tiers only (~2-3 min)."
+CI_MODE   && @info "Lava: CI mode — fast subset + Tier 4 GPUArrays (~15-20 min)."
 
 # Print driver info for test logs (helps distinguish RADV vs lavapipe vs others)
 let ctx = Lava.vk_context()
@@ -151,8 +160,10 @@ end
         include(joinpath(@__DIR__, "test_graphics_pipeline.jl"))
     end
 
-    # ── Tier 4: GPUArrays TestSuite (full only — ~12 min on its own) ──
-    if FULL_MODE
+    # ── Tier 4: GPUArrays TestSuite (~12 min) — full suite AND CI mode ──
+    # The bulk of real correctness coverage. Runs on lavapipe CI with the few
+    # process-crashing groups skipped (test_gpuarrays.jl LAVAPIPE_CRASH_SKIP).
+    if FULL_MODE || CI_MODE
         @testset "Tier 4: GPUArrays TestSuite" begin
             include(joinpath(@__DIR__, "test_gpuarrays.jl"))
         end

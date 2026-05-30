@@ -47,7 +47,7 @@ function device_alive()
     end
 end
 
-# Skip tests that need features we don't support
+# Skip tests that need features we don't support (all drivers).
 const SKIP = Set([
     "sparse",       # needs sparse array types
     "ext/jld2",     # needs JLD2 extension
@@ -56,9 +56,27 @@ const SKIP = Set([
     "statistics",   # mean(sin, A; dims=2) precision mismatch on lavapipe — TODO fix
 ])
 
+# Groups that *crash the whole process* (SIGSEGV / EXCEPTION_ACCESS_VIOLATION in
+# the JIT) on the lavapipe software rasterizer — a try/catch cannot recover a
+# segfault, so they must be skipped entirely on llvmpipe. They pass on real
+# hardware (RADV runs them as part of the full suite), so they are skipped ONLY
+# when the active device is llvmpipe.
+const LAVAPIPE_CRASH_SKIP = Set([
+    "indexing find",   # EXCEPTION_ACCESS_VIOLATION in vulkan_lvp.dll (Azure runners)
+])
+
+function effective_skip()
+    skip = copy(SKIP)
+    if occursin("llvmpipe", lowercase(Lava.vk_context().device_name))
+        union!(skip, LAVAPIPE_CRASH_SKIP)
+    end
+    return skip
+end
+
 function run_gpuarrays_tests()
+    skip = effective_skip()
     test_names = sort(collect(keys(TestSuite.tests)))
-    filter!(n -> n ∉ SKIP, test_names)
+    filter!(n -> n ∉ skip, test_names)
 
     all_results = Vector{Tuple{String,Int,Int,Int}}()
     device_dead = false
@@ -112,7 +130,7 @@ function run_gpuarrays_tests()
     println("  Total: $total_p passed, $total_f failed, $total_e errors")
     n_groups_pass = count(x -> x[3] + x[4] == 0, all_results)
     println("  $n_groups_pass/$(length(all_results)) test groups fully passing")
-    println("  Skipped: $(join(sort(collect(SKIP)), ", "))")
+    println("  Skipped: $(join(sort(collect(effective_skip())), ", "))")
     return all_results
 end
 
