@@ -257,16 +257,22 @@ end
 
 # Float64: rescale by maxabs to avoid overflow.
 #
-# We deliberately DIVIDE by `maxabs` rather than pre-computing and multiplying
-# by `inv_maxabs = 1/maxabs`.  When `maxabs` is near `floatmax(Float64)`,
-# `1/maxabs` is a subnormal Float64 (~1.1e-308, below 2.2e-308 normal floor),
-# and SPIR-V implementations that default to flush-denormals-to-zero (lavapipe
-# and at least some Mesa builds on Intel/Arc) silently turn it into 0 inside
-# the kernel.  Then `abs(x) * 0 = 0`, `sum = 0`, and the rescaled norm collapses
-# to 0 — the exact failure observed in `linalg/norm` 2-norm with Float64 on
-# lavapipe.  Division avoids the subnormal intermediate.
+# Subtlety: writing `abs(x) / maxabs` in the source is NOT enough. GPU drivers
+# (and LLVM's `arcp` fast-math) lower a Float64 `x / m` to `x * (1/m)`, so when
+# `maxabs` is near `floatmax(Float64)` the reciprocal `1/maxabs` is a subnormal
+# (~1.1e-308, below the 2.2e-308 normal floor). Under flush-denormals-to-zero —
+# the default on lavapipe AND RDNA3 (RADV) — that reciprocal becomes 0, then
+# `abs(x) * 0 = 0`, `sum = 0`, and the rescaled norm collapses to 0. (Verified:
+# `sum(x -> x/m, v)` returns exactly 0.0 iff `1/m` is subnormal, 2.0 otherwise.)
+#
+# Fix: divide by `sqrt(maxabs)` TWICE instead of by `maxabs` once.
+# `(x / √m) / √m == x / m`, but `1/√m` is always normal (even for m == floatmax,
+# `1/√floatmax ≈ 7.5e-155`), so no subnormal reciprocal is ever formed. This is
+# correct for the overflow case (maxabs near floatmax), the underflow case
+# (maxabs near floatmin), and normal magnitudes alike.
 function lava_norm_p2_rescale(v::LavaArray{T}, maxabs::Float64) where T
-    s = sum(x -> (abs(x) / maxabs)^2, v; init=Float64(0))
+    sm = sqrt(maxabs)
+    s = sum(x -> ((abs(x) / sm) / sm)^2, v; init=Float64(0))
     return typeof(float(LinearAlgebra.norm(zero(T))))(maxabs * sqrt(s))
 end
 

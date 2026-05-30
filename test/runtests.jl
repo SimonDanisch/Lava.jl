@@ -57,6 +57,11 @@ end
         include(joinpath(@__DIR__, "test_barrier_skip.jl"))
     end
 
+    # ── Tier 3a2: norm FTZ rescaling regression (GPU; Float64/ComplexF64) ──
+    @testset "Tier 3a2: norm FTZ rescaling" begin
+        include(joinpath(@__DIR__, "test_norm_overflow.jl"))
+    end
+
     # ── Tier 3: GPU Execution ──
     @testset "Tier 3: GPU Execution" begin
         include(joinpath(@__DIR__, "test_handwritten_spirv.jl"))
