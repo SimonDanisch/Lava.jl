@@ -67,6 +67,11 @@ end
         include(joinpath(@__DIR__, "test_shared_memory_stress.jl"))
     end
 
+    # ── Tier 3a4: OpSelect-of-Workgroup-pointers type-dedup regression (GPU) ──
+    @testset "Tier 3a4: OpSelect Workgroup pointer dedup" begin
+        include(joinpath(@__DIR__, "test_select_width_mismatch.jl"))
+    end
+
     # ── Tier 3: GPU Execution ──
     @testset "Tier 3: GPU Execution" begin
         include(joinpath(@__DIR__, "test_handwritten_spirv.jl"))

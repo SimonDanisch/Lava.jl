@@ -1542,8 +1542,17 @@ function map_pointer_type_for_value!(ctx::SPIRVTypeContext, ptr_value::LLVM.Valu
         end
     end
 
-    # Map pointee type and create pointer type
-    pointee_spirv = map_type!(ctx, pointee_llvm)
+    # Map pointee type and create pointer type. Workgroup pointees MUST go through
+    # the workgroup type path (matching the store/access-chain paths) so an
+    # aggregate pointee shares the SAME layout-decoration-free, deduplicated
+    # type id as the shared-memory global. Using `map_type!` here instead minted a
+    # second, structurally-identical-but-distinct `[N x T]` id, so a pointer
+    # bitcast/select against the global (e.g. `lid==1 ? a[lid] : a[lid-1]`, which
+    # LLVM lowers to an OpSelect of Workgroup pointers) tripped
+    # "Expected both objects to be of Result Type: Select".
+    pointee_spirv = sc == SC.Workgroup ?
+        map_workgroup_type!(ctx, pointee_llvm) :
+        map_type!(ctx, pointee_llvm)
     return map_pointer_type!(ctx, pointee_spirv, sc)
 end
 
