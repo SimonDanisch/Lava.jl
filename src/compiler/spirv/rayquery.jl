@@ -74,13 +74,38 @@ function emit_compute_tlas_descriptor!(state::SPIRVEmitterState)
     state.rt_tlas_var_id = var_id
     push!(state.entry_interface_ids, var_id)
 
-    # Eagerly allocate the per-function rayQuery OpVariable so it lands in
-    # the entry block preamble regardless of whether the first lava_ray_query_init
-    # is reached through a conditional path. Without this the SPIR-V optimizer
-    # can sink the OpVariable out of the entry block, causing validation failure.
-    get_or_create_ray_query_var!(state)
+    # Note: the per-function rayQuery OpVariable is allocated by
+    # prescan_function_for_rayquery! at the top of every emit_function!,
+    # so it lands in entry_function_locals of whichever function actually uses it
+    # (entry kernel or a @noinline helper).
 
     return var_id
+end
+
+"""
+Pre-scan a function's body for ray-query intrinsic calls. If any are present,
+eagerly allocates the per-function rayQuery OpVariable so it lands in the
+function's preamble (`state.entry_function_locals`) BEFORE any block emits. Without
+this, the first lazy allocation happens deep inside a non-first block and
+the OpVariable would be referenced before its definition.
+
+Safe to call on every function; no-op if no ray queries are used. Also asserts
+that no parameter has type OpTypeRayQueryKHR — ray queries must be allocated
+inside the function that uses them per SPIR-V spec.
+"""
+function prescan_function_for_rayquery!(state::SPIRVEmitterState, fn::LLVM.Function)
+    isempty(LLVM.blocks(fn)) && return nothing
+    for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+        inst isa LLVM.CallInst || continue
+        callee = LLVM.called_operand(inst)
+        callee isa LLVM.Function || continue
+        name = LLVM.name(callee)
+        if startswith(name, "lava_ray_query_")
+            get_or_create_ray_query_var!(state)
+            return nothing
+        end
+    end
+    return nothing
 end
 
 """

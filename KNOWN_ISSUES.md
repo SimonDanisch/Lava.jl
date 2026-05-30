@@ -89,3 +89,42 @@ remains unconfirmed.
 The unaligned BDA access bug has been fixed. The RT crash after many SW dispatches followed
 by HW RT may still occur on RADV. If it does, it is a driver bug - all known shader-level
 issues have been resolved.
+
+## False-positive `Location` validation warning on RT pipelines
+
+**Status**: Known false positive in the Vulkan validation layers / `spirv-val`.
+
+### Symptom
+
+Every time an RT pipeline is created, the validation layer (or `spirv-val` invoked
+by it during pipeline creation) emits two warnings of the form:
+
+```
+SPIR-V offset 540: SPIR-V WARNING:
+    Location must be on input, output, uniform, sampler or image variable
+    540 bytes into the SPIR-V binary
+```
+
+The two offsets shown correspond to the `OpDecorate ... Location 0` decorations
+that Lava emits on the `RayPayloadKHR` and `IncomingRayPayloadKHR` variables.
+
+### Why it's a false positive
+
+`Location` is a legitimate decoration on RT-pipeline storage classes per the
+SPIR-V / Vulkan ray-tracing spec:
+
+> `OpDecorate` of `Location` is valid on `OpVariable` declared with the
+> `RayPayloadKHR`, `IncomingRayPayloadKHR`, `CallableDataKHR`,
+> `IncomingCallableDataKHR`, or `HitAttributeKHR` storage class.
+
+The validator's allow-list pre-dates the KHR ray-tracing extensions and still
+restricts `Location` to "input, output, uniform, sampler, or image variable".
+Newer `SPIRV-Tools` / validation-layer releases should know about the RT
+storage classes; the warning is harmless and does not block pipeline
+creation.
+
+### Workaround / future fix
+
+None needed for correctness. If the noise becomes a problem we can filter the
+exact message text in `debug_callback` in `runtime/device.jl`. Re-evaluate
+after the next `SPIRV_Tools_jll` / Vulkan SDK bump.

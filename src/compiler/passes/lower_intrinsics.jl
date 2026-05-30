@@ -10,12 +10,41 @@
 # - `llvm.assume` calls (can cause validation failures when misplaced near merge blocks)
 #
 # Pass pipeline order (assembled in compilation.jl):
-#   GPUCompiler.rm_trap! -> replace_unreachable! -> replace_freeze!
+#   rm_trap! -> replace_unreachable! -> replace_freeze!
 #   -> strip_noreturn! -> strip_assume!
 #   (then SimplifyCFG -> structurize_cfg pipeline)
 
 """
-    replace_unreachable!(mod::LLVM.Module)
+    rm_trap!(mod::LLVM.Module)
+
+Remove `llvm.trap` intrinsic calls (and the declaration) from the module.
+
+SPIR-V has no `trap` and no way to abort a compute kernel, so the trap calls
+GPUCompiler emits on error paths (via `lower_throw!`) must be stripped before
+the SPIR-V emitter runs.
+
+This was historically `GPUCompiler.rm_trap!`, an internal helper. It was
+removed for good in GPUCompiler 1.13.3 — deliberately unified into
+`lower_unreachable_control_flow!`, which GPUCompiler now runs inside its
+SPIR-V `finish_ir!`. Lava uses its own emitter pipeline (it reads the LLVM
+module after passes; GPUCompiler's `finish_ir!` never runs here), so the
+trap-stripping is ours to do. Vendored permanently — `rm_trap!` is not
+coming back, and we shouldn't depend on a GPUCompiler internal regardless.
+"""
+function rm_trap!(mod::LLVM.Module)
+    fns = LLVM.functions(mod)
+    haskey(fns, "llvm.trap") || return mod
+    trap = fns["llvm.trap"]
+    for use in LLVM.uses(trap)
+        val = LLVM.user(use)
+        val isa LLVM.CallInst && LLVM.erase!(val)
+    end
+    LLVM.erase!(trap)
+    return mod
+end
+
+"""
+    replace_unreachable!(mod::LLVM.Module, entry::Union{LLVM.Function,Nothing}=nothing)
 
 Replace `unreachable` terminators with branches to a unified return block.
 
@@ -28,8 +57,32 @@ unified return block.
 For void functions, the return block contains `ret void`.
 For value-returning functions, a PHI node merges the return values from all
 predecessors (with `undef` for formerly-unreachable paths).
+
+# Kernel vs. helper (why `entry` matters)
+
+Lowering an `unreachable` to a `ret` is only *safe* in a kernel/entry function:
+there the throw path becomes an early thread-exit, which is the best a GPU can
+do (it cannot abort). In a **non-entry helper** the same lowering makes the
+function *return* — and for a value-returning helper it returns `undef` (see
+the phi patching below). The caller then resumes with that garbage instead of
+the program aborting; for a pointer/index-returning helper that garbage is then
+dereferenced → wild access → crash. This is exactly the miscompile GPUCompiler's
+own `lower_unreachable_control_flow!` avoids by only lowering inside kernels and
+warning when a throwing helper could not be inlined.
+
+When `entry` is supplied, this pass `@warn`s for every *non-entry* function in
+which it lowers an `unreachable`, so a surviving throwing helper is loud rather
+than silent. It still lowers it (the SPIR-V emitter cannot represent
+`unreachable` at all, and a non-inlined helper has no way to exit the thread),
+but the warning flags that the throw path now returns `undef`.
+
+Note (GPUCompiler 1.13.x): in practice GPUCompiler already lowers all
+throws/`unreachable` upstream, so this pass is a no-op on the normal compile
+path — it is kept (and hardened) as vendored defensive code for the day a
+GPUCompiler version stops doing so. It is exercised directly by
+`test/test_replace_unreachable.jl`.
 """
-function replace_unreachable!(mod::LLVM.Module)
+function replace_unreachable!(mod::LLVM.Module, entry::Union{LLVM.Function,Nothing}=nothing)
     for f in LLVM.functions(mod)
         isempty(LLVM.blocks(f)) && continue
 
@@ -45,6 +98,22 @@ function replace_unreachable!(mod::LLVM.Module)
             end
         end
         isempty(unreachables) && continue
+
+        # Surviving throwing helper: lowering its `unreachable` makes it return
+        # `undef` and the caller resume with garbage (a pointer/index return is
+        # then dereferenced → wild access). Lower it anyway (the emitter has no
+        # `unreachable`), but make it loud.
+        if entry !== nothing && f !== entry
+            rt = LLVM.return_type(LLVM.function_type(f))
+            ptr_note = rt isa LLVM.PointerType ?
+                " WARNING: helper returns a POINTER — the undef return is liable to be dereferenced." : ""
+            msg = "replace_unreachable!: lowering `unreachable` in non-entry helper " *
+                  "`$(LLVM.name(f))` (returns $(rt)). Its throw path will return undef and " *
+                  "the caller will resume with that value instead of aborting. This is safe " *
+                  "only if the throw path is never taken; inline the helper into the kernel " *
+                  "to make it an early exit." * ptr_note
+            @warn msg maxlog=8
+        end
 
         # If no exit block exists, create one with `ret void` (or `ret null`)
         if isempty(exit_blocks)
@@ -196,6 +265,70 @@ function strip_assume!(mod::LLVM.Module)
 end
 
 """
+    function_contains_barrier(f, barrier_fn_name, memo) -> Bool
+
+Whether `f` reaches the workgroup barrier intrinsic, directly or through a call
+to another function that does (transitively, memoized; cycle-safe).
+
+On the no-inline path each `@synchronize` survives as a tiny wrapper function
+(`call @llvm.spv...barrier; ret void`) instead of an inlined intrinsic call, so a
+block that *calls such a wrapper* still executes a barrier. `fix_barrier_skipping_paths!`
+must look through these calls or it sees zero barriers and does nothing — which is
+exactly how a no-inline kernel with an error path deadlocks on lavapipe (and drops
+the dead invocation's writes on real hardware).
+"""
+function function_contains_barrier(f::LLVM.Function, barrier_fn_name::AbstractString,
+                                   memo::Dict{LLVM.Function,Bool})
+    haskey(memo, f) && return memo[f]
+    isempty(LLVM.blocks(f)) && (memo[f] = false; return false)
+    memo[f] = false  # break recursion cycles: treat as non-barrier while descending
+    result = false
+    for bb in LLVM.blocks(f), inst in LLVM.instructions(bb)
+        inst isa LLVM.CallInst || continue
+        callee = LLVM.called_operand(inst)
+        callee isa LLVM.Function || continue
+        if LLVM.name(callee) == barrier_fn_name ||
+           (callee !== f && function_contains_barrier(callee, barrier_fn_name, memo))
+            result = true
+            break
+        end
+    end
+    memo[f] = result
+    return result
+end
+
+"""
+    block_reaches(start, target) -> Bool
+
+True if `target` is reachable from `start` by following successor edges.
+
+Used to refuse a barrier-skip redirect that would create a cycle. A genuine
+error/exception path branches to `return` and never flows back, so the barrier
+continuation it should join is NOT able to reach it. A *loop exit* edge looks
+identical to the local pattern (branch toward return; sibling reaches a barrier
+inside the loop body), but redirecting it into the loop body closes a cycle and
+destroys the loop's structure (the loop loses its exit → `OpLoopMerge` ends up
+with Merge Block == Continue Target → invalid SPIR-V). Refusing the redirect
+when `other_target` can already reach `bb` keeps loop-with-barrier kernels
+(tree reductions, scans, bitonic sort, iterative stencils) valid.
+"""
+function block_reaches(start::LLVM.BasicBlock, target::LLVM.BasicBlock)
+    start === target && return true
+    visited = Set{LLVM.BasicBlock}()
+    queue = LLVM.BasicBlock[start]
+    while !isempty(queue)
+        bb = popfirst!(queue)
+        bb in visited && continue
+        push!(visited, bb)
+        bb === target && return true
+        for succ in LLVM.successors(LLVM.terminator(bb))
+            succ in visited || push!(queue, succ)
+        end
+    end
+    return false
+end
+
+"""
     fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
 
 After inlining and optimization, detect error paths (from `replace_unreachable!`)
@@ -211,19 +344,26 @@ implementations, undefined on GPU hardware).
 its predecessor's alternative path leads to a barrier. If so, redirect the block
 to the barrier-containing path. This makes dead invocations participate in all
 remaining barriers before returning.
+
+A "barrier block" is one that calls the barrier intrinsic directly *or* calls a
+function that (transitively) contains a barrier — the latter is the no-inline case
+where each `@synchronize` is its own wrapper function (see `function_contains_barrier`).
 """
 function fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
     isempty(LLVM.blocks(entry_fn)) && return false
 
-    # 1. Find all blocks containing barrier calls
+    # 1. Find all blocks containing barrier calls (direct intrinsic or a call to
+    #    a wrapper function that contains one — the no-inline `@synchronize` case).
     barrier_fn_name = "llvm.spv.group.memory.barrier.with.group.sync"
     barrier_blocks = Set{LLVM.BasicBlock}()
+    barrier_memo = Dict{LLVM.Function,Bool}()
     for bb in LLVM.blocks(entry_fn), inst in LLVM.instructions(bb)
-        if inst isa LLVM.CallInst
-            callee = LLVM.called_operand(inst)
-            if callee isa LLVM.Function && LLVM.name(callee) == barrier_fn_name
-                push!(barrier_blocks, bb)
-            end
+        inst isa LLVM.CallInst || continue
+        callee = LLVM.called_operand(inst)
+        callee isa LLVM.Function || continue
+        if LLVM.name(callee) == barrier_fn_name ||
+           function_contains_barrier(callee, barrier_fn_name, barrier_memo)
+            push!(barrier_blocks, bb)
         end
     end
     isempty(barrier_blocks) && return false
@@ -266,8 +406,12 @@ function fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
         # Find the "other" target (the non-error path)
         other_target = pred_succs[1] == bb ? pred_succs[2] : pred_succs[1]
 
-        # Check if the other path leads to a barrier (directly or transitively)
-        if path_reaches_barrier(other_target, barrier_blocks, return_blocks)
+        # Redirect only if the other path leads to a barrier AND doing so won't
+        # create a cycle. If `other_target` can already reach `bb`, then `bb` is a
+        # loop exit (not an error path) and rerouting it into the barrier-bearing
+        # loop body would strip the loop of its exit — see `block_reaches`.
+        if path_reaches_barrier(other_target, barrier_blocks, return_blocks) &&
+           !block_reaches(other_target, bb)
             # Redirect this block to the barrier-containing path
             LLVM.@dispose builder = LLVM.IRBuilder() begin
                 LLVM.position!(builder, term)
@@ -377,7 +521,7 @@ end
 Run the full CFG cleanup pipeline. Must be called BEFORE the structurize_cfg pipeline.
 
 Order:
-1. GPUCompiler.rm_trap!(mod) -- call this separately before this function
+1. rm_trap!(mod) -- call this separately before this function
 2. replace_unreachable! -- replace dead-end blocks with branches to exit
 3. replace_freeze! -- remove freeze instructions (no SPIR-V equivalent)
 4. strip_noreturn! -- prevent SimplifyCFG from reintroducing unreachable

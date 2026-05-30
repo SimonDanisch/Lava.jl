@@ -153,7 +153,8 @@ function create_rt_pipeline(ctx::VkContext,
         Int32(-1);  # base_pipeline_index
     )
 
-    pipelines, _ = @vk_checked "vkCreateRayTracingPipelinesKHR" Vulkan.create_ray_tracing_pipelines_khr(dev, [rt_ci])
+    pipelines, _ = @vk_checked "vkCreateRayTracingPipelinesKHR" Vulkan.create_ray_tracing_pipelines_khr(
+        dev, [rt_ci]; pipeline_cache=ctx.pipeline_cache)
     pipeline = pipelines[1]
 
     # Build SBT (still 3 groups — any-hit is part of the hit group, not a separate group)

@@ -25,19 +25,16 @@ const HW_HITS_BUF = Lava.LavaArray(fill(Raycore.RTHitResult(0, 0, 0, 0, 0, 0, 0,
 
 """Unit sphere centred at origin; `n` = tessellation count."""
 function sphere_mesh(n::Int)
-    GeometryBasics.normal_mesh(Tesselation(Sphere(Point3f(0), 1f0), n))
+    GeometryBasics.normal_mesh(Tessellation(Sphere(Point3f(0), 1f0), n))
 end
 
 """Ray straight down the +z axis from z=5. For a unit sphere translated by
 `offset_z`, the closest hit is at t = 4 - offset_z."""
 expected_t(offset_z::Real) = Float32(5) - Float32(offset_z) - Float32(1)
 
-translation(dx, dy, dz) = SMatrix{4,4,Float32,16}(
-    1, 0, 0, 0,
-    0, 1, 0, 0,
-    0, 0, 1, 0,
-    dx, dy, dz, 1,
-)
+# Shared HW-TLAS helpers — see test/hwtlas_helpers.jl (provides `translation`).
+isdefined(@__MODULE__, :translation) ||
+    include(joinpath(@__DIR__, "hwtlas_helpers.jl"))
 
 """Trace one ray down the +z axis via HW RT and return (hit, t) on CPU."""
 function hw_trace_one(hwtlas)

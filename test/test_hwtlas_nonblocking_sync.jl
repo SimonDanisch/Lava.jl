@@ -43,7 +43,7 @@ end
 @testset "Lava.HWTLAS — sync! CPU time is bounded on idle queue" begin
     backend = Lava.LavaBackend()
     hwtlas = Lava.HWTLAS(backend)
-    mesh = GeometryBasics.normal_mesh(Tesselation(Sphere(Point3f(0), 1f0), 128))
+    mesh = GeometryBasics.normal_mesh(Tessellation(Sphere(Point3f(0), 1f0), 128))
     h = push!(hwtlas, mesh, SMatrix{4,4,Float32}(I); instance_id=UInt32(1))
     Raycore.sync!(hwtlas)
 
@@ -53,7 +53,7 @@ end
 
     # Mutate (delete + re-push a slightly displaced mesh) and time sync!.
     Raycore.delete!(hwtlas, h)
-    mesh2 = GeometryBasics.normal_mesh(Tesselation(Sphere(Point3f(0,0,0.1f0), 1f0), 128))
+    mesh2 = GeometryBasics.normal_mesh(Tessellation(Sphere(Point3f(0,0,0.1f0), 1f0), 128))
     push!(hwtlas, mesh2, SMatrix{4,4,Float32}(I); instance_id=UInt32(2))
 
     t_sync = @elapsed Raycore.sync!(hwtlas)

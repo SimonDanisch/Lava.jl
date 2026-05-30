@@ -47,10 +47,12 @@ else
 init_pipeline_thread!() = nothing
 end
 
-function create_compute_pipeline_large_stack(device::Ptr{Cvoid}, create_info_ptr::Ptr{Cvoid},
+function create_compute_pipeline_large_stack(device::Ptr{Cvoid},
+                                               pipeline_cache::Ptr{Cvoid},
+                                               create_info_ptr::Ptr{Cvoid},
                                                p_pipelines::Ptr{Cvoid})
     args = Ref(_VkCreatePipelineArgs(
-        device, C_NULL, UInt32(1), UInt32(0),
+        device, pipeline_cache, UInt32(1), UInt32(0),
         create_info_ptr, C_NULL, p_pipelines,
         Int32(0), Int32(0),
     ))
@@ -62,15 +64,33 @@ function create_compute_pipeline_large_stack(device::Ptr{Cvoid}, create_info_ptr
             C_NULL, LARGE_STACK_SIZE, PIPELINE_THREAD_CFUNC[], args_ptr,
             UInt32(0), thread_id)
         handle == C_NULL && error("CreateThread failed for vkCreateComputePipelines")
-        # 60 second timeout — AMD's Windows driver can hang on certain SPIR-V patterns
+        # 600 second timeout — AMD's Windows driver can be very slow under
+        # accumulated session state (~thousands of prior compiles). Real hangs
+        # are exceedingly rare; the failure mode is "slow but progressing".
+        # If we timeout-and-CloseHandle while the thread is still inside
+        # AMDVLK's compiler, the thread later crashes accessing freed
+        # _VkCreatePipelineArgs (observed: access violation in vkResetEvent
+        # after a Pkg.test Tier 4 broadcast Complex{Int32}). The crash kills
+        # the whole process. To avoid that, we TerminateThread on timeout —
+        # leaks the AMDVLK internal allocations but keeps Julia alive so
+        # the test/user can recover gracefully (or call vk_reset_device!).
         wait_result = ccall((:WaitForSingleObject, "kernel32"), UInt32,
-            (Ptr{Cvoid}, UInt32), handle, UInt32(60_000))
-        ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), handle)
+            (Ptr{Cvoid}, UInt32), handle, UInt32(600_000))
         if wait_result == 0x00000102  # WAIT_TIMEOUT
-            error("vkCreateComputePipelines timed out after 60s — AMD Windows driver " *
-                  "shader compiler hung. This is a known driver bug with certain " *
-                  "large SPIR-V modules. Try reducing kernel complexity.")
+            # Force-kill the leaked AMDVLK thread so it can't crash the
+            # process later when it accesses our freed args memory.
+            ccall((:TerminateThread, "kernel32"), Cint,
+                (Ptr{Cvoid}, UInt32), handle, UInt32(1))
+            ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), handle)
+            # Best-effort: mark the Lava context as device_lost so subsequent
+            # work doesn't try to use a driver in unknown state.
+            ctx = VK_CONTEXT_REF[]
+            ctx === nothing || mark_device_lost!(ctx)
+            error("vkCreateComputePipelines timed out after 600s — AMD Windows " *
+                  "driver shader compiler hung. Device marked DEVICE_LOST; " *
+                  "call Lava.vk_reset_device!() to recover.")
         end
+        ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), handle)
         wait_result != 0 && error("WaitForSingleObject failed: $wait_result")
         return args[].result
     end
@@ -163,7 +183,7 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
     ci = Vulkan.ComputePipelineCreateInfo(stage, layout, -1;
         flags=Vulkan.PIPELINE_CREATE_DISPATCH_BASE_BIT)
 
-    pipeline = create_compute_pipeline(dev, ci)
+    pipeline = create_compute_pipeline(dev, ci; pipeline_cache=ctx.pipeline_cache)
 
     result = LavaComputePipeline(shader_mod, layout, pipeline, UInt32(push_constant_size),
                                   needs_tlas_descriptor, ds_layout)
@@ -225,15 +245,26 @@ function alloc_compute_tlas_descriptor_set(dev::Vulkan.Device,
     return desc_pool, desc_set
 end
 
-function create_compute_pipeline(dev::Vulkan.Device, ci::Vulkan.ComputePipelineCreateInfo)
+function create_compute_pipeline(dev::Vulkan.Device, ci::Vulkan.ComputePipelineCreateInfo;
+                                   pipeline_cache=C_NULL)
+    # Resolve the raw handle for the LARGE_STACK ccall path. Vulkan.jl high-
+    # level wrappers carry the raw UInt64 (non-dispatchable handle) in `.vks`;
+    # ccall accepts a Ptr{Cvoid} of that value on 64-bit systems.
+    cache_handle = if pipeline_cache === C_NULL
+        C_NULL
+    else
+        raw = pipeline_cache.vks
+        raw isa Ptr ? raw : Ptr{Cvoid}(UInt(raw))
+    end
     if LARGE_STACK_PIPELINE
         ci_low = convert(Vulkan._ComputePipelineCreateInfo, ci)
         vk_ci_ref = Ref(ci_low.vks)
         pipeline_out = Ref(Ptr{Cvoid}(C_NULL))
 
-        GC.@preserve ci_low vk_ci_ref pipeline_out begin
+        GC.@preserve ci_low vk_ci_ref pipeline_out pipeline_cache begin
             vk_result = create_compute_pipeline_large_stack(
                 dev.vks,
+                cache_handle,
                 Ptr{Cvoid}(pointer_from_objref(vk_ci_ref)),
                 Ptr{Cvoid}(pointer_from_objref(pipeline_out)))
             vk_result != 0 && error("vkCreateComputePipelines failed with VkResult $vk_result")
@@ -244,7 +275,7 @@ function create_compute_pipeline(dev::Vulkan.Device, ci::Vulkan.ComputePipelineC
         destructor = x -> Vulkan._destroy_pipeline(parent, x)
         return Vulkan.Pipeline(raw_pipeline, destructor, dev)
     else
-        pipelines, _ = @vk_checked "vkCreateComputePipelines" Vulkan.create_compute_pipelines(dev, [ci])
+        pipelines, _ = @vk_checked "vkCreateComputePipelines" Vulkan.create_compute_pipelines(dev, [ci]; pipeline_cache)
         return pipelines[1]
     end
 end

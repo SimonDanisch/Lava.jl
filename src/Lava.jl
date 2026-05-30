@@ -6,6 +6,7 @@ export CompilationResult, lava_compile, optimize_spirv
 # Debugging & diagnostics
 export vk_reset_device!, dump_state, gpu_memory_usage, allocate_batch_queue!
 export set_dispatch_logging!, get_dispatch_log
+export enable_gpu_av, disable_gpu_av, verify_gpu_av, activate_all_debugging
 
 # Graphics exports
 export GraphicsPipeline, Rasterizer, TrianglePipeline, LinePipeline
@@ -137,12 +138,18 @@ include("array/pin_leaves.jl") # @generated walker that pins LavaArray leaves pe
 
 # ---- Launch API (depends on LavaArray / LavaDeviceArray) ----
 include("runtime/launch.jl")
+# Pipeline cache persistence — depends on lava_disk_cache_dir from launch.jl;
+# referenced by VkContext constructor (forward at include time, resolved at call time)
+include("runtime/pipeline_cache.jl")
 # runtime/sync.jl — sync handled via vk_flush!() in launch.jl
 
 # ---- KernelAbstractions backend ----
 include("array/ka_backend.jl")
 include("array/gpuarrays.jl")
 include("array/mapreduce.jl")
+
+# ---- Debug / validation API (needs LavaArray + KA backend) ----
+include("runtime/debug.jl")
 
 # ---- Phase 2: Graphics ----
 include("graphics/window.jl")         # RenderWindow, swapchain, present

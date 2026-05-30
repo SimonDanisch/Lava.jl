@@ -66,7 +66,159 @@ function build_pointee_type_map(mod::LLVM.Module)
         end
     end
 
+    # 3. Function parameters with the `byval(T)` attribute carry the pointee
+    # type directly. Needed once we emit helper OpFunctions whose only signal
+    # for the pointee is the byval annotation. Priority 4: above load/store/GEP,
+    # below alloca (which is authoritative for stack-local types).
+    byval_kind = LLVM.API.LLVMGetEnumAttributeKindForName("byval", Csize_t(5))
+    for fn in LLVM.functions(mod)
+        isempty(LLVM.blocks(fn)) && continue
+        for (i, param) in enumerate(LLVM.parameters(fn))
+            LLVM.value_type(param) isa LLVM.PointerType || continue
+            for attr in collect(LLVM.parameter_attributes(fn, i))
+                if attr isa LLVM.TypeAttribute && LLVM.kind(attr) == byval_kind
+                    set_pointee_type!(ptm, param, LLVM.value(attr); priority=4)
+                    break
+                end
+            end
+        end
+    end
+
+    # 4. Call-site propagation: if a call passes a pointer arg with a known
+    # pointee, propagate that pointee onto the callee's corresponding parameter.
+    # For function PARAMS specifically, the caller's pointee type is
+    # authoritative — the helper body might load only one field of a struct
+    # (PTM would infer just that field's scalar type), but the param itself
+    # holds the whole struct that the caller allocated. Priority 3 beats
+    # load/store inference (priority 2) but loses to byval (4) and alloca (5).
+    for iter in 1:10
+        changed = false
+        for fn in LLVM.functions(mod), bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+            inst isa LLVM.CallInst || continue
+            callee = LLVM.called_operand(inst)
+            callee isa LLVM.Function || continue
+            isempty(LLVM.blocks(callee)) && continue
+            params = collect(LLVM.parameters(callee))
+            ops = LLVM.operands(inst)
+            n_args = length(ops) - 1
+            for i in 1:min(n_args, length(params))
+                arg = ops[i]
+                param = params[i]
+                LLVM.value_type(param) isa LLVM.PointerType || continue
+                arg_pointee = get_pointee_type(ptm, arg)
+                arg_pointee === nothing && continue
+                existing = get(ptm.map, param, nothing)
+                # Don't overwrite a higher-priority entry (byval=4, alloca=5)
+                if existing === nothing || existing[2] < 3
+                    set_pointee_type!(ptm, param, arg_pointee; priority=3)
+                    changed = true
+                end
+            end
+        end
+        changed || break
+        @assert iter < 10 "call-site propagation failed to converge"
+    end
+
+    # 5. Composite-pointee inference from byte-offset GEP patterns.
+    #
+    # When a pointer is used at multiple distinct byte offsets via
+    # `getelementptr i8, ptr %p, i64 N` + load (or store) of the same scalar
+    # type, the pointer's *real* pointee is a composite of that scalar type,
+    # not a single scalar. Without this inference, PTM records just "the type
+    # of the first load" and Lava's byte-offset GEP emission falls into the
+    # PSB byte-arithmetic path — which is invalid for Function-class params.
+    #
+    # ONLY fires when no existing PTM entry exists. For function PARAMETERS,
+    # call-site propagation (pass 4) is authoritative because the caller knows
+    # the real type. For other values (allocas, GEP intermediates) without
+    # existing inference, this is the fallback. Priority 1 (lowest) so any
+    # other inference wins if present.
+    for fn in LLVM.functions(mod)
+        isempty(LLVM.blocks(fn)) && continue
+        for param in LLVM.parameters(fn)
+            LLVM.value_type(param) isa LLVM.PointerType || continue
+            existing = get(ptm.map, param, nothing)
+            existing === nothing || continue  # caller knows better
+            offset_type = infer_param_composite_pointee(param)
+            offset_type === nothing && continue
+            set_pointee_type!(ptm, param, offset_type; priority=1)
+        end
+    end
+
     return ptm
+end
+
+"""
+Inspect uses of a pointer parameter. If it's accessed at multiple distinct
+constant byte offsets via `gep i8, %param, K` followed by load/store of the
+same scalar type, return a composite `[N x T]` type covering those accesses.
+Returns `nothing` if the pattern doesn't apply (no byte-offset GEPs, mixed
+types, non-constant offsets, gaps, etc.).
+"""
+function infer_param_composite_pointee(param::LLVM.Argument)
+    # Map: byte offset -> scalar type observed at that offset
+    by_offset = Dict{Int64, LLVM.LLVMType}()
+
+    # Walk users (direct loads/stores at offset 0, and byte-offset GEPs)
+    function record!(offset::Int64, ty::LLVM.LLVMType)
+        if haskey(by_offset, offset)
+            # Conflict on existing offset → bail
+            by_offset[offset] === ty || return false
+        else
+            by_offset[offset] = ty
+        end
+        return true
+    end
+
+    for use in LLVM.uses(param)
+        user = LLVM.user(use)
+        if user isa LLVM.LoadInst
+            ty = LLVM.value_type(user)
+            ty isa LLVM.PointerType && return nothing  # ptr-of-ptr: too complex here
+            record!(Int64(0), ty) || return nothing
+        elseif user isa LLVM.StoreInst
+            # Skip — only consider load patterns to keep this conservative
+            continue
+        elseif user isa LLVM.GetElementPtrInst
+            # Only handle byte-offset GEPs: source type i8, single index
+            src_ty = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(user))
+            (src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8) || continue
+            ops = LLVM.operands(user)
+            length(ops) == 2 || continue
+            offset_op = ops[2]
+            offset_op isa LLVM.ConstantInt || continue
+            byte_offset = convert(Int64, offset_op)
+            # The GEP result must be loaded as a scalar at offset `byte_offset`
+            for gep_use in LLVM.uses(user)
+                gep_user = LLVM.user(gep_use)
+                gep_user isa LLVM.LoadInst || continue
+                ty = LLVM.value_type(gep_user)
+                ty isa LLVM.PointerType && return nothing
+                record!(byte_offset, ty) || return nothing
+            end
+        end
+    end
+
+    # Need at least 2 distinct offsets to call this a composite
+    length(by_offset) >= 2 || return nothing
+
+    # All inferred types must agree
+    types = unique(values(by_offset))
+    length(types) == 1 || return nothing
+    elem_ty = types[1]
+    elem_size = Int64(approx_sizeof(elem_ty))
+    elem_size > 0 || return nothing
+
+    # Offsets must be multiples of element size and form a contiguous run
+    offsets = sort(collect(keys(by_offset)))
+    minoff = offsets[1]
+    minoff == 0 || return nothing  # need to start at offset 0 to be a clean array
+    for (i, off) in enumerate(offsets)
+        off == (i - 1) * elem_size || return nothing
+    end
+
+    n = length(offsets)
+    return LLVM.ArrayType(elem_ty, n)
 end
 
 function collect_pointee_types!(ptm::PointeeTypeMap, inst::LLVM.Instruction)
@@ -1301,6 +1453,33 @@ end
 
 Map a pointer value to its SPIR-V pointer type, using the PointeeTypeMap for type recovery.
 """
+function param_called_with_alloca_arg(param::LLVM.Argument)
+    fn = LLVM.Function(LLVM.API.LLVMGetParamParent(param))
+    param_idx = nothing
+    for (i, p) in enumerate(LLVM.parameters(fn))
+        if p === param
+            param_idx = i
+            break
+        end
+    end
+    param_idx === nothing && return false
+    mod = LLVM.parent(fn)
+    for caller in LLVM.functions(mod)
+        isempty(LLVM.blocks(caller)) && continue
+        for bb in LLVM.blocks(caller), inst in LLVM.instructions(bb)
+            inst isa LLVM.CallInst || continue
+            callee = LLVM.called_operand(inst)
+            callee === fn || continue
+            ops = LLVM.operands(inst)
+            param_idx <= length(ops) - 1 || continue
+            arg = ops[param_idx]
+            LLVM.value_type(arg) isa LLVM.PointerType || continue
+            trace_pointer_to_alloca(arg) && return true
+        end
+    end
+    return false
+end
+
 function map_pointer_type_for_value!(ctx::SPIRVTypeContext, ptr_value::LLVM.Value)
     # Get pointee type from the map
     pointee_llvm = get_pointee_type(ctx.ptm, ptr_value)
@@ -1350,14 +1529,30 @@ function map_pointer_type_for_value!(ctx::SPIRVTypeContext, ptr_value::LLVM.Valu
     # target SC (which `get_pointer_storage_class` derives correctly via
     # `is_psb_pointer`'s alloca trace).  The mismatch triggers an invalid
     # cross-SC OpBitcast at the PHI emit site.
-    if sc == SC.Function && !(ptr_value isa LLVM.AllocaInst) && trace_pointer_to_alloca(ptr_value)
-        # Stays Function: pointer chain bottoms out at an alloca.
-    elseif sc == SC.Function && !(ptr_value isa LLVM.AllocaInst)
-        sc = SC.PhysicalStorageBuffer
+    if sc == SC.Function && !(ptr_value isa LLVM.AllocaInst)
+        keeps_function = trace_pointer_to_alloca(ptr_value)
+        # For function PARAMETERS: alloca lives in the caller, so the trace
+        # can't reach it. Check call sites — if any caller passes an
+        # alloca-derived pointer, the param itself stays Function class.
+        if !keeps_function && ptr_value isa LLVM.Argument
+            keeps_function = param_called_with_alloca_arg(ptr_value)
+        end
+        if !keeps_function
+            sc = SC.PhysicalStorageBuffer
+        end
     end
 
-    # Map pointee type and create pointer type
-    pointee_spirv = map_type!(ctx, pointee_llvm)
+    # Map pointee type and create pointer type. Workgroup pointees MUST go through
+    # the workgroup type path (matching the store/access-chain paths) so an
+    # aggregate pointee shares the SAME layout-decoration-free, deduplicated
+    # type id as the shared-memory global. Using `map_type!` here instead minted a
+    # second, structurally-identical-but-distinct `[N x T]` id, so a pointer
+    # bitcast/select against the global (e.g. `lid==1 ? a[lid] : a[lid-1]`, which
+    # LLVM lowers to an OpSelect of Workgroup pointers) tripped
+    # "Expected both objects to be of Result Type: Select".
+    pointee_spirv = sc == SC.Workgroup ?
+        map_workgroup_type!(ctx, pointee_llvm) :
+        map_type!(ctx, pointee_llvm)
     return map_pointer_type!(ctx, pointee_spirv, sc)
 end
 

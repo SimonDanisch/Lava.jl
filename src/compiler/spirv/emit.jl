@@ -74,13 +74,14 @@ mutable struct SPIRVEmitterState
     # Cached OpTypeRayQueryKHR id, allocated lazily.
     ray_query_type_id::Union{Nothing, UInt32}
     # Function-local rayQuery OpVariable id, allocated lazily on first use.
-    # Reset to nothing per function (currently only the entry function uses this).
+    # Reset to nothing at the top of every emit_function! so each OpFunction
+    # that uses ray queries gets its own Function-storage OpVariable.
     current_ray_query_var::Union{Nothing, UInt32}
-    # OpVariable Function instructions buffered for the entry function.
-    # They are injected right after the entry block's first OpLabel, alongside
-    # alloca preamble words, so they satisfy the SPIR-V spec's requirement that
-    # all Function-storage OpVariable instructions precede any other instruction
-    # in the entry block.
+    # OpVariable Function instructions buffered for the function currently being
+    # emitted. They are injected right after the function's entry block's first
+    # OpLabel, alongside alloca preamble words, so they satisfy the SPIR-V spec
+    # requirement that all Function-storage OpVariable instructions precede any
+    # other instruction in a function. Cleared at the top of every emit_function!.
     entry_function_locals::Vector{UInt32}
     # Additional interface IDs for OpEntryPoint gathered outside emit_globals!.
     # The compute TLAS descriptor variable (for ray-query kernels) is pushed here
@@ -108,11 +109,11 @@ mutable struct SPIRVEmitterState
     # GEP chains. Used by psb_needs_decomposition() to detect i64 stores that need
     # decomposition into two i32 stores.
     psb_ptr_alignment::Dict{LLVM.Value, UInt32}
-    # Workgroup variables wrapped in Block structs for explicit layout.
-    # Maps LLVM global → (wrapped_var_spirv_id, inner_type_spirv_id, inner_llvm_type).
-    # The function preamble emits unwrapping OpAccessChains to drill through the Block
-    # wrapper and stores the unwrapped pointer IDs in value_map.
-    wg_wrapped_vars::Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.LLVMType}}
+    # Workgroup @localmem globals, all members of one shared Block struct.
+    # Maps LLVM global → (block_var_spirv_id, member_type_spirv_id, member_llvm_type, member_index).
+    # The function preamble emits an unwrapping OpAccessChain to member `member_index`
+    # of the shared Block variable and stores the unwrapped pointer ID in value_map.
+    wg_wrapped_vars::Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.LLVMType, UInt32}}
     # LLVM DataLayout for correct struct field offset computation
     data_layout::Union{Nothing, LLVM.DataLayout}
     # Maps SPIR-V alloca variable IDs to their declared LLVM pointee type.
@@ -142,7 +143,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{Tuple{UInt32, UInt32}, UInt32}(), UInt32(0),
         Dict{LLVM.Value, Int64}(),
         Dict{LLVM.Value, UInt32}(),
-        Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.LLVMType}}(),
+        Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.LLVMType, UInt32}}(),
         nothing,  # data_layout (set by caller)
         Dict{UInt32, LLVM.LLVMType}(),  # spirv_var_pointee
         Dict{UInt32, LLVM.LLVMType}(),  # spirv_id_llvm_type
@@ -476,8 +477,39 @@ end
 Emit a single LLVM function as a SPIR-V function.
 """
 function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::Bool=false)
+    # Reset per-function caches that would otherwise leak between functions in
+    # multi-OpFunction emission. Defensive when only one function is emitted; load-
+    # bearing when more than one runs through here. Fields with LLVM-Value-keyed
+    # dicts are left alone — Values are unique per function so no collision.
+    empty!(state.deferred_phis)
+    empty!(state.psb_ptr_to_u64)
+    state.current_ray_query_var = nothing
+    empty!(state.entry_function_locals)
+
+    # Pre-scan: if the function uses ray-query intrinsics, eagerly allocate the
+    # per-function rayQuery OpVariable BEFORE block emission so it lands in
+    # entry_function_locals and gets injected at the start of the first block. Without
+    # this, the first lazy allocation happens deep inside a non-first block and
+    # would produce an OpVariable referenced before its definition.
+    prescan_function_for_rayquery!(state, fn)
+
     fn_ty = LLVM.function_type(fn)
     ret_ty = LLVM.return_type(fn_ty)
+    # SPIR-V Logical addressing requires every OpTypePointer to carry a
+    # StorageClass.  A pointer-return function can't be expressed as a
+    # standalone OpFunction — the storage class would need to flow from the
+    # call site, which Logical addressing doesn't permit.  The inline pass
+    # in `compilation.jl` force-inlines any ptr-return helper for exactly
+    # this reason; this guard is a sharp error message for the case where
+    # something slips through (e.g. a new GPUCompiler runtime stub).
+    if ret_ty isa LLVM.PointerType
+        error("emit_function!: function `$(LLVM.name(fn))` has pointer return " *
+              "type `$(string(ret_ty))` and survived as a non-inlined OpFunction. " *
+              "SPIR-V Logical addressing cannot express pointer returns across " *
+              "function boundaries — the function must be `alwaysinline`. " *
+              "If this is a new GPUCompiler/Julia runtime stub, extend the " *
+              "ptr-return-force-inline pass in `compilation.jl`.")
+    end
     ret_spirv = map_type!(state.type_ctx, ret_ty)
 
     # Map parameter types — use actual parameter values to resolve pointer types
@@ -497,11 +529,15 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
         fresh_id!(state.mod)
     end
 
-    # Function control
-    fc = is_entry ? FuncControl.None : FuncControl.None
-    # TODO: Use DontInline for @noinline functions
-
-    # OpFunction
+    # OpFunction — set DontInline when the LLVM function has the noinline
+    # attribute (from Julia `@noinline` or otherwise). This tells spirv-opt's
+    # inliner to leave the function alone, preserving the call boundary the
+    # author asked for. Without it, spirv-opt's `-O` pipeline inlines small
+    # helpers and the multi-OpFunction split disappears at the SPIR-V level.
+    noinline_kind = LLVM.API.LLVMGetEnumAttributeKindForName("noinline", 8)
+    has_noinline = any(a -> a isa LLVM.EnumAttribute && LLVM.kind(a) == noinline_kind,
+                        collect(LLVM.function_attributes(fn)))
+    fc = (is_entry || !has_noinline) ? FuncControl.None : FuncControl.DontInline
     encode_instruction!(state.mod.functions, Op.OpFunction, ret_spirv, func_id, fc, func_type_id)
 
     # OpFunctionParameter for each parameter
@@ -559,16 +595,16 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
         for alloca_inst in all_allocas
             emit_alloca!(state, alloca_inst)
         end
-        # Emit unwrapping AccessChains for Block-wrapped workgroup variables.
-        # Each wrapped variable is a pointer to a Block struct containing the inner type.
-        # We emit OpAccessChain with index 0 to get a pointer to the inner type,
-        # then store that in value_map so all existing GEP handlers work unchanged.
-        for (gv, (wrapped_var_id, inner_type_spirv_id, inner_llvm_ty)) in state.wg_wrapped_vars
+        # Emit unwrapping AccessChains for the shared Block workgroup variable.
+        # Each @localmem global is member `member_index` of the one Block struct; an
+        # OpAccessChain to that member yields a pointer to the inner array/type, stored
+        # in value_map so all existing GEP handlers work unchanged.
+        for (gv, (wrapped_var_id, inner_type_spirv_id, inner_llvm_ty, member_index)) in state.wg_wrapped_vars
             inner_ptr_ty = map_pointer_type!(state.type_ctx, inner_type_spirv_id, SC.Workgroup)
             unwrapped_id = fresh_id!(state.mod)
-            zero_id = emit_constant_u32!(state.mod, UInt32(0))
+            idx_id = emit_constant_u32!(state.mod, member_index)
             encode_instruction!(state.mod.functions, Op.OpAccessChain,
-                                inner_ptr_ty, unwrapped_id, wrapped_var_id, zero_id)
+                                inner_ptr_ty, unwrapped_id, wrapped_var_id, idx_id)
             state.value_map[gv] = unwrapped_id
         end
         state.mod.functions = real_buf
@@ -591,7 +627,7 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
         # They are appended here, after block emission, so their IDs are defined before use.
         if !entry_label_emitted
             entry_label_emitted = true
-            if is_entry && !isempty(state.entry_function_locals)
+            if !isempty(state.entry_function_locals)
                 append!(preamble_words, state.entry_function_locals)
             end
             if !isempty(preamble_words)
@@ -1636,6 +1672,15 @@ function find_zero_index_path(from_ty::LLVM.LLVMType, target_ty::LLVM.LLVMType)
             LLVM.length(current) == 0 && return nothing
             push!(path, 0)
             current = LLVM.eltype(current)
+        elseif current isa LLVM.VectorType
+            # SROA/InstCombine folds `load <N x T>, ptr %v; extractelement 0`
+            # into `load T, ptr %v`.  In SPIR-V Logical addressing the scalar
+            # element of a vector pointer must be reached via OpAccessChain
+            # (you can't OpLoad a scalar from a vector pointer).  Treat vectors
+            # the same as arrays here so the caller emits the AccessChain.
+            LLVM.length(current) == 0 && return nothing
+            push!(path, 0)
+            current = LLVM.eltype(current)
         else
             return nothing  # Can't drill further, type not found
         end
@@ -1651,13 +1696,17 @@ Returns (path, leaf_type) or (nothing, nothing).
 function find_zero_index_path_to_leaf(from_ty::LLVM.LLVMType)
     path = Int[]
     current = from_ty
-    while current isa LLVM.StructType || current isa LLVM.ArrayType
+    while current isa LLVM.StructType || current isa LLVM.ArrayType || current isa LLVM.VectorType
         if current isa LLVM.StructType
             elems = LLVM.elements(current)
             isempty(elems) && return (nothing, nothing)
             push!(path, 0)
             current = first(elems)
         elseif current isa LLVM.ArrayType
+            LLVM.length(current) == 0 && return (nothing, nothing)
+            push!(path, 0)
+            current = LLVM.eltype(current)
+        else  # VectorType — same handling as array (SROA scalar-from-vector)
             LLVM.length(current) == 0 && return (nothing, nothing)
             push!(path, 0)
             current = LLVM.eltype(current)
@@ -2322,7 +2371,15 @@ function trace_to_non_alloca(ptr::LLVM.Value, visited::Set{LLVM.Value}=Set{LLVM.
         # All incoming values are non-alloca → PSB
         return true
     end
-    # Function parameter, inttoptr, etc. → PSB
+    # Function parameter: the alloca lives in the CALLER. Check call sites —
+    # if any caller passes an alloca-derived pointer, this param is
+    # Function-class (not PSB). Without this, helpers emitted via the
+    # multi-OpFunction walker would classify alloca-derived params as PSB
+    # and emit invalid byte-arithmetic on them.
+    if ptr isa LLVM.Argument
+        return !param_called_with_alloca_arg(ptr)
+    end
+    # inttoptr, etc. → PSB
     return true
 end
 
@@ -3687,6 +3744,15 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                         append!(state.mod.functions, idx_ids)
                         state.value_map[inst] = result_id
                         set_pointee_type!(state.type_ctx.ptm, inst, inner_elem_ty; priority=4)
+                        # Mirror of the struct-base fix: record chain origin so a
+                        # follow-up `gep i8, ptr %this, i64 %dyn*ELEM_SIZE` can
+                        # fold its additional offset into the same array index
+                        # instead of mis-routing into a sibling field.
+                        static_path = UInt32[zero_id]
+                        for idx_val in sub_path
+                            push!(static_path, emit_constant_u32!(state.mod, UInt32(idx_val)))
+                        end
+                        state.array_element_origin[inst] = (base_id, static_path, dyn_idx_i32, sub_leaf)
                         return
                     end
                 end
@@ -3957,6 +4023,14 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                             append!(state.mod.functions, all_indices)
                             state.value_map[inst] = result_id
                             set_pointee_type!(state.type_ctx.ptm, inst, inner_elem_ty; priority=4)
+                            # Record array element origin so chained byte-offset GEPs can fold
+                            # additional offsets into the same array index. Without this, a
+                            # follow-up `gep i8, ptr %this, i64 %dyn*ELEM_SIZE` falls into the
+                            # struct-stride heuristic on inner_elem_ty and accesses the wrong
+                            # struct field (observed in broadcast-with-tuple kernels where the
+                            # iteration index is decomposed across two consecutive byte GEPs).
+                            static_path = UInt32[emit_constant_u32!(state.mod, UInt32(idx_val)) for idx_val in sub_path]
+                            state.array_element_origin[inst] = (base_id, static_path, dyn_idx_i32, sub_leaf)
                             return
                         end
                     elseif sub_path !== nothing && !(sub_leaf isa LLVM.ArrayType)

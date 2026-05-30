@@ -29,7 +29,7 @@ if get(ENV, "LAVA_GPU_AV", "0") != "1"
 else
     using Hikari, Raycore, Adapt
     using GeometryBasics
-    using GeometryBasics: normal_mesh, Tesselation, Sphere, Point3f, Point2f, Vec3f
+    using GeometryBasics: normal_mesh, Tessellation, Sphere, Point3f, Point2f, Vec3f
     using LinearAlgebra: I
 
     @testset "GPU-AV clean — minimal Hikari HW RT render" begin
@@ -38,7 +38,7 @@ else
 
         # Tiny scene + tiny film keeps the GPU-AV-instrumented run finite.
         scene = Hikari.Scene(; backend=backend, hw_accel=true)
-        sphere = normal_mesh(Tesselation(Sphere(Point3f(0, 0, 0.35), 0.35f0), 8))
+        sphere = normal_mesh(Tessellation(Sphere(Point3f(0, 0, 0.35), 0.35f0), 8))
         push!(scene, sphere, Hikari.Diffuse(Kd=Hikari.RGBSpectrum(0.6f0, 0.6f0, 0.6f0)))
         push!(scene, Hikari.PointLight(Point3f(0, -2, 3), Hikari.RGBSpectrum(30f0)))
         Hikari.sync!(scene)

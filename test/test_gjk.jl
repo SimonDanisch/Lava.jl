@@ -2,27 +2,10 @@ using Test, Lava
 using Lava: UnitCube, gjk, GJKResult, transform_point, support_AB
 using GeometryBasics: Vec3f
 
-# ---------------------------------------------------------------------------
-# Small helpers to build common transforms without having to spell out
-# NTuple{12,Float32} by hand every time.
-# ---------------------------------------------------------------------------
-
-function translation_transform(x, y, z)
-    (1f0, 0f0, 0f0, Float32(x),
-     0f0, 1f0, 0f0, Float32(y),
-     0f0, 0f0, 1f0, Float32(z))
-end
-
-function rotation_z_transform(angle, tx=0f0, ty=0f0, tz=0f0)
-    c = Float32(cos(angle))
-    s = Float32(sin(angle))
-    (c,    -s,   0f0,  Float32(tx),
-     s,     c,   0f0,  Float32(ty),
-     0f0,  0f0,  1f0,  Float32(tz))
-end
-
-# Identity (no rotation, no translation).
-const ID = translation_transform(0, 0, 0)
+# Shared narrow-phase helpers: translation_transform, rotation_z_transform,
+# ID, tx.  Guarded so re-includes in the same Main are no-ops.
+isdefined(@__MODULE__, :translation_transform) ||
+    include(joinpath(@__DIR__, "narrow_phase_helpers.jl"))
 
 # ---------------------------------------------------------------------------
 # Test utilities

@@ -255,15 +255,30 @@ function lava_norm_pp_widen(v::LavaArray{T}, spp::Float64) where T
     return typeof(float(LinearAlgebra.norm(zero(T))))(exp2(inv(spp) * log2(s)))
 end
 
-# Float64: rescale by inv_maxabs to avoid overflow
-function lava_norm_p2_rescale(v::LavaArray{T}, inv_maxabs::Float64, maxabs::Float64) where T
-    s = sum(x -> (abs(x) * inv_maxabs)^2, v; init=Float64(0))
+# Float64: rescale by maxabs to avoid overflow.
+#
+# Subtlety: writing `abs(x) / maxabs` in the source is NOT enough. GPU drivers
+# (and LLVM's `arcp` fast-math) lower a Float64 `x / m` to `x * (1/m)`, so when
+# `maxabs` is near `floatmax(Float64)` the reciprocal `1/maxabs` is a subnormal
+# (~1.1e-308, below the 2.2e-308 normal floor). Under flush-denormals-to-zero —
+# the default on lavapipe AND RDNA3 (RADV) — that reciprocal becomes 0, then
+# `abs(x) * 0 = 0`, `sum = 0`, and the rescaled norm collapses to 0. (Verified:
+# `sum(x -> x/m, v)` returns exactly 0.0 iff `1/m` is subnormal, 2.0 otherwise.)
+#
+# Fix: divide by `sqrt(maxabs)` TWICE instead of by `maxabs` once.
+# `(x / √m) / √m == x / m`, but `1/√m` is always normal (even for m == floatmax,
+# `1/√floatmax ≈ 7.5e-155`), so no subnormal reciprocal is ever formed. This is
+# correct for the overflow case (maxabs near floatmax), the underflow case
+# (maxabs near floatmin), and normal magnitudes alike.
+function lava_norm_p2_rescale(v::LavaArray{T}, maxabs::Float64) where T
+    sm = sqrt(maxabs)
+    s = sum(x -> ((abs(x) / sm) / sm)^2, v; init=Float64(0))
     return typeof(float(LinearAlgebra.norm(zero(T))))(maxabs * sqrt(s))
 end
 
-function lava_norm_pp_rescale(v::LavaArray{T}, inv_maxabs::Float64, maxabs::Float64, spp::Float64) where T
+function lava_norm_pp_rescale(v::LavaArray{T}, maxabs::Float64, spp::Float64) where T
     # Use exp2(p*log2(x)) instead of x^p to avoid ^ operator dispatch issues on GPU
-    s = sum(x -> exp2(spp * log2(abs(x) * inv_maxabs)), v; init=Float64(0))
+    s = sum(x -> exp2(spp * log2(abs(x) / maxabs)), v; init=Float64(0))
     return typeof(float(LinearAlgebra.norm(zero(T))))(maxabs * exp2(inv(spp) * log2(s)))
 end
 
@@ -295,8 +310,7 @@ function LinearAlgebra.norm(v::LavaArray{T}, p::Real=2) where T
         return convert(RT, sqrt(s))
     end
 
-    inv_maxabs = 1.0 / maxabs
-    p == 2 && return lava_norm_p2_rescale(v, inv_maxabs, maxabs)
+    p == 2 && return lava_norm_p2_rescale(v, maxabs)
     p == 1 && return convert(RT, sum(abs, v; init=Float64(0)))
-    return lava_norm_pp_rescale(v, inv_maxabs, maxabs, Float64(p))
+    return lava_norm_pp_rescale(v, maxabs, Float64(p))
 end

@@ -53,13 +53,9 @@ end
 box_mesh(origin::Vec3f, extent::Vec3f) =
     GeometryBasics.normal_mesh(Rect3f(origin, extent))
 
-"""Translation matrix as `Mat4f`."""
-translation(dx, dy, dz) = SMatrix{4,4,Float32,16}(
-    1, 0, 0, 0,
-    0, 1, 0, 0,
-    0, 0, 1, 0,
-    dx, dy, dz, 1,
-)
+# Shared HW-TLAS helpers — see test/hwtlas_helpers.jl (provides `translation`).
+isdefined(@__MODULE__, :translation) ||
+    include(joinpath(@__DIR__, "hwtlas_helpers.jl"))
 
 """Translation as `Mat3x4f` (Vulkan row-major 3×4) for `update_transform!`."""
 vk_translation(dx, dy, dz) = Lava.mat4_to_vk_transform(translation(dx, dy, dz))
@@ -400,7 +396,7 @@ sphere_hit_t(offset_z) = 5f0 - Float32(offset_z) - 1f0
 # Sphere BLAS test scaffolding -- different geometry from unit_triangle_mesh,
 # kept separate so the existing triangle-based tests aren't disturbed.
 sphere_mesh_n(n::Int) = GeometryBasics.normal_mesh(
-    GeometryBasics.Tesselation(GeometryBasics.Sphere(GeometryBasics.Point3f(0,0,0), 1f0), n))
+    GeometryBasics.Tessellation(GeometryBasics.Sphere(GeometryBasics.Point3f(0,0,0), 1f0), n))
 
 function trace_one_sphere(hwtlas, ox, oy, oz)
     # Single ray (ox, oy, oz) → -z direction.  Returns (hit, t).

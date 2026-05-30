@@ -1,8 +1,9 @@
 # Lava.jl Master Test Runner
 #
-# 3-tier testing:
-#   Tier 1: Pattern checks on SPIR-V disassembly (no GPU needed)
-#   Tier 2: Golden file comparison (no GPU needed)
+# Tiered testing:
+#   Tier 1: Pattern checks on SPIR-V disassembly (no GPU needed) — semantic
+#           assertions via check/check_not/check_dag, robust across GPUCompiler
+#           and LLVM versions (unlike byte-exact golden files, which we dropped).
 #   Tier 3: GPU execution tests (requires Vulkan device)
 
 using Test
@@ -11,6 +12,32 @@ using Lava
 # Load test utilities once — individual files guard with @isdefined(SPIRVTestUtils)
 include(joinpath(@__DIR__, "spirv_test_utils.jl"))
 import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count, check_regex, normalize_spirv, compare_golden, compile_and_disasm, spirv_opt_roundtrip, check_vendor_safety, compile_with_llc
+
+# ── Fast mode ──
+# A ~3-minute subset for local CI iteration (`act`, smoke-checking workflow
+# changes, fast loop after touching the emitter).  Triggered by either:
+#
+#     julia> Pkg.test("Lava"; test_args=["fast"])
+#     $  LAVA_FAST=1 julia --project -e 'using Pkg; Pkg.test()'
+#     $  julia --project test/runtests.jl fast
+#
+# Includes the categories that have historically caught regressions:
+#   Tier 1 SPIR-V emission, Tier 3 GPU execution, Tier 3c atomics & dispatch,
+#   Tier 3g graphics pipeline, Tier 3h kernel cache, Phase-M alloc/free MWE.
+# Skips the heavy ones: Tier 4 (GPUArrays, ~12 min) and the stress / per-vendor
+# suites.  Full runs are still the default locally.
+#
+# ── CI mode (`ci`) ──
+# The fast subset PLUS the full Tier 4 GPUArrays correctness suite (~15-20 min).
+# This is what the lavapipe CI runs: the GPUArrays suite is the bulk of real
+# correctness coverage, and it runs on lavapipe with the few process-crashing
+# groups skipped (see test_gpuarrays.jl `LAVAPIPE_CRASH_SKIP`). The RADV-only /
+# per-vendor stress tiers stay FULL-only. Trigger with test_args=["ci"] or LAVA_CI=1.
+const CI_MODE   = "ci"   in ARGS || get(ENV, "LAVA_CI",   "0") == "1"
+const FAST_MODE = ("fast" in ARGS || get(ENV, "LAVA_FAST", "0") == "1") && !CI_MODE
+const FULL_MODE = !FAST_MODE && !CI_MODE
+FAST_MODE && @info "Lava: FAST mode — running essential tiers only (~2-3 min)."
+CI_MODE   && @info "Lava: CI mode — fast subset + Tier 4 GPUArrays (~15-20 min)."
 
 # Print driver info for test logs (helps distinguish RADV vs lavapipe vs others)
 let ctx = Lava.vk_context()
@@ -29,13 +56,29 @@ end
         end
     end
 
-    # ── Tier 2: Golden File Comparison ──
-    # Skipped in CI — SPIR-V IDs differ across platforms (LLVM CSE).
-    # Run locally with: LAVA_BLESS=1 julia --project test/runtests.jl
-    if get(ENV, "CI", "") != "true"
-        @testset "Tier 2: Golden Files" begin
-            include(joinpath(@__DIR__, "test_golden.jl"))
-        end
+    # ── Tier 1b: Compiler IR passes (no GPU) ──
+    @testset "Tier 1b: Compiler IR passes" begin
+        include(joinpath(@__DIR__, "test_replace_unreachable.jl"))
+    end
+
+    # ── Tier 3a: Workgroup barrier-skip fix (GPU; catches lavapipe deadlock) ──
+    @testset "Tier 3a: Barrier skip fix" begin
+        include(joinpath(@__DIR__, "test_barrier_skip.jl"))
+    end
+
+    # ── Tier 3a2: norm FTZ rescaling regression (GPU; Float64/ComplexF64) ──
+    @testset "Tier 3a2: norm FTZ rescaling" begin
+        include(joinpath(@__DIR__, "test_norm_overflow.jl"))
+    end
+
+    # ── Tier 3a3: workgroup (shared) memory stress (GPU) ──
+    @testset "Tier 3a3: shared-memory stress" begin
+        include(joinpath(@__DIR__, "test_shared_memory_stress.jl"))
+    end
+
+    # ── Tier 3a4: OpSelect-of-Workgroup-pointers type-dedup regression (GPU) ──
+    @testset "Tier 3a4: OpSelect Workgroup pointer dedup" begin
+        include(joinpath(@__DIR__, "test_select_width_mismatch.jl"))
     end
 
     # ── Tier 3: GPU Execution ──
@@ -47,20 +90,24 @@ end
         include(joinpath(@__DIR__, "test_instance_masks.jl"))
     end
 
-    # ── Tier 3b: Struct Broadcast Regression Tests ──
-    @testset "Tier 3b: Struct Broadcast" begin
-        include(joinpath(@__DIR__, "test_struct_broadcast.jl"))
+    # ── Tier 3b: Struct Broadcast Regression Tests (full only) ──
+    if FULL_MODE
+        @testset "Tier 3b: Struct Broadcast" begin
+            include(joinpath(@__DIR__, "test_struct_broadcast.jl"))
+        end
     end
 
-    # ── Narrow phase (CPU) -- ConvexShape / GJK / EPA ──
+    # ── Narrow phase (CPU) -- ConvexShape / GJK / EPA (full only) ──
     # Pure-CPU reference implementations for the P4 narrow-phase pipeline; no GPU.
-    @testset "Narrow phase (CPU)" begin
-        include(joinpath(@__DIR__, "test_convex_shape.jl"))
-        include(joinpath(@__DIR__, "test_gjk.jl"))
-        include(joinpath(@__DIR__, "test_epa.jl"))
-        include(joinpath(@__DIR__, "test_narrow_phase_kernel.jl"))
-        include(joinpath(@__DIR__, "test_contact_record.jl"))
-        include(joinpath(@__DIR__, "test_narrow_phase_contacts.jl"))
+    if FULL_MODE
+        @testset "Narrow phase (CPU)" begin
+            include(joinpath(@__DIR__, "test_convex_shape.jl"))
+            include(joinpath(@__DIR__, "test_gjk.jl"))
+            include(joinpath(@__DIR__, "test_epa.jl"))
+            include(joinpath(@__DIR__, "test_narrow_phase_kernel.jl"))
+            include(joinpath(@__DIR__, "test_contact_record.jl"))
+            include(joinpath(@__DIR__, "test_narrow_phase_contacts.jl"))
+        end
     end
 
     # ── Tier 3c: Atomics & Batched Dispatch ──
@@ -68,29 +115,39 @@ end
         include(joinpath(@__DIR__, "test_atomics_and_dispatch.jl"))
     end
 
-    # ── Tier 3d: NVIDIA Regression & Stress Tests ──
-    @testset "Tier 3d: NVIDIA Regression & Stress" begin
-        include(joinpath(@__DIR__, "test_nvidia_regression.jl"))
+    # ── Tier 3d: NVIDIA Regression & Stress Tests (full only) ──
+    if FULL_MODE
+        @testset "Tier 3d: NVIDIA Regression & Stress" begin
+            include(joinpath(@__DIR__, "test_nvidia_regression.jl"))
+        end
     end
 
-    # ── Tier 3e: GPU Memory Safety ──
-    @testset "Tier 3e: GPU Memory Safety" begin
-        include(joinpath(@__DIR__, "test_gpu_memory_safety.jl"))
+    # ── Tier 3e: GPU Memory Safety (full only) ──
+    if FULL_MODE
+        @testset "Tier 3e: GPU Memory Safety" begin
+            include(joinpath(@__DIR__, "test_gpu_memory_safety.jl"))
+        end
     end
 
-    # ── Tier 3e2: BAR-memory copy_buffer! sync regression ──
-    @testset "Tier 3e2: BAR Memcpy Sync" begin
-        include(joinpath(@__DIR__, "test_bar_memcpy_sync.jl"))
+    # ── Tier 3e2: BAR-memory copy_buffer! sync regression (full only) ──
+    if FULL_MODE
+        @testset "Tier 3e2: BAR Memcpy Sync" begin
+            include(joinpath(@__DIR__, "test_bar_memcpy_sync.jl"))
+        end
     end
 
-    # ── Tier 3e3: Raycore MultiTypeSet surgical-per-mutation invariants ──
-    @testset "Tier 3e3: MultiTypeSet Surgical" begin
-        include(joinpath(@__DIR__, "test_multitypeset_surgical.jl"))
+    # ── Tier 3e3: Raycore MultiTypeSet surgical-per-mutation invariants (full only) ──
+    if FULL_MODE
+        @testset "Tier 3e3: MultiTypeSet Surgical" begin
+            include(joinpath(@__DIR__, "test_multitypeset_surgical.jl"))
+        end
     end
 
-    # ── Tier 3f: Caching & Allocations ──
-    @testset "Tier 3f: Caching & Allocations" begin
-        include(joinpath(@__DIR__, "test_caching_and_allocations.jl"))
+    # ── Tier 3f: Caching & Allocations (full only) ──
+    if FULL_MODE
+        @testset "Tier 3f: Caching & Allocations" begin
+            include(joinpath(@__DIR__, "test_caching_and_allocations.jl"))
+        end
     end
 
     # ── Tier 3h: Disk Cache & Two-Tier Caching ──
@@ -103,26 +160,32 @@ end
         include(joinpath(@__DIR__, "test_graphics_pipeline.jl"))
     end
 
-    # ── Tier 4: GPUArrays TestSuite ──
-    @testset "Tier 4: GPUArrays TestSuite" begin
-        include(joinpath(@__DIR__, "test_gpuarrays.jl"))
+    # ── Tier 4: GPUArrays TestSuite (~12 min) — full suite AND CI mode ──
+    # The bulk of real correctness coverage. Runs on lavapipe CI with the few
+    # process-crashing groups skipped (test_gpuarrays.jl LAVAPIPE_CRASH_SKIP).
+    if FULL_MODE || CI_MODE
+        @testset "Tier 4: GPUArrays TestSuite" begin
+            include(joinpath(@__DIR__, "test_gpuarrays.jl"))
+        end
     end
 
-    # ── Tier 3i: HW TLAS (Lava.HWTLAS) ──
-    @testset "HW TLAS — stress + correctness" begin
-        include(joinpath(@__DIR__, "test_hwtlas_stress.jl"))
-    end
+    # ── Tier 3i: HW TLAS (Lava.HWTLAS) — full only ──
+    if FULL_MODE
+        @testset "HW TLAS — stress + correctness" begin
+            include(joinpath(@__DIR__, "test_hwtlas_stress.jl"))
+        end
 
-    @testset "HW TLAS — mesh update" begin
-        include(joinpath(@__DIR__, "test_hwtlas_mesh_update.jl"))
-    end
+        @testset "HW TLAS — mesh update" begin
+            include(joinpath(@__DIR__, "test_hwtlas_mesh_update.jl"))
+        end
 
-    @testset "HW TLAS — UAF safety" begin
-        include(joinpath(@__DIR__, "test_hwtlas_uaf_safety.jl"))
-    end
+        @testset "HW TLAS — UAF safety" begin
+            include(joinpath(@__DIR__, "test_hwtlas_uaf_safety.jl"))
+        end
 
-    @testset "HW TLAS — nonblocking sync!" begin
-        include(joinpath(@__DIR__, "test_hwtlas_nonblocking_sync.jl"))
+        @testset "HW TLAS — nonblocking sync!" begin
+            include(joinpath(@__DIR__, "test_hwtlas_nonblocking_sync.jl"))
+        end
     end
 
     # ── Tier 3j: Phase-M alloc/free regression matrix ──────────────────
