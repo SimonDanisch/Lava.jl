@@ -62,7 +62,12 @@ const SKIP = Set([
 # hardware (RADV runs them as part of the full suite), so they are skipped ONLY
 # when the active device is llvmpipe.
 const LAVAPIPE_CRASH_SKIP = Set([
-    "indexing find",   # EXCEPTION_ACCESS_VIOLATION in vulkan_lvp.dll (Azure runners)
+    # These crash ONLY on the GitHub Azure runner's CPU — they are NOT
+    # reproducible on a local lavapipe LLVM 20.1.2 container (verified), so the
+    # set can only be discovered by watching CI. Each was confirmed via a
+    # `signal 11` / EXCEPTION_ACCESS_VIOLATION that aborted the test process.
+    "indexing find",     # signal 11 in vulkan_lvp.dll
+    "linalg/diagonal",   # signal 11 (Azure Linux + Windows), exposed once Tier 4 ran in CI
 ])
 
 function effective_skip()
