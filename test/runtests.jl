@@ -47,6 +47,11 @@ end
         end
     end
 
+    # ── Tier 1b: Compiler IR passes (no GPU) ──
+    @testset "Tier 1b: Compiler IR passes" begin
+        include(joinpath(@__DIR__, "test_replace_unreachable.jl"))
+    end
+
     # ── Tier 3a: Workgroup barrier-skip fix (GPU; catches lavapipe deadlock) ──
     @testset "Tier 3a: Barrier skip fix" begin
         include(joinpath(@__DIR__, "test_barrier_skip.jl"))

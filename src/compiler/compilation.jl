@@ -864,7 +864,9 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # Remove trap/unreachable from error paths (GPUCompiler's lower_throw!).
     # Vendored locally (was GPUCompiler.rm_trap!, removed in GPUCompiler 1.13.3).
     rm_trap!(mod)
-    replace_unreachable!(mod)
+    # Pass entry_fn so the pass warns (rather than silently miscompiles) if it
+    # ever lowers an `unreachable` in a non-entry helper — see replace_unreachable!.
+    replace_unreachable!(mod, entry_fn)
     strip_noreturn!(mod)
     verify_ir!("pre_inline")
 

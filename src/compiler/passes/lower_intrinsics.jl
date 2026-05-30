@@ -24,9 +24,12 @@ GPUCompiler emits on error paths (via `lower_throw!`) must be stripped before
 the SPIR-V emitter runs.
 
 This was historically `GPUCompiler.rm_trap!`, an internal helper. It was
-removed in GPUCompiler 1.13.3 (folded into `finish_ir!` /
-`lower_unreachable_control_flow!`), so we vendor the (tiny) logic here rather
-than depend on a GPUCompiler internal that changes between patch releases.
+removed for good in GPUCompiler 1.13.3 — deliberately unified into
+`lower_unreachable_control_flow!`, which GPUCompiler now runs inside its
+SPIR-V `finish_ir!`. Lava uses its own emitter pipeline (it reads the LLVM
+module after passes; GPUCompiler's `finish_ir!` never runs here), so the
+trap-stripping is ours to do. Vendored permanently — `rm_trap!` is not
+coming back, and we shouldn't depend on a GPUCompiler internal regardless.
 """
 function rm_trap!(mod::LLVM.Module)
     fns = LLVM.functions(mod)
@@ -41,7 +44,7 @@ function rm_trap!(mod::LLVM.Module)
 end
 
 """
-    replace_unreachable!(mod::LLVM.Module)
+    replace_unreachable!(mod::LLVM.Module, entry::Union{LLVM.Function,Nothing}=nothing)
 
 Replace `unreachable` terminators with branches to a unified return block.
 
@@ -54,8 +57,32 @@ unified return block.
 For void functions, the return block contains `ret void`.
 For value-returning functions, a PHI node merges the return values from all
 predecessors (with `undef` for formerly-unreachable paths).
+
+# Kernel vs. helper (why `entry` matters)
+
+Lowering an `unreachable` to a `ret` is only *safe* in a kernel/entry function:
+there the throw path becomes an early thread-exit, which is the best a GPU can
+do (it cannot abort). In a **non-entry helper** the same lowering makes the
+function *return* — and for a value-returning helper it returns `undef` (see
+the phi patching below). The caller then resumes with that garbage instead of
+the program aborting; for a pointer/index-returning helper that garbage is then
+dereferenced → wild access → crash. This is exactly the miscompile GPUCompiler's
+own `lower_unreachable_control_flow!` avoids by only lowering inside kernels and
+warning when a throwing helper could not be inlined.
+
+When `entry` is supplied, this pass `@warn`s for every *non-entry* function in
+which it lowers an `unreachable`, so a surviving throwing helper is loud rather
+than silent. It still lowers it (the SPIR-V emitter cannot represent
+`unreachable` at all, and a non-inlined helper has no way to exit the thread),
+but the warning flags that the throw path now returns `undef`.
+
+Note (GPUCompiler 1.13.x): in practice GPUCompiler already lowers all
+throws/`unreachable` upstream, so this pass is a no-op on the normal compile
+path — it is kept (and hardened) as vendored defensive code for the day a
+GPUCompiler version stops doing so. It is exercised directly by
+`test/test_replace_unreachable.jl`.
 """
-function replace_unreachable!(mod::LLVM.Module)
+function replace_unreachable!(mod::LLVM.Module, entry::Union{LLVM.Function,Nothing}=nothing)
     for f in LLVM.functions(mod)
         isempty(LLVM.blocks(f)) && continue
 
@@ -71,6 +98,22 @@ function replace_unreachable!(mod::LLVM.Module)
             end
         end
         isempty(unreachables) && continue
+
+        # Surviving throwing helper: lowering its `unreachable` makes it return
+        # `undef` and the caller resume with garbage (a pointer/index return is
+        # then dereferenced → wild access). Lower it anyway (the emitter has no
+        # `unreachable`), but make it loud.
+        if entry !== nothing && f !== entry
+            rt = LLVM.return_type(LLVM.function_type(f))
+            ptr_note = rt isa LLVM.PointerType ?
+                " WARNING: helper returns a POINTER — the undef return is liable to be dereferenced." : ""
+            msg = "replace_unreachable!: lowering `unreachable` in non-entry helper " *
+                  "`$(LLVM.name(f))` (returns $(rt)). Its throw path will return undef and " *
+                  "the caller will resume with that value instead of aborting. This is safe " *
+                  "only if the throw path is never taken; inline the helper into the kernel " *
+                  "to make it an early exit." * ptr_note
+            @warn msg maxlog=8
+        end
 
         # If no exit block exists, create one with `ret void` (or `ret null`)
         if isempty(exit_blocks)
