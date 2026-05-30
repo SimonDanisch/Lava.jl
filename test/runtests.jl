@@ -47,6 +47,11 @@ end
         end
     end
 
+    # ── Tier 3a: Workgroup barrier-skip fix (GPU; catches lavapipe deadlock) ──
+    @testset "Tier 3a: Barrier skip fix" begin
+        include(joinpath(@__DIR__, "test_barrier_skip.jl"))
+    end
+
     # ── Tier 3: GPU Execution ──
     @testset "Tier 3: GPU Execution" begin
         include(joinpath(@__DIR__, "test_handwritten_spirv.jl"))

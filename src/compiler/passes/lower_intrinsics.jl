@@ -222,6 +222,70 @@ function strip_assume!(mod::LLVM.Module)
 end
 
 """
+    function_contains_barrier(f, barrier_fn_name, memo) -> Bool
+
+Whether `f` reaches the workgroup barrier intrinsic, directly or through a call
+to another function that does (transitively, memoized; cycle-safe).
+
+On the no-inline path each `@synchronize` survives as a tiny wrapper function
+(`call @llvm.spv...barrier; ret void`) instead of an inlined intrinsic call, so a
+block that *calls such a wrapper* still executes a barrier. `fix_barrier_skipping_paths!`
+must look through these calls or it sees zero barriers and does nothing — which is
+exactly how a no-inline kernel with an error path deadlocks on lavapipe (and drops
+the dead invocation's writes on real hardware).
+"""
+function function_contains_barrier(f::LLVM.Function, barrier_fn_name::AbstractString,
+                                   memo::Dict{LLVM.Function,Bool})
+    haskey(memo, f) && return memo[f]
+    isempty(LLVM.blocks(f)) && (memo[f] = false; return false)
+    memo[f] = false  # break recursion cycles: treat as non-barrier while descending
+    result = false
+    for bb in LLVM.blocks(f), inst in LLVM.instructions(bb)
+        inst isa LLVM.CallInst || continue
+        callee = LLVM.called_operand(inst)
+        callee isa LLVM.Function || continue
+        if LLVM.name(callee) == barrier_fn_name ||
+           (callee !== f && function_contains_barrier(callee, barrier_fn_name, memo))
+            result = true
+            break
+        end
+    end
+    memo[f] = result
+    return result
+end
+
+"""
+    block_reaches(start, target) -> Bool
+
+True if `target` is reachable from `start` by following successor edges.
+
+Used to refuse a barrier-skip redirect that would create a cycle. A genuine
+error/exception path branches to `return` and never flows back, so the barrier
+continuation it should join is NOT able to reach it. A *loop exit* edge looks
+identical to the local pattern (branch toward return; sibling reaches a barrier
+inside the loop body), but redirecting it into the loop body closes a cycle and
+destroys the loop's structure (the loop loses its exit → `OpLoopMerge` ends up
+with Merge Block == Continue Target → invalid SPIR-V). Refusing the redirect
+when `other_target` can already reach `bb` keeps loop-with-barrier kernels
+(tree reductions, scans, bitonic sort, iterative stencils) valid.
+"""
+function block_reaches(start::LLVM.BasicBlock, target::LLVM.BasicBlock)
+    start === target && return true
+    visited = Set{LLVM.BasicBlock}()
+    queue = LLVM.BasicBlock[start]
+    while !isempty(queue)
+        bb = popfirst!(queue)
+        bb in visited && continue
+        push!(visited, bb)
+        bb === target && return true
+        for succ in LLVM.successors(LLVM.terminator(bb))
+            succ in visited || push!(queue, succ)
+        end
+    end
+    return false
+end
+
+"""
     fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
 
 After inlining and optimization, detect error paths (from `replace_unreachable!`)
@@ -237,19 +301,26 @@ implementations, undefined on GPU hardware).
 its predecessor's alternative path leads to a barrier. If so, redirect the block
 to the barrier-containing path. This makes dead invocations participate in all
 remaining barriers before returning.
+
+A "barrier block" is one that calls the barrier intrinsic directly *or* calls a
+function that (transitively) contains a barrier — the latter is the no-inline case
+where each `@synchronize` is its own wrapper function (see `function_contains_barrier`).
 """
 function fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
     isempty(LLVM.blocks(entry_fn)) && return false
 
-    # 1. Find all blocks containing barrier calls
+    # 1. Find all blocks containing barrier calls (direct intrinsic or a call to
+    #    a wrapper function that contains one — the no-inline `@synchronize` case).
     barrier_fn_name = "llvm.spv.group.memory.barrier.with.group.sync"
     barrier_blocks = Set{LLVM.BasicBlock}()
+    barrier_memo = Dict{LLVM.Function,Bool}()
     for bb in LLVM.blocks(entry_fn), inst in LLVM.instructions(bb)
-        if inst isa LLVM.CallInst
-            callee = LLVM.called_operand(inst)
-            if callee isa LLVM.Function && LLVM.name(callee) == barrier_fn_name
-                push!(barrier_blocks, bb)
-            end
+        inst isa LLVM.CallInst || continue
+        callee = LLVM.called_operand(inst)
+        callee isa LLVM.Function || continue
+        if LLVM.name(callee) == barrier_fn_name ||
+           function_contains_barrier(callee, barrier_fn_name, barrier_memo)
+            push!(barrier_blocks, bb)
         end
     end
     isempty(barrier_blocks) && return false
@@ -292,8 +363,12 @@ function fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
         # Find the "other" target (the non-error path)
         other_target = pred_succs[1] == bb ? pred_succs[2] : pred_succs[1]
 
-        # Check if the other path leads to a barrier (directly or transitively)
-        if path_reaches_barrier(other_target, barrier_blocks, return_blocks)
+        # Redirect only if the other path leads to a barrier AND doing so won't
+        # create a cycle. If `other_target` can already reach `bb`, then `bb` is a
+        # loop exit (not an error path) and rerouting it into the barrier-bearing
+        # loop body would strip the loop of its exit — see `block_reaches`.
+        if path_reaches_barrier(other_target, barrier_blocks, return_blocks) &&
+           !block_reaches(other_target, bb)
             # Redirect this block to the barrier-containing path
             LLVM.@dispose builder = LLVM.IRBuilder() begin
                 LLVM.position!(builder, term)
