@@ -62,6 +62,11 @@ end
         include(joinpath(@__DIR__, "test_norm_overflow.jl"))
     end
 
+    # ── Tier 3a3: workgroup (shared) memory stress (GPU) ──
+    @testset "Tier 3a3: shared-memory stress" begin
+        include(joinpath(@__DIR__, "test_shared_memory_stress.jl"))
+    end
+
     # ── Tier 3: GPU Execution ──
     @testset "Tier 3: GPU Execution" begin
         include(joinpath(@__DIR__, "test_handwritten_spirv.jl"))

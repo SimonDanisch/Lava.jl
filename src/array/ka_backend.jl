@@ -703,15 +703,36 @@ end
 @lava_device_override @inline function KA.SharedMemory(::Type{T}, ::Val{Dims}, ::Val{Id}) where {T, Dims, Id}
     N = prod(Dims)
     ptr = lava_alloc_shared(Val(Id), T, Val(N))
-    LavaSharedArray{T}(ptr, N)
+    LavaSharedArray{T, Dims}(ptr, N)
 end
 
-# Simple 1D shared array backed by LLVMPtr in addrspace(3)
-struct LavaSharedArray{T}
+# Shared array backed by LLVMPtr in addrspace(3). `Dims` (a tuple type parameter)
+# carries the static shape so multi-dimensional indexing `a[i, j]` works without a
+# runtime shape field. Storage is column-major, matching Julia/LavaArray.
+struct LavaSharedArray{T, Dims}
     ptr::Core.LLVMPtr{T, 3}
     len::Int
 end
 
+# Backward-compatible 1-D construction (`LavaSharedArray{T}(ptr, len)`): defaults
+# the shape to `(len,)`. `len` is a compile-time constant at every call site
+# (literal, or `prod(Val(Dims))`), so the `(len,)` type parameter is stable.
+@inline LavaSharedArray{T}(ptr::Core.LLVMPtr{T, 3}, len::Integer) where {T} =
+    LavaSharedArray{T, (Int(len),)}(ptr, Int(len))
+
+# Column-major linear index from an N-d cartesian index, fully constant-folded
+# (both `dims` and the index arity are compile-time constants here).
+@inline function lava_shared_linear(dims::NTuple{N,Int}, I::NTuple{N,Integer}) where N
+    @inbounds begin
+        lin = Int(I[N]) - 1
+        for d in (N-1):-1:1
+            lin = lin * dims[d] + (Int(I[d]) - 1)
+        end
+        return lin + 1
+    end
+end
+
+# Linear (single-index) access — works for any shape.
 Base.@propagate_inbounds function Base.getindex(a::LavaSharedArray{T}, i::Integer) where T
     @boundscheck (1 <= i <= a.len || throw(BoundsError(a, i)))
     unsafe_load(a.ptr, i)
@@ -723,7 +744,26 @@ Base.@propagate_inbounds function Base.setindex!(a::LavaSharedArray{T}, v, i::In
     return v
 end
 
+# Multi-dimensional access (≥2 indices; the 1-index method above handles linear).
+# Without these, `a[i, j]` on a 2-D `@localmem` hits no method → a MethodError
+# throw path → `gpu_gc_pool_alloc` (heap alloc in the kernel) → compile failure.
+Base.@propagate_inbounds function Base.getindex(a::LavaSharedArray{T, Dims},
+                                                 i1::Integer, i2::Integer, Irest::Integer...) where {T, Dims}
+    lin = lava_shared_linear(Dims, (i1, i2, Irest...))
+    @boundscheck (1 <= lin <= a.len || throw(BoundsError(a, (i1, i2, Irest...))))
+    unsafe_load(a.ptr, lin)
+end
+
+Base.@propagate_inbounds function Base.setindex!(a::LavaSharedArray{T, Dims}, v,
+                                                 i1::Integer, i2::Integer, Irest::Integer...) where {T, Dims}
+    lin = lava_shared_linear(Dims, (i1, i2, Irest...))
+    @boundscheck (1 <= lin <= a.len || throw(BoundsError(a, (i1, i2, Irest...))))
+    unsafe_store!(a.ptr, convert(T, v), lin)
+    return v
+end
+
 Base.length(a::LavaSharedArray) = a.len
+Base.size(::LavaSharedArray{T, Dims}) where {T, Dims} = Dims
 Base.eltype(::LavaSharedArray{T}) where T = T
 
 # ── Synchronization ──
