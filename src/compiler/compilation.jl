@@ -1779,6 +1779,7 @@ Handles push constant globals (addrspace 2) and builtin globals (addrspace 7).
 """
 function emit_globals!(state::SPIRVEmitterState, llvm_mod::LLVM.Module)
     interface_ids = UInt32[]
+    wg_globals = LLVM.GlobalVariable[]
 
     for gv in LLVM.globals(llvm_mod)
         gv_ty = LLVM.value_type(gv)
@@ -1790,9 +1791,9 @@ function emit_globals!(state::SPIRVEmitterState, llvm_mod::LLVM.Module)
             var_id = emit_push_constant_global!(state, gv)
             push!(interface_ids, var_id)
         elseif as == 3
-            # Workgroup/shared memory global (addrspace 3)
-            var_id = emit_workgroup_global!(state, gv)
-            push!(interface_ids, var_id)
+            # Workgroup/shared memory global (addrspace 3) — collected and emitted
+            # as members of ONE combined Block struct after the loop (see below).
+            push!(wg_globals, gv)
         elseif as == 7
             # Input global (addrspace 7) — SPIR-V builtins
             var_id = emit_builtin_global!(state, gv)
@@ -1804,6 +1805,17 @@ function emit_globals!(state::SPIRVEmitterState, llvm_mod::LLVM.Module)
                 push!(interface_ids, var_id)  # SPIR-V 1.4+ requires all globals in interface
             end
         end
+    end
+
+    # Emit ALL workgroup (@localmem) globals as members of a SINGLE Block struct.
+    # Multiple *separate* Block-decorated Workgroup variables must each carry the
+    # `Aliased` decoration (SPV_KHR_workgroup_memory_explicit_layout spec rule) and
+    # are then permitted to overlap the same storage — which lavapipe does, so a
+    # kernel with two @localmem buffers silently corrupts (the second aliases the
+    # first). One combined Block with distinct member offsets gives every @localmem
+    # its own storage and needs no Aliased.
+    if !isempty(wg_globals)
+        push!(interface_ids, emit_combined_workgroup_block!(state, wg_globals))
     end
 
     return interface_ids
@@ -1850,78 +1862,73 @@ function emit_push_constant_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVar
 end
 
 """
-Emit a workgroup (shared memory) global variable in SPIR-V.
-Creates OpVariable with Workgroup storage class for addrspace(3) globals.
-These are used by KA's @localmem for shared memory within a workgroup.
+Emit ALL workgroup (shared memory / @localmem) globals as members of a single
+Block-decorated struct backed by ONE Workgroup OpVariable.
 
-Workgroup variables must NOT have explicit layout decorations (ArrayStride,
-Offset, Block) unless VK_KHR_workgroup_memory_explicit_layout is enabled.
-We create FRESH type IDs (via `map_workgroup_type!`) separate from the main
-cache, so PSB types keep their decorations while workgroup types stay clean.
+Why combined rather than one variable per global: under
+`SPV_KHR_workgroup_memory_explicit_layout` (which we always enable, since struct
+and 8-bit workgroup types need it), the spec requires that if more than one
+Workgroup variable points to a Block-decorated type, *all* of them be decorated
+`Aliased` — and `Aliased` then permits them to share storage. Conformant
+software rasterizers (lavapipe) take that permission and overlap the variables,
+so a kernel with two `@localmem` buffers has its second buffer alias the first
+(silent corruption; RADV happened to keep them separate, masking the bug).
+
+A single Block struct with one member per `@localmem`, each at a distinct
+explicit Offset, gives every buffer its own storage with no `Aliased`. The
+function preamble drills to member `i` (instead of member 0) for the i-th global.
+Fresh workgroup type IDs (`map_workgroup_type!`) keep these layout-decoration-free
+types separate from the PSB-decorated main cache.
 """
-function emit_workgroup_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariable)
+function emit_combined_workgroup_block!(state::SPIRVEmitterState,
+                                        wg_globals::Vector{<:LLVM.GlobalVariable})
     mod = state.mod
-    gv_value_ty = LLVM.global_value_type(gv)
 
-    # Always use explicit layout for workgroup variables.
-    # Once WorkgroupMemoryExplicitLayoutKHR is enabled (needed for struct-containing
-    # workgroup vars), ALL workgroup variables in the module must follow explicit layout
-    # rules. Using explicit layout unconditionally ensures consistency.
-    pointee_spirv = map_workgroup_type!(state.type_ctx, gv_value_ty)
-
-    begin
-        # Wrap in a Block-decorated outer struct for explicit layout.
-        # SPIR-V requires: Block on outermost struct, Offset on its members,
-        # ArrayStride on arrays of structs, MemberOffset on inner structs.
-        #
-        # Structure: %outer_block = OpTypeStruct %pointee_type
-        #   with Block decoration and member 0 at Offset 0
-        block_struct_id = fresh_id!(mod)
-        word_count = UInt32(3)  # OpTypeStruct + result + 1 member
-        push!(mod.types_constants, (word_count << 16) | UInt32(Op.OpTypeStruct))
-        push!(mod.types_constants, block_struct_id)
-        push!(mod.types_constants, pointee_spirv)
-
-        emit_decorate!(mod, block_struct_id, Dec.Block)
-        emit_member_decorate!(mod, block_struct_id, UInt32(0), Dec.Offset, UInt32(0))
-
-        # Create pointer type for the Block wrapper
-        ptr_ty = map_pointer_type!(state.type_ctx, block_struct_id, SC.Workgroup)
-
-        # Require the extension and capability
-        require_capability!(mod, Cap.WorkgroupMemoryExplicitLayoutKHR)
-        require_extension!(mod, "SPV_KHR_workgroup_memory_explicit_layout")
-
-        # Require 8-bit/16-bit access capabilities if the type contains such elements
-        if wg_type_contains_width(gv_value_ty, 8)
-            require_capability!(mod, Cap.WorkgroupMemoryExplicitLayout8BitAccessKHR)
-        end
-        if wg_type_contains_width(gv_value_ty, 16)
-            require_capability!(mod, Cap.WorkgroupMemoryExplicitLayout16BitAccessKHR)
-        end
-
-        # Create OpVariable
-        var_id = fresh_id!(mod)
-        encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Workgroup)
-
-        # Aliased decoration: required when multiple Block-decorated Workgroup variables exist.
-        # Always emit it -- harmless for single variables, required for multiple.
-        emit_decorate!(mod, var_id, Dec.Aliased)
-
-        # Register the wrapping so the function preamble can emit unwrapping AccessChains.
-        # The unwrapping AccessChain will drill through the Block struct to get a pointer
-        # to the inner array/type, which all existing GEP handlers expect.
-        state.wg_wrapped_vars[gv] = (var_id, pointee_spirv, gv_value_ty)
+    member_spirv = UInt32[]
+    member_lly = LLVM.LLVMType[]
+    for gv in wg_globals
+        ty = LLVM.global_value_type(gv)
+        push!(member_spirv, map_workgroup_type!(state.type_ctx, ty))
+        push!(member_lly, ty)
     end
 
-    # Register pointee type in PTM for downstream GEP/load/store resolution
-    # (always the ORIGINAL type, not the Block wrapper)
-    set_pointee_type!(state.type_ctx.ptm, gv, gv_value_ty; priority=5)
+    # OpTypeStruct with one member per @localmem buffer.
+    block_id = fresh_id!(mod)
+    word_count = UInt32(2 + length(member_spirv))
+    push!(mod.types_constants, (word_count << 16) | UInt32(Op.OpTypeStruct))
+    push!(mod.types_constants, block_id)
+    append!(mod.types_constants, member_spirv)
+    emit_decorate!(mod, block_id, Dec.Block)
 
-    # Debug name
-    gv_name = LLVM.name(gv)
-    if !isempty(gv_name)
-        emit_name!(mod, var_id, gv_name)
+    # Member offsets: running offset, each member aligned to its natural alignment,
+    # so members occupy disjoint storage.
+    running_offset = UInt32(0)
+    for (i, ty) in enumerate(member_lly)
+        member_align = UInt32(wg_compute_type_alignment(ty))
+        running_offset = (running_offset + member_align - UInt32(1)) & ~(member_align - UInt32(1))
+        emit_member_decorate!(mod, block_id, UInt32(i - 1), Dec.Offset, running_offset)
+        running_offset += UInt32(wg_compute_type_size(ty))
+    end
+
+    ptr_ty = map_pointer_type!(state.type_ctx, block_id, SC.Workgroup)
+
+    require_capability!(mod, Cap.WorkgroupMemoryExplicitLayoutKHR)
+    require_extension!(mod, "SPV_KHR_workgroup_memory_explicit_layout")
+    for ty in member_lly
+        wg_type_contains_width(ty, 8)  && require_capability!(mod, Cap.WorkgroupMemoryExplicitLayout8BitAccessKHR)
+        wg_type_contains_width(ty, 16) && require_capability!(mod, Cap.WorkgroupMemoryExplicitLayout16BitAccessKHR)
+    end
+
+    var_id = fresh_id!(mod)
+    encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Workgroup)
+    # Single Block Workgroup variable → no `Aliased` required; members are disjoint.
+
+    for (i, gv) in enumerate(wg_globals)
+        # (var, inner_type_spirv, inner_llvm_type, member_index) — preamble drills to member i.
+        state.wg_wrapped_vars[gv] = (var_id, member_spirv[i], member_lly[i], UInt32(i - 1))
+        set_pointee_type!(state.type_ctx.ptm, gv, member_lly[i]; priority=5)
+        gv_name = LLVM.name(gv)
+        isempty(gv_name) || emit_name!(mod, var_id, gv_name)
     end
 
     return var_id

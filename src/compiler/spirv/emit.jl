@@ -109,11 +109,11 @@ mutable struct SPIRVEmitterState
     # GEP chains. Used by psb_needs_decomposition() to detect i64 stores that need
     # decomposition into two i32 stores.
     psb_ptr_alignment::Dict{LLVM.Value, UInt32}
-    # Workgroup variables wrapped in Block structs for explicit layout.
-    # Maps LLVM global → (wrapped_var_spirv_id, inner_type_spirv_id, inner_llvm_type).
-    # The function preamble emits unwrapping OpAccessChains to drill through the Block
-    # wrapper and stores the unwrapped pointer IDs in value_map.
-    wg_wrapped_vars::Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.LLVMType}}
+    # Workgroup @localmem globals, all members of one shared Block struct.
+    # Maps LLVM global → (block_var_spirv_id, member_type_spirv_id, member_llvm_type, member_index).
+    # The function preamble emits an unwrapping OpAccessChain to member `member_index`
+    # of the shared Block variable and stores the unwrapped pointer ID in value_map.
+    wg_wrapped_vars::Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.LLVMType, UInt32}}
     # LLVM DataLayout for correct struct field offset computation
     data_layout::Union{Nothing, LLVM.DataLayout}
     # Maps SPIR-V alloca variable IDs to their declared LLVM pointee type.
@@ -143,7 +143,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{Tuple{UInt32, UInt32}, UInt32}(), UInt32(0),
         Dict{LLVM.Value, Int64}(),
         Dict{LLVM.Value, UInt32}(),
-        Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.LLVMType}}(),
+        Dict{LLVM.Value, Tuple{UInt32, UInt32, LLVM.LLVMType, UInt32}}(),
         nothing,  # data_layout (set by caller)
         Dict{UInt32, LLVM.LLVMType}(),  # spirv_var_pointee
         Dict{UInt32, LLVM.LLVMType}(),  # spirv_id_llvm_type
@@ -595,16 +595,16 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
         for alloca_inst in all_allocas
             emit_alloca!(state, alloca_inst)
         end
-        # Emit unwrapping AccessChains for Block-wrapped workgroup variables.
-        # Each wrapped variable is a pointer to a Block struct containing the inner type.
-        # We emit OpAccessChain with index 0 to get a pointer to the inner type,
-        # then store that in value_map so all existing GEP handlers work unchanged.
-        for (gv, (wrapped_var_id, inner_type_spirv_id, inner_llvm_ty)) in state.wg_wrapped_vars
+        # Emit unwrapping AccessChains for the shared Block workgroup variable.
+        # Each @localmem global is member `member_index` of the one Block struct; an
+        # OpAccessChain to that member yields a pointer to the inner array/type, stored
+        # in value_map so all existing GEP handlers work unchanged.
+        for (gv, (wrapped_var_id, inner_type_spirv_id, inner_llvm_ty, member_index)) in state.wg_wrapped_vars
             inner_ptr_ty = map_pointer_type!(state.type_ctx, inner_type_spirv_id, SC.Workgroup)
             unwrapped_id = fresh_id!(state.mod)
-            zero_id = emit_constant_u32!(state.mod, UInt32(0))
+            idx_id = emit_constant_u32!(state.mod, member_index)
             encode_instruction!(state.mod.functions, Op.OpAccessChain,
-                                inner_ptr_ty, unwrapped_id, wrapped_var_id, zero_id)
+                                inner_ptr_ty, unwrapped_id, wrapped_var_id, idx_id)
             state.value_map[gv] = unwrapped_id
         end
         state.mod.functions = real_buf
