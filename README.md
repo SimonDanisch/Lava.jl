@@ -136,8 +136,9 @@ VkShaderModule -> VkPipeline -> GPU dispatch
 
 ### Compute
 - **GPUArrays.jl**: ~99.9% test suite pass (9,578 passed, 26 failed across 27 groups)
-- **KernelAbstractions.jl**: Full `LavaBackend <: KA.GPU` with `@kernel`, `@index`, `@localmem`, `@synchronize`
+- **KernelAbstractions.jl**: Full `LavaBackend <: KA.GPU` with `@kernel`, `@index`, `@localmem`, `@synchronize`, and `@print`
 - **Atomix.jl**: Int32/UInt32/Float32 atomics (add, sub, and, or, xor, xchg, min, max; Float32 add via CAS loop)
+- **On-kernel printf**: portable `KernelAbstractions.@print` and Lava's `@lava_printf` via `NonSemantic.DebugPrintf` — see [Debugging](docs/src/debugging.md)
 - **Complex structs**: Deeply nested types, NTuple fields, multi-field structs pass through BDA without corruption
 - **Hikari raytracer**: Full wavefront volume path tracer (93 source files, 20 materials, 6+ kernel stages) renders correctly
 

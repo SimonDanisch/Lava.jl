@@ -22,6 +22,7 @@ const SPIRV_GENERATOR = UInt32(0)
 module Op
     const OpNop                     = UInt16(0)
     const OpSource                  = UInt16(3)
+    const OpString                  = UInt16(7)
     const OpName                    = UInt16(5)
     const OpMemberName              = UInt16(6)
     const OpExtInstImport           = UInt16(11)
@@ -608,6 +609,47 @@ function require_extension!(mod::SPIRVModule, ext::String)
         mod.extensions[start_len + 1] = (total_words << 16) | UInt32(10)
     end
     return nothing
+end
+
+"""
+    setup_debug_printf!(mod::SPIRVModule) -> UInt32
+
+Import the `NonSemantic.DebugPrintf` extended instruction set (and the required
+`SPV_KHR_non_semantic_info` extension), returning its import id. Deduplicated via
+`type_cache` so repeated printf call sites share one import. The result id is the
+`<set>` operand of `OpExtInst … 1 …` (instruction 1 = DebugPrintf).
+"""
+function setup_debug_printf!(mod::SPIRVModule)
+    key = (:debug_printf_extinst_set,)
+    cached = get(mod.type_cache, key, UInt32(0))
+    cached != 0 && return cached
+    require_extension!(mod, "SPV_KHR_non_semantic_info")
+    id = fresh_id!(mod)
+    start_len = length(mod.ext_inst_imports)
+    push!(mod.ext_inst_imports, UInt32(0))  # placeholder
+    push!(mod.ext_inst_imports, id)
+    nwords = encode_string_words!(mod.ext_inst_imports, "NonSemantic.DebugPrintf")
+    total_words = UInt32(2 + nwords)
+    mod.ext_inst_imports[start_len + 1] = (total_words << 16) | UInt32(Op.OpExtInstImport)
+    mod.type_cache[key] = id
+    return id
+end
+
+"""
+    emit_op_string!(mod::SPIRVModule, s::AbstractString) -> UInt32
+
+Emit `OpString` for `s` and return its id. SPIR-V's logical layout requires all
+`OpString`s (debug section 7a) to precede `OpName`s (7b), so we prepend into the
+debug buffer — every `OpName` Lava emits stays after them regardless of when the
+printf is walked.
+"""
+function emit_op_string!(mod::SPIRVModule, s::AbstractString)
+    id = fresh_id!(mod)
+    words = UInt32[UInt32(0), id]  # placeholder + result id
+    nwords = encode_string_words!(words, String(s))
+    words[1] = (UInt32(2 + nwords) << 16) | UInt32(Op.OpString)
+    prepend!(mod.debug, words)
+    return id
 end
 
 """

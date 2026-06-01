@@ -29,6 +29,68 @@ dump_state()
 
 Prints batch queue contents, in-flight command buffers, deferred frees, slab inventories, and the timeline semaphore counters. The same information backs the `mwe_*.jl` regression tests in `test/`.
 
+## Printing from kernels
+
+Lava can print directly from a running kernel, which is often the fastest way to
+diagnose a wrong value or a driver miscompile (you see the offending index/offset
+instead of inferring it from the output). It is implemented with the Vulkan
+validation layer's `NonSemantic.DebugPrintf`.
+
+Two entry points are available:
+
+* **`KernelAbstractions.@print`** — the portable API (same one CUDA.jl and
+  AMDGPU.jl implement). Interleave string literals with values, like `print`;
+  format specifiers are chosen automatically from the argument types.
+* **`@lava_printf`** — Lava-specific, with an explicit C-style format string when
+  you want full control over specifiers, width and padding.
+
+```julia
+using Lava, KernelAbstractions
+
+@kernel function k!(out)
+    i = @index(Global)
+    @print("tid=", i, "  val=", out[i], "\n")          # portable
+    @lava_printf "tid=%u  val=%f\n" UInt32(i) out[i]    # explicit format
+    @inbounds out[i] = Float32(i)
+end
+
+Lava.enable_debug_printf!()        # resets the device with the layer feature on
+backend = Lava.LavaBackend()
+out = Lava.LavaArray(zeros(Float32, 8))
+k!(backend)(out; ndrange = 8)
+Lava.vk_flush!(Lava.vk_context().default_bq)
+KernelAbstractions.synchronize(backend)
+
+Lava.get_printf_output()           # Vector{String} of captured lines
+Lava.disable_debug_printf!()       # back to the fast path
+```
+
+Captured lines are also `@info`-logged as they arrive. Read them with
+`Lava.get_printf_output()` and reset with `Lava.clear_printf_output!()`.
+
+Format-specifier **width** must match the argument width or the layer warns:
+
+| Argument type | specifier |
+|---|---|
+| `Int32` / smaller, `Bool` | `%d` |
+| `UInt32` / smaller | `%u` (also `%x`) |
+| `Int64`, `Int` | `%ld` |
+| `UInt64` | `%lu` |
+| `Float16`, `Float32` | `%f` (also `%e`, `%g`) |
+| `Float64` | `%lf` (the `l` is **required** for 64-bit) |
+
+`@print` picks these for you; with `@lava_printf` you write them.
+
+!!! note
+    Output only appears while debug printf is enabled. Without it the
+    `DebugPrintf` instruction is inert — the kernel still runs and computes
+    correctly and simply produces no output — so prints are safe to leave in
+    code. Debug printf and GPU-Assisted Validation both instrument shaders and
+    cannot be active at the same time, so `enable_debug_printf!()` turns GPU-AV
+    off. Like all validation features it slows execution substantially; use it
+    for triage. Do not run a debug-printf workload concurrently with another
+    heavy GPU process — that has been observed to crash the NVIDIA driver.
+
 ## Dispatch logging
 
 ```julia

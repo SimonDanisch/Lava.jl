@@ -300,6 +300,36 @@ end
 const VALIDATION_MESSAGES = String[]
 const MAX_VALIDATION_MESSAGES = 50
 
+# Captured @lava_printf output (NonSemantic.DebugPrintf, delivered at INFO
+# severity via the debug-utils callback). Kept separate from validation errors.
+const PRINTF_MESSAGES = String[]
+const MAX_PRINTF_MESSAGES = 4096
+
+# ── Async-safe validation message capture ──────────────────────────────────
+#
+# The Vulkan debug-utils callback can be invoked re-entrantly from inside a
+# blocking driver ccall — notably GPU-Assisted Validation reading back its
+# error log during `vkWaitSemaphores`.  In that context the calling thread is
+# mid-ccall with driver locks held; doing ANY Julia work that can allocate,
+# log, or hit a scheduler yield/safepoint deadlocks the runtime.  (Observed on
+# the RTX 4000 Ada: GPU-AV catches a BDA OOB, `@error` prints it once, then the
+# process hangs forever — the `@error` yielded while the driver held a lock.)
+#
+# So the callback writes ONLY into preallocated memory via raw ccalls
+# (strlen/memcpy) and `unsafe_store!`/`@inbounds` array writes — no allocation,
+# no logging, no `push!`.  The main thread later calls
+# `drain_validation_messages!()` to turn raw slots into Strings, capture the
+# hard errors in VALIDATION_MESSAGES, and log everything.  These const arrays
+# are never resized, so their data pointers are stable for the callback.
+const VAL_RING_SLOTS      = 64
+const VAL_RING_SLOT_BYTES = 2048
+const VAL_RING_BUF  = zeros(UInt8,  VAL_RING_SLOTS * VAL_RING_SLOT_BYTES)
+const VAL_RING_LEN  = zeros(Cint,   VAL_RING_SLOTS)
+const VAL_RING_SEV  = zeros(UInt32, VAL_RING_SLOTS)
+const VAL_RING_TYPE = zeros(UInt32, VAL_RING_SLOTS)
+const VAL_RING_WRITE = zeros(Int, 1)   # total messages written by the callback
+const VAL_RING_READ  = Ref{Int}(0)     # main-thread drain cursor
+
 const VK_CONTEXT_REF = Ref{Union{Nothing, VkContext}}(nothing)
 
 """
@@ -360,6 +390,9 @@ function vk_reset_device!()
     # GC will eventually try to destroy them; _destroy_buffer! skips when
     # DEVICE_LOST was true (and we set it false only after clearing context).
     empty!(VALIDATION_MESSAGES)
+    # The old messenger is gone; drop any undrained ring entries from it so a
+    # later drain doesn't replay stale messages against the new instance.
+    VAL_RING_READ[] = @inbounds VAL_RING_WRITE[1]
     # Run cleanup callbacks registered by other modules
     for cb in RESET_CALLBACKS
         try
@@ -446,10 +479,19 @@ function init_vulkan!()
     # All are very slow; use one or a combination as needed for triage.
     gpu_assisted = false
     sync_val     = false
+    #   LAVA_DEBUG_PRINTF=1 → enable NonSemantic.DebugPrintf output from kernels
+    #                      (@lava_printf). Mutually exclusive with GPU-AV in the
+    #                      layer (both instrument shaders), so it wins if both set.
     want_gpu_av  = get(ENV, "LAVA_GPU_AV",  "0") != "0"
+    want_printf  = get(ENV, "LAVA_DEBUG_PRINTF", "0") != "0"
+    want_gpu_av  = want_gpu_av && !want_printf   # printf takes precedence
     want_sync_val= get(ENV, "LAVA_SYNC_VAL","0") != "0"
     want_best    = get(ENV, "LAVA_BEST",    "0") != "0"
     validation_features_reqs = Vulkan.ValidationFeatureEnableEXT[]
+    if want_printf
+        push!(validation_features_reqs,
+              Vulkan.VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT)
+    end
     if want_gpu_av
         push!(validation_features_reqs,
               Vulkan.VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT)
@@ -890,40 +932,76 @@ end
 
 # ── Validation layer debug messenger ──
 
+# Async-safe Vulkan debug callback.  MUST NOT allocate, log, take locks, or
+# hit a scheduler yield/safepoint — it can run re-entrantly inside a blocking
+# driver ccall (GPU-AV readback during vkWaitSemaphores) with driver locks
+# held, where any of those deadlocks the runtime.  All it does is copy the
+# message bytes into the preallocated ring via raw ccalls + @inbounds stores.
+# Classification + logging happens later on the main thread in
+# `drain_validation_messages!`.  The flag args are received as raw UInt32 (the
+# C ABI for VkDebugUtilsMessageSeverity/TypeFlags) so no flag-wrapper is built.
 function debug_callback(
-    severity,
-    type,
+    severity::UInt32,
+    type::UInt32,
     p_callback_data::Ptr{Vulkan.VkCore.VkDebugUtilsMessengerCallbackDataEXT},
     p_user_data::Ptr{Cvoid},
 )
     p_callback_data == C_NULL && return UInt32(0)
-    data = unsafe_load(p_callback_data)
-    msg_ptr = data.pMessage
-    message = msg_ptr == C_NULL ? "(no message)" : unsafe_string(msg_ptr)
+    data = unsafe_load(p_callback_data)        # isbits C struct → stack value, no heap alloc
+    msg_ptr = Ptr{UInt8}(data.pMessage)
+    idx  = @inbounds VAL_RING_WRITE[1]
+    slot = idx % VAL_RING_SLOTS
+    dst  = pointer(VAL_RING_BUF) + slot * VAL_RING_SLOT_BYTES
+    n = 0
+    if msg_ptr != C_NULL
+        n = Int(ccall(:strlen, Csize_t, (Ptr{UInt8},), msg_ptr))
+        n > VAL_RING_SLOT_BYTES - 1 && (n = VAL_RING_SLOT_BYTES - 1)
+        ccall(:memcpy, Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{Cvoid}, Csize_t), dst, msg_ptr, n % Csize_t)
+    end
+    @inbounds VAL_RING_LEN[slot + 1]  = Cint(n)
+    @inbounds VAL_RING_SEV[slot + 1]  = severity
+    @inbounds VAL_RING_TYPE[slot + 1] = type
+    @inbounds VAL_RING_WRITE[1] = idx + 1
+    # Return VK_FALSE — can't throw from a @cfunction callback (would corrupt
+    # Vulkan state).  Errors are surfaced via drain_validation_messages!.
+    return UInt32(0)
+end
 
-    # Distinguish *validation layer* output (opt-in via LAVA_VALIDATION=1) from
-    # *driver-general* output (always on with debug_utils). Per the Vulkan spec,
-    # the message-type bits classify the source:
-    #
+# Classify one drained message and, for hard validation errors, capture it.
+# Runs ONLY on the main thread (called from drain), so logging/alloc is safe.
+function _handle_validation_message(message::String, sev_u::UInt32, type_u::UInt32)
+    # Message-type bits classify the source (Vulkan spec):
     #   VALIDATION (0x2) — VK_LAYER_KHRONOS_validation + driver spec checks
     #   GENERAL    (0x1) — driver runtime notes (not spec checks)
     #   PERFORMANCE (0x4), DEVICE_ADDRESS_BINDING (0x8) — self-explanatory
-    #
-    # Only VALIDATION-typed errors are captured as hard failures — that's the
-    # "validation is the knob" contract: when you don't opt into validation,
-    # nothing is a hard failure outside of what VkResult itself reports.
-    # Driver GENERAL chatter (e.g. lavapipe's SPIR-V linter running inside
-    # vkCreateRayTracingPipelinesKHR) is informational: the API call itself
-    # returns SUCCESS, and the driver is just being loud.
-    # NOTE: Vulkan.jl's flag-set types define `&` to return another flag-set,
-    # which compares `!= 0` *as always true* (a struct is never == an Int).
-    # Coerce to UInt32 first so the bitmask check is actually a bitmask check.
-    sev_u = UInt32(severity)
-    type_u = UInt32(type)
+    # Only VALIDATION-typed errors are captured as hard failures.
     is_error = (sev_u & UInt32(Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)) != 0
     is_warning = (sev_u & UInt32(Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)) != 0
     is_validation = (type_u & UInt32(Vulkan.DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT)) != 0
-    is_setup_noise = contains(message, "adjusting settings") || contains(message, "VALIDATION-SETTINGS")
+    # Known-benign device-creation chatter that must NOT be captured as a hard
+    # validation error.  The "Device Layers have never worked" notice is a VVL
+    # deprecation (VUID-VkDeviceCreateInfo-ppEnabledLayerNames-12385) triggered
+    # because Vulkan.jl's generated `_DeviceCreateInfo` always passes a non-null
+    # `ppEnabledLayerNames` even for an empty layer list (count is 0, so it is
+    # functionally ignored by the loader).  It is a dependency-side quirk with
+    # no runtime effect; log it as a warning but don't treat it as a failure.
+    is_setup_noise = contains(message, "adjusting settings") ||
+                     contains(message, "VALIDATION-SETTINGS") ||
+                     contains(message, "Device Layers have never worked")
+    # @lava_printf output arrives at INFO severity. The Khronos layer wraps it as
+    #   "vkQueueSubmit2(): pSubmits[0] DebugPrintf:\n<user text>"
+    # Capture just the user text into PRINTF_MESSAGES, separate from validation.
+    if contains(message, "DebugPrintf")
+        marker = findlast("DebugPrintf:", message)
+        text = marker === nothing ? message :
+               lstrip(message[last(marker) + 1 : end], ['\n', '\r', ' '])
+        if length(PRINTF_MESSAGES) >= MAX_PRINTF_MESSAGES
+            popfirst!(PRINTF_MESSAGES)
+        end
+        push!(PRINTF_MESSAGES, String(text))
+        @info "lava_printf" text
+        return nothing
+    end
     if is_error && is_validation && !is_setup_noise
         if length(VALIDATION_MESSAGES) >= MAX_VALIDATION_MESSAGES
             popfirst!(VALIDATION_MESSAGES)
@@ -934,29 +1012,62 @@ function debug_callback(
         # Driver-general error (e.g. chatty lavapipe SPIR-V notes). Log but
         # don't capture — the authoritative signal is the VkResult of the
         # surrounding API call, which @vk_checked already unwraps.
-        @warn "Vulkan driver note (type=$(type), not a validation error)" message
+        @warn "Vulkan driver note (type=$(type_u), not a validation error)" message
     elseif is_warning || is_setup_noise
         @warn "Vulkan validation warning" message
     end
-    # Return VK_FALSE — can't throw from @cfunction callback (would corrupt Vulkan state).
-    # Errors are collected in VALIDATION_MESSAGES and checked after Vulkan calls.
-    return UInt32(0)
+    return nothing
+end
+
+"""
+    drain_validation_messages!()
+
+Convert any messages the async callback wrote into the ring into Strings,
+capture hard validation errors in `VALIDATION_MESSAGES`, and log them. Must be
+called on the main thread (it allocates + logs). Idempotent — only processes
+slots written since the last drain. Call this before reading
+`VALIDATION_MESSAGES` and while polling for a GPU-AV fault.
+"""
+function drain_validation_messages!()
+    write_idx = @inbounds VAL_RING_WRITE[1]
+    read_idx  = VAL_RING_READ[]
+    # If the callback lapped us, skip the slots it overwrote.
+    if write_idx - read_idx > VAL_RING_SLOTS
+        read_idx = write_idx - VAL_RING_SLOTS
+    end
+    while read_idx < write_idx
+        slot = read_idx % VAL_RING_SLOTS
+        n    = Int(@inbounds VAL_RING_LEN[slot + 1])
+        sev  = @inbounds VAL_RING_SEV[slot + 1]
+        typ  = @inbounds VAL_RING_TYPE[slot + 1]
+        message = n == 0 ? "(no message)" :
+            unsafe_string(pointer(VAL_RING_BUF) + slot * VAL_RING_SLOT_BYTES, n)
+        _handle_validation_message(message, sev, typ)
+        read_idx += 1
+    end
+    VAL_RING_READ[] = write_idx
+    return nothing
 end
 
 function setup_debug_messenger(instance::Vulkan.Instance)
     callback_ptr = @cfunction(
         debug_callback,
         UInt32,
-        (Vulkan.DebugUtilsMessageSeverityFlagEXT,
-         Vulkan.DebugUtilsMessageTypeFlagEXT,
+        (UInt32,
+         UInt32,
          Ptr{Vulkan.VkCore.VkDebugUtilsMessengerCallbackDataEXT},
          Ptr{Cvoid})
     )
 
+    # Debug printf is delivered at INFO severity, so subscribe down to INFO when
+    # it's enabled; otherwise stay at WARNING to avoid info-level chatter.
+    min_sev = get(ENV, "LAVA_DEBUG_PRINTF", "0") != "0" ?
+        Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT :
+        Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT
     messenger = Vulkan.DebugUtilsMessengerEXT(
         instance,
         callback_ptr;
-        min_severity=Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
+        min_severity=min_sev,
     )
     return messenger
 end
@@ -966,14 +1077,30 @@ end
 
 Return recent validation layer messages. Useful for diagnosing DEVICE_LOST errors.
 """
-get_validation_messages() = copy(VALIDATION_MESSAGES)
+get_validation_messages() = (drain_validation_messages!(); copy(VALIDATION_MESSAGES))
 
 """
     clear_validation_messages!()
 
-Clear the validation message buffer.
+Clear the validation message buffer. Drains the async ring first (so captured
+hard errors are logged), then empties the capture list.
 """
-clear_validation_messages!() = empty!(VALIDATION_MESSAGES)
+clear_validation_messages!() = (drain_validation_messages!(); empty!(VALIDATION_MESSAGES))
+
+"""
+    get_printf_output() -> Vector{String}
+
+Return captured `@lava_printf` output since the last clear. Drains the async
+callback ring first. Requires `enable_debug_printf!()` to have been called.
+"""
+get_printf_output() = (drain_validation_messages!(); copy(PRINTF_MESSAGES))
+
+"""
+    clear_printf_output!()
+
+Drop captured `@lava_printf` output (drains the ring first).
+"""
+clear_printf_output!() = (drain_validation_messages!(); empty!(PRINTF_MESSAGES))
 
 """
     check_validation_errors!(context::String)
@@ -984,6 +1111,7 @@ Call this after Vulkan operations that may trigger validation errors
 (shader module creation, pipeline creation, dispatch recording).
 """
 function check_validation_errors!(context::String)
+    drain_validation_messages!()
     isempty(VALIDATION_MESSAGES) && return
     # Separate true errors from warnings using the severity recorded by the callback.
     # GPU-AV messages like "Unaligned pointer access" are errors, not warnings,

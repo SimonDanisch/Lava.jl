@@ -115,6 +115,13 @@ end
         include(joinpath(@__DIR__, "test_atomics_and_dispatch.jl"))
     end
 
+    # ── Tier 3c2: On-kernel printf (DebugPrintf SPIR-V emission) ──
+    # Only the spirv-val emission test runs here; the live-output test resets the
+    # device and is opt-in via LAVA_PRINTF_LIVE=1.
+    @testset "Tier 3c2: @lava_printf" begin
+        include(joinpath(@__DIR__, "test_lava_printf.jl"))
+    end
+
     # ── Tier 3d: SPIR-V emitter pattern correctness & stress (full only) ──
     #
     # Patterns here have each, at some point, miscompiled on a specific driver

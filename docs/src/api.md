@@ -53,6 +53,16 @@ set_dispatch_logging!
 get_dispatch_log
 ```
 
+### Printing from kernels
+
+```@docs
+@lava_printf
+Lava.enable_debug_printf!
+Lava.disable_debug_printf!
+Lava.get_printf_output
+Lava.clear_printf_output!
+```
+
 ## Index
 
 ```@index

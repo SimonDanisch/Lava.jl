@@ -6283,6 +6283,46 @@ const LAVA_GLSL_MAP = Dict{String, UInt32}(
     "_lava_glsl_atan2" => UInt32(25),  # Atan2
 )
 
+# On-kernel printf via the validation layer's NonSemantic.DebugPrintf.
+#
+# The frontend (@lava_printf) encodes the format string as hex in the callee name
+# `_lava_debug_printf_<hexfmt>` and passes the runtime values as the call args
+# (already lowered to i32/i64/float/double by the llvmcall signature). We decode
+# the format back to an OpString and emit
+#   OpExtInst %void %res <DebugPrintf-set> 1 <fmtstr> <args...>
+# DebugPrintf is a non-semantic instruction: without the validation layer it is
+# inert (drivers ignore the unrecognised ext-inst set), so printing kernels still
+# run normally — they just produce no output unless debug-printf is enabled.
+function emit_debug_printf!(state::SPIRVEmitterState, inst::LLVM.CallInst, fn_name::String)
+    hexfmt = fn_name[length("_lava_debug_printf_") + 1 : end]
+    # Trailing "__<sigcodes>" disambiguates same-format/different-signature call
+    # sites (LLVM would reject two decls of one name with differing types).
+    sep = findfirst("__", hexfmt)
+    sep !== nothing && (hexfmt = hexfmt[1:first(sep) - 1])
+    fmt = String(hex2bytes(hexfmt))
+
+    set_id = setup_debug_printf!(state.mod)
+    fmt_id = emit_op_string!(state.mod, fmt)
+
+    ops = LLVM.operands(inst)            # [args..., callee]
+    arg_ids = UInt32[get_value_id!(state, ops[i]) for i in 1:(length(ops) - 1)]
+
+    void_ty = map_type!(state.type_ctx, LLVM.value_type(inst))  # call returns Cvoid
+    result_id = fresh_id!(state.mod)
+    word_count = UInt32(6 + length(arg_ids))   # opcode + restype + resid + set + instr(1) + fmt + args
+    push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpExtInst))
+    push!(state.mod.functions, void_ty)
+    push!(state.mod.functions, result_id)
+    push!(state.mod.functions, set_id)
+    push!(state.mod.functions, UInt32(1))      # DebugPrintf instruction number
+    push!(state.mod.functions, fmt_id)
+    for a in arg_ids
+        push!(state.mod.functions, a)
+    end
+    state.value_map[inst] = result_id
+    return nothing
+end
+
 function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     called = LLVM.called_operand(inst)
 
@@ -6297,6 +6337,12 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
         # Check for custom _lava_glsl_* → GLSL.std.450
         if startswith(fn_name, "_lava_glsl_")
             return emit_lava_glsl!(state, inst, fn_name)
+        end
+
+        # On-kernel printf → NonSemantic.DebugPrintf. The format string is hex-encoded
+        # into the function name by the @lava_printf frontend (see device/printf.jl).
+        if startswith(fn_name, "_lava_debug_printf_")
+            return emit_debug_printf!(state, inst, fn_name)
         end
 
         # Check for RT intrinsics → OpTraceRayKHR, payload load/store

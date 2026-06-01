@@ -787,8 +787,4 @@ end
     StaticArrays.MArray{KA.__size(Dims), T}(undef)
 end
 
-# ── Print (no-op on GPU) ──
-
-@lava_device_override @inline function KA.__print(args...)
-    # GPU print not yet supported
-end
+# KA.__print is now overridden in device/printf.jl (routes @print → DebugPrintf).

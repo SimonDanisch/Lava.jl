@@ -143,6 +143,8 @@ function GPUCompiler.isintrinsic(::LavaCompilerJob, fn::String)
     startswith(fn, "_lava_glsl_") && return true
     # RT intrinsics → SPIR-V emitter maps to OpTraceRayKHR, payload load/store
     startswith(fn, "_lava_rt_") && return true
+    # @lava_printf externals → SPIR-V emitter maps to NonSemantic.DebugPrintf
+    startswith(fn, "_lava_debug_printf_") && return true
     # OpenCL C++ mangled builtins (thread indices, barriers, math)
     fn in KNOWN_INTRINSICS && return true
     return false
