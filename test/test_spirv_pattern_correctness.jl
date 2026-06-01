@@ -1,9 +1,14 @@
-# test_nvidia_regression.jl
+# test_spirv_pattern_correctness.jl
 #
-# Regression tests for all 9 NVIDIA-specific fixes + performance optimizations.
-# Each test documents which fix it validates and the original symptom.
+# Each testset pins a SPIR-V emitter pattern that has historically miscompiled on
+# one or more drivers. The TEST is "this source pattern produces correct SPIR-V
+# and runs correctly" — vendor-neutral. The comment block above each testset
+# attributes which driver first surfaced the issue (NVIDIA, RADV, lavapipe, AMD
+# Windows, …) as historical context only; the assertion is the same on every
+# platform. If any test fails on a new vendor, that is a real correctness bug
+# either in Lava's emitter or in the driver — investigate it the same way.
 #
-# Run: julia --project=. -e 'include("test/test_nvidia_regression.jl")'
+# Run: julia --project=. -e 'include("test/test_spirv_pattern_correctness.jl")'
 #
 # These tests exercise GPU execution — they require a Vulkan device.
 

@@ -62,6 +62,74 @@ GPUCompiler.method_table(::LavaCompilerJob) = lava_method_table
 # Vulkan doesn't use GPUCompiler's kernel state mechanism
 GPUCompiler.kernel_state_type(::LavaCompilerJob) = Nothing
 
+# ── Disable loop unswitching ──
+#
+# GPUCompiler's optimizer runs `SimpleLoopUnswitchPass` (twice, at opt_level≥2).
+# When a loop contains a branch on a loop-invariant condition, unswitching
+# duplicates the loop into two bodies dispatched on that condition. After our
+# StructurizeCFG pipeline this becomes two sequential guarded loops joined by
+# `Flow` selection-merge blocks. That SPIR-V is valid and semantically correct
+# (spirv-val passes, and it matches the LLVM IR), but **NVIDIA's shader compiler
+# miscompiles it** — a comparison inside one of the unswitched loop bodies
+# silently returns the wrong result. This corrupted, with no error, anything
+# with a loop-invariant branch in a loop: e.g. every `Base.isless`-based merge
+# sort binary search (AcceleratedKernels.sort!), where the loop-invariant
+# operand's NaN check is the branch that gets unswitched.
+#
+# Unswitching is a pure optimization (never required for correctness) and brings
+# little benefit on a GPU — a branch on a uniform/loop-invariant condition is
+# cheap and doesn't diverge, while the duplicated loop body just enlarges the
+# shader. So we drop ONLY `SimpleLoopUnswitchPass` and keep every other loop
+# optimization (LICM, rotation, indvar simplify, unroll, …). This is the general
+# root-cause fix for the whole "loop-invariant branch miscompiles on NVIDIA"
+# class; pinned by `test_loop_unswitch_miscompile.jl`.
+#
+# This mirrors GPUCompiler's own `buildLoopOptimizerPipeline` verbatim except for
+# the two omitted `SimpleLoopUnswitchPass` lines. Passes live in LLVM.jl; the
+# `instcombine_pass`/`*Callbacks`/`BasicSimplifyCFGOptions` helpers are
+# GPUCompiler-internal. Dispatching on our own `LavaCompilerJob` makes this a
+# normal (precompile-safe) method extension, not piracy. If GPUCompiler's
+# pipeline changes upstream, re-sync this body (the regression test will catch a
+# silent unswitch reintroduction).
+function GPUCompiler.buildLoopOptimizerPipeline(fpm, job::LavaCompilerJob, opt_level)
+    # All pass/helper symbols are qualified `GPUCompiler.` — that's the namespace
+    # the original pipeline uses them from (some, e.g. LowerSIMDLoopPass /
+    # JuliaLICMPass, live in LLVM.Interop and are not bare `LLVM` bindings).
+    GPUCompiler.add!(fpm, GPUCompiler.NewPMLoopPassManager(; use_memory_ssa=true)) do lpm
+        GPUCompiler.add!(lpm, GPUCompiler.LowerSIMDLoopPass())
+        if opt_level >= 2
+            GPUCompiler.add!(lpm, GPUCompiler.LoopInstSimplifyPass())
+            GPUCompiler.add!(lpm, GPUCompiler.LoopSimplifyCFGPass())
+            GPUCompiler.add!(lpm, GPUCompiler.LICMPass(; allowspeculation=false))
+            GPUCompiler.add!(lpm, GPUCompiler.JuliaLICMPass())
+            GPUCompiler.add!(lpm, GPUCompiler.LoopRotatePass())
+            GPUCompiler.add!(lpm, GPUCompiler.LICMPass())
+            GPUCompiler.add!(lpm, GPUCompiler.JuliaLICMPass())
+            # SimpleLoopUnswitchPass intentionally omitted — see comment above.
+        end
+        if LLVM.version() >= v"17"
+            GPUCompiler.add!(lpm, GPUCompiler.LateLoopOptimizationsCallbacks(; opt_level))
+        end
+    end
+    if opt_level >= 2
+        GPUCompiler.add!(fpm, GPUCompiler.IRCEPass())
+    end
+    GPUCompiler.add!(fpm, GPUCompiler.SimplifyCFGPass(; GPUCompiler.BasicSimplifyCFGOptions...))
+    GPUCompiler.add!(fpm, GPUCompiler.instcombine_pass(job))
+    GPUCompiler.add!(fpm, GPUCompiler.NewPMLoopPassManager()) do lpm
+        if opt_level >= 2
+            GPUCompiler.add!(lpm, GPUCompiler.LoopIdiomRecognizePass())
+            GPUCompiler.add!(lpm, GPUCompiler.IndVarSimplifyPass())
+            # SimpleLoopUnswitchPass intentionally omitted — see comment above.
+            GPUCompiler.add!(lpm, GPUCompiler.LoopDeletionPass())
+            GPUCompiler.add!(lpm, GPUCompiler.LoopFullUnrollPass())
+        end
+        if LLVM.version() >= v"17"
+            GPUCompiler.add!(lpm, GPUCompiler.LoopOptimizerEndCallbacks(; opt_level))
+        end
+    end
+end
+
 # Allow SPIR-V intrinsic function calls to pass IR validation.
 # llvm.spv.* intrinsics are used by the LLVM SPIR-V backend.
 # OpenCL-mangled names (_Z*) are registered dynamically by our intrinsics

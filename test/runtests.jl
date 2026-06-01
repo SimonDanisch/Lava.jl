@@ -115,10 +115,20 @@ end
         include(joinpath(@__DIR__, "test_atomics_and_dispatch.jl"))
     end
 
-    # ── Tier 3d: NVIDIA Regression & Stress Tests (full only) ──
+    # ── Tier 3d: SPIR-V emitter pattern correctness & stress (full only) ──
+    #
+    # Patterns here have each, at some point, miscompiled on a specific driver
+    # (NVIDIA / RADV / AMDVLK / lavapipe). The pattern is the test identity, not
+    # the vendor. Every test runs the same way on every platform — if it fails
+    # somewhere new, that is a real correctness regression. There are no
+    # vendor-conditional code paths in src/, and so there must be no
+    # vendor-conditional tests here either.
     if FULL_MODE
-        @testset "Tier 3d: NVIDIA Regression & Stress" begin
-            include(joinpath(@__DIR__, "test_nvidia_regression.jl"))
+        @testset "Tier 3d: SPIR-V Pattern Correctness & Stress" begin
+            include(joinpath(@__DIR__, "test_spirv_pattern_correctness.jl"))
+            include(joinpath(@__DIR__, "test_loop_unswitch_miscompile.jl"))
+            include(joinpath(@__DIR__, "test_psb_chain_fold.jl"))
+            include(joinpath(@__DIR__, "test_repeat_inner_3d.jl"))
         end
     end
 

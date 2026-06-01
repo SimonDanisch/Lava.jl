@@ -48,10 +48,14 @@ else
         camera = Hikari.PerspectiveCamera(Point3f(0, -3, 1.5), Point3f(0, 0, 0.35),
                                           film; fov=50f0)
 
-        empty!(Lava.VALIDATION_MESSAGES)
+        Lava.clear_validation_messages!()
         vp = Hikari.VolPath(samples=1, max_depth=1, hw_accel=true)
         vp(scene, gpu_film, camera)
         close(vp)
+
+        # The async debug callback writes into a ring; pull anything not yet
+        # surfaced by the render's own flushes into VALIDATION_MESSAGES.
+        Lava.drain_validation_messages!()
 
         # `Lava.VALIDATION_MESSAGES` collects setup-noise warnings (validation
         # layer adjusts settings on init) alongside real errors.  Filter to
@@ -78,5 +82,36 @@ else
         @test isempty(real_messages)
         # Also assert the device didn't actually go lost during the render.
         @test !Lava.device_lost(ctx)
+    end
+
+    # Regression for the GPU-AV fault-readback DEADLOCK.
+    #
+    # The Vulkan debug-utils callback used to `@error`/`push!` (allocate + log)
+    # from inside the driver's GPU-AV error readback, which the layer invokes
+    # re-entrantly during `vkWaitSemaphores`.  Logging there yields to the Julia
+    # scheduler while the driver holds an internal lock, hanging the process
+    # forever after the FIRST caught fault (reproduced on the RTX 4000 Ada:
+    # the OOB printed once, then the session wedged).  The callback is now
+    # async-safe — it only `memcpy`s the message into a preallocated ring and
+    # the main thread drains it later — so a caught fault returns control
+    # cleanly.  `verify_gpu_av` drives a known out-of-bounds BDA store and must
+    # report it within a bounded time; if the callback regresses to allocating
+    # or logging, this hangs (caught by a CI watchdog) or never surfaces the OOB.
+    @testset "GPU-AV fault readback does not hang" begin
+        Lava.enable_gpu_av(pool_disabled=true)
+        ctx = Lava.vk_context()
+        if !ctx.gpu_assisted
+            @info "GPU-AV did not attach on this driver — skipping fault-readback test"
+            @test_skip true
+        else
+            # First caught fault must be reported (this is exactly the call that
+            # used to hang forever).
+            @test Lava.verify_gpu_av(timeout=30.0) == true
+            # And we must be able to KEEP GOING: a second probe proves the
+            # post-fault `vk_reset_device!` left a usable, still-instrumented
+            # device rather than a wedged one.
+            @test Lava.verify_gpu_av(timeout=30.0) == true
+        end
+        Lava.disable_gpu_av()
     end
 end

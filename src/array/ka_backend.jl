@@ -596,17 +596,26 @@ end
 @inline function linear_index(dims::NTuple{2,Int}, I::CartesianIndex{2})
     I[1] + dims[1] * (I[2] - 1)
 end
+# Horner form. The naive column-major expansion
+#   I[1] + dims[1]*(I[2]-1) + dims[1]*dims[2]*(I[3]-1) + …
+# forms a standalone `dims[1]*dims[2]` product (and shares `dims[1]` across two
+# terms). NVIDIA's shader compiler miscompiles exactly that shape when the result
+# feeds a PhysicalStorageBuffer load offset: it drops the I[1] term, so every read
+# lands on source row 1. Horner factoring keeps each stride coefficient as a single
+# value applied to a running sum, never materialising the nested product, which the
+# driver evaluates correctly. Symptom was `repeat(x; inner)` with a 3-D `inner`
+# (GPUArrays repeat_inner_dst_kernel! → xs[CartesianIndex(sdx)]). Pinned by
+# test_repeat_inner_3d.jl. Same NVIDIA complex-integer family as the unswitch and
+# shared-PSB-access-chain miscompiles.
 @inline function linear_index(dims::NTuple{3,Int}, I::CartesianIndex{3})
-    I[1] + dims[1] * (I[2] - 1) + dims[1] * dims[2] * (I[3] - 1)
+    I[1] + dims[1] * ((I[2] - 1) + dims[2] * (I[3] - 1))
 end
 @inline function linear_index(dims::NTuple{N,Int}, I::CartesianIndex{N}) where N
-    idx = I[1]
-    stride = 1
-    for d in 2:N
-        stride *= dims[d-1]
-        idx += stride * (I[d] - 1)
+    off = I[N] - 1
+    @inbounds for d in (N-1):-1:1
+        off = off * dims[d] + (I[d] - 1)
     end
-    return idx
+    return off + 1
 end
 
 # Ptr{T} indexing overrides are intentionally absent — device kernels never

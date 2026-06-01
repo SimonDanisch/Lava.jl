@@ -166,6 +166,12 @@ end
     (Base.MultiplicativeInverses._mul_high(a % UInt64, b % UInt64) - t1 - t2) % Int64
 end
 
+# NOTE: `Base.isless(::IEEEFloat,...)` used to be overridden here with a
+# branchless version to dodge an NVIDIA miscompile. That was a band-aid: the real
+# bug was loop unswitching turning the isless NaN-guard branch into a double-loop
+# NVIDIA mis-structures. It's now fixed generally by disabling SimpleLoopUnswitch
+# in `compiler/target.jl`, so no isless override is needed.
+
 # ── sincos domain error ──
 @lava_device_override function Base.Math.sincos_domain_error(x)
     return nothing

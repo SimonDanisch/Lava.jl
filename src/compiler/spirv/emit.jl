@@ -121,6 +121,18 @@ mutable struct SPIRVEmitterState
     # Maps SPIR-V result IDs to their actual emitted LLVM-level type when it
     # differs from the source IR value type.
     spirv_id_llvm_type::Dict{UInt32, LLVM.LLVMType}
+    # PSB OpPtrAccessChain folding: maps a chain result id → (root_base_id, accumulated_index_id).
+    # Used to flatten chained PSB access chains (`gep(gep(base, c), idx)`) into a single
+    # OpPtrAccessChain from the root with a combined index, so a loop-invariant intermediate
+    # (e.g. the `base + (-1)` from 1-based indexing) is never SHARED by multiple loads — NVIDIA
+    # miscompiles a multi-use intermediate PSB access chain (2+ loads from it in a loop read 0).
+    psb_access_chain::Dict{UInt32, Tuple{UInt32, UInt32}}
+    # The pointee LLVM type a pointer value was ACTUALLY emitted with. The PTM can evolve
+    # between a pointer's emission and a later use (usage-inference backprop), so for
+    # reconciling pointer `OpSelect` operands — which must share the result type, and which
+    # for PSB pointers cannot be bridged with OpBitcast — we record the emitted pointee here
+    # and pick the select result type from it rather than from the (possibly newer) PTM.
+    value_emitted_pointee::Dict{LLVM.Value, LLVM.LLVMType}
 end
 
 function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
@@ -147,6 +159,8 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         nothing,  # data_layout (set by caller)
         Dict{UInt32, LLVM.LLVMType}(),  # spirv_var_pointee
         Dict{UInt32, LLVM.LLVMType}(),  # spirv_id_llvm_type
+        Dict{UInt32, Tuple{UInt32, UInt32}}(),  # psb_access_chain
+        Dict{LLVM.Value, LLVM.LLVMType}(),  # value_emitted_pointee
     )
 end
 
@@ -1085,6 +1099,16 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
         map_pointer_type_for_value!(state.type_ctx, inst)
     else
         map_type!(state.type_ctx, load_ty)
+    end
+
+    # Record the pointee this pointer-load is ACTUALLY emitted with (the i8 fallback in
+    # map_pointer_type_for_value! kicks in when the load is only dereferenced through an
+    # opaque op like a select). Pointer `OpSelect` reconciliation reads this so the select's
+    # result type matches its operands, instead of a later-inferred (and PSB-unbitcastable)
+    # type. Mirror map_pointer_type_for_value!'s first-level decision: PTM pointee, else i8.
+    if load_ty isa LLVM.PointerType
+        emitted_pointee = get_pointee_type(state.type_ctx.ptm, inst)
+        state.value_emitted_pointee[inst] = emitted_pointee === nothing ? LLVM.Int8Type() : emitted_pointee
     end
 
     # Handle struct-pointer mismatch: SROA may optimize
@@ -4497,10 +4521,30 @@ function emit_psb_ptr_arithmetic!(state::SPIRVEmitterState, base_id::UInt32,
     is_scalar = !(element_ty isa LLVM.StructType) && !(element_ty isa LLVM.ArrayType)
     if is_scalar && !type_mismatch
         ensure_array_stride_decoration!(state, result_ptr_ty, element_ty)
+        is_i64 = idx_llvm_ty isa LLVM.IntegerType && LLVM.width(idx_llvm_ty) == 64
+        # Chain-fold: when the base is itself a tracked PSB access chain, combine the
+        # indices and emit a fresh OpPtrAccessChain from the ROOT base. This guarantees
+        # the loop-invariant intermediate (e.g. `base + (-1)` from 1-based indexing) is
+        # never shared by multiple loads — a multi-use intermediate PSB access chain is
+        # miscompiled by NVIDIA (2+ loads off it in a loop read 0). The now-unused
+        # intermediate is dead-code-eliminated by spirv-opt. Only folds i64-indexed
+        # chains (the common float/int array case) so operand types match for OpIAdd.
+        if is_i64 && haskey(state.psb_access_chain, base_id)
+            root_id, prev_idx = state.psb_access_chain[base_id]
+            i64_ty = map_type!(state.type_ctx, idx_llvm_ty)
+            combined = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpIAdd, i64_ty, combined, prev_idx, idx_id)
+            result_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpPtrAccessChain,
+                                result_ptr_ty, result_id, root_id, combined)
+            state.psb_access_chain[result_id] = (root_id, combined)
+            return result_id
+        end
         result_id = fresh_id!(state.mod)
         # OpPtrAccessChain result_type result_id base element
         encode_instruction!(state.mod.functions, Op.OpPtrAccessChain,
                             result_ptr_ty, result_id, base_id, idx_id)
+        is_i64 && (state.psb_access_chain[result_id] = (base_id, idx_id))
         return result_id
     end
 
@@ -5789,6 +5833,32 @@ function emit_select!(state::SPIRVEmitterState, inst::LLVM.SelectInst)
     true_val = get_value_id!(state, ops[2])
     false_val = get_value_id!(state, ops[3])
     llvm_ty = LLVM.value_type(inst)
+
+    # Pointer select: SPIR-V's OpSelect requires both objects to have the *result* type.
+    # The operands were already emitted with some concrete pointer type; reconcile from
+    # those ACTUALLY-emitted pointees rather than a possibly-newer PTM inference. This is
+    # essential for PhysicalStorageBuffer pointers, which cannot be OpBitcast: e.g. two
+    # array base pointers (emitted as ptr<uchar> because their only use is this select) fed
+    # into a select whose result the PTM has since inferred as ptr<float> — emitting that
+    # gives an invalid `OpSelect ptr<float> %u8 %u8`.
+    if llvm_ty isa LLVM.PointerType
+        t_pte = get(state.value_emitted_pointee, ops[2], nothing)
+        f_pte = get(state.value_emitted_pointee, ops[3], nothing)
+        if t_pte !== nothing && t_pte == f_pte
+            # Both operands carry the same emitted pointee — use it verbatim for the result.
+            # High priority so it wins over usage-inference backprop; the select's only
+            # consumer (a GEP/load) then sees this pointee and, for PSB, takes the
+            # type-agnostic byte-arithmetic path for any differently-typed element access.
+            set_pointee_type!(state.type_ctx.ptm, inst, t_pte; priority=50)
+            result_ty = map_pointer_type_for_value!(state.type_ctx, inst)
+            state.value_emitted_pointee[inst] = t_pte
+            result_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpSelect, result_ty, result_id, cond, true_val, false_val)
+            state.value_map[inst] = result_id
+            return
+        end
+    end
+
     result_ty = if llvm_ty isa LLVM.PointerType
         # Opaque pointer — try to get type from true/false operands first
         pointee = get_pointee_type(state.type_ctx.ptm, ops[2])
@@ -5805,7 +5875,9 @@ function emit_select!(state::SPIRVEmitterState, inst::LLVM.SelectInst)
     # For pointer selects, ensure both operands have the same SPIR-V type as result.
     # LLVM opaque pointers are all `ptr`, but SPIR-V has distinct typed pointers.
     # Try to map each operand's pointer type; if it differs from result_ty, bitcast.
-    if llvm_ty isa LLVM.PointerType
+    # NEVER bitcast PhysicalStorageBuffer pointers (OpBitcast on PSB pointers is invalid in
+    # Vulkan) — the emitted-pointee reconciliation above is the PSB path.
+    if llvm_ty isa LLVM.PointerType && get_pointer_storage_class(ops[2]) != SC.PhysicalStorageBuffer
         for (i, op_llvm) in ((2, ops[2]), (3, ops[3]))
             op_pointee = get_pointee_type(state.type_ctx.ptm, op_llvm)
             res_pointee = get_pointee_type(state.type_ctx.ptm, inst)
@@ -5824,6 +5896,10 @@ function emit_select!(state::SPIRVEmitterState, inst::LLVM.SelectInst)
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, Op.OpSelect, result_ty, result_id, cond, true_val, false_val)
     state.value_map[inst] = result_id
+    if llvm_ty isa LLVM.PointerType
+        rp = get_pointee_type(state.type_ctx.ptm, inst)
+        rp !== nothing && (state.value_emitted_pointee[inst] = rp)
+    end
 end
 
 # ================================================================
