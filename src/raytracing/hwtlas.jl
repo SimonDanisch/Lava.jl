@@ -898,3 +898,81 @@ end
         Float32(d[1]), Float32(d[2]), Float32(d[3]), Float32(ray.t_max))
     return _hw_rq_collect(accel)
 end
+
+# ── HWTLAS-bound compute dispatch overloads (specialized on `tlas` type) ──
+#
+# These are the type-dispatched counterparts to the no-TLAS fast paths in
+# runtime/command.jl. Splitting on `tlas` type at the method level removes the
+# `pipeline.needs_tlas_descriptor` runtime branch and the `extra_dst_access`
+# ternary from every pure-compute record. The lava_launch! TLAS-vs-no-TLAS
+# safety check still runs before getting here, so we know `pipeline` agrees
+# with `tlas`.
+
+@inline function vk_dispatch_base!(bq::BatchQueue, pipeline::LavaComputePipeline, push_bda::UInt64,
+                                   base_x::Int, base_y::Int, base_z::Int,
+                                   gx::Int, gy::Int, gz::Int, tlas::HWTLAS)
+    dispatch_info = DISPATCH_LOGGING_ENABLED[] ?
+        "$(LAST_DISPATCH_INFO[]) base=($base_x,$base_y,$base_z) g=($gx,$gy,$gz)" : ""
+    record_dispatch!(bq;
+        dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        extra_dst_access=Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+        info=dispatch_info
+    ) do batch
+        cmd = batch.cmd_buf
+        Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline)
+        pin!(batch, pipeline)
+        _bind_compute_tlas!(batch, cmd, pipeline, tlas)
+        push_constants_bda!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_bda)
+        if base_x == 0 && base_y == 0 && base_z == 0
+            Vulkan.cmd_dispatch(cmd, UInt32(gx), UInt32(gy), UInt32(gz))
+        else
+            Vulkan.cmd_dispatch_base(cmd,
+                UInt32(base_x), UInt32(base_y), UInt32(base_z),
+                UInt32(gx), UInt32(gy), UInt32(gz))
+        end
+    end
+end
+
+@inline function vk_dispatch_indirect_base!(bq::BatchQueue, pipeline::LavaComputePipeline,
+                                            push_bda::UInt64,
+                                            indirect, tlas::HWTLAS)
+    dispatch_info = DISPATCH_LOGGING_ENABLED[] ?
+        "$(LAST_DISPATCH_INFO[]) (indirect)" : ""
+    record_dispatch!(bq;
+        dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+        extra_dst_access=Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT |
+                          Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+        info=dispatch_info
+    ) do batch
+        cmd = batch.cmd_buf
+        Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline)
+        pin!(batch, pipeline)
+        _bind_compute_tlas!(batch, cmd, pipeline, tlas)
+        push_constants_bda!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_bda)
+        mb = indirect.buf[]::VkManagedBuffer
+        byte_offset = UInt64(indirect.offset)
+        Vulkan.cmd_dispatch_indirect(cmd, mb.buffer, byte_offset)
+        pin!(batch, indirect)
+    end
+end
+
+# Shared TLAS-bind body, deduplicated between direct and indirect.
+@inline function _bind_compute_tlas!(batch, cmd, pipeline::LavaComputePipeline, tlas::HWTLAS)
+    lava_tlas = tlas.hw_tlas::LavaTLAS
+    dev = batch.bq.ctx.device
+    desc_pool, desc_set = alloc_compute_tlas_descriptor_set(dev, pipeline, lava_tlas)
+    Vulkan.cmd_bind_descriptor_sets(cmd, Vulkan.PIPELINE_BIND_POINT_COMPUTE,
+        pipeline.pipeline_layout, UInt32(0), [desc_set], UInt32[])
+    pin!(batch, desc_pool)
+    pin!(batch, lava_tlas.accel)
+    pin!(batch, lava_tlas.storage)
+    # Pin every BLAS the TLAS references — rayQuery walks the TLAS into its
+    # BLASes and reads their storage; without pinning each BLAS storage,
+    # `Raycore.sync!`-driven BLAS swaps can free a BLAS whose GPU memory the
+    # GPU is still using through this dispatch.
+    for blas in lava_tlas.blases
+        pin!(batch, blas.accel)
+        pin!(batch, blas.storage)
+    end
+    return nothing
+end

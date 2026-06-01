@@ -221,6 +221,40 @@ KA.argconvert(::KA.Kernel{LavaBackend}, x) = x
     return acc
 end
 
+# Cached per-kernel iteration plan. Key = (typeof(obj), ndrange, workgroupsize).
+# The plan only depends on those — `typeof(obj)` carries the F type plus KA's
+# static NDRange / WG-size type parameters, so two Kernel instances with the same
+# shape share the plan. Built lazily on first launch.
+struct _IterPlan{Ctx}
+    ka_ctx::Ctx
+    block_dims::NTuple{3, Int}
+    ws_3d::NTuple{3, Int}
+    nblocks::Int
+end
+const KERNEL_ITER_PLAN_CACHE = Dict{Any, _IterPlan}()
+
+function get_or_build_iter_plan(obj::KA.Kernel{LavaBackend}, ndrange, workgroupsize,
+                                vkctx::VkContext)
+    key = (typeof(obj), ndrange, workgroupsize)
+    plan = get(KERNEL_ITER_PLAN_CACHE, key, nothing)
+    plan === nothing || return plan::_IterPlan
+
+    ndr_canon, _ws, iterspace, _dyn = KA.launch_config(obj, ndrange, workgroupsize)
+    ka_ctx  = KA.mkcontext(obj, ndr_canon, iterspace)
+    blocks  = KA.blocks(iterspace)
+    nblocks = length(blocks)
+    if nblocks == 0
+        new_plan = _IterPlan(ka_ctx, (0, 0, 0), (0, 0, 0), 0)
+    else
+        block_dims = pad_to_3d(vkctx, size(blocks))
+        nthreads   = length(KA.workitems(iterspace))
+        ws_3d      = (nthreads, 1, 1)
+        new_plan   = _IterPlan(ka_ctx, block_dims, ws_3d, nblocks)
+    end
+    KERNEL_ITER_PLAN_CACHE[key] = new_plan
+    return new_plan
+end
+
 function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=nothing)
     validate_launch_args(args)
     bq = obj.backend.bq
@@ -236,20 +270,20 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
         pin_leaves!(batch, args)
         adaptor = LavaAdaptor(batch)
         converted_args = map(a -> Adapt.adapt(adaptor, a), args)
-        ka_launch_indirect!(obj, converted_args, ndrange, workgroupsize, args, adaptor; tlas)
+        ka_launch_indirect!(obj, converted_args, ndrange, workgroupsize, args, adaptor, bq, tlas)
         return nothing
     end
 
-    ndrange, workgroupsize, iterspace, dynamic = KA.launch_config(obj, ndrange, workgroupsize)
-    ka_ctx = KA.mkcontext(obj, ndrange, iterspace)
-
-    blocks = KA.blocks(iterspace)
-    nblocks = length(blocks)
-    nblocks == 0 && return nothing
-
-    block_dims = pad_to_3d(bq.ctx::VkContext, size(blocks))
-    nthreads = length(KA.workitems(iterspace))
-    ws_3d = (nthreads, 1, 1)
+    # KA's launch_config / partition / mkcontext / blocks / workitems plus our
+    # pad_to_3d add up to ~50% of per-record cost in tight loops, yet they only
+    # depend on (typeof(obj), ndrange, workgroupsize) — typeof(obj) carries the
+    # static NDRange/WG-size and F type parameters. Cache the whole plan so the
+    # second-and-later launch with the same shape is one Dict lookup.
+    plan = get_or_build_iter_plan(obj, ndrange, workgroupsize, bq.ctx::VkContext)
+    plan.nblocks == 0 && return nothing
+    ka_ctx     = plan.ka_ctx
+    block_dims = plan.block_dims
+    ws_3d      = plan.ws_3d
 
     batch = ensure_active_batch!(bq)
     # Side-effect pass: pin every LavaArray leaf in the closure + args into
@@ -262,7 +296,7 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     converted_args = map(a -> Adapt.adapt(adaptor, a), args)
     all_args = (converted_f, ka_ctx, converted_args...)
 
-    ka_launch!(bq, converted_f, all_args, block_dims, ws_3d; tlas)
+    ka_launch!(bq, converted_f, all_args, block_dims, ws_3d, tlas)
 
     return nothing
 end
@@ -341,8 +375,9 @@ Internal launch function for KA kernels. Compiles and dispatches the GPU functio
 """
 const DBG_LAUNCH_COUNT = Ref(0)
 
-function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple, block_dims::NTuple{3,Int}, workgroup_size::NTuple{3,Int};
-                    tlas=nothing)
+function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple,
+                    block_dims::NTuple{3,Int}, workgroup_size::NTuple{3,Int},
+                    tlas=nothing)  # positional, Nothing default — hot path
     DBG_LAUNCH_COUNT[] += 1
     _n = DBG_LAUNCH_COUNT[]
     # Build type tuple for compilation (excludes f — GPUCompiler prepends typeof(f)).
@@ -376,7 +411,7 @@ function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple, block_dim
     if DISPATCH_LOGGING_ENABLED[]
         LAST_DISPATCH_INFO[] = "ka f=$(dispatch_name(f, all_args)) groups=$block_dims"
     end
-    vk_dispatch!(bq, pipeline, arg_buf.address, block_dims; tlas)
+    vk_dispatch!(bq, pipeline, arg_buf.address, block_dims, tlas)
 
     return nothing
 end
@@ -478,9 +513,10 @@ Launch a KA kernel using indirect dispatch. `ndrange_buf` is a GPU array contain
 the work item count (1-element Int32 array). The prepare-indirect kernel writes
 group counts to an indirect buffer, then vk_dispatch_indirect! dispatches the main kernel.
 """
-function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, original_args, adaptor::LavaAdaptor;
+function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, original_args,
+                             adaptor::LavaAdaptor,
                              bq::BatchQueue=obj.backend.bq,
-                             tlas=nothing)
+                             tlas=nothing)  # positional — same NamedTuple-avoidance as ka_launch!
     # Respect static workgroup size from @kernel definition
     ws = if workgroupsize !== nothing
         workgroupsize isa Integer ? (workgroupsize,) : workgroupsize
@@ -536,7 +572,7 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
     if DISPATCH_LOGGING_ENABLED[]
         LAST_DISPATCH_INFO[] = "indirect f=$(dispatch_name(obj.f, all_args))"
     end
-    vk_dispatch_indirect!(bq, pipeline, arg_buf.address, indirect_view; tlas)
+    vk_dispatch_indirect!(bq, pipeline, arg_buf.address, indirect_view, tlas)
 
     end # GC.@preserve
 

@@ -163,7 +163,7 @@ function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
     if DISPATCH_LOGGING_ENABLED[]
         LAST_DISPATCH_INFO[] = "compute f=$(nameof(typeof(converted_f))) groups=$groups"
     end
-    vk_dispatch!(bq, pipeline, arg_buf.address, groups; tlas)
+    vk_dispatch!(bq, pipeline, arg_buf.address, groups, tlas)
     return nothing
 end
 
