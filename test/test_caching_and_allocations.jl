@@ -143,16 +143,24 @@ using KernelAbstractions
     end
 
     # ── 5. GC pressure tracking ──
-    # `GPU_BYTES_SINCE_LAST_GC` is still a module-level counter; the only drift
-    # was `vk_alloc(::Int64)` → `vk_alloc(::BatchQueue, ::Integer)`.
+    # After the AMDGPU.jl-style refactor of `maybe_collect`, the byte counter
+    # `GPU_BYTES_SINCE_LAST_GC` is gone — pressure is read directly from
+    # `GPU_LIVE_BYTES / heap_size`.  Verify the live-bytes accounting still
+    # increments on `vk_alloc` and decrements on `vk_free!`.
     @testset "GC pressure tracking" begin
-        @testset "GPU_BYTES_SINCE_LAST_GC increments" begin
+        @testset "GPU_LIVE_BYTES tracks vk_alloc / vk_free!" begin
             bq = Lava.vk_context().default_bq
-            before = Lava.GPU_BYTES_SINCE_LAST_GC[]
+            before = Lava.GPU_LIVE_BYTES[]
             buf = Lava.vk_alloc(bq, 1024)
-            after = Lava.GPU_BYTES_SINCE_LAST_GC[]
-            @test after >= before + 1024
+            after_alloc = Lava.GPU_LIVE_BYTES[]
+            @test after_alloc >= before + 1024
             Lava.vk_free!(buf)
+            # Buffer may be deferred (timeline gate); a sync ensures destroy
+            # actually runs and decrements GPU_LIVE_BYTES.
+            Lava.vk_flush!(Lava.vk_context())
+            Lava.drain_deferred_frees!(bq)
+            after_free = Lava.GPU_LIVE_BYTES[]
+            @test after_free <= after_alloc
         end
     end
 

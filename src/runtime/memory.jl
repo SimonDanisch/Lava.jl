@@ -124,55 +124,135 @@ const BDA_POISON = UInt64(0)
 push!(RESET_CALLBACKS, function()
     empty!(LIVE_BUFFERS)
     GPU_LIVE_BYTES[] = 0
-    GPU_BYTES_SINCE_LAST_GC[] = 0
+    reset_memory_stats!()
     # Per-BQ staging, indirect, and arg slabs die with the old ctx.
 end)
 
-# ── GPU memory pressure tracking ──
+# ── GPU memory pressure tracking (ported from AMDGPU.jl) ──
 # Julia's GC doesn't know about GPU memory. LavaArray wrappers are ~50 bytes on
 # the CPU heap, but back 100+ MB of VRAM each. Without pressure signals, GC
 # never fires and dead GPU buffers accumulate until OOM.
-# Solution: track live GPU bytes and trigger GC.gc(false) proactively,
-# matching AMDGPU.jl's maybe_collect() pattern.
+#
+# Strategy mirrors `AMDGPU.jl/src/memory.jl::maybe_collect`:
+#   * Pressure-based trigger (`live / heap_size`), not raw byte counter, so the
+#     same logic works for 8 GiB iGPUs and 24 GiB dGPUs without tuning.
+#   * GC-rate budget: collector skips itself when it has already spent more than
+#     ~5% of wall time in GC (`last_gc_time / dt`).  Budget doubles on high
+#     pressure, on blocking calls, and after a productive collection.
+#   * Only `GC.gc(false)` (incremental) is ever called automatically — full GC
+#     is too expensive to fire from the alloc hot path; if we're truly OOM the
+#     caller's retry loop in `vk_alloc` runs the full GC explicitly.
+#   * EWMA on `last_gc_time` so a single slow GC doesn't permanently inhibit
+#     future GCs.
+#
+# `GPU_LIVE_BYTES` is incremented by `try_vk_alloc` (real Vulkan allocations,
+# including pool blocks) and decremented by `destroy_buffer!`.  Sub-pool chunks
+# don't move this counter — the pool block they live in already accounts for
+# the VRAM.
 const GPU_LIVE_BYTES = Threads.Atomic{Int}(0)
-const GPU_BYTES_SINCE_LAST_GC = Threads.Atomic{Int}(0)
-const GPU_LAST_INCR_GC_TIME = Ref(0.0)
-const GPU_LAST_FULL_GC_TIME = Ref(0.0)
+
+mutable struct MemoryStats
+    # Estimated maximum bytes available to us on the device-local heap.
+    # Probed lazily from `ctx.memory_properties` and refreshed every 10s.
+    @atomic size::Int
+    @atomic last_updated::Float64
+
+    # Last `maybe_collect` run + the rolling cost of that GC.
+    @atomic last_time::Float64
+    @atomic last_gc_time::Float64
+    # Bytes freed by the most recent `maybe_collect`-triggered GC.
+    @atomic last_freed::Int
+end
+
+MemoryStats() = MemoryStats(0, 0.0, 0.0, 0.0, 0)
+
+const MEMORY_STATS = MemoryStats()
+
+const EAGER_GC = Ref{Bool}(true)
 
 """
-    maybe_collect()
+    eager_gc!(flag::Bool)
 
-Trigger GC if GPU allocation pressure is high. Julia's GC doesn't know about
-VRAM — LavaArray wrappers are ~50 bytes on the CPU heap but back hundreds of
-MB of GPU memory. Without this, dead GPU buffers accumulate until OOM.
-
-Tracks bytes allocated since last GC (not total live bytes), so steady-state
-rendering with stable GPU memory doesn't trigger unnecessary GC cycles.
-
-Two tiers (with separate timers so incremental GC doesn't starve full GC):
-- >256 MiB new allocs: incremental GC (rate-limited to every 100ms)
-- >512 MiB new allocs: full GC (rate-limited to every 2s)
-
-Called from `vk_alloc` before each allocation.
+Enable/disable the pressure-driven `maybe_collect`.  Useful when benchmarking,
+to take the allocator's GC hooks out of the measurement.
 """
-function maybe_collect()
-    since_gc = GPU_BYTES_SINCE_LAST_GC[]
-    since_gc < 256 * 1024 * 1024 && return  # <256 MiB new allocs: no pressure
-    t = time()
-    # Full GC has its own timer — incremental GC must not starve it.
-    # atomic_xchg! is the ONLY safe reset: a plain `[]=0` would lose any
-    # atomic_add! that races with our read → the bytes-since counter would
-    # drift negative (effectively) and future GCs would never fire.
-    if since_gc > 512 * 1024 * 1024 && (t - GPU_LAST_FULL_GC_TIME[]) > 2.0
-        GPU_LAST_FULL_GC_TIME[] = t
-        GPU_LAST_INCR_GC_TIME[] = t
-        Threads.atomic_xchg!(GPU_BYTES_SINCE_LAST_GC, 0)
-        GC.gc(true)
-    elseif (t - GPU_LAST_INCR_GC_TIME[]) > 0.1
-        GPU_LAST_INCR_GC_TIME[] = t
-        Threads.atomic_xchg!(GPU_BYTES_SINCE_LAST_GC, 0)
-        GC.gc(false)
+eager_gc!(flag::Bool) = (EAGER_GC[] = flag)
+
+function reset_memory_stats!()
+    @atomic MEMORY_STATS.size = 0
+    @atomic MEMORY_STATS.last_updated = 0.0
+    @atomic MEMORY_STATS.last_time = 0.0
+    @atomic MEMORY_STATS.last_gc_time = 0.0
+    @atomic MEMORY_STATS.last_freed = 0
+    return
+end
+
+"""Sum of device-local heap sizes in bytes for `ctx`'s physical device."""
+function probe_device_local_heap(ctx::VkContext)
+    mem_props = ctx.memory_properties
+    total = 0
+    for i in 0:(mem_props.memory_heap_count - 1)
+        heap = mem_props.memory_heaps[i + 1]
+        if (UInt32(heap.flags) & UInt32(Vulkan.MEMORY_HEAP_DEVICE_LOCAL_BIT)) != 0
+            total += Int(heap.size)
+        end
     end
+    return total
+end
+
+"""
+    maybe_collect(ctx::VkContext; blocking::Bool=false)
+
+Trigger an incremental GC if GPU pressure is high.  Ported from
+`AMDGPU.jl/src/memory.jl::maybe_collect`.
+
+Called from `vk_alloc` and `pool_alloc` before allocating.  `blocking=true`
+lowers the pressure threshold and inflates the rate budget — use it when the
+caller is about to do a heavy synchronous operation anyway.
+"""
+function maybe_collect(ctx::VkContext; blocking::Bool=false)
+    EAGER_GC[] || return
+    stats = MEMORY_STATS
+    current_time = time()
+
+    # Refresh device heap estimate every 10s.  The heap size itself doesn't
+    # change, but on iGPUs with shared memory another process could shift what
+    # we can actually use; a periodic re-probe keeps us honest if we later
+    # adopt VK_EXT_memory_budget for real free-memory tracking.
+    if current_time - (@atomic stats.last_updated) > 10.0
+        max_size = probe_device_local_heap(ctx)
+        @atomic stats.size = max_size
+        @atomic stats.last_updated = current_time
+    end
+
+    size = (@atomic stats.size)
+    size > 0 || return  # haven't probed yet
+
+    live = GPU_LIVE_BYTES[]
+    pressure = live / size
+    min_pressure = blocking ? 0.5 : 0.75
+    pressure < min_pressure && return
+
+    # GC rate budget: skip if we've already burned >5% wall time on GC.
+    last_time = @atomic stats.last_time
+    last_gc_time = @atomic stats.last_gc_time
+    dt = current_time - last_time
+    gc_rate = dt > 0 ? last_gc_time / dt : 0.0
+    max_gc_rate = 0.05
+    (@atomic stats.last_freed) > 0.1 * size && (max_gc_rate *= 2)
+    blocking && (max_gc_rate *= 2)
+    pressure > 0.9 && (max_gc_rate *= 2)
+    pressure > 0.95 && (max_gc_rate *= 2)
+    gc_rate > max_gc_rate && return
+
+    @atomic stats.last_time = current_time
+
+    pre_gc_live = live
+    gc_time = Base.@elapsed GC.gc(false)
+    post_gc_live = GPU_LIVE_BYTES[]
+
+    @atomic stats.last_freed = pre_gc_live - post_gc_live
+    @atomic stats.last_gc_time = 0.75 * last_gc_time + 0.25 * gc_time
     return
 end
 
@@ -210,7 +290,7 @@ function vk_alloc(bq::BatchQueue, nbytes::Integer;
     sweep_retired_batches!(bq)
     drain_deferred_frees!(bq)
     drain_deferred_as_frees!(bq)
-    maybe_collect()
+    maybe_collect(bq.ctx::VkContext)
     result = try_vk_alloc(bq, nbytes; extra_usage, unified)
     if result !== nothing
         return result
@@ -299,7 +379,6 @@ function try_vk_alloc(bq::BatchQueue, nbytes::Integer;
     result = VkManagedBuffer(buf, memory, address, mapped_ptr, Int(nbytes), 0, nothing, nothing, BUF_STATE_ALIVE, ctx)
     push!(LIVE_BUFFERS, result)
     Threads.atomic_add!(GPU_LIVE_BYTES, nbytes)
-    Threads.atomic_add!(GPU_BYTES_SINCE_LAST_GC, nbytes)
     if ALLOC_DEBUG_ENABLED[]
         push!(ALLOC_DEBUG_LOG,
               (kind=:direct, addr=address, size=Int(nbytes), pool=false,
@@ -733,6 +812,12 @@ function pool_alloc(bq::BatchQueue, nbytes::Integer; extra_usage::UInt32=UInt32(
         _record_alloc_site!(nbytes)
     end
     sweep_retired_batches!(bq)
+    drain_deferred_frees!(bq)
+    # Pressure-driven GC, identical hook to `vk_alloc`.  Without this the pool
+    # fast path silently grows VRAM until the bump pointers exhaust every block,
+    # then forces a `GC.gc` from inside the alloc — exactly the 2-5 ms spike the
+    # AK benchmarks regressed on.
+    maybe_collect(ctx)
 
     if POOL_DISABLED[] || nbytes > POOL_LARGE_THRESHOLD || extra_usage != UInt32(0)
         return vk_alloc(bq, nbytes; extra_usage)
@@ -779,19 +864,14 @@ function pool_alloc(bq::BatchQueue, nbytes::Integer; extra_usage::UInt32=UInt32(
 
     buf = try_reuse_or_bump()
     buf === nothing || return buf
-    # Free list empty + every block full → we are about to cut a new 64-MiB
-    # block. Before we do, force a full GC so pending LavaArray finalizers
-    # run and return their backing chunks to the free list. `maybe_collect`
-    # is rate-limited and may skip, so hit it with `GC.gc(false)` directly —
-    # the cost of an incremental GC is much cheaper than a 64 MiB Vulkan
-    # alloc we didn't need.
-    GC.gc(false)
-    buf = try_reuse_or_bump()
-    buf === nothing || return buf
-    GC.gc(true)  # still nothing? run a full GC to drain any deferred finalizers.
-    buf = try_reuse_or_bump()
-    buf === nothing || return buf
-
+    # Free list empty + every block full → cut a new 64-MiB block.  We used to
+    # force a `GC.gc(false)` + `GC.gc(true)` chain here to drain finalizers
+    # before growing the pool, but that synchronous GC inside the alloc hot
+    # path showed up as 2-5 ms spikes in tight loops (AK benchmarks).  The
+    # proactive `maybe_collect(ctx)` at the top now drives finalizer drains via
+    # rate-limited incremental GC; if pressure is still low when we land here
+    # the right answer is to just commit another pool block rather than pay a
+    # stop-the-world full GC the budget would have skipped anyway.
     block = alloc_pool_block(bq)
     byte_offset = block.bump
     block.bump += alloc_size
@@ -874,7 +954,6 @@ function get_staging(bq::BatchQueue, nbytes::Integer)
                               0, nothing, nothing, BUF_STATE_ALIVE, ctx)
     push!(LIVE_BUFFERS, managed)
     Threads.atomic_add!(GPU_LIVE_BYTES, managed.size)
-    Threads.atomic_add!(GPU_BYTES_SINCE_LAST_GC, managed.size)
     bq.staging = managed
     return (vkbuf, memory, mapped_ptr, Int(alloc_size))
 end
