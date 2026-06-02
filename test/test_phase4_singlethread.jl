@@ -28,8 +28,8 @@ end
     end
 end
 
-@testset "GPU_BYTES_SINCE_LAST_GC is atomic" begin
-    @test Lava.GPU_BYTES_SINCE_LAST_GC isa Threads.Atomic{Int}
+@testset "GPU_LIVE_BYTES is atomic" begin
+    @test Lava.GPU_LIVE_BYTES isa Threads.Atomic{Int}
 end
 
 @testset "VkContext has no public nothing-default_bq path" begin
