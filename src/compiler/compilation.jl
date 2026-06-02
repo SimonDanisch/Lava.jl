@@ -1091,6 +1091,20 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     lower_phi_typepunned_loads!(mod)
     verify_ir!("lower_phi_typepun")
 
+    # ── Lower phi/select of Function-storage pointers to value-level ──
+    # SROA can't promote allocas whose addresses flow through `phi ptr` /
+    # `select ptr` (the canonical case is GPUArrays' findfirstlast_reduction,
+    # whose conditional tuple swap leaves a select+phi over three small
+    # allocas).  RADV's `nir_lower_vars_to_ssa` and lavapipe's equivalent both
+    # bail on the resulting `OpPhi`/`OpSelect %_ptr_Function_*`, leaving a
+    # `@store_deref` intrinsic that aborts pipeline creation
+    # ("Unimplemented intrinsic instr: @store_deref").  This pass rewrites
+    # `load Ty, ptr (phi/select of allocas)` into a parallel value-level
+    # phi/select that loads `Ty` at each leaf alloca site, side-stepping the
+    # backend SSA promoter altogether.
+    lower_phi_select_function_ptrs!(mod)
+    verify_ir!("lower_phi_select_func_ptrs")
+
     # ── Lift byte-offset GEPs on workgroup globals ──
     # The decompose passes above may create byte-offset ConstantExpr GEPs like
     # `gep i8, @shared, <offset>` when splitting struct loads from workgroup globals.
