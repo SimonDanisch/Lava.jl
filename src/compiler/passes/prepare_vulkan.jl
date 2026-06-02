@@ -4740,6 +4740,258 @@ function emit_gep_chain_extract!(gep_end::LLVM.GetElementPtrInst, alloca, alloca
 end
 
 """
+    lower_phi_select_function_ptrs!(mod::LLVM.Module)
+
+Lower `phi`/`select` of Function-storage (addrspace 0) pointers to value-level.
+
+Pattern (from a conditional swap of small allocas, e.g. GPUArrays'
+`findfirstlast_reduction`):
+
+    %a1 = alloca i8
+    %a2 = alloca i8
+    %a3 = alloca i8
+    ...
+    %sel  = select i1 %cond, ptr %a3, ptr %a2
+    %phi  = phi ptr [%sel, %bb_sel], [%a1, %bb_other]
+    %val  = load i8, ptr %phi
+
+LLVM's SROA can't promote allocas whose addresses flow through `phi ptr`/
+`select ptr`, so they survive into SPIR-V emission as `OpPhi`/`OpSelect`
+results of `_ptr_Function_*`.  Both Mesa drivers (RADV ACO and lavapipe)
+abort during compute pipeline creation: their `nir_lower_vars_to_ssa` pass
+leaves an `@store_deref` intrinsic that the backend instruction selector
+has no lowering for ("Unimplemented intrinsic instr: @store_deref").
+
+This pass rewrites:
+
+    %val  = load Ty, ptr (phi/select of Function-storage allocas)
+
+into a parallel value-level mirror — `phi`/`select` over `Ty` values
+loaded from each leaf alloca in the appropriate predecessor / select
+block.  The original load is replaced with the mirrored value and erased.
+The pointer-typed `phi`/`select` chain is left as dead code; later
+DCE / `lower_dead_lifetime!` / `LLVM.verify` are unaffected since the
+chain has no remaining uses.
+
+Limitations / preconditions enforced before transforming:
+
+* All leaves of the phi/select chain must be `LLVM.AllocaInst` in
+  addrspace 0 (Function storage).  Leaves of other kinds (GEPs,
+  parameters, BDA pointers) are out of scope and skipped.
+* The alloca's allocated type must equal `access_ty` — we don't
+  decompose larger types here (that's `lower_phi_typepunned_loads!`'s
+  job for byte-pun chains).
+* `UndefValue` incoming on a phi is allowed (becomes `UndefValue` on
+  the value mirror).
+
+Runs after SROA + the byte-pun phi lowering: at that point SROA has
+already promoted everything it can, so the only remaining
+`phi`/`select` on Function allocas are the ones the standard SSA passes
+cannot handle.
+"""
+function lower_phi_select_function_ptrs!(mod::LLVM.Module)
+    for fn in LLVM.functions(mod)
+        isempty(LLVM.blocks(fn)) && continue
+        changed = true
+        while changed
+            changed = false
+            for bb in LLVM.blocks(fn)
+                for inst in LLVM.instructions(bb)
+                    inst isa LLVM.LoadInst || continue
+                    ptr = LLVM.operands(inst)[1]
+                    ptr isa Union{LLVM.PHIInst, LLVM.SelectInst} || continue
+                    ptr_ty = LLVM.value_type(ptr)
+                    ptr_ty isa LLVM.PointerType || continue
+                    LLVM.addrspace(ptr_ty) == 0 || continue
+
+                    access_ty = LLVM.value_type(inst)
+
+                    # Verify ALL leaves of the chain are Function-storage allocas
+                    # with the matching allocated type.  Bail otherwise — handling
+                    # a partial chain would create a half-promoted load.
+                    if !validate_function_alloca_chain(ptr, access_ty, Set{LLVM.Value}())
+                        continue
+                    end
+
+                    cache = Dict{LLVM.Value, LLVM.Value}()
+                    new_val = build_function_ptr_value_mirror!(ptr, access_ty, cache)
+                    new_val === nothing && continue
+
+                    LLVM.replace_uses!(inst, new_val)
+                    LLVM.erase!(inst)
+                    # Sweep the dead pointer-phi/select chain.  Without this the
+                    # SPIR-V emitter still produces `OpPhi`/`OpSelect` over them
+                    # (now unconstrained by any consuming load), and a chain
+                    # spanning differently-typed allocas yields invalid SPIR-V
+                    # ("OpPhi's result type does not match incoming value type").
+                    erase_dead_ptr_chain!(ptr)
+                    changed = true
+                    break
+                end
+                changed && break
+            end
+        end
+    end
+end
+
+"""
+Erase a now-dead pointer phi/select chain, recursively visiting operands
+that themselves become dead as parent uses are removed.  Allocas at the
+leaves are intentionally left in place — other code paths (the LLVM IR
+before our rewrite still had stores into them) may legitimately keep
+them live, and a subsequent DCE/SROA cleanup pass owns deciding whether
+those allocas can go away.
+"""
+function erase_dead_ptr_chain!(val::LLVM.Value)
+    val isa LLVM.Instruction || return
+    val isa LLVM.AllocaInst && return   # leaves stay
+    LLVM.first_use(val) == C_NULL || return  # still used elsewhere
+    # Snapshot operands before erasing so we don't traverse a freed list.
+    children = LLVM.Value[]
+    if val isa LLVM.PHIInst
+        for (v, _) in LLVM.incoming(val)
+            push!(children, v)
+        end
+    elseif val isa LLVM.SelectInst
+        ops = LLVM.operands(val)
+        push!(children, ops[2])
+        push!(children, ops[3])
+    end
+    LLVM.erase!(val)
+    for child in children
+        erase_dead_ptr_chain!(child)
+    end
+end
+
+"""
+Recursively verify that every leaf of a phi/select pointer chain is an
+addrspace-0 alloca whose allocated type equals `access_ty`.  Cycles are
+tolerated (SSA forbids them in practice but the trace is defensive).
+"""
+function validate_function_alloca_chain(val::LLVM.Value, access_ty::LLVM.LLVMType,
+                                          visited::Set{LLVM.Value})
+    val in visited && return true
+    push!(visited, val)
+
+    if val isa LLVM.AllocaInst
+        # Function storage check (defense in depth — the alloca itself is the
+        # ground truth for its address space).
+        ptr_ty = LLVM.value_type(val)
+        ptr_ty isa LLVM.PointerType || return false
+        LLVM.addrspace(ptr_ty) == 0 || return false
+        # We trust the type-pun semantics that the original `load access_ty,
+        # ptr %phi/select` already implied: each leaf alloca holds bytes
+        # compatible with `access_ty` at offset 0.  Verify only that the
+        # alloca is large enough to hold the access — otherwise the original
+        # load was out-of-bounds and the IR was already broken.
+        dl = LLVM.datalayout(LLVM.parent(LLVM.parent(LLVM.parent(val))))
+        allocated_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(val))
+        Int(LLVM.API.LLVMABISizeOfType(dl, allocated_ty)) >=
+            Int(LLVM.API.LLVMABISizeOfType(dl, access_ty)) || return false
+        return true
+    elseif val isa LLVM.PHIInst
+        for (v, _) in LLVM.incoming(val)
+            v isa LLVM.UndefValue && continue
+            validate_function_alloca_chain(v, access_ty, visited) || return false
+        end
+        return true
+    elseif val isa LLVM.SelectInst
+        ops = LLVM.operands(val)
+        validate_function_alloca_chain(ops[2], access_ty, visited) || return false
+        validate_function_alloca_chain(ops[3], access_ty, visited) || return false
+        return true
+    else
+        # Anything else (GEP, parameter, BDA pointer, constant) — out of scope
+        return false
+    end
+end
+
+"""
+Build the value-level mirror of `val` (a phi/select chain of allocas)
+loading `access_ty` at each leaf.  Returns the value that should replace
+the consuming `load`, or `nothing` on failure.  `cache` is keyed on the
+original pointer instruction so cycles + shared subexpressions don't
+duplicate the work.
+"""
+function build_function_ptr_value_mirror!(val::LLVM.Value, access_ty::LLVM.LLVMType,
+                                            cache::Dict{LLVM.Value, LLVM.Value})
+    haskey(cache, val) && return cache[val]
+
+    if val isa LLVM.PHIInst
+        phi_bb = LLVM.parent(val)
+        # Position right after existing phis in the same block.
+        first_non_phi = nothing
+        for ins in LLVM.instructions(phi_bb)
+            if !(ins isa LLVM.PHIInst)
+                first_non_phi = ins
+                break
+            end
+        end
+        new_phi = LLVM.@dispose builder=LLVM.IRBuilder() begin
+            if first_non_phi !== nothing
+                LLVM.position!(builder, first_non_phi)
+            else
+                LLVM.position!(builder, phi_bb)
+            end
+            LLVM.phi!(builder, access_ty, "vmirror_phi")
+        end
+        cache[val] = new_phi   # register before recursion to support cycles
+
+        for (incoming_val, pred_bb) in LLVM.incoming(val)
+            if incoming_val isa LLVM.UndefValue
+                push!(LLVM.incoming(new_phi), (LLVM.UndefValue(access_ty), pred_bb))
+            elseif incoming_val isa LLVM.AllocaInst
+                # Emit `load access_ty, ptr alloca` right before pred_bb's terminator
+                # so the value is available when control transfers into phi_bb.
+                term = LLVM.terminator(pred_bb)
+                term === nothing && return nothing
+                loaded = LLVM.@dispose builder=LLVM.IRBuilder() begin
+                    LLVM.position!(builder, term)
+                    LLVM.load!(builder, access_ty, incoming_val, "vmirror_leaf_load")
+                end
+                push!(LLVM.incoming(new_phi), (loaded, pred_bb))
+            else
+                sub = build_function_ptr_value_mirror!(incoming_val, access_ty, cache)
+                sub === nothing && return nothing
+                push!(LLVM.incoming(new_phi), (sub, pred_bb))
+            end
+        end
+        return new_phi
+    elseif val isa LLVM.SelectInst
+        ops = LLVM.operands(val)
+        cond = ops[1]
+        true_op = ops[2]
+        false_op = ops[3]
+
+        # Recursively build (or load at) each operand site.  For alloca operands,
+        # the load is inserted right before the select itself — that's the
+        # closest dominating point where both source pointers are known live.
+        function operand_value(op)
+            if op isa LLVM.AllocaInst
+                return LLVM.@dispose builder=LLVM.IRBuilder() begin
+                    LLVM.position!(builder, val)
+                    LLVM.load!(builder, access_ty, op, "vmirror_sel_load")
+                end
+            else
+                return build_function_ptr_value_mirror!(op, access_ty, cache)
+            end
+        end
+        tval = operand_value(true_op)
+        tval === nothing && return nothing
+        fval = operand_value(false_op)
+        fval === nothing && return nothing
+
+        new_sel = LLVM.@dispose builder=LLVM.IRBuilder() begin
+            LLVM.position!(builder, val)
+            LLVM.select!(builder, cond, tval, fval, "vmirror_sel")
+        end
+        cache[val] = new_sel
+        return new_sel
+    end
+    return nothing
+end
+
+"""
     flatten_chained_geps_on_allocas!(mod::LLVM.Module)
 
 Flatten chained GEPs where a typed GEP uses a byte-offset GEP from an alloca as its base.
