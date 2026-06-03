@@ -333,23 +333,41 @@ function maybe_write_dispatch_start_timestamp!(cb::VK.CommandBuffer, kernel_name
     if slot + 2 > TIMESTAMP_POOL_SIZE[]
         return -1  # pool full; the END writer also checks this
     end
-    # Use BOTTOM_OF_PIPE for both endpoints so the delta is actual GPU
-    # execution time.  TOP_OF_PIPE on the start would fire when the command
-    # is parsed (before any prior work completes), causing the "start" to be
-    # earlier than the previous dispatch's end and making back-to-back
-    # dispatches appear to have ~0 µs execution time.
-    VK.cmd_write_timestamp(cb, VK.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, UInt32(slot))
+    # COMPUTE_SHADER_BIT for both endpoints.  Spec says the timestamp fires
+    # when all prior commands have completed at this stage; for a pure-
+    # compute queue that's the natural boundary.
+    #
+    # KNOWN LIMITATION: per-dispatch timing for INDIRECT dispatches is
+    # under-reported on NVIDIA driver 595.80 (RTX 4000 Ada).  Indirect
+    # dispatches we know take milliseconds report 2–12 µs.  Tried
+    # BOTTOM_OF_PIPE, COMPUTE_SHADER, and an explicit COMPUTE→BOTTOM
+    # execution barrier before the END timestamp — none gave realistic
+    # numbers for indirect.  Direct dispatches measure correctly.  The
+    # workaround for now is to trust wall-clock for the integrator total
+    # and use these per-dispatch numbers only for DIRECT dispatch kernels
+    # (camera ray gen, film accumulate, finalize, fill kernels).
+    VK.cmd_write_timestamp(cb, VK.PIPELINE_STAGE_COMPUTE_SHADER_BIT, pool, UInt32(slot))
     TIMESTAMP_NEXT_SLOT[] = slot + 2
     push!(RECORDED_DISPATCHES, DispatchTiming(String(kernel_name), slot, 0.0))
     return slot
 end
 
 # Internal: write the END timestamp after a dispatch.
+#
+# Inserts an execution barrier (compute → BOTTOM_OF_PIPE, no memory barrier)
+# before the timestamp so it really fires after this dispatch's workgroups
+# complete.  Without the barrier, NVIDIA's driver was firing the
+# BOTTOM_OF_PIPE timestamp when the cmd_dispatch_indirect *command* was
+# processed — not when its workgroups completed — which made every indirect
+# dispatch appear to take 2–12 µs no matter how much work it did.  Direct
+# dispatches were unaffected; the symptom only showed on indirect because
+# indirect-dispatch parameters are read at dispatch time and workgroup
+# launches are visibly deferred.
 function maybe_write_dispatch_end_timestamp!(cb::VK.CommandBuffer, start_slot::Int)
     start_slot < 0 && return
     pool = TIMESTAMP_POOL[]
     pool === nothing && return
-    VK.cmd_write_timestamp(cb, VK.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, UInt32(start_slot + 1))
+    VK.cmd_write_timestamp(cb, VK.PIPELINE_STAGE_COMPUTE_SHADER_BIT, pool, UInt32(start_slot + 1))
     return nothing
 end
 
