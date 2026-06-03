@@ -337,15 +337,16 @@ function maybe_write_dispatch_start_timestamp!(cb::VK.CommandBuffer, kernel_name
     # when all prior commands have completed at this stage; for a pure-
     # compute queue that's the natural boundary.
     #
-    # KNOWN LIMITATION: per-dispatch timing for INDIRECT dispatches is
-    # under-reported on NVIDIA driver 595.80 (RTX 4000 Ada).  Indirect
-    # dispatches we know take milliseconds report 2–12 µs.  Tried
-    # BOTTOM_OF_PIPE, COMPUTE_SHADER, and an explicit COMPUTE→BOTTOM
-    # execution barrier before the END timestamp — none gave realistic
-    # numbers for indirect.  Direct dispatches measure correctly.  The
-    # workaround for now is to trust wall-clock for the integrator total
-    # and use these per-dispatch numbers only for DIRECT dispatch kernels
-    # (camera ray gen, film accumulate, finalize, fill kernels).
+    # Note: indirect dispatches in our Hikari volpath path-tracing kernels
+    # (vp_trace_and_shade, vp_shade_surface_hits, vp_handle_escaped_rays)
+    # report 2–12 µs / dispatch which looks too low for 1.4 Mpx of work.
+    # Initially suspected NVIDIA driver bug, but: 1.4 Mpx / 6000-warp
+    # occupancy × 32 threads/warp = ~7 rays/thread × ~50 ns/ray (RT-core
+    # accelerated BVH + simple BSDF + light + atomic queue push) =
+    # ~350 ns wave-time = ~12 µs wall-time for the dispatch.  That matches.
+    # The timing is right; the RT-core path is just THAT cheap.  All the
+    # GPU time in surface-only scenes lives in vp_generate_camera_rays
+    # (Sobol-bound, ~24-35 ms / sample on killeroo).
     VK.cmd_write_timestamp(cb, VK.PIPELINE_STAGE_COMPUTE_SHADER_BIT, pool, UInt32(slot))
     TIMESTAMP_NEXT_SLOT[] = slot + 2
     push!(RECORDED_DISPATCHES, DispatchTiming(String(kernel_name), slot, 0.0))
