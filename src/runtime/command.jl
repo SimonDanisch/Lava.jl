@@ -439,6 +439,10 @@ end
         Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline)
         pin!(batch, pipeline)
         push_constants_bda!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_bda)
+        # Profiling: optional GPU-side timestamp around the dispatch.  Returns
+        # -1 (and does nothing) when `with_dispatch_timing` is not active, so
+        # the hot path stays unperturbed.
+        ts_slot = maybe_write_dispatch_start_timestamp!(cmd, LAST_DISPATCH_INFO[])
         if base_x == 0 && base_y == 0 && base_z == 0
             Vulkan.cmd_dispatch(cmd, UInt32(gx), UInt32(gy), UInt32(gz))
         else
@@ -446,6 +450,7 @@ end
                 UInt32(base_x), UInt32(base_y), UInt32(base_z),
                 UInt32(gx), UInt32(gy), UInt32(gz))
         end
+        maybe_write_dispatch_end_timestamp!(cmd, ts_slot)
     end
 end
 
@@ -484,7 +489,9 @@ end
         push_constants_bda!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_bda)
         mb = indirect.buf[]::VkManagedBuffer
         byte_offset = UInt64(indirect.offset)
+        ts_slot = maybe_write_dispatch_start_timestamp!(cmd, LAST_DISPATCH_INFO[])
         Vulkan.cmd_dispatch_indirect(cmd, mb.buffer, byte_offset)
+        maybe_write_dispatch_end_timestamp!(cmd, ts_slot)
         pin!(batch, indirect)
     end
 end

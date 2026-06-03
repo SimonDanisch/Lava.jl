@@ -153,6 +153,9 @@ include("array/mapreduce.jl")
 # ---- Debug / validation API (needs LavaArray + KA backend) ----
 include("runtime/debug.jl")
 
+# ---- Profiling (kernel SPIR-V stats + per-dispatch GPU timing) ----
+include("runtime/profiling.jl")
+
 # ---- Phase 2: Graphics ----
 include("graphics/window.jl")         # RenderWindow, swapchain, present
 include("graphics/framebuffer.jl")   # LavaFramebuffer, RenderTarget, image memory helpers
