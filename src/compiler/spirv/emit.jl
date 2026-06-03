@@ -5875,16 +5875,25 @@ function emit_select!(state::SPIRVEmitterState, inst::LLVM.SelectInst)
     # For pointer selects, ensure both operands have the same SPIR-V type as result.
     # LLVM opaque pointers are all `ptr`, but SPIR-V has distinct typed pointers.
     # Try to map each operand's pointer type; if it differs from result_ty, bitcast.
-    # NEVER bitcast PhysicalStorageBuffer pointers (OpBitcast on PSB pointers is invalid in
-    # Vulkan) — the emitted-pointee reconciliation above is the PSB path.
-    if llvm_ty isa LLVM.PointerType && get_pointer_storage_class(ops[2]) != SC.PhysicalStorageBuffer
+    # PSB pointers cannot be OpBitcast (invalid in Vulkan) — use the
+    # OpConvertPtrToU/OpConvertUToPtr roundtrip via emit_psb_ptr_reinterpret!
+    # to reinterpret to the result type.
+    if llvm_ty isa LLVM.PointerType
+        is_psb = get_pointer_storage_class(ops[2]) == SC.PhysicalStorageBuffer
         for (i, op_llvm) in ((2, ops[2]), (3, ops[3]))
-            op_pointee = get_pointee_type(state.type_ctx.ptm, op_llvm)
+            emitted_pte = get(state.value_emitted_pointee, op_llvm, nothing)
             res_pointee = get_pointee_type(state.type_ctx.ptm, inst)
+            op_pointee = emitted_pte !== nothing ? emitted_pte :
+                         get_pointee_type(state.type_ctx.ptm, op_llvm)
             if op_pointee !== nothing && res_pointee !== nothing && op_pointee != res_pointee
                 val_to_cast = i == 2 ? true_val : false_val
-                cast_id = fresh_id!(state.mod)
-                encode_instruction!(state.mod.functions, Op.OpBitcast, result_ty, cast_id, val_to_cast)
+                cast_id = if is_psb
+                    emit_psb_ptr_reinterpret!(state, result_ty, val_to_cast)
+                else
+                    new_id = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpBitcast, result_ty, new_id, val_to_cast)
+                    new_id
+                end
                 if i == 2
                     true_val = cast_id
                 else
