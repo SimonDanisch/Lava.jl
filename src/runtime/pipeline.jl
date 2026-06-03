@@ -180,8 +180,13 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
         shader_mod,
         entry_name
     )
-    ci = Vulkan.ComputePipelineCreateInfo(stage, layout, -1;
-        flags=Vulkan.PIPELINE_CREATE_DISPATCH_BASE_BIT)
+    # Optional CAPTURE_STATISTICS bit so VK_KHR_pipeline_executable_properties
+    # has a populated stats table to query later via pipeline_exec_stats.
+    pipeline_flags = Vulkan.PipelineCreateFlag(Vulkan.PIPELINE_CREATE_DISPATCH_BASE_BIT)
+    if PIPELINE_EXEC_PROPERTIES_REQUESTED[]
+        pipeline_flags |= Vulkan.PipelineCreateFlag(Vulkan.PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR)
+    end
+    ci = Vulkan.ComputePipelineCreateInfo(stage, layout, -1; flags=pipeline_flags)
 
     pipeline = create_compute_pipeline(dev, ci; pipeline_cache=ctx.pipeline_cache)
 

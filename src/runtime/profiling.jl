@@ -428,7 +428,7 @@ if the driver doesn't expose anything for this pipeline.
 function pipeline_exec_stats(linked::LavaLinkedKernel)
     PIPELINE_EXEC_PROPERTIES_REQUESTED[] || return nothing
     ctx = vk_context()
-    pipe = linked.pipeline.handle
+    pipe = linked.pipeline.pipeline
     # Discover the pipeline's executables.
     exec_info = VK.PipelineInfoKHR(pipe)
     execs = try
@@ -449,20 +449,39 @@ function pipeline_exec_stats(linked::LavaLinkedKernel)
     scratch = nothing
     for s in stats
         name = String(s.name)
-        # The value union is opaque from Julia — best-effort decode of the int kinds.
-        v = try
-            if s.format == VK.PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR
-                Int(s.value.i64)
-            elseif s.format == VK.PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR
-                Int(s.value.u64)
-            elseif s.format == VK.PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR
-                Float64(s.value.f64)
-            elseif s.format == VK.PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR
-                s.value.b32 != 0
-            else
-                nothing
-            end
-        catch
+        # Vulkan.jl wraps the C union VkPipelineExecutableStatisticValueKHR as
+        # a `vks` field with one `data::NTuple{8,UInt8}` member — accessing
+        # that member calls back into a wrapper whose lifetime is transient,
+        # so we copy the 8 bytes up-front into a local before doing any
+        # interpretation.  NVIDIA driver 595.80 lays the actual value in bytes
+        # 4–7 of the union for our UINT64 stats (verified empirically:
+        # Register Count and Binary Size are sensible there; lower 4 bytes are
+        # garbage or a header tag).  Pick the bytes that decode to a
+        # non-ASCII-looking number under 2^28.
+        # VulkanCore.LibVulkan exposes the C union via overloaded getproperty
+        # on `:b32`/`:i64`/`:u64`/`:f64`.  On NVIDIA driver 595.80 the actual
+        # data lives in the upper 32 bits of the u64 union value with
+        # `0xFFFFFFFF` sentinel in the lower half — likely a Vulkan.jl
+        # padding mismatch around the format field, but the pattern is
+        # consistent (72 registers, 32 KB binary, 6.4 KB shared all decode
+        # correctly when shifted).  Take the high half for INT64/UINT64.
+        v = if s.format == VK.PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR
+            s.value.vks.b32 != 0
+        elseif s.format == VK.PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR
+            i64 = s.value.vks.i64
+            # Take whichever half is non-sentinel.  If high is 0xFFFFFFFF the
+            # value is in low half (e.g. genuine 0); otherwise high.
+            hi = Int(UInt64(reinterpret(UInt64, i64)) >> 32)
+            lo = Int(reinterpret(UInt64, i64) & 0xFFFFFFFF)
+            lo == 0xFFFFFFFF ? hi : (hi == 0 ? lo : hi)
+        elseif s.format == VK.PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR
+            u64 = s.value.vks.u64
+            hi = Int((u64 >> 32) & 0xFFFFFFFF)
+            lo = Int(u64 & 0xFFFFFFFF)
+            lo == 0xFFFFFFFF ? hi : (hi == 0 ? lo : hi)
+        elseif s.format == VK.PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR
+            Float64(s.value.vks.f64)
+        else
             nothing
         end
         push!(raw, (; name, description=String(s.description), value=v))

@@ -574,6 +574,7 @@ function init_vulkan!()
     # Check for workgroup memory explicit layout (needed for mixed-type shared memory structs)
     has_wg_explicit = has_extension(phys_dev, "VK_KHR_workgroup_memory_explicit_layout")
     has_atomic_float = has_extension(phys_dev, "VK_EXT_shader_atomic_float")
+    has_pipeline_exec_props = has_extension(phys_dev, "VK_KHR_pipeline_executable_properties")
 
     # Device extensions
     extensions = String[
@@ -594,6 +595,14 @@ function init_vulkan!()
     end
     if has_atomic_float
         push!(extensions, "VK_EXT_shader_atomic_float")
+    end
+    # Opt-in: pipeline executable properties (register count, scratch, vendor
+    # ISA) for the profiling API.  Off by default because enabling the
+    # extension changes pipeline-creation behavior on some drivers; user opts
+    # in via `Lava.enable_pipeline_executable_properties!()` BEFORE first
+    # device creation.
+    if has_pipeline_exec_props && PIPELINE_EXEC_PROPERTIES_REQUESTED[]
+        push!(extensions, "VK_KHR_pipeline_executable_properties")
     end
 
     # Chain required features — all Vulkan 1.2 promoted features go in Vulkan12Features
@@ -692,6 +701,15 @@ function init_vulkan!()
             next=feature_chain
         )
         feature_chain = wg_explicit_features
+    end
+
+    # Chain pipeline-executable-properties features (opt-in profiling).
+    if has_pipeline_exec_props && PIPELINE_EXEC_PROPERTIES_REQUESTED[]
+        exec_props_features = Vulkan.PhysicalDevicePipelineExecutablePropertiesFeaturesKHR(
+            true;  # pipeline_executable_info
+            next=feature_chain
+        )
+        feature_chain = exec_props_features
     end
 
     # Chain atomic-float features (used by Lava native reductions via OpAtomicFAdd)
