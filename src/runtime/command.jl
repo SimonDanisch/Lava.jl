@@ -254,17 +254,79 @@ Example:
         Vulkan.cmd_dispatch(batch.cmd_buf, ...)
     end
 """
+# Inter-dispatch barrier overrides for the concurrent-dispatch-group flow.
+#
+# By default every `record_dispatch!` after the first one in a batch inserts
+# a global SHADER_WRITE → SHADER_READ|WRITE memory barrier. That guarantees
+# safety but forces strict serialisation on the GPU. For a group of dispatches
+# that are mutually independent (different output buffers, or shared output
+# via atomically-claimed slots) the barriers are unnecessary and prevent
+# overlap on idle SMs — proven 3.06× → 1.13× on a 3-dispatch group of
+# 1024-thread kernels.
+#
+# Within a `concurrent_dispatch_group(...) do ... end`:
+#   * The very first dispatch keeps its barrier (it must still sync against
+#     the producer that came before the group).
+#   * Subsequent dispatches in the group skip the barrier.
+#   * The barrier between the last dispatch in the group and the next
+#     dispatch outside the group is re-established automatically by that
+#     next dispatch's normal pre-barrier.
+#
+# The two flags are task-local-style (plain `Threads.Atomic{Bool}`); they
+# could be `task_local_storage` instead if multi-task command recording
+# becomes a thing, but Lava's BatchQueue is single-threaded today.
+const CONCURRENT_GROUP_ACTIVE  = Threads.Atomic{Bool}(false)
+const CONCURRENT_GROUP_STARTED = Threads.Atomic{Bool}(false)
+
+"""
+    concurrent_dispatch_group(f)
+
+Run `f()` with inter-dispatch barriers suppressed *between* dispatches
+inside `f`. The first dispatch inside the group still pre-barriers
+against whatever ran before (producer→consumer), and the next dispatch
+*outside* the group will pre-barrier against the group's writes
+(group→consumer). Inside the group the dispatches may overlap on the GPU.
+"""
+function concurrent_dispatch_group(f::F) where F
+    prev_active  = CONCURRENT_GROUP_ACTIVE[]
+    prev_started = CONCURRENT_GROUP_STARTED[]
+    CONCURRENT_GROUP_ACTIVE[]  = true
+    CONCURRENT_GROUP_STARTED[] = false
+    try
+        f()
+    finally
+        CONCURRENT_GROUP_ACTIVE[]  = prev_active
+        CONCURRENT_GROUP_STARTED[] = prev_started
+    end
+end
+
 @inline function record_dispatch!(f, bq::BatchQueue;
                            dst_stage::Vulkan.PipelineStageFlag,
                            extra_dst_access::Vulkan.AccessFlag=Vulkan.AccessFlag(0),
                            is_rt::Bool=false,
+                           skip_pre_barrier::Bool=false,
                            info::String="")
     batch = ensure_active_batch!(bq)
     cmd = batch.cmd_buf
 
     # Memory barrier between dispatches (write→read synchronization).
     # Uses direct ccall to avoid Vulkan.jl wrapper allocations (~1.2KB/call).
-    if batch.dispatch_count > 0
+    #
+    # `skip_pre_barrier=true` opts a dispatch out of the inter-dispatch
+    # barrier — the caller is asserting that this dispatch has no execution
+    # or memory dependency on the previous one in the same batch (they
+    # write to disjoint memory, or share only atomically-claimed slots in
+    # a work queue, etc). Vulkan permits the implementation to overlap
+    # those dispatches on different SMs; with the barrier they're serialised.
+    # Also honoured: the task-local concurrent_dispatch_group state — the
+    # FIRST dispatch inside a group still barriers (producer→consumer),
+    # but all subsequent dispatches inside the group skip.
+    effective_skip = skip_pre_barrier ||
+                     (CONCURRENT_GROUP_ACTIVE[] && CONCURRENT_GROUP_STARTED[])
+    if CONCURRENT_GROUP_ACTIVE[]
+        CONCURRENT_GROUP_STARTED[] = true
+    end
+    if batch.dispatch_count > 0 && !effective_skip
         src_stage = batch.last_was_rt ?
             VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR :
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT

@@ -6,6 +6,7 @@ export CompilationResult, lava_compile, optimize_spirv
 # Debugging & diagnostics
 export vk_reset_device!, dump_state, gpu_memory_usage, allocate_batch_queue!
 export set_dispatch_logging!, get_dispatch_log
+export concurrent_dispatch_group
 export enable_gpu_av, disable_gpu_av, verify_gpu_av, activate_all_debugging
 
 # Graphics exports
