@@ -333,7 +333,12 @@ function maybe_write_dispatch_start_timestamp!(cb::VK.CommandBuffer, kernel_name
     if slot + 2 > TIMESTAMP_POOL_SIZE[]
         return -1  # pool full; the END writer also checks this
     end
-    VK.cmd_write_timestamp(cb, VK.PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, UInt32(slot))
+    # Use BOTTOM_OF_PIPE for both endpoints so the delta is actual GPU
+    # execution time.  TOP_OF_PIPE on the start would fire when the command
+    # is parsed (before any prior work completes), causing the "start" to be
+    # earlier than the previous dispatch's end and making back-to-back
+    # dispatches appear to have ~0 µs execution time.
+    VK.cmd_write_timestamp(cb, VK.PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, UInt32(slot))
     TIMESTAMP_NEXT_SLOT[] = slot + 2
     push!(RECORDED_DISPATCHES, DispatchTiming(String(kernel_name), slot, 0.0))
     return slot
