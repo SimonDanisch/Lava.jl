@@ -492,6 +492,18 @@ end
 # SER (SPV_NV_shader_invocation_reorder) emission
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Read `vk_context().ser_available` defensively: the emitter runs in contexts
+# where vk_context may not be initialised (unit tests without a device).  When
+# the flag is unavailable we treat SER as unsupported and emit the implicit
+# OpTraceRayKHR fallback so the SPIR-V stays valid without the NV capability.
+function _ser_available_for_emit()
+    try
+        return vk_context().ser_available
+    catch
+        return false
+    end
+end
+
 """
 Emit OpTypeHitObjectNV once per module.  Cached in `state.rt_hit_object_type_id`.
 """
@@ -533,8 +545,17 @@ end
 Emit OpHitObjectTraceRayNV from a call to lava_rt_hit_object_trace_ray.
 Same 13 operands as OpTraceRayKHR; result is written into the implicit
 HitObject variable (no closest-hit shader is invoked yet).
+
+On devices without VK_NV_ray_tracing_invocation_reorder the SER opcode and
+its OpTypeHitObjectNV would fail spirv-val (the capability is not declared),
+so we degrade to a regular OpTraceRayKHR.  The companion reorder/execute
+ops then become no-ops; together they reproduce the implicit-trace path
+the SER pattern emulates on hardware that does support reordering.
 """
 function emit_rt_hit_object_trace_ray!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    if !_ser_available_for_emit()
+        return emit_rt_trace_ray!(state, inst)
+    end
     mod = state.mod
 
     args = UInt32[]
@@ -594,8 +615,13 @@ end
 
 """
 Emit OpReorderThreadWithHitObjectNV using the implicit HitObject.
+
+On devices without SER, the preceding `lava_rt_hit_object_trace_ray` was
+already lowered to a full OpTraceRayKHR (which invoked the chit inline);
+nothing remains to reorder, so this is a no-op.
 """
 function emit_rt_reorder_thread!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    _ser_available_for_emit() || return
     mod = state.mod
     ho_var = get_or_create_hit_object_var!(state)
     # OpReorderThreadWithHitObjectNV %hit_object_var
@@ -608,8 +634,13 @@ end
 """
 Emit OpHitObjectExecuteShaderNV — invokes the closest-hit / miss shader for
 the recorded HitObject, using the current ray payload.
+
+On devices without SER, the closest-hit / miss shader was already invoked
+inline by the fallback OpTraceRayKHR in `emit_rt_hit_object_trace_ray!`, so
+this is a no-op.
 """
 function emit_rt_hit_object_execute_shader!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    _ser_available_for_emit() || return
     mod = state.mod
     ho_var = get_or_create_hit_object_var!(state)
     payload_var = state.rt_payload_var_id
