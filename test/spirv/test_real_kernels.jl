@@ -31,6 +31,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
 using Hikari
 using Raycore
 using GeometryBasics
+using StructArrays
 using StaticArrays
 
 @testset "Real Kernel Compilation" begin
@@ -248,24 +249,45 @@ using StaticArrays
         end
     end
 
-    # ── Test 7: vp_sample_surface_direct_lighting_kernel! with Conductor{PiecewiseLinearSpectrum{56}} ──
+    # ── Test 7: vp_shade_material_kernel! with TypedHit{Conductor{PiecewiseLinearSpectrum{56}}} ──
     # Regression test for retype_allocas bug: LLVM emits a float access (f32/f64) wider than the
     # alloca's chosen integer element type (e.g. T=i8), hitting the decomposition branch that
     # only handled int→int.  Fix: pick_uniform_type bails when decomp would involve non-integer types.
-    @testset "vp_sample_surface_direct_lighting_kernel! — Conductor PiecewiseLinearSpectrum" begin
+    #
+    # Originally framed against `vp_sample_surface_direct_lighting_kernel!` which Hikari fused
+    # into `vp_shade_surface_hits_kernel!` and then split per-material into `vp_shade_material_
+    # kernel!{T}` once per concrete material type. The retype_allocas path is exercised the
+    # same way — heavy struct access through Conductor{PiecewiseLinearSpectrum{56}}.
+    @testset "vp_shade_material_kernel! — Conductor PiecewiseLinearSpectrum" begin
         using KernelAbstractions
 
-        T_mat_eval_wq = Lava.LavaDeviceArray{Hikari.VPMaterialEvalWorkItem, 1}
-        T_size         = Lava.LavaDeviceArray{Int32, 1}
-        T_in_q  = Hikari.WorkQueue{Hikari.VPMaterialEvalWorkItem, T_mat_eval_wq, T_size}
-        T_out_q = Hikari.WorkQueue{Hikari.VPShadowRayWorkItem,
-                                    Lava.LavaDeviceArray{Hikari.VPShadowRayWorkItem, 1}, T_size}
-        T_mats  = Raycore.StaticMultiTypeSet{Tuple{
-            Lava.LavaDeviceArray{Hikari.Emissive{Hikari.RGBSpectrum}, 1},
-            Lava.LavaDeviceArray{Hikari.Conductor{Hikari.PiecewiseLinearSpectrum{56}, Hikari.PiecewiseLinearSpectrum{56}, Float32, Hikari.RGBSpectrum}, 1},
-            Lava.LavaDeviceArray{Hikari.CoatedDiffuse{Hikari.RGBSpectrum, Float32, Float32, Float32, Hikari.RGBSpectrum, Float32}, 1},
-            Lava.LavaDeviceArray{Hikari.Dielectric{Hikari.RGBSpectrum, Hikari.RGBSpectrum, Float32, Float32, Float32}, 1},
-            Lava.LavaDeviceArray{Hikari.Diffuse{Hikari.RGBSpectrum, Float32}, 1},
+        T_conductor = Hikari.Conductor{Hikari.PiecewiseLinearSpectrum{56},
+                                       Hikari.PiecewiseLinearSpectrum{56},
+                                       Float32, Hikari.RGBSpectrum}
+        T_typed_hit = Hikari.TypedHit{T_conductor}
+        T_size      = Lava.LavaDeviceArray{Int32, 1}
+        T_in_q      = Hikari.WorkQueue{T_typed_hit,
+                                       Lava.LavaDeviceArray{T_typed_hit, 1},
+                                       T_size}
+        T_next_ray_q = Hikari.WorkQueue{Hikari.VPRayWorkItem,
+                                        StructArrays.StructVector{Hikari.VPRayWorkItem, @NamedTuple{
+                                            ray::Lava.LavaDeviceArray{Raycore.Ray, 1},
+                                            depth::Lava.LavaDeviceArray{Int32, 1},
+                                            lambda::Lava.LavaDeviceArray{Hikari.SampledWavelengths{4}, 1},
+                                            pixel_index::Lava.LavaDeviceArray{Int32, 1},
+                                            beta::Lava.LavaDeviceArray{Hikari.SampledSpectrum{4}, 1},
+                                            r_u::Lava.LavaDeviceArray{Hikari.SampledSpectrum{4}, 1},
+                                            r_l::Lava.LavaDeviceArray{Hikari.SampledSpectrum{4}, 1},
+                                            prev_intr_p::Lava.LavaDeviceArray{Point{3, Float32}, 1},
+                                            prev_intr_n::Lava.LavaDeviceArray{Vec{3, Float32}, 1},
+                                            eta_scale::Lava.LavaDeviceArray{Float32, 1},
+                                            specular_bounce::Lava.LavaDeviceArray{Bool, 1},
+                                            any_non_specular_bounces::Lava.LavaDeviceArray{Bool, 1},
+                                            medium_idx::Lava.LavaDeviceArray{Raycore.SetKey, 1},
+                                        }, Int64},
+                                        T_size}
+        T_mats = Raycore.StaticMultiTypeSet{Tuple{
+            Lava.LavaDeviceArray{T_conductor, 1},
         }, Tuple{}}
         T_lights = Raycore.StaticMultiTypeSet{Tuple{
             Lava.LavaDeviceArray{Hikari.DiffuseAreaLight{Hikari.RGBSpectrum}, 1},
@@ -274,6 +296,10 @@ using StaticArrays
             Lava.LavaDeviceArray{Float32, 1},
             Lava.LavaDeviceArray{Float32, 5},
             Lava.LavaDeviceArray{Float32, 1}}
+        T_accel = Lava.HWAdaptedAccel{Nothing,
+                                       Lava.LavaDeviceArray{Raycore.Triangle{Hikari.TriangleMeta}, 1},
+                                       Lava.LavaDeviceArray{UInt32, 1},
+                                       Raycore.Triangle{Hikari.TriangleMeta}}
 
         ws = 256
         kernel_obj = Hikari.workqueue_map_kernel!(Lava.LavaBackend(), ws)
@@ -282,20 +308,30 @@ using StaticArrays
 
         tt = Tuple{
             typeof(ctx),
-            typeof(Hikari.vp_sample_surface_direct_lighting_kernel!),
-            T_in_q, T_out_q, T_mats, T_lights,
-            T_rgb_table,
-            Lava.LavaDeviceArray{Hikari.LightBVHNode, 1},
-            Lava.LavaDeviceArray{Int32, 1},
-            Int32, Int32, Int32,
-            Lava.LavaDeviceArray{Float32, 1},
-            Lava.LavaDeviceArray{Point{2, Float32}, 1},
-            Hikari.PerspectiveCamera,
-            Int32, Bool,
+            typeof(Hikari.vp_shade_material_kernel!),
+            T_in_q,                                      # typed work queue (TypedHit{Conductor})
+            T_next_ray_q,                                # next_ray_queue
+            Lava.LavaDeviceArray{Float32, 1},            # pixel_L
+            T_accel,                                     # accel
+            Lava.LavaDeviceArray{Hikari.MediumInterfaceIdx, 1},  # media_interfaces
+            Raycore.StaticMultiTypeSet{Tuple{}, Tuple{}},        # media
+            T_mats,                                      # materials
+            T_lights,                                    # lights
+            T_rgb_table,                                 # rgb2spec_table
+            Lava.LavaDeviceArray{Hikari.LightBVHNode, 1},        # bvh_nodes
+            Lava.LavaDeviceArray{Int32, 1},                      # infinite_light_indices
+            Lava.LavaDeviceArray{UInt32, 1},                     # light_to_bit_trail
+            Int32, Int32, Int32,                                 # num_inf / num_bvh / num_lights
+            Int32, Bool,                                         # max_depth, do_regularize
+            Hikari.SobolRNG{Lava.LavaDeviceArray{UInt32, 1}},    # sobol_rng
+            Int32,                                               # sample_idx
+            Hikari.PerspectiveCamera,                            # camera
+            Int32, Int32,                                        # samples_per_pixel, rr_depth
         }
 
         d, bytes = compile_and_disasm(Hikari.gpu_workqueue_map_kernel!, tt;
-                                       workgroup_size=(ws, 1, 1))
+                                       workgroup_size=(ws, 1, 1),
+                                       enable_ray_query=true)  # inline shadow trace via rayQuery
         @test !isempty(bytes)
         @testset "vendor safety" begin
             check_vendor_safety(d)
