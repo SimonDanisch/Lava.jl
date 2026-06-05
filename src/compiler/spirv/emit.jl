@@ -66,6 +66,14 @@ mutable struct SPIRVEmitterState
     rt_tlas_var_id::Union{Nothing, UInt32}
     rt_accel_type_id::Union{Nothing, UInt32}
     rt_payload_type::Symbol  # :f32, :struct, etc.
+    # Storage class of the payload variable for the current RT stage.
+    # Raygen: RayPayloadKHR. closesthit/miss/anyhit/intersection:
+    # IncomingRayPayloadKHR. Used by `payload_sc_for_state` so the access
+    # chain that loads/stores the payload picks the right storage class on
+    # every stage — previously this was inferred from `rt_tlas_var_id !==
+    # nothing` (only raygen had a TLAS), which broke once chit/miss/anyhit
+    # started emitting the TLAS descriptor too (for inline ray queries).
+    rt_payload_storage_class::UInt32
     rt_hit_attrib_var_id::Union{Nothing, UInt32}  # HitAttributeKHR variable (vec2 barycentrics)
     # SER: cached OpTypeHitObjectNV id + the Private-storage HitObject variable
     # allocated lazily on first lava_rt_hit_object_* call.  Reused by every SER
@@ -155,7 +163,9 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{Tuple{UInt32, UInt32}, UInt32}(),
         Dict{LLVM.Value, Tuple{UInt32, Vector{UInt32}, UInt32, LLVM.ArrayType}}(),
         Dict{LLVM.Value, UInt32}(),
-        nothing, nothing, nothing, :none, nothing,
+        nothing, nothing, nothing, :none,
+        UInt32(0),  # rt_payload_storage_class — filled in by emit_spirv_from_llvm_rt
+        nothing,
         nothing, nothing,  # SER: rt_hit_object_type_id, rt_hit_object_var_id
         false,
         nothing, nothing, UInt32[], UInt32[],  # ray-query state

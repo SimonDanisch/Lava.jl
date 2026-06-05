@@ -147,6 +147,7 @@ function emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
     state.rt_payload_var_id = payload_var_id
     state.rt_tlas_var_id = tlas_var_id
     state.rt_payload_type = payload_type
+    state.rt_payload_storage_class = stage_info.payload_sc
     state.rt_hit_attrib_var_id = hit_attrib_var_id
 
     # Emit function
@@ -375,7 +376,7 @@ function emit_rt_payload_store_at!(state::SPIRVEmitterState, inst::LLVM.CallInst
 
     # Get pointer to element: OpAccessChain
     f32_ty = emit_type_float!(mod, UInt32(32))
-    payload_sc = state.rt_payload_type == :f32 ? SC.RayPayloadKHR : payload_sc_for_state(state)
+    payload_sc = payload_sc_for_state(state)
     elem_ptr_ty = map_pointer_type!(state.type_ctx, f32_ty, payload_sc)
 
     ac_id = fresh_id!(mod)
@@ -409,9 +410,15 @@ end
 
 """Get the payload storage class from the emitter state."""
 function payload_sc_for_state(state::SPIRVEmitterState)
-    # If rt_tlas_var_id is set, we're in raygen → RayPayloadKHR
-    # Otherwise → IncomingRayPayloadKHR
-    state.rt_tlas_var_id !== nothing ? SC.RayPayloadKHR : SC.IncomingRayPayloadKHR
+    # `rt_payload_storage_class` was set when the payload OpVariable was
+    # created in `emit_spirv_from_llvm_rt`, using `RT_STAGE_INFO[stage]`'s
+    # `payload_sc` — `RayPayloadKHR` for raygen, `IncomingRayPayloadKHR`
+    # for closesthit / miss / anyhit / intersection. Previously this was
+    # inferred from `rt_tlas_var_id !== nothing` (only raygen had a TLAS),
+    # but chit/miss/anyhit now also emit the TLAS descriptor so they can
+    # fire inline ray queries — so the TLAS-as-proxy heuristic produced
+    # the wrong storage class on chit/miss.
+    state.rt_payload_storage_class
 end
 
 # ── Hit Attribute (Barycentric) Support ──
