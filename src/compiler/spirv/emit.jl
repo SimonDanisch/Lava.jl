@@ -67,6 +67,12 @@ mutable struct SPIRVEmitterState
     rt_accel_type_id::Union{Nothing, UInt32}
     rt_payload_type::Symbol  # :f32, :struct, etc.
     rt_hit_attrib_var_id::Union{Nothing, UInt32}  # HitAttributeKHR variable (vec2 barycentrics)
+    # SER: cached OpTypeHitObjectNV id + the Private-storage HitObject variable
+    # allocated lazily on first lava_rt_hit_object_* call.  Reused by every SER
+    # intrinsic in the same shader so we always reorder/execute against the same
+    # implicit hit-object slot (matches the GLSL `hitObjectNV hit;` pattern).
+    rt_hit_object_type_id::Union{Nothing, UInt32}
+    rt_hit_object_var_id::Union{Nothing, UInt32}
     # Set true when OpIgnoreIntersectionKHR/OpTerminateRayKHR is emitted (block terminators).
     # Suppresses the redundant OpReturn from the trailing `ret void`.
     rt_block_terminated::Bool
@@ -149,7 +155,9 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{Tuple{UInt32, UInt32}, UInt32}(),
         Dict{LLVM.Value, Tuple{UInt32, Vector{UInt32}, UInt32, LLVM.ArrayType}}(),
         Dict{LLVM.Value, UInt32}(),
-        nothing, nothing, nothing, :none, nothing, false,
+        nothing, nothing, nothing, :none, nothing,
+        nothing, nothing,  # SER: rt_hit_object_type_id, rt_hit_object_var_id
+        false,
         nothing, nothing, UInt32[], UInt32[],  # ray-query state
         nothing,  # gfx_io
         Dict{Tuple{UInt32, UInt32}, UInt32}(), UInt32(0),
@@ -6371,6 +6379,12 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return emit_rt_ignore_intersection!(state, inst)
         elseif fn_name == "lava_rt_terminate_ray"
             return emit_rt_terminate_ray!(state, inst)
+        elseif fn_name == "lava_rt_hit_object_trace_ray"
+            return emit_rt_hit_object_trace_ray!(state, inst)
+        elseif fn_name == "lava_rt_reorder_thread"
+            return emit_rt_reorder_thread!(state, inst)
+        elseif fn_name == "lava_rt_hit_object_execute_shader"
+            return emit_rt_hit_object_execute_shader!(state, inst)
         elseif fn_name == "lava_ray_query_init"
             return emit_ray_query_init!(state, inst)
         elseif fn_name == "lava_ray_query_proceed"

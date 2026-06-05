@@ -54,6 +54,8 @@ export refit_tlas!
 export trace_closest_hits!, trace_closest_hits_indirect!, RayTracingPipeline, trace_rays!, trace_rays_indirect!
 export set_anyhit_pipeline!, trace_closest_hits_anyhit!, trace_closest_hits_anyhit_indirect!
 export lava_rt_ignore_intersection, lava_rt_terminate_ray
+# SER (SPV_NV_shader_invocation_reorder)
+export lava_rt_hit_object_trace_ray, lava_rt_reorder_thread, lava_rt_hit_object_execute_shader
 export HWTLAS, HWAdaptedAccel
 # P4 narrow-phase convex shapes
 export ConvexShape, UnitCube, support

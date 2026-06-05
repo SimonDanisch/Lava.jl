@@ -230,6 +230,11 @@ mutable struct VkContext
     # Whether VK_KHR_ray_query is available on this device.
     # Set to true by B1 (device extension probe). False until proven otherwise.
     ray_query_available::Bool
+    # Whether VK_NV_ray_tracing_invocation_reorder (SER) is available.
+    # When true, the SPIR-V emitter declares the ShaderInvocationReorderNV
+    # capability and the raygen can use `lava_rt_hit_object_*` /
+    # `lava_rt_reorder_thread_*` intrinsics.  NVIDIA-only.
+    ser_available::Bool
     # Whether GPU-Assisted Validation is active on this instance. Captured
     # so callers can check (e.g. verify_gpu_av) without re-reading env vars.
     gpu_assisted::Bool
@@ -262,6 +267,7 @@ mutable struct VkContext
                        max_wg_dims::NTuple{3, Int},
                        as_scratch_align::UInt64,
                        ray_query_available::Bool=false,
+                       ser_available::Bool=false,
                        gpu_assisted::Bool=false,
                        driver_version::AbstractString="unknown")
         ctx = new()
@@ -282,6 +288,7 @@ mutable struct VkContext
         ctx.max_wg_dims = max_wg_dims
         ctx.as_scratch_align = as_scratch_align
         ctx.ray_query_available = ray_query_available
+        ctx.ser_available = ser_available
         ctx.gpu_assisted = gpu_assisted
         ctx.driver_version = driver_version
         # Seed a persistent VkPipelineCache from disk (if any). Driver
@@ -570,6 +577,13 @@ function init_vulkan!()
     # Check for RT extension support
     has_rt = has_rt_extensions(phys_dev)
     has_ray_query = has_rt && has_extension(phys_dev, "VK_KHR_ray_query")
+    # SER (Shader Execution Reordering) — NVIDIA-specific extension that
+    # exposes the `HitObject*` API and `reorderThreadWithHitObjectNV` for
+    # warp-level work reordering between traceRay and shading.  Lets
+    # divergent path-tracer chits ((`vp_closesthit_shade`) execute in
+    # coherent warps.  Optional; we still ship a working RT pipeline path
+    # without it.
+    has_ser = has_rt && has_extension(phys_dev, "VK_NV_ray_tracing_invocation_reorder")
 
     # Check for workgroup memory explicit layout (needed for mixed-type shared memory structs)
     has_wg_explicit = has_extension(phys_dev, "VK_KHR_workgroup_memory_explicit_layout")
@@ -589,6 +603,9 @@ function init_vulkan!()
     end
     if has_ray_query
         push!(extensions, "VK_KHR_ray_query")
+    end
+    if has_ser
+        push!(extensions, "VK_NV_ray_tracing_invocation_reorder")
     end
     if has_wg_explicit
         push!(extensions, "VK_KHR_workgroup_memory_explicit_layout")
@@ -759,6 +776,13 @@ function init_vulkan!()
         )
         feature_chain = rq_features
     end
+    if has_ser
+        ser_features = Vulkan.PhysicalDeviceRayTracingInvocationReorderFeaturesNV(
+            true;   # ray_tracing_invocation_reorder
+            next=feature_chain
+        )
+        feature_chain = ser_features
+    end
 
     # Enable shader int64, float64, geometry/tessellation shaders, wide lines
     core_features = Vulkan.PhysicalDeviceFeatures(
@@ -845,6 +869,7 @@ function init_vulkan!()
         mem_props, max_wg,
         as_scratch_align,
         has_ray_query,
+        has_ser,
         gpu_assisted,
         string(phys_props.driver_version),
     )

@@ -227,7 +227,16 @@ end
 @noinline function lava_full_compiler_config(;
         kernel = true,
         name = nothing,
-        always_inline = true,
+        # GPUCompiler's `always_inline=true` raises Julia's inline_cost_threshold
+        # to MAX_INLINE_COST, which forces every callee into the entry function
+        # at Julia IR level — overriding even `@noinline`. That was needed when
+        # Lava's SPIR-V emitter could only handle single-OpFunction kernels, but
+        # now that Lava's force_inline_all! supports multi-OpFunction output
+        # (force_inline_all=false default), we want Julia/GPUCompiler to respect
+        # `@noinline` so callees like `trace_shadow_transmittance` (which has a
+        # self-contained ray-query lifecycle) can survive as a separate
+        # OpFunction and keep their state out of the caller's register frame.
+        always_inline = false,
         workgroup_size::NTuple{3,Int} = (64, 1, 1),
         enable_ray_query::Bool = false,
         kwargs...)

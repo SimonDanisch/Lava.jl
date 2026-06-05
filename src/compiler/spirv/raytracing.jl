@@ -86,6 +86,20 @@ function emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
     require_capability!(spirv_mod, Cap.RayTracingKHR)
     require_extension!(spirv_mod, "SPV_KHR_variable_pointers")
     require_extension!(spirv_mod, "SPV_KHR_ray_tracing")
+    # SER capability — opt-in, declared only when the device supports it.
+    # Reading `vk_context().ser_available` keeps the SPIR-V module valid on
+    # non-NVIDIA hardware (where the capability would be a validation error).
+    if stage === :raygen
+        try
+            if vk_context().ser_available
+                require_capability!(spirv_mod, Cap.ShaderInvocationReorderNV)
+                require_extension!(spirv_mod, "SPV_NV_shader_invocation_reorder")
+            end
+        catch
+            # vk_context() not yet initialised (e.g. emitter tests without a
+            # device).  Silently skip; only the raygen path uses SER intrinsics.
+        end
+    end
 
     # Build struct pointer member type map
     build_struct_ptr_member_types!(type_ctx, llvm_mod)
@@ -107,11 +121,19 @@ function emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
     payload_var_id = emit_rt_payload_global!(state, stage_info.payload_sc, payload_type)
     push!(interface_ids, payload_var_id)
 
-    # For raygen: create TLAS descriptor variable
+    # TLAS descriptor variable.  Raygen always gets it (used by `traceRay`).
+    # closesthit / miss get it too so they can fire ray queries for shadow
+    # tracing — the descriptor binding is already visible to those stages
+    # via the pipeline's `all_stage_flags`, so the only thing missing was
+    # the SPIR-V OpVariable in the chit/miss modules. Declare RayQuery cap
+    # for the non-raygen stages so OpRayQueryInitializeKHR is accepted.
     tlas_var_id = nothing
-    if stage == :raygen
+    if stage in (:raygen, :closesthit, :miss, :anyhit)
         tlas_var_id = emit_rt_tlas_descriptor!(state)
         push!(interface_ids, tlas_var_id)
+        if stage in (:closesthit, :miss, :anyhit)
+            setup_ray_query_capabilities!(spirv_mod)
+        end
     end
 
     # For closesthit/anyhit: create hit attribute variable (vec2 barycentrics)
@@ -136,6 +158,10 @@ function emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
     else
         func_id = emit_entry_wrapper!(state, entry_fn)
     end
+
+    # Pick up any interface-list IDs registered during function emission
+    # (currently: the Private OpVariable backing OpTypeHitObjectNV for SER).
+    append!(interface_ids, state.entry_interface_ids)
 
     # Entry point — RT execution model, no LocalSize
     emit_entry_point!(spirv_mod, stage_info.exec_model, func_id, "main", interface_ids)
@@ -453,4 +479,138 @@ Accepts the current hit and stops traversal immediately.
 function emit_rt_terminate_ray!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     encode_instruction!(state.mod.functions, Op.OpTerminateRayKHR)
     state.rt_block_terminated = true
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SER (SPV_NV_shader_invocation_reorder) emission
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+Emit OpTypeHitObjectNV once per module.  Cached in `state.rt_hit_object_type_id`.
+"""
+function emit_rt_hit_object_type!(state::SPIRVEmitterState)
+    state.rt_hit_object_type_id !== nothing && return state.rt_hit_object_type_id
+    mod = state.mod
+    id = fresh_id!(mod)
+    encode_instruction!(mod.types_constants, Op.OpTypeHitObjectNV, id)
+    state.rt_hit_object_type_id = id
+    return id
+end
+
+"""
+Get or lazily create the implicit Private-storage HitObject variable that all
+SER intrinsics in this raygen share.  Mirrors the `hitObjectNV hit;` slot in
+GLSL — exactly one per shader.
+"""
+function get_or_create_hit_object_var!(state::SPIRVEmitterState)
+    state.rt_hit_object_var_id !== nothing && return state.rt_hit_object_var_id
+    mod = state.mod
+    ho_ty = emit_rt_hit_object_type!(state)
+    # OpTypePointer Private OpTypeHitObjectNV
+    ptr_ty = fresh_id!(mod)
+    encode_instruction!(mod.types_constants, Op.OpTypePointer, ptr_ty,
+                        SC.Private, ho_ty)
+    # OpVariable Private
+    var_id = fresh_id!(mod)
+    encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Private)
+    emit_name!(mod, var_id, "hit_object")
+    state.rt_hit_object_var_id = var_id
+    # SPIR-V 1.4+ requires every global OpVariable the entry point uses to
+    # be listed in OpEntryPoint's interface list — including Private-storage
+    # ones like our HitObject slot.
+    push!(state.entry_interface_ids, var_id)
+    return var_id
+end
+
+"""
+Emit OpHitObjectTraceRayNV from a call to lava_rt_hit_object_trace_ray.
+Same 13 operands as OpTraceRayKHR; result is written into the implicit
+HitObject variable (no closest-hit shader is invoked yet).
+"""
+function emit_rt_hit_object_trace_ray!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    mod = state.mod
+
+    args = UInt32[]
+    for i in 1:LLVM.API.LLVMGetNumArgOperands(inst)
+        push!(args, get_value_id!(state, LLVM.operands(inst)[i]))
+    end
+    length(args) == 13 || error("lava_rt_hit_object_trace_ray expects 13 arguments, got $(length(args))")
+
+    flags_id      = args[1]
+    mask_id       = args[2]
+    sbt_off_id    = args[3]
+    sbt_stride_id = args[4]
+    miss_idx_id   = args[5]
+    ox_id, oy_id, oz_id = args[6], args[7], args[8]
+    tmin_id       = args[9]
+    dx_id, dy_id, dz_id = args[10], args[11], args[12]
+    tmax_id       = args[13]
+
+    f32_ty = emit_type_float!(mod, UInt32(32))
+    vec3_ty = emit_type_vector!(mod, f32_ty, UInt32(3))
+
+    origin_id = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpCompositeConstruct, vec3_ty, origin_id,
+                        ox_id, oy_id, oz_id)
+
+    dir_id = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpCompositeConstruct, vec3_ty, dir_id,
+                        dx_id, dy_id, dz_id)
+
+    tlas_var = state.rt_tlas_var_id
+    tlas_var === nothing && error("OpHitObjectTraceRayNV requires TLAS variable (only valid in raygen)")
+    accel_ty = state.rt_accel_type_id
+    tlas_id = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpLoad, accel_ty, tlas_id, tlas_var)
+
+    payload_var = state.rt_payload_var_id
+    ho_var = get_or_create_hit_object_var!(state)
+
+    # OpHitObjectTraceRayNV %hit_object_var %accel %flags %mask %sbt_off %sbt_stride
+    #                       %miss_idx %origin %tmin %dir %tmax %payload
+    # 12 operands + opcode = word count 13
+    word_count = UInt32(13)
+    push!(mod.functions, (word_count << 16) | UInt32(Op.OpHitObjectTraceRayNV))
+    push!(mod.functions, ho_var)
+    push!(mod.functions, tlas_id)
+    push!(mod.functions, flags_id)
+    push!(mod.functions, mask_id)
+    push!(mod.functions, sbt_off_id)
+    push!(mod.functions, sbt_stride_id)
+    push!(mod.functions, miss_idx_id)
+    push!(mod.functions, origin_id)
+    push!(mod.functions, tmin_id)
+    push!(mod.functions, dir_id)
+    push!(mod.functions, tmax_id)
+    push!(mod.functions, payload_var)
+end
+
+"""
+Emit OpReorderThreadWithHitObjectNV using the implicit HitObject.
+"""
+function emit_rt_reorder_thread!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    mod = state.mod
+    ho_var = get_or_create_hit_object_var!(state)
+    # OpReorderThreadWithHitObjectNV %hit_object_var
+    # 1 operand + opcode = word count 2
+    word_count = UInt32(2)
+    push!(mod.functions, (word_count << 16) | UInt32(Op.OpReorderThreadWithHitObjectNV))
+    push!(mod.functions, ho_var)
+end
+
+"""
+Emit OpHitObjectExecuteShaderNV — invokes the closest-hit / miss shader for
+the recorded HitObject, using the current ray payload.
+"""
+function emit_rt_hit_object_execute_shader!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    mod = state.mod
+    ho_var = get_or_create_hit_object_var!(state)
+    payload_var = state.rt_payload_var_id
+    payload_var === nothing && error("OpHitObjectExecuteShaderNV requires a payload variable")
+    # OpHitObjectExecuteShaderNV %hit_object_var %payload
+    # 2 operands + opcode = word count 3
+    word_count = UInt32(3)
+    push!(mod.functions, (word_count << 16) | UInt32(Op.OpHitObjectExecuteShaderNV))
+    push!(mod.functions, ho_var)
+    push!(mod.functions, payload_var)
 end

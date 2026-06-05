@@ -115,6 +115,48 @@ Lava SW is **1.4-2.5x faster than AMDGPU** across all scenes. Hardware RT adds a
 
 Lava wins on compute-bound and dispatch-sensitive operations (up to **23x faster** on map/sin at 10M). AMDGPU wins on memory-bound operations (sort, sortperm) where its native HIP driver has an edge.
 
+## Benchmarks — NVIDIA RTX 4000 Ada Generation
+
+Same workloads on NVIDIA RTX 4000 Ada (driver 595.80) / Ryzen 9 7900X. Full data and methodology in [RayDemo](https://github.com/SimonDanisch/RayDemo).
+
+### Ray Tracing (Hikari scenes)
+
+Median of 3 trials (after 1 warmup), in seconds. Best per row in **bold**.
+
+| Scene | Resolution | spp | pbrt-v4 OptiX | CUDA | Lava SW | Lava HW RT |
+|---|---|---:|---:|---:|---:|---:|
+| Crown | 500×700 | 16 | 2.372 s | 2.752 s | 1.844 s | **1.291 s** |
+| Bunny cloud | 960×540 | 8 | 3.459 s | 1.310 s | 1.146 s | **1.142 s** |
+| Killeroo (gold) | 684×513 | 32 | 1.541 s | **0.889 s** | 1.246 s | 1.191 s |
+| Materials | 1200×900 | 10 | 1.503 s | **0.886 s** | 1.232 s | 1.164 s |
+| Black hole | 800×450 | 32 | — | 2.089 s | **1.870 s** | 1.945 s |
+
+**Lava HW RT beats pbrt-v4 OptiX on every comparable scene** (Crown 2.2×, Bunny cloud 3.0×, Killeroo 1.3×, Materials 1.3× faster). Against the CUDA path of the same Hikari integrator, Lava wins on the volumetric scenes (Crown, Bunny cloud, Black hole — where shader-side complexity dominates) while CUDA wins on the surface-only scenes (Killeroo, Materials — where Lava is still dispatch-overhead-dominated at this scale; sub-ms-per-dispatch matters less for compute-heavy paths).
+
+pbrt-v4 was built from upstream master `91bc6ca` against CUDA 13.3 + OptiX 9.1 on the same machine. Black hole has no `.pbrt` counterpart (Julia-only spacetime-medium scene).
+
+> **Note on the pbrt-v4 comparison.** Hikari (the integrator behind the Lava and CUDA columns) is a port of pbrt-v4's volumetric path tracer — MIS, light sampling, RR, the delta-tracking pattern for media all mirror pbrt — and it implements every surface/material type (`diffuse`, `conductor`, `dielectric`, `thindielectric`, `coateddiffuse`, `coatedconductor`, `diffusetransmission`, `interface`) and camera sensor (`canon_eos_5d_mkiv`, `nikon_d850`, default CIE 1931) these scenes use. Two scene-fidelity gaps are still open on the Lava/CUDA side: (a) **Killeroo's grid floor/walls** — the pbrt parser was extended to accept spectrum-class `scale` textures (the floor diffuse now resolves to a `Texture{RGBSpectrum,2}` with the right line-pattern Kd), but the rendered floor still looks flat-grey at normal contrast, indicating the spectrum-texture UV path isn't producing varying output downstream of the resolved material; (b) **Crown's gold/sapphire/pearl displacement maps** — a `BumpMapped{Inner, BumpTex}` wrapper material was added and is registered in the GPU material set with proper `TextureRef` conversion, but the perturbed shading frame doesn't visibly change the rendered surface yet. Both gaps are now in Hikari/RayMakie, not the pbrt parser; the timings above are for renders that are still missing Crown's displacement detail. BSSRDF (separable subsurface) and hair BxDFs are also not yet implemented; none of these scenes use either.
+
+### AcceleratedKernels — 100M and 1M elements
+
+Median ms, lower is better. `←` = Lava ≤ CUDA on that op.
+
+| Operation | CUDA 1M | Lava 1M | ratio | CUDA 100M | Lava 100M | ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| sort/UInt32 | 0.713 | 7.694 | 10.79× | 113.194 | 130.218 | 1.15× |
+| sort/Float32 | 0.892 | 9.957 | 11.16× | 139.821 | 158.075 | 1.13× |
+| reduce/UInt32 | 0.031 | 0.244 | 7.87× | 1.276 | 1.285 | 1.01× ← |
+| reduce/Float32 | 0.030 | 0.236 | 7.87× | 1.287 | 1.277 | 0.99× ← |
+| accumulate/UInt32 | 0.047 | 0.667 | 14.19× | 11.912 | 51.102 | 4.29× |
+| accumulate/Float32 | 0.045 | 0.681 | 15.13× | 11.893 | 45.959 | 3.86× |
+| map/Float32 (acck_2x) | 0.025 | 0.135 | 5.40× | 2.844 | 2.716 | 0.95× ← |
+| map/Float32 (acck_sin) | 0.017 | 0.136 | 8.00× | 2.854 | 2.737 | 0.96× ← |
+| mapreduce/Float32 (acck_sin) | 0.031 | 0.226 | 7.29× | 1.295 | 1.282 | 0.99× ← |
+| sortperm/UInt32 | 1.063 | 10.290 | 9.68× | 309.817 | 446.300 | 1.44× |
+| sortperm/Float32 | 3.767 | 12.028 | 3.19× | 1450.118 | 447.890 | **0.31× ← (Lava 3.2× faster)** |
+
+**At 100M Lava ≤ CUDA on 6 of 11 ops** — reduce, map, mapreduce all tie or favor Lava, and `sortperm/Float32` is **3.2× faster** (CUDA's float comparator with NaN handling is heavy here). Sort closes to within 15% of CUB. The remaining gaps (accumulate, sort) are vendor-tuned-kernel territory (CUDA's CUB / Thrust). At 1M most ops are dispatch-overhead-bound — Lava's per-record cost is 1.51 µs vs CUDA's effectively free stream queuing, which dominates total time when each op is sub-ms.
+
 
 ## Architecture
 

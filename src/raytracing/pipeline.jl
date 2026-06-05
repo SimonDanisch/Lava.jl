@@ -32,22 +32,33 @@ struct LavaRTPipeline
 end
 
 """
-    create_rt_pipeline(raygen_spirv, miss_spirv, chit_spirv;
+    create_rt_pipeline(raygen_spirv, miss_spirv, chit_spirvs;
                        push_constant_size=8) -> LavaRTPipeline
 
-Create a ray tracing pipeline from 3 SPIR-V binaries (raygen, miss, closest-hit).
+Create a ray tracing pipeline from raygen + miss + N closest-hit SPIR-V
+binaries.
 
 Layout:
-  - Group 0: raygen (GENERAL)
-  - Group 1: miss (GENERAL)
-  - Group 2: closest-hit (TRIANGLES_HIT_GROUP)
-  - Descriptor set 0, binding 0: AccelerationStructure (TLAS)
-  - Push constant: BDA pointer (8 bytes by default)
+  - Group 0:                raygen (GENERAL)
+  - Group 1:                miss (GENERAL)
+  - Group 2 .. 1+N:         closest-hit hit groups (TRIANGLES_HIT_GROUP)
+  - Optional any-hit:       shared across every hit group when supplied
+  - Descriptor set 0/0:     AccelerationStructure (TLAS)
+  - Push constant:          BDA pointer (8 bytes by default)
 """
 function create_rt_pipeline(ctx::VkContext,
                             raygen_spirv::Vector{UInt8},
                             miss_spirv::Vector{UInt8},
                             chit_spirv::Vector{UInt8};
+                            kwargs...)
+    return create_rt_pipeline(ctx, raygen_spirv, miss_spirv,
+                              Vector{UInt8}[chit_spirv]; kwargs...)
+end
+
+function create_rt_pipeline(ctx::VkContext,
+                            raygen_spirv::Vector{UInt8},
+                            miss_spirv::Vector{UInt8},
+                            chit_spirvs::Vector{Vector{UInt8}};
                             anyhit_spirv::Union{Nothing, Vector{UInt8}}=nothing,
                             push_constant_size::Integer=8)
     dev = ctx.device
@@ -56,34 +67,48 @@ function create_rt_pipeline(ctx::VkContext,
         "RT pipeline creation",
         "Ray tracing not supported on this device",
         "Ensure VK_KHR_ray_tracing_pipeline is available"))
+    n_chits = length(chit_spirvs)
+    n_chits >= 1 || throw(ArgumentError("create_rt_pipeline: at least one closest-hit shader required"))
 
     # Create shader modules
     raygen_mod = create_shader_module(dev, raygen_spirv)
     check_validation_errors!("vkCreateShaderModule (raygen)")
     miss_mod = create_shader_module(dev, miss_spirv)
     check_validation_errors!("vkCreateShaderModule (miss)")
-    chit_mod = create_shader_module(dev, chit_spirv)
-    check_validation_errors!("vkCreateShaderModule (closest-hit)")
-    shader_modules = [raygen_mod, miss_mod, chit_mod]
+    shader_modules = [raygen_mod, miss_mod]
+    chit_mods = Vulkan.ShaderModule[]
+    for (i, chit_spirv) in enumerate(chit_spirvs)
+        m = create_shader_module(dev, chit_spirv)
+        check_validation_errors!("vkCreateShaderModule (closest-hit $i)")
+        push!(chit_mods, m)
+        push!(shader_modules, m)
+    end
 
     has_anyhit = anyhit_spirv !== nothing
 
-    # Shader stages (index 0=raygen, 1=miss, 2=closest-hit, [3=any-hit])
-    stages = [
+    # Shader stages: 0=raygen, 1=miss, 2..1+N=closest-hit per chit_spirvs,
+    # then optional anyhit at the next index.
+    stages = Vulkan.PipelineShaderStageCreateInfo[
         Vulkan.PipelineShaderStageCreateInfo(
             Vulkan.SHADER_STAGE_RAYGEN_BIT_KHR, raygen_mod, "main"),
         Vulkan.PipelineShaderStageCreateInfo(
             Vulkan.SHADER_STAGE_MISS_BIT_KHR, miss_mod, "main"),
-        Vulkan.PipelineShaderStageCreateInfo(
-            Vulkan.SHADER_STAGE_CLOSEST_HIT_BIT_KHR, chit_mod, "main"),
     ]
+    chit_stage_indices = Int[]
+    for chit_mod in chit_mods
+        push!(stages, Vulkan.PipelineShaderStageCreateInfo(
+            Vulkan.SHADER_STAGE_CLOSEST_HIT_BIT_KHR, chit_mod, "main"))
+        push!(chit_stage_indices, length(stages) - 1)   # 0-based
+    end
 
+    anyhit_stage_index = VK_SHADER_UNUSED_KHR
     if has_anyhit
         anyhit_mod = create_shader_module(dev, anyhit_spirv)
         check_validation_errors!("vkCreateShaderModule (any-hit)")
         push!(stages, Vulkan.PipelineShaderStageCreateInfo(
             Vulkan.SHADER_STAGE_ANY_HIT_BIT_KHR, anyhit_mod, "main"))
         push!(shader_modules, anyhit_mod)
+        anyhit_stage_index = UInt32(length(stages) - 1)
     end
 
     # All stage flags (for descriptor set and push constant visibility)
@@ -94,33 +119,28 @@ function create_rt_pipeline(ctx::VkContext,
         all_stage_flags |= Vulkan.SHADER_STAGE_ANY_HIT_BIT_KHR
     end
 
-    # Shader groups
-    groups = [
-        # Group 0: raygen (GENERAL, shader index 0)
+    # Shader groups: raygen (0), miss (1), then one triangles-hit-group per chit.
+    groups = Vulkan.RayTracingShaderGroupCreateInfoKHR[
         Vulkan.RayTracingShaderGroupCreateInfoKHR(
             Vulkan.RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR,
-            UInt32(0),              # general_shader = stage index 0
-            VK_SHADER_UNUSED_KHR,  # closest_hit_shader
-            VK_SHADER_UNUSED_KHR,  # any_hit_shader
-            VK_SHADER_UNUSED_KHR,  # intersection_shader
+            UInt32(0),
+            VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR,
         ),
-        # Group 1: miss (GENERAL, shader index 1)
         Vulkan.RayTracingShaderGroupCreateInfoKHR(
             Vulkan.RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR,
             UInt32(1),
-            VK_SHADER_UNUSED_KHR,
-            VK_SHADER_UNUSED_KHR,
-            VK_SHADER_UNUSED_KHR,
-        ),
-        # Group 2: triangles hit group (closest-hit at index 2, optional any-hit at index 3)
-        Vulkan.RayTracingShaderGroupCreateInfoKHR(
-            Vulkan.RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR,
-            VK_SHADER_UNUSED_KHR,  # general_shader (not used for hit groups)
-            UInt32(2),              # closest_hit_shader = stage index 2
-            has_anyhit ? UInt32(3) : VK_SHADER_UNUSED_KHR,  # any_hit_shader
-            VK_SHADER_UNUSED_KHR,  # intersection_shader
+            VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR, VK_SHADER_UNUSED_KHR,
         ),
     ]
+    for chit_idx in chit_stage_indices
+        push!(groups, Vulkan.RayTracingShaderGroupCreateInfoKHR(
+            Vulkan.RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR,
+            VK_SHADER_UNUSED_KHR,
+            UInt32(chit_idx),
+            anyhit_stage_index,
+            VK_SHADER_UNUSED_KHR,
+        ))
+    end
 
     # Descriptor set layout: binding 0 = TLAS
     ds_layout = Vulkan.DescriptorSetLayout(dev, [
@@ -157,9 +177,10 @@ function create_rt_pipeline(ctx::VkContext,
         dev, [rt_ci]; pipeline_cache=ctx.pipeline_cache)
     pipeline = pipelines[1]
 
-    # Build SBT (still 3 groups — any-hit is part of the hit group, not a separate group)
+    # Build SBT (raygen + miss + N hit groups; any-hit is shared inside each
+    # triangles-hit-group, not a separate SBT entry).
     sbt_buf, raygen_region, miss_region, hit_region, callable_region =
-        build_sbt(ctx, pipeline, rt_props, 3)
+        build_sbt(ctx, pipeline, rt_props, n_chits)
 
     return LavaRTPipeline(
         pipeline, layout, ds_layout,
@@ -295,9 +316,19 @@ function create_shader_module(dev, spirv_bytes::Vector{UInt8})
     return Vulkan.ShaderModule(dev, length(spirv_bytes), code_u32)
 end
 
-"""Build the shader binding table for a 3-group RT pipeline (raygen, miss, chit)."""
+"""Build the SBT for raygen + miss + `n_hit_groups` triangles-hit-groups.
+
+Pipeline group ordering matches `create_rt_pipeline`:
+  - group 0           : raygen
+  - group 1           : miss
+  - groups 2..1+N     : the N hit groups, in chit order.
+
+Per-instance dispatch picks an SBT hit-group entry by
+`instanceShaderBindingTableRecordOffset` (0..N-1).
+"""
 function build_sbt(ctx::VkContext, pipeline::Vulkan.Pipeline, rt_props::RTPipelineProperties,
-                    n_groups::Int)
+                    n_hit_groups::Int)
+    n_hit_groups >= 1 || throw(ArgumentError("build_sbt: n_hit_groups must be >= 1"))
     dev = ctx.device
     handle_size = rt_props.shader_group_handle_size
     base_align = rt_props.shader_group_base_alignment
@@ -306,31 +337,30 @@ function build_sbt(ctx::VkContext, pipeline::Vulkan.Pipeline, rt_props::RTPipeli
     # but stride must be multiple of shader_group_handle_alignment
     handle_size_aligned = align_up(handle_size, rt_props.shader_group_handle_alignment)
 
-    # Get all group handles
+    # Pull every pipeline group handle: raygen + miss + N hit groups = 2 + N
+    n_groups = 2 + n_hit_groups
     total_handle_data = handle_size * n_groups
     handles = Vector{UInt8}(undef, total_handle_data)
     unwrap(Vulkan.get_ray_tracing_shader_group_handles_khr(
         dev, pipeline, UInt32(0), UInt32(n_groups), total_handle_data, Ptr{Nothing}(pointer(handles))))
 
-    # SBT layout:
-    # [raygen region | miss region | hit region]
-    # Each region is base_align-aligned
     raygen_stride = align_up(handle_size_aligned, base_align)
-    miss_stride = handle_size_aligned
-    hit_stride = handle_size_aligned
+    miss_stride   = handle_size_aligned
+    hit_stride    = handle_size_aligned
 
-    raygen_size = raygen_stride  # exactly 1 raygen entry
-    miss_size = align_up(miss_stride, base_align)  # 1 miss entry, region aligned
-    hit_size = align_up(hit_stride, base_align)  # 1 hit entry, region aligned
+    raygen_size = raygen_stride                      # exactly 1 raygen entry
+    miss_size   = align_up(miss_stride, base_align)  # 1 miss entry, region aligned
+    # N hit entries, then round the region up to base_align.
+    hit_size_raw = hit_stride * n_hit_groups
+    hit_size     = align_up(hit_size_raw, base_align)
 
     total_sbt_size = align_up(raygen_size, base_align) +
-                     align_up(miss_size, base_align) +
-                     align_up(hit_size, base_align)
+                     align_up(miss_size,   base_align) +
+                     align_up(hit_size,    base_align)
 
     sbt_buf = vk_alloc(ctx.default_bq, total_sbt_size;
         extra_usage=UInt32(Vulkan.BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR))
 
-    # Upload SBT data via staging
     sbt_data = zeros(UInt8, total_sbt_size)
     offset = 0
 
@@ -344,9 +374,14 @@ function build_sbt(ctx::VkContext, pipeline::Vulkan.Pipeline, rt_props::RTPipeli
     copyto!(sbt_data, offset + 1, handles, handle_size + 1, handle_size)
     offset = miss_offset + align_up(miss_size, base_align)
 
-    # Hit (group 2)
+    # Hit groups (groups 2..1+N). Pack one handle every `hit_stride` bytes;
+    # an SBT entry is indexed by `instanceShaderBindingTableRecordOffset`.
     hit_offset = offset
-    copyto!(sbt_data, offset + 1, handles, 2 * handle_size + 1, handle_size)
+    for i in 1:n_hit_groups
+        src_start = (1 + i) * handle_size + 1     # 1-based start of group (1+i)'s handle
+        dst_start = hit_offset + (i - 1) * hit_stride + 1
+        copyto!(sbt_data, dst_start, handles, src_start, handle_size)
+    end
 
     upload!(sbt_buf, sbt_data)
 

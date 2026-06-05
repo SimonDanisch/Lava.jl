@@ -39,17 +39,41 @@ trace_rays!(rt, tlas, output_buf; width=1920, height=1080)
 mutable struct RayTracingPipeline
     # User-provided Julia functions
     raygen_func::Any
-    closesthit_func::Any
+    # Tuple of one-or-more closest-hit functions.  When the tuple has length
+    # N > 1 the SBT is built with N hit groups; each TLAS instance picks a
+    # group via `instanceShaderBindingTableRecordOffset`.  Per-material chit
+    # shaders + SER live on this path.
+    closesthit_funcs::Tuple
     miss_func::Any
     anyhit_func::Any          # nothing = no any-hit shader
     payload_type::Symbol
+    # When true, the closest-hit and miss shaders are compiled with the same
+    # BDA argument signature as the raygen — they receive the raygen's args
+    # as function parameters and can read every buffer/queue the raygen sees.
+    # Required for the pbrt-v4 OptiX pattern (shading happens in closesthit,
+    # raygen just calls traceRay).  Default `false` keeps the legacy contract
+    # where chit/miss take no args (the `hw_closesthit` / `hw_miss` pattern
+    # used by `trace_closest_hits!`).
+    chit_miss_take_args::Bool
     # Compiled state (lazy)
     _compiled::Union{Nothing, NamedTuple}
     PIPELINE_CACHE::Dict{UInt64, Tuple{LavaRTPipeline, LavaRTShader, Vector{Int}, Vector{Int}}}
 end
 
-function RayTracingPipeline(; raygen, closest_hit, miss, any_hit=nothing, payload_type::Symbol=:f32)
-    RayTracingPipeline(raygen, closest_hit, miss, any_hit, payload_type, nothing,
+# Normalise `closest_hit` to a Tuple: accept a single function or a
+# tuple/vector of functions.  Stored internally as a Tuple so each chit's
+# identity participates in dispatch caches and pin walks.
+_normalise_chit(f) = (f,)
+_normalise_chit(t::Tuple) = t
+_normalise_chit(v::AbstractVector) = tuple(v...)
+
+function RayTracingPipeline(; raygen, closest_hit, miss, any_hit=nothing,
+                              payload_type::Symbol=:f32,
+                              chit_miss_take_args::Bool=false)
+    chits = _normalise_chit(closest_hit)
+    isempty(chits) && throw(ArgumentError("RayTracingPipeline: at least one closest_hit shader is required"))
+    RayTracingPipeline(raygen, chits, miss, any_hit, payload_type,
+                        chit_miss_take_args, nothing,
                         Dict{UInt64, Tuple{LavaRTPipeline, LavaRTShader, Vector{Int}, Vector{Int}}}())
 end
 
@@ -94,7 +118,9 @@ function trace_rays!(bq::BatchQueue, pipeline::RayTracingPipeline, tlas::LavaTLA
     # Now open (or re-open) the real active batch and adapt args into it.
     batch = ensure_active_batch!(bq)
     pin_leaves!(batch, pipeline.raygen_func)
-    pin_leaves!(batch, pipeline.closesthit_func)
+    for chit in pipeline.closesthit_funcs
+        pin_leaves!(batch, chit)
+    end
     pin_leaves!(batch, pipeline.miss_func)
     pin_leaves!(batch, pipeline.anyhit_func)   # pin_leaves!(::Nothing) is a no-op
     pin_leaves!(batch, args)
@@ -153,7 +179,9 @@ function trace_rays_indirect!(bq::BatchQueue, pipeline::RayTracingPipeline,
 
     batch = ensure_active_batch!(bq)
     pin_leaves!(batch, pipeline.raygen_func)
-    pin_leaves!(batch, pipeline.closesthit_func)
+    for chit in pipeline.closesthit_funcs
+        pin_leaves!(batch, chit)
+    end
     pin_leaves!(batch, pipeline.miss_func)
     pin_leaves!(batch, pipeline.anyhit_func)   # pin_leaves!(::Nothing) is a no-op
     pin_leaves!(batch, args)
@@ -206,15 +234,22 @@ function compile_rt_pipeline(ctx::VkContext, pipeline::RayTracingPipeline, rayge
     raygen_compiled = lava_compile_rt_shader(pipeline.raygen_func, raygen_tt;
         stage=:raygen, push_constant_size=8, payload_type=pt, validate=true)
 
-    # Compile closesthit
-    chit_tt = Tuple{}
-    chit_compiled = lava_compile_rt_shader(pipeline.closesthit_func, chit_tt;
-        stage=:closesthit, push_constant_size=0, payload_type=pt, validate=true)
+    # Compile closesthits & miss.  When `chit_miss_take_args` is set the chit
+    # and miss receive the raygen's BDA arg signature (same push-constant
+    # pointer the raygen sees), enabling the pbrt-v4 OptiX pattern where
+    # shading happens in closesthit.  Otherwise they're compiled with no
+    # args (legacy `hw_closesthit` / `hw_miss` contract).
+    chit_tt, chit_push = pipeline.chit_miss_take_args ? (raygen_tt, 8) : (Tuple{}, 0)
+    chit_spirvs = Vector{UInt8}[]
+    for chit in pipeline.closesthit_funcs
+        c = lava_compile_rt_shader(chit, chit_tt;
+            stage=:closesthit, push_constant_size=chit_push, payload_type=pt, validate=true)
+        push!(chit_spirvs, c.spirv_bytes)
+    end
 
-    # Compile miss
-    miss_tt = Tuple{}
+    miss_tt, miss_push = pipeline.chit_miss_take_args ? (raygen_tt, 8) : (Tuple{}, 0)
     miss_compiled = lava_compile_rt_shader(pipeline.miss_func, miss_tt;
-        stage=:miss, push_constant_size=0, payload_type=pt, validate=true)
+        stage=:miss, push_constant_size=miss_push, payload_type=pt, validate=true)
 
     # Compile any-hit (optional)
     anyhit_spirv = nothing
@@ -230,7 +265,7 @@ function compile_rt_pipeline(ctx::VkContext, pipeline::RayTracingPipeline, rayge
         ctx,
         raygen_compiled.spirv_bytes,
         miss_compiled.spirv_bytes,
-        chit_compiled.spirv_bytes;
+        chit_spirvs;
         anyhit_spirv=anyhit_spirv,
         push_constant_size=8)
 

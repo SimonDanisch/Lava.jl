@@ -216,6 +216,45 @@ module Op
     # Intersection-kind operand to GetIntersection* (and related ops)
     const RayQueryCandidateIntersectionKHR = UInt32(0)
     const RayQueryCommittedIntersectionKHR = UInt32(1)
+    # ── SER (SPV_NV_shader_invocation_reorder) ──
+    # The opaque HitObject type carries the result of a hitObjectTraceRayNV
+    # call.  reorderThreadNV uses it (optionally) to coherently rebin warp
+    # lanes, then hitObjectExecuteShaderNV invokes the closest-hit / miss
+    # shader for the reordered thread.  This is what makes per-material
+    # closesthit shaders deliver coherent warps under divergent rays.
+    const OpHitObjectRecordHitMotionNV                = UInt16(5249)
+    const OpHitObjectRecordHitWithIndexMotionNV       = UInt16(5250)
+    const OpHitObjectRecordMissMotionNV               = UInt16(5251)
+    const OpHitObjectGetWorldToObjectNV               = UInt16(5252)
+    const OpHitObjectGetObjectToWorldNV               = UInt16(5253)
+    const OpHitObjectGetObjectRayDirectionNV          = UInt16(5254)
+    const OpHitObjectGetObjectRayOriginNV             = UInt16(5255)
+    const OpHitObjectTraceRayMotionNV                 = UInt16(5256)
+    const OpHitObjectGetShaderRecordBufferHandleNV    = UInt16(5257)
+    const OpHitObjectGetShaderBindingTableRecordIndexNV = UInt16(5258)
+    const OpHitObjectRecordEmptyNV                    = UInt16(5259)
+    const OpHitObjectTraceRayNV                       = UInt16(5260)
+    const OpHitObjectRecordHitNV                      = UInt16(5261)
+    const OpHitObjectRecordHitWithIndexNV             = UInt16(5262)
+    const OpHitObjectRecordMissNV                     = UInt16(5263)
+    const OpHitObjectExecuteShaderNV                  = UInt16(5264)
+    const OpHitObjectGetCurrentTimeNV                 = UInt16(5265)
+    const OpHitObjectGetAttributesNV                  = UInt16(5266)
+    const OpHitObjectGetHitKindNV                     = UInt16(5267)
+    const OpHitObjectGetPrimitiveIndexNV              = UInt16(5268)
+    const OpHitObjectGetGeometryIndexNV               = UInt16(5269)
+    const OpHitObjectGetInstanceIdNV                  = UInt16(5270)
+    const OpHitObjectGetInstanceCustomIndexNV         = UInt16(5271)
+    const OpHitObjectGetWorldRayDirectionNV           = UInt16(5272)
+    const OpHitObjectGetWorldRayOriginNV              = UInt16(5273)
+    const OpHitObjectGetRayTMaxNV                     = UInt16(5274)
+    const OpHitObjectGetRayTMinNV                     = UInt16(5275)
+    const OpHitObjectIsEmptyNV                        = UInt16(5276)
+    const OpHitObjectIsHitNV                          = UInt16(5277)
+    const OpHitObjectIsMissNV                         = UInt16(5278)
+    const OpReorderThreadWithHitObjectNV              = UInt16(5279)
+    const OpReorderThreadWithHintNV                   = UInt16(5280)
+    const OpTypeHitObjectNV                           = UInt16(5281)
 end
 
 # ---- Capabilities ----
@@ -253,6 +292,10 @@ module Cap
     const GroupNonUniformClustered      = UInt32(67)
     const GroupNonUniformQuad           = UInt32(68)
     const RayQueryKHR                   = UInt32(4472)
+    # SER (SPV_NV_shader_invocation_reorder).  Value per the SPIR-V unified1
+    # grammar (5383).  Earlier guesses (5288 / 5247) collided with
+    # ComputeDerivativeGroupQuadsKHR and were invalid respectively.
+    const ShaderInvocationReorderNV     = UInt32(5383)
 end
 
 # ---- Storage Classes ----

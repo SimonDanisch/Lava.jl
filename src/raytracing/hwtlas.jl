@@ -45,6 +45,11 @@ struct InstanceBatch{Tri}
     custom_index::UInt32      # low 24 bits of gl_InstanceCustomIndexEXT (mi_idx / instance_id)
     handle::Raycore.TLASHandle
     triangles::Vector{Tri}
+    # SBT hit-group offset every instance in the batch shares.  0 maps to the
+    # first chit slot (legacy single-chit pipelines); per-material pipelines
+    # set this per push! to the material's slot index in
+    # `RayTracingPipeline.closesthit_funcs`.
+    sbt_offset::UInt32
 end
 
 # ============================================================================
@@ -378,32 +383,36 @@ end
 function _register_batch!(hwtlas::HWTLAS{Tri}, blas::LavaBLAS,
                           records::Vector{LavaInstanceRecord},
                           triangles::Vector{Tri},
-                          instance_mask::UInt8) where {Tri}
+                          instance_mask::UInt8,
+                          sbt_offset::UInt32) where {Tri}
     n = length(records)
     instance_buf = LavaArray{LavaInstanceRecord, 1}(undef, n; extra_usage=AS_INPUT_USAGE)
     Base.copyto!(instance_buf, records)
     handle = Raycore.TLASHandle(hwtlas.next_handle_id)
     hwtlas.next_handle_id += UInt32(1)
     push!(hwtlas.instance_batches,
-          InstanceBatch{Tri}(blas, instance_buf, n, instance_mask, UInt32(0), handle, triangles))
+          InstanceBatch{Tri}(blas, instance_buf, n, instance_mask, UInt32(0), handle, triangles, sbt_offset))
     hwtlas.handle_to_batch_idx[handle] = lastindex(hwtlas.instance_batches)
     hwtlas.dirty = true
     return handle
 end
 
 function Base.push!(hwtlas::HWTLAS{Tri}, mesh::GeometryBasics.Mesh, transform::Mat4f=Mat4f(I);
-                    instance_id::UInt32=UInt32(0), instance_mask::UInt8=UInt8(0xff)) where {Tri}
+                    instance_id::UInt32=UInt32(0), instance_mask::UInt8=UInt8(0xff),
+                    sbt_offset::UInt32=UInt32(0)) where {Tri}
     blas_idx  = hwtlas_add_geometry!(hwtlas, mesh)
     blas      = hwtlas.blas_list[blas_idx]
     triangles = hwtlas.blas_triangles[blas_idx]
     record    = LavaInstanceRecord(mat4_to_vk_transform(transform), blas.address;
-                                   custom_index=instance_id, mask=instance_mask)
-    return _register_batch!(hwtlas, blas, [record], triangles, instance_mask)
+                                   custom_index=instance_id, mask=instance_mask,
+                                   sbt_offset=sbt_offset)
+    return _register_batch!(hwtlas, blas, [record], triangles, instance_mask, sbt_offset)
 end
 
 function Base.push!(hwtlas::HWTLAS{Tri}, mesh::GeometryBasics.Mesh, transforms::AbstractVector{Mat4f};
                     instance_ids::Union{Nothing, AbstractVector{<:Integer}}=nothing,
-                    instance_mask::UInt8=UInt8(0xff)) where {Tri}
+                    instance_mask::UInt8=UInt8(0xff),
+                    sbt_offset::UInt32=UInt32(0)) where {Tri}
     if instance_ids !== nothing && length(instance_ids) != length(transforms)
         throw(ArgumentError("instance_ids length $(length(instance_ids)) != transforms length $(length(transforms))"))
     end
@@ -415,9 +424,10 @@ function Base.push!(hwtlas::HWTLAS{Tri}, mesh::GeometryBasics.Mesh, transforms::
     @inbounds for i in eachindex(transforms)
         iid = instance_ids === nothing ? UInt32(0) : UInt32(instance_ids[i])
         records[i] = LavaInstanceRecord(mat4_to_vk_transform(transforms[i]), addr;
-                                        custom_index=iid, mask=instance_mask)
+                                        custom_index=iid, mask=instance_mask,
+                                        sbt_offset=sbt_offset)
     end
-    return _register_batch!(hwtlas, blas, records, triangles, instance_mask)
+    return _register_batch!(hwtlas, blas, records, triangles, instance_mask, sbt_offset)
 end
 
 """
@@ -431,7 +441,8 @@ this call.  Use the compute-rayQuery path (`lava_launch!` with `tlas=hwtlas`)
 instead.
 """
 function Base.push!(hwtlas::HWTLAS{Tri}, blas::LavaBLAS, transform::Mat4f=Mat4f(I);
-                    instance_id::UInt32=UInt32(0), instance_mask::UInt8=UInt8(0xff)) where {Tri}
+                    instance_id::UInt32=UInt32(0), instance_mask::UInt8=UInt8(0xff),
+                    sbt_offset::UInt32=UInt32(0)) where {Tri}
     # Register the pre-built BLAS — no triangles.
     push!(hwtlas.blas_list, blas)
     push!(hwtlas.blas_triangles, Tri[])
@@ -441,8 +452,9 @@ function Base.push!(hwtlas::HWTLAS{Tri}, blas::LavaBLAS, transform::Mat4f=Mat4f(
     push!(hwtlas.blas_offsets, offset)
 
     record = LavaInstanceRecord(mat4_to_vk_transform(transform), blas.address;
-                                custom_index=instance_id, mask=instance_mask)
-    return _register_batch!(hwtlas, blas, [record], Tri[], instance_mask)
+                                custom_index=instance_id, mask=instance_mask,
+                                sbt_offset=sbt_offset)
+    return _register_batch!(hwtlas, blas, [record], Tri[], instance_mask, sbt_offset)
 end
 
 """
@@ -470,13 +482,14 @@ function Base.push!(tlas::HWTLAS{Tri}, blas::LavaBLAS,
                     n::Integer = length(instance_buf),
                     instance_mask::UInt8 = UInt8(0xff),
                     custom_index::UInt32 = UInt32(0),
-                    triangles::Vector{Tri} = Tri[]) where {Tri}
+                    triangles::Vector{Tri} = Tri[],
+                    sbt_offset::UInt32 = UInt32(0)) where {Tri}
     n_int = Int(n)
     n_int <= length(instance_buf) || error(
         "push!: n=$n_int exceeds instance_buf length $(length(instance_buf))")
     handle = Raycore.TLASHandle(tlas.next_handle_id)
     tlas.next_handle_id += UInt32(1)
-    push!(tlas.instance_batches, InstanceBatch{Tri}(blas, instance_buf, n_int, instance_mask, custom_index, handle, triangles))
+    push!(tlas.instance_batches, InstanceBatch{Tri}(blas, instance_buf, n_int, instance_mask, custom_index, handle, triangles, sbt_offset))
     tlas.handle_to_batch_idx[handle] = lastindex(tlas.instance_batches)
     tlas.dirty = true
     return handle
@@ -501,7 +514,8 @@ function Base.push!(hwtlas::HWTLAS{Tri}, mesh::GeometryBasics.Mesh,
                     instance_buf::LavaArray{LavaInstanceRecord, 1};
                     n::Integer = length(instance_buf),
                     instance_mask::UInt8 = UInt8(0xff),
-                    custom_index::UInt32 = UInt32(0)) where {Tri}
+                    custom_index::UInt32 = UInt32(0),
+                    sbt_offset::UInt32 = UInt32(0)) where {Tri}
     n_int = Int(n)
     n_int <= length(instance_buf) || error(
         "push!: n=$n_int exceeds instance_buf length $(length(instance_buf))")
@@ -510,7 +524,7 @@ function Base.push!(hwtlas::HWTLAS{Tri}, mesh::GeometryBasics.Mesh,
     triangles = hwtlas.blas_triangles[blas_idx]
     handle = Raycore.TLASHandle(hwtlas.next_handle_id)
     hwtlas.next_handle_id += UInt32(1)
-    push!(hwtlas.instance_batches, InstanceBatch{Tri}(blas, instance_buf, n_int, instance_mask, custom_index, handle, triangles))
+    push!(hwtlas.instance_batches, InstanceBatch{Tri}(blas, instance_buf, n_int, instance_mask, custom_index, handle, triangles, sbt_offset))
     hwtlas.handle_to_batch_idx[handle] = lastindex(hwtlas.instance_batches)
     hwtlas.dirty = true
     return handle
@@ -584,9 +598,11 @@ Raycore.update_transform!(hwtlas::HWTLAS, handle::Raycore.TLASHandle, transform:
 function _apply_pending_update!(batch::InstanceBatch, transforms::LavaArray{Mat3x4f, 1})
     backend = KA.get_backend(batch.instance_buf)
     cim = (batch.custom_index & 0x00FFFFFF) | (UInt32(batch.instance_mask) << 24)
+    # Preserve the batch's SBT hit-group offset across refits (8-bit flags = 0).
+    sof = batch.sbt_offset & 0x00FFFFFF
     update_instance_records_kernel!(backend)(
         batch.instance_buf, transforms,
-        batch.blas.address, cim, UInt32(0);
+        batch.blas.address, cim, sof;
         ndrange = batch.n)
 end
 

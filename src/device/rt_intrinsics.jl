@@ -308,6 +308,77 @@ end
     """, "entry"), Cvoid, Tuple{})
 end
 
+# ── SER (SPV_NV_shader_invocation_reorder) intrinsics ──
+#
+# These three calls replace the implicit `lava_rt_trace_ray` + automatic
+# closest-hit dispatch with the explicit pbrt-v4-OptiX HitObject pattern:
+#
+#   1. lava_rt_hit_object_trace_ray(...)  — same operands as trace_ray, but
+#      writes the result into the per-shader implicit HitObject variable
+#      INSTEAD of immediately invoking the closest-hit shader.
+#   2. lava_rt_reorder_thread()           — reorders the warp lanes so
+#      threads with similar hit info group together; later
+#      hitObjectExecuteShaderNV calls then dispatch coherent closest-hit
+#      shaders per warp.
+#   3. lava_rt_hit_object_execute_shader() — invokes the closest-hit (or
+#      miss) shader for the recorded HitObject, with the current payload.
+#
+# The implicit HitObject is owned by the emitter (`state.rt_hit_object_var_id`)
+# and lazily allocated as a Private-storage OpVariable in the raygen.  Only
+# valid inside the raygen.
+
+@inline function lava_rt_hit_object_trace_ray(
+    ray_flags::UInt32, cull_mask::UInt32,
+    sbt_offset::UInt32, sbt_stride::UInt32, miss_index::UInt32,
+    origin_x::Float32, origin_y::Float32, origin_z::Float32, tmin::Float32,
+    dir_x::Float32, dir_y::Float32, dir_z::Float32, tmax::Float32
+)
+    Base.llvmcall(("""
+        declare void @lava_rt_hit_object_trace_ray(
+            i32, i32, i32, i32, i32,
+            float, float, float, float,
+            float, float, float, float) #0
+        define void @entry(
+            i32 %flags, i32 %mask, i32 %sbt_off, i32 %sbt_stride, i32 %miss_idx,
+            float %ox, float %oy, float %oz, float %tmin,
+            float %dx, float %dy, float %dz, float %tmax) #0 {
+            call void @lava_rt_hit_object_trace_ray(
+                i32 %flags, i32 %mask, i32 %sbt_off, i32 %sbt_stride, i32 %miss_idx,
+                float %ox, float %oy, float %oz, float %tmin,
+                float %dx, float %dy, float %dz, float %tmax)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32, UInt32, UInt32, UInt32, UInt32,
+                                Float32, Float32, Float32, Float32,
+                                Float32, Float32, Float32, Float32},
+    ray_flags, cull_mask, sbt_offset, sbt_stride, miss_index,
+    origin_x, origin_y, origin_z, tmin,
+    dir_x, dir_y, dir_z, tmax)
+end
+
+@inline function lava_rt_reorder_thread()
+    Base.llvmcall(("""
+        declare void @lava_rt_reorder_thread() #0
+        define void @entry() #0 {
+            call void @lava_rt_reorder_thread()
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{})
+end
+
+@inline function lava_rt_hit_object_execute_shader()
+    Base.llvmcall(("""
+        declare void @lava_rt_hit_object_execute_shader() #0
+        define void @entry() #0 {
+            call void @lava_rt_hit_object_execute_shader()
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{})
+end
+
 # Register RT intrinsic names for GPUCompiler validation
 push!(KNOWN_INTRINSICS, "lava_rt_trace_ray")
 push!(KNOWN_INTRINSICS, "lava_rt_payload_store_f32")
@@ -317,3 +388,6 @@ push!(KNOWN_INTRINSICS, "lava_rt_payload_load_f32_at")
 push!(KNOWN_INTRINSICS, "lava_rt_hit_attrib_load_f32_at")
 push!(KNOWN_INTRINSICS, "lava_rt_ignore_intersection")
 push!(KNOWN_INTRINSICS, "lava_rt_terminate_ray")
+push!(KNOWN_INTRINSICS, "lava_rt_hit_object_trace_ray")
+push!(KNOWN_INTRINSICS, "lava_rt_reorder_thread")
+push!(KNOWN_INTRINSICS, "lava_rt_hit_object_execute_shader")

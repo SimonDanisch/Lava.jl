@@ -722,7 +722,12 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
                                  push_constant_size::Integer=8,
                                  payload_type::Symbol=:f32,
                                  validate::Bool=true)
-    config = lava_compiler_config(; workgroup_size=(1, 1, 1))
+    # Per-material chit shaders may do inline shadow-ray traces via ray query
+    # (`surface_direct_lighting_inner_typed!`), so the chit shader needs
+    # `enable_ray_query=true` to bring in the TLAS variable + the rayQuery
+    # capability. The cost of enabling on RT shaders that don't actually use
+    # ray query is one unused descriptor binding (the driver strips dead code).
+    config = lava_compiler_config(; workgroup_size=(1, 1, 1), enable_ray_query=true)
     source = GPUCompiler.methodinstance(typeof(f), tt)
     job = GPUCompiler.CompilerJob(source, config)
 
@@ -1586,29 +1591,61 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
         end
     end
 
-    # Force-inline any function that calls ray-query intrinsics. A ray query
-    # is a Function-scope OpVariable: the OpRayQueryInitializeKHR call and
-    # all subsequent OpRayQueryProceedKHR / Get... calls MUST reference the
-    # SAME variable, which means they must live in the same OpFunction.
-    # Without this, Julia's frontend can hoist (for example) a `while
-    # lava_ray_query_proceed() ... end` loop body into a separate function;
-    # each function then allocates its own ray query OpVariable, and Init
-    # initializes one variable while Proceed advances a different
-    # (uninitialized) variable → DEVICE_LOST at runtime.
-    rayquery_callers = Set{LLVM.Function}()
+    # Force-inline functions whose ray-query state would otherwise cross a
+    # SPIR-V function boundary.
+    #
+    # A ray query is a Function-scope `OpVariable %ray_query OpTypeRayQueryKHR`:
+    # `OpRayQueryInitializeKHR` allocates the implicit per-function variable
+    # and all subsequent `OpRayQueryProceedKHR` / `OpRayQueryGet*KHR` /
+    # `OpRayQueryConfirm*KHR` / `OpRayQueryTerminateKHR` calls in the SAME
+    # SPIR-V function operate on that same variable.
+    #
+    # The original Lava rule was "any function with any `lava_ray_query_*`
+    # call gets `alwaysinline`". That is correct but overly conservative: it
+    # force-inlines self-contained helpers (e.g. `trace_shadow_transmittance`
+    # which runs a complete init+proceed+get+terminate session every call)
+    # into their callers, ballooning the caller's register pressure for no
+    # SPIR-V-correctness reason — the helper would get its own implicit
+    # ray-query OpVariable if left alone, which is what it wants.
+    #
+    # Correctness rule (refined): a SPIR-V function's ray-query state must be
+    # SELF-CONTAINED. A function F is self-contained when EITHER
+    #   (a) F has zero `lava_ray_query_*` calls, OR
+    #   (b) F has BOTH a `lava_ray_query_init` AND at least one other
+    #       `lava_ray_query_*` call (proceed/get/confirm/terminate).
+    # Case (b) covers the common shadow-trace pattern where a helper runs the
+    # entire ray-query lifecycle internally and exposes only ordinary scalar
+    # / vector returns to its caller.
+    #
+    # The case the old rule was guarding against — Julia hoisting a
+    # `while lava_ray_query_proceed() ... end` loop body into a separate
+    # function — is detected: the hoisted helper has proceed/get calls but no
+    # init, so it falls into the INCOMPLETE bucket and gets `alwaysinline`'d
+    # back into its caller. Meanwhile, helpers whose lifecycle is closed
+    # (init AND proceed) survive as separate OpFunctions and get their own
+    # register frame.
+    rayquery_init_callers = Set{LLVM.Function}()
+    rayquery_other_callers = Set{LLVM.Function}()
     for fn in LLVM.functions(mod)
         isempty(LLVM.blocks(fn)) && continue
         for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
             inst isa LLVM.CallInst || continue
             callee = LLVM.called_operand(inst)
             callee isa LLVM.Function || continue
-            if startswith(LLVM.name(callee), "lava_ray_query_")
-                push!(rayquery_callers, fn)
-                break
+            cname = LLVM.name(callee)
+            startswith(cname, "lava_ray_query_") || continue
+            if cname == "lava_ray_query_init"
+                push!(rayquery_init_callers, fn)
+            else
+                push!(rayquery_other_callers, fn)
             end
         end
     end
-    for fn in rayquery_callers
+    # symmetric difference = functions with init xor (proceed/get/...).
+    # Either side alone is an incomplete lifecycle; force-inline so the
+    # surviving entry-side function has a complete one.
+    incomplete_rayquery = symdiff(rayquery_init_callers, rayquery_other_callers)
+    for fn in incomplete_rayquery
         fn === entry_fn && continue
         attrs = LLVM.function_attributes(fn)
         delete!(attrs, LLVM.EnumAttribute("noinline"))
