@@ -201,6 +201,31 @@ function probe_device_local_heap(ctx::VkContext)
 end
 
 """
+Per-heap snapshot of (device_local, size, budget, usage) in bytes.  `budget`
+and `usage` are the driver's view via VK_EXT_memory_budget; both are 0 when the
+extension is unavailable.  Used to attach real driver-side memory pressure to
+OOM error messages.
+"""
+function probe_device_memory_budget(ctx::VkContext)
+    mem_props = ctx.memory_properties
+    n = Int(mem_props.memory_heap_count)
+    sizes = ntuple(i -> Int(mem_props.memory_heaps[i].size), n)
+    flags = ntuple(i -> UInt32(mem_props.memory_heaps[i].flags), n)
+    device_local = ntuple(i -> (flags[i] & UInt32(Vulkan.MEMORY_HEAP_DEVICE_LOCAL_BIT)) != 0, n)
+    if !ctx.memory_budget_available
+        return [(heap=i-1, device_local=device_local[i], size=sizes[i],
+                 budget=0, usage=0) for i in 1:n]
+    end
+    # Vulkan.jl's get_physical_device_memory_properties_2 takes the desired
+    # chain types as varargs and allocates+populates them itself.
+    props2 = Vulkan.get_physical_device_memory_properties_2(
+        ctx.physical_device, Vulkan.PhysicalDeviceMemoryBudgetPropertiesEXT)
+    bp = props2.next::Vulkan.PhysicalDeviceMemoryBudgetPropertiesEXT
+    return [(heap=i-1, device_local=device_local[i], size=sizes[i],
+             budget=Int(bp.heap_budget[i]), usage=Int(bp.heap_usage[i])) for i in 1:n]
+end
+
+"""
     maybe_collect(ctx::VkContext; blocking::Bool=false)
 
 Trigger an incremental GC if GPU pressure is high.  Ported from
@@ -257,6 +282,52 @@ function maybe_collect(ctx::VkContext; blocking::Bool=false)
 end
 
 """
+Captures the exact Vulkan error that caused an allocation to fail.  Returned
+from `try_vk_alloc` instead of swallowing the result code, so callers can
+include the real `VkResult` and the failing op in the LavaError they throw.
+"""
+struct AllocFailure
+    code::Vulkan.Result
+    op::Symbol          # :Buffer, :DeviceMemory, :bind_buffer_memory, :map_memory
+    nbytes::Int
+    mem_type_idx::Int   # -1 if the failure happened before memory-type selection
+end
+
+function format_oom_error(ctx::VkContext, fail::AllocFailure)
+    io = IOBuffer()
+    println(io, "Out of GPU memory.")
+    req_mb = fail.nbytes ÷ (1024 * 1024)
+    live_mb = GPU_LIVE_BYTES[] ÷ (1024 * 1024)
+    println(io, "  Vulkan returned $(fail.code) from $(fail.op) for $(fail.nbytes) bytes ($(req_mb) MiB).")
+    println(io, "  Lava tracked state: $(live_mb) MiB live across $(length(LIVE_BUFFERS)) buffers.")
+    if fail.mem_type_idx >= 0
+        mem_props = ctx.memory_properties
+        mt = mem_props.memory_types[fail.mem_type_idx + 1]
+        heap_idx = Int(mt.heap_index)
+        println(io, "  Memory type idx=$(fail.mem_type_idx) → heap idx=$(heap_idx), property_flags=0x$(string(UInt32(mt.property_flags), base=16))")
+    end
+    snapshot = probe_device_memory_budget(ctx)
+    if ctx.memory_budget_available
+        println(io, "  Driver heap budgets (VK_EXT_memory_budget):")
+        for h in snapshot
+            sz_mb = h.size ÷ (1024 * 1024)
+            bud_mb = h.budget ÷ (1024 * 1024)
+            use_mb = h.usage ÷ (1024 * 1024)
+            tag = h.device_local ? "DEVICE_LOCAL" : "HOST"
+            println(io, "    heap $(h.heap) [$tag] size=$(sz_mb) MiB budget=$(bud_mb) MiB used=$(use_mb) MiB")
+        end
+    else
+        println(io, "  (VK_EXT_memory_budget unavailable — only static heap sizes known)")
+        for h in snapshot
+            sz_mb = h.size ÷ (1024 * 1024)
+            tag = h.device_local ? "DEVICE_LOCAL" : "HOST"
+            println(io, "    heap $(h.heap) [$tag] size=$(sz_mb) MiB")
+        end
+    end
+    return String(take!(io))
+end
+
+"""
     vk_alloc(bq::BatchQueue, nbytes; extra_usage=UInt32(0), unified=false) -> VkManagedBuffer
 
 Allocate a GPU buffer with BDA support.  Takes the queue the allocation is
@@ -292,25 +363,22 @@ function vk_alloc(bq::BatchQueue, nbytes::Integer;
     drain_deferred_as_frees!(bq)
     maybe_collect(bq.ctx::VkContext)
     result = try_vk_alloc(bq, nbytes; extra_usage, unified)
-    if result !== nothing
-        return result
-    end
+    result isa VkManagedBuffer && return result
     GC.gc(true)
     drain_deferred_frees!(bq)
     drain_deferred_as_frees!(bq)
     result = try_vk_alloc(bq, nbytes; extra_usage, unified)
-    if result !== nothing
+    if result isa VkManagedBuffer
         @info "Lava: GPU allocation succeeded after GC retry" bytes=nbytes
         return result
     end
-    live_mb = GPU_LIVE_BYTES[] ÷ (1024 * 1024)
-    req_mb = nbytes ÷ (1024 * 1024)
+    fail = result::AllocFailure
     throw(LavaError("memory allocation",
-        "Out of GPU memory. Requested $(req_mb) MiB ($(nbytes) bytes), currently $(live_mb) MiB live in $(length(LIVE_BUFFERS)) buffers.",
+        format_oom_error(bq.ctx::VkContext, fail),
         "Free unused LavaArrays, reduce problem size, or check for memory leaks with Lava.gpu_memory_usage()."))
 end
 
-"""Attempt GPU buffer allocation, returning nothing on OOM."""
+"""Attempt GPU buffer allocation, returning an `AllocFailure` on OOM."""
 function try_vk_alloc(bq::BatchQueue, nbytes::Integer;
                       extra_usage::UInt32=UInt32(0), unified::Bool=false)
     ctx = bq.ctx::VkContext
@@ -327,6 +395,11 @@ function try_vk_alloc(bq::BatchQueue, nbytes::Integer;
 
     local buf, memory, mem_type_idx
     mapped_ptr = Ptr{UInt8}(0)
+    # Track which Vulkan call is in-flight so the catch site can tag the
+    # failure precisely.  `mem_type_idx_local` mirrors `mem_type_idx` but
+    # stays defined even if the DeviceMemory call throws before assignment.
+    op::Symbol = :Buffer
+    mem_type_idx_local::Int = -1
     try
         buf = Vulkan.Buffer(dev, nbytes, usage, Vulkan.SHARING_MODE_EXCLUSIVE, UInt32[])
         mem_reqs = Vulkan.get_buffer_memory_requirements(dev, buf)
@@ -345,13 +418,17 @@ function try_vk_alloc(bq::BatchQueue, nbytes::Integer;
             mem_type_idx = find_memory_type(ctx, mem_reqs.memory_type_bits,
                 Vulkan.MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
         end
+        mem_type_idx_local = Int(mem_type_idx)
 
         alloc_flags = Vulkan.MemoryAllocateFlagsInfo(UInt32(0);
             flags=Vulkan.MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT)
+        op = :DeviceMemory
         memory = Vulkan.DeviceMemory(dev, mem_reqs.size, mem_type_idx; next=alloc_flags)
+        op = :bind_buffer_memory
         unwrap(Vulkan.bind_buffer_memory(dev, buf, memory, 0))
 
         if unified
+            op = :map_memory
             mapped_ptr = Ptr{UInt8}(unwrap(Vulkan.map_memory(dev, memory, 0, nbytes)))
         end
     catch e
@@ -363,7 +440,7 @@ function try_vk_alloc(bq::BatchQueue, nbytes::Integer;
            (e.code == Vulkan.ERROR_OUT_OF_DEVICE_MEMORY ||
             e.code == Vulkan.ERROR_OUT_OF_HOST_MEMORY)
             empty!(VALIDATION_MESSAGES)
-            return nothing
+            return AllocFailure(e.code, op, Int(nbytes), mem_type_idx_local)
         end
         # DEVICE_LOST during alloc is a hard fault — mark + propagate so the
         # subsequent dispatcher gate fires cleanly.
@@ -718,12 +795,17 @@ end
 """Allocate a new pool block (one large VkBuffer)."""
 function alloc_pool_block(bq::BatchQueue)
     buf_result = try_vk_alloc(bq, POOL_BLOCK_SIZE)
-    if buf_result === nothing
+    if buf_result isa AllocFailure
         GC.gc(true)
         drain_deferred_frees!(bq)
         drain_deferred_as_frees!(bq)
         buf_result = try_vk_alloc(bq, POOL_BLOCK_SIZE)
-        buf_result === nothing && error("Lava: cannot allocate pool block ($(POOL_BLOCK_SIZE ÷ 1024÷1024) MiB)")
+        if buf_result isa AllocFailure
+            throw(LavaError("pool block allocation",
+                "Cannot allocate $(POOL_BLOCK_SIZE ÷ 1024 ÷ 1024) MiB pool block.\n" *
+                format_oom_error(bq.ctx::VkContext, buf_result),
+                "Free unused LavaArrays, reduce problem size, or check for memory leaks with Lava.gpu_memory_usage()."))
+        end
     end
     # Extract Vulkan handles from the VkManagedBuffer, then remove it from LIVE_BUFFERS
     # (the pool block manages its own lifetime, not the per-chunk tracking)

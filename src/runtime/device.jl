@@ -235,6 +235,10 @@ mutable struct VkContext
     # capability and the raygen can use `lava_rt_hit_object_*` /
     # `lava_rt_reorder_thread_*` intrinsics.  NVIDIA-only.
     ser_available::Bool
+    # Whether VK_EXT_memory_budget is enabled. When true, OOM error reporting
+    # queries the driver's real per-heap budget vs usage via
+    # VkPhysicalDeviceMemoryBudgetPropertiesEXT.
+    memory_budget_available::Bool
     # Whether GPU-Assisted Validation is active on this instance. Captured
     # so callers can check (e.g. verify_gpu_av) without re-reading env vars.
     gpu_assisted::Bool
@@ -268,6 +272,7 @@ mutable struct VkContext
                        as_scratch_align::UInt64,
                        ray_query_available::Bool=false,
                        ser_available::Bool=false,
+                       memory_budget_available::Bool=false,
                        gpu_assisted::Bool=false,
                        driver_version::AbstractString="unknown")
         ctx = new()
@@ -289,6 +294,7 @@ mutable struct VkContext
         ctx.as_scratch_align = as_scratch_align
         ctx.ray_query_available = ray_query_available
         ctx.ser_available = ser_available
+        ctx.memory_budget_available = memory_budget_available
         ctx.gpu_assisted = gpu_assisted
         ctx.driver_version = driver_version
         # Seed a persistent VkPipelineCache from disk (if any). Driver
@@ -589,6 +595,9 @@ function init_vulkan!()
     has_wg_explicit = has_extension(phys_dev, "VK_KHR_workgroup_memory_explicit_layout")
     has_atomic_float = has_extension(phys_dev, "VK_EXT_shader_atomic_float")
     has_pipeline_exec_props = has_extension(phys_dev, "VK_KHR_pipeline_executable_properties")
+    # VK_EXT_memory_budget — lets us read VkPhysicalDeviceMemoryBudgetPropertiesEXT
+    # for real heap utilisation, used in OOM error reporting.
+    has_memory_budget = has_extension(phys_dev, "VK_EXT_memory_budget")
 
     # Device extensions
     extensions = String[
@@ -620,6 +629,9 @@ function init_vulkan!()
     # device creation.
     if has_pipeline_exec_props && PIPELINE_EXEC_PROPERTIES_REQUESTED[]
         push!(extensions, "VK_KHR_pipeline_executable_properties")
+    end
+    if has_memory_budget
+        push!(extensions, "VK_EXT_memory_budget")
     end
 
     # Chain required features — all Vulkan 1.2 promoted features go in Vulkan12Features
@@ -870,6 +882,7 @@ function init_vulkan!()
         as_scratch_align,
         has_ray_query,
         has_ser,
+        has_memory_budget,
         gpu_assisted,
         string(phys_props.driver_version),
     )
