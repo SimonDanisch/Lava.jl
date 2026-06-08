@@ -367,6 +367,14 @@ function vk_alloc(bq::BatchQueue, nbytes::Integer;
     GC.gc(true)
     drain_deferred_frees!(bq)
     drain_deferred_as_frees!(bq)
+    # Reclaim any pool blocks that are now fully empty after the GC drained
+    # their chunks back to the free list.  Without this the pool ratchets
+    # up across renders — see Crown 1400×1000 hw_accel=true repro where
+    # render 1 left 3.7 GiB of empty 64 MiB blocks pinning the heap.
+    n_blocks, bytes_freed = reclaim_empty_pool_blocks!(bq)
+    if n_blocks > 0
+        @info "Lava: reclaimed empty pool blocks on OOM retry" blocks=n_blocks MiB=(bytes_freed >> 20)
+    end
     result = try_vk_alloc(bq, nbytes; extra_usage, unified)
     if result isa VkManagedBuffer
         @info "Lava: GPU allocation succeeded after GC retry" bytes=nbytes
@@ -799,6 +807,12 @@ function alloc_pool_block(bq::BatchQueue)
         GC.gc(true)
         drain_deferred_frees!(bq)
         drain_deferred_as_frees!(bq)
+        # Same fallback as vk_alloc: reclaim any pool blocks the GC just
+        # emptied before deciding the OOM is real.
+        n_blocks, bytes_freed = reclaim_empty_pool_blocks!(bq)
+        if n_blocks > 0
+            @info "Lava: reclaimed empty pool blocks on pool-block OOM retry" blocks=n_blocks MiB=(bytes_freed >> 20)
+        end
         buf_result = try_vk_alloc(bq, POOL_BLOCK_SIZE)
         if buf_result isa AllocFailure
             throw(LavaError("pool block allocation",
@@ -959,6 +973,70 @@ function pool_alloc(bq::BatchQueue, nbytes::Integer; extra_usage::UInt32=UInt32(
         Ptr{UInt8}(0),
         alloc_size,
         byte_offset, block, nothing, BUF_STATE_ALIVE, ctx)
+end
+
+"""
+    reclaim_empty_pool_blocks!(bq::BatchQueue) -> (n_blocks::Int, bytes::Int)
+
+Free every pool block whose `live_count` is 0: drop the block's chunks from
+`POOL_FREE_LISTS`, destroy its `VkBuffer` + `VkDeviceMemory`, and remove it
+from `POOL_BLOCKS`.  Returns `(n_blocks_reclaimed, bytes_reclaimed)`.
+
+Called from `vk_alloc` / `alloc_pool_block` only on the OOM retry path, so
+steady-state allocations don't pay the scan cost.  Not finalizer-safe —
+runs only on the main allocator path.
+
+Lifetime invariant relied on: `return_to_pool!` runs from
+`destroy_buffer!`'s post-timeline path, so a chunk reaches the free list
+only after its `last_write` semaphore has signaled.  Once `live_count == 0`,
+every chunk ever bumped from this block has signaled, so the block's
+underlying VkBuffer + VkDeviceMemory are GPU-quiesced and safe to destroy.
+"""
+function reclaim_empty_pool_blocks!(bq::BatchQueue)
+    isempty(POOL_BLOCKS) && return (0, 0)
+    ctx = bq.ctx::VkContext
+    empty_blocks = Set{PoolBlock}()
+    kept = PoolBlock[]
+    bytes_reclaimed = 0
+    for block in POOL_BLOCKS
+        if block.live_count == 0
+            push!(empty_blocks, block)
+            bytes_reclaimed += block.capacity
+        else
+            push!(kept, block)
+        end
+    end
+    isempty(empty_blocks) && return (0, 0)
+    # Drop free-list chunks that belong to any reclaimed block.  Each chunk
+    # is a VkManagedBuffer whose `pool_block` field identifies its host.
+    for fl in POOL_FREE_LISTS
+        filter!(buf -> begin
+            pb = buf.pool_block
+            pb === nothing || !(pb in empty_blocks)
+        end, fl)
+    end
+    # Swap kept list into POOL_BLOCKS so `pool_alloc` no longer sees the
+    # reclaimed blocks (must precede destructor calls — a concurrent bump
+    # against a freed handle would corrupt the driver).
+    empty!(POOL_BLOCKS)
+    append!(POOL_BLOCKS, kept)
+    if !device_lost(ctx)
+        for block in empty_blocks
+            try
+                block.buffer.destructor()
+                block.memory.destructor()
+            catch
+                # Match destroy_buffer!: don't propagate from destructors,
+                # but log loudly so driver misbehaviour is visible.
+                safe_fin_log("Lava reclaim_empty_pool_blocks!: Vulkan destructor failed\n")
+            end
+        end
+    end
+    # Pool blocks ARE counted in GPU_LIVE_BYTES (see alloc_pool_block —
+    # we intentionally don't subtract per-chunk because the block is the
+    # real live memory).  Subtract the reclaimed capacity here.
+    Threads.atomic_sub!(GPU_LIVE_BYTES, bytes_reclaimed)
+    return (length(empty_blocks), bytes_reclaimed)
 end
 
 """Return a pooled chunk to the free list. Keeps VkManagedBuffer object for reuse."""
