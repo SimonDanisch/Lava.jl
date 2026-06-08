@@ -408,12 +408,8 @@ function vk_free!(buf::VkManagedBuffer)
     delete!(LIVE_BUFFERS, buf)
 
     if FREE_DEBUG_ENABLED[]
-        ctx_dbg = buf.ctx
-        active_dbg = false
-        try
-            bqd = ctx_dbg.default_bq
-            active_dbg = (bqd.active_batch !== nothing) && bqd.active_batch.recording
-        catch; end
+        bqd = buf.ctx.default_bq
+        active_dbg = (bqd.active_batch !== nothing) && bqd.active_batch.recording
         push!(FREE_DEBUG_LOG,
               (addr=buf.address, size=buf.size,
                pool=buf.pool_block !== nothing,
@@ -538,8 +534,7 @@ function scan_arg_slabs_for_bda!(buf::VkManagedBuffer)
     target == UInt64(0) && return 0
     hits = 0
     ctx = buf.ctx
-    bq = try ctx.default_bq catch; nothing end
-    bq === nothing && return 0
+    bq = ctx.default_bq
     for (kind, slabs) in ((:arg, bq.arg_slabs), (:indirect, bq.indirect_slabs))
         for (i, slab) in enumerate(slabs)
             mb = slab.buf[]::VkManagedBuffer

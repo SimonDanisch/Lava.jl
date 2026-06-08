@@ -173,24 +173,22 @@ end
 
 # Check if a non-isbits type is still GPU-compatible by verifying all
 # non-isbits fields are zero-sized (will be elided by LLVM).
+#
+# `Base.allocatedinline(t)` is the predicate that captures both:
+#   - non-concrete/UnionAll types (`Vector`, `Tuple`, `Tuple{Vararg{Int}}`)
+#   - concrete-but-flexible-size builtins (`Memory{T}`, `Symbol`, `String`),
+#     which are heap-referenced and would trip `sizeof` if we called it.
+# Anything not allocated inline carries a heap reference and is therefore
+# not GPU-compatible.  Once `allocatedinline` is true, `sizeof` is safe.
 function is_gpu_compatible(@nospecialize(dt::Type))
     isbitstype(dt) && return true
-    isabstracttype(dt) && return false
-    try
-        sizeof(dt) == 0 && return true
-    catch
-        return false
-    end
-    # Check recursively: all fields must be either isbits or zero-sized
+    Base.allocatedinline(dt) || return false
+    sizeof(dt) == 0 && return true
     for i in 1:fieldcount(dt)
         ft = fieldtype(dt, i)
         isbitstype(ft) && continue
-        try
-            sizeof(ft) == 0 && continue
-        catch
-            return false
-        end
-        # Recurse into non-isbits, non-zero-sized fields
+        Base.allocatedinline(ft) || return false
+        sizeof(ft) == 0 && continue
         is_gpu_compatible(ft) || return false
     end
     return true

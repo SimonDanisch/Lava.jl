@@ -433,7 +433,8 @@ function pipeline_exec_stats(linked::LavaLinkedKernel)
     exec_info = VK.PipelineInfoKHR(pipe)
     execs = try
         VK.unwrap(VK.get_pipeline_executable_properties_khr(ctx.device, exec_info))
-    catch
+    catch ex
+        @debug "Lava: pipeline executable properties query failed" exception=ex
         return nothing
     end
     isempty(execs) && return nothing
@@ -441,7 +442,8 @@ function pipeline_exec_stats(linked::LavaLinkedKernel)
     stats_info = VK.PipelineExecutableInfoKHR(pipe, UInt32(0))
     stats = try
         VK.unwrap(VK.get_pipeline_executable_statistics_khr(ctx.device, stats_info))
-    catch
+    catch ex
+        @debug "Lava: pipeline executable statistics query failed" exception=ex
         return nothing
     end
     raw = NamedTuple[]

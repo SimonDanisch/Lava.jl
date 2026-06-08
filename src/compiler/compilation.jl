@@ -267,8 +267,9 @@ function run_spirv_opt(spirv_bytes::Vector{UInt8})
         if p.exitcode == 0 && isfile(out_path)
             return read(out_path)
         end
-    catch
-        # Fall through to return original bytes
+        @debug "Lava: spirv-opt non-zero exit; returning unoptimized SPIR-V" exitcode=p.exitcode
+    catch ex
+        @debug "Lava: spirv-opt invocation failed; returning unoptimized SPIR-V" exception=ex
     finally
         rm(in_path; force=true)
         rm(out_path; force=true)

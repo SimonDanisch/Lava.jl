@@ -1503,10 +1503,14 @@ end
 function to_cpu_vector(x)
     x isa Vector && return x
     x isa Tuple && return collect(x)
-    # Try Array() for GPU arrays (LavaArray, CuArray, ROCArray, etc.)
+    # Try Array() for GPU arrays (LavaArray, CuArray, ROCArray, etc.).  Only
+    # fall through on MethodError — every other failure (DEVICE_LOST during
+    # readback, OOM in staging buffer, …) must propagate so the caller sees
+    # the real cause.
     try
         return Array(x)
-    catch
+    catch ex
+        ex isa MethodError || rethrow()
         return collect(x)
     end
 end

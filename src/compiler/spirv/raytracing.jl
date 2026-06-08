@@ -87,17 +87,15 @@ function emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
     require_extension!(spirv_mod, "SPV_KHR_variable_pointers")
     require_extension!(spirv_mod, "SPV_KHR_ray_tracing")
     # SER capability — opt-in, declared only when the device supports it.
-    # Reading `vk_context().ser_available` keeps the SPIR-V module valid on
-    # non-NVIDIA hardware (where the capability would be a validation error).
+    # Reading `ser_available` keeps the SPIR-V module valid on non-NVIDIA
+    # hardware (where the capability would be a validation error).  Check
+    # VK_CONTEXT_REF[] directly so emitter tests without a device don't
+    # trigger lazy `init_vulkan!()`.
     if stage === :raygen
-        try
-            if vk_context().ser_available
-                require_capability!(spirv_mod, Cap.ShaderInvocationReorderNV)
-                require_extension!(spirv_mod, "SPV_NV_shader_invocation_reorder")
-            end
-        catch
-            # vk_context() not yet initialised (e.g. emitter tests without a
-            # device).  Silently skip; only the raygen path uses SER intrinsics.
+        ctx = VK_CONTEXT_REF[]
+        if ctx !== nothing && ctx.ser_available
+            require_capability!(spirv_mod, Cap.ShaderInvocationReorderNV)
+            require_extension!(spirv_mod, "SPV_NV_shader_invocation_reorder")
         end
     end
 

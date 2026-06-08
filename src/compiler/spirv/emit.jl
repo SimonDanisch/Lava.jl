@@ -6063,11 +6063,7 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
             # Insert OpBitcast in predecessor block if types differ.
             # Skip PHI values themselves — their pointee types aren't in PTM.
             if LLVM.value_type(val) isa LLVM.PointerType && !(val isa LLVM.UndefValue || val isa LLVM.PoisonValue) && !(val isa LLVM.PHIInst)
-                val_spirv_ty = try
-                    map_pointer_type_for_value!(state.type_ctx, val)
-                catch
-                    type_id  # If we can't determine the type, assume it matches
-                end
+                val_spirv_ty = map_pointer_type_for_value!(state.type_ctx, val)
                 if val_spirv_ty != type_id
                     # Check if this is a cross-storage-class mismatch by looking up
                     # the storage classes. Cross-SC bitcasts are INVALID in SPIR-V.
