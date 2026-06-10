@@ -205,6 +205,21 @@ end
         end
     end
 
+    # ── Tier 3i2: batch/pool ordering regressions ───────────────────────
+    # Two latent races surfaced by Hikari's volpath bounce-loop early-exit
+    # (mid-pipeline synchronize): arg-slab cursor reset while the active
+    # batch holds recorded dispatches, and barrier elision between a
+    # prepare-indirect and its own vkCmdDispatchIndirect inside a
+    # concurrent_dispatch_group.
+    @testset "Batch/pool ordering" begin
+        @testset "arg-slab mid-recording sweep" begin
+            include(joinpath(@__DIR__, "test_argslab_midrecording_sweep.jl"))
+        end
+        @testset "indirect in concurrent group" begin
+            include(joinpath(@__DIR__, "test_indirect_in_concurrent_group.jl"))
+        end
+    end
+
     # ── Tier 3j: Phase-M alloc/free regression matrix ──────────────────
     # Five MWEs that progressively approach Hikari's render workload.
     # All five MUST stay clean across 20+ iters with per-iter alloc/free.

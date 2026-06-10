@@ -305,6 +305,7 @@ end
                            extra_dst_access::Vulkan.AccessFlag=Vulkan.AccessFlag(0),
                            is_rt::Bool=false,
                            skip_pre_barrier::Bool=false,
+                           force_pre_barrier::Bool=false,
                            info::String="")
     batch = ensure_active_batch!(bq)
     cmd = batch.cmd_buf
@@ -321,8 +322,22 @@ end
     # Also honoured: the task-local concurrent_dispatch_group state — the
     # FIRST dispatch inside a group still barriers (producer→consumer),
     # but all subsequent dispatches inside the group skip.
-    effective_skip = skip_pre_barrier ||
-                     (CONCURRENT_GROUP_ACTIVE[] && CONCURRENT_GROUP_STARTED[])
+    #
+    # `force_pre_barrier=true` overrides BOTH skip mechanisms. Indirect
+    # dispatches (vk_dispatch_indirect!/rt) must use it: the command
+    # processor's read of the VkDispatchIndirectCommand depends on the
+    # immediately preceding prepare-indirect kernel's write. Inside a
+    # concurrent_dispatch_group the group skip used to drop exactly that
+    # barrier, leaving a prepare→indirect-read race that the GPU usually —
+    # but not always — won. It reliably LOST right after a mid-pipeline
+    # flush (empty queue, commands execute as they arrive), which is how
+    # Hikari's volpath bounce-loop early-exit surfaced it (2026-06-10):
+    # `vp_shade_typed!`'s 12 in-group prepare+indirect pairs read garbage
+    # group counts and silently dropped shading work (~15% energy loss on
+    # shadow_bumpgold).
+    effective_skip = (skip_pre_barrier ||
+                      (CONCURRENT_GROUP_ACTIVE[] && CONCURRENT_GROUP_STARTED[])) &&
+                     !force_pre_barrier
     if CONCURRENT_GROUP_ACTIVE[]
         CONCURRENT_GROUP_STARTED[] = true
     end
@@ -481,6 +496,9 @@ end
     record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
         extra_dst_access=Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT,
+        # The indirect-args read depends on the preceding prepare-indirect
+        # write — never elide this barrier (see record_dispatch! docs).
+        force_pre_barrier=true,
         info=dispatch_info
     ) do batch
         cmd = batch.cmd_buf
@@ -781,7 +799,24 @@ function sweep_retired_batches!(bq::BatchQueue)
     # Reset pools once the queue is idle.  Done HERE (not inside reclaim_batch!)
     # because reclaim is called with the batch still in `bq.in_flight` — the
     # isempty check had to run after `deleteat!` to ever return true.
-    if isempty(bq.in_flight)
+    #
+    # CRITICAL: "idle" must include the ACTIVE batch. sweep_retired_batches!
+    # runs opportunistically from `ensure_active_batch!` and the allocation
+    # paths — i.e. potentially MID-RECORDING. If the active batch already
+    # holds recorded dispatches, their packed args / indirect-command slots
+    # live in the slabs at offsets below the current cursors; resetting the
+    # cursors here lets the very next dispatch overwrite them, so the earlier
+    # dispatches read garbage arg buffers when the batch finally submits
+    # (silently — typically as kernels seeing wrong buffer pointers).
+    # Latent for a long time because `in_flight` only drains to empty
+    # mid-recording when the GPU runs ahead of the host — exactly what
+    # happens after a host-side mid-pipeline synchronize, e.g. volpath's
+    # bounce-loop early-exit check (Hikari, 2026-06-10: every sample after
+    # the first rendered black because round-0's trace dispatch read a
+    # clobbered queue pointer).
+    active = bq.active_batch
+    active_has_commands = active !== nothing && active.dispatch_count > 0
+    if isempty(bq.in_flight) && !active_has_commands
         reset_arg_buffer_pool!(bq)
         reset_indirect_buffer_pool!(bq)
     end
