@@ -958,6 +958,9 @@ end
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
         extra_dst_access=Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT |
                           Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+        # Indirect-args read depends on the preceding prepare write — never
+        # elide this barrier (see record_dispatch! docs).
+        force_pre_barrier=true,
         info=dispatch_info
     ) do batch
         cmd = batch.cmd_buf

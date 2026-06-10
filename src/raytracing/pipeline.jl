@@ -286,6 +286,9 @@ function rt_dispatch_indirect!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::L
         dst_stage=Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
         extra_dst_access=Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT,
         is_rt=true,
+        # Indirect-args read depends on the preceding prepare write — never
+        # elide this barrier (see record_dispatch! docs).
+        force_pre_barrier=true,
         info="rt_indirect"
     ) do batch
         cmd = batch.cmd_buf
