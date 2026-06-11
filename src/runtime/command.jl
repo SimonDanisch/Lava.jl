@@ -300,6 +300,48 @@ function concurrent_dispatch_group(f::F) where F
     end
 end
 
+# ── Deferred indirect dispatch group ──
+#
+# An indirect dispatch's args read depends on its own prepare-indirect
+# kernel, so it can never skip its pre-barrier (`force_pre_barrier` above).
+# Inside a plain `concurrent_dispatch_group` that forced barrier serialises
+# every prepare+dispatch pair — N pairs degrade to fully sequential
+# execution, which costs real wall-clock when the dispatches are small
+# (Hikari's 12 per-material shading kernels per bounce).
+#
+# `concurrent_indirect_group` restores the overlap CORRECTLY by splitting
+# the group into two phases:
+#   1. While `f()` runs, `ka_launch_indirect!` records only the prepares
+#      (first one barriers against the producer, the rest skip — they read
+#      disjoint queue counters and write disjoint indirect slots) and
+#      defers the actual dispatches into `DEFERRED_INDIRECT[]`.
+#   2. On exit, the dispatches are recorded back-to-back: the FIRST carries
+#      one barrier (orders ALL subsequent commands after every prepare's
+#      writes, with INDIRECT_COMMAND_READ access), the rest skip — they
+#      only share atomically-claimed queue slots, same contract as a plain
+#      concurrent group.
+# Net: 2 barriers for N pairs instead of N, with all N dispatches free to
+# overlap on the GPU.
+
+const DEFERRED_INDIRECT = Ref{Union{Nothing, Vector{Any}}}(nothing)
+
+function concurrent_indirect_group(f::F) where F
+    prev = DEFERRED_INDIRECT[]
+    list = Any[]
+    DEFERRED_INDIRECT[] = list
+    try
+        concurrent_dispatch_group(f)
+    finally
+        DEFERRED_INDIRECT[] = prev
+    end
+    for (i, entry) in enumerate(list)
+        bq, pipeline, push_bda, indirect, tlas = entry
+        vk_dispatch_indirect_base!(bq, pipeline, push_bda, indirect, tlas;
+                                   first_in_group = i == 1)
+    end
+    return nothing
+end
+
 @inline function record_dispatch!(f, bq::BatchQueue;
                            dst_stage::Vulkan.PipelineStageFlag,
                            extra_dst_access::Vulkan.AccessFlag=Vulkan.AccessFlag(0),
@@ -486,19 +528,27 @@ function vk_dispatch_indirect!(bq::BatchQueue, pipeline::LavaComputePipeline,
 end
 
 # Specialized on `tlas` type. The TLAS overload lives in raytracing/hwtlas.jl.
-"""Record an indirect compute dispatch (no-TLAS fast path)."""
+"""Record an indirect compute dispatch (no-TLAS fast path).
+
+`first_in_group=false` is ONLY for `concurrent_indirect_group`'s flush
+phase: the group's first dispatch already recorded the barrier covering
+every prepare's writes, so the rest may skip (they share only
+atomically-claimed queue slots)."""
 @inline function vk_dispatch_indirect_base!(bq::BatchQueue, pipeline::LavaComputePipeline,
                                             push_bda::UInt64,
                                             indirect,  # LavaArray{UInt32,1}
-                                            ::Nothing=nothing)
+                                            ::Nothing=nothing;
+                                            first_in_group::Bool=true)
     dispatch_info = DISPATCH_LOGGING_ENABLED[] ?
         "$(LAST_DISPATCH_INFO[]) (indirect)" : ""
     record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
         extra_dst_access=Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT,
         # The indirect-args read depends on the preceding prepare-indirect
-        # write — never elide this barrier (see record_dispatch! docs).
-        force_pre_barrier=true,
+        # write — never elide this barrier (see record_dispatch! docs),
+        # except behind a deferred group's shared barrier.
+        force_pre_barrier=first_in_group,
+        skip_pre_barrier=!first_in_group,
         info=dispatch_info
     ) do batch
         cmd = batch.cmd_buf

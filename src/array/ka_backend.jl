@@ -572,7 +572,18 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
     if DISPATCH_LOGGING_ENABLED[]
         LAST_DISPATCH_INFO[] = "indirect f=$(dispatch_name(obj.f, all_args))"
     end
-    vk_dispatch_indirect!(bq, pipeline, arg_buf.address, indirect_view, tlas)
+    deferred = DEFERRED_INDIRECT[]
+    if deferred !== nothing
+        # Inside `concurrent_indirect_group`: the prepare above was recorded,
+        # the actual indirect dispatch is deferred to the group's flush so
+        # all dispatches in the group share ONE prepare→dispatch barrier and
+        # overlap on the GPU. The packed args + indirect slot stay valid:
+        # both live in this batch's slabs and the pool-reset guard keeps the
+        # cursors from rewinding while the batch holds recorded dispatches.
+        push!(deferred, (bq, pipeline, arg_buf.address, indirect_view, tlas))
+    else
+        vk_dispatch_indirect!(bq, pipeline, arg_buf.address, indirect_view, tlas)
+    end
 
     end # GC.@preserve
 

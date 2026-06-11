@@ -951,7 +951,8 @@ end
 
 @inline function vk_dispatch_indirect_base!(bq::BatchQueue, pipeline::LavaComputePipeline,
                                             push_bda::UInt64,
-                                            indirect, tlas::HWTLAS)
+                                            indirect, tlas::HWTLAS;
+                                            first_in_group::Bool=true)
     dispatch_info = DISPATCH_LOGGING_ENABLED[] ?
         "$(LAST_DISPATCH_INFO[]) (indirect)" : ""
     record_dispatch!(bq;
@@ -959,8 +960,10 @@ end
         extra_dst_access=Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT |
                           Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
         # Indirect-args read depends on the preceding prepare write — never
-        # elide this barrier (see record_dispatch! docs).
-        force_pre_barrier=true,
+        # elide this barrier (see record_dispatch! docs), except behind a
+        # deferred group's shared barrier.
+        force_pre_barrier=first_in_group,
+        skip_pre_barrier=!first_in_group,
         info=dispatch_info
     ) do batch
         cmd = batch.cmd_buf
