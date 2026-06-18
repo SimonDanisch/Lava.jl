@@ -310,20 +310,50 @@ end
 # (Hikari's 12 per-material shading kernels per bounce).
 #
 # `concurrent_indirect_group` restores the overlap CORRECTLY by splitting
-# the group into two phases:
-#   1. While `f()` runs, `ka_launch_indirect!` records only the prepares
-#      (first one barriers against the producer, the rest skip — they read
-#      disjoint queue counters and write disjoint indirect slots) and
-#      defers the actual dispatches into `DEFERRED_INDIRECT[]`.
-#   2. On exit, the dispatches are recorded back-to-back: the FIRST carries
-#      one barrier (orders ALL subsequent commands after every prepare's
-#      writes, with INDIRECT_COMMAND_READ access), the rest skip — they
-#      only share atomically-claimed queue slots, same contract as a plain
-#      concurrent group.
-# Net: 2 barriers for N pairs instead of N, with all N dispatches free to
-# overlap on the GPU.
+# the group into three phases:
+#   1. While `f()` runs, `ka_launch_indirect!` packs args + allocates the
+#      indirect slot for each dispatch but records NOTHING — it defers
+#      (pipeline, args, indirect slot, queue-size buffer, workgroup size)
+#      into `DEFERRED_INDIRECT[]`.
+#   2. On exit, ONE fused multi-prepare dispatch writes every deferred
+#      indirect command (a single thread looping over the slots — same
+#      pattern as `empty_all!`). Its normal pre-barrier orders it after
+#      the producers that filled the queues.
+#   3. The dispatches record back-to-back: the FIRST carries one barrier
+#      (orders ALL subsequent commands after the multi-prepare's writes,
+#      with INDIRECT_COMMAND_READ access), the rest skip — they only share
+#      atomically-claimed queue slots, same contract as a plain concurrent
+#      group.
+# Net for N pairs: 2 barriers + N+1 commands, instead of N barriers + 2N
+# commands; all N dispatches free to overlap on the GPU.
+#
+# CONTRACT: everything dispatched inside `f` must be mutually independent
+# (it's a CONCURRENT group), and because the indirect dispatches flush at
+# group exit, a DIRECT dispatch recorded inside `f` lands BEFORE them in
+# the command stream regardless of lexical order.
 
 const DEFERRED_INDIRECT = Ref{Union{Nothing, Vector{Any}}}(nothing)
+
+# One thread writes every deferred VkDispatchIndirectCommand. Statically
+# unrolled over the tuples; compiled per arity via the normal kernel cache.
+@inline _multi_prepare!(::Tuple{}, ::Tuple{}, ::Tuple{}) = nothing
+@inline function _multi_prepare!(inds::Tuple, sizes::Tuple, wss::Tuple)
+    n = UInt32(@inbounds sizes[1][1])
+    ws = wss[1]
+    groups = (n + ws - UInt32(1)) ÷ ws
+    @inbounds begin
+        inds[1][1] = groups      # groupCountX
+        inds[1][2] = UInt32(1)   # groupCountY
+        inds[1][3] = UInt32(1)   # groupCountZ
+    end
+    _multi_prepare!(Base.tail(inds), Base.tail(sizes), Base.tail(wss))
+    return nothing
+end
+
+function multi_prepare_indirect_kernel(inds, sizes, wss)
+    _multi_prepare!(inds, sizes, wss)
+    return nothing
+end
 
 function concurrent_indirect_group(f::F) where F
     prev = DEFERRED_INDIRECT[]
@@ -334,8 +364,20 @@ function concurrent_indirect_group(f::F) where F
     finally
         DEFERRED_INDIRECT[] = prev
     end
+    isempty(list) && return nothing
+
+    # Phase 2: one fused prepare for every deferred indirect slot.
+    bq0 = list[1][1]::BatchQueue
+    inds  = ntuple(i -> list[i][4], length(list))
+    sizes = ntuple(i -> list[i][6], length(list))
+    wss   = ntuple(i -> UInt32(list[i][7]), length(list))
+    lava_launch!(bq0, multi_prepare_indirect_kernel, inds, sizes, wss;
+                 ndrange=1, workgroup_size=(1, 1, 1))
+
+    # Phase 3: the dispatches, overlapped behind one shared barrier.
     for (i, entry) in enumerate(list)
         bq, pipeline, push_bda, indirect, tlas = entry
+        @assert bq === bq0  "concurrent_indirect_group: all dispatches must share one BatchQueue"
         vk_dispatch_indirect_base!(bq, pipeline, push_bda, indirect, tlas;
                                    first_in_group = i == 1)
     end
