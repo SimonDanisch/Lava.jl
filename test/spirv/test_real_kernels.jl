@@ -249,7 +249,7 @@ using StaticArrays
         end
     end
 
-    # ── Test 7: vp_shade_material_kernel! with TypedHit{Conductor{PiecewiseLinearSpectrum{56}}} ──
+    # ── Test 7: vp_shade_material_kernel! with TypedHitRef{Conductor{PiecewiseLinearSpectrum{56}}} ──
     # Regression test for retype_allocas bug: LLVM emits a float access (f32/f64) wider than the
     # alloca's chosen integer element type (e.g. T=i8), hitting the decomposition branch that
     # only handled int→int.  Fix: pick_uniform_type bails when decomp would involve non-integer types.
@@ -264,11 +264,25 @@ using StaticArrays
         T_conductor = Hikari.Conductor{Hikari.PiecewiseLinearSpectrum{56},
                                        Hikari.PiecewiseLinearSpectrum{56},
                                        Float32, Hikari.RGBSpectrum}
-        T_typed_hit = Hikari.TypedHit{T_conductor}
+        # The per-material split (2026-06-03) replaced the full-payload
+        # `TypedHit{T}` queue with a 4-byte `TypedHitRef{T}` index queue plus a
+        # shared `hit_surface_queue::WorkQueue{VPHitSurfaceWorkItem}`; the kernel
+        # signature gained `hit_surface_queue` as its 2nd argument.
+        T_typed_hit = Hikari.TypedHitRef{T_conductor}
         T_size      = Lava.LavaDeviceArray{Int32, 1}
+        # Per-material typed queue: 4-byte TypedHitRef{T} indices (AOS).
         T_in_q      = Hikari.WorkQueue{T_typed_hit,
                                        Lava.LavaDeviceArray{T_typed_hit, 1},
                                        T_size}
+        # Shared hit queue (SOA): one device component array per top-level field
+        # of VPHitSurfaceWorkItem, generated from the struct so this type tracks
+        # field changes automatically instead of drifting like the old spelling.
+        _hs_item = Hikari.VPHitSurfaceWorkItem
+        _hs_cols = NamedTuple{fieldnames(_hs_item),
+                              Tuple{map(F -> Lava.LavaDeviceArray{F, 1}, fieldtypes(_hs_item))...}}
+        T_hit_surface_q = Hikari.WorkQueue{_hs_item,
+                                           StructArrays.StructVector{_hs_item, _hs_cols, Int64},
+                                           T_size}
         T_next_ray_q = Hikari.WorkQueue{Hikari.VPRayWorkItem,
                                         StructArrays.StructVector{Hikari.VPRayWorkItem, @NamedTuple{
                                             ray::Lava.LavaDeviceArray{Raycore.Ray, 1},
@@ -309,7 +323,8 @@ using StaticArrays
         tt = Tuple{
             typeof(ctx),
             typeof(Hikari.vp_shade_material_kernel!),
-            T_in_q,                                      # typed work queue (TypedHit{Conductor})
+            T_in_q,                                      # workqueue-map iterates TypedHitRef{Conductor}
+            T_hit_surface_q,                             # shared hit_surface_queue (VPHitSurfaceWorkItem)
             T_next_ray_q,                                # next_ray_queue
             Lava.LavaDeviceArray{Float32, 1},            # pixel_L
             T_accel,                                     # accel
