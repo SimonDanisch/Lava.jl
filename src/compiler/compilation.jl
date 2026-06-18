@@ -243,6 +243,31 @@ function dump_spirv_to_disk(spirv_bytes::Vector{UInt8},
 end
 
 """
+    lava_run(cmd; timeout=180.0, label="subprocess") -> Base.Process
+
+Spawn `cmd` and wait for it WITHOUT `wait(p)`. Once a Vulkan device is up, the
+GPU driver breaks Julia's libuv SIGCHLD reaping: an external process (spirv-opt,
+spirv-val, spirv-dis) exits and is reaped (no zombie), but the libuv exit
+notification is lost, so `wait`/`success`/`read(cmd)` block forever. Poll the
+already-updated `process_exited` state instead, with a hard timeout that kills a
+genuinely-stuck child. Always check `process_exited(p) && p.exitcode == 0`
+before trusting the result.
+"""
+function lava_run(cmd::Base.AbstractCmd; timeout::Float64=180.0,
+                  label::AbstractString="subprocess")
+    p = run(cmd; wait=false)
+    deadline = time() + timeout
+    while !process_exited(p) && time() < deadline
+        sleep(0.005)
+    end
+    if !process_exited(p)
+        @warn "Lava: $label did not report exit within $(round(Int, timeout))s — killing"
+        try kill(p) catch end
+    end
+    return p
+end
+
+"""
     run_spirv_opt(spirv_bytes::Vector{UInt8}) -> Vector{UInt8}
 
 Run spirv-opt on the SPIR-V binary to optimize it. Uses SPIRV_Tools_jll.
@@ -262,9 +287,9 @@ function run_spirv_opt(spirv_bytes::Vector{UInt8})
     out_path = tempname() * ".spv"
     try
         write(in_path, spirv_bytes)
-        p = run(pipeline(`$spirv_opt --target-env=vulkan1.3 -O $in_path -o $out_path`;
-                          stderr=devnull, stdout=devnull); wait=true)
-        if p.exitcode == 0 && isfile(out_path)
+        p = lava_run(pipeline(`$spirv_opt --target-env=vulkan1.3 -O $in_path -o $out_path`;
+                              stderr=devnull, stdout=devnull); label="spirv-opt")
+        if process_exited(p) && p.exitcode == 0 && isfile(out_path)
             return read(out_path)
         end
         @debug "Lava: spirv-opt non-zero exit; returning unoptimized SPIR-V" exitcode=p.exitcode
@@ -516,10 +541,12 @@ function optimize_spirv(spirv_bytes::Vector{UInt8}; passes::String="-O")
     out_path = tempname() * ".spv"
     try
         write(in_path, spirv_bytes)
-        run(`$spirv_opt --target-env=vulkan1.3 --scalar-block-layout $passes $in_path -o $out_path`)
+        po = lava_run(`$spirv_opt --target-env=vulkan1.3 --scalar-block-layout $passes $in_path -o $out_path`; label="spirv-opt")
+        (process_exited(po) && po.exitcode == 0) || error("spirv-opt failed (exit $(process_exited(po) ? po.exitcode : "timeout"))")
         optimized = read(out_path)
         # Validate optimized output
-        run(`$spirv_val_cmd --target-env vulkan1.3 --scalar-block-layout $out_path`)
+        pv = lava_run(`$spirv_val_cmd --target-env vulkan1.3 --scalar-block-layout $out_path`; label="spirv-val")
+        (process_exited(pv) && pv.exitcode == 0) || error("spirv-val failed on optimized SPIR-V")
         return optimized
     finally
         rm(in_path; force=true)
@@ -2240,18 +2267,27 @@ function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
 
     # Validate — capture stderr via temp file (spirv-val writes errors to stderr)
     val_err_file = tempname()
-    p = run(pipeline(`$spirv_val --target-env vulkan1.3 --scalar-block-layout $spv_path`;
-                      stderr=val_err_file, stdout=devnull); wait=false)
-    wait(p)
+    # `lava_run` (not `wait(p)`): the wait condition can be lost once a Vulkan
+    # device is up. Fail open on timeout — Vulkan rejects invalid SPIR-V anyway.
+    p = lava_run(pipeline(`$spirv_val --target-env vulkan1.3 --scalar-block-layout $spv_path`;
+                          stderr=val_err_file, stdout=devnull); label="spirv-val")
+    if !process_exited(p)
+        rm(val_err_file; force=true)
+        return nothing
+    end
     val_errors = isfile(val_err_file) ? read(val_err_file, String) : ""
     rm(val_err_file; force=true)
     p.exitcode == 0 && return nothing
 
     # ── Validation failed — build a useful error message ──
 
-    # Disassemble and save
+    # Disassemble and save (spawn + poll, not the deadlock-prone read(cmd))
     dis = try
-        read(`$spirv_dis_cmd --no-color $spv_path`, String)
+        dis_out = tempname() * ".dis"
+        pd = lava_run(pipeline(`$spirv_dis_cmd --no-color $spv_path`; stdout=dis_out); label="spirv-dis")
+        txt = (process_exited(pd) && pd.exitcode == 0 && isfile(dis_out)) ? read(dis_out, String) : ""
+        rm(dis_out; force=true)
+        txt
     catch
         ""
     end
@@ -2393,11 +2429,15 @@ Disassemble SPIR-V binary to text for debugging.
 function disassemble_spirv(spirv_bytes::Vector{UInt8})
     spirv_dis = SPIRV_Tools_jll.spirv_dis()
     tmpfile = tempname() * ".spv"
+    out_path = tempname() * ".dis"
     try
         write(tmpfile, spirv_bytes)
-        return read(`$spirv_dis --no-color $tmpfile`, String)
+        # `read(cmd, String)` blocks on the deadlock-prone wait; spawn + poll.
+        p = lava_run(pipeline(`$spirv_dis --no-color $tmpfile`; stdout=out_path); label="spirv-dis")
+        return (process_exited(p) && p.exitcode == 0 && isfile(out_path)) ? read(out_path, String) : ""
     finally
         rm(tmpfile; force=true)
+        rm(out_path; force=true)
     end
 end
 
