@@ -774,9 +774,11 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
         wrapper_name = push_info.wrapper_name
         wrapper_fn = LLVM.functions(mod)[wrapper_name]
 
-        # LLVM passes (RT emit doesn't have the multi-OpFunction walker yet;
-        # keep the old single-OpFunction behavior for now.)
-        run_llvm_passes!(mod, wrapper_fn; force_inline_all=true)
+        # LLVM passes. The RT emitter now has the multi-OpFunction walker, so
+        # keep callees as separate OpFunctions (force_inline_all=false): a fat
+        # per-material chit stays one architecture but compiles as many small
+        # functions instead of one giant inlined one (minutes -> seconds).
+        run_llvm_passes!(mod, wrapper_fn; force_inline_all=false)
 
         ir = string(mod)
         write(lava_debug_path("lava_last_rt.ll"), ir)
