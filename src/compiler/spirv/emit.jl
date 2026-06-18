@@ -5628,6 +5628,18 @@ function find_merge_block(state::SPIRVEmitterState, inst::LLVM.BrInst)
     true_bb = LLVM.successors(inst)[1]
     false_bb = LLVM.successors(inst)[2]
 
+    # Fast path: the merge of a structured conditional is the immediate
+    # post-dominator of the branch block, already computed in `state.ipdom`.
+    # When it is one of the two targets (the StructurizeCFG'd if-then form) it
+    # is provably the same block the reachability check below would return —
+    # so use it directly. This turns an O(blocks) per-branch BFS (which made
+    # big shaders O(n²) to emit) into an O(1) lookup; the BFS stays as a
+    # fallback for the rare cases where the ipdom isn't one of the targets.
+    ipd = get(state.ipdom, current_bb, nothing)
+    if ipd === true_bb || ipd === false_bb
+        return get_block_id!(state, ipd)
+    end
+
     # Check if true_bb is reachable from false_bb's path (pattern 2: true is merge)
     if is_forward_reachable(false_bb, true_bb, current_bb, state)
         return get_block_id!(state, true_bb)
