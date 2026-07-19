@@ -239,6 +239,16 @@ mutable struct VkContext
     # queries the driver's real per-heap budget vs usage via
     # VkPhysicalDeviceMemoryBudgetPropertiesEXT.
     memory_budget_available::Bool
+    # Whether VK_KHR_external_memory(_fd) is enabled. When true,
+    # `ExternalImage` can export allocations as opaque fds for zero-copy
+    # sharing with other APIs (OpenGL via GL_EXT_memory_object_fd).
+    external_memory_available::Bool
+    # Whether VK_KHR_video_decode_queue + h264 are enabled (hardware decode into
+    # Vulkan images). The decode queue + its family index are `nothing` when the
+    # device has no video-decode support. No effect until a decode session is made.
+    video_decode_available::Bool
+    video_decode_queue::Union{Nothing, Vulkan.Queue}
+    video_decode_queue_family_index::Union{Nothing, UInt32}
     # Whether GPU-Assisted Validation is active on this instance. Captured
     # so callers can check (e.g. verify_gpu_av) without re-reading env vars.
     gpu_assisted::Bool
@@ -273,8 +283,12 @@ mutable struct VkContext
                        ray_query_available::Bool=false,
                        ser_available::Bool=false,
                        memory_budget_available::Bool=false,
+                       external_memory_available::Bool=false,
                        gpu_assisted::Bool=false,
-                       driver_version::AbstractString="unknown")
+                       driver_version::AbstractString="unknown",
+                       video_decode_available::Bool=false,
+                       video_decode_queue::Union{Nothing, Vulkan.Queue}=nothing,
+                       video_decode_queue_family_index::Union{Nothing, UInt32}=nothing)
         ctx = new()
         ctx.instance = instance
         ctx.physical_device = physical_device
@@ -295,6 +309,10 @@ mutable struct VkContext
         ctx.ray_query_available = ray_query_available
         ctx.ser_available = ser_available
         ctx.memory_budget_available = memory_budget_available
+        ctx.external_memory_available = external_memory_available
+        ctx.video_decode_available = video_decode_available
+        ctx.video_decode_queue = video_decode_queue
+        ctx.video_decode_queue_family_index = video_decode_queue_family_index
         ctx.gpu_assisted = gpu_assisted
         ctx.driver_version = driver_version
         # Seed a persistent VkPipelineCache from disk (if any). Driver
@@ -580,6 +598,18 @@ function init_vulkan!()
         push!(queue_ci, Vulkan.DeviceQueueCreateInfo(async_qf_idx, ones(Float32, async_n_queues)))
     end
 
+    # Hardware video decode (opt-in): request one queue from the VIDEO_DECODE
+    # family. Enabling the extensions + queue has no effect until a decode
+    # session is created, so it's safe to always request when the device offers it.
+    video_qf_idx = find_video_decode_queue_family(phys_dev)
+    has_video_decode = video_qf_idx !== nothing &&
+        has_extension(phys_dev, "VK_KHR_video_queue") &&
+        has_extension(phys_dev, "VK_KHR_video_decode_queue") &&
+        has_extension(phys_dev, "VK_KHR_video_decode_h264")
+    has_video_decode || (video_qf_idx = nothing)
+    video_qf_idx === nothing ||
+        push!(queue_ci, Vulkan.DeviceQueueCreateInfo(video_qf_idx, Float32[1.0]))
+
     # Check for RT extension support
     has_rt = has_rt_extensions(phys_dev)
     has_ray_query = has_rt && has_extension(phys_dev, "VK_KHR_ray_query")
@@ -632,6 +662,20 @@ function init_vulkan!()
     end
     if has_memory_budget
         push!(extensions, "VK_EXT_memory_budget")
+    end
+    # External-memory export (opaque fds for GL/other-API interop). Enabling
+    # the extension has no effect until an ExternalImage is created.
+    has_external_memory = has_extension(phys_dev, "VK_KHR_external_memory_fd")
+    if has_external_memory
+        push!(extensions, "VK_KHR_external_memory")
+        push!(extensions, "VK_KHR_external_memory_fd")
+    end
+    # Hardware video decode extensions (family already probed + queue requested above).
+    if has_video_decode
+        append!(extensions, ["VK_KHR_video_queue", "VK_KHR_video_decode_queue",
+                             "VK_KHR_video_decode_h264"])
+        has_extension(phys_dev, "VK_KHR_video_decode_h265") &&
+            push!(extensions, "VK_KHR_video_decode_h265")
     end
 
     # Chain required features — all Vulkan 1.2 promoted features go in Vulkan12Features
@@ -817,6 +861,8 @@ function init_vulkan!()
     # Second queue for async compute/RT (falls back to same queue if only 1 available)
     compute_queue = n_queues >= 2 ?
         Vulkan.get_device_queue(device, qf_idx, 1) : queue
+    video_decode_queue = video_qf_idx === nothing ? nothing :
+        Vulkan.get_device_queue(device, video_qf_idx, 0)
 
     # Query RT pipeline properties
     rt_props = nothing
@@ -883,8 +929,10 @@ function init_vulkan!()
         has_ray_query,
         has_ser,
         has_memory_budget,
+        has_external_memory,
         gpu_assisted,
         string(phys_props.driver_version),
+        has_video_decode, video_decode_queue, video_qf_idx,
     )
     return ctx
 end
@@ -960,6 +1008,22 @@ function find_async_compute_queue_family(phys_dev, primary_qf_idx::UInt32)
         if (qfp.queue_flags & Vulkan.QUEUE_COMPUTE_BIT) != 0 &&
            (qfp.queue_flags & Vulkan.QUEUE_TRANSFER_BIT) != 0
             return family
+        end
+    end
+    return nothing
+end
+
+"""
+Find a queue family that supports hardware video decode
+(`VK_QUEUE_VIDEO_DECODE_BIT_KHR`, bit 0x20 — not surfaced as a named flag in
+Vulkan.jl). Dedicated on NVIDIA (transfer + video-decode, no graphics/compute).
+Returns `nothing` if the device has none.
+"""
+function find_video_decode_queue_family(phys_dev)
+    qf_props = Vulkan.get_physical_device_queue_family_properties(phys_dev)
+    for (i, qfp) in enumerate(qf_props)
+        if (UInt32(qfp.queue_flags) & 0x00000020) != 0
+            return UInt32(i - 1)
         end
     end
     return nothing
