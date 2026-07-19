@@ -5,6 +5,7 @@ export BatchQueue
 export CompilationResult, lava_compile, optimize_spirv
 # Debugging & diagnostics
 export vk_reset_device!, dump_state, gpu_memory_usage, allocate_batch_queue!
+export ExternalImage, memoryfd
 export set_dispatch_logging!, get_dispatch_log
 export concurrent_dispatch_group, concurrent_indirect_group
 export enable_gpu_av, disable_gpu_av, verify_gpu_av, activate_all_debugging
@@ -154,6 +155,18 @@ include("array/mapreduce.jl")
 
 # ---- Debug / validation API (needs LavaArray + KA backend) ----
 include("runtime/debug.jl")
+include("runtime/external.jl")
+
+# ---- Hardware video decode (VK_KHR_video_decode_queue) ----
+include("runtime/video.jl")
+"""
+    decode_h264_luma(annexb::Vector{UInt8}; maxframes) -> (width, height, Vector{Matrix{UInt8}})
+
+Hardware-decode an H.264 Annex-B elementary stream on the GPU (VK_KHR_video_decode)
+and return the luma (Y) planes in display order. Requires a device created with video
+decode support (`vk_context().video_decode_available`).
+"""
+decode_h264_luma(annexb::Vector{UInt8}; kw...) = VideoDecode.decode_h264_luma(vk_context(), annexb; kw...)
 
 # ---- Profiling (kernel SPIR-V stats + per-dispatch GPU timing) ----
 include("runtime/profiling.jl")
