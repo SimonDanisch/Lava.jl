@@ -55,6 +55,18 @@ function record_luma_copy!(cb, img::VideoImage, buffer::Vulkan.Buffer, offset::I
     return cb
 end
 
+# Record the chroma (interleaved U/V) plane of an NV12 frame into `buffer`: a
+# (width÷2 × height÷2) region of 2-byte (U,V) pixels, tightly packed, so the
+# destination is a `width × (height÷2)` UInt8 buffer of interleaved U,V samples.
+function record_chroma_copy!(cb, img::VideoImage, buffer::Vulkan.Buffer, offset::Integer)
+    Vulkan.cmd_copy_image_to_buffer(cb, img.image,
+        Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer,
+        [Vulkan.BufferImageCopy(UInt64(offset), 0, 0,
+            Vulkan.ImageSubresourceLayers(Vulkan.IMAGE_ASPECT_PLANE_1_BIT, 0, 0, 1),
+            Vulkan.Offset3D(0, 0, 0), Vulkan.Extent3D(img.width ÷ 2, img.height ÷ 2, 1))])
+    return cb
+end
+
 # Transition `img` to TRANSFER_SRC_OPTIMAL on `cb` if it isn't already there.
 function transition_transfer_src!(cb, img::VideoImage)
     img.layout[] == UInt32(Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) && return cb
@@ -287,7 +299,7 @@ plane. The video *codec* commands (session/decode/DPB) are raw VulkanCore FFI �
 Vulkan.jl generates no wrappers for the video codec API — but the frame images and
 the transfer are ordinary Vulkan.jl abstractions.
 """
-function decode_h264(ctx, annexb::Vector{UInt8}; maxframes::Int=typemax(Int))
+function decode_h264(ctx, annexb::Vector{UInt8}; maxframes::Int=typemax(Int), chroma::Bool=false)
     ctx.video_decode_available || error("device has no video decode support")
     Lava = parentmodule(@__MODULE__)   # parent: LavaArray, VideoImage, record_luma_copy!
     w=Ctxwrap(ctx, ctx.device, UInt32(ctx.video_decode_queue_family_index), ctx.video_decode_queue)
@@ -403,7 +415,7 @@ function decode_h264(ctx, annexb::Vector{UInt8}; maxframes::Int=typemax(Int))
     dpb=Tuple{Int,Int,Int}[]   # (slot, framenum, poc)  ; slot indexes imgs
     freeslots=collect(1:nslots)
     prevmsb=0; prevlsb=0; maxpoclsb=1<<(sps.log2poc+4); gop=0
-    outputs=Tuple{Int,Int,Any}[]   # (gop, poc, LavaArray{UInt8,2})
+    outputs=Tuple{Int,Int,Any,Any}[]   # (gop, poc, Y::LavaArray, UV::LavaArray|nothing)
     isfirst=true
     for (ai_i,au) in enumerate(aus)
         ai_i>maxframes && break
@@ -460,7 +472,8 @@ function decode_h264(ctx, annexb::Vector{UInt8}; maxframes::Int=typemax(Int))
         # `record_luma_copy!` — a real image→buffer transfer, no raw copy FFI.
         dst=Lava.LavaArray{UInt8,2}(undef,(DW,DH); extra_usage=UInt32(Vk.BUFFER_USAGE_TRANSFER_DST_BIT))
         dstbuf=dst.buf[]
-        GC.@preserve PIN dst cbh outvimg refpr refri refds decref begref outpr outri outds setup stdpic soff h264pi decinfo beginfo ctl endinfo bi imgs begin
+        duv = chroma ? Lava.LavaArray{UInt8,2}(undef,(DW,DH÷2); extra_usage=UInt32(Vk.BUFFER_USAGE_TRANSFER_DST_BIT)) : nothing
+        GC.@preserve PIN dst duv cbh outvimg refpr refri refds decref begref outpr outri outds setup stdpic soff h264pi decinfo beginfo ctl endinfo bi imgs begin
             ccall(dfp(w,"vkBeginCommandBuffer"),Int32,(C.VkCommandBuffer,Ptr{Cvoid}),CB,pc(bi))
             for (slot,_,_) in dpb; lay=imgs[slot][1].layout; if lay[]!=DPBLAYOUT; emit(CB,barrier(imgs[slot][1].image.vks,lay[],DPBLAYOUT)); lay[]=DPBLAYOUT; end; end
             emit(CB,barrier(outimg,outlay[],DPBLAYOUT)); outlay[]=DPBLAYOUT
@@ -470,12 +483,16 @@ function decode_h264(ctx, annexb::Vector{UInt8}; maxframes::Int=typemax(Int))
             ccall(dfp(w,"vkCmdEndVideoCodingKHR"),Cvoid,(C.VkCommandBuffer,Ptr{Cvoid}),CB,pc(endinfo))
             emit(CB,barrier(outimg,DPBLAYOUT,TSRC)); outlay[]=TSRC   # outvimg.layout now TRANSFER_SRC
             Lava.record_luma_copy!(cbh, outvimg, dstbuf.buffer, dstbuf.pool_offset + dst.offset)
+            if chroma
+                uvbuf = duv.buf[]
+                Lava.record_chroma_copy!(cbh, outvimg, uvbuf.buffer, uvbuf.pool_offset + duv.offset)
+            end
             ccall(dfp(w,"vkEndCommandBuffer"),Int32,(C.VkCommandBuffer,),CB)
         end
         cbref=Ref(CB); si=Ref(C.VkSubmitInfo(C.VK_STRUCTURE_TYPE_SUBMIT_INFO,C_NULL,UInt32(0),Ptr{C.VkSemaphore}(C_NULL),Ptr{UInt32}(C_NULL),UInt32(1),Base.unsafe_convert(Ptr{C.VkCommandBuffer},cbref),UInt32(0),Ptr{C.VkSemaphore}(C_NULL)))
         GC.@preserve si cbref ccall(dfp(w,"vkQueueSubmit"),Int32,(Ptr{Cvoid},UInt32,Ptr{Cvoid},Ptr{Cvoid}),w.q.vks,UInt32(1),Base.unsafe_convert(Ptr{Cvoid},si),C_NULL)
         ccall(dfp(w,"vkQueueWaitIdle"),Int32,(Ptr{Cvoid},),w.q.vks)
-        push!(outputs,(gop,poc,dst))      # GPU-resident luma, cropped DW×DH
+        push!(outputs,(gop,poc,dst,duv))      # GPU-resident luma (+chroma), cropped
         if isref
             adaptive, mmops = parse_mmco(au[1], sps, pps)
             if adaptive
@@ -503,6 +520,8 @@ function decode_h264(ctx, annexb::Vector{UInt8}; maxframes::Int=typemax(Int))
     # Display order is (GOP, POC): pic_order_cnt resets to 0 at every IDR, so
     # POC alone interleaves frames from different coded video sequences.
     sort!(outputs, by=x->(x[1], x[2]))
-    (DW, DH, Lava.LavaArray{UInt8,2}[o[3] for o in outputs])
+    ys  = Lava.LavaArray{UInt8,2}[o[3] for o in outputs]
+    uvs = chroma ? Lava.LavaArray{UInt8,2}[o[4] for o in outputs] : Lava.LavaArray{UInt8,2}[]
+    (DW, DH, ys, uvs)
 end
 end # module
