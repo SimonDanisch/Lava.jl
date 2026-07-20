@@ -160,13 +160,27 @@ include("runtime/external.jl")
 # ---- Hardware video decode (VK_KHR_video_decode_queue) ----
 include("runtime/video.jl")
 """
+    decode_h264_gpu(annexb::Vector{UInt8}; maxframes) -> (width, height, Vector{LavaArray{UInt8,2}})
+
+Hardware-decode an H.264 Annex-B elementary stream on the GPU (VK_KHR_video_decode),
+keeping every decoded luma (Y) plane GPU-resident: each frame is returned as a
+device-local `LavaArray{UInt8,2}` (cropped to the display size), never touching host
+memory. Feed these straight into Lava kernels / the motion tracker. Requires a device
+created with video decode support (`vk_context().video_decode_available`).
+"""
+decode_h264_gpu(annexb::Vector{UInt8}; kw...) = VideoDecode.decode_h264(vk_context(), annexb; kw...)
+
+"""
     decode_h264_luma(annexb::Vector{UInt8}; maxframes) -> (width, height, Vector{Matrix{UInt8}})
 
-Hardware-decode an H.264 Annex-B elementary stream on the GPU (VK_KHR_video_decode)
-and return the luma (Y) planes in display order. Requires a device created with video
-decode support (`vk_context().video_decode_available`).
+Like [`decode_h264_gpu`] but downloads each decoded luma plane to a host
+`Matrix{UInt8}` (grayscale = the NV12 Y plane). Used to validate the GPU decoder
+against a reference (e.g. ffmpeg).
 """
-decode_h264_luma(annexb::Vector{UInt8}; kw...) = VideoDecode.decode_h264_luma(vk_context(), annexb; kw...)
+function decode_h264_luma(annexb::Vector{UInt8}; kw...)
+    w, h, frames = decode_h264_gpu(annexb; kw...)
+    return (w, h, Matrix{UInt8}[Array(f) for f in frames])
+end
 
 # ---- Profiling (kernel SPIR-V stats + per-dispatch GPU timing) ----
 include("runtime/profiling.jl")

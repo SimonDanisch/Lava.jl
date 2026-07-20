@@ -122,6 +122,11 @@ end
         include(joinpath(@__DIR__, "test_lava_printf.jl"))
     end
 
+    # ── Tier 3v: hardware H.264 video decode (skips without a video-decode queue) ──
+    @testset "Tier 3v: H.264 hardware decode" begin
+        include(joinpath(@__DIR__, "test_video_decode.jl"))
+    end
+
     # ── Tier 3d: SPIR-V emitter pattern correctness & stress (full only) ──
     #
     # Patterns here have each, at some point, miscompiled on a specific driver
