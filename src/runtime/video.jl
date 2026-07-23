@@ -289,22 +289,144 @@ function video_profile(w)
 end
 
 """
-    decode_h264(ctx, annexb; maxframes=typemax(Int)) -> (w, h, Vector{VideoImage-backed LavaArray})
+    H264Decoder(ctx, paramnals; chroma=false)
 
-Hardware-decode an H.264 Annex-B stream on the GPU. Each decoded frame's luma (Y)
-plane is left GPU-resident in its own device-local `LavaArray{UInt8,2}` (cropped to
-the display size, copied out through the high-level [`VideoImage`] `copyto!` path —
-no host round-trip). Frames are returned in DISPLAY order. Grayscale = the NV12 Y
-plane. The video *codec* commands (session/decode/DPB) are raw VulkanCore FFI —
-Vulkan.jl generates no wrappers for the video codec API — but the frame images and
-the transfer are ordinary Vulkan.jl abstractions.
+A PERSISTENT hardware H.264 decode session: the Vulkan video session, its parameter
+objects, the DPB image pool and the bitstream upload buffer are created once and
+reused across [`feed!`](@ref)/[`decodemore!`](@ref) calls, so a caller can decode a
+long stream (or many GOPs of one stream) INCREMENTALLY — a few frames at a time,
+interleaved with other GPU work on the same thread — instead of paying for a whole
+GOP in one blocking call. `paramnals` is any Annex-B chunk that contains the
+stream's SPS+PPS (the lead parameter sets); every later [`feed!`](@ref) must start
+at an IDR so the DPB resets naturally. `close(dec)` frees the session.
+
+The batch [`decode_h264`](@ref) is a thin wrapper over this type (feed everything,
+drain, flush) — one decode core, two access patterns.
 """
-function decode_h264(ctx, annexb::Vector{UInt8}; maxframes::Int=typemax(Int), chroma::Bool=false)
+mutable struct H264Decoder
+    w::Ctxwrap; dev::Any
+    sps::Any; pps::Any
+    chroma::Bool
+    SESSION::Any; PARAMS::Any
+    PIN::Vector{Any}
+    imgs::Vector{Any}                       # DPB pool: (VideoImage, ImageView) per slot
+    nslots::Int
+    bbuf::Any; bmem::Any; bmap::Ptr{UInt8}; bufsz::UInt64
+    cbh::Any; CB::Any
+    CW::Int; CH::Int; DW::Int; DH::Int
+    # feed / decode state
+    aus::Vector{Vector{Vector{UInt8}}}      # access units of the current feed
+    nextau::Int
+    dpb::Vector{Tuple{Int,Int,Int}}         # (slot, framenum, poc)
+    freeslots::Vector{Int}
+    prevmsb::Int; prevlsb::Int; maxpoclsb::Int; gop::Int
+    decoded::Int                            # AUs decoded ever (display index for poct≠0)
+    isfirst::Bool
+    pending::Vector{Tuple{Int,Int,Any,Any}} # decoded, not yet display-safe: (gop, poc, Y, UV)
+    open::Bool
+end
+
+"""
+    feed!(dec, annexb)
+
+Queue an Annex-B chunk (typically ONE GOP, starting at an IDR) for incremental
+decode. Undrained frames of a previous feed stay pending and drain first.
+"""
+function feed!(dec::H264Decoder, annexb::AbstractVector{UInt8})
+    nalu = split_nals(annexb)
+    aus = Vector{Vector{Vector{UInt8}}}()
+    maxau = 0
+    for n in nalu
+        (n[1]==1 || n[1]==5) || continue
+        sh = parse_slice(n[3], dec.sps)
+        if sh.first_mb==0; push!(aus,[n[3]]) else push!(aus[end],n[3]) end
+        maxau = max(maxau, sum(length(sl)+3 for sl in aus[end]))
+    end
+    ensurebitbuf!(dec, maxau)
+    dec.aus = aus
+    dec.nextau = 1
+    return dec
+end
+
+"Frames not yet returned by [`decodemore!`](@ref) (undedcoded AUs + pending reorder)."
+remaining(dec::H264Decoder) = (length(dec.aus) - dec.nextau + 1) + length(dec.pending)
+
+"""
+    decodemore!(dec, maxframes; holdback=dec.nslots) -> Vector{(Y, UV)}
+
+Decode up to `maxframes` access units of the current feed and return every frame
+that is DISPLAY-ORDER safe. B-frames decode before the frames they display after,
+so up to `holdback` decoded frames are held back for reordering; once the feed is
+exhausted everything flushes (`holdback = typemax(Int)` reproduces the batch
+behavior exactly: emit nothing until the end, then the full sort). Each call costs
+about `maxframes` × per-frame decode time — size it to the latency budget.
+"""
+function decodemore!(dec::H264Decoder, maxframes::Integer; holdback::Integer = dec.nslots)
+    hi = min(dec.nextau + Int(min(maxframes, typemax(Int) ÷ 2)) - 1, length(dec.aus))
+    if dec.nextau <= hi
+        batch = dec.nextau:hi
+        ausize(au) = cld(sum(length(sl) + 3 for sl in au), 256) * 256
+        ensurebitbuf!(dec, sum(ausize(dec.aus[i]) for i in batch))
+        w = dec.w; CB = dec.CB
+        # ONE command buffer + ONE queue wait for the whole chunk — per-AU waits
+        # would serialize the hardware decoder against ~2 ms round-trips per frame
+        bi = Ref(C.VkCommandBufferBeginInfo(C.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, C_NULL,
+                                            UInt32(C.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT), Ptr{Cvoid}(C_NULL)))
+        GC.@preserve bi ccall(dfp(w,"vkBeginCommandBuffer"),Int32,(C.VkCommandBuffer,Ptr{Cvoid}),CB,pc(bi))
+        base = 0
+        for i in batch
+            base += decodeau!(dec, dec.aus[i], base)
+        end
+        ccall(dfp(w,"vkEndCommandBuffer"),Int32,(C.VkCommandBuffer,),CB)
+        cbref = Ref(CB)
+        si = Ref(C.VkSubmitInfo(C.VK_STRUCTURE_TYPE_SUBMIT_INFO,C_NULL,UInt32(0),Ptr{C.VkSemaphore}(C_NULL),Ptr{UInt32}(C_NULL),UInt32(1),Base.unsafe_convert(Ptr{C.VkCommandBuffer},cbref),UInt32(0),Ptr{C.VkSemaphore}(C_NULL)))
+        GC.@preserve si cbref ccall(dfp(w,"vkQueueSubmit"),Int32,(Ptr{Cvoid},UInt32,Ptr{Cvoid},Ptr{Cvoid}),w.q.vks,UInt32(1),Base.unsafe_convert(Ptr{Cvoid},si),C_NULL)
+        ccall(dfp(w,"vkQueueWaitIdle"),Int32,(Ptr{Cvoid},),w.q.vks)
+        dec.nextau = hi + 1
+    end
+    sort!(dec.pending, by = x -> (x[1], x[2]))   # display order = (GOP, POC)
+    nkeep = dec.nextau <= length(dec.aus) ? min(holdback, typemax(Int)) : 0
+    nemit = max(length(dec.pending) - nkeep, 0)
+    out = [(y, uv) for (_, _, y, uv) in dec.pending[1:nemit]]
+    deleteat!(dec.pending, 1:nemit)
+    return out
+end
+
+"Grow the (host-visible) bitstream upload buffer to hold an AU of `need` bytes."
+function ensurebitbuf!(dec::H264Decoder, need::Integer)
+    sz = UInt64(cld(max(need, 1), 256) * 256)
+    sz <= dec.bufsz && return nothing
+    w = dec.w; dev = dec.dev
+    dec.bbuf === nothing || ccall(dfp(w,"vkDestroyBuffer"),Cvoid,(Ptr{Cvoid},C.VkBuffer,Ptr{Cvoid}),dev.vks,dec.bbuf,C_NULL)
+    hp,pr,pl = video_profile(w); push!(dec.PIN, hp, pr, pl)
+    ci=Ref(C.VkBufferCreateInfo(C.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,Ptr{Cvoid}(rp(pl)),UInt32(0),sz,UInt32(C.VK_BUFFER_USAGE_VIDEO_DECODE_SRC_BIT_KHR),C.VK_SHARING_MODE_EXCLUSIVE,UInt32(0),Ptr{UInt32}(C_NULL)))
+    rb=Ref{C.VkBuffer}(); GC.@preserve ci pl ccall(dfp(w,"vkCreateBuffer"),Int32,(Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid}),dev.vks,pc(ci),C_NULL,rp(rb)); bf=rb[]
+    mr=Ref(C.VkMemoryRequirements(UInt64(0),UInt64(0),UInt32(0))); ccall(dfp(w,"vkGetBufferMemoryRequirements"),Cvoid,(Ptr{Cvoid},C.VkBuffer,Ptr{Cvoid}),dev.vks,bf,rp(mr))
+    m=Vk.unwrap(Vk.allocate_memory(dev,mr[].size,memtype(w,mr[].memoryTypeBits,UInt32(C.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)|UInt32(C.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)))); push!(dec.PIN, m)
+    ccall(dfp(w,"vkBindBufferMemory"),Int32,(Ptr{Cvoid},C.VkBuffer,C.VkDeviceMemory,UInt64),dev.vks,bf,m.vks,UInt64(0))
+    pmap=Ref{Ptr{Cvoid}}(); ccall(dfp(w,"vkMapMemory"),Int32,(Ptr{Cvoid},C.VkDeviceMemory,UInt64,UInt64,UInt32,Ptr{Cvoid}),dev.vks,m.vks,UInt64(0),sz,UInt32(0),Base.unsafe_convert(Ptr{Ptr{Cvoid}},pmap))
+    dec.bbuf=bf; dec.bmem=m; dec.bmap=Ptr{UInt8}(pmap[]); dec.bufsz=sz
+    return nothing
+end
+
+function Base.close(dec::H264Decoder)
+    dec.open || return nothing
+    dec.open = false
+    w = dec.w; dev = dec.dev
+    ccall(dfp(w,"vkQueueWaitIdle"),Int32,(Ptr{Cvoid},),w.q.vks)
+    dec.PARAMS === nothing || ccall(dfp(w,"vkDestroyVideoSessionParametersKHR"),Cvoid,(Ptr{Cvoid},C.VkVideoSessionParametersKHR,Ptr{Cvoid}),dev.vks,dec.PARAMS,C_NULL)
+    dec.SESSION === nothing || ccall(dfp(w,"vkDestroyVideoSessionKHR"),Cvoid,(Ptr{Cvoid},C.VkVideoSessionKHR,Ptr{Cvoid}),dev.vks,dec.SESSION,C_NULL)
+    dec.bbuf === nothing || ccall(dfp(w,"vkDestroyBuffer"),Cvoid,(Ptr{Cvoid},C.VkBuffer,Ptr{Cvoid}),dev.vks,dec.bbuf,C_NULL)
+    empty!(dec.PIN); empty!(dec.imgs); empty!(dec.pending); empty!(dec.aus)
+    return nothing
+end
+
+function H264Decoder(ctx, paramnals::AbstractVector{UInt8}; chroma::Bool=false)
     ctx.video_decode_available || error("device has no video decode support")
-    Lava = parentmodule(@__MODULE__)   # parent: LavaArray, VideoImage, record_luma_copy!
+    Lava = parentmodule(@__MODULE__)
     w=Ctxwrap(ctx, ctx.device, UInt32(ctx.video_decode_queue_family_index), ctx.video_decode_queue)
     dev=w.dev
-    nalu=split_nals(annexb)
+    nalu=split_nals(paramnals)
     sps = parse_sps(first(n[3] for n in nalu if n[1]==7))
     pps = parse_pps(first(n[3] for n in nalu if n[1]==8))
     # Only 4:2:0 (NV12) is supported: it's the one chroma format the H.264 video
@@ -377,70 +499,69 @@ function decode_h264(ctx, annexb::Vector{UInt8}; maxframes::Int=typemax(Int), ch
         pin(image); pin(mem); pin(view)
         imgs[k]=(vimg, view)
     end
-    # bitstream buffer (reused, sized to the largest AU) + readback buffer (Y+UV)
-    maxau=0; for n in nalu; (n[1]==1||n[1]==5) && (maxau=max(maxau,length(n[3])+3)); end
-    bufsz=UInt64(cld(maxau,256)*256)
-    bbuf,bmem,bmap = let
-        ci=Ref(C.VkBufferCreateInfo(C.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,Ptr{Cvoid}(rp(pl)),UInt32(0),bufsz,UInt32(C.VK_BUFFER_USAGE_VIDEO_DECODE_SRC_BIT_KHR),C.VK_SHARING_MODE_EXCLUSIVE,UInt32(0),Ptr{UInt32}(C_NULL)))
-        rb=Ref{C.VkBuffer}(); GC.@preserve ci pl PIN ccall(dfp(w,"vkCreateBuffer"),Int32,(Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid}),dev.vks,pc(ci),C_NULL,rp(rb)); bf=rb[]
-        mr=Ref(C.VkMemoryRequirements(UInt64(0),UInt64(0),UInt32(0))); ccall(dfp(w,"vkGetBufferMemoryRequirements"),Cvoid,(Ptr{Cvoid},C.VkBuffer,Ptr{Cvoid}),dev.vks,bf,rp(mr))
-        m=Vk.unwrap(Vk.allocate_memory(dev,mr[].size,memtype(w,mr[].memoryTypeBits,UInt32(C.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)|UInt32(C.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)))); pin(m)
-        ccall(dfp(w,"vkBindBufferMemory"),Int32,(Ptr{Cvoid},C.VkBuffer,C.VkDeviceMemory,UInt64),dev.vks,bf,m.vks,UInt64(0))
-        pmap=Ref{Ptr{Cvoid}}(); ccall(dfp(w,"vkMapMemory"),Int32,(Ptr{Cvoid},C.VkDeviceMemory,UInt64,UInt64,UInt32,Ptr{Cvoid}),dev.vks,m.vks,UInt64(0),bufsz,UInt32(0),Base.unsafe_convert(Ptr{Ptr{Cvoid}},pmap))
-        (bf,m,Ptr{UInt8}(pmap[]))
-    end
     # command pool + buffer. The command buffer is a *high-level* Vulkan handle
     # so the output copy can use `cmd_copy_image_to_buffer`; the raw video-codec
-    # commands take its `.vks` raw handle.
+    # commands take its `.vks` raw handle. (The bitstream upload buffer is created
+    # lazily by `ensurebitbuf!` — its size depends on the fed stream's largest AU.)
     cbh=first(Vk.unwrap(Vk.allocate_command_buffers(dev,
         Vk.CommandBufferAllocateInfo(Vk.unwrap(Vk.create_command_pool(dev, w.qf; flags=Vk.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)),
             Vk.COMMAND_BUFFER_LEVEL_PRIMARY, 1)))); pin(cbh)
     CB=cbh.vks
 
-    # ---- group slice NALs into access units (new AU when first_mb==0) ----
-    aus=Vector{Vector{Vector{UInt8}}}()
-    for n in nalu
-        (n[1]==1||n[1]==5) || continue
-        sh=parse_slice(n[3],sps)
-        if sh.first_mb==0; push!(aus,[n[3]]) else push!(aus[end],n[3]) end
-    end
+    return H264Decoder(w, dev, sps, pps, chroma, SESSION, PARAMS, PIN, imgs, nslots,
+                       nothing, nothing, Ptr{UInt8}(0), UInt64(0), cbh, CB,
+                       Int(CW), Int(CH), Int(DW), Int(DH),
+                       Vector{Vector{Vector{UInt8}}}(), 1,
+                       Tuple{Int,Int,Int}[], collect(1:nslots),
+                       0, 0, 1 << (sps.log2poc + 4), 0, 0, true,
+                       Tuple{Int,Int,Any,Any}[], true)
+end
 
-    # ---- decode loop ----
+"""
+Record ONE access unit's decode + output copy into the decoder's (already begun)
+command buffer, uploading its bitstream at `bufbase`, and append the frame's output
+arrays to `dec.pending`. Pure recording + CPU-side DPB bookkeeping — the caller
+([`decodemore!`](@ref)) submits the whole chunk with ONE queue wait, which is what
+makes chunked decode cheap (a per-frame `vkQueueWaitIdle` costs ~2 ms alone).
+Returns the 256-aligned bitstream bytes consumed.
+"""
+function decodeau!(dec::H264Decoder, au, bufbase::Integer)
+    Lava = parentmodule(@__MODULE__)
+    w=dec.w; dev=dec.dev; sps=dec.sps; pps=dec.pps
+    SESSION=dec.SESSION; PARAMS=dec.PARAMS; PIN=dec.PIN; imgs=dec.imgs
+    bbuf=dec.bbuf; bmap=dec.bmap; cbh=dec.cbh; CB=dec.CB
+    CW=dec.CW; CH=dec.CH; DW=dec.DW; DH=dec.DH; chroma=dec.chroma
+    dpb=dec.dpb; freeslots=dec.freeslots; maxpoclsb=dec.maxpoclsb
     allcol=C.VkImageSubresourceRange(UInt32(C.VK_IMAGE_ASPECT_COLOR_BIT),UInt32(0),UInt32(1),UInt32(0),UInt32(1))
     IGN=UInt32(0xffffffff); allst=UInt32(C.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)
     barrier(img,old,new)=Ref(C.VkImageMemoryBarrier(C.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,C_NULL,UInt32(C.VK_ACCESS_MEMORY_WRITE_BIT),UInt32(C.VK_ACCESS_MEMORY_READ_BIT)|UInt32(C.VK_ACCESS_MEMORY_WRITE_BIT),C.VkImageLayout(old),C.VkImageLayout(new),IGN,IGN,img,allcol))
     emit(cb,b)=ccall(dfp(w,"vkCmdPipelineBarrier"),Cvoid,(C.VkCommandBuffer,UInt32,UInt32,UInt32,UInt32,Ptr{Cvoid},UInt32,Ptr{Cvoid},UInt32,Ptr{Cvoid}),cb,allst,allst,UInt32(0),UInt32(0),C_NULL,UInt32(0),C_NULL,UInt32(1),pc(b))
     picres(view)=C.VkVideoPictureResourceInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR,C_NULL,C.VkOffset2D(0,0),C.VkExtent2D(CW,CH),UInt32(0),view)
     DPBLAYOUT=UInt32(C.VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR); TSRC=UInt32(C.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
-    dpb=Tuple{Int,Int,Int}[]   # (slot, framenum, poc)  ; slot indexes imgs
-    freeslots=collect(1:nslots)
-    prevmsb=0; prevlsb=0; maxpoclsb=1<<(sps.log2poc+4); gop=0
-    outputs=Tuple{Int,Int,Any,Any}[]   # (gop, poc, Y::LavaArray, UV::LavaArray|nothing)
-    isfirst=true
-    for (ai_i,au) in enumerate(aus)
-        ai_i>maxframes && break
+    begin
         sh=parse_slice(au[1],sps)
         if sh.idr
-            for (slot,_,_) in dpb; push!(freeslots,slot); end; empty!(dpb); prevmsb=0; prevlsb=0; gop+=1
+            for (slot,_,_) in dpb; push!(freeslots,slot); end; empty!(dpb)
+            dec.prevmsb=0; dec.prevlsb=0; dec.gop+=1
         end
         # POC (type 0)
         if sps.poct==0
             if sh.idr; pmsb=0
-            elseif sh.poclsb<prevlsb && (prevlsb-sh.poclsb)>=maxpoclsb÷2; pmsb=prevmsb+maxpoclsb
-            elseif sh.poclsb>prevlsb && (sh.poclsb-prevlsb)>maxpoclsb÷2; pmsb=prevmsb-maxpoclsb
-            else; pmsb=prevmsb; end
+            elseif sh.poclsb<dec.prevlsb && (dec.prevlsb-sh.poclsb)>=maxpoclsb÷2; pmsb=dec.prevmsb+maxpoclsb
+            elseif sh.poclsb>dec.prevlsb && (sh.poclsb-dec.prevlsb)>maxpoclsb÷2; pmsb=dec.prevmsb-maxpoclsb
+            else; pmsb=dec.prevmsb; end
             poc=pmsb+sh.poclsb
-            if sh.nrid!=0; prevmsb=pmsb; prevlsb=sh.poclsb; end
-        else; poc=ai_i-1; end
+            if sh.nrid!=0; dec.prevmsb=pmsb; dec.prevlsb=sh.poclsb; end
+        else; poc=dec.decoded; end
         isref = sh.nrid!=0
         outslot=popfirst!(freeslots)
         outvimg,outviewhl=imgs[outslot]
         outimg=outvimg.image.vks; outview=outviewhl.vks; outlay=outvimg.layout
-        # upload AU to bitstream buffer with slice offsets
+        # upload AU to its chunk-batched region of the bitstream buffer
         off=0; sliceoffs=UInt32[]
         for sl in au
             push!(sliceoffs,UInt32(off))
-            unsafe_copyto!(bmap+off, pointer(vcat(UInt8[0,0,1],sl)), length(sl)+3); off+=length(sl)+3
+            unsafe_copyto!(bmap+bufbase+off, pointer(vcat(UInt8[0,0,1],sl)), length(sl)+3); off+=length(sl)+3
         end
         # reference slots (active DPB)
         refpr=Ref{C.VkVideoPictureResourceInfoKHR}[]; refri=Ref{C.StdVideoDecodeH264ReferenceInfo}[]; refds=Ref{C.VkVideoDecodeH264DpbSlotInfoKHR}[]
@@ -462,19 +583,18 @@ function decode_h264(ctx, annexb::Vector{UInt8}; maxframes::Int=typemax(Int), ch
         stdpic=Ref(C.StdVideoDecodeH264PictureInfo(C.StdVideoDecodeH264PictureInfoFlags(pbytes(picflags)),UInt8(0),UInt8(0),UInt8(0),UInt8(0),UInt16(sh.fnum),UInt16(sh.idrid),(Int32(poc),Int32(poc))))
         soff=copy(sliceoffs)
         h264pi=Ref(C.VkVideoDecodeH264PictureInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_PICTURE_INFO_KHR,C_NULL,rp(stdpic),UInt32(length(soff)),pointer(soff)))
-        decinfo=Ref(C.VkVideoDecodeInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_INFO_KHR,pc(h264pi),UInt32(0),bbuf,UInt64(0),UInt64(cld(off,256)*256),outpr[],rp(setup),UInt32(length(decref)),isempty(decref) ? Ptr{C.VkVideoReferenceSlotInfoKHR}(C_NULL) : pointer(decref)))
+        decinfo=Ref(C.VkVideoDecodeInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_INFO_KHR,pc(h264pi),UInt32(0),bbuf,UInt64(bufbase),UInt64(cld(off,256)*256),outpr[],rp(setup),UInt32(length(decref)),isempty(decref) ? Ptr{C.VkVideoReferenceSlotInfoKHR}(C_NULL) : pointer(decref)))
         beginfo=Ref(C.VkVideoBeginCodingInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_BEGIN_CODING_INFO_KHR,C_NULL,UInt32(0),SESSION,PARAMS,UInt32(length(begref)),pointer(begref)))
         ctl=Ref(C.VkVideoCodingControlInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_CODING_CONTROL_INFO_KHR,C_NULL,UInt32(C.VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR)))
         endinfo=Ref(C.VkVideoEndCodingInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_END_CODING_INFO_KHR,C_NULL,UInt32(0)))
-        bi=Ref(C.VkCommandBufferBeginInfo(C.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,C_NULL,UInt32(C.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT),Ptr{Cvoid}(C_NULL)))
+        isfirst=dec.isfirst
         # This frame's luma lands in its own device-local LavaArray (cropped to
         # the display size DW×DH), copied out through the high-level VideoImage
         # `record_luma_copy!` — a real image→buffer transfer, no raw copy FFI.
         dst=Lava.LavaArray{UInt8,2}(undef,(DW,DH); extra_usage=UInt32(Vk.BUFFER_USAGE_TRANSFER_DST_BIT))
         dstbuf=dst.buf[]
         duv = chroma ? Lava.LavaArray{UInt8,2}(undef,(DW,DH÷2); extra_usage=UInt32(Vk.BUFFER_USAGE_TRANSFER_DST_BIT)) : nothing
-        GC.@preserve PIN dst duv cbh outvimg refpr refri refds decref begref outpr outri outds setup stdpic soff h264pi decinfo beginfo ctl endinfo bi imgs begin
-            ccall(dfp(w,"vkBeginCommandBuffer"),Int32,(C.VkCommandBuffer,Ptr{Cvoid}),CB,pc(bi))
+        GC.@preserve PIN dst duv cbh outvimg refpr refri refds decref begref outpr outri outds setup stdpic soff h264pi decinfo beginfo ctl endinfo imgs begin
             for (slot,_,_) in dpb; lay=imgs[slot][1].layout; if lay[]!=DPBLAYOUT; emit(CB,barrier(imgs[slot][1].image.vks,lay[],DPBLAYOUT)); lay[]=DPBLAYOUT; end; end
             emit(CB,barrier(outimg,outlay[],DPBLAYOUT)); outlay[]=DPBLAYOUT
             ccall(dfp(w,"vkCmdBeginVideoCodingKHR"),Cvoid,(C.VkCommandBuffer,Ptr{Cvoid}),CB,pc(beginfo))
@@ -487,12 +607,8 @@ function decode_h264(ctx, annexb::Vector{UInt8}; maxframes::Int=typemax(Int), ch
                 uvbuf = duv.buf[]
                 Lava.record_chroma_copy!(cbh, outvimg, uvbuf.buffer, uvbuf.pool_offset + duv.offset)
             end
-            ccall(dfp(w,"vkEndCommandBuffer"),Int32,(C.VkCommandBuffer,),CB)
         end
-        cbref=Ref(CB); si=Ref(C.VkSubmitInfo(C.VK_STRUCTURE_TYPE_SUBMIT_INFO,C_NULL,UInt32(0),Ptr{C.VkSemaphore}(C_NULL),Ptr{UInt32}(C_NULL),UInt32(1),Base.unsafe_convert(Ptr{C.VkCommandBuffer},cbref),UInt32(0),Ptr{C.VkSemaphore}(C_NULL)))
-        GC.@preserve si cbref ccall(dfp(w,"vkQueueSubmit"),Int32,(Ptr{Cvoid},UInt32,Ptr{Cvoid},Ptr{Cvoid}),w.q.vks,UInt32(1),Base.unsafe_convert(Ptr{Cvoid},si),C_NULL)
-        ccall(dfp(w,"vkQueueWaitIdle"),Int32,(Ptr{Cvoid},),w.q.vks)
-        push!(outputs,(gop,poc,dst,duv))      # GPU-resident luma (+chroma), cropped
+        push!(dec.pending,(dec.gop,poc,dst,duv))   # completes at the chunk's queue wait
         if isref
             adaptive, mmops = parse_mmco(au[1], sps, pps)
             if adaptive
@@ -515,13 +631,39 @@ function decode_h264(ctx, annexb::Vector{UInt8}; maxframes::Int=typemax(Int), ch
                 while length(dpb)>sps.maxref; old=popfirst!(dpb); push!(freeslots,old[1]); end
             end
         else; push!(freeslots,outslot); end
-        isfirst=false
+        dec.isfirst=false
+        dec.decoded+=1
     end
-    # Display order is (GOP, POC): pic_order_cnt resets to 0 at every IDR, so
-    # POC alone interleaves frames from different coded video sequences.
-    sort!(outputs, by=x->(x[1], x[2]))
-    ys  = Lava.LavaArray{UInt8,2}[o[3] for o in outputs]
-    uvs = chroma ? Lava.LavaArray{UInt8,2}[o[4] for o in outputs] : Lava.LavaArray{UInt8,2}[]
-    (DW, DH, ys, uvs)
+    return Int(cld(off, 256) * 256)
+end
+
+"""
+    decode_h264(ctx, annexb; maxframes=typemax(Int)) -> (w, h, Vector{VideoImage-backed LavaArray})
+
+Hardware-decode an H.264 Annex-B stream on the GPU. Each decoded frame's luma (Y)
+plane is left GPU-resident in its own device-local `LavaArray{UInt8,2}` (cropped to
+the display size, copied out through the high-level [`VideoImage`] `copyto!` path —
+no host round-trip). Frames are returned in DISPLAY order — (GOP, POC):
+pic_order_cnt resets to 0 at every IDR, so POC alone would interleave frames from
+different coded video sequences. The video *codec* commands (session/decode/DPB) are
+raw VulkanCore FFI — Vulkan.jl generates no wrappers for the video codec API — but
+the frame images and the transfer are ordinary Vulkan.jl abstractions.
+
+The batch form of [`H264Decoder`](@ref): feed everything, drain once (`holdback =
+typemax` ⇒ emit only the final full display-order sort), free the session.
+"""
+function decode_h264(ctx, annexb::Vector{UInt8}; maxframes::Int=typemax(Int), chroma::Bool=false)
+    Lava = parentmodule(@__MODULE__)
+    dec = H264Decoder(ctx, annexb; chroma)
+    try
+        feed!(dec, annexb)
+        length(dec.aus) > maxframes && resize!(dec.aus, maxframes)
+        outs = decodemore!(dec, typemax(Int); holdback = typemax(Int))
+        ys  = Lava.LavaArray{UInt8,2}[o[1] for o in outs]
+        uvs = chroma ? Lava.LavaArray{UInt8,2}[o[2] for o in outs] : Lava.LavaArray{UInt8,2}[]
+        return (dec.DW, dec.DH, ys, uvs)
+    finally
+        close(dec)
+    end
 end
 end # module

@@ -1093,11 +1093,16 @@ function get_staging(bq::BatchQueue, nbytes::Integer)
         UInt32[],
     )
     mem_reqs = Vulkan.get_buffer_memory_requirements(dev, vkbuf)
-    mem_type_idx = find_memory_type(
-        ctx, mem_reqs.memory_type_bits,
-        Vulkan.MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-        Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT,
-    )
+    # Prefer HOST_CACHED: downloads memcpy FROM this buffer, and CPU reads of
+    # write-combined (uncached) host-visible memory run ~70 MB/s vs GB/s cached.
+    mem_type_idx = something(
+        find_memory_type_optional(ctx, mem_reqs.memory_type_bits,
+                                  Vulkan.MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                  Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                  Vulkan.MEMORY_PROPERTY_HOST_CACHED_BIT),
+        find_memory_type(ctx, mem_reqs.memory_type_bits,
+                         Vulkan.MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                         Vulkan.MEMORY_PROPERTY_HOST_COHERENT_BIT))
     memory = Vulkan.DeviceMemory(dev, mem_reqs.size, mem_type_idx)
     throw_if_error(ctx, "vkBindBufferMemory",
         Vulkan.bind_buffer_memory(dev, vkbuf, memory, 0))
