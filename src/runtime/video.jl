@@ -280,7 +280,14 @@ function memtype(w,bits,want)
     error("no memory type")
 end
 
+# One decode core, several codecs: the session machinery (chunked submit,
+# bitstream buffer, reorder, teardown) is shared across `VideoDecoder`s;
+# codec-specific parsing/recording lives in `feed!`/`decodeau!` methods and
+# the `decodeprofile` hook. H.265 lives in video_h265.jl.
+abstract type VideoDecoder end
+
 # returns (video-decode profile ref, profile-list ref, caps NamedTuple)
+decodeprofile(dec::VideoDecoder) = video_profile(dec.w)   # h264 default; h265 overrides
 function video_profile(w)
     hp=Ref(C.VkVideoDecodeH264ProfileInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_PROFILE_INFO_KHR,C_NULL,C.STD_VIDEO_H264_PROFILE_IDC_HIGH,C.VK_VIDEO_DECODE_H264_PICTURE_LAYOUT_PROGRESSIVE_KHR))
     pr=Ref(C.VkVideoProfileInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR, Ptr{Cvoid}(rp(hp)), C.VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR, UInt32(C.VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR), UInt32(C.VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR), UInt32(C.VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)))
@@ -303,7 +310,7 @@ at an IDR so the DPB resets naturally. `close(dec)` frees the session.
 The batch [`decode_h264`](@ref) is a thin wrapper over this type (feed everything,
 drain, flush) — one decode core, two access patterns.
 """
-mutable struct H264Decoder
+mutable struct H264Decoder <: VideoDecoder
     w::Ctxwrap; dev::Any
     sps::Any; pps::Any
     chroma::Bool
@@ -349,7 +356,7 @@ function feed!(dec::H264Decoder, annexb::AbstractVector{UInt8})
 end
 
 "Frames not yet returned by [`decodemore!`](@ref) (undedcoded AUs + pending reorder)."
-remaining(dec::H264Decoder) = (length(dec.aus) - dec.nextau + 1) + length(dec.pending)
+remaining(dec::VideoDecoder) = (length(dec.aus) - dec.nextau + 1) + length(dec.pending)
 
 """
     decodemore!(dec, maxframes; holdback=dec.nslots) -> Vector{(Y, UV)}
@@ -361,7 +368,7 @@ exhausted everything flushes (`holdback = typemax(Int)` reproduces the batch
 behavior exactly: emit nothing until the end, then the full sort). Each call costs
 about `maxframes` × per-frame decode time — size it to the latency budget.
 """
-function decodemore!(dec::H264Decoder, maxframes::Integer; holdback::Integer = dec.nslots)
+function decodemore!(dec::VideoDecoder, maxframes::Integer; holdback::Integer = dec.nslots)
     hi = min(dec.nextau + Int(min(maxframes, typemax(Int) ÷ 2)) - 1, length(dec.aus))
     if dec.nextau <= hi
         batch = dec.nextau:hi
@@ -393,12 +400,12 @@ function decodemore!(dec::H264Decoder, maxframes::Integer; holdback::Integer = d
 end
 
 "Grow the (host-visible) bitstream upload buffer to hold an AU of `need` bytes."
-function ensurebitbuf!(dec::H264Decoder, need::Integer)
+function ensurebitbuf!(dec::VideoDecoder, need::Integer)
     sz = UInt64(cld(max(need, 1), 256) * 256)
     sz <= dec.bufsz && return nothing
     w = dec.w; dev = dec.dev
     dec.bbuf === nothing || ccall(dfp(w,"vkDestroyBuffer"),Cvoid,(Ptr{Cvoid},C.VkBuffer,Ptr{Cvoid}),dev.vks,dec.bbuf,C_NULL)
-    hp,pr,pl = video_profile(w); push!(dec.PIN, hp, pr, pl)
+    hp,pr,pl = decodeprofile(dec); push!(dec.PIN, hp, pr, pl)
     ci=Ref(C.VkBufferCreateInfo(C.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,Ptr{Cvoid}(rp(pl)),UInt32(0),sz,UInt32(C.VK_BUFFER_USAGE_VIDEO_DECODE_SRC_BIT_KHR),C.VK_SHARING_MODE_EXCLUSIVE,UInt32(0),Ptr{UInt32}(C_NULL)))
     rb=Ref{C.VkBuffer}(); GC.@preserve ci pl ccall(dfp(w,"vkCreateBuffer"),Int32,(Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid}),dev.vks,pc(ci),C_NULL,rp(rb)); bf=rb[]
     mr=Ref(C.VkMemoryRequirements(UInt64(0),UInt64(0),UInt32(0))); ccall(dfp(w,"vkGetBufferMemoryRequirements"),Cvoid,(Ptr{Cvoid},C.VkBuffer,Ptr{Cvoid}),dev.vks,bf,rp(mr))
@@ -409,7 +416,7 @@ function ensurebitbuf!(dec::H264Decoder, need::Integer)
     return nothing
 end
 
-function Base.close(dec::H264Decoder)
+function Base.close(dec::VideoDecoder)
     dec.open || return nothing
     dec.open = false
     w = dec.w; dev = dec.dev
@@ -666,4 +673,5 @@ function decode_h264(ctx, annexb::Vector{UInt8}; maxframes::Int=typemax(Int), ch
         close(dec)
     end
 end
+include("video_h265.jl")
 end # module
