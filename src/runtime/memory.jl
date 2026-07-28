@@ -249,10 +249,45 @@ Called from `vk_alloc` and `pool_alloc` before allocating.  `blocking=true`
 lowers the pressure threshold and inflates the rate budget — use it when the
 caller is about to do a heavy synchronous operation anyway.
 """
+# Absolute-capacity pool trim.
+#
+# `maybe_collect`'s pressure gate is a *ratio* against the device heap, which is
+# the wrong signal for holding on to dead pool blocks on an iGPU: 3 GB of empty
+# blocks is only ~20 % of a large shared heap, so the gate never trips — but that
+# 3 GB is system RAM the rest of the machine still needs, and the pool is only
+# handed back on an OOM retry. Long multi-scene runs therefore accumulate
+# gigabytes of blocks that nothing will ever reclaim.
+#
+# So trim on absolute dead capacity as well, rate-limited so a render loop can't
+# pay for it repeatedly. Blocks only become empty once the GC has run their
+# sub-allocations' finalizers, hence the collection before the scan.
+const POOL_TRIM_THRESHOLD = Ref{Int}(1024 * 1024 * 1024)   # 1 GiB of pool capacity
+const POOL_TRIM_MIN_INTERVAL = Ref{Float64}(5.0)           # seconds
+const LAST_POOL_TRIM = Ref{Float64}(0.0)
+
+function maybe_trim_pool!(ctx::VkContext)
+    GPU_LIVE_BYTES[] < POOL_TRIM_THRESHOLD[] && return
+    now = time()
+    now - LAST_POOL_TRIM[] < POOL_TRIM_MIN_INTERVAL[] && return
+    LAST_POOL_TRIM[] = now
+
+    GC.gc(false)
+    any(b -> b.live_count == 0, POOL_BLOCKS) || return
+    bq = ctx.default_bq
+    quiesce_before_reclaim!(bq)
+    n_blocks, bytes_freed = reclaim_empty_pool_blocks!(bq)
+    n_blocks > 0 && @debug "Lava: trimmed empty pool blocks" blocks=n_blocks MiB=(bytes_freed >> 20)
+    return
+end
+
 function maybe_collect(ctx::VkContext; blocking::Bool=false)
     EAGER_GC[] || return
     stats = MEMORY_STATS
     current_time = time()
+
+    # Runs before the ratio gate below: dead pool capacity has to be returned on
+    # its own terms, not only when the heap ratio says we are in trouble.
+    maybe_trim_pool!(ctx)
 
     # Refresh device heap estimate every 10s.  The heap size itself doesn't
     # change, but on iGPUs with shared memory another process could shift what
@@ -289,6 +324,25 @@ function maybe_collect(ctx::VkContext; blocking::Bool=false)
     pre_gc_live = live
     gc_time = Base.@elapsed GC.gc(false)
     post_gc_live = GPU_LIVE_BYTES[]
+
+    # The GC just returned sub-allocations to their pool blocks, but a block is
+    # only handed back to the driver on an OOM retry.  `GPU_LIVE_BYTES` tracks
+    # pool *capacity*, so without this the pressure signal never falls: we keep
+    # collecting, relieve nothing, and the first thing to notice the pool is
+    # holding gigabytes of dead blocks is an allocation failure — or, on an iGPU
+    # sharing system RAM, a driver timeout, because the pressure is on memory
+    # the rest of the system also needs.
+    #
+    # Reclaim here, where a collection is already being paid for.  The scan for
+    # empty blocks is cheap; only pay `quiesce_before_reclaim!` (which waits for
+    # in-flight batches) when a block would actually be returned.
+    if any(b -> b.live_count == 0, POOL_BLOCKS)
+        bq = ctx.default_bq
+        quiesce_before_reclaim!(bq)
+        n_blocks, bytes_freed = reclaim_empty_pool_blocks!(bq)
+        n_blocks > 0 && @debug "Lava: reclaimed empty pool blocks after GC" blocks=n_blocks MiB=(bytes_freed >> 20)
+        post_gc_live = GPU_LIVE_BYTES[]
+    end
 
     @atomic stats.last_freed = pre_gc_live - post_gc_live
     @atomic stats.last_gc_time = 0.75 * last_gc_time + 0.25 * gc_time

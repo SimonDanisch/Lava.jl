@@ -214,6 +214,10 @@ end
             include(joinpath(@__DIR__, "test_workgroup_zero_init.jl"))
         end
 
+        @testset "pool trim" begin
+            include(joinpath(@__DIR__, "test_pool_trim.jl"))
+        end
+
         @testset "HW TLAS — nonblocking sync!" begin
             include(joinpath(@__DIR__, "test_hwtlas_nonblocking_sync.jl"))
         end
