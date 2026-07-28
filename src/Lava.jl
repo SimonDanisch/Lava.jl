@@ -98,6 +98,9 @@ include("compiler/spirv/module.jl")
 include("compiler/spirv/types.jl")
 include("compiler/spirv/emit.jl")
 
+# ---- Compiler phase timing ----
+include("compiler/phase_timer.jl")
+
 # ---- LLVM passes ----
 include("compiler/passes/lift_geps.jl")
 include("compiler/passes/retype_allocas.jl")
