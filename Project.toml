@@ -30,13 +30,14 @@ Raycore = {url = "https://github.com/JuliaGeometry/Raycore.jl", rev = "master"}
 # Lava depends on a few GPUCompiler internals (rm_trap! was one, now vendored;
 # kernel_state_type, methodinstance, method_table, cached_compilation remain).
 # GPUCompiler removes/renames internals across PATCH releases (1.13.1 → 1.13.3
-# dropped rm_trap!), so this stays inside the 1.x line and gets bumped only after
-# testing. Validated on 1.23.0: no source changes needed, kernels bit-identical,
-# and ~20% faster end-to-end than 1.13.3.
+# dropped rm_trap!), so a bump is only ever made after testing. Validated on
+# 1.23.0: no source changes needed, kernels bit-identical, and ~20% faster
+# end-to-end than 1.13.3.
 #
-# Do NOT widen this to 2: the whole CUDA 6.x line requires GPUCompiler 1.x, and
-# allowing 2 makes Lava and CUDA.jl mutually unsatisfiable in one project.
-GPUCompiler = "1"
+# 2 is allowed, and has to be: CUDA's own `CUDACore` requires `GPUCompiler = 2.1`
+# from 6.2.1 on, so pinning Lava to 1 is what would make the two unsatisfiable in
+# one project — the reverse of what an earlier note here claimed.
+GPUCompiler = "1, 2"
 SPIRV_LLVM_Backend_jll = "21.1.4"
 StaticArrays = "1.9.17"
 julia = "1.12"

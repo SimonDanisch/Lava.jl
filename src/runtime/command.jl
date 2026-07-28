@@ -46,12 +46,30 @@ const BATCH_WAIT_TIMES = Float64[]  # seconds
 const BATCH_WAIT_INFO  = String[]   # last kernel in batch at wait time
 const BATCH_WAIT_DISPATCHES = Int[] # dispatch count for each measured batch
 
+"""
+Path to mirror the dispatch log to, or `nothing`.
+
+The in-memory ring buffer is worthless for the failure it exists to diagnose: a
+dispatch that never completes leaves the process blocked inside
+`vkWaitForFences`, where nothing can print it and SIGINT does not land, so the
+log dies with the session. Set this and each dispatch name is appended and
+flushed as it is recorded, which makes the last line in the file the kernel that
+hung.
+
+Off by default — it is a write and a flush per dispatch, on a path whose whole
+point is to allocate nothing.
+"""
+const DISPATCH_LOG_FILE = Ref{Union{Nothing,String}}(nothing)
+
 function log_dispatch!(info::String)
     DISPATCH_LOGGING_ENABLED[] || return
     if length(DISPATCH_LOG) >= MAX_DISPATCH_LOG
         popfirst!(DISPATCH_LOG)
     end
     push!(DISPATCH_LOG, info)
+    f = DISPATCH_LOG_FILE[]
+    f === nothing || open(io -> (println(io, info); flush(io)), f, "a")
+    return
 end
 
 # Register cleanup callback for vk_reset_device!
@@ -143,6 +161,22 @@ const CAPTURING = Ref{Union{Nothing,CapturedSequence}}(nothing)
 # on it: a replay puts no `CommandBatch` in `bq.in_flight`, so the in-flight scan
 # alone would return before the GPU had run any of it.
 const REPLAY_WATERMARK = IdDict{BatchQueue,UInt64}()
+
+"""
+How long `flush!` waits for the queue to drain before it gives up, in
+nanoseconds. `0` restores the old behaviour of waiting forever.
+
+`vkWaitSemaphores` took `typemax(UInt64)` here, which is not a timeout — a
+dispatch that never completes turned into a process that could only be killed,
+taking the in-memory dispatch log with it. That is the failure this wait exists
+to survive, so it gets a budget: long enough that no legitimate submission comes
+near it (a whole VAE decode is ~30 s of device work), short enough that a hang
+is a diagnosable error instead of a wedged session.
+"""
+const FLUSH_TIMEOUT_NS = Ref{UInt64}(UInt64(120) * 1_000_000_000)
+
+"""Poll interval inside that budget, so a TDR is noticed without waiting it out."""
+const FLUSH_WAIT_QUANTUM_NS = UInt64(2) * 1_000_000_000
 
 push!(RESET_CALLBACKS, function()
     CAPTURING[] = nothing
@@ -1097,9 +1131,22 @@ function sweep_retired_batches!(bq::BatchQueue)
     # bounce-loop early-exit check (Hikari, 2026-06-10: every sample after
     # the first rendered black because round-0's trace dispatch read a
     # clobbered queue pointer).
+    #
+    # A capture widens "idle" further still: its command buffers outlive the
+    # batches that recorded them, and every dispatch in them keeps reading its
+    # arguments from the slab at replay time. So the bytes of batches that have
+    # already been submitted AND signalled are still live — the one case this
+    # test otherwise treats as the safest of all. Mid-capture the queue drains to
+    # empty routinely (the GPU is running a step's worth of work while the host
+    # records the next), so without this the second half of a capture overwrites
+    # the argument records of the first, and the replay dispatches valid commands
+    # against wrong pointers: no validation error, no device fault, just a kernel
+    # that never returns. `capture` pins the range at the end via
+    # `reserve_arg_slabs!`, which is too late to help the capture itself.
+    capturing_here = let c = CAPTURING[]; c !== nothing && c.bq === bq end
     active = bq.active_batch
     active_has_commands = active !== nothing && active.dispatch_count > 0
-    if isempty(bq.in_flight) && !active_has_commands
+    if isempty(bq.in_flight) && !active_has_commands && !capturing_here
         reset_arg_buffer_pool!(bq)
         reset_indirect_buffer_pool!(bq)
     end
@@ -1124,15 +1171,36 @@ function flush!(bq::BatchQueue, device::Vulkan.Device)
         target = max(target, b.signal_value)
     end
     target == UInt64(0) && return
-    wait_result = Vulkan.wait_semaphores(device,
-        Vulkan.SemaphoreWaitInfo([bq.timeline_sem], [target]),
-        typemax(UInt64))
-    if iserror(wait_result)
-        # Rich rethrow: flush! gets validation context + dispatcher hints the
-        # generic wrapper can't.  The mark_if_dl! call is the single source of
-        # truth for the device_lost flag.
-        mark_if_lost!(bq, wait_result)
-        throw_with_validation_context("vkWaitSemaphores", wait_result, 0, false)
+    budget = FLUSH_TIMEOUT_NS[]
+    quantum = budget == 0 ? typemax(UInt64) : min(budget, FLUSH_WAIT_QUANTUM_NS)
+    waited = UInt64(0)
+    while true
+        wait_result = Vulkan.wait_semaphores(device,
+            Vulkan.SemaphoreWaitInfo([bq.timeline_sem], [target]), quantum)
+        if iserror(wait_result)
+            # Rich rethrow: flush! gets validation context + dispatcher hints the
+            # generic wrapper can't.  The mark_if_dl! call is the single source of
+            # truth for the device_lost flag.
+            mark_if_lost!(bq, wait_result)
+            throw_with_validation_context("vkWaitSemaphores", wait_result, 0, false)
+        end
+        unwrap(wait_result) == Vulkan.SUCCESS && break
+        waited += quantum
+        # A TDR marks the device lost while this call is still waiting on a value
+        # that will now never be signalled, so ask between quanta rather than
+        # sitting in one unbounded wait.
+        if device_lost(bq.ctx::VkContext)
+            throw(LavaError("vkWaitSemaphores", "device was lost while waiting for timeline $target",
+                            "Call Lava.vk_reset_device!() to reinitialize"))
+        end
+        if budget != UInt64(0) && waited >= budget
+            throw(LavaError("vkWaitSemaphores",
+                            "timed out after $(round(waited / 1e9, digits = 1)) s waiting for " *
+                            "timeline value $target on $(length(bq.in_flight)) in-flight batch(es)",
+                            "A dispatch is not completing. Set Lava.DISPATCH_LOGGING_ENABLED[] = true " *
+                            "(and Lava.DISPATCH_LOG_FILE[] to keep it across a restart) to see which " *
+                            "kernel, or raise Lava.FLUSH_TIMEOUT_NS[] if the work is genuinely this long."))
+        end
     end
     sweep_retired_batches!(bq)
     # The queue is drained here, so nothing recorded next can race anything
