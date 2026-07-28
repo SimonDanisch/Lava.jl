@@ -84,6 +84,14 @@ mutable struct SPIRVEmitterState
     # Set true when OpIgnoreIntersectionKHR/OpTerminateRayKHR is emitted (block terminators).
     # Suppresses the redundant OpReturn from the trailing `ret void`.
     rt_block_terminated::Bool
+    # ── Cooperative matrix (SPV_KHR_cooperative_matrix) ──
+    # Cached OpTypeCooperativeMatrixKHR ids, keyed (dtype, rows, cols, use).
+    coopmat_type_ids::Dict{Tuple{String, Int, Int, UInt32}, UInt32}
+    # LLVM values that actually hold a cooperative matrix. The front end carries
+    # them as an i32 handle, so their LLVM type says nothing useful; anything
+    # that derives a SPIR-V type from the LLVM type (phis above all) has to
+    # consult this instead, or it emits `OpPhi %uint` over coopmat operands.
+    coopmat_value_types::Dict{LLVM.Value, UInt32}
     # ── Ray-query state (compute kernels with enable_ray_query=true) ──
     # Cached OpTypeRayQueryKHR id, allocated lazily.
     ray_query_type_id::Union{Nothing, UInt32}
@@ -168,6 +176,8 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         nothing,
         nothing, nothing,  # SER: rt_hit_object_type_id, rt_hit_object_var_id
         false,
+        Dict{Tuple{String, Int, Int, UInt32}, UInt32}(),  # coopmat types
+        Dict{LLVM.Value, UInt32}(),                       # coopmat-typed values
         nothing, nothing, UInt32[], UInt32[],  # ray-query state
         nothing,  # gfx_io
         Dict{Tuple{UInt32, UInt32}, UInt32}(), UInt32(0),
@@ -5981,6 +5991,17 @@ function defer_phi!(state::SPIRVEmitterState, inst::LLVM.PHIInst, block_label_id
         push!(incoming, (val, bb))
     end
 
+    # A phi over cooperative matrices carries the matrix type, not the i32 the
+    # handle happens to have in LLVM.
+    for (val, _) in incoming
+        cm = get(state.coopmat_value_types, val, nothing)
+        if cm !== nothing
+            result_ty = cm
+            state.coopmat_value_types[inst] = cm
+            break
+        end
+    end
+
     push!(state.deferred_phis, (result_id, result_ty, incoming, block_label_id))
 end
 
@@ -6366,6 +6387,11 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
         # into the function name by the @lava_printf frontend (see device/printf.jl).
         if startswith(fn_name, "_lava_debug_printf_")
             return emit_debug_printf!(state, inst, fn_name)
+        end
+
+        # Cooperative matrix → OpCooperativeMatrix{Load,Store,MulAdd}KHR
+        if startswith(fn_name, "_lava_coopmat_")
+            return emit_coopmat_call!(state, inst, fn_name)
         end
 
         # Check for RT intrinsics → OpTraceRayKHR, payload load/store

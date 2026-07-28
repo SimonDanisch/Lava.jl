@@ -191,7 +191,7 @@ end
 function probe_device_local_heap(ctx::VkContext)
     mem_props = ctx.memory_properties
     total = 0
-    for i in 0:(mem_props.memory_heap_count - 1)
+    for i in 0:(length(mem_props.memory_heaps) - 1)
         heap = mem_props.memory_heaps[i + 1]
         if (UInt32(heap.flags) & UInt32(Vulkan.MEMORY_HEAP_DEVICE_LOCAL_BIT)) != 0
             total += Int(heap.size)
@@ -208,7 +208,7 @@ OOM error messages.
 """
 function probe_device_memory_budget(ctx::VkContext)
     mem_props = ctx.memory_properties
-    n = Int(mem_props.memory_heap_count)
+    n = Int(length(mem_props.memory_heaps))
     sizes = ntuple(i -> Int(mem_props.memory_heaps[i].size), n)
     flags = ntuple(i -> UInt32(mem_props.memory_heaps[i].flags), n)
     device_local = ntuple(i -> (flags[i] & UInt32(Vulkan.MEMORY_HEAP_DEVICE_LOCAL_BIT)) != 0, n)
@@ -364,9 +364,7 @@ function vk_alloc(bq::BatchQueue, nbytes::Integer;
     maybe_collect(bq.ctx::VkContext)
     result = try_vk_alloc(bq, nbytes; extra_usage, unified)
     result isa VkManagedBuffer && return result
-    GC.gc(true)
-    drain_deferred_frees!(bq)
-    drain_deferred_as_frees!(bq)
+    quiesce_before_reclaim!(bq)
     # Reclaim any pool blocks that are now fully empty after the GC drained
     # their chunks back to the free list.  Without this the pool ratchets
     # up across renders — see Crown 1400×1000 hw_accel=true repro where
@@ -384,6 +382,44 @@ function vk_alloc(bq::BatchQueue, nbytes::Integer;
     throw(LavaError("memory allocation",
         format_oom_error(bq.ctx::VkContext, fail),
         "Free unused LavaArrays, reduce problem size, or check for memory leaks with Lava.gpu_memory_usage()."))
+end
+
+"""
+    quiesce_before_reclaim!(bq)
+
+Submit and wait for everything on `bq`, then collect and drain deferred frees.
+
+The order is the point. `drain_deferred_frees!` releases a chunk once its
+**`last_write`** semaphore has signaled, which says nothing about dispatches
+that only *read* it, nor about commands already recorded into the batch still
+being built — and a graph evaluator does almost nothing else: every weight and
+every activation is read by the next layer without being written. Draining (or
+reclaiming a block those chunks belong to) while such a batch is open destroys a
+VkBuffer out from under queued work, and the damage surfaces later and
+elsewhere: `sync_access!: buffer is not ALIVE` on a subsequent submit, a
+batch-signal desync, or a segfault inside the driver's `vkCmdPipelineBarrier`.
+
+Flushing first makes the invariant unconditional — after it there is no
+recorded-but-unsubmitted work and everything submitted has completed — and it
+only runs once an allocation has already failed, so the stall is free in the
+steady state. `RECLAIMING` guards the re-entry through `flush!`'s own
+allocations.
+"""
+const RECLAIMING = Threads.Atomic{Bool}(false)
+
+function quiesce_before_reclaim!(bq::BatchQueue)
+    if !RECLAIMING[] && !device_lost(bq.ctx::VkContext)
+        RECLAIMING[] = true
+        try
+            flush!(bq, bq.device)
+        finally
+            RECLAIMING[] = false
+        end
+    end
+    GC.gc(true)
+    drain_deferred_frees!(bq)
+    drain_deferred_as_frees!(bq)
+    return nothing
 end
 
 """Attempt GPU buffer allocation, returning an `AllocFailure` on OOM."""
@@ -804,9 +840,7 @@ end
 function alloc_pool_block(bq::BatchQueue)
     buf_result = try_vk_alloc(bq, POOL_BLOCK_SIZE)
     if buf_result isa AllocFailure
-        GC.gc(true)
-        drain_deferred_frees!(bq)
-        drain_deferred_as_frees!(bq)
+        quiesce_before_reclaim!(bq)
         # Same fallback as vk_alloc: reclaim any pool blocks the GC just
         # emptied before deciding the OOM is real.
         n_blocks, bytes_freed = reclaim_empty_pool_blocks!(bq)
@@ -986,11 +1020,7 @@ Called from `vk_alloc` / `alloc_pool_block` only on the OOM retry path, so
 steady-state allocations don't pay the scan cost.  Not finalizer-safe —
 runs only on the main allocator path.
 
-Lifetime invariant relied on: `return_to_pool!` runs from
-`destroy_buffer!`'s post-timeline path, so a chunk reaches the free list
-only after its `last_write` semaphore has signaled.  Once `live_count == 0`,
-every chunk ever bumped from this block has signaled, so the block's
-underlying VkBuffer + VkDeviceMemory are GPU-quiesced and safe to destroy.
+Callers must have run `quiesce_before_reclaim!` first — see there for why.
 """
 function reclaim_empty_pool_blocks!(bq::BatchQueue)
     isempty(POOL_BLOCKS) && return (0, 0)
@@ -1231,7 +1261,7 @@ const INDIRECT_SLAB_SIZE = 256 * 1024
 
 function find_memory_type_optional(ctx::VkContext, type_bits::UInt32, required_flags)
     mem_props = ctx.memory_properties
-    for i in 0:(mem_props.memory_type_count - 1)
+    for i in 0:(length(mem_props.memory_types) - 1)
         if (type_bits & (UInt32(1) << i)) != 0
             mt = mem_props.memory_types[i + 1]
             if (mt.property_flags & required_flags) == required_flags
@@ -1245,7 +1275,7 @@ end
 function find_memory_type(ctx::VkContext, type_bits::UInt32, required_flags)
     mem_props = ctx.memory_properties
 
-    for i in 0:(mem_props.memory_type_count - 1)
+    for i in 0:(length(mem_props.memory_types) - 1)
         if (type_bits & (UInt32(1) << i)) != 0
             mt = mem_props.memory_types[i + 1]
             if (mt.property_flags & required_flags) == required_flags

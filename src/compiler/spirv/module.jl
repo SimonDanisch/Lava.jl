@@ -200,6 +200,14 @@ module Op
     # Geometry shader
     const OpEmitVertex              = UInt16(218)
     const OpEndPrimitive            = UInt16(219)
+    # SPV_KHR_cooperative_matrix — subgroup-scope matrix multiply-accumulate.
+    # The matrix is an opaque type whose value is distributed across the lanes of
+    # a subgroup; only these ops may produce or consume one.
+    const OpTypeCooperativeMatrixKHR                      = UInt16(4456)
+    const OpCooperativeMatrixLoadKHR                      = UInt16(4457)
+    const OpCooperativeMatrixStoreKHR                     = UInt16(4458)
+    const OpCooperativeMatrixMulAddKHR                    = UInt16(4459)
+    const OpCooperativeMatrixLengthKHR                    = UInt16(4460)
     # VK_KHR_ray_query opcodes (SPV_KHR_ray_query)
     const OpTypeRayQueryKHR                               = UInt16(4472)
     const OpRayQueryInitializeKHR                         = UInt16(4473)
@@ -292,6 +300,7 @@ module Cap
     const GroupNonUniformClustered      = UInt32(67)
     const GroupNonUniformQuad           = UInt32(68)
     const RayQueryKHR                   = UInt32(4472)
+    const CooperativeMatrixKHR          = UInt32(6022)
     # SER (SPV_NV_shader_invocation_reorder).  Value per the SPIR-V unified1
     # grammar (5383).  Earlier guesses (5288 / 5247) collided with
     # ComputeDerivativeGroupQuadsKHR and were invalid respectively.

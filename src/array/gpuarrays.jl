@@ -76,10 +76,170 @@ Base.Broadcast.BroadcastStyle(::Type{<:LavaArray{T,N}}) where {T,N} = LavaArrayS
 Base.Broadcast.BroadcastStyle(::LavaArrayStyle{N}, ::LinearAlgebra.StructuredMatrixStyle{T}) where {N,T} = LavaArrayStyle{N}()
 Base.Broadcast.BroadcastStyle(::LinearAlgebra.StructuredMatrixStyle{T}, ::LavaArrayStyle{N}) where {N,T} = LavaArrayStyle{N}()
 
-# Wrapped GPU arrays (Transpose, Adjoint, SubArray) should use LavaArrayStyle
+# Wrapped GPU arrays (Transpose, Adjoint, SubArray, PermutedDimsArray) should
+# use LavaArrayStyle. Without an entry here the wrapper falls back to
+# DefaultArrayStyle, which iterates and therefore hits the scalar-indexing
+# guard — so `PermutedDimsArray(a, perm) .+ 1` threw rather than running.
 Base.Broadcast.BroadcastStyle(::Type{<:LinearAlgebra.Transpose{T, <:LavaArray{T}}}) where T = LavaArrayStyle{2}()
 Base.Broadcast.BroadcastStyle(::Type{<:LinearAlgebra.Adjoint{T, <:LavaArray{T}}}) where T = LavaArrayStyle{2}()
 Base.Broadcast.BroadcastStyle(::Type{<:SubArray{T, N, <:LavaArray}}) where {T, N} = LavaArrayStyle{N}()
+Base.Broadcast.BroadcastStyle(::Type{<:PermutedDimsArray{T, N, <:Any, <:Any, <:LavaArray}}) where {T, N} = LavaArrayStyle{N}()
+
+# Wrappers compose: `reshape(PermutedDimsArray(a, perm), dims)` is a
+# ReshapedArray over a PermutedDimsArray over a LavaArray, and matching only on
+# a direct LavaArray parent leaves it on DefaultArrayStyle.
+const AnyLavaArray{T} = Union{LavaArray{T},
+                              SubArray{T, <:Any, <:LavaArray},
+                              PermutedDimsArray{T, <:Any, <:Any, <:Any, <:LavaArray},
+                              Base.ReshapedArray{T, <:Any, <:LavaArray},
+                              LinearAlgebra.Transpose{T, <:LavaArray},
+                              LinearAlgebra.Adjoint{T, <:LavaArray}}
+Base.Broadcast.BroadcastStyle(::Type{<:Base.ReshapedArray{T, N, <:AnyLavaArray}}) where {T, N} = LavaArrayStyle{N}()
+
+# ── broadcast: always launch over a flat index space ──
+#
+# GPUArrays' `_copyto!` launches with `ndrange = size(dest)`, so an N-D
+# destination gets an N-D index space and KernelAbstractions partitions it into
+# N-D workgroups — at which point consecutive lanes no longer walk consecutive
+# memory. The cost is not subtle. `D .= A .+ B` over 16.7M Float16:
+#
+#   dest 1-D          315 GB/s     (CUDA.jl: 325)
+#   dest (512,512,64)  54 GB/s     (CUDA.jl: 204)
+#
+# Same kernel, same data, same card — only the launch geometry differs. CUDA.jl
+# never sees this because it overrides broadcast with its own flat grid-stride
+# loop rather than going through the KA path.
+#
+# So: flatten the range, and recover the Cartesian index inside the kernel when
+# the broadcast genuinely needs one. That div/mod chain is far cheaper than
+# losing coalescing. This is the single largest thing in Lava for anything
+# elementwise — `add`, `relu`, `sigmoid`, `_to_copy`, `cat` and every kernel
+# epilogue in LavaDNN were all running at a quarter of the achievable bandwidth.
+@kernel function lava_broadcast_flat!(dest, bc, n)
+    I = @index(Global, Linear)
+    if I <= n
+        @inbounds dest[I] = bc[I]
+    end
+end
+
+# Narrowing the linear->Cartesian `divrem` to 32 bits here was tried and
+# reverted. It is the same trick that took `im2col_kernel!` (four divisions per
+# element) from 35.7 ms to 32.7 on a whole step, but handing these kernels a
+# `CartesianIndices` with `Int32` axes silently produced wrong results — a view
+# operand off by 252, a permuted operand off by 18 — and widening the recovered
+# index back to `Int` immediately afterwards did not fix it, so the fault is in
+# the narrowed `CartesianIndices` itself rather than in what `Broadcasted` does
+# with the index type. Worth revisiting with a hand-rolled 32-bit decomposition
+# instead of `CartesianIndices`, but not without these four cases as a test.
+"""
+Cartesian index for 0-based linear position `q`, given the extents as `Int32`.
+
+Hand-rolled rather than `CartesianIndices[...]`: the divisions happen in 32-bit,
+which NVIDIA has hardware for and 64-bit it does not, but the components are
+widened to `Int` as they are built. Handing a `CartesianIndices` with `Int32`
+axes to these kernels instead is *miscompiled* by Lava — see
+`test/test_int32_cartesian_miscompile.jl` — while this form is correct.
+
+The recursion is over the tuple's type, so it unrolls completely; SPIR-V's ban
+on recursive call graphs does not apply.
+"""
+@inline cart32(q::Int32, ::Tuple{}) = ()
+@inline function cart32(q::Int32, sz::Tuple{Int32,Vararg{Int32}})
+    s = first(sz)
+    (Int(q % s) + 1, cart32(q ÷ s, Base.tail(sz))...)
+end
+
+@kernel function lava_broadcast_flat_cartesian!(dest, bc, sz, n)
+    I = @index(Global, Linear)
+    if I <= n
+        J = CartesianIndex(cart32(Int32(I) - Int32(1), sz))
+        @inbounds dest[J] = bc[J]
+    end
+end
+
+"""Destination dense, source not: index `dest` linearly and only `bc` by index."""
+@kernel function lava_broadcast_flat_mixed!(dest, bc, sz, n)
+    I = @index(Global, Linear)
+    if I <= n
+        @inbounds dest[I] = bc[CartesianIndex(cart32(Int32(I) - Int32(1), sz))]
+    end
+end
+
+"""
+Can every operand be read with the destination's own linear index?
+
+`IndexStyle(::Broadcasted)` is too conservative for the case that dominates a
+DNN — every operand the same dense shape as the destination, no extrusion — and
+answering it directly is what gets those onto the linear kernel. Operands are
+inspected before `preprocess` wraps them in `Extruded`; the `Extruded` method is
+there for when one is passed anyway.
+"""
+flatok(dest, x) = true                                  # scalars, refs, functions
+flatok(dest, x::AbstractArray) =
+    size(x) == size(dest) && IndexStyle(x) === IndexLinear()
+flatok(dest, x::Broadcast.Extruded) = flatok(dest, x.x)
+flatok(dest, x::Broadcast.Broadcasted) = all(a -> flatok(dest, a), x.args)
+
+"""
+Rebuild a broadcast tree over 1-D reshapes of its operands.
+
+Launching over a flat range is not enough on its own: `getindex(::Broadcasted,
+::Integer)` on an N-D tree is defined as `bc[CartesianIndices(bc)[i]]`, so the
+div/mod chain comes back per element even inside a linear kernel. Reshaping the
+leaves to vectors makes the tree genuinely 1-D and the index arithmetic
+disappears. Only valid when every leaf already has the destination's shape,
+which is what `flatok` establishes.
+"""
+flat1(x) = x
+flat1(x::AbstractArray) = reshape(x, length(x))
+flat1(bc::Broadcast.Broadcasted) = Broadcast.broadcasted(bc.f, map(flat1, bc.args)...)
+
+function GPUArrays._copyto!(dest::AnyLavaArray, bc::Broadcast.Broadcasted)
+    axes(dest) == axes(bc) || Broadcast.throwdm(axes(dest), axes(bc))
+    isempty(dest) && return dest
+    n = length(dest)
+    backend = LavaBackend()
+    if ndims(dest) > 1 && IndexStyle(dest) === IndexLinear() && flatok(dest, bc)
+        flat = Broadcast.instantiate(flat1(bc))
+        d1 = reshape(dest, n)
+        lava_broadcast_flat!(backend)(d1, Broadcast.preprocess(d1, flat), n; ndrange = n)
+        return dest
+    end
+    linear = ndims(dest) == 1
+    bc = Broadcast.preprocess(dest, bc)
+    # Extents as `Int32` for `cart32`; anything Lava can address fits.
+    sz = map(Int32, size(dest))
+    if linear
+        lava_broadcast_flat!(backend)(dest, bc, n; ndrange = n)
+    elseif IndexStyle(dest) === IndexLinear()
+        lava_broadcast_flat_mixed!(backend)(dest, bc, sz, n; ndrange = n)
+    else
+        lava_broadcast_flat_cartesian!(backend)(dest, bc, sz, n; ndrange = n)
+    end
+    return dest
+end
+
+# GPUArrays implements `repeat` for `AnyGPUArray` (host/base.jl `repeat_inner`
+# / `repeat_outer`), but `AnyGPUArray` only recognises a *single* layer of
+# wrapping, so a `ReshapedArray{PermutedDimsArray{LavaArray}}` misses it and
+# falls back to `Base._RepeatInnerOuter.repeat_outer`, which indexes
+# elementwise and trips the scalar-indexing guard. Detaching the wrapper first
+# gets it back onto the device kernels; `repeat` allocates its output anyway, so
+# the copy costs nothing that was not already being paid.
+const NestedLavaWrapper = Union{
+    Base.ReshapedArray{<:Any, <:Any, <:Union{SubArray{<:Any, <:Any, <:LavaArray},
+                                             PermutedDimsArray{<:Any, <:Any, <:Any, <:Any, <:LavaArray}}},
+    SubArray{<:Any, <:Any, <:Union{Base.ReshapedArray{<:Any, <:Any, <:LavaArray},
+                                   PermutedDimsArray{<:Any, <:Any, <:Any, <:Any, <:LavaArray}}},
+    PermutedDimsArray{<:Any, <:Any, <:Any, <:Any, <:Union{Base.ReshapedArray{<:Any, <:Any, <:LavaArray},
+                                                          SubArray{<:Any, <:Any, <:LavaArray}}},
+}
+
+function Base.repeat(x::NestedLavaWrapper; inner=nothing, outer=nothing)
+    dense = similar(x)
+    dense .= x
+    repeat(dense; inner, outer)
+end
 
 # Allocate broadcast output
 function Base.similar(bc::Base.Broadcast.Broadcasted{LavaArrayStyle{N}}, ::Type{T}, dims) where {T,N}
@@ -129,7 +289,10 @@ function Base.copyto!(dest::LavaArray{T}, doffs::Integer,
     bq = (dest.buf[].ctx::VkContext).default_bq
     cmd_copy_buffer!(bq, src.buf[], dest.buf[], nbytes;
                      src_off=src_offset, dst_off=dst_offset)
-    flush!(bq, bq.device)
+    # No flush: this is device→device, so nothing on the host needs the result.
+    # `cmd_copy_buffer!` records the transfer-write→shader-read barrier itself,
+    # which is all the ordering a later dispatch in this batch needs. The flush
+    # that used to be here drained the whole GPU on every `copy(::LavaArray)`.
     return dest
 end
 

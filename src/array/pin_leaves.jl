@@ -45,6 +45,57 @@ end
     Expr(:block, exprs..., :(nothing))
 end
 
+# ── Address ranges, for barrier elision ──
+#
+# Same walk, different leaf action: collect the device address range each
+# `LavaArray` occupies. Two dispatches whose ranges are pairwise disjoint cannot
+# alias, so no memory barrier is needed between them — regardless of which side
+# reads and which writes, which is what makes this sound without any read/write
+# annotation on kernel arguments.
+#
+# Walking the *pre-adapt* arguments is what makes it complete: that is the same
+# tree `pin_leaves!` walks, so every buffer the kernel can reach through a BDA is
+# accounted for, including `LavaArray`s nested inside wrapper structs.
+
+"""
+    range_leaves!(dst::Vector{UInt64}, x) -> nothing
+
+Append `lo, hi` device-address pairs for every `LavaArray` leaf inside `x`.
+"""
+function range_leaves! end
+
+@inline function range_leaves!(dst::Vector{UInt64}, a::LavaArray)
+    lo = bda_address(a)
+    push!(dst, lo)
+    push!(dst, lo + UInt64(sizeof(eltype(a)) * length(a)))
+    nothing
+end
+
+@generated function range_leaves!(dst::Vector{UInt64}, x::Tuple)
+    exprs = Expr[:(range_leaves!(dst, x[$i])) for i in 1:fieldcount(x)]
+    Expr(:block, exprs..., :(nothing))
+end
+
+@generated function range_leaves!(dst::Vector{UInt64}, x::NamedTuple)
+    exprs = Expr[:(range_leaves!(dst, x[$i])) for i in 1:fieldcount(x)]
+    Expr(:block, exprs..., :(nothing))
+end
+
+@generated function range_leaves!(dst::Vector{UInt64}, x::T) where T
+    isbitstype(T) && return :(nothing)
+    T <: Ptr               && return :(nothing)
+    T <: Type              && return :(nothing)
+    T === Nothing          && return :(nothing)
+    T <: Symbol            && return :(nothing)
+    T <: AbstractChar      && return :(nothing)
+    T <: AbstractString    && return :(nothing)
+    T <: Module            && return :(nothing)
+    n = fieldcount(T)
+    n == 0 && return :(nothing)
+    exprs = Expr[:(range_leaves!(dst, getfield(x, $i))) for i in 1:n]
+    Expr(:block, exprs..., :(nothing))
+end
+
 # Generic struct walker. One @generated method covers every `x::T` that isn't
 # already caught by a more-specific signature above (LavaArray / Tuple /
 # NamedTuple).  Handles the short-circuit cases (isbits, Ptr, Type, …) at

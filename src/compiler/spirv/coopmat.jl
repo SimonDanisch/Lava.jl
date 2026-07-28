@@ -1,0 +1,166 @@
+# SPV_KHR_cooperative_matrix emission.
+#
+# The front end (`device/coopmat_intrinsics.jl`) emits calls named
+# `_lava_coopmat_<op>_<dtype>_<M>x<N>_<use>` returning an `i32` handle. A
+# cooperative matrix is an SSA value in SPIR-V just as it is in LLVM, so the two
+# graphs line up: the handle's LLVM value is simply mapped to the
+# `OpCooperativeMatrix*` result id via `state.value_map`, and no
+# `OpVariable`, slot table or store/reload is needed anywhere.
+#
+# The shape travels in the function name because a cooperative matrix type is
+# built from literal constants -- component type, rows, columns, use -- and none
+# of those can be a runtime operand.
+
+"""`Use` operand of OpTypeCooperativeMatrixKHR."""
+module CoopMatUse
+const MatrixA           = UInt32(0)
+const MatrixB           = UInt32(1)
+const MatrixAccumulator = UInt32(2)
+end
+
+"""`MemoryLayout` operand of OpCooperativeMatrix{Load,Store}KHR."""
+module CoopMatLayout
+const RowMajor    = UInt32(0)
+const ColumnMajor = UInt32(1)
+end
+
+const COOPMAT_SCOPE_SUBGROUP = UInt32(3)
+
+"""
+    parse_coopmat_name(fn_name) -> (op, T, M, N, use) | nothing
+
+Invert `coopmat_intrinsic_name`. Returns `nothing` for names that are not
+cooperative-matrix intrinsics.
+"""
+function parse_coopmat_name(fn_name::AbstractString)
+    startswith(fn_name, "_lava_coopmat_") || return nothing
+    parts = split(fn_name, '_')
+    # ["", "lava", "coopmat", op, dtype, "MxN", use]
+    length(parts) >= 7 || return nothing
+    op = parts[4]
+    dtype = parts[5]
+    dims = split(parts[6], 'x')
+    length(dims) == 2 || return nothing
+    M = parse(Int, dims[1])
+    N = parse(Int, dims[2])
+    use = parts[7] == "a" ? CoopMatUse.MatrixA :
+          parts[7] == "b" ? CoopMatUse.MatrixB : CoopMatUse.MatrixAccumulator
+    (op, dtype, M, N, use)
+end
+
+"""Component type id for the dtype suffix used in the intrinsic name."""
+function coopmat_component_type!(state::SPIRVEmitterState, dtype::AbstractString)
+    mod = state.mod
+    dtype == "f16" && return emit_type_float!(mod, UInt32(16))
+    dtype == "f32" && return emit_type_float!(mod, UInt32(32))
+    dtype == "f64" && return emit_type_float!(mod, UInt32(64))
+    dtype == "i8" && return emit_type_int!(mod, UInt32(8), UInt32(1))
+    dtype == "u8" && return emit_type_int!(mod, UInt32(8), UInt32(0))
+    dtype == "i32" && return emit_type_int!(mod, UInt32(32), UInt32(1))
+    dtype == "u32" && return emit_type_int!(mod, UInt32(32), UInt32(0))
+    error("unsupported cooperative-matrix component type: $dtype")
+end
+
+"""
+    emit_coopmat_type!(state, dtype, M, N, use) -> UInt32
+
+`OpTypeCooperativeMatrixKHR`, deduplicated per module. Declares the capability
+and extension on first use. Scope is always Subgroup — the only scope Vulkan
+exposes, and the one every driver-reported shape carries.
+"""
+function emit_coopmat_type!(state::SPIRVEmitterState, dtype::AbstractString,
+                            M::Integer, N::Integer, use::UInt32)
+    key = (dtype, Int(M), Int(N), use)
+    cached = get(state.coopmat_type_ids, key, nothing)
+    cached === nothing || return cached
+
+    mod = state.mod
+    require_capability!(mod, Cap.CooperativeMatrixKHR)
+    require_extension!(mod, "SPV_KHR_cooperative_matrix")
+
+    comp_ty = coopmat_component_type!(state, dtype)
+    # Scope/Rows/Columns/Use are <id>s of constants, not literals.
+    scope_id = emit_constant_u32!(mod, COOPMAT_SCOPE_SUBGROUP)
+    rows_id = emit_constant_u32!(mod, UInt32(M))
+    cols_id = emit_constant_u32!(mod, UInt32(N))
+    use_id = emit_constant_u32!(mod, use)
+
+    id = fresh_id!(mod)
+    encode_instruction!(mod.types_constants, Op.OpTypeCooperativeMatrixKHR, id,
+                        comp_ty, scope_id, rows_id, cols_id, use_id)
+    state.coopmat_type_ids[key] = id
+    return id
+end
+
+"""
+Pointer to the tile's first element, in the PhysicalStorageBuffer class the
+device arrays already use. The front end hands us the byte address as an i64.
+"""
+function coopmat_base_pointer!(state::SPIRVEmitterState, addr_val::LLVM.Value,
+                               comp_ty::UInt32)
+    mod = state.mod
+    addr_id = get_value_id!(state, addr_val)
+    ptr_ty = fresh_id!(mod)
+    encode_instruction!(mod.types_constants, Op.OpTypePointer, ptr_ty,
+                        SC.PhysicalStorageBuffer, comp_ty)
+    ptr_id = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpConvertUToPtr, ptr_ty, ptr_id, addr_id)
+    return ptr_id
+end
+
+"""
+    emit_coopmat_call!(state, inst, fn_name) -> nothing
+
+Lower one `_lava_coopmat_*` call. Dispatched from `emit_call!`.
+"""
+function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
+                            fn_name::AbstractString)
+    parsed = parse_coopmat_name(fn_name)
+    parsed === nothing && error("not a cooperative-matrix intrinsic: $fn_name")
+    op, dtype, M, N, use = parsed
+
+    mod = state.mod
+    mat_ty = emit_coopmat_type!(state, dtype, M, N, use)
+    args = LLVM.operands(inst)
+
+    if op == "load"
+        comp_ty = coopmat_component_type!(state, dtype)
+        ptr_id = coopmat_base_pointer!(state, args[1], comp_ty)
+        stride_id = get_value_id!(state, args[2])
+            layout_id = emit_constant_u32!(mod, CoopMatLayout.ColumnMajor)
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpCooperativeMatrixLoadKHR,
+                            mat_ty, id, ptr_id, layout_id, stride_id)
+        state.value_map[inst] = id
+        state.coopmat_value_types[inst] = mat_ty
+
+    elseif op == "store"
+        comp_ty = coopmat_component_type!(state, dtype)
+        ptr_id = coopmat_base_pointer!(state, args[1], comp_ty)
+        stride_id = get_value_id!(state, args[2])
+        obj_id = get_value_id!(state, args[3])
+            layout_id = emit_constant_u32!(mod, CoopMatLayout.ColumnMajor)
+        encode_instruction!(mod.functions, Op.OpCooperativeMatrixStoreKHR,
+                            ptr_id, obj_id, layout_id, stride_id)
+
+    elseif op == "zero"
+        id = fresh_id!(mod)
+        encode_instruction!(mod.types_constants, Op.OpConstantNull, mat_ty, id)
+        state.value_map[inst] = id
+        state.coopmat_value_types[inst] = mat_ty
+
+    elseif op == "muladd"
+        a_id = get_value_id!(state, args[1])
+        b_id = get_value_id!(state, args[2])
+        c_id = get_value_id!(state, args[3])
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpCooperativeMatrixMulAddKHR,
+                            mat_ty, id, a_id, b_id, c_id)
+        state.value_map[inst] = id
+        state.coopmat_value_types[inst] = mat_ty
+
+    else
+        error("unknown cooperative-matrix op: $op")
+    end
+    return nothing
+end

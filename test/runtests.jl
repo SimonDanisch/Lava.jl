@@ -141,6 +141,7 @@ end
             include(joinpath(@__DIR__, "test_loop_unswitch_miscompile.jl"))
             include(joinpath(@__DIR__, "test_psb_chain_fold.jl"))
             include(joinpath(@__DIR__, "test_repeat_inner_3d.jl"))
+            include(joinpath(@__DIR__, "test_multiindex_getindex.jl"))
         end
     end
 

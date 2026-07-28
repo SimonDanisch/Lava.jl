@@ -191,6 +191,47 @@ end
 @lava_device_override @inline Base.atan(y::Float64, x::Float64) = Float64(atan(Float32(y), Float32(x)))
 @lava_device_override @inline Base.:(^)(x::Float64, y::Float64) = Float64(Float32(x) ^ Float32(y))
 
+# ══════════════════════════════════════════════════════════════════════
+# Tier 3b: Float16 transcendentals — same downcast as Float64
+#
+# Without these, `exp(::Float16)` and friends fall through to Julia's generic
+# implementations, which index lookup tables (`Base.Math.J_TABLE`). Those become
+# Private-storage global arrays and the helper that reads them takes a pointer
+# parameter the emitter types as PhysicalStorageBuffer, so spirv-val rejects the
+# module:
+#     OpFunctionCall Argument <id> '%_j_const_1's type does not match
+#     Function <id>'s parameter type
+# It is not an `exp` bug as such — every transcendental on Float16 hit it, which
+# meant NO fp16 autocast kernel using sigmoid/exp/tanh could compile at all.
+#
+# GLSL.std.450 does define these for 16-bit floats, so a native half path is
+# possible later; going through Float32 costs nothing in accuracy here since
+# Float16 has 11 mantissa bits.
+# ══════════════════════════════════════════════════════════════════════
+
+@lava_device_override @inline Base.sin(x::Float16)   = Float16(sin(Float32(x)))
+@lava_device_override @inline Base.cos(x::Float16)   = Float16(cos(Float32(x)))
+@lava_device_override @inline Base.tan(x::Float16)   = Float16(tan(Float32(x)))
+@lava_device_override @inline Base.exp(x::Float16)   = Float16(exp(Float32(x)))
+@lava_device_override @inline Base.exp2(x::Float16)  = Float16(exp2(Float32(x)))
+@lava_device_override @inline Base.log(x::Float16)   = Float16(log(Float32(x)))
+@lava_device_override @inline Base.log2(x::Float16)  = Float16(log2(Float32(x)))
+@lava_device_override @inline Base.log10(x::Float16) = Float16(log10(Float32(x)))
+@lava_device_override @inline Base.asin(x::Float16)  = Float16(asin(Float32(x)))
+@lava_device_override @inline Base.acos(x::Float16)  = Float16(acos(Float32(x)))
+@lava_device_override @inline Base.atan(x::Float16)  = Float16(atan(Float32(x)))
+@lava_device_override @inline Base.sinh(x::Float16)  = Float16(sinh(Float32(x)))
+@lava_device_override @inline Base.cosh(x::Float16)  = Float16(cosh(Float32(x)))
+@lava_device_override @inline Base.tanh(x::Float16)  = Float16(tanh(Float32(x)))
+@lava_device_override @inline Base.asinh(x::Float16) = Float16(asinh(Float32(x)))
+@lava_device_override @inline Base.acosh(x::Float16) = Float16(acosh(Float32(x)))
+@lava_device_override @inline Base.atanh(x::Float16) = Float16(atanh(Float32(x)))
+@lava_device_override @inline Base.sqrt(x::Float16)  = Float16(sqrt(Float32(x)))
+@lava_device_override @inline Base.atan(y::Float16, x::Float16) = Float16(atan(Float32(y), Float32(x)))
+@lava_device_override @inline Base.:(^)(x::Float16, y::Float16) = Float16(Float32(x) ^ Float32(y))
+@lava_device_override @inline Base.sincos(x::Float16) = (sin(x), cos(x))
+@lava_device_override @inline Base.clamp(x::Float16, lo::Float16, hi::Float16) = min(max(x, lo), hi)
+
 # sincos — composition
 @lava_device_override @inline Base.sincos(x::Float32) = (sin(x), cos(x))
 @lava_device_override @inline Base.sincos(x::Float64) = (sin(x), cos(x))

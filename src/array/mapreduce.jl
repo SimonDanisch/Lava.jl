@@ -139,8 +139,13 @@ function mapreducedim_ak!(f::F, op::OP, R::LavaArray{T}, A;
         R_host = T[convert(T, result)]
         copyto!(R, 1, R_host, 1, 1)
     else
-        # Partial reduction (dims=N) — determine which dim is being reduced
-        A_arr = A isa LavaArray ? A : convert(LavaArray, collect(A))
+        # Partial reduction (dims=N) — determine which dim is being reduced.
+        # AK.mapreduce needs a dense array, so wrappers (views, PermutedDimsArray,
+        # ...) get materialised — on the *device*, via broadcast. This used to be
+        # `convert(LavaArray, collect(A))`, i.e. a blocking download to the host
+        # followed by a re-upload; `sum(view(x, ...); dims=)` alone was 21% of a
+        # LavaDNN inference step.
+        A_arr = A isa LavaArray ? A : densify(A)
         rdim = find_reduced_dim(size(A_arr), size(R))
         if rdim !== nothing
             # AK.mapreduce with dims= expects temp to have same ndims as input

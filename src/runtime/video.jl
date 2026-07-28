@@ -273,10 +273,10 @@ dfp(w,n)=Vk.function_pointer(w.dev,n)
 rp(x)=Base.unsafe_convert(Ptr{eltype(x)},x); pc(x)=Ptr{Cvoid}(rp(x))
 function memtype(w,bits,want)
     mp=w.ctx.memory_properties
-    for i in 0:(Int(mp.memory_type_count)-1)
+    for i in 0:(Int(length(mp.memory_types))-1)
         (bits&(UInt32(1)<<i))!=0 && (UInt32(mp.memory_types[i+1].property_flags)&UInt32(want))==UInt32(want) && return i
     end
-    for i in 0:(Int(mp.memory_type_count)-1); (bits&(UInt32(1)<<i))!=0 && return i; end
+    for i in 0:(Int(length(mp.memory_types))-1); (bits&(UInt32(1)<<i))!=0 && return i; end
     error("no memory type")
 end
 

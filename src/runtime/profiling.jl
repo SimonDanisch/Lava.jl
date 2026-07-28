@@ -368,6 +368,29 @@ function maybe_write_dispatch_end_timestamp!(cb::VK.CommandBuffer, start_slot::I
     start_slot < 0 && return
     pool = TIMESTAMP_POOL[]
     pool === nothing && return
+    # The barrier this comment has always described was missing from the code.
+    # Without it, consecutive dispatches overlap and each measured interval spans
+    # this dispatch *plus* whatever is still in flight ahead of it, so summing the
+    # records double-counts: the totals came out larger than the wall-clock time of
+    # the very block being measured (73.7 ms of "GPU time" for a 45 ms block), and
+    # varied 26 -> 74 ms between runs as barrier patterns shifted.
+    #
+    # An execution-only barrier (no memory barrier) makes the end timestamp fire
+    # after this dispatch's workgroups retire. That serialises dispatches while
+    # timing is on, which is the point: per-kernel attribution needs them
+    # serialised, and the overlap you give up is not attributable to any one
+    # kernel anyway. Timing runs are therefore slower than production runs — use
+    # them for the breakdown, not for the step rate.
+    if CMD_PIPELINE_BARRIER_FPTR[] != C_NULL
+        ccall(CMD_PIPELINE_BARRIER_FPTR[], Cvoid,
+              (Ptr{Nothing}, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
+               UInt32, Ptr{VkMemoryBarrier}, UInt32, Ptr{Nothing}, UInt32, Ptr{Nothing}),
+              cb.vks,
+              VkPipelineStageFlags(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
+              VkPipelineStageFlags(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
+              VkDependencyFlags(0),
+              UInt32(0), C_NULL, UInt32(0), C_NULL, UInt32(0), C_NULL)
+    end
     VK.cmd_write_timestamp(cb, VK.PIPELINE_STAGE_COMPUTE_SHADER_BIT, pool, UInt32(start_slot + 1))
     return nothing
 end

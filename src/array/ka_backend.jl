@@ -208,7 +208,28 @@ KA.argconvert(::KA.Kernel{LavaBackend}, x) = x
 # at compile + dispatch.  This keeps the SW/HW swap a single-arg change at
 # the call site — Hikari's `Raycore.closest_hit(accel, ray)` polymorphism
 # falls through unchanged.
-@inline find_tlas_in_args(args::Tuple) = _find_tlas(args, nothing)
+#
+# Whether an argument *can* carry a TLAS is a property of its type, so the scan
+# is resolved at compile time: a compute kernel — every kernel in a DNN or
+# broadcast workload — gets `nothing` and no code at all. The recursive
+# `Base.tail` walk it replaces did not fold away on the long argument tuples KA
+# produces (kernel args plus a `CompilerMetadata` plus a `Val` per static
+# parameter), and showed up as the second-largest host cost in the MatAnyone
+# inference loop, on kernels that have no TLAS and never could.
+#
+# Later arguments win, matching the accumulate-forward order of the walk.
+@generated function find_tlas_in_args(args::Tuple)
+    ts = fieldtypes(args)
+    all(isconcretetype, ts) || return :(_find_tlas(args, nothing))
+    expr = :(nothing)
+    for (i, T) in enumerate(ts)
+        hasfield(T, :hwtlas) || continue
+        expr = :(let h = getfield(args[$i], :hwtlas)
+                     h === nothing ? $expr : h
+                 end)
+    end
+    expr
+end
 @inline _find_tlas(::Tuple{}, acc) = acc
 @inline _find_tlas(args::Tuple, acc) = _find_tlas(Base.tail(args), _maybe_tlas(first(args), acc))
 # `HWAdaptedAccel` is declared in raytracing/hwtlas.jl (loaded after this file);
@@ -255,6 +276,92 @@ function get_or_build_iter_plan(obj::KA.Kernel{LavaBackend}, ndrange, workgroups
     return new_plan
 end
 
+"""
+    BARRIER_ELISION[] :: Bool
+
+Drop the barrier in front of a dispatch whose buffers are disjoint from every
+buffer touched since the last barrier.
+
+Sound without read/write annotations: disjoint memory cannot alias, so it does
+not matter which side reads and which writes. Unsound only if a kernel reaches
+device memory that is not in its argument tree — Lava kernels address memory
+through `LavaDeviceArray` BDAs derived from exactly that tree.
+
+Off by default because the check is O(ranges since last barrier) *per dispatch*,
+which is real host cost. It is meant to be turned on around `Lava.capture`: the
+analysis is then paid once and every `replay!` gets the shorter command buffer
+for free. On the MatAnyone step barriers are 3.35 ms of an 11.07 ms replay.
+"""
+const BARRIER_ELISION = Ref{Bool}(false)
+
+# Flat [lo₁,hi₁,lo₂,hi₂,…] of everything touched since the last barrier, and a
+# scratch list for the dispatch being recorded. Reused, never reallocated.
+const TOUCHED_RANGES = UInt64[]
+const DISPATCH_RANGES = UInt64[]
+
+push!(RESET_CALLBACKS, function()
+    empty!(TOUCHED_RANGES)
+    empty!(DISPATCH_RANGES)
+end)
+
+"""Reset the elision state — call whenever the queue is known to be drained."""
+@inline reset_barrier_elision!() = (empty!(TOUCHED_RANGES); nothing)
+
+"""
+    poison_barrier_elision!()
+
+Record that something touched memory we cannot enumerate, so nothing may be
+elided until a barrier clears it.
+
+Only the KA launch path knows a dispatch's buffers. Everything else that records
+into the same command buffer — `cmd_copy_buffer!`, `lava_launch!` used directly
+by Lava's own internals, indirect prepares — writes memory this tracker never
+sees. Left alone that is not conservative but *wrong*: a later dispatch reading
+what a copy just wrote finds no overlap in the tracker and drops the barrier it
+needed. It cost 0.024 of alpha on the MatAnyone step, which is the sort of small
+plausible error a race gives you.
+
+Modelled as one range covering the whole address space: every subsequent
+dispatch overlaps it, takes its barrier, and clears it — no special cases.
+"""
+@inline function poison_barrier_elision!()
+    empty!(TOUCHED_RANGES)
+    push!(TOUCHED_RANGES, UInt64(0))
+    push!(TOUCHED_RANGES, typemax(UInt64))
+    nothing
+end
+
+"""Set by the KA launch path for the dispatch it is about to record."""
+const RANGES_DECLARED = Ref{Bool}(false)
+
+"""
+True when `new` overlaps anything in `TOUCHED_RANGES`. On overlap the caller
+emits a barrier and `TOUCHED_RANGES` restarts from `new`; otherwise `new` is
+merged in and the barrier is skipped.
+"""
+function barrier_needed!(new::Vector{UInt64})
+    hit = false
+    @inbounds for i in 1:2:length(new)
+        lo, hi = new[i], new[i+1]
+        for j in 1:2:length(TOUCHED_RANGES)
+            if lo < TOUCHED_RANGES[j+1] && TOUCHED_RANGES[j] < hi
+                hit = true
+                break
+            end
+        end
+        hit && break
+    end
+    # The set only clears when a barrier fires, so a long run of elided
+    # dispatches would make this scan quadratic. Past the cap, force a barrier
+    # and start over — conservative, so it can only cost performance.
+    if hit || length(TOUCHED_RANGES) > 512
+        empty!(TOUCHED_RANGES)
+        hit = true
+    end
+    append!(TOUCHED_RANGES, new)
+    hit
+end
+
 function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=nothing)
     validate_launch_args(args)
     bq = obj.backend.bq
@@ -291,6 +398,16 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     # code).  `Adapt.adapt` below is now pure — it only strips.
     pin_leaves!(batch, obj.f)
     pin_leaves!(batch, args)
+    # Same tree the pins just walked, so every buffer this dispatch can reach is
+    # covered. Decided here rather than in `record_dispatch!` because this is the
+    # last point that still has the pre-adapt arguments.
+    if BARRIER_ELISION[]
+        empty!(DISPATCH_RANGES)
+        range_leaves!(DISPATCH_RANGES, obj.f)
+        range_leaves!(DISPATCH_RANGES, args)
+        NEXT_SKIP_BARRIER[] = !barrier_needed!(DISPATCH_RANGES)
+        RANGES_DECLARED[] = true
+    end
     adaptor = LavaAdaptor(batch)
     converted_f = Adapt.adapt(adaptor, obj.f)
     converted_args = map(a -> Adapt.adapt(adaptor, a), args)
@@ -375,43 +492,97 @@ Internal launch function for KA kernels. Compiles and dispatches the GPU functio
 """
 const DBG_LAUNCH_COUNT = Ref(0)
 
+"""
+Everything a dispatch needs that depends only on the *types* of its arguments.
+
+`ka_launch!` used to rebuild `Tuple{map(arg_sigtype, tail(all_args))...}` on
+every single dispatch and hand it to `GPUCompiler.methodinstance`: that interns
+a fresh `Type` object, does a method lookup, and then two hash lookups keyed on
+that type and a freshly built compiler config — all to rediscover a pipeline it
+had already compiled. Types hash and compare slowly, and at ~2000 dispatches per
+MatAnyone inference step this was the largest single host cost in the loop.
+
+`typeof(all_args)` is available for free and types are interned, so an `IdDict`
+keyed on it is a pointer hash. Everything downstream — pipeline, arg layout,
+buffer size — is a function of exactly that, so it is all cached together.
+
+The world counter is stored with the entry and checked on each hit. It moves on
+any method definition, so redefining a kernel (Revise, or a first-time
+specialisation) drops back to the slow path for one call and re-caches; a stale
+pipeline can never be served.
+"""
+struct LaunchPlan
+    compiled::LavaGPUKernel
+    pipeline::LavaComputePipeline
+    offsets::Vector{Int}
+    byval_sizes::Vector{Int}
+    arg_buffer_size::Int
+    total_size::Int
+    world::UInt64
+    wg::NTuple{3,Int}
+    ray_query::Bool
+end
+
+const LAUNCH_PLAN_CACHE = IdDict{DataType,Vector{LaunchPlan}}()
+push!(RESET_CALLBACKS, () -> empty!(LAUNCH_PLAN_CACHE))
+
+@inline function launch_plan(bq::BatchQueue, @nospecialize(f), all_args::Tuple,
+                             wg::NTuple{3,Int}, ray_query::Bool)
+    key = typeof(all_args)
+    world = Base.get_world_counter()
+    v = get(LAUNCH_PLAN_CACHE, key, nothing)
+    if v !== nothing
+        for p in v
+            (p.world === world && p.wg === wg && p.ray_query === ray_query) && return p
+        end
+    end
+    build_launch_plan!(bq, f, all_args, wg, ray_query, key, world)
+end
+
+@noinline function build_launch_plan!(bq::BatchQueue, @nospecialize(f), all_args::Tuple,
+                                      wg::NTuple{3,Int}, ray_query::Bool,
+                                      key::DataType, world::UInt64)
+    # Excludes f — GPUCompiler prepends typeof(f). all_args are already
+    # post-adapt (LavaDeviceArray, not Ptr{T}).
+    tt = Tuple{map(arg_sigtype, Base.tail(all_args))...}
+    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(
+        bq.ctx::VkContext, f, tt, wg; enable_ray_query=ray_query)
+    base = compiled.push_info.arg_buffer_size
+    p = LaunchPlan(compiled, pipeline, offsets, byval_sizes, base,
+                   base + compute_inline_extra_from_byval(byval_sizes),
+                   world, wg, ray_query)
+    v = get!(() -> LaunchPlan[], LAUNCH_PLAN_CACHE, key)
+    filter!(q -> q.world === world, v)   # entries from a superseded world are dead
+    push!(v, p)
+    p
+end
+
 function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple,
                     block_dims::NTuple{3,Int}, workgroup_size::NTuple{3,Int},
                     tlas=nothing)  # positional, Nothing default — hot path
     DBG_LAUNCH_COUNT[] += 1
-    _n = DBG_LAUNCH_COUNT[]
-    # Build type tuple for compilation (excludes f — GPUCompiler prepends typeof(f)).
-    # all_args are already post-adapt (LavaDeviceArray, not Ptr{T}).
-    tt = Tuple{map(arg_sigtype, Base.tail(all_args))...}
 
-    # Compile + pipeline + offsets (cached, single lookup).  When `tlas` was
-    # auto-discovered from kernel args (e.g. an HWAdaptedAccel was passed),
-    # enable ray_query so the SPIR-V emitter binds the TLAS descriptor and
-    # accepts OpRayQueryInitializeKHR / Proceed / Get*KHR.
-    enable_ray_query = tlas !== nothing
-    compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(
-        bq.ctx::VkContext, f, tt, workgroup_size; enable_ray_query)
-
-    # Compute total size: base layout + inline struct data
-    inline_extra = compute_inline_extra_from_byval(byval_sizes)
-    total_size = compiled.push_info.arg_buffer_size + inline_extra
+    # When `tlas` was auto-discovered from kernel args (e.g. an HWAdaptedAccel
+    # was passed), enable ray_query so the SPIR-V emitter binds the TLAS
+    # descriptor and accepts OpRayQueryInitializeKHR / Proceed / Get*KHR.
+    plan = launch_plan(bq, f, all_args, workgroup_size, tlas !== nothing)
 
     # Get host-visible mapped arg buffer (per-BQ slab pool)
-    arg_buf = get_arg_buffer(bq, total_size)
+    arg_buf = get_arg_buffer(bq, plan.total_size)
 
     # The KA.Kernel entry point already ran `Adapt.adapt(LavaAdaptor(batch), ..)`
     # on each original arg, which both pinned every LavaArray (and nested
     # LavaArrays in wrapper structs) AND stripped them to LavaDeviceArray.
     # Here `all_args` is post-adapt, so pack sees no further pinnable leaves.
     ensure_active_batch!(bq)
-    pack_args_direct!(bq, arg_buf.mapped_ptr, arg_buf.address, offsets,
-                       compiled.push_info.arg_buffer_size, byval_sizes, all_args)
+    pack_args_direct!(bq, arg_buf.mapped_ptr, arg_buf.address, plan.offsets,
+                       plan.arg_buffer_size, plan.byval_sizes, all_args)
 
     # Dispatch with N-D block grid (preserves KA's block dimensions)
     if DISPATCH_LOGGING_ENABLED[]
         LAST_DISPATCH_INFO[] = "ka f=$(dispatch_name(f, all_args)) groups=$block_dims"
     end
-    vk_dispatch!(bq, pipeline, arg_buf.address, block_dims, tlas)
+    vk_dispatch!(bq, plan.pipeline, arg_buf.address, block_dims, tlas)
 
     return nothing
 end
@@ -638,6 +809,31 @@ end
     return v
 end
 
+# Multi-index `a[i, j, k, …]` must route through the same Horner `linear_index`
+# as the CartesianIndex path above. Without these, Base's generic fallback
+# (`_to_linear_index` → `_sub2ind`) builds precisely the naive nested-product
+# expansion documented below, and the NVIDIA shader compiler miscompiles it into
+# an out-of-bounds PhysicalStorageBuffer offset.
+#
+# It only misfires once the indices are *computed* rather than literal, so it
+# hides from simple tests: `a[1,2,2,1]` constant-folds and is fine, while
+# `a[is[1], is[2], 2, 1]` with `is` from a delinearised loop index reads garbage.
+# That is how it reached GPUArrays' `vectorized_getindex` (host/indexing.jl:84),
+# silently truncating every strided `a[:, :, 2:2, :]`.
+@lava_device_override @inline function Base.getindex(a::LavaDeviceArray{T,N},
+                                                     i1::Integer, i2::Integer,
+                                                     Ir::Vararg{Integer}) where {T,N}
+    @inbounds unsafe_load(a.ptr, linear_index(a.dims, CartesianIndex(i1, i2, Ir...)))
+end
+
+@lava_device_override @inline function Base.setindex!(a::LavaDeviceArray{T,N}, v,
+                                                      i1::Integer, i2::Integer,
+                                                      Ir::Vararg{Integer}) where {T,N}
+    @inbounds unsafe_store!(a.ptr, convert(T, v),
+                            linear_index(a.dims, CartesianIndex(i1, i2, Ir...)))
+    return v
+end
+
 # Convert CartesianIndex to linear index for LavaDeviceArray
 @inline function linear_index(dims::NTuple{1,Int}, I::CartesianIndex{1})
     I[1]
@@ -832,6 +1028,11 @@ end
 
 # ── @private: per-thread scratch memory via stack-allocated MArray ──
 
+# Identical to CUDA.jl's own definition (CUDAKernels.jl:205). `@private` was
+# once suspected of being ~8x slower here than plain locals; that was a
+# measurement-order artifact — whichever kernel is timed first pays a one-time
+# cost. Interleaved, the two are the same speed, and post-SROA IR is identical
+# (66 instructions, 11 loads, 1 store, 5 phis in both). Nothing to fix here.
 @lava_device_override @inline function KA.Scratchpad(ctx, ::Type{T}, ::Val{Dims}) where {T, Dims}
     StaticArrays.MArray{KA.__size(Dims), T}(undef)
 end

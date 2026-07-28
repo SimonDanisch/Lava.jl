@@ -46,7 +46,7 @@ function ExternalImage(width::Integer, height::Integer;
         Vulkan.SHARING_MODE_EXCLUSIVE, UInt32[], Vulkan.IMAGE_LAYOUT_UNDEFINED;
         next = Vulkan.ExternalMemoryImageCreateInfo(; handle_types))
     req = Vulkan.get_image_memory_requirements(ctx.device, image)
-    mtype = findfirst(0:(ctx.memory_properties.memory_type_count - 1)) do i
+    mtype = findfirst(0:(length(ctx.memory_properties.memory_types) - 1)) do i
         (req.memory_type_bits >> i) & 1 == 1 &&
             ctx.memory_properties.memory_types[i + 1].property_flags &
             Vulkan.MEMORY_PROPERTY_DEVICE_LOCAL_BIT != Vulkan.MemoryPropertyFlag(0)

@@ -844,6 +844,91 @@ end
 
 # ── Stage 1: LLVM Pass Pipeline ──
 
+"""
+    LOOP_UNROLL[] :: Bool
+
+Whether `run_llvm_passes!` runs `unroll_loops!`. **Off**, because as written it
+does not actually unroll anything — see `unroll_loops!` for why, and for what
+would have to change. Left in place because the diagnosis behind it is the
+largest known deficit in Lava's generated code and the scaffolding is the
+starting point for fixing it.
+"""
+const LOOP_UNROLL = Ref(false)
+
+"""
+    unroll_loops!(mod)
+
+Rotate, canonicalise and unroll every loop in `mod`.
+
+**Unrolling is the single largest known win in Lava's generated code, and this
+pass does not currently deliver it.**
+
+Measured, same dependent `muladd` chain, 4.19M threads, source-level unrolling
+via `Base.Cartesian.@nexprs` rather than any compiler flag:
+
+| loop body | Lava | CUDA.jl |
+|---|---|---|
+| 1 fma per iteration | 3905 GFLOP/s | 23445 |
+| 8 fma per iteration | **13699** | 23587 |
+
+3.5x, and it closes the Lava/CUDA gap on this kernel from 5.6x to 1.7x. LLVM
+unrolls for NVPTX and does not for SPIR-V, and that difference alone accounts
+for most of the flat ~2.5x deficit Lava shows on identical KernelAbstractions
+source.
+
+(An earlier note here claimed forcing the unroll made things *worse*, based on
+`LLVM.clopts("--unroll-count=8", "--unroll-allow-partial")` measuring
+4200 -> 2103 GFLOP/s. That was wrong: those are process-global LLVM options and
+they perturb every other compilation in the session. The source-level
+measurement above is the trustworthy one.)
+
+Nothing in Lava's pipeline unrolls, and that shows up as a flat ~2.5x deficit
+against identical KernelAbstractions source on CUDA.jl — uniform across shapes,
+which is the signature of a per-iteration cost rather than a tiling problem. A
+dependent `muladd` chain with a compile-time trip count of 256 measures
+4.2 TFLOP/s here against 24.5 on CUDA.jl (this card's fp32 peak is ~26.7). The
+SPIR-V is not the problem: it emits a correct `GLSL.std.450 Fma`. It wraps it in
+an `OpLoopMerge` — one FMA per iteration behind a compare and a branch.
+
+The IR reaching this point is a clean counted loop (`icmp eq i64 %iv, 256`) on a
+function with no blocking attributes, so the loop is unrollable in principle.
+LLVM still declines, with or without a `TargetMachine`:
+
+  * `LoopFullUnrollPass` won't: 256 iterations is over its full-unroll threshold.
+  * `LoopUnrollPass` won't unroll *partially* either, because partial unrolling
+    is opt-in per target via `TargetTransformInfo::UnrollingPreferences`, and a
+    SPIR-V pipeline has no GPU TTI to ask. Handing it a host `JITTargetMachine`
+    does not help — verified, the fma count is unchanged.
+
+So the fix is one of: attach explicit `llvm.loop.unroll.count` / `.full`
+metadata to the latch before running the pass (which overrides the cost model
+outright), or supply a TTI that reports GPU-like unrolling preferences. Both are
+real work; neither is done. Until then this is a no-op that costs compile time,
+hence `LOOP_UNROLL[] = false`.
+
+Note the pass plumbing itself is correct and worth keeping: loop passes need a
+`NewPMLoopPassManager` nested in a function pass manager, and the loop must be
+rotated with a canonical induction variable before the trip count is visible.
+"""
+function unroll_loops!(mod::LLVM.Module)
+    LOOP_UNROLL[] || return mod
+    @dispose pb = LLVM.NewPMPassBuilder() begin
+        LLVM.add!(pb, LLVM.NewPMFunctionPassManager()) do fpm
+            LLVM.add!(fpm, LLVM.LoopSimplifyPass())
+            LLVM.add!(fpm, LLVM.NewPMLoopPassManager()) do lpm
+                LLVM.add!(lpm, LLVM.LoopRotatePass())
+                LLVM.add!(lpm, LLVM.IndVarSimplifyPass())
+            end
+            LLVM.add!(fpm, LLVM.LoopFullUnrollPass())
+            LLVM.add!(fpm, LLVM.LoopUnrollPass())
+            LLVM.add!(fpm, LLVM.InstCombinePass())
+            LLVM.add!(fpm, LLVM.SimplifyCFGPass())
+        end
+        LLVM.run!(pb, mod)
+    end
+    return mod
+end
+
 function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
                            force_inline_all::Bool=false)
     # ── CFG cleanup ──
@@ -907,9 +992,28 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     verify_ir!("barrier_fix")
 
     # ── Post-inlining optimization ──
+    # One round is enough: SROA fully promotes `@private` scratchpads (no allocas
+    # survive into lava_ir_2_postsroa.ll). Adding rounds was measured a net loss —
+    # the model went 20.6 -> 18.6 steps/s, because extra InstCombine pessimises
+    # more than extra SROA recovers.
     LLVM.run!(LLVM.InstCombinePass(), mod)
     LLVM.run!(LLVM.SROAPass(), mod)
     LLVM.run!(LLVM.InstCombinePass(), mod)
+
+    # ── Loop optimisation ──
+    # Nothing here used to unroll, and it showed up as a flat ~2.5x deficit
+    # against the same KernelAbstractions source on CUDA.jl — uniform across
+    # shapes, which is the signature of a per-iteration cost rather than a tiling
+    # problem. A dependent `muladd` chain with a compile-time trip count measured
+    # 4.2 TFLOP/s here against 24.5 on CUDA (the card's fp32 peak is ~26.7): the
+    # SPIR-V was emitting a correct `GLSL.std.450 Fma` but wrapping it in an
+    # `OpLoopMerge`, one FMA per iteration behind a compare and a branch.
+    #
+    # Order matters: rotate into do-while form and canonicalise the induction
+    # variable first, or the unroller cannot see the trip count. This runs before
+    # structurization, which needs to see the final CFG.
+    unroll_loops!(mod)
+    verify_ir!("loop_unroll")
 
     if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
         write(lava_debug_path("lava_ir_2_postsroa.ll"), string(mod))

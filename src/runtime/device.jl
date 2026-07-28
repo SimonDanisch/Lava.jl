@@ -235,6 +235,14 @@ mutable struct VkContext
     # capability and the raygen can use `lava_rt_hit_object_*` /
     # `lava_rt_reorder_thread_*` intrinsics.  NVIDIA-only.
     ser_available::Bool
+    # Whether VK_KHR_cooperative_matrix is enabled: subgroup-scope matrix
+    # multiply-accumulate (tensor cores). `coopmat_shapes` holds the driver's
+    # legal (M, N, K, A/B type, C/result type, saturating) combinations -- the
+    # hardware only implements a fixed set, so a kernel must pick one of these
+    # rather than any tile size it likes. Empty when unsupported.
+    coopmat_available::Bool
+    coopmat_shapes::Vector{NamedTuple{(:M, :N, :K, :ab_type, :c_type, :scope),
+                                      Tuple{Int, Int, Int, UInt32, UInt32, UInt32}}}
     # Whether VK_EXT_memory_budget is enabled. When true, OOM error reporting
     # queries the driver's real per-heap budget vs usage via
     # VkPhysicalDeviceMemoryBudgetPropertiesEXT.
@@ -282,6 +290,8 @@ mutable struct VkContext
                        as_scratch_align::UInt64,
                        ray_query_available::Bool=false,
                        ser_available::Bool=false,
+                       coopmat_available::Bool=false,
+                       coopmat_shapes=nothing,
                        memory_budget_available::Bool=false,
                        external_memory_available::Bool=false,
                        gpu_assisted::Bool=false,
@@ -308,6 +318,9 @@ mutable struct VkContext
         ctx.as_scratch_align = as_scratch_align
         ctx.ray_query_available = ray_query_available
         ctx.ser_available = ser_available
+        ctx.coopmat_available = coopmat_available
+        ctx.coopmat_shapes = coopmat_shapes === nothing ?
+            eltype(fieldtype(VkContext, :coopmat_shapes))[] : coopmat_shapes
         ctx.memory_budget_available = memory_budget_available
         ctx.external_memory_available = external_memory_available
         ctx.video_decode_available = video_decode_available
@@ -628,6 +641,12 @@ function init_vulkan!()
     # VK_EXT_memory_budget — lets us read VkPhysicalDeviceMemoryBudgetPropertiesEXT
     # for real heap utilisation, used in OOM error reporting.
     has_memory_budget = has_extension(phys_dev, "VK_EXT_memory_budget")
+    # Cooperative matrix — subgroup-scope matrix multiply-accumulate (tensor
+    # cores). Probed once here; kernels pick a coopmat or a scalar
+    # instantiation from `ctx.coopmat_available` / `ctx.coopmat_shapes`.
+    #
+    # Uses the portable VK_KHR_cooperative_matrix.
+    has_coopmat = has_extension(phys_dev, "VK_KHR_cooperative_matrix")
 
     # Device extensions
     extensions = String[
@@ -662,6 +681,9 @@ function init_vulkan!()
     end
     if has_memory_budget
         push!(extensions, "VK_EXT_memory_budget")
+    end
+    if has_coopmat
+        push!(extensions, "VK_KHR_cooperative_matrix")
     end
     # External-memory export (opaque fds for GL/other-API interop). Enabling
     # the extension has no effect until an ExternalImage is created.
@@ -839,6 +861,14 @@ function init_vulkan!()
         )
         feature_chain = ser_features
     end
+    if has_coopmat
+        cm_features = Vulkan.PhysicalDeviceCooperativeMatrixFeaturesKHR(
+            true,   # cooperative_matrix
+            false;  # cooperative_matrix_robust_buffer_access
+            next=feature_chain
+        )
+        feature_chain = cm_features
+    end
 
     # Enable shader int64, float64, geometry/tessellation shaders, wide lines
     core_features = Vulkan.PhysicalDeviceFeatures(
@@ -917,6 +947,22 @@ function init_vulkan!()
     # VkContext's inner constructor builds its own default_bq via `new()`-
     # based two-phase init.  Pass the raw primary queue and all other ctx
     # fields; the ctor wires BatchQueue(device, queue, qfi, ctx) internally.
+    # The hardware implements a fixed set of (M, N, K, dtype) tiles; a kernel
+    # must choose one of these, it cannot pick an arbitrary tile size.
+    CMShape = eltype(fieldtype(VkContext, :coopmat_shapes))
+    coopmat_shapes = CMShape[]
+    if has_coopmat
+        try
+            for p in unwrap(Vulkan.get_physical_device_cooperative_matrix_properties_khr(phys_dev))
+                push!(coopmat_shapes, (M=Int(p.m_size), N=Int(p.n_size), K=Int(p.k_size),
+                                       ab_type=UInt32(p.a_type), c_type=UInt32(p.c_type),
+                                       scope=UInt32(p.scope)))
+            end
+        catch err
+            @debug "cooperative-matrix property query failed; treating as unsupported" err
+        end
+    end
+
     ctx = VkContext(
         instance, phys_dev, device, qf_idx, dev_name,
         queue, compute_queue,
@@ -928,6 +974,8 @@ function init_vulkan!()
         as_scratch_align,
         has_ray_query,
         has_ser,
+        has_coopmat,
+        coopmat_shapes,
         has_memory_budget,
         has_external_memory,
         gpu_assisted,

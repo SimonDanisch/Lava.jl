@@ -549,9 +549,31 @@ function get_arg_buffer(bq::BatchQueue, nbytes::Integer)
     )
 end
 
+"""
+Slabs a captured sequence still points at, per queue: `reset_arg_buffer_pool!`
+must not hand them out again.
+
+A dispatch's arguments live in an arg slab and the slab address is baked into
+the command buffer as a push constant, so a replayed command buffer reads
+whatever those bytes hold at replay time. The bump allocator normally rewinds to
+slab 1 offset 0 once the queue drains, which would let the next recording
+overwrite exactly those bytes — the replay would then dispatch a live pipeline
+against another kernel's arguments. Capturing reserves the slabs it filled.
+"""
+const RESERVED_ARG_SLABS = IdDict{BatchQueue,Int}()
+push!(RESET_CALLBACKS, () -> empty!(RESERVED_ARG_SLABS))
+
+"""Move the bump allocator past everything recorded so far and keep it there."""
+function reserve_arg_slabs!(bq::BatchQueue)
+    RESERVED_ARG_SLABS[bq] = max(get(RESERVED_ARG_SLABS, bq, 0), bq.arg_slab_idx)
+    bq.arg_slab_idx = RESERVED_ARG_SLABS[bq] + 1
+    bq.arg_slab_offset = 0
+    return
+end
+
 """Reset arg buffer slab allocator for `bq` after its in_flight batches drained."""
 function reset_arg_buffer_pool!(bq::BatchQueue)
-    bq.arg_slab_idx = 1
+    bq.arg_slab_idx = get(RESERVED_ARG_SLABS, bq, 0) + 1
     bq.arg_slab_offset = 0
     bq.arg_alloc_count = 0
 end

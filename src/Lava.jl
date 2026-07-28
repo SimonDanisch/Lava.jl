@@ -1,6 +1,8 @@
 module Lava
 
 export LavaArray, LavaBackend, LavaDeviceArray, alloc_index_buffer
+export AcceleratedMatrix, MatrixA, MatrixB, Accumulator, CoopMat, Scalar
+export matriximpl
 export BatchQueue
 export CompilationResult, lava_compile, optimize_spirv
 # Debugging & diagnostics
@@ -116,6 +118,7 @@ include("compiler/compilation.jl")
 #   sourcemap.jl, intrinsics.jl, control_flow.jl, decorations.jl, compute.jl
 include("compiler/spirv/raytracing.jl")    # RT stages, OpTraceRayKHR, payload handling
 include("compiler/spirv/rayquery.jl")     # VK_KHR_ray_query capabilities + emission
+include("compiler/spirv/coopmat.jl")      # SPV_KHR_cooperative_matrix emission
 include("compiler/spirv/graphics.jl")     # Graphics stages, I/O variables, emit_vertex
 
 # ---- Device functions ----
@@ -139,6 +142,8 @@ include("runtime/intrinsics.jl")
 include("array/lavaarray.jl")
 include("device/atomics.jl")  # needs LavaDeviceArray from lavaarray.jl
 include("device/subgroup.jl") # subgroup / group-non-uniform intrinsics
+include("device/acceleratedmatrix.jl")     # AcceleratedMatrix: the user-facing type
+include("device/coopmat_intrinsics.jl")    # its llvmcall stubs
 include("array/pin_leaves.jl") # @generated walker that pins LavaArray leaves per batch
 
 # ---- Launch API (depends on LavaArray / LavaDeviceArray) ----
@@ -151,6 +156,7 @@ include("runtime/pipeline_cache.jl")
 # ---- KernelAbstractions backend ----
 include("array/ka_backend.jl")
 include("array/gpuarrays.jl")
+include("array/gemm.jl")       # mul! for LavaArray — needs AnyLavaArray from gpuarrays.jl
 include("array/mapreduce.jl")
 
 # ---- Debug / validation API (needs LavaArray + KA backend) ----

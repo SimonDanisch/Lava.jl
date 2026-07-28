@@ -57,6 +57,22 @@ end
     return nothing
 end
 
+# ── PermutedDimsArray constructor ──
+# `@Const(A)` runs `constify` -> `Adapt.adapt_structure` *inside* the kernel, and
+# Adapt rebuilds the wrapper through this inner constructor. Its three validity
+# checks all report failure with an interpolated string, so `string`/`error` get
+# compiled into the kernel and GPUCompiler rejects the call to
+# `ijl_pchar_to_string`. `perm`/`iperm` are type parameters that were already
+# validated when the array was built on the host, so re-checking them per thread
+# buys nothing. Same shape as CUDA.jl's StepRangeLen quirk: `@eval` + `Expr(:new)`,
+# because `new` is only callable from inside the type's own definition.
+@eval begin
+    @lava_device_override function Base.PermutedDimsArray{T,N,perm,iperm,AA}(
+            data::AA) where {T,N,perm,iperm,AA<:AbstractArray}
+        $(Expr(:new, :(Base.PermutedDimsArray{T,N,perm,iperm,AA}), :data))
+    end
+end
+
 # ── CartesianIndices indexing ──
 # CartesianIndices{N}[Int] for N>1 calls _ind2sub which has throw paths.
 # Override to avoid the dynamic dispatch.
