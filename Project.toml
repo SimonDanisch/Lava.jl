@@ -38,7 +38,13 @@ Raycore = {url = "https://github.com/JuliaGeometry/Raycore.jl", rev = "master"}
 # from 6.2.1 on, so pinning Lava to 1 is what would make the two unsatisfiable in
 # one project — the reverse of what an earlier note here claimed.
 GPUCompiler = "1, 2"
-SPIRV_LLVM_Backend_jll = "21.1.4"
+
+# Only the test suite touches this jll: test/spirv_test_utils.jl runs `llc` as a
+# reference oracle against our own emitter. Nothing in src/ uses it, so the
+# emitted SPIR-V is unaffected by the backend version. 22 is allowed so OpenCL
+# (which requires 22 from 0.10.10 on) can coexist here — that is what unblocks
+# GPUCompiler 2, since no registered OpenCL allows GPUCompiler 2.
+SPIRV_LLVM_Backend_jll = "21.1.4, 22"
 StaticArrays = "1.9.17"
 julia = "1.12"
 
