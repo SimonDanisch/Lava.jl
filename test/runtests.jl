@@ -206,6 +206,10 @@ end
             include(joinpath(@__DIR__, "test_hwtlas_uaf_safety.jl"))
         end
 
+        @testset "pinned buffer lifetime" begin
+            include(joinpath(@__DIR__, "test_pinned_buffer_lifetime.jl"))
+        end
+
         @testset "HW TLAS — nonblocking sync!" begin
             include(joinpath(@__DIR__, "test_hwtlas_nonblocking_sync.jl"))
         end

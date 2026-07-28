@@ -179,9 +179,16 @@ end
 @inline pin!(batch::CommandBatch, a::LavaArray) = begin
     a in batch.pinned && return
     push!(batch.pinned, a)
-    # Retain an independent DataRef so the batch survives an explicit
-    # `unsafe_free!(a)` between record and submit — see `CommandBatch.pinned_refs`.
-    push!(batch.pinned_refs, copy(a.buf))
+    # Two claims, and both are needed:
+    #   * the retained DataRef keeps `ref[]` dereferenceable after an explicit
+    #     `unsafe_free!(a)` drops the array's own ref (see pinned_refs), and
+    #   * the buffer pin stops `vk_free!` from marking the VkManagedBuffer
+    #     DEFERRED/DEAD underneath us, which `sync_access!` asserts against.
+    # Without the pin the DataRef would stay readable but describe a buffer
+    # already queued for destruction.
+    ref = copy(a.buf)
+    push!(batch.pinned_refs, ref)
+    pin_buffer!(ref[])
     return nothing
 end
 

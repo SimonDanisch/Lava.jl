@@ -345,6 +345,10 @@ end
 # finally reach refcount zero and release its VkManagedBuffer.
 function release_pinned_refs!(batch::CommandBatch)
     for ref in batch.pinned_refs
+        # Drop the buffer pin first: this is the point where a free that was
+        # requested mid-batch actually happens, and it must happen while the
+        # DataRef is still valid so `ref[]` can name the buffer.
+        unpin_buffer!(ref[])
         GPUArrays.unsafe_free!(ref)
     end
     empty!(batch.pinned_refs)

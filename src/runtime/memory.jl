@@ -101,6 +101,20 @@ mutable struct VkManagedBuffer
     # Lifecycle state — see BUF_STATE_* constants above.  @atomic CAS is the
     # single point where double-free / use-after-free is ruled out.
     @atomic state::UInt8
+    # Number of live CommandBatches that have `pin!`ed an array backed by this
+    # buffer.  Incremented at pin time, decremented when the batch releases its
+    # pins (`release_pinned_refs!`, i.e. the batch completed or its submit
+    # failed).  A buffer with pins > 0 is REACHABLE BY A BATCH THAT CAN STILL
+    # SUBMIT, so `vk_free!` must not touch it — not even to mark it DEFERRED,
+    # because `sync_access!` asserts the buffer is ALIVE at submit.
+    #
+    # This is what makes the guarantee structural rather than a timing accident:
+    # `last_write` only tells us about work already *submitted*, so a buffer
+    # pinned into a still-open batch looks idle to the timeline check.
+    @atomic pins::Int
+    # A free was requested while pins > 0.  The free is not lost, just owed: the
+    # last `unpin_buffer!` performs it.
+    @atomic free_requested::Bool
     # Owning VkContext — so upload!/download!/vk_free! don't need the global.
     # Loose type because VkContext is declared in device.jl, included first.
     ctx::Any
@@ -497,7 +511,7 @@ function try_vk_alloc(bq::BatchQueue, nbytes::Integer;
     addr_info = Vulkan.BufferDeviceAddressInfo(buf)
     address = Vulkan.get_buffer_device_address(dev, addr_info)
 
-    result = VkManagedBuffer(buf, memory, address, mapped_ptr, Int(nbytes), 0, nothing, nothing, BUF_STATE_ALIVE, ctx)
+    result = VkManagedBuffer(buf, memory, address, mapped_ptr, Int(nbytes), 0, nothing, nothing, BUF_STATE_ALIVE, 0, false, ctx)
     push!(LIVE_BUFFERS, result)
     Threads.atomic_add!(GPU_LIVE_BYTES, nbytes)
     if ALLOC_DEBUG_ENABLED[]
@@ -506,6 +520,29 @@ function try_vk_alloc(bq::BatchQueue, nbytes::Integer;
                mtype=Int(mem_type_idx), unified=unified, usage=UInt32(usage)))
     end
     return result
+end
+
+# ── Pin accounting ──
+# A CommandBatch that has `pin!`ed an array holds a claim on the backing buffer
+# until the batch can no longer submit (it completed, or its submit failed).
+# `vk_free!` honours that claim instead of racing it, which makes "pinned by a
+# live batch" and "freed" mutually exclusive by construction rather than by
+# timing.
+function pin_buffer!(buf::VkManagedBuffer)
+    @atomic buf.pins += 1
+    return nothing
+end
+
+function unpin_buffer!(buf::VkManagedBuffer)
+    remaining = @atomic buf.pins -= 1
+    @assert remaining >= 0 "unpin_buffer!: pins went negative ($remaining) — pin!/release_pinned_refs! are unbalanced"
+    # Last batch let go, and a free was owed while we held it: pay it now, at a
+    # point where no batch can reference the buffer any more.
+    if remaining == 0
+        _, owed = @atomicreplace buf.free_requested true => false
+        owed && vk_free!(buf)
+    end
+    return nothing
 end
 
 """
@@ -519,6 +556,27 @@ finalizers freeing GPU memory that the in-flight command buffer still
 references via BDA addresses.
 """
 function vk_free!(buf::VkManagedBuffer)
+    # A live batch has this buffer pinned, so it can still be submitted with the
+    # buffer's BDA baked into an arg slab.  Do NOT touch `state` here: marking a
+    # pinned buffer DEFERRED is exactly what made `sync_access!` assert
+    # "buffer is not ALIVE (state=1)" at submit.  Record the debt; the last
+    # `unpin_buffer!` pays it.
+    #
+    # The timeline check further down cannot cover this case: it keys off
+    # `last_write`, which `sync_access!` only writes at submit, so a buffer
+    # pinned into a still-open batch reads as never-written and looks idle.
+    if (@atomic :acquire buf.pins) > 0
+        @atomic :release buf.free_requested = true
+        # The last unpin may have landed between those two lines and seen
+        # `free_requested` still false, in which case nobody owes the free.
+        # Claim it back and fall through; otherwise the unpin path owns it.
+        if (@atomic :acquire buf.pins) > 0
+            return
+        end
+        _, owed = @atomicreplace buf.free_requested true => false
+        owed || return
+    end
+
     # Atomic CAS ALIVE → DEFERRED (optimistic — we haven't yet decided we'll
     # defer; we just need to claim the buffer so no other thread races us).
     # If someone else already transitioned this buffer out of ALIVE, we bail
@@ -981,7 +1039,7 @@ function pool_alloc(bq::BatchQueue, nbytes::Integer; extra_usage::UInt32=UInt32(
                     block.base_address + UInt64(byte_offset),
                     Ptr{UInt8}(0),
                     alloc_size,
-                    byte_offset, block, nothing, BUF_STATE_ALIVE, ctx)
+                    byte_offset, block, nothing, BUF_STATE_ALIVE, 0, false, ctx)
             end
         end
         return nothing
@@ -1006,7 +1064,7 @@ function pool_alloc(bq::BatchQueue, nbytes::Integer; extra_usage::UInt32=UInt32(
         block.base_address + UInt64(byte_offset),
         Ptr{UInt8}(0),
         alloc_size,
-        byte_offset, block, nothing, BUF_STATE_ALIVE, ctx)
+        byte_offset, block, nothing, BUF_STATE_ALIVE, 0, false, ctx)
 end
 
 """
@@ -1141,7 +1199,7 @@ function get_staging(bq::BatchQueue, nbytes::Integer)
 
     managed = VkManagedBuffer(vkbuf, memory, UInt64(0),   # no BDA needed for staging
                               mapped_ptr, Int(alloc_size),
-                              0, nothing, nothing, BUF_STATE_ALIVE, ctx)
+                              0, nothing, nothing, BUF_STATE_ALIVE, 0, false, ctx)
     push!(LIVE_BUFFERS, managed)
     Threads.atomic_add!(GPU_LIVE_BYTES, managed.size)
     bq.staging = managed
