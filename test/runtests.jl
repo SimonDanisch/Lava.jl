@@ -210,6 +210,10 @@ end
             include(joinpath(@__DIR__, "test_pinned_buffer_lifetime.jl"))
         end
 
+        @testset "workgroup zero-init" begin
+            include(joinpath(@__DIR__, "test_workgroup_zero_init.jl"))
+        end
+
         @testset "HW TLAS — nonblocking sync!" begin
             include(joinpath(@__DIR__, "test_hwtlas_nonblocking_sync.jl"))
         end

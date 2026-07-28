@@ -240,21 +240,18 @@ function find_reduced_dim(szA, szR)
     return rdim
 end
 
-# ── Sort override ──
-# AK.merge_sort_by_key! uses shared memory that must be zero-initialized on
-# Vulkan (workgroup memory is undefined per spec). The block-level merge kernel
-# reads uninitialized positions when len < 2*block_size, producing wrong results.
-# Workaround: implement via sortperm + permute which uses correct kernels.
-function AK.merge_sort_by_key!(
-    keys::LavaArray, values::LavaArray, backend::LavaBackend=LavaBackend();
-    lt=isless, by=identity, rev::Union{Nothing, Bool}=nothing,
-    order::Base.Order.Ordering=Base.Order.Forward, kwargs...
-)
-    perm = AK.sortperm(keys, backend; lt, by, rev, order)
-    KA.synchronize(backend)
-    sorted_keys = keys[perm]
-    sorted_vals = values[perm]
-    copyto!(keys, sorted_keys)
-    copyto!(values, sorted_vals)
-    return keys, values
-end
+# ── Sort ──
+# There is deliberately no `AK.merge_sort_by_key!` override here.
+#
+# One used to exist, implementing sort-by-key as sortperm + permute, because
+# AK's block-level merge kernel reads shared-memory positions it never wrote
+# when `len < 2 * block_size`, and Vulkan leaves workgroup memory undefined.
+# That override was circular: AK implements `sortperm` *via* `merge_sort_by_key!`
+# (see AcceleratedKernels/src/sort/merge_sortperm.jl), so the two called each
+# other forever — a StackOverflowError, or 34 GB of pool growth and
+# ERROR_OUT_OF_DEVICE_MEMORY when the recursion allocated temporaries first.
+#
+# The real defect was the uninitialized shared memory, and that is now fixed at
+# the source: the Workgroup Block variable is emitted with an OpConstantNull
+# initializer (see `emit_workgroup_block!` in compiler/compilation.jl), so every
+# kernel starts with zeroed shared memory and AK's own implementation is correct.
