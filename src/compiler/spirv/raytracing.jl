@@ -110,6 +110,17 @@ function emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
     # Find entry function
     entry_fn = LLVM.functions(llvm_mod)[entry_name]
 
+    # Pre-allocate SPIR-V function IDs for every function with a body so that
+    # OpFunctionCall can forward-reference callees regardless of emission order.
+    # Enables multi-OpFunction emission when force_inline_all=false (no effect in
+    # the single-function case). Mirrors the compute emitter (emit_spirv_from_llvm).
+    for fn in LLVM.functions(llvm_mod)
+        isempty(LLVM.blocks(fn)) && continue
+        get!(state.value_map, fn) do
+            fresh_id!(spirv_mod)
+        end
+    end
+
     # Emit standard globals (push constants, builtins, constants)
     interface_ids = emit_globals!(state, llvm_mod)
 
@@ -148,7 +159,23 @@ function emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
     state.rt_payload_storage_class = stage_info.payload_sc
     state.rt_hit_attrib_var_id = hit_attrib_var_id
 
-    # Emit function
+    # Multi-OpFunction emission: walk the call graph from the entry and emit
+    # every reachable helper as its own OpFunction (so the fat per-material chit
+    # is many small functions instead of one giant inlined one — keeps compile
+    # time sane). Only non-empty when force_inline_all=false. Mirrors compute.
+    let reachable = collect_reachable_callees(entry_fn)
+        for scc in strongly_connected_components(reachable)
+            length(scc) > 1 && error("Mutual recursion is not supported in SPIR-V " *
+                "multi-OpFunction emission: cycle through " * join(LLVM.name.(scc), " -> "))
+        end
+        for fn in reachable
+            fn === entry_fn && continue
+            isempty(LLVM.blocks(fn)) && continue
+            emit_function!(state, fn; is_entry=false)
+        end
+    end
+
+    # Emit entry function
     fn_ty = LLVM.function_type(entry_fn)
     n_params = length(collect(LLVM.parameters(fn_ty)))
 

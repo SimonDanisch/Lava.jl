@@ -584,7 +584,13 @@ function combine_chained_geps!(mod::LLVM.Module)
         while changed
             changed = false
             for bb in LLVM.blocks(fn)
-                for inst in LLVM.instructions(bb)
+                # Snapshot the block: a combine erases the current GEP and its
+                # `base` (a dominating def — always already visited), so iterating
+                # a snapshot stays valid while we fold EVERY combinable GEP in one
+                # sweep. The old code `break`d after the first fold per block and
+                # let `while changed` rescan the whole function, which is O(n²) on
+                # a large shader (folds one GEP per full-function pass).
+                for inst in collect(LLVM.instructions(bb))
                     inst isa LLVM.GetElementPtrInst || continue
                     ops = LLVM.operands(inst)
                     length(ops) != 2 && continue  # Single-index outer GEP only
@@ -619,7 +625,6 @@ function combine_chained_geps!(mod::LLVM.Module)
                             LLVM.erase!(base)
                         end
                         changed = true
-                        break
                     else
                         # Case 2: outer is single-index, base is multi-index.
                         # Pattern: gep T, (gep Struct, ptr, 0, ..., i64 %arr_idx), i64 %offset
@@ -645,10 +650,8 @@ function combine_chained_geps!(mod::LLVM.Module)
                             LLVM.erase!(base)
                         end
                         changed = true
-                        break
                     end
                 end
-                changed && break
             end
         end
     end

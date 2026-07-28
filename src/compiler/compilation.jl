@@ -243,6 +243,31 @@ function dump_spirv_to_disk(spirv_bytes::Vector{UInt8},
 end
 
 """
+    lava_run(cmd; timeout=180.0, label="subprocess") -> Base.Process
+
+Spawn `cmd` and wait for it WITHOUT `wait(p)`. Once a Vulkan device is up, the
+GPU driver breaks Julia's libuv SIGCHLD reaping: an external process (spirv-opt,
+spirv-val, spirv-dis) exits and is reaped (no zombie), but the libuv exit
+notification is lost, so `wait`/`success`/`read(cmd)` block forever. Poll the
+already-updated `process_exited` state instead, with a hard timeout that kills a
+genuinely-stuck child. Always check `process_exited(p) && p.exitcode == 0`
+before trusting the result.
+"""
+function lava_run(cmd::Base.AbstractCmd; timeout::Float64=180.0,
+                  label::AbstractString="subprocess")
+    p = run(cmd; wait=false)
+    deadline = time() + timeout
+    while !process_exited(p) && time() < deadline
+        sleep(0.005)
+    end
+    if !process_exited(p)
+        @warn "Lava: $label did not report exit within $(round(Int, timeout))s — killing"
+        try kill(p) catch end
+    end
+    return p
+end
+
+"""
     run_spirv_opt(spirv_bytes::Vector{UInt8}) -> Vector{UInt8}
 
 Run spirv-opt on the SPIR-V binary to optimize it. Uses SPIRV_Tools_jll.
@@ -262,9 +287,9 @@ function run_spirv_opt(spirv_bytes::Vector{UInt8})
     out_path = tempname() * ".spv"
     try
         write(in_path, spirv_bytes)
-        p = run(pipeline(`$spirv_opt --target-env=vulkan1.3 -O $in_path -o $out_path`;
-                          stderr=devnull, stdout=devnull); wait=true)
-        if p.exitcode == 0 && isfile(out_path)
+        p = lava_run(pipeline(`$spirv_opt --target-env=vulkan1.3 -O $in_path -o $out_path`;
+                              stderr=devnull, stdout=devnull); label="spirv-opt")
+        if process_exited(p) && p.exitcode == 0 && isfile(out_path)
             return read(out_path)
         end
         @debug "Lava: spirv-opt non-zero exit; returning unoptimized SPIR-V" exitcode=p.exitcode
@@ -516,10 +541,12 @@ function optimize_spirv(spirv_bytes::Vector{UInt8}; passes::String="-O")
     out_path = tempname() * ".spv"
     try
         write(in_path, spirv_bytes)
-        run(`$spirv_opt --target-env=vulkan1.3 --scalar-block-layout $passes $in_path -o $out_path`)
+        po = lava_run(`$spirv_opt --target-env=vulkan1.3 --scalar-block-layout $passes $in_path -o $out_path`; label="spirv-opt")
+        (process_exited(po) && po.exitcode == 0) || error("spirv-opt failed (exit $(process_exited(po) ? po.exitcode : "timeout"))")
         optimized = read(out_path)
         # Validate optimized output
-        run(`$spirv_val_cmd --target-env vulkan1.3 --scalar-block-layout $out_path`)
+        pv = lava_run(`$spirv_val_cmd --target-env vulkan1.3 --scalar-block-layout $out_path`; label="spirv-val")
+        (process_exited(pv) && pv.exitcode == 0) || error("spirv-val failed on optimized SPIR-V")
         return optimized
     finally
         rm(in_path; force=true)
@@ -734,11 +761,13 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
 
     GPUCompiler.JuliaContext() do ctx
         local mod, meta
+        checkpoint = PhaseTimer("[phase] "; threshold=1.0)
         try
             mod, meta = GPUCompiler.compile(:llvm, job)
         catch e
             wrap_gpu_compiler_error(e, f, tt)
         end
+        checkpoint("GPUCompiler.compile(:llvm)")
         entry_fn = meta.entry
         entry_name = LLVM.name(entry_fn)
 
@@ -746,23 +775,33 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
         push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
         wrapper_name = push_info.wrapper_name
         wrapper_fn = LLVM.functions(mod)[wrapper_name]
+        checkpoint("wrap_entry_for_vulkan!")
 
-        # LLVM passes (RT emit doesn't have the multi-OpFunction walker yet;
-        # keep the old single-OpFunction behavior for now.)
-        run_llvm_passes!(mod, wrapper_fn; force_inline_all=true)
+        # LLVM passes. The RT emitter now has the multi-OpFunction walker, so
+        # keep callees as separate OpFunctions (force_inline_all=false): a fat
+        # per-material chit stays one architecture but compiles as many small
+        # functions instead of one giant inlined one (minutes -> seconds).
+        run_llvm_passes!(mod, wrapper_fn; force_inline_all=false)
+        checkpoint("run_llvm_passes!")
 
         ir = string(mod)
         write(lava_debug_path("lava_last_rt.ll"), ir)
+        # Own checkpoint: on a fat chit `string(mod)` is seconds by itself, and
+        # folding it into the emitter's number would point the finger at the
+        # wrong phase.
+        checkpoint("string(mod) + IR dump")
 
         # RT-specific SPIR-V emission
         spirv_bytes, source_map = emit_spirv_from_llvm_rt(mod, wrapper_name, stage;
                                                 payload_type=payload_type)
+        checkpoint("emit_spirv_from_llvm_rt")
 
         write(lava_debug_path("lava_last.spv"), spirv_bytes)
         dump_spirv_to_disk(spirv_bytes, ir, wrapper_name; entry_name)
 
         if validate
             validate_spirv(spirv_bytes, ir, source_map)
+            checkpoint("validate_spirv")
         end
 
         return LavaRTShader(spirv_bytes, stage, push_info, ir)
@@ -946,6 +985,8 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
         end
     end
 
+    checkpoint = PhaseTimer("    [pass] ")
+
     # Remove constructs that SPIR-V can't handle
     # Replace freeze before optimization: GPU kernel arguments are never undef,
     # so freeze is unnecessary. Removing it early lets LLVM produce simpler IR.
@@ -966,8 +1007,10 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # alwaysinline (throw/box wrappers) get inlined; other helpers survive
     # as their own functions and are emitted as separate OpFunctions.
     # Pass `force_inline_all=true` for the old single-OpFunction behavior.
+    checkpoint("pre_inline_cleanup")
     force_inline_all!(mod, entry_fn; force_inline_all)
     verify_ir!("force_inline")
+    checkpoint("force_inline_all!")
 
     if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
         write(lava_debug_path("lava_ir_1_postinline.ll"), string(mod))
@@ -982,6 +1025,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # emits the helpers as separate OpFunctions, keeping each one under the limit.
     outline_oversized!(mod; force_inline_all)
     verify_ir!("outline_oversized")
+    checkpoint("outline_oversized!")
 
     # ── Fix barrier-skipping error paths ──
     # replace_unreachable! (pre-inlining) converts error paths to early returns.
@@ -990,6 +1034,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # Redirect barrier-skipping paths to the barrier-containing continuation.
     fix_barrier_skipping_paths!(entry_fn)
     verify_ir!("barrier_fix")
+    checkpoint("fix_barrier_skipping_paths!")
 
     # ── Post-inlining optimization ──
     # One round is enough: SROA fully promotes `@private` scratchpads (no allocas
@@ -999,6 +1044,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     LLVM.run!(LLVM.InstCombinePass(), mod)
     LLVM.run!(LLVM.SROAPass(), mod)
     LLVM.run!(LLVM.InstCombinePass(), mod)
+    checkpoint("InstCombine+SROA+InstCombine")
 
     # ── Loop optimisation ──
     # Nothing here used to unroll, and it showed up as a flat ~2.5x deficit
@@ -1046,6 +1092,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # memcpy → typed loads/stores, lifetime markers → removed
     lower_unsupported_intrinsics!(mod)
     verify_ir!("lower_intrinsics")
+    checkpoint("addrspace+runtime+lower_intrinsics")
 
     # ── Fix GEPs with mismatched source types on allocas ──
     # After SROA + inlining, some GEPs reference the original full tuple type
@@ -1069,12 +1116,14 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     LLVM.run!(LLVM.InstCombinePass(), mod)
     lift_byte_geps_on_allocas!(mod)
     verify_ir!("lift_byte_geps")
+    checkpoint("fix_gep+flatten+lift_byte_geps x3")
 
     # ── Combine consecutive same-type GEPs ──
     # Patterns like `gep T, (gep T, p, i), j` → `gep T, p, add(i, j)`.
     # This avoids chained OpPtrAccessChain which some drivers handle incorrectly.
     combine_chained_geps!(mod)
     verify_ir!("combine_geps")
+    checkpoint("combine_chained_geps! #1")
 
     # ── Retype uniformly-typed Function allocas ──
     # Run BEFORE structurize_cfg, while the IR is still simple — structurize
@@ -1088,6 +1137,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
         write(lava_debug_path("lava_ir_2_post_retype.ll"), string(mod))
     end
     verify_ir!("retype_allocas")
+    checkpoint("retype_uniform_typed_allocas!")
 
     # ── Structured control flow ──
     # SPIR-V requires structured CF. Run the full structurize pipeline.
@@ -1099,6 +1149,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
         write(lava_debug_path("lava_ir_4_post_structurize.ll"), string(mod))
     end
     verify_ir!("structurize_cfg")
+    checkpoint("run_structurize_cfg_pipeline!")
 
     # ── Flatten nested workgroup array globals ──
     # Replace [32 x [2 x float]] → [64 x float] in addrspace(3).
@@ -1140,6 +1191,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # reads crossing struct field boundaries. Decompose into per-field loads + pack.
     decompose_typepun_gep_loads!(mod, dl)
     verify_ir!("decompose_typepun_gep")
+    checkpoint("workgroup+typepun decompose block")
 
     # Re-combine chained byte-offset GEPs that were left undecomposed above
     # (because the chain contains dynamic indices). E.g.:
@@ -1200,6 +1252,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # Critical for MVector{32,UInt32} stored as [16 x i64] in BVH stack traversal.
     lower_phi_typepunned_loads!(mod)
     verify_ir!("lower_phi_typepun")
+    checkpoint("combine#2..lower_phi_typepunned_loads!")
 
     # ── Lower phi/select of Function-storage pointers to value-level ──
     # SROA can't promote allocas whose addresses flow through `phi ptr` /
@@ -1214,6 +1267,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # backend SSA promoter altogether.
     lower_phi_select_function_ptrs!(mod)
     verify_ir!("lower_phi_select_func_ptrs")
+    checkpoint("lower_phi_select_function_ptrs!")
 
     # ── Lift byte-offset GEPs on workgroup globals ──
     # The decompose passes above may create byte-offset ConstantExpr GEPs like
@@ -1234,6 +1288,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # one more time to fix these.
     decompose_typepun_gep_loads!(mod, dl)
     verify_ir!("final")
+    checkpoint("final lift+decompose block")
 
     # ── Fix Workgroup (shared memory) load/store alignment ──
     # Julia/GPUCompiler emits `align 1` for all addrspace(3) accesses regardless of
@@ -1248,6 +1303,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # Walk the IR and propagate alignment using Julia ABI invariants (loaded i64
     # used via inttoptr is 8-aligned, GEPs preserve via gcd).
     propagate_psb_alignment!(mod, dl)
+    checkpoint("workgroup_align+propagate_psb_alignment!")
 
     return nothing
 end
@@ -2344,18 +2400,27 @@ function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
 
     # Validate — capture stderr via temp file (spirv-val writes errors to stderr)
     val_err_file = tempname()
-    p = run(pipeline(`$spirv_val --target-env vulkan1.3 --scalar-block-layout $spv_path`;
-                      stderr=val_err_file, stdout=devnull); wait=false)
-    wait(p)
+    # `lava_run` (not `wait(p)`): the wait condition can be lost once a Vulkan
+    # device is up. Fail open on timeout — Vulkan rejects invalid SPIR-V anyway.
+    p = lava_run(pipeline(`$spirv_val --target-env vulkan1.3 --scalar-block-layout $spv_path`;
+                          stderr=val_err_file, stdout=devnull); label="spirv-val")
+    if !process_exited(p)
+        rm(val_err_file; force=true)
+        return nothing
+    end
     val_errors = isfile(val_err_file) ? read(val_err_file, String) : ""
     rm(val_err_file; force=true)
     p.exitcode == 0 && return nothing
 
     # ── Validation failed — build a useful error message ──
 
-    # Disassemble and save
+    # Disassemble and save (spawn + poll, not the deadlock-prone read(cmd))
     dis = try
-        read(`$spirv_dis_cmd --no-color $spv_path`, String)
+        dis_out = tempname() * ".dis"
+        pd = lava_run(pipeline(`$spirv_dis_cmd --no-color $spv_path`; stdout=dis_out); label="spirv-dis")
+        txt = (process_exited(pd) && pd.exitcode == 0 && isfile(dis_out)) ? read(dis_out, String) : ""
+        rm(dis_out; force=true)
+        txt
     catch
         ""
     end
@@ -2497,11 +2562,15 @@ Disassemble SPIR-V binary to text for debugging.
 function disassemble_spirv(spirv_bytes::Vector{UInt8})
     spirv_dis = SPIRV_Tools_jll.spirv_dis()
     tmpfile = tempname() * ".spv"
+    out_path = tempname() * ".dis"
     try
         write(tmpfile, spirv_bytes)
-        return read(`$spirv_dis --no-color $tmpfile`, String)
+        # `read(cmd, String)` blocks on the deadlock-prone wait; spawn + poll.
+        p = lava_run(pipeline(`$spirv_dis --no-color $tmpfile`; stdout=out_path); label="spirv-dis")
+        return (process_exited(p) && p.exitcode == 0 && isfile(out_path)) ? read(out_path, String) : ""
     finally
         rm(tmpfile; force=true)
+        rm(out_path; force=true)
     end
 end
 

@@ -257,23 +257,24 @@ pre-StructurizeCFG fixup pass inserted:
 9. fixup_post_structurize! - insert trampolines for continue-target merge conflicts
 """
 function run_structurize_cfg_pipeline!(mod::LLVM.Module)
-    LLVM.run!(LLVM.SimplifyCFGPass(), mod)
-    fixup_structured_cfg!(mod)
-    LLVM.run!(LLVM.LowerSwitchPass(), mod)
-    LLVM.run!(LLVM.UnifyFunctionExitNodesPass(), mod)
-    LLVM.run!(LLVM.FixIrreduciblePass(), mod)
-    LLVM.run!(LLVM.LoopSimplifyPass(), mod)
-    LLVM.run!(LLVM.StructurizeCFGPass(), mod)
-    LLVM.run!(LLVM.InstCombinePass(), mod)
+    checkpoint = PhaseTimer("        [structurize] ")
+    LLVM.run!(LLVM.SimplifyCFGPass(), mod);            checkpoint("SimplifyCFG")
+    fixup_structured_cfg!(mod);                        checkpoint("fixup_structured_cfg!")
+    LLVM.run!(LLVM.LowerSwitchPass(), mod);            checkpoint("LowerSwitch")
+    LLVM.run!(LLVM.UnifyFunctionExitNodesPass(), mod); checkpoint("UnifyFunctionExitNodes")
+    LLVM.run!(LLVM.FixIrreduciblePass(), mod);         checkpoint("FixIrreducible")
+    LLVM.run!(LLVM.LoopSimplifyPass(), mod);           checkpoint("LoopSimplify")
+    LLVM.run!(LLVM.StructurizeCFGPass(), mod);         checkpoint("StructurizeCFG")
+    LLVM.run!(LLVM.InstCombinePass(), mod);            checkpoint("InstCombine")
     # Collapse duplicated loop-carried phis that StructurizeCFG introduces for
     # loops containing `continue`. See merge_equivalent_loop_phis! docstring.
-    merge_equivalent_loop_phis!(mod)
+    merge_equivalent_loop_phis!(mod);                  checkpoint("merge_equivalent_loop_phis!")
     # Replace `undef` scalar phi operands introduced by StructurizeCFG with
     # constant zeros so the SPIR-V emitter doesn't emit OpUndef — which RADV
     # interprets non-deterministically and causes guard phis to pick the wrong
     # branch. See replace_undef_phi_operands_with_constants! docstring.
-    replace_undef_phi_operands_with_constants!(mod)
-    fixup_post_structurize!(mod)
+    replace_undef_phi_operands_with_constants!(mod);   checkpoint("replace_undef_phi_operands!")
+    fixup_post_structurize!(mod);                      checkpoint("fixup_post_structurize!")
 end
 
 # Post-StructurizeCFG fixup: insert trampolines for SPIR-V continue-construct conflicts.

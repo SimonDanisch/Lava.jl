@@ -181,6 +181,12 @@ function disassemble_spirv(spirv_binary::AbstractVector{UInt8})
         write(io, spirv_binary)
         close(io)
         spirv_dis = SPIRV_Tools_jll.spirv_dis()
-        return read(`$spirv_dis --no-color $path`, String)
+        out = tempname() * ".dis"
+        # `read(cmd, String)` blocks on the pipe forever once a Vulkan device is
+        # up (lost SIGCHLD); spawn + poll via lava_run, read the output file.
+        p = lava_run(pipeline(`$spirv_dis --no-color $path`; stdout=out); label="spirv-dis")
+        txt = (process_exited(p) && p.exitcode == 0 && isfile(out)) ? read(out, String) : ""
+        rm(out; force=true)
+        return txt
     end
 end
