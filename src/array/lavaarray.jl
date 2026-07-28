@@ -179,6 +179,9 @@ end
 @inline pin!(batch::CommandBatch, a::LavaArray) = begin
     a in batch.pinned && return
     push!(batch.pinned, a)
+    # Retain an independent DataRef so the batch survives an explicit
+    # `unsafe_free!(a)` between record and submit — see `CommandBatch.pinned_refs`.
+    push!(batch.pinned_refs, copy(a.buf))
     return nothing
 end
 

@@ -339,6 +339,18 @@ function alloc_cmd_buf(bq::BatchQueue)
         Vulkan.allocate_command_buffers(bq.device, alloc_info))[1]
 end
 
+# Drop the DataRefs retained by `pin!`.  Called once the batch can no longer be
+# submitted — it either completed (`reclaim_batch!`) or its submit failed.  This
+# is what lets a buffer whose owning LavaArray was `unsafe_free!`d mid-batch
+# finally reach refcount zero and release its VkManagedBuffer.
+function release_pinned_refs!(batch::CommandBatch)
+    for ref in batch.pinned_refs
+        GPUArrays.unsafe_free!(ref)
+    end
+    empty!(batch.pinned_refs)
+    return nothing
+end
+
 """Reclaim a completed batch: clear pinned set, return to free pool."""
 function reclaim_batch!(bq::BatchQueue, batch::CommandBatch)
     batch.recording = false
@@ -346,6 +358,7 @@ function reclaim_batch!(bq::BatchQueue, batch::CommandBatch)
     batch.segment_dispatches = 0
     batch.last_was_rt = false
     empty!(batch.pinned)
+    release_pinned_refs!(batch)
     empty!(batch.wait_semaphores)
     empty!(batch.dispatch_log)
     append!(bq.free_cmd_bufs, batch.sealed_cmd_bufs)
@@ -997,7 +1010,15 @@ function submit!(bq::BatchQueue)
     # (bq, signal_value) into buf.last_write.  Runs ONCE per batch, not per
     # dispatch — the IdSet dedupes multi-dispatch reuse for free.
     for obj in batch.pinned
+        # LavaArrays are handled via `pinned_refs` below.  Between `pin!` and
+        # here, an explicit `unsafe_free!(a)` (HW-accel BLAS/TLAS teardown) can
+        # have marked `a.buf` freed; `a.buf[]` would throw even though the
+        # VkManagedBuffer is still alive via our retained ref.
+        obj isa LavaArray && continue
         sync_access!(batch, obj)
+    end
+    for ref in batch.pinned_refs
+        sync_access!(batch, ref[])
     end
 
     # Pre-submit safety scan: catch stale-BDA-in-arg-slab corruption BEFORE
@@ -1056,6 +1077,7 @@ function submit!(bq::BatchQueue)
         mark_if_lost!(bq, submit_result)
         batch.recording = false
         empty!(batch.pinned)
+        release_pinned_refs!(batch)
         empty!(batch.wait_semaphores)
         bq.active_batch = nothing
         throw_with_validation_context("vkQueueSubmit2", submit_result,

@@ -41,6 +41,16 @@ mutable struct CommandBatch
     # so each object is pinned (and sync-tracked) at most once per batch.
     # Populated by `pin!` during arg packing and from dispatch entry points.
     pinned::Base.IdSet{Any}
+    # Retained `GPUArrays.DataRef`s for every pinned LavaArray, taken via
+    # `copy(a.buf)` at `pin!` time.  `pinned` alone is not enough: it keeps the
+    # *wrapper* alive, but an explicit `unsafe_free!(a)` (HW-accel BLAS/TLAS
+    # teardown does exactly this) sets `a.buf.freed = true` on that DataRef, and
+    # `DataRef` throws on `freed` regardless of refcount — so `submit!` would
+    # later trip "Attempt to use a freed reference" dereferencing `a.buf`.
+    # A `copy` is an independent, non-freed handle onto the same RefCounted, so
+    # it both keeps the VkManagedBuffer alive and stays dereferenceable.
+    # Released in `reclaim_batch!` once the batch's timeline has been reached.
+    pinned_refs::Vector{Any}
     dispatch_log::Vector{String}
     sealed_cmd_bufs::Vector{Vulkan.CommandBuffer}  # Completed CB segments awaiting submit
 
@@ -139,7 +149,7 @@ function init_batch(cb::Vulkan.CommandBuffer)
     pinned = Base.IdSet{Any}()
     sizehint!(pinned, 128)
     waits = Tuple{Vulkan.Semaphore, UInt64, Vulkan.PipelineStageFlag2}[]
-    return CommandBatch(cb, false, 0, 0, false, pinned, String[],
+    return CommandBatch(cb, false, 0, 0, false, pinned, Any[], String[],
         Vulkan.CommandBuffer[],
         UInt64(0),                       # signal_value (assigned at record time)
         waits,
