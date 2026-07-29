@@ -1,0 +1,294 @@
+"""
+Frozen kernel cache: SPIR-V on disk under a key that never changes by itself.
+
+The existing disk cache (`lava_disk_cache_*`) keys on a `Core.MethodInstance`,
+which means obtaining the key already costs what the cache was meant to save:
+`get_compiled_kernel_and_pipeline` calls `GPUCompiler.methodinstance(typeof(f),
+tt)`, and that infers the kernel. Measured on SAM 2's encoder, a cold call spends
+70 s in Julia's compiler with every one of its 99 kernels already on disk as
+SPIR-V. The bytes were there; getting permission to use them was the expensive
+part.
+
+So this cache is keyed on nothing but `typeof(f)`, `tt` and the workgroup size —
+all of them types the caller already holds, none of them requiring inference —
+plus a **version string the programmer sets by hand**. There is no hashing of
+source, no dependency scan, no staleness check. An entry written under `v3` is
+read back under `v3` forever. Change a kernel and the cache is wrong until you
+bump the version; that is the trade, and it is deliberate, because every
+automatic invalidation scheme so far has cost more than it saved.
+
+Two levels, because SPIR-V is portable and machine code is not:
+
+  * `<key>.spirv` — the compiled module. Valid on any device, so it survives a
+    driver update or a different GPU.
+  * the driver's own `VkPipelineCache` (see `pipeline_cache.jl`) — SPIR-V to
+    ISA. Device- and driver-specific, header-validated before the driver is
+    allowed to touch it, and simply absent after an update, at which point the
+    driver recompiles from level 1.
+
+The module in the key is the one the kernel is **defined** in, not the one that
+launched it. A broadcast kernel over `LavaArray` belongs to Lava whoever calls
+it, so LavaDNN and VideoEditor share Lava's entry instead of each writing their
+own copy under their own name.
+"""
+
+"""
+    FROZEN_VERSION[]
+
+The cache generation. Empty disables the frozen cache entirely.
+
+Set by `@compile_workload`, and the only thing that invalidates an entry. Bump
+it while developing kernels; leave it alone otherwise.
+"""
+const FROZEN_VERSION = Ref("")
+
+"""When true, kernels compiled the slow way are written to the frozen cache."""
+const FROZEN_RECORDING = Ref(false)
+
+# Session-local, keyed by the same types the disk key is derived from, so a
+# repeat launch costs a tuple hash rather than building a filename.
+const FROZEN_MEM = Dict{Tuple{DataType, DataType, Any}, Any}()
+
+"""
+The per-kernel `VkPipelineCache` the pipeline for the kernel being recorded was
+built with, so `frozen_store` can snapshot exactly that kernel's ISA rather than
+the device-wide accumulation.
+"""
+const FROZEN_LAST_PCACHE = Ref{Any}(nothing)
+
+const FROZEN_HITS = Ref(0)
+const FROZEN_STORES = Ref(0)
+const FROZEN_MISSES = Ref(0)
+
+"""
+    FROZEN_LOG_MISSES[]
+
+Print the key of every kernel that falls through to a compile.
+
+A miss is invisible otherwise — the answer is still right, it just cost seconds
+— so this is how a workload is debugged into covering everything. What it prints
+is exactly the filename that *would* have been read, which is directly
+comparable against a directory listing.
+"""
+const FROZEN_LOG_MISSES = Ref(false)
+
+"""Whether to log keys, from the env so precompilation can be traced too."""
+frozen_logging() = FROZEN_LOG_MISSES[] || get(ENV, "LAVA_FROZEN_LOG", "") == "1"
+
+"""Where frozen entries live: one directory, shared by every package."""
+function frozen_cache_dir()
+    dir = FROZEN_CACHE_DIR[]
+    isempty(dir) || return dir
+    dir = joinpath(first(Base.DEPOT_PATH), "scratchspaces", "lava_frozen_kernels")
+    FROZEN_CACHE_DIR[] = dir
+    return dir
+end
+const FROZEN_CACHE_DIR = Ref("")
+
+"""
+    typestring(T) -> String
+
+`T` printed with every name fully qualified, whatever is in scope.
+
+`string(T)` abbreviates names that are visible from the *current module*, and
+which module that is differs between precompilation and the session that loads
+the result: the same kernel signature printed
+`Lava.LavaDeviceArray{Int64,1}` while precompiling and `LavaDeviceArray{Int64,1}`
+at run time. Two spellings, two digests, and every entry the workload froze
+missed — 168 stored, 168 missed, with the right bytes sitting on disk the whole
+time. `:module => nothing` turns the abbreviation off.
+"""
+typestring(@nospecialize(T)) = sprint(show, T; context = :module => nothing)
+
+"""
+    frozen_key(f, tt, workgroup_size) -> String
+
+`<module>_<kernel>_<signature digest>_v<version>`.
+
+The digest is over `typestring(tt)` and the workgroup size — a *string*, because
+`hash` of a type is object identity and changes between sessions, while its
+printed form does not. It is a filename, not a change detector: two different
+signatures must not collide, but a changed *body* under the same signature is
+explicitly not detected. That is what the version is for.
+"""
+function frozen_key(@nospecialize(f), @nospecialize(tt), workgroup_size)
+    F = typeof(f)
+    h = hash(typestring(tt), hash(typestring(F), hash(workgroup_size)))
+    sanitize(s) = replace(s, r"[^A-Za-z0-9_]" => "_")
+    mod = sanitize(string(parentmodule(F)))
+    fn = sanitize(string(nameof(F)))
+    # Filesystems cap names near 255 bytes and a mangled kernel name can run
+    # far past that on its own; the digest is what makes the entry unique, the
+    # rest is for a human reading the directory.
+    length(fn) > 72 && (fn = fn[1:72])
+    return string(mod, '_', fn, '_', string(h; base = 16, pad = 16),
+                  "_v", FROZEN_VERSION[])
+end
+
+frozen_path(key::AbstractString) = joinpath(frozen_cache_dir(), key * ".spirv")
+frozen_binpath(key::AbstractString) = joinpath(frozen_cache_dir(), key * ".bin")
+
+"""
+    frozen_pipeline_cache(ctx, key) -> VkPipelineCache | nothing
+
+A `VkPipelineCache` seeded with this kernel's own `<key>.bin`, or `nothing` when
+there is none for this device.
+
+This is level 2, per kernel: SPIR-V is portable, the ISA the driver derives from
+it is not. The blob is validated against vendor ID, device ID and cache UUID
+before `vkCreatePipelineCache` sees a byte of it — a foreign or truncated blob
+is a documented way to crash *inside* the driver, and a crash there takes the
+process with it before any Julia `try` can run. After a driver update the UUID
+changes, every `.bin` stops matching, and the kernel is rebuilt from its
+`.spirv`, which is exactly the fallback the two levels exist for.
+"""
+function frozen_pipeline_cache(ctx::VkContext, key::AbstractString)
+    path = frozen_binpath(key)
+    isfile(path) || return nothing
+    bytes = try
+        read(path)
+    catch ex
+        @debug "Lava: frozen pipeline blob unreadable" path exception = ex
+        return nothing
+    end
+    pipeline_cache_compatible(bytes, ctx.physical_device) || return nothing
+    try
+        return GC.@preserve bytes begin
+            ci = Vulkan.PipelineCacheCreateInfo(Ptr{Cvoid}(pointer(bytes));
+                                                initial_data_size = UInt64(length(bytes)))
+            Vulkan.PipelineCache(ctx.device, ci)
+        end
+    catch ex
+        # Passed the header check and still refused: keep the session, drop the
+        # blob so the next run does not retry it.
+        @warn "Lava: frozen pipeline blob rejected; rebuilding from SPIR-V" path exception = ex
+        rm(path; force = true)
+        return nothing
+    end
+end
+
+"""Snapshot `pcache` to `<key>.bin`, atomically. Best effort."""
+function frozen_store_bin(ctx::VkContext, key::AbstractString, pcache)
+    try
+        size, ptr = unwrap(Vulkan.get_pipeline_cache_data(ctx.device, pcache))
+        try
+            size == 0 && return nothing
+            bytes = unsafe_wrap(Array, Ptr{UInt8}(ptr), Int(size); own = false)
+            dir = frozen_cache_dir(); mkpath(dir)
+            tmppath, io = mktemp(dir; cleanup = false)
+            write(io, bytes); close(io)
+            mv(tmppath, frozen_binpath(key); force = true)
+        finally
+            Libc.free(ptr)
+        end
+    catch ex
+        @debug "Lava: frozen pipeline blob store failed" key exception = ex
+    end
+    return nothing
+end
+
+"""
+    frozen_load(ctx, f, tt, workgroup_size) -> LavaLinkedKernel | nothing
+
+The linked kernel for this signature, from memory or from disk, without ever
+asking Julia to infer anything.
+"""
+function frozen_load(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workgroup_size)
+    isempty(FROZEN_VERSION[]) && return nothing
+    memkey = (typeof(f), tt, workgroup_size)
+    hit = get(FROZEN_MEM, memkey, nothing)
+    hit === nothing || return hit
+    key = frozen_key(f, tt, workgroup_size)
+    path = frozen_path(key)
+    if !isfile(path)
+        frozen_logging() && println("frozen MISS: ", key, " || ", typestring(tt))
+        return nothing
+    end
+    compiled = try
+        open(Serialization.deserialize, path)::LavaGPUKernel
+    catch ex
+        # A damaged entry costs a recompile, never the session.
+        @debug "Lava: frozen cache entry unreadable" path exception = ex
+        return nothing
+    end
+    # Level 2: hand the pipeline this kernel's own driver blob when there is a
+    # matching one, so the driver reuses its ISA instead of recompiling.
+    linked = link_kernel(ctx, compiled; pipeline_cache = frozen_pipeline_cache(ctx, key))
+    FROZEN_MEM[memkey] = linked
+    FROZEN_HITS[] += 1
+    return linked
+end
+
+"""
+    frozen_store(f, tt, workgroup_size, compiled)
+
+Write a compiled kernel under its frozen key. Only while recording.
+"""
+function frozen_store(@nospecialize(f), @nospecialize(tt), workgroup_size,
+                      compiled::LavaGPUKernel)
+    (FROZEN_RECORDING[] && !isempty(FROZEN_VERSION[])) || return nothing
+    dir = frozen_cache_dir()
+    mkpath(dir)
+    key = frozen_key(f, tt, workgroup_size)
+    path = frozen_path(key)
+    # The LLVM IR string is session-specific and large; the frozen entry is the
+    # SPIR-V and what it takes to build a pipeline from it, nothing else.
+    entry = LavaGPUKernel(compiled.spirv_bytes, compiled.entry_name,
+                          compiled.workgroup_size, compiled.push_info, "",
+                          compiled.enable_ray_query)
+    try
+        tmppath, io = mktemp(dir; cleanup = false)
+        Serialization.serialize(io, entry)
+        close(io)
+        mv(tmppath, path; force = true)          # atomic: no half-written entry
+        FROZEN_STORES[] += 1
+        # …and the driver's ISA for it, from a cache holding only this kernel.
+        # Recording builds the pipeline through `frozen_link_recording`, which
+        # leaves the per-kernel cache in `FROZEN_LAST_PCACHE`.
+        let pc = FROZEN_LAST_PCACHE[]
+            pc === nothing || frozen_store_bin(vk_context(), key, pc)
+        end
+        frozen_logging() &&
+            println("frozen STORE: ", basename(path)[1:end-6], " || ", typestring(tt))
+    catch ex
+        @debug "Lava: frozen cache store failed" path exception = ex
+    end
+    return nothing
+end
+
+"""
+    frozen_stats() -> NamedTuple
+
+Hits, stores and misses since the counters were last reset, plus how many
+entries are on disk for the current version. What a test asserts on.
+"""
+function frozen_stats()
+    dir = frozen_cache_dir()
+    suffix = "_v" * FROZEN_VERSION[] * ".spirv"
+    ondisk = isdir(dir) ? count(f -> endswith(f, suffix), readdir(dir)) : 0
+    (hits = FROZEN_HITS[], stores = FROZEN_STORES[], misses = FROZEN_MISSES[],
+     ondisk = ondisk, version = FROZEN_VERSION[])
+end
+
+"""Reset the hit/store/miss counters (not the cache itself)."""
+frozen_reset_stats!() = (FROZEN_HITS[] = 0; FROZEN_STORES[] = 0; FROZEN_MISSES[] = 0; nothing)
+
+"""
+    frozen_clear!(; version = FROZEN_VERSION[])
+
+Delete every on-disk entry for `version`, and the session's memory of them.
+The one supported way to invalidate, short of bumping the version.
+"""
+function frozen_clear!(; version::AbstractString = FROZEN_VERSION[])
+    empty!(FROZEN_MEM)
+    dir = frozen_cache_dir()
+    isdir(dir) || return 0
+    suffix = "_v" * version * ".spirv"
+    n = 0
+    for f in readdir(dir)
+        endswith(f, suffix) || continue
+        rm(joinpath(dir, f); force = true)
+        n += 1
+    end
+    return n
+end

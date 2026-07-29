@@ -4,9 +4,22 @@
 # AMDVLK / RADV / etc. don't recompile SPIR-V → ISA every session. Lives in the
 # same scratchspace as the SPIR-V cache (`lava_disk_cache_dir()`) for cohesion.
 #
-# Safety: the spec's pInitialData header carries vendor/device/driver IDs and
-# the driver rejects any mismatch — so loading stale or wrong-driver data is a
-# harmless empty start. We just pass the raw bytes through.
+# Safety: the header is validated HERE, before the driver ever sees the bytes.
+#
+# The spec says an implementation must detect incompatible `pInitialData` and
+# behave as if the cache were empty, and it is tempting to lean on that — the
+# blob carries vendor/device IDs and a cache UUID precisely so it can be
+# checked. Drivers are not reliably defensive about it in practice: a blob from
+# another device, or one truncated by a half-written file, is a documented way
+# to crash inside `vkCreatePipelineCache`, and a crash there takes the process
+# with it before any Julia-level `try` can see it. `catch` does not help
+# against a segfault.
+#
+# So the 32-byte `VkPipelineCacheHeaderVersionOne` is parsed and compared
+# against this physical device before the data is passed on, and anything that
+# does not match exactly is discarded. That is cheap, it is the one check that
+# makes the "load whatever is on disk" path safe, and it is what lets the
+# frozen kernel cache keep a driver-specific level at all.
 
 """
 Disk path for this device's pipeline-cache blob. Co-located with the SPIR-V
@@ -20,18 +33,58 @@ function lava_pipeline_cache_path(device_name::AbstractString, driver_version::A
 end
 
 """
-Read the saved pipeline-cache blob from disk; return empty bytes on miss/error.
-The driver will validate the header at create-time and reject bad data, so
-returning whatever's on disk is safe.
+    PIPELINE_CACHE_HEADER_BYTES
+
+Size of `VkPipelineCacheHeaderVersionOne`: four `uint32` then a 16-byte UUID.
 """
-function load_pipeline_cache_data(path::String)
+const PIPELINE_CACHE_HEADER_BYTES = 32
+const PIPELINE_CACHE_HEADER_VERSION_ONE = UInt32(1)
+
+"""
+    pipeline_cache_compatible(bytes, phys_device) -> Bool
+
+Whether `bytes` is a pipeline-cache blob this device will accept.
+
+Parses `VkPipelineCacheHeaderVersionOne` — `headerSize`, `headerVersion`,
+`vendorID`, `deviceID`, `pipelineCacheUUID[16]`, all little-endian — and
+requires every field to match the device. The UUID is the authoritative one: a
+driver update changes it even when vendor and device do not, which is exactly
+the case a filename keyed on the driver *version string* can miss (two builds
+can report the same version).
+
+Checked here rather than delegated to `vkCreatePipelineCache` because a
+mismatch there is not reliably a clean rejection. See the note at the top of
+this file.
+"""
+function pipeline_cache_compatible(bytes::Vector{UInt8}, phys_device)
+    length(bytes) >= PIPELINE_CACHE_HEADER_BYTES || return false
+    u32(off) = UInt32(bytes[off + 1]) | (UInt32(bytes[off + 2]) << 8) |
+               (UInt32(bytes[off + 3]) << 16) | (UInt32(bytes[off + 4]) << 24)
+    u32(0) == UInt32(PIPELINE_CACHE_HEADER_BYTES) || return false
+    u32(4) == PIPELINE_CACHE_HEADER_VERSION_ONE || return false
+    props = Vulkan.get_physical_device_properties(phys_device)
+    u32(8) == props.vendor_id || return false
+    u32(12) == props.device_id || return false
+    return all(i -> bytes[16 + i] == props.pipeline_cache_uuid[i], 1:16)
+end
+
+"""
+Read the saved pipeline-cache blob from disk, or empty bytes when there is none,
+it is unreadable, or its header does not match `phys_device`.
+"""
+function load_pipeline_cache_data(path::String, phys_device)
     isfile(path) || return UInt8[]
-    try
-        return read(path)
+    bytes = try
+        read(path)
     catch ex
         @debug "Lava: pipeline cache read failed" path exception=ex
         return UInt8[]
     end
+    if !pipeline_cache_compatible(bytes, phys_device)
+        @debug "Lava: pipeline cache header does not match this device; ignoring" path
+        return UInt8[]
+    end
+    return bytes
 end
 
 """
@@ -39,13 +92,13 @@ Create a `VkPipelineCache` for `device`, seeded from `path` if it exists.
 Vulkan.jl's `PipelineCacheCreateInfo(initial_data::Ptr{Cvoid}; initial_data_size)`
 takes a raw pointer — the bytes vector is GC-pinned for the duration of the call.
 
-If creation with the seed data fails (e.g., the file is corrupt or from a
-different driver build that the validating loader doesn't auto-reject
-cleanly), fall back to an empty cache and delete the bad file so the next
-session starts fresh.
+The header is checked against `phys_device` first, so the driver only ever sees
+data it declared compatible. Creation is still wrapped: a blob can pass the
+header check and be damaged past it, and that case should cost a recompile
+rather than the session.
 """
-function create_lava_pipeline_cache(device::Vulkan.Device, path::String)
-    initial = load_pipeline_cache_data(path)
+function create_lava_pipeline_cache(device::Vulkan.Device, path::String, phys_device)
+    initial = load_pipeline_cache_data(path, phys_device)
     function _create_empty()
         ci = Vulkan.PipelineCacheCreateInfo(Ptr{Cvoid}(C_NULL); initial_data_size=UInt64(0))
         return Vulkan.PipelineCache(device, ci)

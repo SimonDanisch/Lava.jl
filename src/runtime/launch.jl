@@ -407,10 +407,11 @@ end
 
 Create session-dependent Vulkan objects (VkPipeline) from cached SPIR-V bytes.
 """
-function link_kernel(ctx::VkContext, compiled::LavaGPUKernel)
+function link_kernel(ctx::VkContext, compiled::LavaGPUKernel; pipeline_cache=nothing)
     pipeline = get_compute_pipeline(ctx, compiled.spirv_bytes, compiled.entry_name;
                                     push_constant_size=compiled.push_info.push_size,
-                                    needs_tlas_descriptor=compiled.enable_ray_query)
+                                    needs_tlas_descriptor=compiled.enable_ray_query,
+                                    pipeline_cache)
     offsets = Int[p.first for p in compiled.push_info.arg_layout]
     byval_sizes = compiled.push_info.byval_llvm_sizes
     return LavaLinkedKernel(compiled, pipeline, offsets, byval_sizes)
@@ -461,8 +462,25 @@ own MethodInstance cache and skips inference.
 struct LavaLinker <: Function
     ctx::VkContext
 end
-@inline (l::LavaLinker)(::GPUCompiler.CompilerJob, compiled::LavaGPUKernel) =
-    link_kernel(l.ctx, compiled)
+# While recording, each kernel is linked through a pipeline cache holding only
+# itself, so `frozen_store` can snapshot that kernel's ISA rather than whatever
+# the device-wide cache has accumulated. Outside recording this is the plain
+# path and the device-wide cache is used as before.
+@inline function (l::LavaLinker)(::GPUCompiler.CompilerJob, compiled::LavaGPUKernel)
+    if FROZEN_RECORDING[] && !isempty(FROZEN_VERSION[])
+        pc = try
+            Vulkan.PipelineCache(l.ctx.device,
+                                 Vulkan.PipelineCacheCreateInfo(Ptr{Cvoid}(C_NULL);
+                                                                initial_data_size=UInt64(0)))
+        catch
+            nothing
+        end
+        FROZEN_LAST_PCACHE[] = pc
+        return link_kernel(l.ctx, compiled; pipeline_cache=pc)
+    end
+    FROZEN_LAST_PCACHE[] = nothing
+    return link_kernel(l.ctx, compiled)
+end
 
 """
     get_compiled_kernel_and_pipeline(ctx, f, tt, workgroup_size)
@@ -477,10 +495,24 @@ and world-age tracking means Revise edits invalidate correctly.
 function get_compiled_kernel_and_pipeline(ctx::VkContext, @nospecialize(f), @nospecialize(tt),
                                           workgroup_size;
                                           enable_ray_query::Bool=false)
+    # The frozen cache first, and deliberately before anything that needs a
+    # `MethodInstance`. `GPUCompiler.methodinstance` infers the kernel, so
+    # reaching `cached_compilation` at all costs the inference the cache exists
+    # to avoid — SAM 2's encoder spends 70 s there with every kernel already on
+    # disk. `frozen_load` keys on types the caller already holds.
+    let hit = frozen_load(ctx, f, tt, workgroup_size)
+        if hit !== nothing
+            hit = hit::LavaLinkedKernel
+            return hit.compiled, hit.pipeline, hit.offsets, hit.byval_sizes
+        end
+    end
+    isempty(FROZEN_VERSION[]) || (FROZEN_MISSES[] += 1)
+
     config = lava_compiler_config(; workgroup_size, enable_ray_query)
     source = GPUCompiler.methodinstance(typeof(f), tt)
     linked = GPUCompiler.cached_compilation(LINKED_KERNEL_CACHE, source, config,
                                              lava_kernel_compile, LavaLinker(ctx))
+    frozen_store(f, tt, workgroup_size, linked.compiled)
 
     # Dump SPIR-V if dump dir is set
     if !isempty(SPIRV_DUMP_DIR[])

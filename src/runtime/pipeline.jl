@@ -130,7 +130,8 @@ Validates SPIR-V before creating the shader module.
 """
 function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_name::String;
                                push_constant_size::Integer=8,
-                               needs_tlas_descriptor::Bool=false)
+                               needs_tlas_descriptor::Bool=false,
+                               pipeline_cache=nothing)
     cache_key = hash((spirv_bytes, entry_name, push_constant_size, needs_tlas_descriptor))
     cached = get(PIPELINE_CACHE, cache_key, nothing)
     if cached !== nothing
@@ -188,7 +189,11 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
     end
     ci = Vulkan.ComputePipelineCreateInfo(stage, layout, -1; flags=pipeline_flags)
 
-    pipeline = create_compute_pipeline(dev, ci; pipeline_cache=ctx.pipeline_cache)
+    # `pipeline_cache` lets the frozen cache hand in a per-kernel one seeded from
+    # that kernel's own `.bin`; without it the device-wide cache is used, which is
+    # what every other caller wants.
+    pcache = pipeline_cache === nothing ? ctx.pipeline_cache : pipeline_cache
+    pipeline = create_compute_pipeline(dev, ci; pipeline_cache=pcache)
 
     result = LavaComputePipeline(shader_mod, layout, pipeline, UInt32(push_constant_size),
                                   needs_tlas_descriptor, ds_layout)

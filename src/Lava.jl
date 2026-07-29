@@ -4,6 +4,9 @@ export LavaArray, LavaBackend, LavaDeviceArray, alloc_index_buffer
 export AcceleratedMatrix, MatrixA, MatrixB, Accumulator, CoopMat, Scalar
 export matriximpl
 export BatchQueue
+# Freezing kernels: `@setup_workload` is PrecompileTools', re-exported so a
+# package needs one import to get both halves of the workload.
+export @setup_workload, @compile_workload
 export CompilationResult, lava_compile, optimize_spirv
 # Debugging & diagnostics
 export vk_reset_device!, dump_state, gpu_memory_usage, allocate_batch_queue!
@@ -72,6 +75,8 @@ export narrow_phase_kernel, NO_CONTACT
 export ContactRecord, narrow_phase_contacts_kernel
 
 import Serialization
+import PrecompileTools
+using PrecompileTools: @setup_workload
 using Vulkan
 using GPUCompiler
 using Raycore: Ray
@@ -151,6 +156,11 @@ include("array/pin_leaves.jl") # @generated walker that pins LavaArray leaves pe
 
 # ---- Launch API (depends on LavaArray / LavaDeviceArray) ----
 include("runtime/launch.jl")
+# Frozen kernel cache — `launch.jl` calls into it, and it calls `link_kernel`
+# back; both are resolved at call time, so the include order is free.
+include("runtime/frozen_cache.jl")
+# The workload macros sit on top of the frozen cache and PrecompileTools.
+include("runtime/workload.jl")
 # Pipeline cache persistence — depends on lava_disk_cache_dir from launch.jl;
 # referenced by VkContext constructor (forward at include time, resolved at call time)
 include("runtime/pipeline_cache.jl")

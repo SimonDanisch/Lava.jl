@@ -338,10 +338,11 @@ mutable struct VkContext
         ctx.video_decode_queue_family_index = video_decode_queue_family_index
         ctx.gpu_assisted = gpu_assisted
         ctx.driver_version = driver_version
-        # Seed a persistent VkPipelineCache from disk (if any). Driver
-        # validates the header — bad/stale data is silently ignored.
+        # Seed a persistent VkPipelineCache from disk (if any). The header is
+        # validated against this physical device before the driver sees it —
+        # `vkCreatePipelineCache` is not a safe place to discover a mismatch.
         ctx.pipeline_cache = create_lava_pipeline_cache(
-            device, lava_pipeline_cache_path(device_name, driver_version))
+            device, lava_pipeline_cache_path(device_name, driver_version), physical_device)
         _register_pipeline_cache_atexit!()
         # Now build the default BatchQueue with the live ctx.  Sets the
         # remaining field; no nullable slot, no post-hoc mutation.
