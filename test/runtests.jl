@@ -135,6 +135,10 @@ end
         include(joinpath(@__DIR__, "test_double_indirect.jl"))
     end
 
+    @testset "Int32 CartesianIndex into Broadcasted" begin
+        include(joinpath(@__DIR__, "test_int32_cartesian_miscompile.jl"))
+    end
+
     # ── Tier 3d: SPIR-V emitter pattern correctness & stress (full only) ──
     #
     # Patterns here have each, at some point, miscompiled on a specific driver

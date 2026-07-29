@@ -1,4 +1,7 @@
-# Regression test for a Lava miscompile, currently EXPECTED TO FAIL.
+# Regression test for a Lava miscompile. FIXED — this test now guards the fix
+# rather than documenting the break. It was gated with `@test_broken` and left
+# unregistered in runtests.jl, so the fix went unnoticed and the 32-bit index
+# narrowing it blocks was never taken up (see the speedup note below).
 #
 # Recovering a `CartesianIndex` from an `Int32` linear index, then using it to
 # index a `Broadcasted`, produces wrong values on device. The same expression is
@@ -90,6 +93,6 @@ end
             reshape(Array(out), sz)
         end
         @test results[1] ≈ want                  # wide index: correct
-        @test_broken results[2] ≈ want           # narrow index: the miscompile
+        @test results[2] ≈ want                  # narrow index: was the miscompile
     end
 end
