@@ -129,6 +129,17 @@ end
 
 const SUBGROUP_SIZE_CONTROL = Ref{Union{Nothing,SubgroupSizeControl}}(nothing)
 
+# The device's DEFAULT subgroup width, as opposed to the min/max it can be pinned
+# to. Queried once; cleared on device reset with the rest.
+const DEVICE_SUBGROUP_SIZE = Ref(0)
+
+function device_subgroup_size(ctx::VkContext = vk_context())
+    DEVICE_SUBGROUP_SIZE[] != 0 && return DEVICE_SUBGROUP_SIZE[]
+    props = Vulkan.get_physical_device_properties_2(ctx.physical_device,
+                                                    Vulkan.PhysicalDeviceSubgroupProperties)
+    DEVICE_SUBGROUP_SIZE[] = Int(props.next.subgroup_size)
+end
+
 """
     subgroup_size_control(ctx) -> SubgroupSizeControl
 
@@ -180,6 +191,7 @@ push!(RESET_CALLBACKS, function()
     empty!(PIPELINE_CACHE)
     empty!(PIPELINE_INSERTION_ORDER)
     SUBGROUP_SIZE_CONTROL[] = nothing   # re-query: the next device may differ
+    DEVICE_SUBGROUP_SIZE[]  = 0
 end)
 
 """
@@ -242,8 +254,14 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
     # those kernels correct on wave64 hardware rather than merely disabled. This
     # is a deterministic function of (SPIR-V, device), so `cache_key` still
     # identifies the pipeline uniquely without naming the size.
+    #
+    # Skipped entirely where the device is already COOPMAT_SUBGROUP wide: pinning
+    # would be semantically identical, and not touching the create-info at all is
+    # a stronger guarantee than "should be equivalent" for the wave32 hardware the
+    # kernels were tuned on.
     stage_next = C_NULL
     if spirv_declares_capability(spirv_bytes, Cap.CooperativeMatrixKHR) &&
+       device_subgroup_size(ctx) != COOPMAT_SUBGROUP &&
        can_require_subgroup_size(ctx, COOPMAT_SUBGROUP)
         stage_next = Vulkan.PipelineShaderStageRequiredSubgroupSizeCreateInfo(
             UInt32(COOPMAT_SUBGROUP))

@@ -323,6 +323,34 @@ function decode_capability_flags(ctx)
 end
 
 """
+    video_capabilities(ctx) -> NamedTuple
+
+The H.264 decode profile's `VkVideoCapabilitiesKHR` limits that callers have to
+respect. `minBitstreamBufferOffsetAlignment` / `minBitstreamBufferSizeAlignment`
+are the ones that bite: a `srcBufferOffset` or `srcBufferRange` that is not a
+multiple of them is a decode that produces nothing, with no error reported.
+"""
+function video_capabilities(ctx)
+    hp, pr, pl = video_profile(nothing)
+    e0 = C.VkExtent2D(0, 0)
+    GC.@preserve hp pr pl begin
+        cp = Ref(C.VkVideoCapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR, C_NULL, UInt32(0),
+                 UInt64(0), UInt64(0), e0, e0, e0, UInt32(0), UInt32(0),
+                 C.VkExtensionProperties(ntuple(_ -> Cchar(0), 256), UInt32(0))))
+        GC.@preserve cp begin
+            ccall(Vk.function_pointer(ctx.instance, "vkGetPhysicalDeviceVideoCapabilitiesKHR"),
+                  Int32, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+                  ctx.physical_device.vks, pc(pr), pc(cp))
+        end
+        c = cp[]
+        return (minBitstreamBufferOffsetAlignment = Int(c.minBitstreamBufferOffsetAlignment),
+                minBitstreamBufferSizeAlignment   = Int(c.minBitstreamBufferSizeAlignment),
+                maxDpbSlots                       = Int(c.maxDpbSlots),
+                maxActiveReferencePictures        = Int(c.maxActiveReferencePictures))
+    end
+end
+
+"""
     decode_coincide_supported(ctx) -> Bool
 
 Whether one image may serve as both DPB and decode target. False just means the
@@ -411,6 +439,12 @@ function feed!(dec::H264Decoder, annexb::AbstractVector{UInt8})
     return dec
 end
 
+"""
+Decode targets allocated at once under DPB_AND_OUTPUT_DISTINCT. Bounds the memory
+of an unbounded chunk; larger just means fewer video-queue submits per stream.
+"""
+const MAX_DECODE_TARGETS = 16
+
 "Frames not yet returned by [`decodemore!`](@ref) (undedcoded AUs + pending reorder)."
 remaining(dec::VideoDecoder) = (length(dec.aus) - dec.nextau + 1) + length(dec.pending)
 
@@ -429,23 +463,35 @@ function decodemore!(dec::VideoDecoder, maxframes::Integer; holdback::Integer = 
     if dec.nextau <= hi
         batch = dec.nextau:hi
         ausize(au) = cld(sum(length(sl) + 3 for sl in au), dec.bsalign) * dec.bsalign
-        ensurebitbuf!(dec, sum(ausize(dec.aus[i]) for i in batch))
         w = dec.w; CB = dec.CB
-        # ONE command buffer + ONE queue wait for the whole chunk — per-AU waits
-        # would serialize the hardware decoder against ~2 ms round-trips per frame
-        bi = Ref(C.VkCommandBufferBeginInfo(C.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, C_NULL,
-                                            UInt32(C.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT), Ptr{Cvoid}(C_NULL)))
-        GC.@preserve bi ccall(dfp(w,"vkBeginCommandBuffer"),Int32,(C.VkCommandBuffer,Ptr{Cvoid}),CB,pc(bi))
-        base = 0
-        for (j, i) in enumerate(batch)
-            base += decodeau!(dec, dec.aus[i], base, j)
+        # COINCIDE copies out of the DPB slot inside this command buffer, so the
+        # whole chunk is ONE command buffer + ONE queue wait — per-AU waits would
+        # serialize the hardware decoder against ~2 ms round-trips per frame.
+        #
+        # DISTINCT needs a decode target per AU that survives until its copy runs
+        # (slots are recycled mid-chunk), and `decode_h264` passes maxframes=typemax,
+        # so an unbounded chunk would allocate one full-size image per frame of the
+        # entire stream. Cap the targets and submit in sub-chunks of that size: the
+        # copies drain and the images are reused every MAX_DECODE_TARGETS frames.
+        step = dec.mkoutimg === nothing ? length(batch) : min(length(batch), MAX_DECODE_TARGETS)
+        for sub in Iterators.partition(batch, max(step, 1))
+            ensurebitbuf!(dec, sum(ausize(dec.aus[i]) for i in sub))
+            bi = Ref(C.VkCommandBufferBeginInfo(C.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, C_NULL,
+                                                UInt32(C.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT), Ptr{Cvoid}(C_NULL)))
+            GC.@preserve bi ccall(dfp(w,"vkBeginCommandBuffer"),Int32,(C.VkCommandBuffer,Ptr{Cvoid}),CB,pc(bi))
+            base = 0
+            for (j, i) in enumerate(sub)
+                base += decodeau!(dec, dec.aus[i], base, j)
+            end
+            ccall(dfp(w,"vkEndCommandBuffer"),Int32,(C.VkCommandBuffer,),CB)
+            cbref = Ref(CB)
+            si = Ref(C.VkSubmitInfo(C.VK_STRUCTURE_TYPE_SUBMIT_INFO,C_NULL,UInt32(0),Ptr{C.VkSemaphore}(C_NULL),Ptr{UInt32}(C_NULL),UInt32(1),Base.unsafe_convert(Ptr{C.VkCommandBuffer},cbref),UInt32(0),Ptr{C.VkSemaphore}(C_NULL)))
+            GC.@preserve si cbref ccall(dfp(w,"vkQueueSubmit"),Int32,(Ptr{Cvoid},UInt32,Ptr{Cvoid},Ptr{Cvoid}),w.q.vks,UInt32(1),Base.unsafe_convert(Ptr{Cvoid},si),C_NULL)
+            ccall(dfp(w,"vkQueueWaitIdle"),Int32,(Ptr{Cvoid},),w.q.vks)
+            # Blocks until the copies complete (flush! waits on the timeline), so the
+            # decode targets are free for the next sub-chunk.
+            drain_copies!(dec)
         end
-        ccall(dfp(w,"vkEndCommandBuffer"),Int32,(C.VkCommandBuffer,),CB)
-        cbref = Ref(CB)
-        si = Ref(C.VkSubmitInfo(C.VK_STRUCTURE_TYPE_SUBMIT_INFO,C_NULL,UInt32(0),Ptr{C.VkSemaphore}(C_NULL),Ptr{UInt32}(C_NULL),UInt32(1),Base.unsafe_convert(Ptr{C.VkCommandBuffer},cbref),UInt32(0),Ptr{C.VkSemaphore}(C_NULL)))
-        GC.@preserve si cbref ccall(dfp(w,"vkQueueSubmit"),Int32,(Ptr{Cvoid},UInt32,Ptr{Cvoid},Ptr{Cvoid}),w.q.vks,UInt32(1),Base.unsafe_convert(Ptr{Cvoid},si),C_NULL)
-        ccall(dfp(w,"vkQueueWaitIdle"),Int32,(Ptr{Cvoid},),w.q.vks)
-        drain_copies!(dec)
         dec.nextau = hi + 1
     end
     sort!(dec.pending, by = x -> (x[1], x[2]))   # display order = (GOP, POC)

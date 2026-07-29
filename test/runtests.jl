@@ -127,6 +127,10 @@ end
         include(joinpath(@__DIR__, "test_video_decode.jl"))
     end
 
+    @testset "video decode layout" begin
+        include(joinpath(@__DIR__, "test_video_decode_layout.jl"))
+    end
+
     # ── Tier 3d: SPIR-V emitter pattern correctness & stress (full only) ──
     #
     # Patterns here have each, at some point, miscompiled on a specific driver

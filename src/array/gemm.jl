@@ -91,17 +91,6 @@ do; anything else falls back to the register-blocked kernel."""
 # uses when it pins a coopmat pipeline's subgroup size.
 const GEMM_SUBGROUP = COOPMAT_SUBGROUP
 
-# Queried once; `vk_reset_device!` clears it along with everything else.
-const GEMM_DEVICE_SUBGROUP = Ref(0)
-push!(RESET_CALLBACKS, () -> GEMM_DEVICE_SUBGROUP[] = 0)
-
-function device_subgroup_size(ctx::VkContext = vk_context())
-    GEMM_DEVICE_SUBGROUP[] != 0 && return GEMM_DEVICE_SUBGROUP[]
-    props = Vulkan.get_physical_device_properties_2(ctx.physical_device,
-                                                    Vulkan.PhysicalDeviceSubgroupProperties)
-    GEMM_DEVICE_SUBGROUP[] = Int(props.next.subgroup_size)
-end
-
 # Cooperative-matrix operations are subgroup-scoped, so a device whose subgroup
 # is not 32 lanes gets a different number of subgroups per workgroup than this
 # kernel assumes, and `lane ÷ 32` stops naming a real subgroup. The arithmetic
