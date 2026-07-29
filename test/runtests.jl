@@ -147,6 +147,99 @@ end
         include(joinpath(@__DIR__, "test_static_workgroup.jl"))
     end
 
+    # ── Previously unregistered test files ──
+    #
+    # These existed in test/ but were never included here. That is not neutral:
+    # of the files found unregistered, three characterised bugs that had since been
+    # FIXED without anyone noticing, one exercised an API deleted three months
+    # earlier, one never waited on its own spawned task, and two had gone stale
+    # against a refactor. Registered so they cannot rot again.
+    #
+    # Still deliberately out: test_struct_alignment_systematic.jl (fails on the open
+    # whole-struct-copy bug, see test_struct_copy_alignment.jl) and the heavy
+    # stress/CI entry points.
+    @testset "barrier elision" begin
+        include(joinpath(@__DIR__, "test_barrier_elision.jl"))
+    end
+    @testset "broadcast paths" begin
+        include(joinpath(@__DIR__, "test_broadcast_paths.jl"))
+    end
+    @testset "closest_hit via ray query" begin
+        include(joinpath(@__DIR__, "test_closesthit_via_rayquery.jl"))
+    end
+    @testset "coopmat shared memory" begin
+        include(joinpath(@__DIR__, "test_coopmat_shared.jl"))
+    end
+    @testset "batched coopmat GEMM" begin
+        include(joinpath(@__DIR__, "test_gemm_batched.jl"))
+    end
+    @testset "HWAdaptedAccel via ray query" begin
+        include(joinpath(@__DIR__, "test_hwadapted_via_rayquery.jl"))
+    end
+    @testset "hwtlas batch delete" begin
+        include(joinpath(@__DIR__, "test_hwtlas_batch_delete.jl"))
+    end
+    @testset "hwtlas batch triangles" begin
+        include(joinpath(@__DIR__, "test_hwtlas_batch_triangles.jl"))
+    end
+    @testset "hwtlas instance buffer" begin
+        include(joinpath(@__DIR__, "test_hwtlas_instance_buffer.jl"))
+    end
+    @testset "hwtlas push instances" begin
+        include(joinpath(@__DIR__, "test_hwtlas_push_instances.jl"))
+    end
+    @testset "hwtlas refit" begin
+        include(joinpath(@__DIR__, "test_hwtlas_refit.jl"))
+    end
+    @testset "hwtlas sync batch" begin
+        include(joinpath(@__DIR__, "test_hwtlas_sync_batch.jl"))
+    end
+    @testset "instance record" begin
+        include(joinpath(@__DIR__, "test_instance_record.jl"))
+    end
+    @testset "permutedims" begin
+        include(joinpath(@__DIR__, "test_permutedims.jl"))
+    end
+    @testset "phase 1 — pin/sync_access" begin
+        include(joinpath(@__DIR__, "test_phase1_pin.jl"))
+    end
+    @testset "phase 2 — error surfacing" begin
+        include(joinpath(@__DIR__, "test_phase2_errors.jl"))
+    end
+    @testset "phase 3 — lifecycle" begin
+        include(joinpath(@__DIR__, "test_phase3_lifecycle.jl"))
+    end
+    @testset "phase 4 — single writer" begin
+        include(joinpath(@__DIR__, "test_phase4_singlethread.jl"))
+    end
+    @testset "phase 5 — transfer path" begin
+        include(joinpath(@__DIR__, "test_phase5_copy.jl"))
+    end
+    @testset "phase 6 — graphics dispatch" begin
+        include(joinpath(@__DIR__, "test_phase6_graphics.jl"))
+    end
+    @testset "pool size classes" begin
+        include(joinpath(@__DIR__, "test_pool_sizeclass.jl"))
+    end
+    @testset "source mapping" begin
+        include(joinpath(@__DIR__, "test_source_mapping.jl"))
+    end
+    @testset "tlas allow_update" begin
+        include(joinpath(@__DIR__, "test_tlas_allow_update.jl"))
+    end
+    @testset "tlas refit" begin
+        include(joinpath(@__DIR__, "test_tlas_refit.jl"))
+    end
+    @testset "tlas refit integration" begin
+        include(joinpath(@__DIR__, "test_tlas_refit_integration.jl"))
+    end
+    @testset "trace cull mask" begin
+        include(joinpath(@__DIR__, "test_trace_cull_mask.jl"))
+    end
+    @testset "typepun trunc/bitcast" begin
+        include(joinpath(@__DIR__, "test_typepun_trunc_bitcast.jl"))
+    end
+
     # ── Tier 3d: SPIR-V emitter pattern correctness & stress (full only) ──
     #
     # Patterns here have each, at some point, miscompiled on a specific driver
