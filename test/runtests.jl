@@ -218,6 +218,10 @@ end
             include(joinpath(@__DIR__, "test_pool_trim.jl"))
         end
 
+        @testset "frozen RT cache" begin
+            include(joinpath(@__DIR__, "test_frozen_rt_cache.jl"))
+        end
+
         @testset "HW TLAS — nonblocking sync!" begin
             include(joinpath(@__DIR__, "test_hwtlas_nonblocking_sync.jl"))
         end

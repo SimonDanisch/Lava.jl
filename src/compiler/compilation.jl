@@ -750,6 +750,16 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
                                  push_constant_size::Integer=8,
                                  payload_type::Symbol=:f32,
                                  validate::Bool=true)
+    # Frozen SPIR-V, before any of the compiler runs.  Everything below —
+    # GPUCompiler, the LLVM pass pipeline, structurize, the SPIR-V emitter — is
+    # what an hw_accel=true scene pays in every session, and it dwarfs rendering
+    # (crown: ~610 s of compile against ~7.8 s of frames).  `ctx.pipeline_cache`
+    # does not help here; it caches the driver's SPIR-V → ISA step, which cannot
+    # start until this function has produced the SPIR-V.
+    let hit = frozen_rt_load(f, tt, stage, payload_type, push_constant_size)
+        hit === nothing || return hit
+    end
+
     # Per-material chit shaders may do inline shadow-ray traces via ray query
     # (`surface_direct_lighting_inner_typed!`), so the chit shader needs
     # `enable_ray_query=true` to bring in the TLAS variable + the rayQuery
@@ -804,7 +814,9 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
             checkpoint("validate_spirv")
         end
 
-        return LavaRTShader(spirv_bytes, stage, push_info, ir)
+        shader = LavaRTShader(spirv_bytes, stage, push_info, ir)
+        frozen_rt_store(f, tt, stage, payload_type, push_constant_size, shader)
+        return shader
     end
 end
 

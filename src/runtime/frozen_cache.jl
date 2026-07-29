@@ -281,6 +281,7 @@ The one supported way to invalidate, short of bumping the version.
 """
 function frozen_clear!(; version::AbstractString = FROZEN_VERSION[])
     empty!(FROZEN_MEM)
+    empty!(FROZEN_RT_MEM)
     dir = frozen_cache_dir()
     isdir(dir) || return 0
     suffix = "_v" * version * ".spirv"
@@ -291,4 +292,94 @@ function frozen_clear!(; version::AbstractString = FROZEN_VERSION[])
         n += 1
     end
     return n
+end
+
+# RT entries key on (F, tt, stage, payload, push_size) — five fields, so they
+# cannot share `FROZEN_MEM`, whose key type is fixed at three.
+const FROZEN_RT_MEM = Dict{Tuple{DataType, DataType, Symbol, Symbol, Int}, Any}()
+
+# ── Ray-tracing shaders ──
+#
+# The compute path freezes in `launch.jl`; the RT path had no equivalent, so an
+# hw_accel=true scene rebuilt every raygen/miss/chit from scratch in every
+# session. That is the expensive half: crown spends ~610 s in Lava-side compile
+# (of which `run_structurize_cfg_pipeline!` alone is 57.8 s and 54.6 s on the two
+# fat chits) against ~7.8 s of actual rendering.
+#
+# The device-wide `ctx.pipeline_cache` does NOT cover this. It caches the
+# driver's SPIR-V → ISA step, which happens *after* everything above; the
+# SPIR-V has to exist before the driver is asked for anything.
+#
+# Keyed like the compute entries plus `stage` and `payload_type`, since one
+# function is compiled once per stage and payloads change the emitted module.
+
+function frozen_rt_key(@nospecialize(f), @nospecialize(tt), stage::Symbol,
+                       payload_type::Symbol, push_constant_size::Integer)
+    F = typeof(f)
+    h = hash(typestring(tt),
+             hash(typestring(F),
+                  hash(stage, hash(payload_type, hash(push_constant_size)))))
+    sanitize(s) = replace(s, r"[^A-Za-z0-9_]" => "_")
+    mod = sanitize(string(parentmodule(F)))
+    fn = sanitize(string(nameof(F)))
+    length(fn) > 64 && (fn = fn[1:64])
+    return string(mod, '_', fn, "_rt", sanitize(string(stage)), '_',
+                  string(h; base = 16, pad = 16), "_v", FROZEN_VERSION[])
+end
+
+"""
+    frozen_rt_load(f, tt, stage, payload_type, push_constant_size) -> LavaRTShader | nothing
+
+The frozen SPIR-V for an RT stage, without running the compiler.
+"""
+function frozen_rt_load(@nospecialize(f), @nospecialize(tt), stage::Symbol,
+                        payload_type::Symbol, push_constant_size::Integer)
+    isempty(FROZEN_VERSION[]) && return nothing
+    memkey = (typeof(f), tt, stage, payload_type, Int(push_constant_size))
+    hit = get(FROZEN_RT_MEM, memkey, nothing)
+    hit === nothing || return hit
+    key = frozen_rt_key(f, tt, stage, payload_type, push_constant_size)
+    path = frozen_path(key)
+    if !isfile(path)
+        frozen_logging() && println("frozen RT MISS: ", key, " || ", typestring(tt))
+        return nothing
+    end
+    shader = try
+        open(Serialization.deserialize, path)::LavaRTShader
+    catch ex
+        @debug "Lava: frozen RT entry unreadable" path exception = ex
+        return nothing
+    end
+    FROZEN_RT_MEM[memkey] = shader
+    FROZEN_HITS[] += 1
+    return shader
+end
+
+"""
+    frozen_rt_store(f, tt, stage, payload_type, push_constant_size, shader)
+
+Write an RT stage's SPIR-V under its frozen key. Only while recording.
+"""
+function frozen_rt_store(@nospecialize(f), @nospecialize(tt), stage::Symbol,
+                         payload_type::Symbol, push_constant_size::Integer,
+                         shader::LavaRTShader)
+    (FROZEN_RECORDING[] && !isempty(FROZEN_VERSION[])) || return nothing
+    dir = frozen_cache_dir()
+    mkpath(dir)
+    key = frozen_rt_key(f, tt, stage, payload_type, push_constant_size)
+    path = frozen_path(key)
+    # Drop the LLVM IR: session-specific, and by far the largest field.
+    entry = LavaRTShader(shader.spirv_bytes, shader.stage, shader.push_info, "")
+    try
+        tmppath, io = mktemp(dir; cleanup = false)
+        Serialization.serialize(io, entry)
+        close(io)
+        mv(tmppath, path; force = true)
+        FROZEN_STORES[] += 1
+        frozen_logging() &&
+            println("frozen RT STORE: ", basename(path)[1:end-6], " || ", typestring(tt))
+    catch ex
+        @debug "Lava: frozen RT store failed" path exception = ex
+    end
+    return nothing
 end
