@@ -139,8 +139,8 @@ end
         include(joinpath(@__DIR__, "test_int32_cartesian_miscompile.jl"))
     end
 
-    @testset "broadcast of a 6-byte struct" begin
-        include(joinpath(@__DIR__, "test_broadcast_struct_stride6.jl"))
+    @testset "whole-struct copy alignment" begin
+        include(joinpath(@__DIR__, "test_struct_copy_alignment.jl"))
     end
 
     @testset "static workgroup indexing" begin
