@@ -362,8 +362,64 @@ function barrier_needed!(new::Vector{UInt64})
     hit
 end
 
+"""
+    interior_unit_workgroup(W) -> Bool
+
+Whether the static workgroup `W` has an extent of 1 in an *interior* dimension —
+anything but the first or the last.
+
+That is the exact trigger for a Lava codegen fault: with such a workgroup baked
+into the kernel's TYPE, the block index decode takes the wrong divisor for
+dimension 2 and only `min(1, blocks[3] / blocks[2])` of the output is written,
+silently. A *trailing* unit extent is harmless, which is why ranks 1-3 look
+clean — `(32, 4, 1)`'s unit extent is the last one.
+
+Established as Lava's and not KernelAbstractions': the identical kernel,
+workgroup and ndrange are correct on `KA.CPU()`, which runs the same `expand`
+and `NDRange` machinery with no SPIR-V emitter anywhere. `test_static_workgroup.jl`
+pins the trigger, the law, and the interior-versus-trailing rule.
+"""
+const WORKGROUP_FALLBACK = Ref(true)
+
+@inline function interior_unit_workgroup(W::NTuple{N,Int}) where {N}
+    N >= 3 || return false
+    @inbounds for d in 2:(N - 1)
+        W[d] == 1 && return true
+    end
+    false
+end
+interior_unit_workgroup(::Any) = false
+
+"""
+Re-launch a kernel whose workgroup lives in its TYPE as one that takes the size
+at the call, which is the path that computes correct indices.
+
+Set `WORKGROUP_FALLBACK[] = false` to take the raw path anyway — only
+`test_static_workgroup.jl` does that, to check the underlying fault is still
+present and this guard is still load-bearing.
+
+Only for shapes `interior_unit_workgroup` rejects, so this cannot change any
+launch that is currently right — it turns a silently wrong answer into a correct
+one. It is slower (the index arithmetic stops being compile-time constant, ~2x on
+the kernels measured), and that is the trade until the codegen fault is fixed.
+"""
+@inline function relaunch_dynamic(obj::KA.Kernel{LavaBackend, KA.NDIteration.StaticSize{W}, ND, F},
+                                  args, ndrange) where {W, ND, F}
+    dyn = KA.Kernel{LavaBackend, KA.NDIteration.DynamicSize, ND, F}(obj.backend, obj.f)
+    dyn(args...; ndrange = ndrange, workgroupsize = W)
+end
+
 function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=nothing)
     validate_launch_args(args)
+    # A static workgroup with an interior unit extent miscompiles; take the
+    # dynamic path instead. Checked on the TYPE, so it folds away for every
+    # kernel that is not affected.
+    if WORKGROUP_FALLBACK[] && workgroupsize === nothing && ndrange isa Tuple
+        WGT = typeof(obj).parameters[2]
+        if WGT <: KA.NDIteration.StaticSize && interior_unit_workgroup(WGT.parameters[1])
+            return relaunch_dynamic(obj, args, ndrange)
+        end
+    end
     bq = obj.backend.bq
 
     # Auto-discover TLAS for ray-query kernels — extract BEFORE Adapt strips

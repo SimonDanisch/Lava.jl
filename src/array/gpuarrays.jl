@@ -477,3 +477,141 @@ function LinearAlgebra.norm(v::LavaArray{T}, p::Real=2) where T
     p == 1 && return convert(RT, sum(abs, v; init=Float64(0)))
     return lava_norm_pp_rescale(v, maxabs, Float64(p))
 end
+
+# ── permutedims: N-D ndrange, no integer division ──
+#
+# GPUArrays' generic kernel takes a *linear* global index and recovers the
+# Cartesian one with `permute_linearindex`, which is `ndims - 1` integer
+# divisions per element. That is what the kernel is bound by, not memory: on this
+# card a 4.7 M-element `Float16` permute runs at 20-32 GB/s while a straight copy
+# of the same bytes does 311 GB/s, a 10-15x gap — and for the permutations that
+# actually show up (`(1, 3, 2, 4)`, swapping two middle axes) the fast axis is
+# contiguous on *both* sides, so there is nothing about the access pattern that
+# should cost anything.
+#
+# Asking KernelAbstractions for an N-D index removes the division entirely: the
+# grid already knows the coordinates. Measured in SAM 2's encoder, `permutedims`
+# is 27 ms of 411 ms — 6.5% spent on pure relayout with no arithmetic in it.
+# `IP` is the INVERSE permutation. `permutedims(A, perm)[I...] == A[I[invperm(perm)]...]`,
+# and the two spellings agree only when `perm` is self-inverse — `(1,3,2,4)` is,
+# which is how a version using `perm` directly passed a benchmark on that shape
+# and still produced garbage for SAM 2, whose encoder also uses permutations that
+# are not. Throughput without a correctness check proves nothing.
+@kernel function lava_permutedims_kernel!(dest, @Const(src), ::Val{IP}) where {IP}
+    I = @index(Global, NTuple)
+    @inbounds dest[I...] = src[ntuple(d -> I[IP[d]], Val(length(IP)))...]
+end
+
+@inline groupfill(::Tuple{}, left::Int) = ()
+@inline function groupfill(sz::Tuple{Int, Vararg{Int}}, left::Int)
+    t = min(first(sz), left)
+    (t, groupfill(Base.tail(sz), max(1, left ÷ t))...)
+end
+
+"""
+    launchgroup(sz, target = 256) -> Dims
+
+Workgroup shape for an `ndrange` of `sz`: fill from the fastest axis up, moving
+to the next only once the current one is exhausted.
+
+Filling in axis order is what makes the group a *contiguous* run of memory —
+every axis before the first partially-taken one is complete, so `(4, 4, 288,
+1024)` yields `(4, 4, 16, 1)`, covering 256 consecutive elements. Left to
+KernelAbstractions, which derives the group from the ndrange alone, that same
+shape launches with a **4-thread** workgroup: 4 of 32 lanes in the warp doing
+work.
+
+**Pass the result as a launch keyword**, `kernel(backend)(args...; ndrange,
+workgroupsize = launchgroup(ndrange))`, and *not* as `kernel(backend, wg)`.
+Those two spellings are not equivalent:
+
+  * `kernel(backend, wg)` puts the size in the kernel's type, so the iteration
+    space it builds pairs a `blocks` field with a zero-size `workitems::Nothing`.
+    For a **rank-4** ndrange that combination computes wrong global indices —
+    `ndrange = (72, 256, 8, 16)`, `wg = (32, 4, 1, 1)` writes 294 912 of
+    2 359 296 elements and reports no error. Ranks 1-3 and rank 5 are fine, as
+    is `kernel(backend, wg, ndrange)` with both static, which is what makes the
+    fault easy to miss.
+  * The keyword form keeps both extents as fields and is correct at every rank
+    tested. `test_static_workgroup.jl` pins the difference.
+"""
+@inline launchgroup(sz::Dims, target::Int = 256) = groupfill(sz, target)
+
+"""
+    staticgroup(sz, target = 256) -> Dims
+
+Like [`launchgroup`](@ref) but never returns an interior unit extent, so the
+result can go in the kernel's TYPE without tripping `WORKGROUP_FALLBACK` — which
+keeps the index arithmetic compile-time constant.
+
+Each interior axis is given 2 first (or its own extent, if smaller), and whatever
+is left of the budget goes to the fastest axis. That trades some of `launchgroup`'s
+contiguity for the constant-folded indexing; only worth it where measured.
+"""
+function staticgroup(sz::Dims{N}, target::Int = 256) where {N}
+    N <= 2 && return launchgroup(sz, target)
+    w = ones(Int, N)
+    # Reserve 2 on each interior axis so none stays at 1…
+    for d in 2:(N - 1)
+        w[d] = min(2, sz[d])
+    end
+    # …give the fastest axis whatever that leaves…
+    w[1] = min(sz[1], max(1, target ÷ prod(w)))
+    # …and spend the remainder outward, so a short leading axis (`(4,4,288,…)`
+    # would otherwise get a 16-thread group) still fills the budget.
+    for d in 1:(N - 1)
+        room = target ÷ prod(w)
+        room <= 1 && break
+        w[d] = min(sz[d], w[d] * room)
+    end
+    return ntuple(d -> w[d], Val(N))
+end
+
+
+"""
+    permutedims!(dest::AnyLavaArray, src::AnyLavaArray, perm)
+
+`dest[I...] = src[I[perm]...]`, one thread per destination element.
+
+More specific than GPUArrays' method, which this exists to replace; see the note
+above for why.
+"""
+# Two methods, matching GPUArrays' own signatures so neither is ambiguous with
+# them: it defines one for `NTuple` and one for the general case.
+Base.permutedims!(dest::AnyLavaArray, src::AnyLavaArray, perm::NTuple{N, T}) where {N, T} =
+    lavapermutedims!(dest, src, perm)
+Base.permutedims!(dest::AnyLavaArray, src::AnyLavaArray, perm::AbstractVector) =
+    lavapermutedims!(dest, src, Tuple(perm))
+
+function lavapermutedims!(dest::AnyLavaArray, src::AnyLavaArray, perm::Tuple)
+    N = ndims(src)
+    length(perm) == N ||
+        throw(ArgumentError("permutedims!: perm has $(length(perm)) entries for a $N-d array"))
+    isperm(perm) || throw(ArgumentError("permutedims!: $perm is not a permutation"))
+    ndims(dest) == N ||
+        throw(DimensionMismatch("permutedims!: destination is $(ndims(dest))-d, source $N-d"))
+    for d in 1:N
+        size(dest, d) == size(src, perm[d]) ||
+            throw(DimensionMismatch("permutedims!: destination axis $d is $(size(dest, d)), " *
+                                    "source axis $(perm[d]) is $(size(src, perm[d]))"))
+    end
+    N == 0 && return dest
+    # An explicit workgroup, rather than letting KA partition an N-D ndrange
+    # however it likes: left to itself it picks a group whose threads do not run
+    # along the fast axis and the transpose reads and writes in short bursts,
+    # measured 33 GB/s against 65 for a group that fills dimension 1 first.
+    #
+    # Passed as a launch KEYWORD and not as `lava_permutedims_kernel!(backend, wg)`.
+    # The two are not interchangeable — see `launchgroup` — and the second form
+    # computes wrong indices for a rank-4 ndrange, which is most of what a
+    # permute is used for. That spelling silently left 7 of every 8 elements
+    # unwritten here.
+    # The workgroup goes in the kernel's TYPE here, not as a keyword: that keeps
+    # the index arithmetic compile-time constant, and `staticgroup` shapes it so
+    # `WORKGROUP_FALLBACK` never has to step in. Correctness is unaffected either
+    # way — the guard would catch a bad shape — so this is purely about speed.
+    sz = size(dest)
+    lava_permutedims_kernel!(LavaBackend(), staticgroup(sz))(
+        dest, src, Val(Tuple(invperm(collect(perm)))); ndrange = sz)
+    return dest
+end
