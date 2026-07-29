@@ -222,6 +222,10 @@ end
             include(joinpath(@__DIR__, "test_frozen_rt_cache.jl"))
         end
 
+        @testset "Diagonal mul! disambiguation" begin
+            include(joinpath(@__DIR__, "test_diagonal_mul.jl"))
+        end
+
         # test_frozen_cache.jl shipped unregistered, so the compute-side frozen
         # cache had no coverage in CI. It restores FROZEN_VERSION by plain
         # assignment, so a throw part-way through would leave the cache ENABLED

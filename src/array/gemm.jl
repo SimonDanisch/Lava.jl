@@ -557,3 +557,33 @@ function gemmlaunch!(C, A, B, M, N, K, α, β)
                                         α, β, M, M * N; ndrange = M * N)
     C
 end
+
+# Disambiguation: Diagonal * matrix.
+#
+# `mul!(C::LavaArray{T,2}, ::AbstractVecOrMat, ::AbstractVecOrMat, α, β)` above and
+# GPUArrays' `mul!(::AbstractGPUVecOrMat, ::Diagonal{<:Any,<:AbstractGPUArray}, …)`
+# are both applicable to `mul!(::LavaArray{Float32,2}, ::Diagonal{Float32,LavaArray{Float32,1}}, ::LavaArray{Float32,2}, α, β)`
+# and neither is more specific, so the call is an ambiguity error rather than a
+# dispatch to either. Lava's method became applicable when the GEMM landed.
+#
+# GPUArrays' is the one that should win: a diagonal operand is a scaling, and
+# routing it through the dense GEMM would materialise the zeros and do O(n)
+# times the work. This mirrors its implementation rather than `invoke`-ing it,
+# because the signature to invoke through is unwieldy and would silently rot if
+# GPUArrays retyped it.
+function LinearAlgebra.mul!(C::LavaArray{T,2},
+                            D::Diagonal{<:Any, <:AbstractGPUArray},
+                            B::Union{AbstractGPUArray,
+                                     Adjoint{S, <:AbstractGPUArray{S}},
+                                     Transpose{S, <:AbstractGPUArray{S}}},
+                            α::Number, β::Number) where {T, S}
+    dd = D.diag
+    d = length(dd)
+    m, n = size(B, 1), size(B, 2)
+    m′, n′ = size(C, 1), size(C, 2)
+    m == d || throw(DimensionMismatch("right hand side has $m rows but D is $d by $d"))
+    (m, n) == (m′, n′) ||
+        throw(DimensionMismatch("expect output to be $m by $n, but got $m′ by $n′"))
+    @. C = α * dd * B + β * C
+    C
+end
