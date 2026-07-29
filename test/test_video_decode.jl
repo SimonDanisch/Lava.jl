@@ -12,9 +12,21 @@ using Lava
 
 @testset "H.264 hardware decode" begin
     ctx = Lava.vk_context()
+    # A video-decode queue is necessary but not sufficient. This decoder puts the
+    # DPB and the decode target in ONE image, which needs
+    # DPB_AND_OUTPUT_COINCIDE; a distinct-only device (AMD Radeon 8060S reports
+    # flags=0x2) cannot create that image at all. That used to surface as every
+    # frame decoding to all-zero and the comparison below failing with
+    # `243 == 0`, which reads like an accuracy bug and is not one — the decode
+    # simply never happened. Unsupported hardware is a skip, not a failure.
     if !ctx.video_decode_available
         @info "skipping H.264 decode test: no video-decode queue on $(ctx.device_name)"
         @test_skip ctx.video_decode_available
+    elseif !Lava.VideoDecode.decode_coincide_supported(ctx)
+        @info "skipping H.264 decode test: $(ctx.device_name) is DPB_AND_OUTPUT_DISTINCT only " *
+              "(flags=0x$(string(Lava.VideoDecode.decode_capability_flags(ctx), base=16))); " *
+              "the distinct-image decode path is not implemented"
+        @test_skip Lava.VideoDecode.decode_coincide_supported(ctx)
     else
         annexb = read(joinpath(@__DIR__, "data", "h264_decode_test.h264"))
         yref   = read(joinpath(@__DIR__, "data", "h264_decode_test_y.raw"))

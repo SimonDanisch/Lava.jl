@@ -288,6 +288,47 @@ abstract type VideoDecoder end
 
 # returns (video-decode profile ref, profile-list ref, caps NamedTuple)
 decodeprofile(dec::VideoDecoder) = video_profile(dec.w)   # h264 default; h265 overrides
+"""
+    decode_capability_flags(ctx) -> UInt32
+
+`VkVideoDecodeCapabilityFlagsKHR` for the H.264 decode profile on this device:
+`0x1` DPB_AND_OUTPUT_COINCIDE, `0x2` DPB_AND_OUTPUT_DISTINCT.
+
+Split out so the decoder and its tests ask the same question. `H264Decoder`
+requires COINCIDE because it allocates one image with
+`VIDEO_DECODE_DST|VIDEO_DECODE_DPB`; a distinct-only device cannot create that
+image at all, and the failure is silent (all-zero frames) without validation
+layers.
+"""
+function decode_capability_flags(ctx)
+    hp, pr, pl = video_profile(nothing)
+    hc = Ref(C.VkVideoDecodeH264CapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_CAPABILITIES_KHR, C_NULL,
+                                                C.StdVideoH264LevelIdc(0), C.VkOffset2D(0, 0)))
+    e0 = C.VkExtent2D(0, 0)
+    GC.@preserve hp pr pl hc begin
+        dc = Ref(C.VkVideoDecodeCapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR, pc(hc), UInt32(0)))
+        GC.@preserve dc begin
+            cp = Ref(C.VkVideoCapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR, pc(dc), UInt32(0),
+                     UInt64(0), UInt64(0), e0, e0, e0, UInt32(0), UInt32(0),
+                     C.VkExtensionProperties(ntuple(_ -> Cchar(0), 256), UInt32(0))))
+            GC.@preserve cp begin
+                ccall(Vk.function_pointer(ctx.instance, "vkGetPhysicalDeviceVideoCapabilitiesKHR"),
+                      Int32, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+                      ctx.physical_device.vks, pc(pr), pc(cp))
+            end
+            return dc[].flags
+        end
+    end
+end
+
+"""
+    decode_coincide_supported(ctx) -> Bool
+
+Whether one image may serve as both DPB and decode target. False means this
+decoder cannot run on the device; the distinct-image path is not implemented.
+"""
+decode_coincide_supported(ctx) = (decode_capability_flags(ctx) & UInt32(0x1)) != 0
+
 function video_profile(w)
     hp=Ref(C.VkVideoDecodeH264ProfileInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_PROFILE_INFO_KHR,C_NULL,C.STD_VIDEO_H264_PROFILE_IDC_HIGH,C.VK_VIDEO_DECODE_H264_PICTURE_LAYOUT_PROGRESSIVE_KHR))
     pr=Ref(C.VkVideoProfileInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR, Ptr{Cvoid}(rp(hp)), C.VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR, UInt32(C.VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR), UInt32(C.VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR), UInt32(C.VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)))
@@ -478,7 +519,8 @@ function H264Decoder(ctx, paramnals::AbstractVector{UInt8}; chroma::Bool=false)
                 " — DPB_AND_OUTPUT_COINCIDE (0x1) is not supported.\n",
                 "This decoder allocates a single image with VIDEO_DECODE_DST|VIDEO_DECODE_DPB, ",
                 "which requires COINCIDE; a DISTINCT-only device (0x2) needs separate DPB and ",
-                "output images, which is not implemented yet.")
+                "output images, which is not implemented yet. ",
+                "Callers can test for this up front with `decode_coincide_supported(ctx)`.")
         end
     end
     maxslots=UInt32(sps.maxref+2)
