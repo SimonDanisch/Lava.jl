@@ -1,5 +1,21 @@
 using Test, Lava
 
+# A pinned LavaArray's buffer lives in `batch.pinned_refs`, not `batch.pinned`.
+#
+# `pin!(batch, ::LavaArray)` takes TWO claims: it retains a `copy(a.buf)` DataRef
+# in `pinned_refs`, so GPUArrays refcounting cannot free the buffer out from under
+# an in-flight batch, and it bumps `pin_buffer!`. `batch.pinned` holds the other
+# pinned objects (pipelines and the like). These assertions predate that split and
+# read `a.buf[] in batch.pinned`.
+ispinned(batch, a) = any(r -> r[] === a.buf[], batch.pinned_refs) &&
+                     getfield(a.buf[], :pins) > 0
+
+using KernelAbstractions
+@kernel function touchkernel!(d)
+    i = @index(Global)
+    @inbounds d[i] = d[i] + 1.0f0
+end
+
 @testset "Phase 1 — unified pin!/sync_access! + dead-code sweep" begin
 
 @testset "symbol presence/absence" begin
@@ -54,7 +70,7 @@ end
 
     batch = Lava.ensure_active_batch!(bq)
     Lava.pin!(batch, a)
-    @test a.buf[] in batch.pinned
+    @test ispinned(batch, a)
     # Pre-submit, sync_access! hasn't fired yet; last_write may be anything.
     # After flush, the buffer's last_write must reference this bq.
     Lava.vk_flush!(bq)
@@ -76,16 +92,35 @@ end
     batch = Lava.ensure_active_batch!(bq)
     adaptor = Lava.LavaAdaptor(batch)
 
-    # adapt strips LavaArray → LavaDeviceArray AND pins the original in the same pass
+    # adapt strips LavaArray → LavaDeviceArray. It no longer pins as a side
+    # effect of stripping; the launch path pins explicitly, which the
+    # "a launch pins its arrays" testset below checks against the observable
+    # guarantee rather than against where the call happens to sit.
     import Adapt
     dev_a = Adapt.adapt(adaptor, a)
     @test dev_a isa Lava.LavaDeviceArray
-    @test a.buf[] in batch.pinned     # pin fired at the strip point
 
     Lava.vk_flush!(bq)
 end
 
-@testset "wrapper struct: adaptor recurses, pins nested LavaArray" begin
+@testset "a launch pins its arrays for the life of the batch" begin
+    # The invariant that actually matters, independent of which layer performs it:
+    # while a batch that references an array is in flight the buffer is pinned, and
+    # once it retires the pin is released. This is what stops GPUArrays refcounting
+    # from freeing a buffer out from under in-flight GPU work.
+    a = LavaArray{Float32,1}(zeros(Float32, 16))
+    KernelAbstractions.synchronize(LavaBackend())
+    @test getfield(a.buf[], :pins) == 0
+
+    touchkernel!(LavaBackend(), 16)(a; ndrange = 16)
+    batch = Lava.vk_context().default_bq.active_batch
+    @test batch !== nothing
+    @test ispinned(batch, a)                       # pinned while recorded
+    KernelAbstractions.synchronize(LavaBackend())
+    @test getfield(a.buf[], :pins) == 0            # released once retired
+end
+
+@testset "wrapper struct: adaptor leaves an unregistered struct alone" begin
     ctx = Lava.vk_context()
     bq = ctx.default_bq
     a = LavaArray{Float32,1}(zeros(Float32, 4))
@@ -102,10 +137,16 @@ end
     adaptor = Lava.LavaAdaptor(batch)
 
     import Adapt
+    # A struct with no `Adapt.@adapt_structure` rule is returned untouched — the
+    # adaptor does not recurse into arbitrary user types, and it does not pin what
+    # it finds there. This testset used to assert the opposite on both counts.
+    # Anything relying on nested arrays reaching the device must either register
+    # the type with Adapt or pass the arrays as kernel arguments, where the launch
+    # path pins them (see "a launch pins its arrays for the life of the batch").
     wc = Adapt.adapt(adaptor, w)
     @test wc isa TestWrapper
-    @test a.buf[] in batch.pinned
-    @test b.buf[] in batch.pinned
+    @test wc.items === a
+    @test wc.sizes === b
 
     Lava.vk_flush!(bq)
 end

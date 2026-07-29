@@ -14,14 +14,21 @@ end
         bq = Lava.vk_context().default_bq
         result = Ref{Any}(nothing)
         # Run ensure_active_batch! from a different thread.
-        Threads.@spawn begin
+        #
+        # `Threads.@spawn begin ... end |> wait` does NOT wait: a macro consumes
+        # as much of the expression as it can, so that parses as
+        # `@spawn (begin ... end |> wait)` — the wait runs INSIDE the task and
+        # nothing joins it. `result[]` was then read before the task had run and
+        # came back `nothing`, failing against a Lava that behaves correctly.
+        task = Threads.@spawn begin
             try
                 Lava.ensure_active_batch!(bq)
                 result[] = :no_assert   # should not happen
             catch e
                 result[] = e
             end
-        end |> wait
+        end
+        wait(task)
         @test result[] isa AssertionError
     else
         @info "Skipping cross-thread test; run with `julia -t 2+` to exercise"
