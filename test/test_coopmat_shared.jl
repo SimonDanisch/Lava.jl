@@ -68,8 +68,12 @@ end
 end
 
 @testset "cooperative matrix from Workgroup memory" begin
-    if !coopmat_gemm_available()
-        @info "no cooperative-matrix support on this device — skipping"
+    # Guarded on the shape query, NOT on `coopmat_gemm_available()`: this test
+    # launches its own 32-wide kernel and never uses the block GEMM's `lane ÷ 32`
+    # subgroup indexing, so it is meaningful (and passes) on a wave64 device where
+    # the GEMM path is correctly disabled.
+    if !Lava.coopmat_shape(Lava.vk_context(), Float16, TILE, TILE, TILE)
+        @info "skipping: device reports no $(TILE)^3 Float16 cooperative-matrix shape"
     else
         backend = LavaBackend()
         h = Float16.(reshape(1:(TILE * TILE), TILE, TILE) ./ 16)

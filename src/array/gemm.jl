@@ -85,8 +85,36 @@ do; anything else falls back to the register-blocked kernel."""
     M % GEMM_BM == 0 && N % GEMM_BN == 0 && K % GEMM_BK == 0
 
 """Does this device implement the tile `mul!` wants?"""
+# The block kernel derives its subgroup index as `lane ÷ 32` and GEMM_WORKGROUP
+# is sized as "2 subgroups" on the same assumption, so the whole thing is only
+# correct where a subgroup is 32 lanes wide.
+const GEMM_SUBGROUP = 32
+
+# Queried once; `vk_reset_device!` clears it along with everything else.
+const GEMM_DEVICE_SUBGROUP = Ref(0)
+push!(RESET_CALLBACKS, () -> GEMM_DEVICE_SUBGROUP[] = 0)
+
+function device_subgroup_size(ctx::VkContext = vk_context())
+    GEMM_DEVICE_SUBGROUP[] != 0 && return GEMM_DEVICE_SUBGROUP[]
+    props = Vulkan.get_physical_device_properties_2(ctx.physical_device,
+                                                    Vulkan.PhysicalDeviceSubgroupProperties)
+    GEMM_DEVICE_SUBGROUP[] = Int(props.next.subgroup_size)
+end
+
+# Cooperative-matrix operations are subgroup-scoped, so a device whose subgroup
+# is not 32 lanes gets a different number of subgroups per workgroup than this
+# kernel assumes, and `lane ÷ 32` stops naming a real subgroup. The arithmetic
+# still comes out right for the lanes that run — on a wave64 device exactly half
+# the output tile is written, bit-exact, and the other half stays zero, which is
+# a silently wrong answer rather than a failure.
+#
+# Reporting "unavailable" instead sends `mul!` down `gemmlaunch!`, which is
+# correct on any subgroup width. Making the kernel itself wave-size agnostic
+# means retuning GEMM_WORKGROUP and the block factors together, and those were
+# measured on wave32 hardware.
 function coopmat_gemm_available(ctx::VkContext = vk_context())
-    coopmat_shape(ctx, Float16, GEMM_TILE, GEMM_TILE, GEMM_TILE)
+    coopmat_shape(ctx, Float16, GEMM_TILE, GEMM_TILE, GEMM_TILE) &&
+        device_subgroup_size(ctx) == GEMM_SUBGROUP
 end
 
 # Tile index comes from the global lane index, so a workgroup may hold several
