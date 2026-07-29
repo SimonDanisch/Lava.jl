@@ -62,10 +62,23 @@ for BLK in (1, 2, 4)
             g = lane ÷ 32
             tiles_m = M ÷ (GEMM_TILE * $BLK)
             ntiles = tiles_m * (N ÷ (GEMM_TILE * $BLK))
-            t = g % ntiles
-            sk = g ÷ ntiles
+            # Batched by decomposing the subgroup index, not by a second kernel.
+            # `splitk` and `ntiles` come from `Val` parameters, so `per` is a
+            # compile-time constant and this is two folded integer ops; with
+            # `nbatch == 1` it is `bat = 0, r = g` and the arithmetic below is
+            # identical to the unbatched form it replaces. The batch is
+            # OUTERMOST so consecutive subgroups still walk one matrix's tiles.
+            splitk = (K ÷ GEMM_TILE) ÷ KPER
+            per = ntiles * splitk
+            bat = g ÷ per
+            r = g % per
+            t = r % ntiles
+            sk = r ÷ ntiles
             tm = (t % tiles_m) * (GEMM_TILE * $BLK)
             tn = (t ÷ tiles_m) * (GEMM_TILE * $BLK)
+            aoff = bat * M * K
+            boff = bat * K * N
+            coff = bat * M * N * splitk
 
             # `KPER` — how many 16-wide k-tiles this split covers — is a static
             # parameter and every split gets exactly that many, so the reduction
@@ -88,10 +101,10 @@ for BLK in (1, 2, 4)
                     k0_u = klo + (kt + (u - 1)) * GEMM_TILE
                     Base.Cartesian.@nexprs $BLK i -> a_i_u =
                         AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixA}(
-                            pointer(A), 1 + tm + (i - 1) * GEMM_TILE + k0_u * M, M)
+                            pointer(A), 1 + aoff + tm + (i - 1) * GEMM_TILE + k0_u * M, M)
                     Base.Cartesian.@nexprs $BLK j -> b_j_u =
                         AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixB}(
-                            pointer(B), 1 + k0_u + (tn + (j - 1) * GEMM_TILE) * K, K)
+                            pointer(B), 1 + boff + k0_u + (tn + (j - 1) * GEMM_TILE) * K, K)
                     Base.Cartesian.@nexprs $BLK j -> Base.Cartesian.@nexprs $BLK i ->
                         c_i_j = muladd(a_i_u, b_j_u, c_i_j)
                 end
@@ -101,17 +114,17 @@ for BLK in (1, 2, 4)
                 k0 = klo + kt * GEMM_TILE
                 Base.Cartesian.@nexprs $BLK i -> a_i =
                     AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixA}(
-                        pointer(A), 1 + tm + (i - 1) * GEMM_TILE + k0 * M, M)
+                        pointer(A), 1 + aoff + tm + (i - 1) * GEMM_TILE + k0 * M, M)
                 Base.Cartesian.@nexprs $BLK j -> b_j =
                     AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixB}(
-                        pointer(B), 1 + k0 + (tn + (j - 1) * GEMM_TILE) * K, K)
+                        pointer(B), 1 + boff + k0 + (tn + (j - 1) * GEMM_TILE) * K, K)
                 Base.Cartesian.@nexprs $BLK j -> Base.Cartesian.@nexprs $BLK i ->
                     c_i_j = muladd(a_i, b_j, c_i_j)
                 kt += 1
             end
 
             Base.Cartesian.@nexprs $BLK j -> Base.Cartesian.@nexprs $BLK i ->
-                copyto!(pointer(C), 1 + tm + (i - 1) * GEMM_TILE +
+                copyto!(pointer(C), 1 + coff + tm + (i - 1) * GEMM_TILE +
                                     (tn + (j - 1) * GEMM_TILE) * M + sk * M * N,
                         M, c_i_j)
         end
@@ -266,8 +279,15 @@ narrower block costs arithmetic intensity — BLK=1 does one `muladd` per two
 loads where BLK=4 does sixteen per eight — so it is the last resort, not the
 first.
 """
-function coopmat_gemm_shape(M::Int, N::Int, K::Int; cores::Int = 48)
-    target = 4cores
+function coopmat_gemm_shape(M::Int, N::Int, K::Int; cores::Int = 48, nbatch::Int = 1)
+    # A batched call already has `nbatch` independent copies of every output
+    # tile, so the device is full at `target ÷ nbatch` tiles per matrix. Ignoring
+    # this is not a missed optimisation, it is a large pessimisation: SAM 2's
+    # windowed attention (M=N=256, K=80, nbatch=128) picks `splitk = 5` on the
+    # unbatched target and runs at 1.2 TFLOP/s, against 11.6 at `splitk = 1` —
+    # 1.14 ms versus 0.12. The split writes five partial planes per matrix and
+    # then reads them all back to sum, for parallelism the batch already had.
+    target = max(1, cld(4cores, nbatch))
     nk = K ÷ GEMM_TILE
     # Only splits that divide the k-tile count, so every split has the same
     # static trip count (see the kernel).
@@ -289,13 +309,22 @@ end
 
 const GEMM_MAXSPLIT = 8    # past this the partial-sum traffic outweighs the parallelism
 
-"""Sum the `SPLITK` partial planes `Cp[:, :, s]` into `C`."""
+"""
+Sum the `SPLITK` partial planes `Cp[:, :, s]` into `C`.
+
+`n` is one plane, `M * N`. Batched runs lay the planes out as
+`[batch][split][plane]`, so the source offset needs the batch's own stride of
+`S * n` — indexing with `i + s * n` alone would read batch 0's later splits for
+every batch and silently return the wrong sum for all but the first.
+"""
 @kernel function splitk_reduce_kernel!(C, @Const(Cp), ::Val{S}, n) where {S}
     i = @index(Global, Linear)
     @inbounds begin
-        acc = Cp[i]
+        b = (i - 1) ÷ n                 # 0 for an unbatched call
+        j = (i - 1) % n + 1 + b * S * n
+        acc = Cp[j]
         for s in 1:(S - 1)
-            acc += Cp[i + s * n]
+            acc += Cp[j + s * n]
         end
         C[i] = acc
     end
@@ -336,24 +365,25 @@ caller pads (an im2col matrix is built to size, and weights are padded once at
 load) because a cooperative-matrix load has no bounds check.
 """
 function coopmat_gemm!(C, A, B, M::Int, N::Int, K::Int;
-                       blk_split = coopmat_gemm_shape(M, N, K), partials = nothing,
-                       reduce::Bool = true)
+                       nbatch::Int = 1,
+                       blk_split = coopmat_gemm_shape(M, N, K; nbatch),
+                       partials = nothing, reduce::Bool = true)
     backend = LavaBackend()
     blk, splitk = blk_split
     span = GEMM_TILE * blk
     ntiles = (M ÷ span) * (N ÷ span)
     dst = splitk == 1 ? C :
-          (partials === nothing ? splitscratch(M, N, splitk) : partials)
+          (partials === nothing ? splitscratch(M, N, splitk * nbatch) : partials)
     GEMM_BLOCK_KERNELS[blk](backend, GEMM_WORKGROUP)(
         dst, A, B, Val(M), Val(N), Val(K),
-        Val((K ÷ GEMM_TILE) ÷ splitk); ndrange = ntiles * splitk * 32)
+        Val((K ÷ GEMM_TILE) ÷ splitk); ndrange = ntiles * splitk * 32 * nbatch)
     splitk == 1 && return C
     # `reduce=false` hands the partial planes back untouched, for a caller whose
     # own epilogue can sum them — a convolution already reads every element of
     # the result to add bias and scatter it, so folding the sum in there saves a
     # dispatch and a full write-plus-read of `M*N*splitk` floats per convolution.
     reduce || return dst
-    splitk_reduce_kernel!(backend)(C, dst, Val(splitk), M * N; ndrange = M * N)
+    splitk_reduce_kernel!(backend)(C, dst, Val(splitk), M * N; ndrange = M * N * nbatch)
     C
 end
 
