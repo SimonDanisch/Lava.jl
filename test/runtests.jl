@@ -139,6 +139,10 @@ end
         include(joinpath(@__DIR__, "test_int32_cartesian_miscompile.jl"))
     end
 
+    @testset "broadcast of a 6-byte struct" begin
+        include(joinpath(@__DIR__, "test_broadcast_struct_stride6.jl"))
+    end
+
     # ── Tier 3d: SPIR-V emitter pattern correctness & stress (full only) ──
     #
     # Patterns here have each, at some point, miscompiled on a specific driver
