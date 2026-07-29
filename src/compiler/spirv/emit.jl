@@ -5874,6 +5874,49 @@ function emit_select!(state::SPIRVEmitterState, inst::LLVM.SelectInst)
     false_val = get_value_id!(state, ops[3])
     llvm_ty = LLVM.value_type(inst)
 
+    # `select i1` becomes logical ops, never `OpSelect %bool`.
+    #
+    # `OpSelect` with a Bool result type is valid SPIR-V and validates clean, and the
+    # driver honours it while the operands are produced in the same block. It returns
+    # the *condition* instead of the selected operand once an operand is a Bool
+    # defined in another block and read inside a loop body — which is precisely the
+    # shape LLVM produces after hoisting a loop-invariant comparison into the loop
+    # preheader. The result is a guard that silently stops guarding: for
+    # `(t < 0 || t % s != 0) && continue` the `t < 0` half survived and the
+    # divisibility half was dropped, so `convolutiontranspose!` accumulated into
+    # every output pixel rather than only the ones an input actually maps to.
+    #
+    # Same reasoning as `emit_bitwise_or_logical!` above, which already keeps `and`/`or`
+    # off the bitwise opcodes for i1. On booleans `select c, a, b` is
+    # `(c & a) | (!c & b)`; the four constant-operand forms collapse to one
+    # instruction and cover what LLVM actually emits, since it canonicalises `||` and
+    # `&&` to `select c, true, b` and `select c, a, false`.
+    if is_bool_type(llvm_ty)
+        bool_ty = map_type!(state.type_ctx, llvm_ty)
+        logical!(op, args...) = begin
+            id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, op, bool_ty, id, args...)
+            id
+        end
+        constbool(v) = v isa LLVM.ConstantInt ? convert(Int64, v) != 0 : nothing
+        t, f = constbool(ops[2]), constbool(ops[3])
+        result_id = if t === true
+            logical!(Op.OpLogicalOr, cond, false_val)
+        elseif t === false
+            logical!(Op.OpLogicalAnd, logical!(Op.OpLogicalNot, cond), false_val)
+        elseif f === true
+            logical!(Op.OpLogicalOr, logical!(Op.OpLogicalNot, cond), true_val)
+        elseif f === false
+            logical!(Op.OpLogicalAnd, cond, true_val)
+        else
+            logical!(Op.OpLogicalOr,
+                     logical!(Op.OpLogicalAnd, cond, true_val),
+                     logical!(Op.OpLogicalAnd, logical!(Op.OpLogicalNot, cond), false_val))
+        end
+        state.value_map[inst] = result_id
+        return
+    end
+
     # Pointer select: SPIR-V's OpSelect requires both objects to have the *result* type.
     # The operands were already emitted with some concrete pointer type; reconcile from
     # those ACTUALLY-emitted pointees rather than a possibly-newer PTM inference. This is
