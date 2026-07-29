@@ -89,6 +89,9 @@ consecutive columns. Lowers to `OpCooperativeMatrixLoadKHR`.
 @inline AcceleratedMatrix{T,M,N,U}(src, offset::Integer, stride::Integer) where {T,M,N,U} =
     coopmat_load(AcceleratedMatrix{T,M,N,U}, src, offset, stride)
 
+# The `@localmem` forms of these live in `array/ka_backend.jl`, beside
+# `LavaSharedArray` — this file is included before that type exists.
+
 """
     copyto!(dst, offset, stride, m)
 

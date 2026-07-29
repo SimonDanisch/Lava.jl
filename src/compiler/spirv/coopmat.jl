@@ -109,6 +109,33 @@ function coopmat_base_pointer!(state::SPIRVEmitterState, addr_val::LLVM.Value,
 end
 
 """
+Pointer to the tile's first element in `Workgroup` memory — the `loadw`/`storew`
+half of the intrinsics.
+
+Nothing is converted here, and in particular nothing is **bitcast**. Vulkan's
+Logical addressing model permits `OpBitcast` between pointer types only for
+`PhysicalStorageBuffer`; a `Workgroup` pointer must be arrived at by
+`OpAccessChain`. Emitting one anyway is not caught by `spirv-val` — the module
+validates — and NVIDIA's shader compiler **segfaults on it**, inside
+`vkCreateComputePipelines`, which is how this was found. GLSL's `coopMatLoad`
+on a `shared` array produces an access chain for the same reason.
+
+`ptr_val` is always the `@localmem` array itself and `idx_val` the element index
+— the intrinsic passes the index rather than folding it into a `getelementptr`,
+precisely so that only one shape ever reaches here. See `coopmat_intrinsics.jl`.
+"""
+function coopmat_workgroup_pointer!(state::SPIRVEmitterState, ptr_val::LLVM.Value,
+                                    idx_val::LLVM.Value, comp_ty::UInt32)
+    mod = state.mod
+    src_id = get_value_id!(state, ptr_val)
+    idx_id = get_value_id!(state, idx_val)
+    ptr_ty = map_pointer_type!(state.type_ctx, comp_ty, SC.Workgroup)
+    id = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpAccessChain, ptr_ty, id, src_id, idx_id)
+    return id
+end
+
+"""
     emit_coopmat_call!(state, inst, fn_name) -> nothing
 
 Lower one `_lava_coopmat_*` call. Dispatched from `emit_call!`.
@@ -123,10 +150,17 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
     mat_ty = emit_coopmat_type!(state, dtype, M, N, use)
     args = LLVM.operands(inst)
 
-    if op == "load"
+    # `load`/`store` address global memory through a device address;
+    # `loadw`/`storew` address `@localmem` through a Workgroup pointer. The only
+    # difference is how the pointer is produced — the instruction, the layout and
+    # the stride are identical — so the two share everything below.
+    if op == "load" || op == "loadw"
         comp_ty = coopmat_component_type!(state, dtype)
-        ptr_id = coopmat_base_pointer!(state, args[1], comp_ty)
-        stride_id = get_value_id!(state, args[2])
+        # `loadw` carries an extra element-index argument; see below.
+        ptr_id, stride_arg = op == "loadw" ?
+            (coopmat_workgroup_pointer!(state, args[1], args[2], comp_ty), args[3]) :
+            (coopmat_base_pointer!(state, args[1], comp_ty), args[2])
+        stride_id = get_value_id!(state, stride_arg)
             layout_id = emit_constant_u32!(mod, CoopMatLayout.ColumnMajor)
         id = fresh_id!(mod)
         encode_instruction!(mod.functions, Op.OpCooperativeMatrixLoadKHR,
@@ -134,11 +168,13 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         state.value_map[inst] = id
         state.coopmat_value_types[inst] = mat_ty
 
-    elseif op == "store"
+    elseif op == "store" || op == "storew"
         comp_ty = coopmat_component_type!(state, dtype)
-        ptr_id = coopmat_base_pointer!(state, args[1], comp_ty)
-        stride_id = get_value_id!(state, args[2])
-        obj_id = get_value_id!(state, args[3])
+        ptr_id, stride_arg, obj_arg = op == "storew" ?
+            (coopmat_workgroup_pointer!(state, args[1], args[2], comp_ty), args[3], args[4]) :
+            (coopmat_base_pointer!(state, args[1], comp_ty), args[2], args[3])
+        stride_id = get_value_id!(state, stride_arg)
+        obj_id = get_value_id!(state, obj_arg)
             layout_id = emit_constant_u32!(mod, CoopMatLayout.ColumnMajor)
         encode_instruction!(mod.functions, Op.OpCooperativeMatrixStoreKHR,
                             ptr_id, obj_id, layout_id, stride_id)

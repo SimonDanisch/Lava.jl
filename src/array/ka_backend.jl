@@ -1043,6 +1043,29 @@ end
 @inline LavaSharedArray{T}(ptr::Core.LLVMPtr{T, 3}, len::Integer) where {T} =
     LavaSharedArray{T, (Int(len),)}(ptr, Int(len))
 
+"""
+    AcceleratedMatrix{T,M,N,Use}(shared, offset, stride)
+
+Load a cooperative matrix out of `@localmem` rather than out of global memory —
+the same call as the device-array form, with a `Workgroup` pointer instead of a
+device address.
+
+Here rather than beside the rest of `AcceleratedMatrix` only because
+`device/acceleratedmatrix.jl` is included before this type exists.
+
+Taking the array rather than making callers reach for `.ptr`: that field is an
+implementation detail, and a kernel reading `AcceleratedMatrix{...}(tile, 1, 16)`
+should say the same thing whether `tile` is shared or global.
+"""
+@inline AcceleratedMatrix{T,M,N,U}(src::LavaSharedArray, offset::Integer,
+                                   stride::Integer) where {T,M,N,U} =
+    coopmat_load(AcceleratedMatrix{T,M,N,U}, src.ptr, offset, stride)
+
+"""Store a cooperative matrix into `@localmem`; see the load above."""
+@inline Base.copyto!(dst::LavaSharedArray, offset::Integer, stride::Integer,
+                     m::AcceleratedMatrix) =
+    coopmat_store(dst.ptr, offset, stride, m)
+
 # Column-major linear index from an N-d cartesian index, fully constant-folded
 # (both `dims` and the index arity are compile-time constants here).
 @inline function lava_shared_linear(dims::NTuple{N,Int}, I::NTuple{N,Integer}) where N

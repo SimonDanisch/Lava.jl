@@ -60,6 +60,73 @@ end
     end
 end
 
+# ── Workgroup (shared) memory ────────────────────────────────────────────────
+#
+# The methods above take a `Ptr`, i.e. an integer device address, which the
+# emitter turns into a `PhysicalStorageBuffer` pointer. Shared memory has no
+# such address: `@localmem` is an LLVM global in `addrspace(3)` and the only way
+# to name it is to keep the pointer, so these take a `Core.LLVMPtr{S,3}` and the
+# emitter reads the storage class off the pointer instead of assuming one.
+#
+# Separate intrinsic names (`loadw`/`storew`) rather than the same name with a
+# different argument type, because the emitter dispatches on the LLVM function
+# name and nothing else — the same reason the shape is in the name.
+#
+# This is what a shared-memory staged GEMM needs. Loading cooperative matrices
+# straight from global, as `coopmat_gemm_kernel!` does, re-reads each tile once
+# per register-block row and column; every high-performance GEMM stages a block
+# into shared once and loads from there.
+
+"""
+The element offset is an *argument*, not a GEP.
+
+Doing it as a GEP made the emitter's job depend on whether LLVM had folded it:
+at offset 1 the `getelementptr` by zero disappeared and what arrived was a
+pointer to the whole array, while at offset 17 it survived — as a constant
+expression rather than an instruction, so no test on the LLVM node kind
+distinguished the two reliably. Passing the index through means the emitter
+always sees the same shape and always emits exactly one `OpAccessChain`.
+"""
+@generated function coopmat_load(::Type{AcceleratedMatrix{T,M,N,U}},
+                                 ptr::Core.LLVMPtr{S,3},
+                                 offset::Integer, stride::Integer) where {T,M,N,U,S}
+    fname = coopmat_intrinsic_name("loadw", T, M, N, U)
+    ir = """
+        declare i32 @$fname(ptr addrspace(3), i32, i32) #0
+        define i32 @entry(ptr addrspace(3) %p, i32 %o, i32 %s) #0 {
+            %r = call i32 @$fname(ptr addrspace(3) %p, i32 %o, i32 %s)
+            ret i32 %r
+        }
+        attributes #0 = { alwaysinline convergent }
+    """
+    quote
+        h = Base.llvmcall(($ir, "entry"), Int32,
+                          Tuple{Core.LLVMPtr{$S,3},UInt32,UInt32},
+                          ptr, UInt32(offset - 1), UInt32(stride))
+        AcceleratedMatrix{$T,$M,$N,$U}(h)
+    end
+end
+
+@generated function coopmat_store(ptr::Core.LLVMPtr{S,3}, offset::Integer,
+                                  stride::Integer,
+                                  m::AcceleratedMatrix{T,M,N,U}) where {S,T,M,N,U}
+    fname = coopmat_intrinsic_name("storew", T, M, N, U)
+    ir = """
+        declare void @$fname(ptr addrspace(3), i32, i32, i32) #0
+        define void @entry(ptr addrspace(3) %p, i32 %o, i32 %s, i32 %h) #0 {
+            call void @$fname(ptr addrspace(3) %p, i32 %o, i32 %s, i32 %h)
+            ret void
+        }
+        attributes #0 = { alwaysinline convergent }
+    """
+    quote
+        Base.llvmcall(($ir, "entry"), Cvoid,
+                      Tuple{Core.LLVMPtr{$S,3},UInt32,UInt32,Int32},
+                      ptr, UInt32(offset - 1), UInt32(stride), m.handle)
+        nothing
+    end
+end
+
 @generated function coopmat_store(ptr::Ptr{S}, offset::Integer, stride::Integer,
                                   m::AcceleratedMatrix{T,M,N,U}) where {S,T,M,N,U}
     fname = coopmat_intrinsic_name("store", T, M, N, U)
@@ -118,7 +185,8 @@ end
 # The emitter matches on the prefix, so individual names need no registration;
 # this keeps GPUCompiler's unknown-intrinsic check happy for the common shapes.
 for T in (Float16, Float32), U in (MatrixA, MatrixB, Accumulator),
-    (M, N) in ((16, 16), (16, 8)), op in ("load", "store", "zero", "muladd")
+    (M, N) in ((16, 16), (16, 8)),
+    op in ("load", "store", "zero", "muladd", "loadw", "storew")
     push!(KNOWN_INTRINSICS, coopmat_intrinsic_name(op, T, M, N, U))
 end
 
