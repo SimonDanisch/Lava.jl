@@ -165,6 +165,27 @@ end
     end
 end
 
+# ── the permuted-copy path is bandwidth-bound, not index-bound ───────────────
+#
+# `dest .= PermutedDimsArray(a, perm)` is **203 of 203** dispatches on this path
+# for SAM 2's encoder — 40.1 ms, the third-largest kernel family, moving ~2.4 GB
+# at 60 GB/s where a plain copy of the same bytes runs at 150-270. In 178 of
+# them `perm[1] == 1` (Hiera's window partition `(1,2,4,3,5,6)`, attention's
+# head/token swap `(1,3,2,4)`), so the copy is a permutation of whole contiguous
+# rows and the general kernel's per-element `cart32` decomposition plus
+# `PermutedDimsArray` re-indexing looks like pure overhead.
+#
+# It is not. A kernel that decomposes only the *row* index and adds the column —
+# written, bit-exact on every shape the encoder uses, and verified firing on 90
+# dispatches per encode — is worth **-0.5 ms end to end**, which is noise. Both
+# kernels touch memory in the same order, and that order is what the time is.
+#
+# Recorded rather than kept: the addressing is not the cost, so anything that
+# helps has to change the access pattern — a tiled staging transpose, as
+# `DNNKernels`' `toLE_tiled` does — rather than the index arithmetic.
+# `BROADCAST_PROBE[]` below is what identified the shapes.
+
+
 """
 Can every operand be read with the destination's own linear index?
 
@@ -194,12 +215,41 @@ flat1(x) = x
 flat1(x::AbstractArray) = reshape(x, length(x))
 flat1(bc::Broadcast.Broadcasted) = Broadcast.broadcasted(bc.f, map(flat1, bc.args)...)
 
+"""
+    BROADCAST_PROBE[] :: Union{Nothing,Dict}
+
+Set to a dict to record which broadcast kernel each `.=` takes, keyed by
+`(path, dest size, leaf sizes)`. Off by default and free when off.
+
+The three paths differ by roughly 3x in achieved bandwidth and which one a
+broadcast lands on is decided by operand *shapes*, invisibly. On SAM 2's encoder
+`lava_broadcast_flat_mixed!` — the one that pays a `cart32` division chain per
+element — is 203 dispatches and 40 ms, the third-largest kernel family, and this
+is how to find out what is feeding it.
+"""
+const BROADCAST_PROBE = Ref{Any}(nothing)
+
+leafsizes(x) = Any[]
+leafsizes(x::AbstractArray) = Any[(size(x), nameof(typeof(x)), IndexStyle(x) === IndexLinear())]
+leafsizes(x::PermutedDimsArray{T,N,perm}) where {T,N,perm} = Any[(size(parent(x)), :Permuted, perm)]
+leafsizes(x::Broadcast.Extruded) = leafsizes(x.x)
+leafsizes(bc::Broadcast.Broadcasted) = reduce(vcat, map(leafsizes, bc.args); init = Any[])
+
+function probe_broadcast!(path, dest, bc)
+    p = BROADCAST_PROBE[]
+    p === nothing && return
+    key = (path, size(dest), Tuple(unique(leafsizes(bc))))
+    p[key] = get(p, key, 0) + 1
+    return
+end
+
 function GPUArrays._copyto!(dest::AnyLavaArray, bc::Broadcast.Broadcasted)
     axes(dest) == axes(bc) || Broadcast.throwdm(axes(dest), axes(bc))
     isempty(dest) && return dest
     n = length(dest)
     backend = LavaBackend()
     if ndims(dest) > 1 && IndexStyle(dest) === IndexLinear() && flatok(dest, bc)
+        probe_broadcast!(:flat, dest, bc)
         flat = Broadcast.instantiate(flat1(bc))
         d1 = reshape(dest, n)
         lava_broadcast_flat!(backend)(d1, Broadcast.preprocess(d1, flat), n; ndrange = n)
@@ -210,10 +260,13 @@ function GPUArrays._copyto!(dest::AnyLavaArray, bc::Broadcast.Broadcasted)
     # Extents as `Int32` for `cart32`; anything Lava can address fits.
     sz = map(Int32, size(dest))
     if linear
+        probe_broadcast!(:linear1d, dest, bc)
         lava_broadcast_flat!(backend)(dest, bc, n; ndrange = n)
     elseif IndexStyle(dest) === IndexLinear()
+        probe_broadcast!(:mixed, dest, bc)
         lava_broadcast_flat_mixed!(backend)(dest, bc, sz, n; ndrange = n)
     else
+        probe_broadcast!(:cartesian, dest, bc)
         lava_broadcast_flat_cartesian!(backend)(dest, bc, sz, n; ndrange = n)
     end
     return dest
