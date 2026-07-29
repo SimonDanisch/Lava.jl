@@ -903,6 +903,27 @@ end
     return v
 end
 
+# Trailing singleton indices. Julia lets you index an array with MORE indices
+# than it has dimensions as long as the extras are 1 — `v[i, 1]` is valid for a
+# Vector, `A[i, j, 1]` for a Matrix — and generic kernels rely on it rather than
+# specialising on ndims. GPUArrays' `gpu_kron_kernel!` does exactly that: it
+# indexes `a[i, j]` where `a` is whichever operand it was handed, so
+# `kron(vec(x), y)` passes a 1-D array and the kernel fails to compile with a
+# method lookup failure inside `linear_index` — for every element type, since
+# nothing about it is type-specific.
+#
+# Only M > N is handled. M < N (fewer indices than dimensions, where the last
+# index spans the remaining ones) is a different rule and no caller here needs
+# it; the branch is resolved at compile time, so the error never reaches a
+# shader.
+@inline function linear_index(dims::NTuple{N,Int}, I::CartesianIndex{M}) where {N,M}
+    if M > N
+        linear_index(dims, CartesianIndex(ntuple(i -> I[i], Val(N))))
+    else
+        error("linear_index: $M indices for $N dimensions is not supported")
+    end
+end
+
 # Convert CartesianIndex to linear index for LavaDeviceArray
 @inline function linear_index(dims::NTuple{1,Int}, I::CartesianIndex{1})
     I[1]

@@ -77,3 +77,47 @@ const KA = KernelAbstractions
         @test vec(Array(dst)) == Float32.(1:prod(dims))
     end
 end
+
+# Trailing singleton indices: MORE indices than the array has dimensions.
+#
+# Julia allows `v[i, 1]` on a Vector and `A[i, j, 1]` on a Matrix, and generic
+# kernels lean on it instead of specialising on ndims. GPUArrays'
+# `gpu_kron_kernel!` indexes `a[i, j]` whatever `a` is, so `kron(vec(x), y)`
+# hands it a 1-D array — and `linear_index(::NTuple{N}, ::CartesianIndex{M})`
+# only had methods for M == N, so the kernel failed to compile:
+#
+#   Cannot compile gpu_kron_kernel!(…, ::LavaDeviceArray{T,1}, ::LavaDeviceArray{T,2})
+#   → getindex @ ka_backend.jl → Problem: method lookup failure
+#
+# Nothing about it was type-specific; every eltype failed identically.
+@testset "trailing singleton indices (more indices than dims)" begin
+    be = Lava.LavaBackend()
+
+    @testset "kron(vec, matrix) — $T" for T in (Int16, Float32, ComplexF32)
+        ha = rand(T, 16, 32)
+        hb = rand(T, 64, 8)
+        a = Lava.LavaArray(ha)
+        b = Lava.LavaArray(hb)
+        for op in (identity, transpose, adjoint)
+            got = Array(kron(vec(a), op(b)))
+            ref = kron(vec(ha), op(hb))
+            @test size(got) == size(ref)
+            # Float kron reassociates on the GPU, so compare approximately for
+            # the float eltypes and exactly for the integer one.
+            @test T <: Integer ? got == ref : got ≈ ref
+        end
+    end
+
+    @testset "reading a 1-D device array with two indices" begin
+        n = 8
+        src = Lava.LavaArray(Float32.(1:n))
+        dst = Lava.LavaArray(zeros(Float32, n))
+        @kernel function trailing_one!(dst, @Const(src))
+            i = @index(Global, Linear)
+            @inbounds dst[i] = src[i, 1]      # trailing singleton
+        end
+        trailing_one!(be)(dst, src; ndrange = n)
+        KA.synchronize(be)
+        @test Array(dst) == Float32.(1:n)
+    end
+end
