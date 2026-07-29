@@ -6605,7 +6605,8 @@ end
 #   _lava_subgroup_<op>_<suffix>     — reduction/scan or arithmetic-style op
 #   _lava_subgroup_elect             — returns i1, true on exactly one lane
 #   _lava_subgroup_broadcast_first_T — pick value from first active lane
-#   _lava_subgroup_ballot            — i32 → i32 (lane predicate bitmask; we use one dword)
+#   _lava_subgroup_ballot            — i1 → uvec4 (lane predicate bitmask; NOT one dword,
+#                                      see the wave64 note at the emission site)
 #   _lava_subgroup_all               — boolean vote: all lanes' predicate true
 #   _lava_subgroup_any               — boolean vote: any lane's predicate true
 #
@@ -6685,7 +6686,13 @@ function emit_lava_subgroup!(state::SPIRVEmitterState, inst::LLVM.CallInst, name
         return
     end
 
-    # ── Ballot (i1 predicate → 32-bit bitmask of lanes passing the predicate) ──
+    # ── Ballot (i1 predicate → bitmask of lanes passing the predicate) ──
+    # OpGroupNonUniformBallot always yields a uvec4, i.e. up to 128 lanes. There
+    # is currently no Julia-side intrinsic that reaches this branch; whoever adds
+    # one must read more than the low dword, because a subgroup wider than 32
+    # lanes (AMD wave64 reports subgroupSize 64) puts lanes 32..63 in `.y` and
+    # taking only `.x` silently drops half the subgroup. Same class of bug as the
+    # coopmat GEMM's `lane ÷ 32` — see COOPMAT_SUBGROUP in runtime/pipeline.jl.
     if name == "_lava_subgroup_ballot"
         require_capability!(state.mod, Cap.GroupNonUniformBallot)
         # Declare uvec4 result type (ballot is always <4 x i32>); caller sees
