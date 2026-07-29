@@ -1025,40 +1025,22 @@ function reset_pool_accounting!()
     return
 end
 
-"""
-    POOL_RECLAIM_WATERMARK[]
-
-Reclaim empty pool blocks once this many are live, rather than waiting for an
-OOM. `0` restores the old behaviour of only reclaiming on allocation failure.
-
-A backstop rather than the policy. [`POOL_SOFT_CAP`] holds the pool well below
-this by collecting instead of destroying, and on the workload that motivated
-both — SAM 2's encoder — the pool settles at 32 blocks against this 48, so the
-sweep does not normally fire at all. It stays for the case the cheap mechanism
-cannot handle: memory that really is unreachable *and* whose blocks are empty,
-where returning the VkDeviceMemory to the driver is the only thing that helps.
-
-Keep it above the soft cap. The reclaim quiesces the queue, and firing one per
-block allocation cost **2.83x** on SAM 2's encoder (1 046 ms against 370) — it
-found nothing to free and drained the GPU anyway, every time. That is also why
-[`POOL_RECLAIM_AT`] backs off when a sweep does not pay for itself.
-"""
-const POOL_RECLAIM_WATERMARK = Ref(48)
-
-"""
-Block count at which the next sweep fires. Raised when a sweep does not pay for
-itself, so a steady state that simply needs its blocks stops being swept.
-
-The back-off is the whole design. A sweep quiesces the queue, and firing one on
-*every* block allocation past the watermark cost **2.83x** on SAM 2's encoder
-(1046 ms against 370) — the reclaim found nothing to free and drained the queue
-anyway, every time. Freeing >= `POOL_RECLAIM_MINBLOCKS` keeps the trigger where
-it is so a shrinking workload keeps shrinking; below that it moves out by half
-the current pool, which decays to never for a workload at its true high-water
-mark.
-"""
-const POOL_RECLAIM_AT = Ref(0)
-const POOL_RECLAIM_MINBLOCKS = 4
+# A block-count watermark used to live here, reclaiming on the allocation path
+# once the pool passed 48 blocks. It is gone: [`maybe_trim_pool!`] does the same
+# job — return dead capacity to the driver — and does it better, because it is
+# limited by elapsed time rather than by allocation count and it only pays
+# `quiesce_before_reclaim!` when a block is actually empty. The watermark
+# version quiesced whether or not anything came back, which cost **2.83x** on
+# SAM 2's encoder (1 046 ms against 370) before a back-off was bolted on.
+#
+# Two mechanisms, two jobs, and they are not interchangeable:
+#
+#   * [`POOL_SOFT_CAP`] stops the pool GROWING. On the allocation path, cheap,
+#     no queue drain — the memory comes back as free-list chunks the caller
+#     takes immediately.
+#   * [`POOL_TRIM_THRESHOLD`] RELEASES capacity that is already dead, back to
+#     the driver. Periodic, expensive, and the only thing that helps when the
+#     pressure is on memory the rest of the machine needs.
 
 """
     POOL_SOFT_CAP[]
@@ -1067,13 +1049,18 @@ Pool footprint in bytes past which `pool_alloc` collects *before* committing
 another block. `0` disables it.
 
 This is the cheap half of keeping the pool small, and it is deliberately not
-the same mechanism as [`POOL_RECLAIM_WATERMARK`]:
+the same mechanism as [`maybe_trim_pool!`]:
 
   * here we run a **GC and reuse** — no queue drain, no Vulkan call, and the
-    memory comes back as free-list chunks the caller immediately takes;
-  * there we **destroy blocks**, which needs `quiesce_before_reclaim!` and
-    therefore stalls the GPU. Measured at 2.83x on SAM 2's encoder when it fired
-    per block allocation.
+    memory comes back as free-list chunks the caller immediately takes, so this
+    can afford to run on the allocation path;
+  * there we **destroy blocks** and hand the VkDeviceMemory back, which needs
+    `quiesce_before_reclaim!` and therefore stalls the GPU — so it is limited by
+    elapsed time and skipped entirely unless a block is actually empty.
+
+Preventing growth and releasing dead capacity are different problems: this one
+keeps a steady workload's footprint flat, that one is what stops a finished
+workload from holding memory the rest of the machine needs.
 
 Without a trigger here the only backstop is `maybe_collect`, whose pressure
 threshold is a fraction of the *device heap* — 0.75 x 20 GiB on this card. That
@@ -1140,25 +1127,8 @@ function collect_for_pool!(bq::BatchQueue)
     return true
 end
 
-push!(RESET_CALLBACKS, function()
-    POOL_RECLAIM_AT[] = 0
-end)
-
 """Allocate a new pool block (one large VkBuffer)."""
 function alloc_pool_block(bq::BatchQueue)
-    w = POOL_RECLAIM_WATERMARK[]
-    if w > 0
-        POOL_RECLAIM_AT[] < w && (POOL_RECLAIM_AT[] = w)
-        nblocks = length(POOL_BLOCKS)
-        if nblocks >= POOL_RECLAIM_AT[]
-            quiesce_before_reclaim!(bq)
-            n, freed = reclaim_empty_pool_blocks!(bq)
-            POOL_RECLAIM_AT[] = n >= POOL_RECLAIM_MINBLOCKS ?
-                max(w, length(POOL_BLOCKS)) :
-                length(POOL_BLOCKS) + max(8, length(POOL_BLOCKS) ÷ 2)
-            n > 0 && @debug "Lava: reclaimed pool blocks" blocks=n MiB=(freed >> 20) next=POOL_RECLAIM_AT[]
-        end
-    end
     buf_result = try_vk_alloc(bq, POOL_BLOCK_SIZE)
     if buf_result isa AllocFailure
         quiesce_before_reclaim!(bq)
