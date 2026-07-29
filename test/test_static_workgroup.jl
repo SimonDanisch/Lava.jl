@@ -1,40 +1,34 @@
 """
-A workgroup passed in the kernel's TYPE computes wrong global indices when it has
-an INTERIOR unit extent — and `Lava.WORKGROUP_FALLBACK` now catches that.
+FIXED. A workgroup passed in the kernel's TYPE used to compute wrong global
+indices when it had an INTERIOR unit extent; it no longer does, verified with
+`Lava.WORKGROUP_FALLBACK` switched OFF across every shape below.
 
-The fault: with such a workgroup baked into the kernel's type, the block index
-decode takes the wrong divisor for dimension 2 and exactly
-`min(1, blocks[3] / blocks[2])` of the output is written, silently. A *trailing*
-unit extent is harmless, which is why ranks 1-3 look clean. It is Lava's codegen,
-not KernelAbstractions': the same kernel, workgroup and ndrange are correct on
-`KA.CPU()`, which runs the same `expand`/`NDRange` machinery.
+The fault was: with such a workgroup baked into the kernel's type, the block
+index decode took the wrong divisor for dimension 2 and exactly
+`min(1, blocks[3] / blocks[2])` of the output was written, silently. A *trailing*
+unit extent was harmless, which is why ranks 1-3 looked clean. It was Lava's
+codegen, not KernelAbstractions': the same kernel, workgroup and ndrange were
+correct on `KA.CPU()`.
 
-`(obj::KA.Kernel{LavaBackend})` now detects the shape and re-launches through the
-dynamic path, which computes correct indices. That costs ~2x on the affected
-kernels (the index arithmetic stops being compile-time constant) and cannot
-affect any launch that was already right. This file checks BOTH halves: that the
-guard fixes it, and — with the guard switched off — that the underlying fault is
-still there, so nobody deletes a guard that is still load-bearing.
-
-Superseded framing, kept because the API rule still holds:
-
-    kernel(backend, wg)(args...; ndrange)                      # WRONG at rank 4
-    kernel(backend)(args...; ndrange, workgroupsize = wg)      # correct
-    kernel(backend, wg, ndrange)(args...)                      # correct
-
-Found because `permutedims!` used the first spelling: `ndrange = (72, 256, 8, 16)`
+Found because `permutedims!` used the typed spelling: `ndrange = (72, 256, 8, 16)`
 with `wg = (32, 4, 1, 1)` left 2 064 384 of 2 359 296 destination elements never
-written, with no error anywhere. Every group does run — the per-lane global
-indices simply collide, so 8 groups land on the same region and the rest of the
-array is never visited.
+written, with no error anywhere.
 
-The failing configuration is the only one whose iteration space pairs a real
-`blocks` field with a zero-size `workitems::Nothing`; both-static has two
-`Nothing`s and the keyword form has two real fields, and both are correct. Ranks
-1-3 and rank 5 are also correct, which is what makes this easy to walk past.
+This file previously asserted the fault was STILL PRESENT with the guard off, so
+that nobody deleted a load-bearing guard. Those assertions now fail, which is how
+the fix was noticed — the file was never registered in runtests.jl, so nobody ran
+it. They are flipped to assert correctness.
 
-Kept as a test rather than a comment so that whoever fixes the layout finds out.
-Until then the rule is: pass workgroup sizes as the launch keyword.
+OPEN: `Lava.WORKGROUP_FALLBACK` re-launches the affected shapes through the
+dynamic path at roughly 2x the cost of the static one. With the fault gone it is
+dead weight, but it has only been re-verified on one device (AMD 8060S / Windows).
+Confirm on the other drivers before removing it.
+
+The API rule still holds and is still worth following:
+
+    kernel(backend, wg)(args...; ndrange)                      # typed
+    kernel(backend)(args...; ndrange, workgroupsize = wg)      # keyword
+    kernel(backend, wg, ndrange)(args...)                      # both-static
 """
 
 using Test, Lava, KernelAbstractions
@@ -90,17 +84,17 @@ end
         @test coverage((72, 256, 8, 16), (32, 4, 1, 1), :bothstatic) == 1.0
     end
 
-    @testset "the typed form is correct only outside rank 4" begin
+    @testset "the typed form is correct at every rank" begin
         @test coverage((1000,), (64,), :typed) == 1.0
         @test coverage((250, 250), (32, 4), :typed) == 1.0
         @test coverage((72, 64, 64), (32, 4, 1), :typed) == 1.0
         @test coverage((8, 8, 8, 8, 8), (8, 1, 1, 1, 1), :typed) == 1.0
-        # Documented failure. Flip these to `== 1.0` when the layout is fixed.
-        @test coverage((72, 256, 8, 16), (32, 4, 1, 1), :typed; fallback = false) < 1.0
-        @test coverage((72, 8, 1, 1), (32, 4, 1, 1), :typed; fallback = false) < 1.0
+        # Was the documented failure; correct now even with the guard OFF.
+        @test coverage((72, 256, 8, 16), (32, 4, 1, 1), :typed; fallback = false) == 1.0
+        @test coverage((72, 8, 1, 1), (32, 4, 1, 1), :typed; fallback = false) == 1.0
     end
 
-    @testset "the trigger is workitems[3] == 1" begin
+    @testset "workitems[3] == 1 was the trigger; no longer" begin
         # Sharpest form of the bug. At rank 4 the typed spelling is wrong IFF the
         # THIRD workgroup extent is 1; `wg[4]` is irrelevant. With `wg[3] > 1`
         # every block grid is correct, so a unit interior workitem extent is what
@@ -110,32 +104,33 @@ end
         for wg in ((32, 4, 2, 1), (32, 4, 4, 1))
             @test coverage(ND, wg, :typed; fallback = false) == 1.0   # wg[3] > 1: fine
         end
+        # These once wrote only min(1, b3/b2) of the output. Full now.
         for wg in ((32, 4, 1, 1), (32, 4, 1, 2), (32, 1, 1, 1), (32, 8, 1, 1))
-            b = cld.(ND, wg)
-            @test coverage(ND, wg, :typed; fallback = false) ≈ min(1.0, b[3] / b[2])
+            @test coverage(ND, wg, :typed; fallback = false) == 1.0
         end
     end
 
-    @testset "an INTERIOR unit extent is the trigger, a trailing one is harmless" begin
+    @testset "an INTERIOR unit extent was the trigger; no longer" begin
         # Generalises past rank 4 and explains the whole pattern: ranks 1-3 look
         # clean because `(32,4,1)`'s unit extent is trailing, and the rank-5 case
         # that passed earlier did so because it satisfied b2 <= b3, not because
         # rank 5 is immune.
         ND5 = (32, 128, 8, 4, 2)
-        @test coverage(ND5, (16, 4, 1, 1, 1), :typed; fallback = false) < 1.0   # dims 3,4 unit, interior
-        @test coverage(ND5, (16, 4, 2, 1, 1), :typed; fallback = false) < 1.0   # dim 4 unit, interior
+        @test coverage(ND5, (16, 4, 1, 1, 1), :typed; fallback = false) == 1.0  # dims 3,4 unit, interior
+        @test coverage(ND5, (16, 4, 2, 1, 1), :typed; fallback = false) == 1.0  # dim 4 unit, interior
         @test coverage(ND5, (16, 4, 2, 2, 1), :typed) == 1.0  # only dim 5, trailing
     end
 
-    @testset "the failure obeys an exact law: written = min(1, b3/b2)" begin
+    @testset "the old failure law min(1, b3/b2) no longer holds" begin
         # Not decoration — this is the sharpest statement of the bug and the
         # thing a fix has to explain. Dimension 2 of the BLOCK grid is decoded
         # with dimension 3's extent as its divisor, so its component ranges over
         # `0:b3-1` instead of `0:b2-1` and exactly `b3/b2` of the output is
         # written. Verified over a 6x5 grid; a few representative cells here.
         law(b2, b3) = coverage((64, 4b2, b3, 2), (32, 4, 1, 1), :typed; fallback = false)
+        # Every one of these used to write exactly min(1, b3/b2) of the output.
         for (b2, b3) in ((2, 1), (4, 2), (8, 1), (16, 4), (64, 8))
-            @test law(b2, b3) ≈ min(1.0, b3 / b2)
+            @test law(b2, b3) == 1.0
         end
         # …and it is correct exactly when b2 <= b3.
         for (b2, b3) in ((2, 2), (4, 4), (8, 16), (2, 8))
