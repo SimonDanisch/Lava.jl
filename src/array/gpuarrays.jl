@@ -114,8 +114,8 @@ Base.Broadcast.BroadcastStyle(::Type{<:Base.ReshapedArray{T, N, <:AnyLavaArray}}
 # the broadcast genuinely needs one. That div/mod chain is far cheaper than
 # losing coalescing. This is the single largest thing in Lava for anything
 # elementwise — `add`, `relu`, `sigmoid`, `_to_copy`, `cat` and every kernel
-# epilogue in LavaDNN were all running at a quarter of the achievable bandwidth.
-@kernel function lava_broadcast_flat!(dest, bc, n)
+# epilogue in DNNKernels were all running at a quarter of the achievable bandwidth.
+@kernel cpu=false function lava_broadcast_flat!(dest, bc, n)
     I = @index(Global, Linear)
     if I <= n
         @inbounds dest[I] = bc[I]
@@ -149,7 +149,7 @@ on recursive call graphs does not apply.
     (Int(q % s) + 1, cart32(q ÷ s, Base.tail(sz))...)
 end
 
-@kernel function lava_broadcast_flat_cartesian!(dest, bc, sz, n)
+@kernel cpu=false function lava_broadcast_flat_cartesian!(dest, bc, sz, n)
     I = @index(Global, Linear)
     if I <= n
         J = CartesianIndex(cart32(Int32(I) - Int32(1), sz))
@@ -158,7 +158,7 @@ end
 end
 
 """Destination dense, source not: index `dest` linearly and only `bc` by index."""
-@kernel function lava_broadcast_flat_mixed!(dest, bc, sz, n)
+@kernel cpu=false function lava_broadcast_flat_mixed!(dest, bc, sz, n)
     I = @index(Global, Linear)
     if I <= n
         @inbounds dest[I] = bc[CartesianIndex(cart32(Int32(I) - Int32(1), sz))]
@@ -301,7 +301,7 @@ end
 function Base.fill!(a::LavaArray{T}, val) where T
     length(a) == 0 && return a
     v = convert(T, val)
-    @kernel function fill_kernel!(A, v)
+    @kernel cpu=false function fill_kernel!(A, v)
         I = @index(Global)
         @inbounds A[I] = v
     end
@@ -497,7 +497,7 @@ end
 # which is how a version using `perm` directly passed a benchmark on that shape
 # and still produced garbage for SAM 2, whose encoder also uses permutations that
 # are not. Throughput without a correctness check proves nothing.
-@kernel function lava_permutedims_kernel!(dest, @Const(src), ::Val{IP}) where {IP}
+@kernel cpu=false function lava_permutedims_kernel!(dest, @Const(src), ::Val{IP}) where {IP}
     I = @index(Global, NTuple)
     @inbounds dest[I...] = src[ntuple(d -> I[IP[d]], Val(length(IP)))...]
 end
@@ -547,13 +547,24 @@ keeps the index arithmetic compile-time constant.
 Each interior axis is given 2 first (or its own extent, if smaller), and whatever
 is left of the budget goes to the fastest axis. That trades some of `launchgroup`'s
 contiguity for the constant-folded indexing; only worth it where measured.
+
+**Only as far as the budget reaches.** Two threads on every interior axis is
+`2^(N-2)` threads, which passes `target` at rank 10 and is 65 536 at rank 18 —
+past `maxComputeWorkGroupInvocations` on every device, so the dispatch simply
+never completes. GPUArrays' 18-d `permutedims` test hung there for the full
+120 s flush timeout and took the following 354 assertions of the suite with it.
+Above that rank the reservation stops and the trailing axes stay at 1, which is
+exactly what `WORKGROUP_FALLBACK` exists to catch: the launch is re-issued
+dynamically and is correct, just without the constant-folded indices.
 """
 function staticgroup(sz::Dims{N}, target::Int = 256) where {N}
     N <= 2 && return launchgroup(sz, target)
     w = ones(Int, N)
-    # Reserve 2 on each interior axis so none stays at 1…
+    # Reserve 2 on each interior axis so none stays at 1, while it still fits…
     for d in 2:(N - 1)
-        w[d] = min(2, sz[d])
+        c = min(2, sz[d])
+        c > 1 && c * prod(w) > target && break
+        w[d] = c
     end
     # …give the fastest axis whatever that leaves…
     w[1] = min(sz[1], max(1, target ÷ prod(w)))

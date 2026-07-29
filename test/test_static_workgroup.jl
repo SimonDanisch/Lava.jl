@@ -176,4 +176,39 @@ end
             @test prod(wg) <= 256
         end
     end
+
+    @testset "no shaping rule may exceed the thread budget" begin
+        # The one invariant that is not a performance preference: a workgroup
+        # larger than `maxComputeWorkGroupInvocations` does not run slowly, it
+        # does not complete. `staticgroup` used to give every interior axis 2
+        # threads unconditionally — `2^(N-2)`, i.e. 65 536 at rank 18 — and
+        # GPUArrays' 18-d `permutedims` hung for the full 120 s flush timeout,
+        # failing the 354 assertions that came after it.
+        shapes = Any[]
+        for n in 1:20
+            push!(shapes, ntuple(d -> d == 1 ? 4 : 2, n))       # the hanging shape
+            push!(shapes, ntuple(_ -> 2, n))
+            push!(shapes, ntuple(d -> d == n ? 1024 : 3, n))
+            push!(shapes, ntuple(d -> isodd(d) ? 1 : 64, n))
+        end
+        for sz in shapes, f in (Lava.launchgroup, Lava.staticgroup)
+            wg = f(sz)
+            @test prod(wg) <= 256
+            @test all(wg .>= 1)
+            @test all(wg .<= sz)
+        end
+    end
+
+    @testset "high rank stays correct via the dynamic fallback" begin
+        # Above the rank where 2-per-interior-axis fits, `staticgroup` has to
+        # leave interior extents at 1 — which is precisely the shape
+        # `WORKGROUP_FALLBACK` re-launches dynamically, so the result is still
+        # right. Asserted here so the two rules stay aware of each other.
+        for n in 12:18
+            sz = ntuple(d -> d == 1 ? 4 : 2, n)
+            wg = Lava.staticgroup(sz)
+            @test prod(wg) <= 256
+            @test Lava.interior_unit_workgroup(wg)   # so the fallback fires
+        end
+    end
 end

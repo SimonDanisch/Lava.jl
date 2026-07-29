@@ -82,6 +82,8 @@ Element types:
 - `shape`:       `ConvexShape` subtype, e.g. `UnitCube()`.
 - `results`:     `AbstractVector{EPAResult}` of length `== length(pairs)`.
 """
+# Keeps its CPU variant: `test_narrow_phase_kernel.jl` is a GPU-vs-CPU parity
+# test and `cpu=false` deletes the side it compares against.
 @kernel function narrow_phase_kernel(
         @Const(transforms),
         @Const(pairs),
@@ -138,6 +140,7 @@ Element types:
                  `length(counters) * max_contacts`.
 - `max_contacts`: `Int32`.
 """
+# Same as `narrow_phase_kernel`: `test_narrow_phase_contacts.jl` runs it on CPU.
 @kernel function narrow_phase_contacts_kernel(
         @Const(transforms),
         @Const(pairs),

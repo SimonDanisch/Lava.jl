@@ -17,7 +17,7 @@ using Atomix
 
 # ── Vulkan-native single-dispatch sum ──
 
-@kernel function _vk_reduce_fadd_kernel!(out, @Const(src), total_threads::Int32)
+@kernel cpu=false function _vk_reduce_fadd_kernel!(out, @Const(src), total_threads::Int32)
     gi = _KA_reduce.@index(Global, Linear)
     n = length(src)
     # Strided: each thread walks the array in steps of `total_threads`. Cuts
@@ -144,7 +144,7 @@ function mapreducedim_ak!(f::F, op::OP, R::LavaArray{T}, A;
         # ...) get materialised — on the *device*, via broadcast. This used to be
         # `convert(LavaArray, collect(A))`, i.e. a blocking download to the host
         # followed by a re-upload; `sum(view(x, ...); dims=)` alone was 21% of a
-        # LavaDNN inference step.
+        # DNNKernels inference step.
         A_arr = A isa LavaArray ? A : densify(A)
         rdim = find_reduced_dim(size(A_arr), size(R))
         if rdim !== nothing

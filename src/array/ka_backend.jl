@@ -13,7 +13,9 @@ export LavaBackend
 # For workqueue foreach dispatches, the KA kernel is always `_workqueue_map_kernel!`
 # but the actual inner function (e.g. `vp_trace_shadow_rays_kernel!`) is in args.
 # all_args layout: (kernel_func, ctx, inner_func, queue, extra_args...)
-function dispatch_name(@nospecialize(f), @nospecialize(all_args))
+# `@noinline`: callers reach this only through `invokelatest`, so the string
+# machinery it touches stays out of the launch path's inference chain.
+@noinline function dispatch_name(@nospecialize(f), @nospecialize(all_args))
     fname = nameof(typeof(f))
     # Check if this is a workqueue_map_kernel dispatch — inner func is arg 3
     if length(all_args) >= 3 && occursin("workqueue_map_kernel", string(fname))
@@ -153,10 +155,19 @@ function KA.launch_config(kernel::KA.Kernel{LavaBackend}, ndrange, workgroupsize
     end
 
     iterspace, dynamic = if KA.workgroupsize(kernel) <: KA.DynamicSize && workgroupsize === nothing
-        # Default workgroup size: 64 for 1D, capped to ndrange
+        # Default workgroup size: 64 for 1D, capped to ndrange.
+        #
+        # `Val(length(ndrange))`, not a plain `Int`: the dynamic form goes through
+        # `Base._ntuple`, whose body is `1:n` with `n` unknown, so it records an
+        # edge on `Tuple{Colon, Int64, Any}`. Any package that adds a `(:)` method
+        # — `Unitful` adds `Colon(::Any, ::Quantity)` — then makes that edge stale,
+        # and every precompiled CodeInstance that inferred through it is thrown
+        # away when the image loads. That single edge accounts for 25 025 of
+        # Lava's 36 245 rejected CodeInstances when SAM 2's image loads after
+        # VideoEditor. `Val` makes the tuple length static and the range vanishes.
         workgroupsize = ntuple(
             i -> i == 1 ? min(prod(ndrange), 64) : 1,
-            length(ndrange))
+            Val(length(ndrange)))
         KA.partition(kernel, ndrange, workgroupsize)
     else
         KA.partition(kernel, ndrange, workgroupsize)
@@ -636,7 +647,8 @@ function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple,
 
     # Dispatch with N-D block grid (preserves KA's block dimensions)
     if DISPATCH_LOGGING_ENABLED[]
-        LAST_DISPATCH_INFO[] = "ka f=$(dispatch_name(f, all_args)) groups=$block_dims"
+        LAST_DISPATCH_INFO[] = Base.invokelatest(dispatch_log_string, "ka f=",
+                                   dispatch_name(f, all_args), " groups=", block_dims)::String
     end
     vk_dispatch!(bq, plan.pipeline, arg_buf.address, block_dims, tlas)
 
@@ -796,7 +808,8 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
     indirect_view = get_indirect_buffer(bq)
 
     if DISPATCH_LOGGING_ENABLED[]
-        LAST_DISPATCH_INFO[] = "indirect f=$(dispatch_name(obj.f, all_args))"
+        LAST_DISPATCH_INFO[] = Base.invokelatest(dispatch_log_string, "indirect f=",
+                                   dispatch_name(obj.f, all_args))::String
     end
     deferred = DEFERRED_INDIRECT[]
     if deferred !== nothing

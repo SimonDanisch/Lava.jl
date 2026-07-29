@@ -470,6 +470,16 @@ end
 
     backend = Lava.LavaBackend()
 
+    # These assert what a *batch* accumulates, so they have to hold the batch
+    # open: `AUTO_SUBMIT_THRESHOLD` defaults to 64 and submits the batch out
+    # from under the assertions long before 350 dispatches (it was 0 when this
+    # was written; overlapping recording with execution measured +44%). Pinned
+    # to 0 for the duration rather than the assertions being relaxed — CB
+    # splitting is a DEVICE_LOST fix and worth keeping covered.
+    old_auto = Lava.AUTO_SUBMIT_THRESHOLD[]
+    Lava.AUTO_SUBMIT_THRESHOLD[] = 0
+    try
+
     # Test 1: Splitting occurs at threshold
     @testset "Split at threshold" begin
         old_threshold = Lava.CB_SPLIT_THRESHOLD[]
@@ -562,5 +572,9 @@ end
 
         Lava.vk_flush!(Lava.vk_context())
         @test Array(a) == fill(5000.0f0, 256)
+    end
+
+    finally
+        Lava.AUTO_SUBMIT_THRESHOLD[] = old_auto
     end
 end

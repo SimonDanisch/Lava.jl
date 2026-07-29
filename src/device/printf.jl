@@ -79,7 +79,7 @@ string literal; arguments are matched positionally to its specifiers. Enable
 output with `Lava.enable_debug_printf!()`.
 
 ```julia
-@kernel function k!(out)
+@kernel cpu=false function k!(out)
     i = @index(Global)
     @lava_printf "thread %u writing %f\\n" UInt32(i) out[i]
 end

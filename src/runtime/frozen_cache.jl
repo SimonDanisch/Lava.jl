@@ -28,7 +28,7 @@ Two levels, because SPIR-V is portable and machine code is not:
 
 The module in the key is the one the kernel is **defined** in, not the one that
 launched it. A broadcast kernel over `LavaArray` belongs to Lava whoever calls
-it, so LavaDNN and VideoEditor share Lava's entry instead of each writing their
+it, so DNNKernels and VideoEditor share Lava's entry instead of each writing their
 own copy under their own name.
 """
 

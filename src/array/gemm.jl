@@ -55,7 +55,7 @@ const GEMM_BLOCK_KERNELS = Dict{Int,Any}()
 for BLK in (1, 2, 4)
     kname = Symbol("coopmat_gemm_kernel_", BLK, "!")
     @eval begin
-        @kernel function $kname(C, @Const(A), @Const(B),
+        @kernel cpu=false function $kname(C, @Const(A), @Const(B),
                                 ::Val{M}, ::Val{N}, ::Val{K},
                                 ::Val{KPER}) where {M,N,K,KPER}
             lane = @index(Global, Linear) - 1
@@ -141,7 +141,7 @@ end
 #
 # `K` is passed rather than read from `axes(A, 2)` for the same reason — the host
 # knows the extent, so the kernel need not query anything.
-@kernel function strided_gemm_kernel!(C, @Const(A), @Const(B), ::Val{K},
+@kernel cpu=false function strided_gemm_kernel!(C, @Const(A), @Const(B), ::Val{K},
                                       co, cr, cc, ao, ar, ac, bo, br, bc,
                                       α, β, M, ntot) where {K}
     # Flat launch: an N-D `ndrange` is partitioned into N-D workgroups, so
@@ -317,7 +317,7 @@ Sum the `SPLITK` partial planes `Cp[:, :, s]` into `C`.
 `S * n` — indexing with `i + s * n` alone would read batch 0's later splits for
 every batch and silently return the wrong sum for all but the first.
 """
-@kernel function splitk_reduce_kernel!(C, @Const(Cp), ::Val{S}, n) where {S}
+@kernel cpu=false function splitk_reduce_kernel!(C, @Const(Cp), ::Val{S}, n) where {S}
     i = @index(Global, Linear)
     @inbounds begin
         b = (i - 1) ÷ n                 # 0 for an unbatched call

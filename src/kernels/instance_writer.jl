@@ -70,7 +70,7 @@ One thread per grain. Reads `positions[i]` and `quats[i]`, writes two
 Both records share the same transform: rotation from `quats[i]`, uniform
 scale `radius`, translation `positions[i]`. Custom index = `i - 1`.
 """
-@kernel function write_grain_instances_kernel(
+@kernel cpu=false function write_grain_instances_kernel(
         @Const(positions),
         @Const(quats),
         radius::Float32,

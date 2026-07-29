@@ -61,6 +61,19 @@ point is to allocate nothing.
 """
 const DISPATCH_LOG_FILE = Ref{Union{Nothing,String}}(nothing)
 
+"""
+Build a dispatch's log string, behind an `invokelatest`.
+
+String interpolation reaches `print`/`show`, and `show` is a function every
+plotting package adds methods to — so a launch path that *infers* this depends
+on all of them, and loading GLMakie throws the precompiled launch code away.
+Measured: `Base.println` is the root of 2 121 of the rejected verification
+groups when SAM 2's image loads after VideoEditor.
+
+It only runs when dispatch logging is on, so the dynamic call is free.
+"""
+@noinline dispatch_log_string(args...) = string(args...)
+
 function log_dispatch!(info::String)
     DISPATCH_LOGGING_ENABLED[] || return
     if length(DISPATCH_LOG) >= MAX_DISPATCH_LOG
@@ -136,7 +149,7 @@ const AUTO_SUBMIT_THRESHOLD = Ref{Int}(64)
 # them removes the recording entirely.
 #
 # The precondition is that every device address the recorded commands refer to
-# is the same next time: a statically planned slab (LavaDNN's `planslab`), fixed
+# is the same next time: a statically planned slab (DNNKernels' `planslab`), fixed
 # weights, and an input buffer written in place rather than reallocated. Command
 # buffers recorded under `capture` therefore use SIMULTANEOUS_USE rather than
 # ONE_TIME_SUBMIT, and ownership of them moves to the `CapturedSequence` so the
@@ -569,9 +582,12 @@ function concurrent_indirect_group(f::F) where F
 
     # Phase 2: one fused prepare for every deferred indirect slot.
     bq0 = list[1][1]::BatchQueue
-    inds  = ntuple(i -> list[i][4], length(list))
-    sizes = ntuple(i -> list[i][6], length(list))
-    wss   = ntuple(i -> UInt32(list[i][7]), length(list))
+    # `Val`: see the note in `ka_backend.jl` about `Base._ntuple` and the
+    # `Tuple{Colon, Int64, Any}` edge — this is on the dispatch path too.
+    nl = length(list)
+    inds  = ntuple(i -> list[i][4], Val(nl))
+    sizes = ntuple(i -> list[i][6], Val(nl))
+    wss   = ntuple(i -> UInt32(list[i][7]), Val(nl))
     lava_launch!(bq0, multi_prepare_indirect_kernel, inds, sizes, wss;
                  ndrange=1, workgroup_size=(1, 1, 1))
 
@@ -681,7 +697,8 @@ end
     batch.last_was_rt = is_rt
     if DISPATCH_LOGGING_ENABLED[]
         Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, 1)
-        log_dispatch!("$(TOTAL_DISPATCH_COUNTER[]) $info")
+        log_dispatch!(Base.invokelatest(dispatch_log_string,
+                                        TOTAL_DISPATCH_COUNTER[], " ", info)::String)
     end
 
     # Split to a new CB if this segment is full
@@ -755,7 +772,9 @@ end
                             base_x::Int, base_y::Int, base_z::Int,
                             gx::Int, gy::Int, gz::Int, ::Nothing=nothing)
     dispatch_info = DISPATCH_LOGGING_ENABLED[] ?
-        "$(LAST_DISPATCH_INFO[]) base=($base_x,$base_y,$base_z) g=($gx,$gy,$gz)" : ""
+        Base.invokelatest(dispatch_log_string, LAST_DISPATCH_INFO[], " base=(",
+                          base_x, ",", base_y, ",", base_z, ") g=(",
+                          gx, ",", gy, ",", gz, ")")::String : ""
     record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         info=dispatch_info
@@ -808,7 +827,7 @@ atomically-claimed queue slots)."""
                                             ::Nothing=nothing;
                                             first_in_group::Bool=true)
     dispatch_info = DISPATCH_LOGGING_ENABLED[] ?
-        "$(LAST_DISPATCH_INFO[]) (indirect)" : ""
+        Base.invokelatest(dispatch_log_string, LAST_DISPATCH_INFO[], " (indirect)")::String : ""
     record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
         extra_dst_access=Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT,
@@ -1431,7 +1450,7 @@ function cmd_copy_buffer!(bq::BatchQueue, src, dst, nbytes::Integer;
     # the first command in a batch wouldn't even get that barrier. Without
     # this, callers have to `flush!` (a blocking host-side GPU drain) purely to
     # get ordering; device→device `copyto!` used to do exactly that and it cost
-    # 45% of a LavaDNN inference step.
+    # 45% of a DNNKernels inference step.
     #
     # Guarded on the function pointer: unlike the pre-barrier above (which only
     # runs once a dispatch has been recorded, by which time the device is

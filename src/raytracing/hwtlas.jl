@@ -534,7 +534,7 @@ end
 # GPU update kernel + update_transform!/update_transforms!
 # ============================================================================
 
-KA.@kernel function update_instance_records_kernel!(
+KA.@kernel cpu=false function update_instance_records_kernel!(
         records,
         @Const(transforms),
         blas_address::UInt64,

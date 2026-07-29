@@ -17,7 +17,7 @@
 # `Int32` matters.
 #
 # Why it is worth fixing rather than avoiding: narrowing this arithmetic is a
-# real speedup — the same narrowing inside `LavaDNN.im2col_kernel!` (four
+# real speedup — the same narrowing inside `DNNKernels.im2col_kernel!` (four
 # integer divisions per element) moved a whole inference step from 35.7 ms to
 # 32.7. Lava's broadcast kernels cannot take it until this is fixed, and any
 # other kernel that reaches for a 32-bit index is exposed to the same silent

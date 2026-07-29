@@ -115,7 +115,7 @@ function (::Type{LavaArray{T,N}})(s::UniformScaling, dims::Tuple{Int,Int}) where
     res = similar(LavaArray{T,N}, dims)
     fill!(res, zero(T))
     isempty(res) && return res
-    @kernel function identity_kernel!(res, stride, val)
+    @kernel cpu=false function identity_kernel!(res, stride, val)
         i = @index(Global, Linear)
         ilin = (stride * (i - 1)) + i
         if ilin <= length(res)

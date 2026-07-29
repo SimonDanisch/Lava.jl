@@ -906,7 +906,29 @@ end
 const POOL_BLOCK_SIZE = 64 * 1024 * 1024  # 64 MiB per block
 const POOL_LARGE_THRESHOLD = POOL_BLOCK_SIZE  # Allocs above this bypass the pool
 const POOL_MIN_SIZE = 16  # Minimum allocation size (Vulkan requires non-zero)
-const POOL_NUM_SIZE_CLASSES = 24  # 2^4=16 to 2^27=128MiB
+"""
+Subclasses per octave above [`POOL_SUBDIV_MIN`]: a size class is
+`2^p * (1 + s/8)` rather than just `2^p`, so rounding wastes at most 1/8 of a
+request instead of at most half of it.
+
+Measured on SAM 2's encoder, which is the workload that made this worth doing.
+One encode asks the pool for 1 649 MiB across 787 allocations; with plain
+powers of two it was handed **2 781 MiB — 59.3% efficient**, and the missing
+1 132 MiB is most of the gap between this allocator's footprint and PyTorch's.
+Eight subclasses put that at ~94% for 5x more free lists, which are empty
+vectors and cost nothing.
+
+Below `POOL_SUBDIV_MIN` the subdivision is skipped: an octave there is a few
+kilobytes, the absolute waste is irrelevant, and the step would fall under the
+16-byte alignment every chunk relies on (`block.bump` advances by the class
+size, so the class size *is* the alignment guarantee).
+"""
+const POOL_SUBDIV = 8
+const POOL_SUBDIV_MIN = 4096          # 2^12; step at that octave is 512 B
+const POOL_SUBDIV_MINEXP = 12
+const POOL_POW2_CLASSES = 9           # 16 B => 1 … 4096 B => 9
+# Up to 2^27 with 8 subclasses each, plus the plain power-of-two head.
+const POOL_NUM_SIZE_CLASSES = POOL_POW2_CLASSES + 16 * POOL_SUBDIV
 
 # Debug-only: force every LavaArray onto its own VkBuffer (one vkGetBufferDeviceAddress
 # per array). GPU-AV's BDA OOB validation tracks ranges per VkBuffer, so with the pool
@@ -937,19 +959,206 @@ push!(RESET_CALLBACKS, function()
     end
 end)
 
-"""Size class index for a given byte size. Returns 1 for 16B, 2 for 32B, etc."""
-@inline function size_class_idx(nbytes::Int)
-    nbytes = max(nbytes, POOL_MIN_SIZE)
-    # Round up to next power of 2
-    rounded = nextpow(2, nbytes)
-    return trailing_zeros(rounded) - 3  # 16=2^4 → idx 1, 32=2^5 → idx 2, etc.
+"""
+    size_class(nbytes) -> (idx, bytes)
+
+The free list a request of `nbytes` belongs to, and the size actually handed
+out. See [`POOL_SUBDIV`] for why this is not simply the next power of two.
+
+The two results must stay consistent in both directions: `pool_alloc` looks the
+class up from the *request*, `return_to_pool!` looks it up again from the size
+that was handed out, and a chunk that came back to the wrong list would be
+handed to a caller who asked for more than it holds. So
+`size_class(size_class(n).bytes) == size_class(n)` for every `n`, which
+`test_pool_sizeclass.jl` checks exhaustively over the octave boundaries.
+"""
+@inline function size_class(nbytes::Int)
+    n = max(nbytes, POOL_MIN_SIZE)
+    if n <= POOL_SUBDIV_MIN
+        r = nextpow(2, n)
+        return (trailing_zeros(r) - 3, r)   # 16=2^4 → 1, 32=2^5 → 2, …
+    end
+    p = 8 * sizeof(Int) - 1 - leading_zeros(n)   # floor(log2 n); ≥ 12 here
+    base = 1 << p
+    step = base >> 3                            # 2^p / POOL_SUBDIV
+    sub = cld(n - base, step)                   # 1…8 (n > base in this branch)
+    if sub == POOL_SUBDIV                       # the top subclass IS the next octave
+        p += 1; sub = 0; base = 1 << p
+        r = base
+    else
+        r = base + sub * step
+    end
+    idx = POOL_POW2_CLASSES + (p - POOL_SUBDIV_MINEXP) * POOL_SUBDIV + sub + 1
+    return (idx, r)
 end
 
+"""Size class index for a given byte size."""
+@inline size_class_idx(nbytes::Int) = size_class(nbytes)[1]
+
 """Rounded-up allocation size for a given byte count."""
-@inline size_class_bytes(nbytes::Int) = nextpow(2, max(nbytes, POOL_MIN_SIZE))
+@inline size_class_bytes(nbytes::Int) = size_class(nbytes)[2]
+
+"""
+    POOL_ACCOUNTING[] :: Bool
+
+Record what the pool is asked for against what it hands out. Off by default;
+the counters below are only meaningful while it is on.
+
+Power-of-two size classes waste up to 2x per chunk, and the pool is the reason
+SAM 2 holds far more VRAM than its live tensors. Whether that rounding is the
+cause or a red herring is a measurement, not a guess — hence these.
+"""
+const POOL_ACCOUNTING = Ref(false)
+const POOL_REQUESTED = Threads.Atomic{Int}(0)
+const POOL_ROUNDED = Threads.Atomic{Int}(0)
+const POOL_NALLOC = Threads.Atomic{Int}(0)
+
+"""Requested / handed-out bytes since `reset_pool_accounting!`, and the ratio."""
+function pool_accounting()
+    req = POOL_REQUESTED[]; rnd = POOL_ROUNDED[]
+    return (; nalloc = POOL_NALLOC[], requested = req, rounded = rnd,
+            efficiency = rnd == 0 ? 1.0 : req / rnd)
+end
+
+function reset_pool_accounting!()
+    POOL_REQUESTED[] = 0; POOL_ROUNDED[] = 0; POOL_NALLOC[] = 0
+    return
+end
+
+"""
+    POOL_RECLAIM_WATERMARK[]
+
+Reclaim empty pool blocks once this many are live, rather than waiting for an
+OOM. `0` restores the old behaviour of only reclaiming on allocation failure.
+
+A backstop rather than the policy. [`POOL_SOFT_CAP`] holds the pool well below
+this by collecting instead of destroying, and on the workload that motivated
+both — SAM 2's encoder — the pool settles at 32 blocks against this 48, so the
+sweep does not normally fire at all. It stays for the case the cheap mechanism
+cannot handle: memory that really is unreachable *and* whose blocks are empty,
+where returning the VkDeviceMemory to the driver is the only thing that helps.
+
+Keep it above the soft cap. The reclaim quiesces the queue, and firing one per
+block allocation cost **2.83x** on SAM 2's encoder (1 046 ms against 370) — it
+found nothing to free and drained the GPU anyway, every time. That is also why
+[`POOL_RECLAIM_AT`] backs off when a sweep does not pay for itself.
+"""
+const POOL_RECLAIM_WATERMARK = Ref(48)
+
+"""
+Block count at which the next sweep fires. Raised when a sweep does not pay for
+itself, so a steady state that simply needs its blocks stops being swept.
+
+The back-off is the whole design. A sweep quiesces the queue, and firing one on
+*every* block allocation past the watermark cost **2.83x** on SAM 2's encoder
+(1046 ms against 370) — the reclaim found nothing to free and drained the queue
+anyway, every time. Freeing >= `POOL_RECLAIM_MINBLOCKS` keeps the trigger where
+it is so a shrinking workload keeps shrinking; below that it moves out by half
+the current pool, which decays to never for a workload at its true high-water
+mark.
+"""
+const POOL_RECLAIM_AT = Ref(0)
+const POOL_RECLAIM_MINBLOCKS = 4
+
+"""
+    POOL_SOFT_CAP[]
+
+Pool footprint in bytes past which `pool_alloc` collects *before* committing
+another block. `0` disables it.
+
+This is the cheap half of keeping the pool small, and it is deliberately not
+the same mechanism as [`POOL_RECLAIM_WATERMARK`]:
+
+  * here we run a **GC and reuse** — no queue drain, no Vulkan call, and the
+    memory comes back as free-list chunks the caller immediately takes;
+  * there we **destroy blocks**, which needs `quiesce_before_reclaim!` and
+    therefore stalls the GPU. Measured at 2.83x on SAM 2's encoder when it fired
+    per block allocation.
+
+Without a trigger here the only backstop is `maybe_collect`, whose pressure
+threshold is a fraction of the *device heap* — 0.75 x 20 GiB on this card. That
+is a fine OOM guard and a terrible footprint policy: SAM 2's encoder ran to a
+stable **16 136 MiB across 200 blocks**, none of it needed, simply because
+nothing asked the GC a question until 15 GiB. The same loop with this cap holds
+its working set instead. A GPU shared with an editor and a REPL is the normal
+case here, not a dedicated one.
+
+2 GiB is where SAM 2's encoder stops caring, measured (blocks / VRAM / p50 / min):
+
+    3.00 GiB   48   4615 MB   340.2   332.2
+    2.00 GiB   32   3541 MB   339.8   328.8     <- same speed, 1 GiB less
+    1.50 GiB   30   3407 MB   374.0   347.9     <- 10% slower for 134 MB
+    1.25 GiB   30   3407 MB   375.4   356.3
+
+The graph's own live set is 26 blocks, so a cap below ~30 leaves nothing to
+collect and every allocation past it pays for a collection and grows anyway.
+"""
+const POOL_SOFT_CAP = Ref(2 * 1024^3)
+
+# Rate limits. The incremental collection is cheap enough to run between graph
+# steps; the full one is not, and only it sweeps the old generation that
+# long-lived activations reach.
+const POOL_GC_MINGAP = Ref(0.02)
+const POOL_GC_FULL_MINGAP = Ref(0.5)
+const POOL_GC_LAST = Ref(0.0)
+const POOL_GC_FULL_LAST = Ref(0.0)
+const POOL_GC_COUNT = Threads.Atomic{Int}(0)
+const POOL_GC_SECONDS = Ref(0.0)
+
+"""Collections run by the soft cap, and the seconds they cost."""
+pool_gc_stats() = (; count = POOL_GC_COUNT[], seconds = POOL_GC_SECONDS[])
+
+function reset_pool_gc_stats!()
+    POOL_GC_COUNT[] = 0; POOL_GC_SECONDS[] = 0.0
+    return
+end
+
+"""
+    collect_for_pool!(bq) -> Bool
+
+Try to turn dead LavaArrays back into free-list chunks. Returns whether a
+collection actually ran, so the caller knows whether retrying is worthwhile.
+
+`drain_deferred_frees!` after each collection is what makes this work at all: a
+buffer freed while the GPU still referenced it went to the deferred list rather
+than the pool, and until it is drained the memory is dead to everyone.
+"""
+function collect_for_pool!(bq::BatchQueue)
+    now = time()
+    now - POOL_GC_LAST[] < POOL_GC_MINGAP[] && return false
+    t0 = time_ns()
+    GC.gc(false)
+    drain_deferred_frees!(bq)
+    if now - POOL_GC_FULL_LAST[] >= POOL_GC_FULL_MINGAP[]
+        GC.gc(true)
+        drain_deferred_frees!(bq)
+        POOL_GC_FULL_LAST[] = now
+    end
+    POOL_GC_LAST[] = time()
+    POOL_GC_SECONDS[] += (time_ns() - t0) / 1e9
+    Threads.atomic_add!(POOL_GC_COUNT, 1)
+    return true
+end
+
+push!(RESET_CALLBACKS, function()
+    POOL_RECLAIM_AT[] = 0
+end)
 
 """Allocate a new pool block (one large VkBuffer)."""
 function alloc_pool_block(bq::BatchQueue)
+    w = POOL_RECLAIM_WATERMARK[]
+    if w > 0
+        POOL_RECLAIM_AT[] < w && (POOL_RECLAIM_AT[] = w)
+        nblocks = length(POOL_BLOCKS)
+        if nblocks >= POOL_RECLAIM_AT[]
+            quiesce_before_reclaim!(bq)
+            n, freed = reclaim_empty_pool_blocks!(bq)
+            POOL_RECLAIM_AT[] = n >= POOL_RECLAIM_MINBLOCKS ?
+                max(w, length(POOL_BLOCKS)) :
+                length(POOL_BLOCKS) + max(8, length(POOL_BLOCKS) ÷ 2)
+            n > 0 && @debug "Lava: reclaimed pool blocks" blocks=n MiB=(freed >> 20) next=POOL_RECLAIM_AT[]
+        end
+    end
     buf_result = try_vk_alloc(bq, POOL_BLOCK_SIZE)
     if buf_result isa AllocFailure
         quiesce_before_reclaim!(bq)
@@ -987,7 +1196,10 @@ end
 # active batch is recording. Used to find per-frame allocations leaking into the
 # render loop. Reads are merged into ALLOC_TRACE; query via dump_alloc_trace().
 const TRACK_ALLOCS = Ref(false)
-const ALLOC_TRACE = Dict{Symbol, Int}()
+# site => (count, bytes). Bytes as well as counts because the two rank call
+# sites completely differently — a hot site allocating 4 KiB matters far less
+# than one full-size tensor per layer.
+const ALLOC_TRACE = Dict{Symbol, Tuple{Int,Int}}()
 const ALLOC_TRACE_LOCK = ReentrantLock()
 
 function _record_alloc_site!(nbytes::Int)
@@ -1010,16 +1222,20 @@ function _record_alloc_site!(nbytes::Int)
     end
     site = Symbol(isempty(user_frames) ? "unknown" : join(user_frames, " <- "))
     lock(ALLOC_TRACE_LOCK) do
-        ALLOC_TRACE[site] = get(ALLOC_TRACE, site, 0) + 1
+        c, b = get(ALLOC_TRACE, site, (0, 0))
+        ALLOC_TRACE[site] = (c + 1, b + nbytes)
     end
 end
 
 function dump_alloc_trace()
     lock(ALLOC_TRACE_LOCK) do
-        sorted = sort(collect(ALLOC_TRACE), by=x->x[2], rev=true)
-        for (site, count) in sorted
-            println("  $count × $site")
+        sorted = sort(collect(ALLOC_TRACE), by = x -> x[2][2], rev = true)
+        tot = sum(x -> x[2][2], sorted; init = 0)
+        for (site, (count, bytes)) in sorted
+            println("  ", lpad(string(round(bytes / 1e6, digits = 1)), 8), " MB  ",
+                    lpad(string(count), 4), " ×  $site")
         end
+        println("  ", lpad(string(round(tot / 1e6, digits = 1)), 8), " MB  total")
     end
 end
 
@@ -1060,9 +1276,17 @@ function pool_alloc(bq::BatchQueue, nbytes::Integer; extra_usage::UInt32=UInt32(
         return vk_alloc(bq, nbytes; extra_usage)
     end
 
-    alloc_size = size_class_bytes(nbytes)
-    idx = size_class_idx(nbytes)
-    idx = clamp(idx, 1, POOL_NUM_SIZE_CLASSES)
+    # No clamp: every class up to `POOL_LARGE_THRESHOLD` has a list, and larger
+    # requests took the `vk_alloc` branch above. Clamping would put a chunk in a
+    # list whose other members are a different size, and the next caller would be
+    # handed a buffer smaller than it asked for — a BoundsError is the better
+    # failure.
+    idx, alloc_size = size_class(nbytes)
+    if POOL_ACCOUNTING[]
+        Threads.atomic_add!(POOL_REQUESTED, nbytes)
+        Threads.atomic_add!(POOL_ROUNDED, alloc_size)
+        Threads.atomic_add!(POOL_NALLOC, 1)
+    end
 
     # Try the free list first. If empty, run GC (which drains LavaArray
     # finalizers → `return_to_pool!`) and re-check, so we reuse whatever
@@ -1101,14 +1325,21 @@ function pool_alloc(bq::BatchQueue, nbytes::Integer; extra_usage::UInt32=UInt32(
 
     buf = try_reuse_or_bump()
     buf === nothing || return buf
-    # Free list empty + every block full → cut a new 64-MiB block.  We used to
-    # force a `GC.gc(false)` + `GC.gc(true)` chain here to drain finalizers
-    # before growing the pool, but that synchronous GC inside the alloc hot
-    # path showed up as 2-5 ms spikes in tight loops (AK benchmarks).  The
-    # proactive `maybe_collect(ctx)` at the top now drives finalizer drains via
-    # rate-limited incremental GC; if pressure is still low when we land here
-    # the right answer is to just commit another pool block rather than pay a
-    # stop-the-world full GC the budget would have skipped anyway.
+    # Free list empty + every block full → cut a new 64-MiB block, unless the
+    # pool is already past its soft cap, in which case ask the GC first: past
+    # that point the memory this request needs is far more likely to be dead and
+    # uncollected than genuinely in use.
+    #
+    # An unconditional `GC.gc(false)` + `GC.gc(true)` chain used to live here and
+    # was removed for showing up as 2-5 ms spikes in tight loops (AK benchmarks).
+    # Both rate limits and the cap are there so this is not that: under the cap
+    # this path is exactly as it was, and above it a collection runs at most
+    # every `POOL_GC_MINGAP` seconds.
+    if POOL_SOFT_CAP[] > 0 && length(POOL_BLOCKS) * POOL_BLOCK_SIZE >= POOL_SOFT_CAP[] &&
+       collect_for_pool!(bq)
+        buf = try_reuse_or_bump()
+        buf === nothing || return buf
+    end
     block = alloc_pool_block(bq)
     byte_offset = block.bump
     block.bump += alloc_size
@@ -1187,8 +1418,9 @@ function return_to_pool!(buf::VkManagedBuffer)
     block === nothing && return
     alloc_size = buf.size
     alloc_size == 0 && return
+    # `size_class` is idempotent on its own output, so this lands in exactly the
+    # list `pool_alloc` took the chunk from — see there about not clamping.
     idx = size_class_idx(alloc_size)
-    idx = clamp(idx, 1, POOL_NUM_SIZE_CLASSES)
     block.live_count -= 1
     # Poison address to detect use-after-free, but keep pool_block + pool_offset
     # so pool_alloc can restore the address from block.base_address + pool_offset

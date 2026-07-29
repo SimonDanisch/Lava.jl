@@ -139,7 +139,10 @@ end
 """Find first memory type index matching required property flags."""
 function find_memory_type(phys_device, type_bits::UInt32, required_flags)
     mem_props = get_physical_device_memory_properties(phys_device)
-    for i in 0:(mem_props.memory_type_count - 1)
+    # `length(memory_types)`, not `memory_type_count`: Vulkan.jl's high-level
+    # struct returns the vector already truncated to the valid count and no
+    # longer carries the count field. Same read `Lava.find_memory_type` does.
+    for i in 0:(length(mem_props.memory_types) - 1)
         if (type_bits >> i) & 1 == 1
             mt = mem_props.memory_types[i + 1]
             if required_flags in mt.property_flags

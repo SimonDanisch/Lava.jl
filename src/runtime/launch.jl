@@ -508,10 +508,18 @@ function get_compiled_kernel_and_pipeline(ctx::VkContext, @nospecialize(f), @nos
     end
     isempty(FROZEN_VERSION[]) || (FROZEN_MISSES[] += 1)
 
+    # `invokelatest` around the compile, for the same reason `vk_context` uses one
+    # (see `device.jl`): a direct call puts GPUCompiler, the SPIR-V emitter and
+    # the file-path handling in `run_spirv_opt`/`validate_spirv`/
+    # `dump_spirv_to_disk` into the inference chain of the LAUNCH path. That is a
+    # lot of foreign surface to depend on — `FilePathsBase` pirates `Base.arg_gen`
+    # and `Base.*`, `Unitful` pirates `Base.Colon` — so loading anything that
+    # pulls them in invalidates `get_or_build_iter_plan` and every launch above
+    # it. This runs once per kernel; the dispatch is free next to compiling one.
     config = lava_compiler_config(; workgroup_size, enable_ray_query)
     source = GPUCompiler.methodinstance(typeof(f), tt)
-    linked = GPUCompiler.cached_compilation(LINKED_KERNEL_CACHE, source, config,
-                                             lava_kernel_compile, LavaLinker(ctx))
+    linked = Base.invokelatest(GPUCompiler.cached_compilation, LINKED_KERNEL_CACHE,
+                               source, config, lava_kernel_compile, LavaLinker(ctx))::LavaLinkedKernel
     frozen_store(f, tt, workgroup_size, linked.compiled)
 
     # Dump SPIR-V if dump dir is set

@@ -413,10 +413,19 @@ Get or create the global Vulkan context. Lazily initializes on first call.
 function vk_context()
     ctx = VK_CONTEXT_REF[]
     if ctx === nothing
-        ctx = init_vulkan!()
+        # `invokelatest`, not a direct call: a direct one makes inference record
+        # a backedge from `vk_context` to `init_vulkan!`, and `getproperty(::
+        # LavaBackend, :bq)` goes through here, so EVERY Lava operation ends up
+        # inferring through Vulkan initialisation. Anything that invalidates
+        # `init_vulkan!` then invalidates the whole package — loading GLMakie
+        # does exactly that (FreeType adds a `Base.unsafe_load` method), and it
+        # cost 50 506 Lava MethodInstances and ~41 s of re-inference on the
+        # first GPU call afterwards. The dynamic dispatch is paid once, on the
+        # single call that creates the context.
+        ctx = Base.invokelatest(init_vulkan!)::VkContext
         VK_CONTEXT_REF[] = ctx
     end
-    return ctx
+    return ctx::VkContext
 end
 
 vk_device() = vk_context().device
