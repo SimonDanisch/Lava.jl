@@ -608,3 +608,35 @@ function LinearAlgebra.mul!(C::LavaArray{T,2},
     @. C = α * dd * B + β * C
     C
 end
+
+# Disambiguation: matrix * Diagonal — the mirror of the case above.
+#
+# Same collision, other operand: GPUArrays has a second method
+# `mul!(::AbstractGPUVecOrMat, ::Union{AbstractGPUArray,Adjoint,Transpose}, ::Diagonal{<:Any,<:AbstractGPUArray}, α, β)`
+# which is equally ambiguous against Lava's dense GEMM. Fixing only the
+# Diagonal-on-the-left case left this one throwing, and the test for it only
+# covered the side that had been fixed — GPUArrays' own linalg/diagonal testset
+# is what caught it, for Float32 and ComplexF32.
+#
+# `D` scales COLUMNS here (A[:,j] * d[j]), so the broadcast transposes `dd`.
+function LinearAlgebra.mul!(C::LavaArray{T,2},
+                            A::Union{AbstractGPUArray,
+                                     Adjoint{S, <:AbstractGPUArray{S}},
+                                     Transpose{S, <:AbstractGPUArray{S}}},
+                            D::Diagonal{<:Any, <:AbstractGPUArray},
+                            α::Number, β::Number) where {T, S}
+    dd = D.diag
+    d = length(dd)
+    m, n = size(A, 1), size(A, 2)
+    m′, n′ = size(C, 1), size(C, 2)
+    n == d || throw(DimensionMismatch("left hand side has $n columns but D is $d by $d"))
+    (m, n) == (m′, n′) ||
+        throw(DimensionMismatch("expect output to be $m by $n, but got $m′ by $n′"))
+    # `ddT` MUST be hoisted out of the `@.`: inside it, `transpose(dd)` becomes
+    # `transpose.(dd)`, which broadcasts transpose over each scalar (a no-op) and
+    # leaves a length-n column, scaling ROWS instead of columns. GPUArrays hoists
+    # it for the same reason.
+    ddT = transpose(dd)
+    @. C = α * A * ddT + β * C
+    C
+end

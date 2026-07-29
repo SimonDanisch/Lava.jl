@@ -65,7 +65,7 @@ const KA = KernelAbstractions
     hB = Float16.(reshape(cos.(range(0, 4, K * N)), K, N))
     A = Lava.LavaArray(hA); B = Lava.LavaArray(hB)
     C = Lava.LavaArray(zeros(Float32, M, N))
-    mul!(C, A, B, 1.0f0, 0.0f0)
+    LinearAlgebra.mul!(C, A, B, 1.0f0, 0.0f0)
     KA.synchronize(LavaBackend())
     got = Array(C)
     want = Float32.(hA) * Float32.(hB)
