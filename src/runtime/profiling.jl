@@ -323,7 +323,8 @@ end
 
 # Internal: write the START timestamp before a dispatch.  Returns the start
 # slot, or -1 if timing is off or the pool is full.
-function maybe_write_dispatch_start_timestamp!(cb::VK.CommandBuffer, kernel_name::AbstractString)
+function maybe_write_dispatch_start_timestamp!(cb::VK.CommandBuffer, kernel_name::AbstractString;
+                                               stage = VK.PIPELINE_STAGE_COMPUTE_SHADER_BIT)
     DISPATCH_TIMING_ENABLED[] || return -1
     pool = ensure_timestamp_pool!()
     slot = TIMESTAMP_NEXT_SLOT[]
@@ -344,10 +345,20 @@ function maybe_write_dispatch_start_timestamp!(cb::VK.CommandBuffer, kernel_name
     # occupancy × 32 threads/warp = ~7 rays/thread × ~50 ns/ray (RT-core
     # accelerated BVH + simple BSDF + light + atomic queue push) =
     # ~350 ns wave-time = ~12 µs wall-time for the dispatch.  That matches.
-    # The timing is right; the RT-core path is just THAT cheap.  All the
-    # GPU time in surface-only scenes lives in vp_generate_camera_rays
-    # (Sobol-bound, ~24-35 ms / sample on killeroo).
-    VK.cmd_write_timestamp(cb, VK.PIPELINE_STAGE_COMPUTE_SHADER_BIT, pool, UInt32(slot))
+    # The timing is right; the RT-core path is just THAT cheap.
+    #
+    # An earlier version of this note concluded from that "all the GPU time in
+    # surface-only scenes lives in vp_generate_camera_rays (Sobol-bound)".  That
+    # was an artefact of a blind spot: only `cmd_dispatch` and
+    # `cmd_dispatch_indirect` were timestamped, so `cmd_trace_rays_khr` — the
+    # entire hw_accel=true ray-tracing workload — was missing from the report,
+    # which accounted for ~155 ms of a ~3.3 s frame.  With the RT paths
+    # instrumented (see raytracing/pipeline.jl), killeroo_gold on hw_accel=true
+    # measures 97.5 % of GPU time in rt_indirect (~19 ms/dispatch) and 1.7 % in
+    # vp_generate_camera_rays.  Read totals against the frame's wall time before
+    # trusting a breakdown; if they do not roughly add up, something is not
+    # being timestamped.
+    VK.cmd_write_timestamp(cb, stage, pool, UInt32(slot))
     TIMESTAMP_NEXT_SLOT[] = slot + 2
     push!(RECORDED_DISPATCHES, DispatchTiming(String(kernel_name), slot, 0.0))
     return slot
@@ -364,7 +375,9 @@ end
 # dispatches were unaffected; the symptom only showed on indirect because
 # indirect-dispatch parameters are read at dispatch time and workgroup
 # launches are visibly deferred.
-function maybe_write_dispatch_end_timestamp!(cb::VK.CommandBuffer, start_slot::Int)
+function maybe_write_dispatch_end_timestamp!(cb::VK.CommandBuffer, start_slot::Int;
+                                             stage = VK.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                             stage_mask::UInt32 = UInt32(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT))
     start_slot < 0 && return
     pool = TIMESTAMP_POOL[]
     pool === nothing && return
@@ -386,12 +399,12 @@ function maybe_write_dispatch_end_timestamp!(cb::VK.CommandBuffer, start_slot::I
               (Ptr{Nothing}, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
                UInt32, Ptr{VkMemoryBarrier}, UInt32, Ptr{Nothing}, UInt32, Ptr{Nothing}),
               cb.vks,
-              VkPipelineStageFlags(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
-              VkPipelineStageFlags(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
+              VkPipelineStageFlags(stage_mask),
+              VkPipelineStageFlags(stage_mask),
               VkDependencyFlags(0),
               UInt32(0), C_NULL, UInt32(0), C_NULL, UInt32(0), C_NULL)
     end
-    VK.cmd_write_timestamp(cb, VK.PIPELINE_STAGE_COMPUTE_SHADER_BIT, pool, UInt32(start_slot + 1))
+    VK.cmd_write_timestamp(cb, stage, pool, UInt32(start_slot + 1))
     return nothing
 end
 
