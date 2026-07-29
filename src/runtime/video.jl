@@ -461,6 +461,25 @@ function H264Decoder(ctx, paramnals::AbstractVector{UInt8}; chroma::Bool=false)
         e0=C.VkExtent2D(0,0), cp=Ref(C.VkVideoCapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR,Ptr{Cvoid}(rp(dc)),UInt32(0),UInt64(0),UInt64(0),e0,e0,e0,UInt32(0),UInt32(0),C.VkExtensionProperties(ntuple(_->Cchar(0),256),UInt32(0))))
         GC.@preserve hc dc cp PIN ccall(Vk.function_pointer(ctx.instance,"vkGetPhysicalDeviceVideoCapabilitiesKHR"),Int32,(Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid}),ctx.physical_device.vks,Ptr{Cvoid}(pProf),pc(cp))
         rHdr[]=cp[].stdHeaderVersion
+        # `dc` was already being filled in and thrown away.  Its flags say
+        # whether one image may serve as both DPB and decode target
+        # (DPB_AND_OUTPUT_COINCIDE, 0x1) or whether they must be separate images
+        # (DPB_AND_OUTPUT_DISTINCT, 0x2).  The DPB allocation below hardcodes the
+        # coincide layout (`VIDEO_DECODE_DST|VIDEO_DECODE_DPB` on one image).
+        #
+        # On a distinct-only device `vkCreateImage` rejects that combination and
+        # returns nothing usable, and the failure is otherwise SILENT: decode
+        # runs, every frame comes back all-zero, and the only symptom is that the
+        # output does not match the reference. Without validation layers there is
+        # nothing in the log at all. AMD Radeon 8060S reports flags=0x2.
+        let f = dc[].flags
+            (f & UInt32(0x1)) != 0 || error(
+                "H264Decoder: device reports video decode flags 0x", string(f, base=16),
+                " — DPB_AND_OUTPUT_COINCIDE (0x1) is not supported.\n",
+                "This decoder allocates a single image with VIDEO_DECODE_DST|VIDEO_DECODE_DPB, ",
+                "which requires COINCIDE; a DISTINCT-only device (0x2) needs separate DPB and ",
+                "output images, which is not implemented yet.")
+        end
     end
     maxslots=UInt32(sps.maxref+2)
     sci=pin(Ref(C.VkVideoSessionCreateInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_SESSION_CREATE_INFO_KHR,C_NULL,w.qf,UInt32(0),pProf,fmt,C.VkExtent2D(CW,CH),fmt,maxslots,UInt32(sps.maxref),rp(rHdr))))
