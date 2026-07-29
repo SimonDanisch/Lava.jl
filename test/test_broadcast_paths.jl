@@ -53,3 +53,38 @@ const KA = KernelAbstractions
     KA.synchronize(be)
     @test Array(pout) ≈ permutedims(host, (2, 1, 3)) .+ 1
 end
+
+# A Tuple operand must NOT take the flat path.
+#
+# `flatok` returns true by default for "scalars, refs, functions", and a Tuple
+# fell into that default — but a Tuple is a broadcast *container* with its own
+# axes, not a scalar. `flat1` reshapes array leaves to vectors of length(dest)
+# while leaving the tuple at its own length, so the flattened tree broadcast a
+# 30-element operand against a 3-element one:
+#
+#   DimensionMismatch: a has axes Base.OneTo(30) and b has axes Base.OneTo(3)
+#
+# This is GPUArrays' own `broadcasting.jl` "Tuple" case, which accounted for 11
+# errors in the suite once the device stopped dying earlier in the run.
+@testset "broadcast with a Tuple operand" begin
+    be = LavaBackend()
+    N = 10
+    ha = rand(Float32, 3, N)
+    hA, hB, hC = rand(Float32, N), rand(Float32, N), rand(Float32, N)
+    hout = zeros(Float32, 3, N)
+    broadcast!((xx, yy) -> xx + first(yy), hout, ha, (hA, hB, hC))
+
+    out = KA.allocate(be, Float32, 3, N); copyto!(out, zeros(Float32, 3, N))
+    arr = KA.allocate(be, Float32, 3, N); copyto!(arr, ha)
+    a = KA.allocate(be, Float32, N); copyto!(a, hA)
+    b = KA.allocate(be, Float32, N); copyto!(b, hB)
+    c = KA.allocate(be, Float32, N); copyto!(c, hC)
+
+    broadcast!((xx, yy) -> xx + first(yy), out, arr, (a, b, c))
+    KA.synchronize(be)
+    @test Array(out) ≈ hout
+
+    # And the eligibility test itself, so the default can't silently swallow
+    # Tuples again.
+    @test Lava.flatok(out, (a, b, c)) === false
+end

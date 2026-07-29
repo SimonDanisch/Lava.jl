@@ -198,6 +198,17 @@ there for when one is passed anyway.
 flatok(dest, x) = true                                  # scalars, refs, functions
 flatok(dest, x::AbstractArray) =
     size(x) == size(dest) && IndexStyle(x) === IndexLinear()
+# A Tuple is a broadcast *container* with its own axes, not a scalar, so it must
+# not fall through to the `true` above. `flat1` reshapes array leaves to vectors
+# of `length(dest)` but leaves a tuple at its own length, so flattening a tree
+# containing one produces `OneTo(length(dest))` against `OneTo(length(tuple))`:
+#
+#   broadcast!(f, out, arr, (a, b, c))   # out 3x10
+#   DimensionMismatch: a has axes OneTo(30) and b has axes OneTo(3)
+#
+# Tuples are never the destination's shape in any useful case here, so the flat
+# path simply does not apply; the general paths below handle them correctly.
+flatok(dest, x::Tuple) = false
 flatok(dest, x::Broadcast.Extruded) = flatok(dest, x.x)
 flatok(dest, x::Broadcast.Broadcasted) = all(a -> flatok(dest, a), x.args)
 
