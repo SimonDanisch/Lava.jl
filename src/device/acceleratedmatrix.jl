@@ -69,10 +69,43 @@ Whether the running device implements this tile. The hardware supports a fixed
 set of `(M, N, K, dtype)` combinations, so a kernel picks one of those or uses
 `MMatrix` instead.
 """
+# VkComponentTypeKHR. Only the types a cooperative-matrix operand can currently
+# have in Lava; an unmapped type reports "no such shape" rather than matching one
+# by accident.
+_vk_component_type(::Type{Float16}) = UInt32(0)
+_vk_component_type(::Type{Float32}) = UInt32(1)
+_vk_component_type(::Type{Float64}) = UInt32(2)
+_vk_component_type(::Type{Int8})    = UInt32(3)
+_vk_component_type(::Type{Int16})   = UInt32(4)
+_vk_component_type(::Type{Int32})   = UInt32(5)
+_vk_component_type(::Type{Int64})   = UInt32(6)
+_vk_component_type(::Type{UInt8})   = UInt32(7)
+_vk_component_type(::Type{UInt16})  = UInt32(8)
+_vk_component_type(::Type{UInt32})  = UInt32(9)
+_vk_component_type(::Type{UInt64})  = UInt32(10)
+_vk_component_type(::Type) = nothing
+
+const VK_SCOPE_SUBGROUP = UInt32(3)
+
+# `T` is the A/B operand type, and it used to be accepted and then ignored: the
+# match was on M, N and K alone. A device can report the same extents for
+# completely different component types — this one lists 16x16x16 for
+# (Float16 -> Float32), (Float16 -> Float16), (UInt8 -> Int32) and
+# (Int8 -> Int32) — so an extent-only match says "yes" for Float16 on hardware
+# that only does the integer forms, and the kernel then emits cooperative-matrix
+# instructions the device cannot execute.
+#
+# The accumulator type is not checked because the signature does not carry one;
+# callers that care (`coopmat_gemm_available`) rely on the operand type plus the
+# extents, which is what distinguishes the shapes in practice.
 function coopmat_shape(ctx::VkContext, ::Type{T}, M::Integer, N::Integer,
                        K::Integer) where {T}
     ctx.coopmat_available || return false
-    any(s -> s.M == M && s.N == N && s.K == K, ctx.coopmat_shapes)
+    want = _vk_component_type(T)
+    want === nothing && return false
+    any(s -> s.M == M && s.N == N && s.K == K &&
+             s.ab_type == want && s.scope == VK_SCOPE_SUBGROUP,
+        ctx.coopmat_shapes)
 end
 
 # ── Device operations ─────────────────────────────────────────────────────────
