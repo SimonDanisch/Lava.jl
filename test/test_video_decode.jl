@@ -12,22 +12,27 @@ using Lava
 
 @testset "H.264 hardware decode" begin
     ctx = Lava.vk_context()
-    # A video-decode queue is necessary but not sufficient. This decoder puts the
-    # DPB and the decode target in ONE image, which needs
-    # DPB_AND_OUTPUT_COINCIDE; a distinct-only device (AMD Radeon 8060S reports
-    # flags=0x2) cannot create that image at all. That used to surface as every
-    # frame decoding to all-zero and the comparison below failing with
-    # `243 == 0`, which reads like an accuracy bug and is not one — the decode
-    # simply never happened. Unsupported hardware is a skip, not a failure.
+    # A video-decode queue is necessary but not sufficient: the device must also
+    # say whether the DPB and the decode target may share ONE image
+    # (DPB_AND_OUTPUT_COINCIDE) or must be separate (DPB_AND_OUTPUT_DISTINCT).
+    # The decoder implements both and picks per device; getting it wrong is
+    # silent, since a distinct-only device (AMD Radeon 8060S reports flags=0x2)
+    # cannot create a DST|DPB image at all and every frame then decodes to
+    # all-zero — the comparison below failed with `243 == 0`, which reads like an
+    # accuracy bug and is not one. Both layouts are checked against the same
+    # ffmpeg ground truth, so this test means the same thing either way.
     if !ctx.video_decode_available
         @info "skipping H.264 decode test: no video-decode queue on $(ctx.device_name)"
         @test_skip ctx.video_decode_available
-    elseif !Lava.VideoDecode.decode_coincide_supported(ctx)
-        @info "skipping H.264 decode test: $(ctx.device_name) is DPB_AND_OUTPUT_DISTINCT only " *
-              "(flags=0x$(string(Lava.VideoDecode.decode_capability_flags(ctx), base=16))); " *
-              "the distinct-image decode path is not implemented"
-        @test_skip Lava.VideoDecode.decode_coincide_supported(ctx)
+    elseif !Lava.VideoDecode.decode_supported(ctx)
+        @info "skipping H.264 decode test: $(ctx.device_name) offers neither " *
+              "DPB_AND_OUTPUT_COINCIDE nor DPB_AND_OUTPUT_DISTINCT " *
+              "(flags=0x$(string(Lava.VideoDecode.decode_capability_flags(ctx), base=16)))"
+        @test_skip Lava.VideoDecode.decode_supported(ctx)
     else
+        @info "H.264 decode on $(ctx.device_name): " *
+              (Lava.VideoDecode.decode_coincide_supported(ctx) ? "COINCIDE" : "DISTINCT") *
+              " layout (flags=0x$(string(Lava.VideoDecode.decode_capability_flags(ctx), base=16)))"
         annexb = read(joinpath(@__DIR__, "data", "h264_decode_test.h264"))
         yref   = read(joinpath(@__DIR__, "data", "h264_decode_test_y.raw"))
         w, h = 128, 96

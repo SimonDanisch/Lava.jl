@@ -295,10 +295,11 @@ decodeprofile(dec::VideoDecoder) = video_profile(dec.w)   # h264 default; h265 o
 `0x1` DPB_AND_OUTPUT_COINCIDE, `0x2` DPB_AND_OUTPUT_DISTINCT.
 
 Split out so the decoder and its tests ask the same question. `H264Decoder`
-requires COINCIDE because it allocates one image with
-`VIDEO_DECODE_DST|VIDEO_DECODE_DPB`; a distinct-only device cannot create that
-image at all, and the failure is silent (all-zero frames) without validation
-layers.
+supports both layouts and needs at least one of them; it prefers COINCIDE, which
+costs one image and one layout transition per frame less. Picking the wrong one
+fails silently (all-zero frames) without validation layers, because a
+distinct-only device cannot create a `VIDEO_DECODE_DST|VIDEO_DECODE_DPB` image
+at all.
 """
 function decode_capability_flags(ctx)
     hp, pr, pl = video_profile(nothing)
@@ -324,10 +325,19 @@ end
 """
     decode_coincide_supported(ctx) -> Bool
 
-Whether one image may serve as both DPB and decode target. False means this
-decoder cannot run on the device; the distinct-image path is not implemented.
+Whether one image may serve as both DPB and decode target. False just means the
+decoder takes the separate-images path instead; see [`decode_supported`](@ref)
+for whether it can run at all.
 """
 decode_coincide_supported(ctx) = (decode_capability_flags(ctx) & UInt32(0x1)) != 0
+
+"""
+    decode_supported(ctx) -> Bool
+
+Whether H.264 decode can run here: the device must offer COINCIDE or DISTINCT.
+A device offering neither reports no way to allocate decode images.
+"""
+decode_supported(ctx) = (decode_capability_flags(ctx) & UInt32(0x3)) != 0
 
 function video_profile(w)
     hp=Ref(C.VkVideoDecodeH264ProfileInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_PROFILE_INFO_KHR,C_NULL,C.STD_VIDEO_H264_PROFILE_IDC_HIGH,C.VK_VIDEO_DECODE_H264_PICTURE_LAYOUT_PROGRESSIVE_KHR))
@@ -359,6 +369,11 @@ mutable struct H264Decoder <: VideoDecoder
     PIN::Vector{Any}
     imgs::Vector{Any}                       # DPB pool: (VideoImage, ImageView) per slot
     nslots::Int
+    outimgs::Vector{Any}                    # DPB_AND_OUTPUT_DISTINCT: decode targets,
+                                            # one per AU of the chunk; empty under COINCIDE
+    mkoutimg::Any                           # grows `outimgs`; `nothing` under COINCIDE
+    copyq::Vector{Any}                      # (image, Y, UV) copies deferred to the main queue
+    bsalign::Int                            # minBitstreamBuffer{Offset,Size}Alignment
     bbuf::Any; bmem::Any; bmap::Ptr{UInt8}; bufsz::UInt64
     cbh::Any; CB::Any
     CW::Int; CH::Int; DW::Int; DH::Int
@@ -413,7 +428,7 @@ function decodemore!(dec::VideoDecoder, maxframes::Integer; holdback::Integer = 
     hi = min(dec.nextau + Int(min(maxframes, typemax(Int) ÷ 2)) - 1, length(dec.aus))
     if dec.nextau <= hi
         batch = dec.nextau:hi
-        ausize(au) = cld(sum(length(sl) + 3 for sl in au), 256) * 256
+        ausize(au) = cld(sum(length(sl) + 3 for sl in au), dec.bsalign) * dec.bsalign
         ensurebitbuf!(dec, sum(ausize(dec.aus[i]) for i in batch))
         w = dec.w; CB = dec.CB
         # ONE command buffer + ONE queue wait for the whole chunk — per-AU waits
@@ -422,14 +437,15 @@ function decodemore!(dec::VideoDecoder, maxframes::Integer; holdback::Integer = 
                                             UInt32(C.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT), Ptr{Cvoid}(C_NULL)))
         GC.@preserve bi ccall(dfp(w,"vkBeginCommandBuffer"),Int32,(C.VkCommandBuffer,Ptr{Cvoid}),CB,pc(bi))
         base = 0
-        for i in batch
-            base += decodeau!(dec, dec.aus[i], base)
+        for (j, i) in enumerate(batch)
+            base += decodeau!(dec, dec.aus[i], base, j)
         end
         ccall(dfp(w,"vkEndCommandBuffer"),Int32,(C.VkCommandBuffer,),CB)
         cbref = Ref(CB)
         si = Ref(C.VkSubmitInfo(C.VK_STRUCTURE_TYPE_SUBMIT_INFO,C_NULL,UInt32(0),Ptr{C.VkSemaphore}(C_NULL),Ptr{UInt32}(C_NULL),UInt32(1),Base.unsafe_convert(Ptr{C.VkCommandBuffer},cbref),UInt32(0),Ptr{C.VkSemaphore}(C_NULL)))
         GC.@preserve si cbref ccall(dfp(w,"vkQueueSubmit"),Int32,(Ptr{Cvoid},UInt32,Ptr{Cvoid},Ptr{Cvoid}),w.q.vks,UInt32(1),Base.unsafe_convert(Ptr{Cvoid},si),C_NULL)
         ccall(dfp(w,"vkQueueWaitIdle"),Int32,(Ptr{Cvoid},),w.q.vks)
+        drain_copies!(dec)
         dec.nextau = hi + 1
     end
     sort!(dec.pending, by = x -> (x[1], x[2]))   # display order = (GOP, POC)
@@ -440,9 +456,37 @@ function decodemore!(dec::VideoDecoder, maxframes::Integer; holdback::Integer = 
     return out
 end
 
+"""
+Record the chunk's deferred image→buffer copies on the MAIN queue and submit them.
+
+Only DPB_AND_OUTPUT_DISTINCT defers: there the decode target is a separate image
+and `vkCmdCopyImageToBuffer` cannot be recorded on the video-decode queue family,
+which need not support transfer (AMD's reports VIDEO_DECODE only). Called after
+`vkQueueWaitIdle` on the decode queue, so the decoded contents and the
+TRANSFER_SRC layout transition recorded there have completed; the targets are
+CONCURRENT across both families, so no ownership transfer is needed.
+"""
+function drain_copies!(dec::VideoDecoder)
+    isempty(dec.copyq) && return nothing
+    Lava = parentmodule(@__MODULE__)
+    ctx = dec.w.ctx
+    cb = Lava.ensure_active_batch!(ctx).cmd_buf
+    for (vimg, y, uv) in dec.copyq
+        yb = y.buf[]
+        Lava.record_luma_copy!(cb, vimg, yb.buffer, yb.pool_offset + y.offset)
+        if uv !== nothing
+            ub = uv.buf[]
+            Lava.record_chroma_copy!(cb, vimg, ub.buffer, ub.pool_offset + uv.offset)
+        end
+    end
+    empty!(dec.copyq)
+    Lava.flush!(ctx.default_bq, ctx.device)
+    return nothing
+end
+
 "Grow the (host-visible) bitstream upload buffer to hold an AU of `need` bytes."
 function ensurebitbuf!(dec::VideoDecoder, need::Integer)
-    sz = UInt64(cld(max(need, 1), 256) * 256)
+    sz = UInt64(cld(max(need, 1), dec.bsalign) * dec.bsalign)
     sz <= dec.bufsz && return nothing
     w = dec.w; dev = dec.dev
     dec.bbuf === nothing || ccall(dfp(w,"vkDestroyBuffer"),Cvoid,(Ptr{Cvoid},C.VkBuffer,Ptr{Cvoid}),dev.vks,dec.bbuf,C_NULL)
@@ -496,31 +540,43 @@ function H264Decoder(ctx, paramnals::AbstractVector{UInt8}; chroma::Bool=false)
     hp,pr,pl=video_profile(w); pin(hp);pin(pr);pin(pl); pProf=rp(pr)
     # session
     rHdr=pin(Ref(C.VkExtensionProperties(ntuple(_->Cchar(0),256),UInt32(0))))
+    # Set from the decode caps below: whether the DPB and the decode target must
+    # be separate images. `let` assigns to this outer binding, it does not shadow it.
+    DISTINCT = false
+    BSALIGN = 256
     # get stdHeaderVersion from caps
     let hc=Ref(C.VkVideoDecodeH264CapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_CAPABILITIES_KHR,C_NULL,C.StdVideoH264LevelIdc(0),C.VkOffset2D(0,0))),
         dc=Ref(C.VkVideoDecodeCapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR,Ptr{Cvoid}(rp(hc)),UInt32(0))),
         e0=C.VkExtent2D(0,0), cp=Ref(C.VkVideoCapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR,Ptr{Cvoid}(rp(dc)),UInt32(0),UInt64(0),UInt64(0),e0,e0,e0,UInt32(0),UInt32(0),C.VkExtensionProperties(ntuple(_->Cchar(0),256),UInt32(0))))
         GC.@preserve hc dc cp PIN ccall(Vk.function_pointer(ctx.instance,"vkGetPhysicalDeviceVideoCapabilitiesKHR"),Int32,(Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid}),ctx.physical_device.vks,Ptr{Cvoid}(pProf),pc(cp))
         rHdr[]=cp[].stdHeaderVersion
+        # The bitstream buffer's offset AND range must each be a multiple of the
+        # profile's alignment. Hardcoding 256 happened to satisfy devices asking for
+        # <=256; this profile asks 4096 on AMD, and a misaligned range is a decode
+        # that silently produces nothing. Both are powers of two, so the larger of
+        # the two satisfies both.
+        BSALIGN = Int(max(cp[].minBitstreamBufferOffsetAlignment, cp[].minBitstreamBufferSizeAlignment, 1))
         # `dc` was already being filled in and thrown away.  Its flags say
         # whether one image may serve as both DPB and decode target
         # (DPB_AND_OUTPUT_COINCIDE, 0x1) or whether they must be separate images
-        # (DPB_AND_OUTPUT_DISTINCT, 0x2).  The DPB allocation below hardcodes the
-        # coincide layout (`VIDEO_DECODE_DST|VIDEO_DECODE_DPB` on one image).
+        # (DPB_AND_OUTPUT_DISTINCT, 0x2).  Both layouts are supported below; a
+        # device must offer at least one.
         #
-        # On a distinct-only device `vkCreateImage` rejects that combination and
-        # returns nothing usable, and the failure is otherwise SILENT: decode
-        # runs, every frame comes back all-zero, and the only symptom is that the
-        # output does not match the reference. Without validation layers there is
-        # nothing in the log at all. AMD Radeon 8060S reports flags=0x2.
+        # Getting this wrong fails SILENTLY: on a distinct-only device
+        # `vkCreateImage` rejects `VIDEO_DECODE_DST|VIDEO_DECODE_DPB`, decode then
+        # runs against nothing usable, every frame comes back all-zero, and the
+        # only symptom is that the output does not match the reference. Without
+        # validation layers there is nothing in the log at all. AMD Radeon 8060S
+        # reports flags=0x2.
+        #
+        # COINCIDE is preferred where offered: it needs one image less and one
+        # layout transition less per frame.
         let f = dc[].flags
-            (f & UInt32(0x1)) != 0 || error(
+            (f & UInt32(0x3)) != 0 || error(
                 "H264Decoder: device reports video decode flags 0x", string(f, base=16),
-                " — DPB_AND_OUTPUT_COINCIDE (0x1) is not supported.\n",
-                "This decoder allocates a single image with VIDEO_DECODE_DST|VIDEO_DECODE_DPB, ",
-                "which requires COINCIDE; a DISTINCT-only device (0x2) needs separate DPB and ",
-                "output images, which is not implemented yet. ",
-                "Callers can test for this up front with `decode_coincide_supported(ctx)`.")
+                " — neither DPB_AND_OUTPUT_COINCIDE (0x1) nor DPB_AND_OUTPUT_DISTINCT (0x2) ",
+                "is supported, so there is no way to allocate decode images.")
+            DISTINCT = (f & UInt32(0x1)) == 0
         end
     end
     maxslots=UInt32(sps.maxref+2)
@@ -553,20 +609,45 @@ function H264Decoder(ctx, paramnals::AbstractVector{UInt8}; chroma::Bool=false)
     # with, or the driver silently declines to decode into them. Reuse the exact
     # raw `pl` (VkVideoProfileListInfoKHR) pointer the session uses — high-level
     # `create_image` accepts a raw pNext pointer, so no re-serialization can drift.
-    dpbusage=Vk.IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR|Vk.IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR|Vk.IMAGE_USAGE_TRANSFER_SRC_BIT
-    imgs=Vector{Any}(undef,nslots)  # (vimg::VideoImage, view::Vulkan.ImageView)
-    for k in 1:nslots
+    # COINCIDE puts DST and DPB on one image and copies the display output straight
+    # out of the DPB slot. DISTINCT forbids that combination, so the DPB images are
+    # DPB-only and a single extra image is the decode target that gets copied from.
+    dpbusage = DISTINCT ?
+        Vk.IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR :
+        Vk.IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR|Vk.IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR|Vk.IMAGE_USAGE_TRANSFER_SRC_BIT
+    # Same profile pNext as the session, or the driver silently declines to decode.
+    mkimage(usage; families=UInt32[]) = begin
         image=GC.@preserve PIN Vk.Image(dev, Vk.IMAGE_TYPE_2D, fmt_hl, Vk.Extent3D(CW,CH,1),
-            1, 1, Vk.SAMPLE_COUNT_1_BIT, Vk.IMAGE_TILING_OPTIMAL, dpbusage,
-            Vk.SHARING_MODE_EXCLUSIVE, UInt32[], Vk.IMAGE_LAYOUT_UNDEFINED; next=Ptr{Cvoid}(rp(pl)))
+            1, 1, Vk.SAMPLE_COUNT_1_BIT, Vk.IMAGE_TILING_OPTIMAL, usage,
+            isempty(families) ? Vk.SHARING_MODE_EXCLUSIVE : Vk.SHARING_MODE_CONCURRENT,
+            families, Vk.IMAGE_LAYOUT_UNDEFINED; next=Ptr{Cvoid}(rp(pl)))
         mem=Lava.alloc_image_memory(ctx, image)
         view=Vk.ImageView(dev, image, Vk.IMAGE_VIEW_TYPE_2D, fmt_hl,
             Vk.ComponentMapping(Vk.COMPONENT_SWIZZLE_IDENTITY,Vk.COMPONENT_SWIZZLE_IDENTITY,Vk.COMPONENT_SWIZZLE_IDENTITY,Vk.COMPONENT_SWIZZLE_IDENTITY),
             Vk.ImageSubresourceRange(Vk.IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1))
         vimg=Lava.VideoImage(image, mem, CW, CH, DW, DH, fmt_hl, Ref(UInt32(C.VK_IMAGE_LAYOUT_UNDEFINED)))
         pin(image); pin(mem); pin(view)
-        imgs[k]=(vimg, view)
+        (vimg, view)
     end
+    imgs=Vector{Any}(undef,nslots)  # (vimg::VideoImage, view::Vulkan.ImageView)
+    for k in 1:nslots
+        imgs[k]=mkimage(dpbusage)
+    end
+    # One decode target PER AU of the chunk, not one shared target: a DPB slot is
+    # recycled as soon as its frame stops being a reference, so within a single
+    # chunk the same slot backs several frames. The output copies therefore cannot
+    # all read one image at the end — each frame needs its own target that survives
+    # until the copy runs. Grown on demand, reused across chunks.
+    #
+    # CONCURRENT across the video and main queue families because the copies run on
+    # the main queue (a video-decode-only family cannot do vkCmdCopyImageToBuffer),
+    # which would otherwise need an ownership transfer.
+    QFAMS = unique(UInt32[UInt32(ctx.queue_family_index), UInt32(w.qf)])
+    OUTIMGS = Any[]
+    MKOUTIMG = DISTINCT ?
+        (() -> mkimage(Vk.IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR|Vk.IMAGE_USAGE_TRANSFER_SRC_BIT;
+                       families = length(QFAMS) > 1 ? QFAMS : UInt32[])) :
+        nothing
     # command pool + buffer. The command buffer is a *high-level* Vulkan handle
     # so the output copy can use `cmd_copy_image_to_buffer`; the raw video-codec
     # commands take its `.vks` raw handle. (The bitstream upload buffer is created
@@ -576,7 +657,7 @@ function H264Decoder(ctx, paramnals::AbstractVector{UInt8}; chroma::Bool=false)
             Vk.COMMAND_BUFFER_LEVEL_PRIMARY, 1)))); pin(cbh)
     CB=cbh.vks
 
-    return H264Decoder(w, dev, sps, pps, chroma, SESSION, PARAMS, PIN, imgs, nslots,
+    return H264Decoder(w, dev, sps, pps, chroma, SESSION, PARAMS, PIN, imgs, nslots, OUTIMGS, MKOUTIMG, Any[], BSALIGN,
                        nothing, nothing, Ptr{UInt8}(0), UInt64(0), cbh, CB,
                        Int(CW), Int(CH), Int(DW), Int(DH),
                        Vector{Vector{Vector{UInt8}}}(), 1,
@@ -591,9 +672,9 @@ command buffer, uploading its bitstream at `bufbase`, and append the frame's out
 arrays to `dec.pending`. Pure recording + CPU-side DPB bookkeeping — the caller
 ([`decodemore!`](@ref)) submits the whole chunk with ONE queue wait, which is what
 makes chunked decode cheap (a per-frame `vkQueueWaitIdle` costs ~2 ms alone).
-Returns the 256-aligned bitstream bytes consumed.
+Returns the bitstream bytes consumed, aligned to the profile's requirement.
 """
-function decodeau!(dec::H264Decoder, au, bufbase::Integer)
+function decodeau!(dec::H264Decoder, au, bufbase::Integer, slot::Integer=1)
     Lava = parentmodule(@__MODULE__)
     w=dec.w; dev=dec.dev; sps=dec.sps; pps=dec.pps
     SESSION=dec.SESSION; PARAMS=dec.PARAMS; PIN=dec.PIN; imgs=dec.imgs
@@ -604,8 +685,17 @@ function decodeau!(dec::H264Decoder, au, bufbase::Integer)
     IGN=UInt32(0xffffffff); allst=UInt32(C.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)
     barrier(img,old,new)=Ref(C.VkImageMemoryBarrier(C.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,C_NULL,UInt32(C.VK_ACCESS_MEMORY_WRITE_BIT),UInt32(C.VK_ACCESS_MEMORY_READ_BIT)|UInt32(C.VK_ACCESS_MEMORY_WRITE_BIT),C.VkImageLayout(old),C.VkImageLayout(new),IGN,IGN,img,allcol))
     emit(cb,b)=ccall(dfp(w,"vkCmdPipelineBarrier"),Cvoid,(C.VkCommandBuffer,UInt32,UInt32,UInt32,UInt32,Ptr{Cvoid},UInt32,Ptr{Cvoid},UInt32,Ptr{Cvoid}),cb,allst,allst,UInt32(0),UInt32(0),C_NULL,UInt32(0),C_NULL,UInt32(1),pc(b))
+    emitmem(cb,b)=ccall(dfp(w,"vkCmdPipelineBarrier"),Cvoid,(C.VkCommandBuffer,UInt32,UInt32,UInt32,UInt32,Ptr{Cvoid},UInt32,Ptr{Cvoid},UInt32,Ptr{Cvoid}),cb,allst,allst,UInt32(0),UInt32(1),pc(b),UInt32(0),C_NULL,UInt32(0),C_NULL)
+    # Consecutive decodes in one command buffer are NOT implicitly ordered: this AU
+    # writes its reconstructed picture into a DPB slot that the next AU reads as a
+    # reference. The per-image barriers below only fire when a LAYOUT changes, so
+    # once every slot sits in DPB layout nothing separated one decode from the next.
+    # The hardware decoder happens to serialize, which is why the output was right
+    # anyway, but the dependency was genuinely missing.
+    mb=Ref(C.VkMemoryBarrier(C.VK_STRUCTURE_TYPE_MEMORY_BARRIER,C_NULL,UInt32(C.VK_ACCESS_MEMORY_WRITE_BIT),UInt32(C.VK_ACCESS_MEMORY_READ_BIT)|UInt32(C.VK_ACCESS_MEMORY_WRITE_BIT)))
     picres(view)=C.VkVideoPictureResourceInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR,C_NULL,C.VkOffset2D(0,0),C.VkExtent2D(CW,CH),UInt32(0),view)
     DPBLAYOUT=UInt32(C.VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR); TSRC=UInt32(C.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+        DSTLAYOUT=UInt32(C.VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR)   # DISTINCT decode target
     begin
         sh=parse_slice(au[1],sps)
         if sh.idr
@@ -623,8 +713,16 @@ function decodeau!(dec::H264Decoder, au, bufbase::Integer)
         else; poc=dec.decoded; end
         isref = sh.nrid!=0
         outslot=popfirst!(freeslots)
-        outvimg,outviewhl=imgs[outslot]
+        outvimg,outviewhl=imgs[outslot]     # DPB slot — the setup reference picture
         outimg=outvimg.image.vks; outview=outviewhl.vks; outlay=outvimg.layout
+        # Decode target. Under COINCIDE this IS the DPB slot, so every value derived
+        # from it below stays bit-identical to the single-image path.
+        distinct = dec.mkoutimg !== nothing
+        if distinct
+            while length(dec.outimgs) < slot; push!(dec.outimgs, dec.mkoutimg()); end
+        end
+        dstvimg,dstviewhl = distinct ? dec.outimgs[slot] : (outvimg,outviewhl)
+        dstimg=dstvimg.image.vks; dstview=dstviewhl.vks; dstlay=dstvimg.layout
         # upload AU to its chunk-batched region of the bitstream buffer
         off=0; sliceoffs=UInt32[]
         for sl in au
@@ -642,7 +740,10 @@ function decodeau!(dec::H264Decoder, au, bufbase::Integer)
             push!(decref,C.VkVideoReferenceSlotInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_REFERENCE_SLOT_INFO_KHR,pc(ds),Int32(slot-1),rp(pr)))
             push!(begref,C.VkVideoReferenceSlotInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_REFERENCE_SLOT_INFO_KHR,C_NULL,Int32(slot-1),rp(pr)))
         end
+        # `outpr` names the DPB slot (setup reference + the slot activated in
+        # BeginCoding); `dstpr` names the decode target. Equal under COINCIDE.
         outpr=Ref(picres(outview))
+        dstpr=Ref(picres(dstview))
         outri=Ref(C.StdVideoDecodeH264ReferenceInfo(C.StdVideoDecodeH264ReferenceInfoFlags(pbytes(UInt32(0))),UInt16(sh.fnum),UInt16(0),(Int32(poc),Int32(poc))))
         outds=Ref(C.VkVideoDecodeH264DpbSlotInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_DPB_SLOT_INFO_KHR,C_NULL,rp(outri)))
         push!(begref,C.VkVideoReferenceSlotInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_REFERENCE_SLOT_INFO_KHR,C_NULL,Int32(-1),rp(outpr)))
@@ -651,7 +752,7 @@ function decodeau!(dec::H264Decoder, au, bufbase::Integer)
         stdpic=Ref(C.StdVideoDecodeH264PictureInfo(C.StdVideoDecodeH264PictureInfoFlags(pbytes(picflags)),UInt8(0),UInt8(0),UInt8(0),UInt8(0),UInt16(sh.fnum),UInt16(sh.idrid),(Int32(poc),Int32(poc))))
         soff=copy(sliceoffs)
         h264pi=Ref(C.VkVideoDecodeH264PictureInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_PICTURE_INFO_KHR,C_NULL,rp(stdpic),UInt32(length(soff)),pointer(soff)))
-        decinfo=Ref(C.VkVideoDecodeInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_INFO_KHR,pc(h264pi),UInt32(0),bbuf,UInt64(bufbase),UInt64(cld(off,256)*256),outpr[],rp(setup),UInt32(length(decref)),isempty(decref) ? Ptr{C.VkVideoReferenceSlotInfoKHR}(C_NULL) : pointer(decref)))
+        decinfo=Ref(C.VkVideoDecodeInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_INFO_KHR,pc(h264pi),UInt32(0),bbuf,UInt64(bufbase),UInt64(cld(off,dec.bsalign)*dec.bsalign),dstpr[],rp(setup),UInt32(length(decref)),isempty(decref) ? Ptr{C.VkVideoReferenceSlotInfoKHR}(C_NULL) : pointer(decref)))
         beginfo=Ref(C.VkVideoBeginCodingInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_BEGIN_CODING_INFO_KHR,C_NULL,UInt32(0),SESSION,PARAMS,UInt32(length(begref)),pointer(begref)))
         ctl=Ref(C.VkVideoCodingControlInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_CODING_CONTROL_INFO_KHR,C_NULL,UInt32(C.VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR)))
         endinfo=Ref(C.VkVideoEndCodingInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_END_CODING_INFO_KHR,C_NULL,UInt32(0)))
@@ -662,18 +763,34 @@ function decodeau!(dec::H264Decoder, au, bufbase::Integer)
         dst=Lava.LavaArray{UInt8,2}(undef,(DW,DH); extra_usage=UInt32(Vk.BUFFER_USAGE_TRANSFER_DST_BIT))
         dstbuf=dst.buf[]
         duv = chroma ? Lava.LavaArray{UInt8,2}(undef,(DW,DH÷2); extra_usage=UInt32(Vk.BUFFER_USAGE_TRANSFER_DST_BIT)) : nothing
-        GC.@preserve PIN dst duv cbh outvimg refpr refri refds decref begref outpr outri outds setup stdpic soff h264pi decinfo beginfo ctl endinfo imgs begin
+        GC.@preserve PIN dst duv cbh outvimg dstvimg mb refpr refri refds decref begref outpr dstpr outri outds setup stdpic soff h264pi decinfo beginfo ctl endinfo imgs begin
             for (slot,_,_) in dpb; lay=imgs[slot][1].layout; if lay[]!=DPBLAYOUT; emit(CB,barrier(imgs[slot][1].image.vks,lay[],DPBLAYOUT)); lay[]=DPBLAYOUT; end; end
             emit(CB,barrier(outimg,outlay[],DPBLAYOUT)); outlay[]=DPBLAYOUT
+            # Under DISTINCT the decode target is its own image and needs the
+            # decode-DST layout; it comes back round as TRANSFER_SRC from the
+            # previous frame's copy. Under COINCIDE `dstlay === outlay`, already
+            # DPBLAYOUT, and this is skipped.
+            if distinct
+                emit(CB,barrier(dstimg,dstlay[],DSTLAYOUT)); dstlay[]=DSTLAYOUT
+            end
             ccall(dfp(w,"vkCmdBeginVideoCodingKHR"),Cvoid,(C.VkCommandBuffer,Ptr{Cvoid}),CB,pc(beginfo))
             isfirst && ccall(dfp(w,"vkCmdControlVideoCodingKHR"),Cvoid,(C.VkCommandBuffer,Ptr{Cvoid}),CB,pc(ctl))
             ccall(dfp(w,"vkCmdDecodeVideoKHR"),Cvoid,(C.VkCommandBuffer,Ptr{Cvoid}),CB,pc(decinfo))
             ccall(dfp(w,"vkCmdEndVideoCodingKHR"),Cvoid,(C.VkCommandBuffer,Ptr{Cvoid}),CB,pc(endinfo))
-            emit(CB,barrier(outimg,DPBLAYOUT,TSRC)); outlay[]=TSRC   # outvimg.layout now TRANSFER_SRC
-            Lava.record_luma_copy!(cbh, outvimg, dstbuf.buffer, dstbuf.pool_offset + dst.offset)
-            if chroma
-                uvbuf = duv.buf[]
-                Lava.record_chroma_copy!(cbh, outvimg, uvbuf.buffer, uvbuf.pool_offset + duv.offset)
+            emitmem(CB,mb)   # this decode's DPB writes → the next decode's reference reads
+            emit(CB,barrier(dstimg,dstlay[],TSRC)); dstlay[]=TSRC   # decode target now TRANSFER_SRC
+            if distinct
+                # vkCmdCopyImageToBuffer needs GRAPHICS/COMPUTE/TRANSFER; a
+                # video-decode-only queue family (AMD reports exactly that) cannot
+                # record it. Defer to the main queue, drained by `decodemore!` once
+                # the decode queue is idle.
+                push!(dec.copyq, (dstvimg, dst, duv))
+            else
+                Lava.record_luma_copy!(cbh, dstvimg, dstbuf.buffer, dstbuf.pool_offset + dst.offset)
+                if chroma
+                    uvbuf = duv.buf[]
+                    Lava.record_chroma_copy!(cbh, dstvimg, uvbuf.buffer, uvbuf.pool_offset + duv.offset)
+                end
             end
         end
         push!(dec.pending,(dec.gop,poc,dst,duv))   # completes at the chunk's queue wait
@@ -702,7 +819,7 @@ function decodeau!(dec::H264Decoder, au, bufbase::Integer)
         dec.isfirst=false
         dec.decoded+=1
     end
-    return Int(cld(off, 256) * 256)
+    return Int(cld(off, dec.bsalign) * dec.bsalign)
 end
 
 """
