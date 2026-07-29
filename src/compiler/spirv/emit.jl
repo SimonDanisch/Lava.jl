@@ -6060,6 +6060,12 @@ function defer_phi!(state::SPIRVEmitterState, inst::LLVM.PHIInst, block_label_id
     push!(state.deferred_phis, (result_id, result_ty, incoming, block_label_id))
 end
 
+"""Whether `id` names an `OpTypeCooperativeMatrixKHR`. Answered from the types
+the emitter itself created, so it needs no bookkeeping beyond what
+`emit_coopmat_type!` already keeps."""
+is_coopmat_type_id(state::SPIRVEmitterState, id::UInt32) =
+    any(==(id), values(state.coopmat_type_ids))
+
 """
 Resolve all deferred PHI nodes by inserting them right after their block's OpLabel.
 Must be called after all blocks are emitted so all operand values have IDs.
@@ -6129,6 +6135,30 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
                         encode_instruction!(state.type_ctx.mod.types_constants, UInt16(46), type_id, uid)  # OpConstantNull
                         uid
                     end
+                end
+            elseif val isa LLVM.Constant && is_coopmat_type_id(state, type_id) &&
+                   get(state.coopmat_value_types, val, nothing) !== type_id
+                # A cooperative-matrix handle is an `i32` to LLVM, so on an edge
+                # where the matrix is dead — the loop-exit path out of a rotated
+                # loop — LLVM is free to put a plain `i32 0` there. Passing that
+                # through emits `OpPhi %coopmat … %uint_0`, which is ill-typed
+                # and fails validation.
+                #
+                # It appears the moment a barrier sits inside a loop carrying an
+                # accumulator: the barrier splits the body, the structurizer adds
+                # a latch phi, and that phi's header edge carries the constant.
+                # That is exactly the shape of a shared-memory staged GEMM, and
+                # it is why `coopmat_gemm_kernel!` could only load from global.
+                #
+                # `OpConstantNull` rather than a workaround: the edge is only
+                # taken where the value is unused, which is the same reasoning
+                # the `UndefValue` branch above already applies.
+                key = (:null, type_id)
+                get!(state.type_ctx.mod.constant_cache, key) do
+                    uid = fresh_id!(state.type_ctx.mod)
+                    encode_instruction!(state.type_ctx.mod.types_constants,
+                                        UInt16(46), type_id, uid)  # OpConstantNull
+                    uid
                 end
             else
                 get_value_id!(state, val)

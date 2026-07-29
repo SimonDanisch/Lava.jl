@@ -21,6 +21,69 @@ const GEMM_BLOCK = 4       # register block: 4×4 accumulators per subgroup
 const GEMM_WORKGROUP = 64  # 2 subgroups; 32 loses latency hiding, 256 spills
 const GEMM_MAXBLOCK = 4    # largest register block `@nexprs` is unrolled for
 
+# ── the staged kernel, and why it is OFF ─────────────────────────────────────
+#
+# The kernel above loads every cooperative matrix straight from global memory,
+# so with a 4×4 register block each A tile is read four times and each B tile
+# four times per k-step, and both subgroups repeat the same B loads. Every
+# high-performance implementation instead stages a block of A and a block of B
+# into workgroup memory once and loads the matrices from there — llama.cpp's
+# Vulkan backend (`ggml-vulkan/vulkan-shaders/mul_mm.comp`, MIT) does exactly
+# that, with BM=BN=64, BK=32, 4 subgroups, and `+4` elements of leading-dimension
+# padding against bank conflicts. So does cuBLAS, which reaches 44.6 TFLOP/s on
+# these shapes against our ~20.
+#
+# **It does not help here.** Measured on SAM 2's six `addmm` shapes, both
+# configurations, best-of-50 after a 2-second warm-up so the clock is up:
+#
+#                        register-blocked   staged 64×64   staged 128×128
+#   2304×4096×576              20.1              20.5            6.3
+#    576×4096×2304             22.5              22.0           22.3
+#   1728×4096×576              19.1              20.0           19.1
+#    576×4096×576              16.9              17.3           17.2
+#    288×16384×1152            14.2              13.9           14.3
+#   1152×16384×288             21.1              20.9            5.5
+#   ────────────────────────────────────────────────────────────────────
+#   weighted total              1.00x            1.03x          0.56x
+#
+# 64×64 is a wash and 128×128 is a loss: at 17.2 KB of workgroup memory only two
+# workgroups fit per SM, which is 256 threads and nowhere near enough to hide
+# latency. The premise — that repeated global tile loads were costing us — is
+# simply false on this hardware. NVIDIA's L1 serves them, and what staging adds
+# is two barriers per k-step and occupancy pressure.
+#
+# Kept, switched off, because it cost a real capability to build (cooperative
+# matrices could not address `Workgroup` memory at all before it) and because
+# that capability is what a flash-attention kernel needs — which the kernel
+# table says is now the larger target. Turning it on is one `Ref`.
+const GEMM_STAGED_WG = 128          # 4 subgroups
+const GEMM_SUBTILES = 2             # tiles per subgroup per axis; 4 measured worse
+const GEMM_BM = GEMM_TILE * GEMM_SUBTILES * 2   # 2 subgroups down
+const GEMM_BN = GEMM_TILE * GEMM_SUBTILES * 2   # 2 subgroups across
+const GEMM_BK = 32
+const GEMM_PAD = 4                  # bank-conflict padding, in elements
+const GEMM_LDA = GEMM_BM + GEMM_PAD
+const GEMM_LDB = GEMM_BK + GEMM_PAD
+const GEMM_AREPS = (GEMM_BM * GEMM_BK) ÷ GEMM_STAGED_WG   # elements each lane stages
+const GEMM_BREPS = (GEMM_BK * GEMM_BN) ÷ GEMM_STAGED_WG
+
+"""
+    GEMM_STAGED[]
+
+Use the workgroup-staged kernel where the shape allows it. **Off**: it measured
+a wash at 64×64 and a 0.56x loss at 128×128 — see the table above. Switchable
+so the comparison can be re-run in one session on the same shapes, which is the
+only form of it that means anything.
+"""
+const GEMM_STAGED = Ref(false)
+
+"""Whether the staged kernel covers this shape: it masks nothing, so every
+block extent has to divide exactly. SAM 2's four dominant `addmm` shapes all
+do; anything else falls back to the register-blocked kernel."""
+@inline staged_gemm_applicable(M::Int, N::Int, K::Int, nbatch::Int) =
+    GEMM_STAGED[] && nbatch == 1 &&
+    M % GEMM_BM == 0 && N % GEMM_BN == 0 && K % GEMM_BK == 0
+
 """Does this device implement the tile `mul!` wants?"""
 function coopmat_gemm_available(ctx::VkContext = vk_context())
     coopmat_shape(ctx, Float16, GEMM_TILE, GEMM_TILE, GEMM_TILE)
@@ -130,6 +193,81 @@ for BLK in (1, 2, 4)
         end
         GEMM_BLOCK_KERNELS[$BLK] = $kname
     end
+end
+
+"""
+One workgroup computes a `GEMM_BM × GEMM_BN` block of C, staging A and B through
+workgroup memory.
+
+The loop is the reference's: fill shared, barrier, multiply out of shared,
+barrier. Each of the four subgroups owns a 32×32 quadrant, which is a 2×2 block
+of cooperative-matrix tiles, and the two `GEMM_BK ÷ GEMM_TILE` k-tiles inside a
+stage are unrolled — so one staged block feeds 2×2×2 = 8 `muladd`s per subgroup
+off 4 A-loads and 4 B-loads from shared, where the global-loading kernel pays
+for those loads out of L2 every time.
+
+Both staging loops are written so that consecutive lanes read consecutive
+*global* addresses — `i` fastest for A, `k` fastest for B — because that is the
+side where coalescing matters. The shared side is strided and does not care.
+"""
+@kernel cpu=false function coopmat_gemm_staged_kernel!(C, @Const(A), @Const(B),
+                                                       ::Val{M}, ::Val{N},
+                                                       ::Val{K}) where {M,N,K}
+    sA = @localmem Float16 (GEMM_LDA * GEMM_BK,)
+    sB = @localmem Float16 (GEMM_LDB * GEMM_BN,)
+
+    tid = @index(Local, Linear) - 1
+    blk = @index(Group, Linear) - 1
+    nblk_m = M ÷ GEMM_BM
+    tm = (blk % nblk_m) * GEMM_BM
+    tn = (blk ÷ nblk_m) * GEMM_BN
+
+    s = tid ÷ 32                       # subgroup within the workgroup
+    sm = (s % 2) * GEMM_SUBTILES       # its first tile row, in tiles
+    sn = (s ÷ 2) * GEMM_SUBTILES       # its first tile column, in tiles
+
+    Base.Cartesian.@nexprs 2 nt -> Base.Cartesian.@nexprs 2 mt ->
+        c_mt_nt = zero(AcceleratedMatrix{Float32,GEMM_TILE,GEMM_TILE,Accumulator})
+
+    k0 = 0
+    while k0 < K
+        # A block: rows [tm, tm+BM) × cols [k0, k0+BK), column-major both sides.
+        @inbounds for r in 0:(GEMM_AREPS - 1)
+            idx = tid + r * GEMM_STAGED_WG
+            i = idx % GEMM_BM
+            kk = idx ÷ GEMM_BM
+            sA[1 + i + kk * GEMM_LDA] = A[1 + (tm + i) + (k0 + kk) * M]
+        end
+        # B block: rows [k0, k0+BK) × cols [tn, tn+BN).
+        @inbounds for r in 0:(GEMM_BREPS - 1)
+            idx = tid + r * GEMM_STAGED_WG
+            kk = idx % GEMM_BK
+            j = idx ÷ GEMM_BK
+            sB[1 + kk + j * GEMM_LDB] = B[1 + (k0 + kk) + (tn + j) * K]
+        end
+        @synchronize
+
+        Base.Cartesian.@nexprs 2 u -> begin
+            kt_u = (u - 1) * GEMM_TILE
+            Base.Cartesian.@nexprs 2 mt -> a_mt_u =
+                AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixA}(
+                    sA, 1 + (sm + mt - 1) * GEMM_TILE + kt_u * GEMM_LDA, GEMM_LDA)
+            Base.Cartesian.@nexprs 2 nt -> b_nt_u =
+                AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixB}(
+                    sB, 1 + kt_u + (sn + nt - 1) * GEMM_TILE * GEMM_LDB, GEMM_LDB)
+            Base.Cartesian.@nexprs 2 nt -> Base.Cartesian.@nexprs 2 mt ->
+                c_mt_nt = muladd(a_mt_u, b_nt_u, c_mt_nt)
+        end
+        @synchronize      # nothing may refill shared until every subgroup is done
+
+        k0 += GEMM_BK
+    end
+
+    Base.Cartesian.@nexprs 2 nt -> Base.Cartesian.@nexprs 2 mt ->
+        copyto!(pointer(C),
+                1 + (tm + (sm + mt - 1) * GEMM_TILE) +
+                    (tn + (sn + nt - 1) * GEMM_TILE) * M,
+                M, c_mt_nt)
 end
 
 # The scalar kernel takes each operand as a *dense base array plus strides*
@@ -369,6 +507,15 @@ function coopmat_gemm!(C, A, B, M::Int, N::Int, K::Int;
                        blk_split = coopmat_gemm_shape(M, N, K; nbatch),
                        partials = nothing, reduce::Bool = true)
     backend = LavaBackend()
+    # The staged kernel masks nothing and does not split K, so it takes only the
+    # shapes it divides exactly — which includes all four of SAM 2's dominant
+    # `addmm` shapes, i.e. 72.7% of the encoder's arithmetic.
+    if staged_gemm_applicable(M, N, K, nbatch)
+        coopmat_gemm_staged_kernel!(backend, GEMM_STAGED_WG)(
+            C, A, B, Val(M), Val(N), Val(K);
+            ndrange = (M ÷ GEMM_BM) * (N ÷ GEMM_BN) * GEMM_STAGED_WG)
+        return C
+    end
     blk, splitk = blk_split
     span = GEMM_TILE * blk
     ntiles = (M ÷ span) * (N ÷ span)
