@@ -222,6 +222,21 @@ end
             include(joinpath(@__DIR__, "test_frozen_rt_cache.jl"))
         end
 
+        # test_frozen_cache.jl shipped unregistered, so the compute-side frozen
+        # cache had no coverage in CI. It restores FROZEN_VERSION by plain
+        # assignment, so a throw part-way through would leave the cache ENABLED
+        # for every later testset here — silently, since a frozen hit looks like
+        # a normal launch. Restore it from a finally block instead.
+        @testset "frozen kernel cache (compute)" begin
+            _fv, _fr = Lava.FROZEN_VERSION[], Lava.FROZEN_RECORDING[]
+            try
+                include(joinpath(@__DIR__, "test_frozen_cache.jl"))
+            finally
+                Lava.FROZEN_VERSION[]   = _fv
+                Lava.FROZEN_RECORDING[] = _fr
+            end
+        end
+
         @testset "HW TLAS — nonblocking sync!" begin
             include(joinpath(@__DIR__, "test_hwtlas_nonblocking_sync.jl"))
         end

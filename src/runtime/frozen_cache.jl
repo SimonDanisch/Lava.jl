@@ -30,6 +30,19 @@ The module in the key is the one the kernel is **defined** in, not the one that
 launched it. A broadcast kernel over `LavaArray` belongs to Lava whoever calls
 it, so DNNKernels and VideoEditor share Lava's entry instead of each writing their
 own copy under their own name.
+
+Ray-tracing stages go through `frozen_rt_load` / `frozen_rt_store`, keyed the
+same way plus `stage` and `payload_type` — one function is compiled once per
+stage, and the payload changes the emitted module. They are the expensive half
+of an hw_accel=true scene: crown's startup is ~1063 s cold against ~123 s
+frozen, for an unchanged 7.5 s frame.
+
+Note that only level 1 applies to them. Their ISA is already covered by the
+device-wide `ctx.pipeline_cache`, which `create_rt_pipeline` passes and which
+persists across sessions, so there is no per-stage `.bin`. That device-wide
+cache is also why the RT compile looked cached when it was not: it caches the
+driver's SPIR-V -> ISA step, and everything above it — GPUCompiler, the LLVM
+passes, structurize, the emitter — ran on every start regardless.
 """
 
 """
