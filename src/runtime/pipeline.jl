@@ -114,10 +114,72 @@ const PIPELINE_CACHE = Dict{UInt64, LavaComputePipeline}()
 const PIPELINE_INSERTION_ORDER = UInt64[]
 const MAX_PIPELINE_CACHE_SIZE = Ref(1024)
 
+# Lava's cooperative-matrix kernels are written against a 32-lane subgroup: they
+# index their subgroup as `lane ÷ 32` and size their workgroups in multiples of
+# it. Cooperative-matrix operations are subgroup-scoped, so on a device with a
+# wider wave those lanes do not form a subgroup and the kernel writes only part
+# of its output tile.
+const COOPMAT_SUBGROUP = 32
+
+struct SubgroupSizeControl
+    min::Int
+    max::Int
+    compute::Bool   # COMPUTE present in requiredSubgroupSizeStages
+end
+
+const SUBGROUP_SIZE_CONTROL = Ref{Union{Nothing,SubgroupSizeControl}}(nothing)
+
+"""
+    subgroup_size_control(ctx) -> SubgroupSizeControl
+
+The device's `VkPhysicalDeviceSubgroupSizeControlProperties`, queried once.
+`compute` says whether a compute pipeline may pin its own subgroup size.
+"""
+function subgroup_size_control(ctx::VkContext = vk_context())
+    cached = SUBGROUP_SIZE_CONTROL[]
+    cached === nothing || return cached
+    p = Vulkan.get_physical_device_properties_2(
+            ctx.physical_device, Vulkan.PhysicalDeviceSubgroupSizeControlProperties).next
+    c = SubgroupSizeControl(
+        Int(p.min_subgroup_size), Int(p.max_subgroup_size),
+        (UInt32(p.required_subgroup_size_stages) &
+         UInt32(Vulkan.SHADER_STAGE_COMPUTE_BIT)) != 0)
+    SUBGROUP_SIZE_CONTROL[] = c
+    return c
+end
+
+"""Whether a compute pipeline on this device can be pinned to `n` lanes per subgroup."""
+function can_require_subgroup_size(ctx::VkContext, n::Integer)
+    c = subgroup_size_control(ctx)
+    c.compute && c.min <= n <= c.max
+end
+
+# Whether the module declares `cap` via OpCapability. Capabilities are the first
+# thing in a valid SPIR-V module, so this stops at OpMemoryModel rather than
+# walking the whole binary.
+function spirv_declares_capability(spirv::Vector{UInt8}, cap::UInt32)
+    length(spirv) >= 20 && length(spirv) % 4 == 0 || return false
+    w = reinterpret(UInt32, spirv)
+    w[1] == 0x07230203 || return false          # magic, matching our byte order
+    i = 6                                       # first word after the 5-word header
+    @inbounds while i <= length(w)
+        count = w[i] >> 16
+        count == 0 && break                     # malformed; refuse to loop forever
+        opcode = UInt16(w[i] & 0xffff)
+        opcode == Op.OpMemoryModel && break      # past the capability section
+        if opcode == Op.OpCapability && count >= 2 && i + 1 <= length(w)
+            w[i+1] == cap && return true
+        end
+        i += count
+    end
+    return false
+end
+
 # Register cleanup callback for vk_reset_device!
 push!(RESET_CALLBACKS, function()
     empty!(PIPELINE_CACHE)
     empty!(PIPELINE_INSERTION_ORDER)
+    SUBGROUP_SIZE_CONTROL[] = nothing   # re-query: the next device may differ
 end)
 
 """
@@ -175,11 +237,24 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
 
     layout = Vulkan.PipelineLayout(dev, ds_layouts, push_ranges)
 
+    # A cooperative-matrix module assumes a 32-lane subgroup (see COOPMAT_SUBGROUP).
+    # Where the device lets a pipeline pin its subgroup size we do, which makes
+    # those kernels correct on wave64 hardware rather than merely disabled. This
+    # is a deterministic function of (SPIR-V, device), so `cache_key` still
+    # identifies the pipeline uniquely without naming the size.
+    stage_next = C_NULL
+    if spirv_declares_capability(spirv_bytes, Cap.CooperativeMatrixKHR) &&
+       can_require_subgroup_size(ctx, COOPMAT_SUBGROUP)
+        stage_next = Vulkan.PipelineShaderStageRequiredSubgroupSizeCreateInfo(
+            UInt32(COOPMAT_SUBGROUP))
+    end
+
     # Create compute pipeline
     stage = Vulkan.PipelineShaderStageCreateInfo(
         Vulkan.SHADER_STAGE_COMPUTE_BIT,
         shader_mod,
-        entry_name
+        entry_name;
+        next = stage_next
     )
     # Optional CAPTURE_STATISTICS bit so VK_KHR_pipeline_executable_properties
     # has a populated stats table to query later via pipeline_exec_stats.

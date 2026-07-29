@@ -87,8 +87,9 @@ do; anything else falls back to the register-blocked kernel."""
 """Does this device implement the tile `mul!` wants?"""
 # The block kernel derives its subgroup index as `lane ÷ 32` and GEMM_WORKGROUP
 # is sized as "2 subgroups" on the same assumption, so the whole thing is only
-# correct where a subgroup is 32 lanes wide.
-const GEMM_SUBGROUP = 32
+# correct where a subgroup is 32 lanes wide. Same constant the pipeline layer
+# uses when it pins a coopmat pipeline's subgroup size.
+const GEMM_SUBGROUP = COOPMAT_SUBGROUP
 
 # Queried once; `vk_reset_device!` clears it along with everything else.
 const GEMM_DEVICE_SUBGROUP = Ref(0)
@@ -108,13 +109,16 @@ end
 # the output tile is written, bit-exact, and the other half stays zero, which is
 # a silently wrong answer rather than a failure.
 #
-# Reporting "unavailable" instead sends `mul!` down `gemmlaunch!`, which is
-# correct on any subgroup width. Making the kernel itself wave-size agnostic
-# means retuning GEMM_WORKGROUP and the block factors together, and those were
-# measured on wave32 hardware.
+# Two ways to have a 32-lane subgroup: the device is natively wave32, or it lets
+# the pipeline pin its subgroup size, which `get_compute_pipeline` does for any
+# coopmat module. Failing both, `mul!` falls through to `gemmlaunch!`, which is
+# correct at any width — slower, but not wrong. Making the kernel itself
+# wave-size agnostic would mean retuning GEMM_WORKGROUP and the block factors
+# together, and those were measured at 32.
 function coopmat_gemm_available(ctx::VkContext = vk_context())
     coopmat_shape(ctx, Float16, GEMM_TILE, GEMM_TILE, GEMM_TILE) &&
-        device_subgroup_size(ctx) == GEMM_SUBGROUP
+        (device_subgroup_size(ctx) == GEMM_SUBGROUP ||
+         can_require_subgroup_size(ctx, GEMM_SUBGROUP))
 end
 
 # Tile index comes from the global lane index, so a workgroup may hold several
