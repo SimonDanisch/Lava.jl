@@ -82,6 +82,14 @@ using GPUCompiler
         # tracking was folded into LINKED_KERNEL_CACHE itself; clearing the
         # cache is the only access we need.
         empty!(Lava.LINKED_KERNEL_CACHE)
+        # LAUNCH_PLAN_CACHE sits ABOVE both tiers: `launch_plan` returns a
+        # cached LaunchPlan without ever calling
+        # `get_compiled_kernel_and_pipeline`, so with only Tier 1 cleared the
+        # next dispatch never reaches the compile path and Tier 1 stays empty —
+        # the assertion below failed with `0 >= 1`. The plan cache postdates
+        # this test (added by "perf: overlap recording with execution"), so drop
+        # it too or the test measures nothing.
+        empty!(Lava.LAUNCH_PLAN_CACHE)
 
         # Next dispatch should hit Tier 2 and repopulate Tier 1
         repop_test_kernel(backend)(c, 99f0; ndrange=4)
@@ -126,14 +134,18 @@ using GPUCompiler
         end
     end
 
-    @testset "GPUCompiler disk cache integration" begin
-        # Check that disk cache is available (may or may not be enabled)
-        path = GPUCompiler.disk_cache_path()
-        @test path isa String
-        @test !isempty(path)
-
-        # Verify cache_file returns nothing for REPL-defined kernels
-        # (disk cache only works for precompiled package code)
+    # GPUCompiler 2.0 removed its disk cache entirely — `disk_cache_path` and
+    # `cache_file` no longer exist, and there is no `disk_cache` anywhere in
+    # 2.1.1 (the replacement direction is `cached_results`). This used to assert
+    # on `GPUCompiler.disk_cache_path()` and became an UndefVarError on the
+    # upgrade from 1.23.
+    #
+    # Nothing in Lava's src depended on it: Lava's own two-tier cache is
+    # `lava_disk_cache_*` in launch.jl and is unaffected. What is still worth
+    # testing is the behaviour the removed assertions surrounded — that a kernel
+    # defined outside a package (so never precompiled, and never disk-cacheable
+    # under any scheme) still compiles and runs.
+    @testset "REPL-defined kernels compile without any disk cache" begin
         @kernel function repl_kernel(dst)
             i = @index(Global)
             @inbounds dst[i] = 1f0
