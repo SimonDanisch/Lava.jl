@@ -110,6 +110,65 @@ struct LavaComputePipeline
     descriptor_set_layout::Union{Nothing, Vulkan.DescriptorSetLayout}
 end
 
+"""
+    PIPELINE_NO_COMPILE
+
+When set, compute pipelines are created with
+`PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT`: the driver REFUSES to
+build a binary and returns `VK_PIPELINE_COMPILE_REQUIRED` instead. That turns
+"the pipeline cache was warm" from a wall-clock inference into something the
+driver asserts directly — a fast second run otherwise proves nothing, since it
+could just as easily be Lava's in-memory `PIPELINE_CACHE` rather than the
+on-disk blob.
+
+Requires `pipelineCreationCacheControl`, which `vk_device!` enables as part of
+the Vulkan 1.3 core feature set. Use via `no_pipeline_compilation`.
+"""
+const PIPELINE_NO_COMPILE = Ref(false)
+
+"How many pipeline creations were refused because they would have compiled."
+const PIPELINE_COMPILES_REFUSED = Ref(0)
+
+# VkResult VK_PIPELINE_COMPILE_REQUIRED. Positive (success class), so a bare
+# `result != 0` check reports it as a generic failure — it needs naming.
+const VK_PIPELINE_COMPILE_REQUIRED = 1000297000
+
+"""
+    no_pipeline_compilation(f) -> f()
+
+Run `f` with the driver forbidden from compiling any compute pipeline: every
+creation carries `PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT`, so a
+pipeline that is not already in the cache makes creation fail loudly instead of
+quietly building a binary.
+
+This is how to prove a cache is doing its job. Timing cannot: a fast second run
+is equally explained by Lava's in-memory `PIPELINE_CACHE` dict, which never
+touches disk. Under this wrapper, a run that completes did zero driver
+compilation — the driver said so.
+
+Clears Lava's in-memory pipeline cache first, so only the `VkPipelineCache`
+(seeded from disk) can satisfy a creation. Restores the previous setting after.
+
+    Lava.no_pipeline_compilation() do
+        run_the_workload()          # throws if anything would compile
+    end
+"""
+function no_pipeline_compilation(f)
+    old = PIPELINE_NO_COMPILE[]
+    old_refused = PIPELINE_COMPILES_REFUSED[]
+    # Otherwise a hit on the Julia-side dict would mask a cold VkPipelineCache.
+    empty!(PIPELINE_CACHE)
+    empty!(PIPELINE_INSERTION_ORDER)
+    PIPELINE_NO_COMPILE[] = true
+    PIPELINE_COMPILES_REFUSED[] = 0
+    try
+        return f()
+    finally
+        PIPELINE_NO_COMPILE[] = old
+        PIPELINE_COMPILES_REFUSED[] += old_refused
+    end
+end
+
 const PIPELINE_CACHE = Dict{UInt64, LavaComputePipeline}()
 const PIPELINE_INSERTION_ORDER = UInt64[]
 const MAX_PIPELINE_CACHE_SIZE = Ref(1024)
@@ -280,6 +339,12 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
     if PIPELINE_EXEC_PROPERTIES_REQUESTED[]
         pipeline_flags |= Vulkan.PipelineCreateFlag(Vulkan.PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR)
     end
+    if PIPELINE_NO_COMPILE[]
+        # EARLY_RETURN_ON_FAILURE alongside, as the spec pairs them: bail at the
+        # first pipeline that would compile rather than continuing the batch.
+        pipeline_flags |= Vulkan.PipelineCreateFlag(Vulkan.PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) |
+                          Vulkan.PipelineCreateFlag(Vulkan.PIPELINE_CREATE_EARLY_RETURN_ON_FAILURE_BIT)
+    end
     ci = Vulkan.ComputePipelineCreateInfo(stage, layout, -1; flags=pipeline_flags)
 
     # `pipeline_cache` lets the frozen cache hand in a per-kernel one seeded from
@@ -370,6 +435,12 @@ function create_compute_pipeline(dev::Vulkan.Device, ci::Vulkan.ComputePipelineC
                 cache_handle,
                 Ptr{Cvoid}(pointer_from_objref(vk_ci_ref)),
                 Ptr{Cvoid}(pointer_from_objref(pipeline_out)))
+            if vk_result == VK_PIPELINE_COMPILE_REQUIRED
+                PIPELINE_COMPILES_REFUSED[] += 1
+                error("vkCreateComputePipelines returned VK_PIPELINE_COMPILE_REQUIRED: this " *
+                      "pipeline is NOT in the cache and would have been compiled. " *
+                      "(PIPELINE_NO_COMPILE is set; see no_pipeline_compilation.)")
+            end
             vk_result != 0 && error("vkCreateComputePipelines failed with VkResult $vk_result")
         end
 

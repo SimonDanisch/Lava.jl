@@ -147,6 +147,10 @@ end
         include(joinpath(@__DIR__, "test_struct_alignment_systematic.jl"))
     end
 
+    @testset "pipeline cache avoids driver compilation" begin
+        include(joinpath(@__DIR__, "test_pipeline_cache_no_compile.jl"))
+    end
+
     @testset "static workgroup indexing" begin
         include(joinpath(@__DIR__, "test_static_workgroup.jl"))
     end
