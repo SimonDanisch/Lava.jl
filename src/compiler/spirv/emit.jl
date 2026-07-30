@@ -4842,11 +4842,20 @@ function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     # Function storage keeps 4: `emit_function_ptr_word!` indexes 4-byte words
     # (`total_byte_offset ÷ 4 + word_idx`) and allocas are at least 4-aligned, so
     # the assumption holds there. Only device pointers have arbitrary strides.
+    # Only 4 or 1: a 16-bit chunk would need the StorageBuffer16BitAccess capability
+    # AND `storageBuffer16BitAccess` enabled at device creation. Lava declares
+    # neither (it enables workgroup_memory_explicit_layout_16_bit_access, which is
+    # Workgroup storage, not PSB), so emitting `OpLoad %ushort` through a device
+    # pointer is undefined behaviour. It produced correct values in a targeted test
+    # and then HUNG the GPUArrays indexing tier. Byte access is already used by the
+    # tail copies below and works, so an unaligned copy degrades to bytes.
+    #
+    # Making 16-bit chunks legal — declare the capability, enable the feature, gate
+    # on device support — would be faster for these sizes and is worth doing
+    # separately; it is not a one-line change and needs checking on every driver.
     chunk = 4
-    if !is_src_function && !is_dest_function
-        while chunk > 1 && nbytes % chunk != 0
-            chunk ÷= 2
-        end
+    if !is_src_function && !is_dest_function && nbytes % 4 != 0
+        chunk = 1
     end
     chunk_ty = emit_type_int!(state.mod, UInt32(chunk * 8), UInt32(0))
     u32_ty = chunk_ty   # bulk-loop element type
