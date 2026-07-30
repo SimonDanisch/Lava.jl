@@ -4820,19 +4820,40 @@ function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     dest_sc = get_pointer_storage_class(dest_ptr)
     src_sc = get_pointer_storage_class(src_ptr)
 
-    # Use i32 for word-by-word copy
-    u32_ty = emit_type_int!(state.mod, UInt32(32), UInt32(0))
     u64_ty = emit_type_int!(state.mod, UInt32(64), UInt32(0))
-
-    # Create pointer types for i32 in appropriate storage classes
-    src_ptr_ty = map_pointer_type!(state.type_ctx, u32_ty, src_sc)
-    dest_ptr_ty = map_pointer_type!(state.type_ctx, u32_ty, dest_sc)
 
     # Memory operands for aligned access
     is_src_psb = src_sc == SC.PhysicalStorageBuffer
     is_dest_psb = dest_sc == SC.PhysicalStorageBuffer
     is_src_function = src_sc == SC.Function
     is_dest_function = dest_sc == SC.Function
+
+    # Chunk width. This used to be 4 unconditionally, with `Aligned 4` stamped on
+    # every load and store — but these copies are ARRAY ELEMENTS, and consecutive
+    # elements sit at multiples of the element size. For a 6-byte struct (three
+    # Int16s) element i is at byte 6(i-1), which is 4-aligned only for odd i, so
+    # every EVEN element declared an alignment its address did not have. The
+    # 32-bit access then dropped its high half: field `a` (bytes 0..1) survived and
+    # field `b` (bytes 2..3) came back zero, silently, for half the array.
+    #
+    # The intrinsic itself declares `align 1` here, so the old code was not merely
+    # optimistic — it contradicted the IR it was lowering.
+    #
+    # Function storage keeps 4: `emit_function_ptr_word!` indexes 4-byte words
+    # (`total_byte_offset ÷ 4 + word_idx`) and allocas are at least 4-aligned, so
+    # the assumption holds there. Only device pointers have arbitrary strides.
+    chunk = 4
+    if !is_src_function && !is_dest_function
+        while chunk > 1 && nbytes % chunk != 0
+            chunk ÷= 2
+        end
+    end
+    chunk_ty = emit_type_int!(state.mod, UInt32(chunk * 8), UInt32(0))
+    u32_ty = chunk_ty   # bulk-loop element type
+
+    # Create pointer types for the chunk type in appropriate storage classes
+    src_ptr_ty = map_pointer_type!(state.type_ctx, chunk_ty, src_sc)
+    dest_ptr_ty = map_pointer_type!(state.type_ctx, chunk_ty, dest_sc)
 
     # Only compute u64 addresses for non-Function pointers
     # (OpConvertPtrToU is invalid for Function storage class)
@@ -4851,12 +4872,12 @@ function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
         UInt32(0)  # unused
     end
 
-    # Copy 4 bytes at a time (i32)
-    nwords = nbytes ÷ 4
-    remainder = nbytes % 4
+    # Copy `chunk` bytes at a time
+    nwords = nbytes ÷ chunk
+    remainder = nbytes % chunk
 
     for i in 0:(nwords - 1)
-        offset = UInt64(i * 4)
+        offset = UInt64(i * chunk)
 
         # Source pointer for this word
         src_elem_id = if is_src_function
@@ -4881,7 +4902,7 @@ function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
         load_id = fresh_id!(state.mod)
         if is_src_psb
             encode_instruction!(state.mod.functions, Op.OpLoad, u32_ty, load_id, src_elem_id,
-                                UInt32(0x02), UInt32(4))
+                                UInt32(0x02), UInt32(chunk))
         else
             encode_instruction!(state.mod.functions, Op.OpLoad, u32_ty, load_id, src_elem_id)
         end
@@ -4908,7 +4929,7 @@ function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
         # Store i32 to dest
         if is_dest_psb
             encode_instruction!(state.mod.functions, Op.OpStore, dest_elem_id, load_id,
-                                UInt32(0x02), UInt32(4))
+                                UInt32(0x02), UInt32(chunk))
         else
             encode_instruction!(state.mod.functions, Op.OpStore, dest_elem_id, load_id)
         end
@@ -4923,7 +4944,7 @@ function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
         dest_u8_ptr_ty = map_pointer_type!(state.type_ctx, u8_ty, dest_sc)
 
         for i in 0:(remainder - 1)
-            offset = UInt64(nwords * 4 + i)
+            offset = UInt64(nwords * chunk + i)
             offset_const = emit_u64_constant!(state.mod, offset)
 
             # Source byte

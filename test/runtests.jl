@@ -143,6 +143,10 @@ end
         include(joinpath(@__DIR__, "test_struct_copy_alignment.jl"))
     end
 
+    @testset "systematic struct alignment" begin
+        include(joinpath(@__DIR__, "test_struct_alignment_systematic.jl"))
+    end
+
     @testset "static workgroup indexing" begin
         include(joinpath(@__DIR__, "test_static_workgroup.jl"))
     end
@@ -155,9 +159,9 @@ end
     # earlier, one never waited on its own spawned task, and two had gone stale
     # against a refactor. Registered so they cannot rot again.
     #
-    # Still deliberately out: test_struct_alignment_systematic.jl (fails on the open
-    # whole-struct-copy bug, see test_struct_copy_alignment.jl) and the heavy
-    # stress/CI entry points.
+    # Still deliberately out: the heavy stress/CI entry points.
+    # (test_struct_alignment_systematic.jl was excluded here while the
+    # whole-struct-copy bug was open; that is fixed, and it is registered above.)
     @testset "barrier elision" begin
         include(joinpath(@__DIR__, "test_barrier_elision.jl"))
     end

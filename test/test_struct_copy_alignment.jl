@@ -1,42 +1,33 @@
-# KNOWN BUG: whole-struct copy of a 6-byte struct drops a field on every other element.
+# Whole-struct copy must not claim an alignment the address does not have.
 #
 #     struct S3I16; a::Int16; b::Int16; c::Int16; end   # sizeof 6, offsets 0/2/4
 #     dst .= src        # b == 0 for even elements
 #     d[i] = s[i]       # same, in a hand-written kernel
 #
-# NOT broadcast-specific — any whole-struct copy is affected, which is the part
-# that makes it dangerous: a plain `d[i] = s[i]` is silently wrong.
+# NOT broadcast-specific: any whole-struct copy went through the same path.
 #
-# Element i sits at byte 6(i-1), so its middle field is at ≡2 (mod 4) for odd i
-# and ≡0 (mod 4) for even i. Only elements whose fields flip 4-byte phase are
-# corrupted.
+# Cause (fixed): `emit_memcpy!` in compiler/spirv/emit.jl copied 4 bytes at a
+# time and stamped `Aligned 4` on every load and store. These copies are ARRAY
+# ELEMENTS, so consecutive elements sit at multiples of the element size — for a
+# 6-byte struct element i is at byte 6(i-1), 4-aligned only for odd i. Every even
+# element therefore declared an alignment its address did not have, and the 32-bit
+# access dropped its high half: field `a` (bytes 0..1) survived, field `b`
+# (bytes 2..3) came back zero. The intrinsic being lowered declares `align 1`, so
+# the emitter was contradicting its own input. It now derives the chunk width from
+# the largest power of two dividing the copy size and emits `Aligned` to match —
+# three `OpLoad %ushort ... Aligned 2` here instead of one over-aligned `%uint`.
 #
-# What has been ruled out, each verified on the 8060S:
+# Two hypotheses were eliminated first, recorded so they are not re-tried:
+#   * `lower_memcpy!` (compiler/compilation.jl) — the obvious suspect, and its
+#     4-byte fallback IS over-aligned in the same way, but it never runs for this
+#     copy: LLVM emits `llvm.memmove`, and re-applying the fix there produced
+#     byte-identical SPIR-V.
+#   * `try_decomposed_struct_store!` and `is_padding_gep` — both guard on the base
+#     being an alloca, so neither applies to a store through a device pointer.
 #
-#   sizeof 4 (2xInt16), 8 (4xInt16), 12 (3xFloat32), 12 (Int16+2xInt32)  correct
-#   sizeof 3 (3xInt8)                                                    correct
-#       -> needs 16-bit fields whose absolute offset alternates 4-byte phase;
-#          not merely "element size is not a multiple of 4"
-#   copyto!(dst, src)                                    correct (different path)
-#   dst .= Ref(S3I16(11,22,33))  constant, no load       correct (not the store)
-#   read src[i], write .a/.b/.c to three arrays          correct (not the load)
-#       -> it needs a loaded AGGREGATE forwarded into a store; neither half alone
-#   rebuilding the struct from its fields before storing correct (typed stores)
-#
-# REJECTED HYPOTHESIS, recorded so it is not re-tried: that `lower_memcpy!` in
-# compiler/compilation.jl over-aligns. Its non-alloca fallback copies 4-byte
-# chunks and stamps `alignment!(..., 4)`, which really is wrong for a 6-byte
-# element stride — but deriving the chunk width from the largest power of two
-# dividing the copy size (i32/i16/i8) changed nothing: all 16 even elements stayed
-# corrupted. So either this copy does not reach that fallback (the destination is
-# an alloca, taking the typed load/store branch above it), or the fault is further
-# down in SPIR-V emission. Next step is to dump the emitted SPIR-V for
-# `aggregate_copy!` and look at the store sequence.
-#
-# Registered with @test_broken rather than left unregistered: a gated test nobody
-# runs rots. Three tests in this suite were fixed without anyone noticing because
-# they were gated AND absent from runtests.jl. @test_broken reports "Unexpected
-# Pass" the moment this is fixed.
+# The sizes below are the boundary: 3 (odd, already byte-copied), 4 and 8 (element
+# size a multiple of 4, so genuinely aligned), 12 and 12-padded. Any change to the
+# chunk derivation must keep all of them correct.
 
 using Test, Lava, KernelAbstractions
 const KA = KernelAbstractions
@@ -72,8 +63,8 @@ end
     # The size that broke: 6 bytes, so even elements are only 2-aligned.
     @test sizeof(CopyS6) == 6
     b, k = check_copy(CopyS6, i -> CopyS6(Int16(i), Int16(i * 3), Int16(i * 7)))
-    @test_broken b        # broadcast
-    @test_broken k        # hand-written kernel — same fault
+    @test b        # broadcast
+    @test k        # hand-written kernel — same emit path
 
     # Sizes that ARE correct. They pin the boundary of the fault, and a fix that
     # changes how copies are chunked must not regress them.
