@@ -166,11 +166,21 @@ function create_rt_pipeline(ctx::VkContext,
     layout = Vulkan.PipelineLayout(dev, [ds_layout], push_ranges)
 
     # Create RT pipeline
+    # Same no-compile verification the compute path uses: with PIPELINE_NO_COMPILE
+    # set the driver refuses to build a binary rather than compiling one, so a run
+    # that completes provably did zero driver compilation. RT is the path that
+    # matters most for startup — a RayDemo scene is mostly RT pipelines.
+    rt_flags = Vulkan.PipelineCreateFlag(0)
+    if PIPELINE_NO_COMPILE[]
+        rt_flags |= Vulkan.PipelineCreateFlag(Vulkan.PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) |
+                    Vulkan.PipelineCreateFlag(Vulkan.PIPELINE_CREATE_EARLY_RETURN_ON_FAILURE_BIT)
+    end
     rt_ci = Vulkan.RayTracingPipelineCreateInfoKHR(
         stages, groups,
         UInt32(1),  # max_pipeline_ray_recursion_depth
         layout,
         Int32(-1);  # base_pipeline_index
+        flags = rt_flags,
     )
 
     pipelines, _ = @vk_checked "vkCreateRayTracingPipelinesKHR" Vulkan.create_ray_tracing_pipelines_khr(

@@ -129,6 +129,9 @@ const PIPELINE_NO_COMPILE = Ref(false)
 "How many pipeline creations were refused because they would have compiled."
 const PIPELINE_COMPILES_REFUSED = Ref(0)
 
+"Entry names of pipelines that would have compiled while PIPELINE_NO_COMPILE was set."
+const PIPELINE_COMPILE_MISSES = String[]
+
 # VkResult VK_PIPELINE_COMPILE_REQUIRED. Positive (success class), so a bare
 # `result != 0` check reports it as a generic failure — it needs naming.
 const VK_PIPELINE_COMPILE_REQUIRED = 1000297000
@@ -161,6 +164,7 @@ function no_pipeline_compilation(f)
     empty!(PIPELINE_INSERTION_ORDER)
     PIPELINE_NO_COMPILE[] = true
     PIPELINE_COMPILES_REFUSED[] = 0
+    empty!(PIPELINE_COMPILE_MISSES)
     try
         return f()
     finally
@@ -351,7 +355,33 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
     # that kernel's own `.bin`; without it the device-wide cache is used, which is
     # what every other caller wants.
     pcache = pipeline_cache === nothing ? ctx.pipeline_cache : pipeline_cache
-    pipeline = create_compute_pipeline(dev, ci; pipeline_cache=pcache)
+    pipeline = try
+        create_compute_pipeline(dev, ci; pipeline_cache=pcache)
+    catch e
+        # A cache miss is RECORDED, not fatal: retry without the flag so the
+        # workload finishes and every miss is reported, rather than dying at the
+        # first one. Aborting a pipeline creation mid-render leaves a partially
+        # recorded batch behind and cost a DEVICE_LOST when this threw instead.
+        if PIPELINE_NO_COMPILE[] && occursin("PIPELINE_COMPILE_REQUIRED", sprint(showerror, e))
+            # Every Lava kernel's entry point is "main", so the name alone does not
+            # identify anything. Record the SPIR-V hash and size, which do.
+            push!(PIPELINE_COMPILE_MISSES,
+                  string(entry_name, " spirv=", string(hash(spirv_bytes), base=16),
+                         " (", length(spirv_bytes), " bytes)",
+                         pipeline_cache === nothing ? "" : " [per-kernel cache]"))
+            old_flag = PIPELINE_NO_COMPILE[]
+            PIPELINE_NO_COMPILE[] = false
+            try
+                ci_retry = Vulkan.ComputePipelineCreateInfo(stage, layout, -1;
+                    flags = Vulkan.PipelineCreateFlag(Vulkan.PIPELINE_CREATE_DISPATCH_BASE_BIT))
+                create_compute_pipeline(dev, ci_retry; pipeline_cache=pcache)
+            finally
+                PIPELINE_NO_COMPILE[] = old_flag
+            end
+        else
+            rethrow()
+        end
+    end
 
     result = LavaComputePipeline(shader_mod, layout, pipeline, UInt32(push_constant_size),
                                   needs_tlas_descriptor, ds_layout)

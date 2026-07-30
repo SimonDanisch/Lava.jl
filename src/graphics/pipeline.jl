@@ -180,10 +180,16 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
     )
 
     # Create graphics pipeline (dynamic rendering — null render pass)
+    gfx_flags = Vulkan.PipelineCreateFlag(0)
+    if PIPELINE_NO_COMPILE[]
+        gfx_flags |= Vulkan.PipelineCreateFlag(Vulkan.PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) |
+                     Vulkan.PipelineCreateFlag(Vulkan.PIPELINE_CREATE_EARLY_RETURN_ON_FAILURE_BIT)
+    end
     ci = Vulkan.GraphicsPipelineCreateInfo(
         stages,
         rasterization,
         layout, UInt32(0), Int32(-1);
+        flags=gfx_flags,
         vertex_input_state=vertex_input,
         input_assembly_state=input_assembly,
         tessellation_state=tess_state,
