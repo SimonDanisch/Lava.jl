@@ -1238,6 +1238,52 @@ Submit the active batch (if any) and block until every in-flight batch on
 `wait_semaphores` call on the HIGHEST pending signal value — the timeline
 is monotonic, so once that value is reached every lower value is too.
 """
+# What the queue looked like when `flush!` gave up, as text for the error.
+#
+# A bare "timed out waiting for timeline value N" does not distinguish the two
+# things that produce it, and they want opposite responses:
+#
+#   * a kernel that is genuinely slow or wedged — the counter sits one below
+#     `target`, the batch that signals it is in flight, and the dispatch log
+#     names the shader;
+#   * a wait on a value nothing will signal — every in-flight batch has already
+#     been signalled (`signal_value <= counter`) yet `target` is higher, or a
+#     batch waits on a value above the counter that no queued batch signals. A
+#     queue runs its submissions in order, so a batch blocked on such a wait
+#     also blocks the batch that would have signalled past it: a deadlock, not
+#     slowness.
+#
+# The second is what the intermittent decode-loop hang looks like from outside
+# (4 in-flight batches, a target that never arrives), and it could not be told
+# from the first without this. Cheap: three queries, only on the failure path.
+#
+# A comment, not a docstring: `flush!`'s own docstring follows immediately, and
+# two adjacent strings make `@doc` document the second one.
+function flush_stall_report(bq::BatchQueue, target::UInt64)
+    io = IOBuffer()
+    ctx = bq.ctx::VkContext
+    cur = try
+        unwrap(Vulkan.get_semaphore_counter_value(ctx.device, bq.timeline_sem))
+    catch
+        nothing
+    end
+    println(io, "  timeline counter = ", cur === nothing ? "unreadable" : cur,
+                ", next_timeline = ", bq.next_timeline,
+                ", replay watermark = ", get(REPLAY_WATERMARK, bq, UInt64(0)))
+    for (i, b) in enumerate(bq.in_flight)
+        waits = [v for (_, v, _) in b.wait_semaphores]
+        done = cur !== nothing && b.signal_value <= cur
+        println(io, "  batch $i: signals ", b.signal_value,
+                    ", waits on ", isempty(waits) ? "nothing" : string(waits),
+                    done ? "  [already signalled]" : "")
+    end
+    if cur !== nothing && all(b -> b.signal_value <= cur, bq.in_flight) && target > cur
+        println(io, "  >> every in-flight batch is already signalled and the target is not: ",
+                    "the wait is on a value nothing will signal.")
+    end
+    return String(take!(io))
+end
+
 function flush!(bq::BatchQueue, device::Vulkan.Device)
     @assert Threads.threadid() == bq.owning_thread  "BatchQueue is single-writer; cross-thread flush forbidden"
     submit!(bq)
@@ -1273,7 +1319,8 @@ function flush!(bq::BatchQueue, device::Vulkan.Device)
         if budget != UInt64(0) && waited >= budget
             throw(LavaError("vkWaitSemaphores",
                             "timed out after $(round(waited / 1e9, digits = 1)) s waiting for " *
-                            "timeline value $target on $(length(bq.in_flight)) in-flight batch(es)",
+                            "timeline value $target on $(length(bq.in_flight)) in-flight batch(es)\n" *
+                            flush_stall_report(bq, target),
                             "A dispatch is not completing. Set Lava.DISPATCH_LOGGING_ENABLED[] = true " *
                             "(and Lava.DISPATCH_LOG_FILE[] to keep it across a restart) to see which " *
                             "kernel, or raise Lava.FLUSH_TIMEOUT_NS[] if the work is genuinely this long."))

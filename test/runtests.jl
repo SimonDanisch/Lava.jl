@@ -147,6 +147,14 @@ end
         include(joinpath(@__DIR__, "test_fastdiv.jl"))
     end
 
+    @testset "cooperative-matrix epilogue" begin
+        include(joinpath(@__DIR__, "test_coopmat_epilogue.jl"))
+    end
+
+    @testset "staged GEMM" begin
+        include(joinpath(@__DIR__, "test_gemm_staged.jl"))
+    end
+
     @testset "whole-struct copy alignment" begin
         include(joinpath(@__DIR__, "test_struct_copy_alignment.jl"))
     end

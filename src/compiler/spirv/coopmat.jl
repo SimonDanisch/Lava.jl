@@ -35,7 +35,8 @@ cooperative-matrix intrinsics.
 function parse_coopmat_name(fn_name::AbstractString)
     startswith(fn_name, "_lava_coopmat_") || return nothing
     parts = split(fn_name, '_')
-    # ["", "lava", "coopmat", op, dtype, "MxN", use]
+    # ["", "lava", "coopmat", op, dtype, "MxN", use] with an optional trailing
+    # "row" on a load or store — see `coopmat_intrinsic_name`.
     length(parts) >= 7 || return nothing
     op = parts[4]
     dtype = parts[5]
@@ -45,7 +46,8 @@ function parse_coopmat_name(fn_name::AbstractString)
     N = parse(Int, dims[2])
     use = parts[7] == "a" ? CoopMatUse.MatrixA :
           parts[7] == "b" ? CoopMatUse.MatrixB : CoopMatUse.MatrixAccumulator
-    (op, dtype, M, N, use)
+    rowmajor = length(parts) >= 8 && parts[8] == "row"
+    (op, dtype, M, N, use, rowmajor)
 end
 
 """Component type id for the dtype suffix used in the intrinsic name."""
@@ -144,11 +146,16 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
                             fn_name::AbstractString)
     parsed = parse_coopmat_name(fn_name)
     parsed === nothing && error("not a cooperative-matrix intrinsic: $fn_name")
-    op, dtype, M, N, use = parsed
+    op, dtype, M, N, use, rowmajor = parsed
 
     mod = state.mod
     mat_ty = emit_coopmat_type!(state, dtype, M, N, use)
     args = LLVM.operands(inst)
+    # Both layouts, because the operands want different ones from the same block:
+    # `mul_mm.comp` stages A and B identically and reads A `RowMajor`, B
+    # `ColumnMajor`. Hardcoding one forces a transposing staging pass for the
+    # other, or a second shared copy.
+    layout = rowmajor ? CoopMatLayout.RowMajor : CoopMatLayout.ColumnMajor
 
     # `load`/`store` address global memory through a device address;
     # `loadw`/`storew` address `@localmem` through a Workgroup pointer. The only
@@ -161,7 +168,7 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
             (coopmat_workgroup_pointer!(state, args[1], args[2], comp_ty), args[3]) :
             (coopmat_base_pointer!(state, args[1], comp_ty), args[2])
         stride_id = get_value_id!(state, stride_arg)
-            layout_id = emit_constant_u32!(mod, CoopMatLayout.ColumnMajor)
+        layout_id = emit_constant_u32!(mod, layout)
         id = fresh_id!(mod)
         encode_instruction!(mod.functions, Op.OpCooperativeMatrixLoadKHR,
                             mat_ty, id, ptr_id, layout_id, stride_id)
@@ -175,7 +182,7 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
             (coopmat_base_pointer!(state, args[1], comp_ty), args[2], args[3])
         stride_id = get_value_id!(state, stride_arg)
         obj_id = get_value_id!(state, obj_arg)
-            layout_id = emit_constant_u32!(mod, CoopMatLayout.ColumnMajor)
+        layout_id = emit_constant_u32!(mod, layout)
         encode_instruction!(mod.functions, Op.OpCooperativeMatrixStoreKHR,
                             ptr_id, obj_id, layout_id, stride_id)
 
@@ -192,6 +199,18 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         id = fresh_id!(mod)
         encode_instruction!(mod.functions, Op.OpCooperativeMatrixMulAddKHR,
                             mat_ty, id, a_id, b_id, c_id)
+        state.value_map[inst] = id
+        state.coopmat_value_types[inst] = mat_ty
+
+    elseif op == "convert"
+        # `OpFConvert` between two cooperative matrix types of the same scope,
+        # rows, columns and use — the one instruction that lets an fp32
+        # accumulator be stored as fp16 without a round trip through memory.
+        # `mat_ty` is the *result* type, from the intrinsic's name; the source
+        # type comes with the operand.
+        src_id = get_value_id!(state, args[1])
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpFConvert, mat_ty, id, src_id)
         state.value_map[inst] = id
         state.coopmat_value_types[inst] = mat_ty
 

@@ -265,6 +265,26 @@ const POOL_TRIM_THRESHOLD = Ref{Int}(1024 * 1024 * 1024)   # 1 GiB of pool capac
 const POOL_TRIM_MIN_INTERVAL = Ref{Float64}(5.0)           # seconds
 const LAST_POOL_TRIM = Ref{Float64}(0.0)
 
+# A sub-allocation is returned to its block by a **finalizer**, so a block only
+# becomes empty once those have run — which is what the paragraph above says, and
+# what `GC.gc(false)` does not do. Julia's incremental collection sweeps the
+# young generation and leaves older objects, and a pool chunk that has survived a
+# few frames is exactly an older object. So the scan below almost always found
+# nothing and the trim almost never fired: the pool ratcheted up to its
+# transient high-water mark and stayed there for the life of the process.
+#
+# Measured on SAM 2.1: encode then 20 decodes reached 2 096 MiB live with two
+# empty 64 MiB blocks that no automatic path would return. A full collection
+# followed by `reclaim_empty_pool_blocks!` handed back 128 MiB.
+#
+# So escalate: try the cheap collection first, and if it finds no empty block,
+# pay for a full one — but on its own, longer, timer. A full GC is the expensive
+# part (tens of ms on a heap this size) and a render loop must not pay it every
+# five seconds; unbounded pool growth is the worse of the two, but not by so much
+# that it justifies a hitch per frame.
+const POOL_TRIM_FULL_GC_INTERVAL = Ref{Float64}(30.0)      # seconds
+const LAST_POOL_FULL_GC = Ref{Float64}(0.0)
+
 function maybe_trim_pool!(ctx::VkContext)
     GPU_LIVE_BYTES[] < POOL_TRIM_THRESHOLD[] && return
     now = time()
@@ -272,12 +292,40 @@ function maybe_trim_pool!(ctx::VkContext)
     LAST_POOL_TRIM[] = now
 
     GC.gc(false)
-    any(b -> b.live_count == 0, POOL_BLOCKS) || return
+    if !any(b -> b.live_count == 0, POOL_BLOCKS)
+        # Nothing reclaimable *yet*; the finalizers may simply not have run.
+        now - LAST_POOL_FULL_GC[] < POOL_TRIM_FULL_GC_INTERVAL[] && return
+        LAST_POOL_FULL_GC[] = now
+        GC.gc(true)
+        any(b -> b.live_count == 0, POOL_BLOCKS) || return
+    end
     bq = ctx.default_bq
     quiesce_before_reclaim!(bq)
     n_blocks, bytes_freed = reclaim_empty_pool_blocks!(bq)
     n_blocks > 0 && @debug "Lava: trimmed empty pool blocks" blocks=n_blocks MiB=(bytes_freed >> 20)
     return
+end
+
+"""
+    trim_gpu_pool!() -> (blocks, bytes)
+
+Hand every empty pool block back to the driver, now.
+
+The automatic path ([`POOL_TRIM_THRESHOLD`](@ref)) is rate-limited and only runs
+while something is allocating, so it is the wrong tool for "I have finished a
+batch of work and want the memory back" — and for measuring, where dead pool
+capacity otherwise counts as live and makes a VRAM figure depend on GC timing
+rather than on demand.
+
+Runs a full collection first: blocks become empty only when their
+sub-allocations' finalizers have run.
+"""
+function trim_gpu_pool!(ctx::VkContext = vk_context())
+    GC.gc(true)
+    any(b -> b.live_count == 0, POOL_BLOCKS) || return (0, 0)
+    bq = ctx.default_bq
+    quiesce_before_reclaim!(bq)
+    return reclaim_empty_pool_blocks!(bq)
 end
 
 function maybe_collect(ctx::VkContext; blocking::Bool=false)

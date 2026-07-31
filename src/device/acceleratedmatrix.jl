@@ -122,6 +122,21 @@ consecutive columns. Lowers to `OpCooperativeMatrixLoadKHR`.
 @inline AcceleratedMatrix{T,M,N,U}(src, offset::Integer, stride::Integer) where {T,M,N,U} =
     coopmat_load(AcceleratedMatrix{T,M,N,U}, src, offset, stride)
 
+"""
+    AcceleratedMatrix{T,M,N,U}(src, offset, stride, Val(true))   # row-major
+
+The `MemoryLayout` operand, which was hardcoded to column-major.
+
+A staged GEMM needs both from the *same* block: `mul_mm.comp` stages A and B
+identically and then reads A `RowMajor` and B `ColumnMajor`, because A is
+`(M, K)` and B is `(K, N)` and they share the k axis. With only one layout
+available, one of the two has to be transposed while staging — an extra pass over
+shared memory, or a second copy of the block.
+"""
+@inline AcceleratedMatrix{T,M,N,U}(src, offset::Integer, stride::Integer,
+                                   rowmajor::Val) where {T,M,N,U} =
+    coopmat_load(AcceleratedMatrix{T,M,N,U}, src, offset, stride, rowmajor)
+
 # The `@localmem` forms of these live in `array/ka_backend.jl`, beside
 # `LavaSharedArray` — this file is included before that type exists.
 
@@ -132,6 +147,24 @@ Store the tile back. Lowers to `OpCooperativeMatrixStoreKHR`.
 """
 @inline Base.copyto!(dst, offset::Integer, stride::Integer, m::AcceleratedMatrix) =
     coopmat_store(dst, offset, stride, m)
+
+"""
+    convert(AcceleratedMatrix{T,M,N,U}, m)
+
+Change a tile's component type in registers. Lowers to `OpFConvert`.
+
+The point is the GEMM's write-out: accumulation is fp32 and the destination is
+fp16, and without this the only way across is a store to an fp32 scratch and a
+second kernel that reads all of it back — `mm_epilogue_kernel!`, which is 23% of
+matmul time and a whole extra pass over `M x N`.
+
+Shape, scope and use must match; only the component type changes.
+"""
+@inline Base.convert(::Type{AcceleratedMatrix{T,M,N,U}},
+                     m::AcceleratedMatrix{S,M,N,U}) where {T,S,M,N,U} =
+    coopmat_convert(AcceleratedMatrix{T,M,N,U}, m)
+@inline Base.convert(::Type{AcceleratedMatrix{T,M,N,U}},
+                     m::AcceleratedMatrix{T,M,N,U}) where {T,M,N,U} = m
 
 @inline Base.zero(::Type{AcceleratedMatrix{T,M,N,U}}) where {T,M,N,U} =
     coopmat_zero(AcceleratedMatrix{T,M,N,U})

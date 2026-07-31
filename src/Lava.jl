@@ -9,7 +9,8 @@ export BatchQueue
 export @setup_workload, @compile_workload
 export CompilationResult, lava_compile, optimize_spirv
 # Debugging & diagnostics
-export vk_reset_device!, dump_state, gpu_memory_usage, allocate_batch_queue!
+export vk_reset_device!, dump_state, gpu_memory_usage, trim_gpu_pool!,
+       allocate_batch_queue!
 export ExternalImage, memoryfd
 export set_dispatch_logging!, get_dispatch_log
 export concurrent_dispatch_group, concurrent_indirect_group

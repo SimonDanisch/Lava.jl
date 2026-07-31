@@ -32,18 +32,20 @@ const COOPMAT_IR_TYPE = Dict(
 keep the two in step.
 """
 function coopmat_intrinsic_name(op::String, ::Type{T}, M::Integer, N::Integer,
-                                ::Type{U}) where {T,U<:MatrixUse}
+                                ::Type{U}; rowmajor::Bool = false) where {T,U<:MatrixUse}
     haskey(COOPMAT_DTYPE_SUFFIX, T) ||
         throw(ArgumentError("no cooperative-matrix component type for $T"))
-    "_lava_coopmat_$(op)_$(COOPMAT_DTYPE_SUFFIX[T])_$(M)x$(N)_$(COOPMAT_USE_SUFFIX[U])"
+    base = "_lava_coopmat_$(op)_$(COOPMAT_DTYPE_SUFFIX[T])_$(M)x$(N)_$(COOPMAT_USE_SUFFIX[U])"
+    return rowmajor ? base * "_row" : base
 end
 
 # Each distinct (op, T, M, N, Use) needs its own LLVM declaration, so the stubs
 # are generated on demand from the type parameters rather than enumerated.
 
 @generated function coopmat_load(::Type{AcceleratedMatrix{T,M,N,U}}, ptr::Ptr{S},
-                                 offset::Integer, stride::Integer) where {T,M,N,U,S}
-    fname = coopmat_intrinsic_name("load", T, M, N, U)
+                                 offset::Integer, stride::Integer,
+                                 ::Val{RM} = Val(false)) where {T,M,N,U,S,RM}
+    fname = coopmat_intrinsic_name("load", T, M, N, U; rowmajor = RM)
     ir = """
         declare i32 @$fname(i64, i32) #0
         define i32 @entry(i64 %p, i32 %s) #0 {
@@ -89,8 +91,9 @@ always sees the same shape and always emits exactly one `OpAccessChain`.
 """
 @generated function coopmat_load(::Type{AcceleratedMatrix{T,M,N,U}},
                                  ptr::Core.LLVMPtr{S,3},
-                                 offset::Integer, stride::Integer) where {T,M,N,U,S}
-    fname = coopmat_intrinsic_name("loadw", T, M, N, U)
+                                 offset::Integer, stride::Integer,
+                                 ::Val{RM} = Val(false)) where {T,M,N,U,S,RM}
+    fname = coopmat_intrinsic_name("loadw", T, M, N, U; rowmajor = RM)
     ir = """
         declare i32 @$fname(ptr addrspace(3), i32, i32) #0
         define i32 @entry(ptr addrspace(3) %p, i32 %o, i32 %s) #0 {
@@ -146,6 +149,23 @@ end
     end
 end
 
+@generated function coopmat_convert(::Type{AcceleratedMatrix{T,M,N,U}},
+                                    m::AcceleratedMatrix{S,M,N,U}) where {T,S,M,N,U}
+    fname = coopmat_intrinsic_name("convert", T, M, N, U)
+    ir = """
+        declare i32 @$fname(i32) #0
+        define i32 @entry(i32 %h) #0 {
+            %r = call i32 @$fname(i32 %h)
+            ret i32 %r
+        }
+        attributes #0 = { alwaysinline convergent }
+    """
+    quote
+        h = Base.llvmcall(($ir, "entry"), Int32, Tuple{Int32}, m.handle)
+        AcceleratedMatrix{$T,$M,$N,$U}(h)
+    end
+end
+
 @generated function coopmat_zero(::Type{AcceleratedMatrix{T,M,N,U}}) where {T,M,N,U}
     fname = coopmat_intrinsic_name("zero", T, M, N, U)
     ir = """
@@ -186,7 +206,9 @@ end
 # this keeps GPUCompiler's unknown-intrinsic check happy for the common shapes.
 for T in (Float16, Float32), U in (MatrixA, MatrixB, Accumulator),
     (M, N) in ((16, 16), (16, 8)),
-    op in ("load", "store", "zero", "muladd", "loadw", "storew")
+    op in ("load", "store", "zero", "muladd", "loadw", "storew", "convert")
     push!(KNOWN_INTRINSICS, coopmat_intrinsic_name(op, T, M, N, U))
+    op in ("load", "loadw", "store", "storew") &&
+        push!(KNOWN_INTRINSICS, coopmat_intrinsic_name(op, T, M, N, U; rowmajor = true))
 end
 
