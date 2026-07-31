@@ -115,11 +115,156 @@ Base.Broadcast.BroadcastStyle(::Type{<:Base.ReshapedArray{T, N, <:AnyLavaArray}}
 # losing coalescing. This is the single largest thing in Lava for anything
 # elementwise — `add`, `relu`, `sigmoid`, `_to_copy`, `cat` and every kernel
 # epilogue in DNNKernels were all running at a quarter of the achievable bandwidth.
-@kernel cpu=false function lava_broadcast_flat!(dest, bc, n)
-    I = @index(Global, Linear)
-    if I <= n
-        @inbounds dest[I] = bc[I]
+# Each thread handles `U` elements, `WG` apart, which is `contig_copy.comp`'s
+# shape from `reference/llama.cpp-vulkan` (128 threads x 4, "num_threads *
+# num_iter must equal 512"). The stride is what keeps it coalesced: iteration `u`
+# has the whole workgroup on one contiguous run, so all `U` runs are wide loads,
+# not a per-thread gather of `U` neighbours.
+#
+# It buys memory-level parallelism, not fewer instructions — one thread with 8
+# loads in flight hides latency a thread with 1 cannot. Measured on the encoder's
+# permuted copies (interleaved, 2265 MHz, bit-exact), against the same kernel at
+# one element per thread:
+#
+#     (72,8,256,16)      104 -> 114 GB/s
+#     (72,4,16,1024)     113 -> 123
+#     (576,16,4,16,4,1)   73 ->  76
+#     (256,256,144,1)     45 -> 125
+#
+# Raising the *workgroup* instead does nothing (64 and 256 measure the same) and
+# above 256 is unsafe on this driver — see `Lava.WORKGROUP_LIMIT`.
+@kernel cpu=false function lava_broadcast_flat!(dest, bc, n, ::Val{U}, ::Val{WG}) where {U, WG}
+    l = @index(Local, Linear)
+    g = @index(Group, Linear)
+    base = (g - 1) * (WG * U) + l
+    @inbounds for u in 0:(U - 1)
+        I = base + u * WG
+        if I <= n
+            dest[I] = bc[I]
+        end
     end
+end
+
+"""
+    BROADCAST_UNROLL[] :: Int
+
+Elements per thread for the broadcast kernels; 1 restores one-element-per-thread.
+
+Exists to be flipped **inside one session**, because that is the only comparison
+this project accepts: an isolated benchmark showed 5-11% here and a
+dispatch-timing profile showed the elementwise bucket dropping 18 ms, while the
+free-running encode did not move at all across sessions. Setting this to 1 and
+back is how that gets decided instead of argued. Changing it recompiles the
+broadcast kernels once per new value, so warm up after each flip before timing.
+"""
+const BROADCAST_UNROLL = Ref(8)
+
+"""
+    broadcastlaunch(n; wg, maxunroll, mingroups) -> (workgroupsize, Val(U), ndrange)
+
+Launch geometry for a flat broadcast over `n` elements.
+
+`U` elements per thread, backed off while the grid would be too small to occupy
+the device — 8 elements per thread over a 4096-element array is 2 workgroups,
+and a kernel that cannot fill the card is slow however well it reads memory.
+`mingroups` is a few per SM (48 here), so the back-off only triggers on arrays
+small enough that the whole launch is noise anyway.
+
+`ndrange` is rounded up to a whole number of workgroups; the kernels bound every
+access with `n` themselves, so the tail threads simply do nothing.
+"""
+@inline function broadcastlaunch(n::Int; wg::Int = 256, maxunroll::Int = BROADCAST_UNROLL[],
+                                 mingroups::Int = 192)
+    u = maxunroll
+    while u > 1 && cld(n, wg * u) < mingroups
+        u >>= 1
+    end
+    return wg, Val(u), wg * cld(n, wg * u)
+end
+
+# ── division by a runtime-constant extent, without dividing ──────────────────
+#
+# **The division chain is the cost of these kernels, which this document said it
+# was not.** Isolated, with no memory traffic in the way — one kernel that only
+# writes, one that also runs `cart32` — over 2.36 M elements:
+#
+#     rank 2, 1 division      11.7 -> 33.5 us
+#     rank 4, 3 divisions     11.7 -> 59.6 us
+#     rank 6, 5 divisions     10.9 -> 85.0 us
+#
+# Linear in the number of divisions, ~15 us each, and at rank 6 that is **74 us
+# against a ~42 us memory floor** for the same array — the arithmetic outweighs
+# the traffic. The earlier note (kept below) concluded the opposite from an
+# end-to-end delta of -0.5 ms; it was measuring a kernel where the access pattern
+# happened to hide it.
+#
+# `reference/llama.cpp-vulkan`'s `generic_unary_head.glsl` solves exactly this,
+# and its `copy.comp` is otherwise the same algorithm as ours: it never divides,
+# it multiplies by a magic number. `init_fastdiv_values` on the host, `fastdiv`
+# in the shader.
+struct FastDiv32
+    d::UInt32
+    mp::UInt32
+    L::UInt32
+end
+
+"""
+    FastDiv32(d)
+
+Magic number and shift for unsigned division by `d`, so the kernel can divide
+with a high multiply and a shift instead of the real thing.
+
+Straight from `init_fastdiv_values` in llama.cpp's `ggml-vulkan.cpp`:
+`L = ceil(log2(d))`, `mp = 2^32 * (2^L - d) / d + 1`, and then
+`n / d == (mulhi(n, mp) + n) >> L`. Verified exact against `÷` for every extent
+SAM 2's encoder decomposes by, and exhaustively over 0:20e6 for the two hottest.
+"""
+function FastDiv32(d::Integer)
+    du = UInt32(d)
+    du == 0 && throw(ArgumentError("FastDiv32: divisor must be positive"))
+    L = 0x00000000
+    while L < 0x20 && (UInt32(1) << L) < du
+        L += 0x1
+    end
+    mp = UInt32(((UInt64(1) << 32) * ((UInt64(1) << L) - UInt64(du)) ÷ UInt64(du)) + 1)
+    return FastDiv32(du, mp, L)
+end
+
+"""`n ÷ f.d`, as a 32-bit high multiply and a shift."""
+@inline function fastdiv(n::UInt32, f::FastDiv32)
+    # The widening multiply is the point: NVIDIA has `mul.hi.u32` and no integer
+    # divide at all, so this is ~5 cycles where the divide was ~25.
+    return (UInt32((UInt64(n) * UInt64(f.mp)) >> 32) + n) >> f.L
+end
+
+"""
+    BROADCAST_FASTDIV[] :: Bool
+
+Whether the broadcast kernels decompose the linear index by multiplying
+([`FastDiv32`](@ref)) or by dividing. `false` restores the divisions.
+
+Here for the same reason as [`BROADCAST_UNROLL`](@ref): so the claim can be
+re-measured **inside one session** rather than against a number from another day.
+Two cross-session readings of the unroll disagreed by 38 ms in opposite
+directions, and both were noise.
+"""
+const BROADCAST_FASTDIV = Ref(true)
+
+"Extents in the form `cart32` should decompose them with."
+@inline broadcastextents(sz::Dims) =
+    BROADCAST_FASTDIV[] ? map(FastDiv32, sz) : map(Int32, sz)
+
+# The kernels hand `cart32` an unsigned position; the dividing path still wants
+# the signed extents it was written for.
+@inline cart32(q::UInt32, sz::Tuple{Int32, Vararg{Int32}}) = cart32(Int32(q), sz)
+
+@inline cart32(q::UInt32, ::Tuple{}) = ()
+@inline function cart32(q::UInt32, sz::Tuple{FastDiv32, Vararg{FastDiv32}})
+    f = first(sz)
+    hi = fastdiv(q, f)
+    # One multiply recovers the remainder, so an axis costs a mulhi, a mul and
+    # two adds. The last axis's `hi` is dead and the compiler drops it.
+    return (Int(q - hi * f.d) + 1, cart32(hi, Base.tail(sz))...)
 end
 
 # Narrowing the linear->Cartesian `divrem` to 32 bits here was tried and
@@ -149,19 +294,31 @@ on recursive call graphs does not apply.
     (Int(q % s) + 1, cart32(q ÷ s, Base.tail(sz))...)
 end
 
-@kernel cpu=false function lava_broadcast_flat_cartesian!(dest, bc, sz, n)
-    I = @index(Global, Linear)
-    if I <= n
-        J = CartesianIndex(cart32(Int32(I) - Int32(1), sz))
-        @inbounds dest[J] = bc[J]
+@kernel cpu=false function lava_broadcast_flat_cartesian!(dest, bc, sz, n,
+                                                          ::Val{U}, ::Val{WG}) where {U, WG}
+    l = @index(Local, Linear)
+    g = @index(Group, Linear)
+    base = (g - 1) * (WG * U) + l
+    @inbounds for u in 0:(U - 1)
+        I = base + u * WG
+        if I <= n
+            J = CartesianIndex(cart32(UInt32(I) - UInt32(1), sz))
+            dest[J] = bc[J]
+        end
     end
 end
 
 """Destination dense, source not: index `dest` linearly and only `bc` by index."""
-@kernel cpu=false function lava_broadcast_flat_mixed!(dest, bc, sz, n)
-    I = @index(Global, Linear)
-    if I <= n
-        @inbounds dest[I] = bc[CartesianIndex(cart32(Int32(I) - Int32(1), sz))]
+@kernel cpu=false function lava_broadcast_flat_mixed!(dest, bc, sz, n,
+                                                      ::Val{U}, ::Val{WG}) where {U, WG}
+    l = @index(Local, Linear)
+    g = @index(Group, Linear)
+    base = (g - 1) * (WG * U) + l
+    @inbounds for u in 0:(U - 1)
+        I = base + u * WG
+        if I <= n
+            dest[I] = bc[CartesianIndex(cart32(UInt32(I) - UInt32(1), sz))]
+        end
     end
 end
 
@@ -259,26 +416,33 @@ function GPUArrays._copyto!(dest::AnyLavaArray, bc::Broadcast.Broadcasted)
     isempty(dest) && return dest
     n = length(dest)
     backend = LavaBackend()
+    wg, u, nd = broadcastlaunch(n)
     if ndims(dest) > 1 && IndexStyle(dest) === IndexLinear() && flatok(dest, bc)
         probe_broadcast!(:flat, dest, bc)
         flat = Broadcast.instantiate(flat1(bc))
         d1 = reshape(dest, n)
-        lava_broadcast_flat!(backend)(d1, Broadcast.preprocess(d1, flat), n; ndrange = n)
+        lava_broadcast_flat!(backend)(d1, Broadcast.preprocess(d1, flat), n, u, Val(wg);
+                                      ndrange = nd, workgroupsize = wg)
         return dest
     end
     linear = ndims(dest) == 1
     bc = Broadcast.preprocess(dest, bc)
-    # Extents as `Int32` for `cart32`; anything Lava can address fits.
-    sz = map(Int32, size(dest))
+    # Extents as magic numbers, so `cart32` multiplies instead of dividing. Built
+    # per launch on the host: three `UInt32` per axis and one `÷` each, against
+    # the ~15 us per axis a real division costs across a 2.4 M-element dispatch.
+    sz = broadcastextents(size(dest))
     if linear
         probe_broadcast!(:linear1d, dest, bc)
-        lava_broadcast_flat!(backend)(dest, bc, n; ndrange = n)
+        lava_broadcast_flat!(backend)(dest, bc, n, u, Val(wg);
+                                      ndrange = nd, workgroupsize = wg)
     elseif IndexStyle(dest) === IndexLinear()
         probe_broadcast!(:mixed, dest, bc)
-        lava_broadcast_flat_mixed!(backend)(dest, bc, sz, n; ndrange = n)
+        lava_broadcast_flat_mixed!(backend)(dest, bc, sz, n, u, Val(wg);
+                                            ndrange = nd, workgroupsize = wg)
     else
         probe_broadcast!(:cartesian, dest, bc)
-        lava_broadcast_flat_cartesian!(backend)(dest, bc, sz, n; ndrange = n)
+        lava_broadcast_flat_cartesian!(backend)(dest, bc, sz, n, u, Val(wg);
+                                                ndrange = nd, workgroupsize = wg)
     end
     return dest
 end
@@ -542,29 +706,24 @@ function LinearAlgebra.norm(v::LavaArray{T}, p::Real=2) where T
     return lava_norm_pp_rescale(v, maxabs, Float64(p))
 end
 
-# ── permutedims: N-D ndrange, no integer division ──
+# ── permutedims: superseded, and the reasoning is why ──
 #
-# GPUArrays' generic kernel takes a *linear* global index and recovers the
-# Cartesian one with `permute_linearindex`, which is `ndims - 1` integer
-# divisions per element. That is what the kernel is bound by, not memory: on this
-# card a 4.7 M-element `Float16` permute runs at 20-32 GB/s while a straight copy
-# of the same bytes does 311 GB/s, a 10-15x gap — and for the permutations that
-# actually show up (`(1, 3, 2, 4)`, swapping two middle axes) the fast axis is
-# contiguous on *both* sides, so there is nothing about the access pattern that
-# should cost anything.
+# There was a `lava_permutedims_kernel!` here: an N-D ndrange so the grid hands
+# the kernel its Cartesian coordinates and the `ndims - 1` integer divisions
+# GPUArrays' generic kernel pays per element disappear. The premise was that the
+# permute is bound by that division chain.
 #
-# Asking KernelAbstractions for an N-D index removes the division entirely: the
-# grid already knows the coordinates. Measured in SAM 2's encoder, `permutedims`
-# is 27 ms of 411 ms — 6.5% spent on pure relayout with no arithmetic in it.
-# `IP` is the INVERSE permutation. `permutedims(A, perm)[I...] == A[I[invperm(perm)]...]`,
-# and the two spellings agree only when `perm` is self-inverse — `(1,3,2,4)` is,
-# which is how a version using `perm` directly passed a benchmark on that shape
-# and still produced garbage for SAM 2, whose encoder also uses permutations that
-# are not. Throughput without a correctness check proves nothing.
-@kernel cpu=false function lava_permutedims_kernel!(dest, @Const(src), ::Val{IP}) where {IP}
-    I = @index(Global, NTuple)
-    @inbounds dest[I...] = src[ntuple(d -> I[IP[d]], Val(length(IP)))...]
-end
+# **It is not, and removing the divisions made it slower.** Measured against the
+# ordinary broadcast — which pays the full `cart32` chain *and* re-indexes a
+# `PermutedDimsArray` — the division-free kernel lost by 2.6-5.9x on every shape
+# SAM 2's encoder runs (table in `lavapermutedims!` below). What it bought in
+# arithmetic it gave back many times over in geometry: an N-D ndrange gets an N-D
+# workgroup, consecutive lanes stop walking consecutive memory, and that is the
+# same effect the note at the top of this file measures at 54 GB/s against 315.
+#
+# Access order is the cost. Anything that beats the broadcast has to change the
+# order — tile it, or widen what one workgroup covers — and it belongs in the
+# broadcast path so both spellings get it.
 
 @inline groupfill(::Tuple{}, left::Int) = ()
 @inline function groupfill(sz::Tuple{Int, Vararg{Int}}, left::Int)
@@ -671,22 +830,29 @@ function lavapermutedims!(dest::AnyLavaArray, src::AnyLavaArray, perm::Tuple)
                                     "source axis $(perm[d]) is $(size(src, perm[d]))"))
     end
     N == 0 && return dest
-    # An explicit workgroup, rather than letting KA partition an N-D ndrange
-    # however it likes: left to itself it picks a group whose threads do not run
-    # along the fast axis and the transpose reads and writes in short bursts,
-    # measured 33 GB/s against 65 for a group that fills dimension 1 first.
+    # One path, not two spellings. `dest .= PermutedDimsArray(src, perm)` and
+    # `permutedims!(dest, src, perm)` are the same operation, and until now they
+    # ran different kernels: the broadcast flattens the launch and recovers the
+    # Cartesian index with `cart32`, this one launched an N-D ndrange with an
+    # N-D workgroup. That is precisely the geometry the note at the top of this
+    # file measures at a quarter of the achievable bandwidth — consecutive lanes
+    # stop walking consecutive memory — and the dedicated kernel lost to the
+    # generic one on every shape SAM 2's encoder runs:
     #
-    # Passed as a launch KEYWORD and not as `lava_permutedims_kernel!(backend, wg)`.
-    # The two are not interchangeable — see `launchgroup` — and the second form
-    # computes wrong indices for a rank-4 ndrange, which is most of what a
-    # permute is used for. That spelling silently left 7 of every 8 elements
-    # unwritten here.
-    # The workgroup goes in the kernel's TYPE here, not as a keyword: that keeps
-    # the index arithmetic compile-time constant, and `staticgroup` shapes it so
-    # `WORKGROUP_FALLBACK` never has to step in. Correctness is unaffected either
-    # way — the guard would catch a bad shape — so this is purely about speed.
-    sz = size(dest)
-    lava_permutedims_kernel!(LavaBackend(), staticgroup(sz))(
-        dest, src, Val(Tuple(invperm(collect(perm)))); ndrange = sz)
+    #   src shape              perm             bcast   permutedims!
+    #   (72, 8, 256, 16)       (1,3,2,4)         34.3     13.2 GB/s
+    #   (72, 4, 16, 1024)      (1,3,2,4)         35.8      9.6
+    #   (576,16,4,16,4,1)      (1,2,4,3,5,6)     33.2      5.6
+    #   (288,4,32,4,32,1)      (1,2,4,3,5,6)     19.0      4.7
+    #   (256,256,144,1)        (3,1,2,4)         17.8     16.9
+    #
+    # (interleaved, one session, bit-exact both ways). 2.6-5.9x, for deleting a
+    # kernel rather than writing one. It also retires two traps that were only
+    # ever this launch's: the rank-6 miscompile that made `permutedims!` write a
+    # fraction of its output, and the rank-18 `staticgroup` hang.
+    #
+    # Anything faster than the broadcast belongs *in* the broadcast path, where
+    # both spellings get it.
+    dest .= PermutedDimsArray(src, perm)
     return dest
 end

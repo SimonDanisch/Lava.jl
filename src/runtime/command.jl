@@ -108,6 +108,12 @@ import Vulkan.VkCore: VkMemoryBarrier, VK_STRUCTURE_TYPE_MEMORY_BARRIER,
 # Function pointer for vkCmdPipelineBarrier — initialized in _init_vulkan!
 const CMD_PIPELINE_BARRIER_FPTR = Ref{Ptr{Nothing}}(C_NULL)
 
+# Despite the `_2_` in its name, Vulkan.jl types PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+# as the *sync1* `PipelineStageFlag`, while `CommandBatch.wait_semaphores` is
+# sync2-typed — so pushing the constant straight in threw a MethodError on every
+# cross-queue wait. Same numeric value (0x10000); only the wrapper type differs.
+const STAGE2_ALL_COMMANDS = Vulkan.PipelineStageFlag2(Vulkan.PIPELINE_STAGE_2_ALL_COMMANDS_BIT)
+
 # CB split threshold: seal the current command buffer and start a new one after
 # this many dispatches per segment. All segments are submitted in a single
 # vkQueueSubmit. This avoids NVIDIA driver crashes from enormous command buffers
@@ -1032,16 +1038,42 @@ function submit!(bq::BatchQueue)
     # VkManagedBuffers this populates batch.wait_semaphores and writes
     # (bq, signal_value) into buf.last_write.  Runs ONCE per batch, not per
     # dispatch — the IdSet dedupes multi-dispatch reuse for free.
-    for obj in batch.pinned
-        # LavaArrays are handled via `pinned_refs` below.  Between `pin!` and
-        # here, an explicit `unsafe_free!(a)` (HW-accel BLAS/TLAS teardown) can
-        # have marked `a.buf` freed; `a.buf[]` would throw even though the
-        # VkManagedBuffer is still alive via our retained ref.
-        obj isa LavaArray && continue
-        sync_access!(batch, obj)
-    end
-    for ref in batch.pinned_refs
-        sync_access!(batch, ref[])
+    # `vkEndCommandBuffer` has already run, so the command buffer is no longer
+    # recording — but `batch.recording` still says it is and `bq.active_batch`
+    # still points here. Anything that throws in between leaves the queue in a
+    # state where the next `ensure_active_batch!` hands this batch straight back
+    # and the caller records into an ENDED command buffer: undefined behaviour
+    # that NVIDIA takes as a SIGSEGV inside the driver, with no Julia frame to
+    # show for it. (Exactly how a sync1/sync2 type error in `sync_access!` used
+    # to present: a segfault in vkCmdPipelineBarrier during SAM 2's weight
+    # upload, three frames removed from the actual bug.) Drop the batch instead,
+    # the same way the vkQueueSubmit2 failure path below does, and let the error
+    # surface as an error.
+    try
+        for obj in batch.pinned
+            # LavaArrays are handled via `pinned_refs` below.  Between `pin!` and
+            # here, an explicit `unsafe_free!(a)` (HW-accel BLAS/TLAS teardown) can
+            # have marked `a.buf` freed; `a.buf[]` would throw even though the
+            # VkManagedBuffer is still alive via our retained ref.
+            obj isa LavaArray && continue
+            sync_access!(batch, obj)
+        end
+        for ref in batch.pinned_refs
+            sync_access!(batch, ref[])
+        end
+    catch
+        batch.recording = false
+        empty!(batch.pinned)
+        release_pinned_refs!(batch)
+        empty!(batch.wait_semaphores)
+        bq.active_batch = nothing
+        # `bq.next_timeline` is deliberately NOT rolled back. `sync_access!` has
+        # already stamped `buf.last_write` on the buffers it reached with this
+        # batch's signal value, which nothing will now signal — but timeline
+        # waits are `>=` (`sweep_retired_batches!`: `signal_value <= current`),
+        # so the next batch's larger signal satisfies them. Giving the value back
+        # would instead risk handing it to a batch while another still holds it.
+        rethrow()
     end
 
     # Pre-submit safety scan: catch stale-BDA-in-arg-slab corruption BEFORE
@@ -1324,9 +1356,19 @@ The `VkManagedBuffer` specialization:
     if lw !== nothing
         prev_bq, prev_val = lw[1]::BatchQueue, lw[2]::UInt64
         if prev_bq !== bq
+            # A timeline semaphore belongs to the device that created it. Waiting
+            # on one from a *different* VkContext hands device B a handle from
+            # device A, which the driver takes as a segfault inside
+            # vkQueueSubmit2 — no Julia frame, nothing to grep for. That state
+            # means two contexts exist and buffers have been mixed between them;
+            # say so here rather than a hundred frames later in the driver.
+            prev_bq.ctx === bq.ctx || throw(LavaError(
+                "sync_access!",
+                "buffer was last written on a BatchQueue from a DIFFERENT VkContext",
+                "Two Vulkan devices are live and one buffer has been used on both. " *
+                "Allocate and use the buffer under a single context."))
             push!(batch.wait_semaphores,
-                (prev_bq.timeline_sem, prev_val,
-                 Vulkan.PIPELINE_STAGE_2_ALL_COMMANDS_BIT))
+                (prev_bq.timeline_sem, prev_val, STAGE2_ALL_COMMANDS))
         end
     end
     @atomic :release buf.last_write = (bq, batch.signal_value)
@@ -1405,6 +1447,13 @@ Record a GPU→GPU buffer copy into `bq`'s active CommandBatch.  `src` and
 """
 function cmd_copy_buffer!(bq::BatchQueue, src, dst, nbytes::Integer;
                           src_off::Integer=0, dst_off::Integer=0)
+    # Recording is single-writer for the same reason dispatch is, and this call
+    # is where an upload first touches the command buffer — `copy_buffer!`'s
+    # `flush!` on the next line already asserts it, but by then the driver has
+    # dereferenced a command buffer it does not own and the process is gone with
+    # SIGSEGV inside vkCmdPipelineBarrier instead of a Julia error naming the
+    # thread. Check before the driver sees it, not after.
+    @assert Threads.threadid() == bq.owning_thread  "BatchQueue is single-writer; cross-thread copy forbidden (owner=$(bq.owning_thread), caller=$(Threads.threadid()))"
     batch = ensure_active_batch!(bq)
     cmd = batch.cmd_buf
     # A copy writes memory the tracker never saw — but the post-copy barrier

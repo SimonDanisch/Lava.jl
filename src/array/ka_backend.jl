@@ -142,6 +142,66 @@ Adapt.adapt_storage(::Type{<:LavaArray}, a::LavaArray) = a
 
 # ── Launch configuration ──
 
+"""
+    WORKGROUP_LIMIT[] :: Int
+
+Largest workgroup Lava will ask the device for. Requesting more throws.
+
+**Above 256 this driver silently runs fewer invocations than the shader
+declares, and the missing ones write nothing.** Measured on the RTX 4000 Ada
+(driver 595.80): one workgroup of 512, `LocalSize 512 1 1` in the SPIR-V, and
+exactly local invocations 1–256 store. At 1024 it is still 256. The grid is
+computed from the size that was *asked* for, so the output comes back with a
+periodic hole — every element whose local index is ≥ 256 keeps its old value.
+
+Everything that would explain it has been ruled out on a minimal reproducer
+(`test/test_workgroup_limit.jl`):
+
+  * not the index arithmetic — the participating invocations compute the right
+    global index and write the right value; only the upper lanes are absent
+  * not `spirv-opt` — the same with optimisation disabled
+  * not a stale pipeline — reproduces when that size is the first ever compiled
+  * not invalid SPIR-V — `spirv-val --target-env vulkan1.3` passes
+  * not `LocalSize` — the module is byte-identical to the working one except
+    that one execution mode, and there is no `WorkgroupSize` builtin to override it
+  * **not a resource limit** — `VK_KHR_pipeline_executable_properties` reports
+    *identical* Register Count (40), Stack Size (0), Local Memory (16) and
+    Shared Memory (0) for a body that fails at 512 and one that succeeds at 1024
+
+So there is no statistic to predicate a per-shader decision on: two kernels with
+the same reported cost behave differently. What is left is a limit that holds
+for every shape measured, and 256 is it.
+
+Nothing in this repo is affected — `launchgroup` and `staticgroup` both target
+256, so every existing launch is at or below the limit. Raise this only after
+verifying full output coverage for the specific kernel; a bigger workgroup that
+writes three quarters of its output looks like a 4x speed-up.
+"""
+const WORKGROUP_LIMIT = Ref(256)
+
+"The extents behind a KA size parameter, or `nothing` when they are dynamic."
+@inline statictuple(::Type{<:KA.NDIteration.StaticSize{S}}) where {S} = S
+@inline statictuple(@nospecialize(_)) = nothing
+
+"""
+Throw if `wg` exceeds [`WORKGROUP_LIMIT`](@ref).
+
+Loud rather than clamped: a kernel that stages into `@localmem` sizes its tile to
+the workgroup it asked for, so quietly handing it a smaller one trades a wrong
+answer for a different wrong answer.
+"""
+@inline check_workgroup(::Nothing) = nothing
+@inline function check_workgroup(wg)
+    n = prod(wg)
+    n > WORKGROUP_LIMIT[] || return wg
+    throw(ArgumentError("""
+        workgroupsize $wg has $n threads, above Lava's limit of $(WORKGROUP_LIMIT[]).
+        This device silently runs only part of a larger workgroup — the launch would
+        return partial output rather than fail. See `Lava.WORKGROUP_LIMIT` for the
+        measurements. If you have verified full output coverage for this kernel at
+        this size, raise it with `Lava.WORKGROUP_LIMIT[] = $n`."""))
+end
+
 function KA.launch_config(kernel::KA.Kernel{LavaBackend}, ndrange, workgroupsize)
     if ndrange isa Integer
         ndrange = (ndrange,)
@@ -170,6 +230,11 @@ function KA.launch_config(kernel::KA.Kernel{LavaBackend}, ndrange, workgroupsize
             Val(length(ndrange)))
         KA.partition(kernel, ndrange, workgroupsize)
     else
+        # Both spellings land here, and only one of them is in `workgroupsize`:
+        # `kernel(backend, wg)` puts the size in the kernel's TYPE and passes the
+        # keyword as `nothing`, so checking the keyword alone would miss it.
+        check_workgroup(workgroupsize === nothing ? statictuple(KA.workgroupsize(kernel)) :
+                        workgroupsize)
         KA.partition(kernel, ndrange, workgroupsize)
     end
 
@@ -402,6 +467,32 @@ end
 interior_unit_workgroup(::Any) = false
 
 """
+A second, independent trigger for the same silent fault: a workgroup in the
+kernel's TYPE, launched on an ndrange whose **last extent is 1**, at rank ≥ 5.
+The kernel writes part of its output and reports nothing — measured 2026-07-29:
+
+    N=6  (576,16,16,4,4,1)  wg (16,2,2,2,2,1)   half written
+    N=6  (288,4,4,32,32,1)  wg (16,2,2,2,2,1)   one sixteenth written
+    N=5  (64,4,4,4,1)       wg (16,2,2,2,1)     half written
+    N=6  (64,4,4,4,4,2)     wg (16,2,2,2,2,1)   correct — last extent is 2
+    N=4  (256,256,144,1)    (via `permutedims!`) correct — rank 4 is unaffected
+
+`interior_unit_workgroup` cannot see this one: `(16,2,2,2,2,1)` has no interior
+unit extent, and its unit extent is *trailing*, which for the earlier fault was
+harmless. The written fraction is not a clean function of the block counts (0.5
+and 0.062 on shapes differing only in extents), so this pins the trigger and
+makes no claim about a law.
+
+Found through `permutedims!`, which returned wrong data for SAM 2's rank-6
+window-partition shapes while the ordinary broadcast of the same permutation was
+correct — the broadcast uses a linear ndrange and never reaches here.
+"""
+@inline function trailing_unit_ndrange(nd::NTuple{N,Int}) where {N}
+    N >= 5 && @inbounds nd[N] == 1
+end
+trailing_unit_ndrange(::Any) = false
+
+"""
 Re-launch a kernel whose workgroup lives in its TYPE as one that takes the size
 at the call, which is the path that computes correct indices.
 
@@ -427,7 +518,8 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     # kernel that is not affected.
     if WORKGROUP_FALLBACK[] && workgroupsize === nothing && ndrange isa Tuple
         WGT = typeof(obj).parameters[2]
-        if WGT <: KA.NDIteration.StaticSize && interior_unit_workgroup(WGT.parameters[1])
+        if WGT <: KA.NDIteration.StaticSize &&
+           (interior_unit_workgroup(WGT.parameters[1]) || trailing_unit_ndrange(ndrange))
             return relaunch_dynamic(obj, args, ndrange)
         end
     end

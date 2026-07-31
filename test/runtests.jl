@@ -139,6 +139,14 @@ end
         include(joinpath(@__DIR__, "test_int32_cartesian_miscompile.jl"))
     end
 
+    @testset "workgroup size limit" begin
+        include(joinpath(@__DIR__, "test_workgroup_limit.jl"))
+    end
+
+    @testset "fastdiv index decomposition" begin
+        include(joinpath(@__DIR__, "test_fastdiv.jl"))
+    end
+
     @testset "whole-struct copy alignment" begin
         include(joinpath(@__DIR__, "test_struct_copy_alignment.jl"))
     end
@@ -388,6 +396,7 @@ end
         @testset "indirect in concurrent group" begin
             include(joinpath(@__DIR__, "test_indirect_in_concurrent_group.jl"))
         end
+        include(joinpath(@__DIR__, "test_crossqueue_sync.jl"))
     end
 
     # ── Tier 3j: Phase-M alloc/free regression matrix ──────────────────

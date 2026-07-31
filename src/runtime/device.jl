@@ -392,6 +392,9 @@ const VAL_RING_WRITE = zeros(Int, 1)   # total messages written by the callback
 const VAL_RING_READ  = Ref{Int}(0)     # main-thread drain cursor
 
 const VK_CONTEXT_REF = Ref{Union{Nothing, VkContext}}(nothing)
+# Guards the lazy init below. `init_vulkan!` builds a whole VkDevice and has no
+# idempotency guard of its own, so two threads arriving together built TWO.
+const VK_CONTEXT_LOCK = ReentrantLock()
 
 """
     device_lost(ctx::VkContext)  ->  Bool
@@ -418,7 +421,16 @@ Get or create the global Vulkan context. Lazily initializes on first call.
 """
 function vk_context()
     ctx = VK_CONTEXT_REF[]
-    if ctx === nothing
+    ctx === nothing || return ctx::VkContext
+    # Double-checked under a lock. Unlocked, two threads both saw `nothing` and
+    # both ran `init_vulkan!`, leaving two live VkDevices: the loser's context is
+    # still reachable from every buffer it allocated (`buf.last_write` retains
+    # its BatchQueue), so the next cross-queue wait passed a semaphore from one
+    # device to the other and the driver segfaulted with no Julia frame to show.
+    lock(VK_CONTEXT_LOCK)
+    try
+        ctx = VK_CONTEXT_REF[]
+        ctx === nothing || return ctx::VkContext
         # `invokelatest`, not a direct call: a direct one makes inference record
         # a backedge from `vk_context` to `init_vulkan!`, and `getproperty(::
         # LavaBackend, :bq)` goes through here, so EVERY Lava operation ends up
@@ -430,8 +442,10 @@ function vk_context()
         # single call that creates the context.
         ctx = Base.invokelatest(init_vulkan!)::VkContext
         VK_CONTEXT_REF[] = ctx
+        return ctx::VkContext
+    finally
+        unlock(VK_CONTEXT_LOCK)
     end
-    return ctx::VkContext
 end
 
 vk_device() = vk_context().device

@@ -461,10 +461,15 @@ Returns a NamedTuple `(registers, scratch_bytes, raw_stats)` where:
 Returns `nothing` if the extension wasn't enabled at device creation, or
 if the driver doesn't expose anything for this pipeline.
 """
-function pipeline_exec_stats(linked::LavaLinkedKernel)
+pipeline_exec_stats(linked::LavaLinkedKernel) = pipeline_exec_stats(linked.pipeline)
+
+# Takes the pipeline, not the linked kernel: the KA launch path keeps
+# `LaunchPlan.pipeline` and drops the `LavaLinkedKernel`, so the linked-kernel
+# method was unreachable from the only place that launches anything.
+function pipeline_exec_stats(pipeline::LavaComputePipeline)
     PIPELINE_EXEC_PROPERTIES_REQUESTED[] || return nothing
     ctx = vk_context()
-    pipe = linked.pipeline.pipeline
+    pipe = pipeline.pipeline
     # Discover the pipeline's executables.
     exec_info = VK.PipelineInfoKHR(pipe)
     execs = try

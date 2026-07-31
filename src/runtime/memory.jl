@@ -704,6 +704,38 @@ function vk_free!(buf::VkManagedBuffer)
         end
     end
 
+    # One more reason to defer, independent of what the GPU is doing: THREAD.
+    # `destroy_buffer!` on a pooled chunk calls `return_to_pool!`, which does a
+    # plain `push!` onto `POOL_FREE_LISTS[idx]` — a Vector that `pool_alloc` pops
+    # from on whichever thread is allocating. `vk_free!` runs from finalizers, so
+    # that is a genuine data race, and Julia 1.12 catches it:
+    #
+    #   error in running finalizer: ConcurrencyViolationError("Vector has invalid
+    #   state. Don't modify internal fields incorrectly, or resize without
+    #   correct locks")  _growend! → push! → return_to_pool!
+    #
+    # after which the process segfaults. The in-flight branch above already hands
+    # buffers to the owning thread under `deferred_frees_lock`; it just never
+    # covered this case, and it cannot — a buffer with `last_write === nothing`
+    # (allocated, never written, dropped) does not enter that branch at all.
+    # Route every off-thread free the same way and `return_to_pool!` stays
+    # single-threaded. State is already DEFERRED here, which is exactly what
+    # `drain_deferred_frees!` expects.
+    # `ctx` is typed `Any` and can be unset on a buffer that never belonged to a
+    # context; such a buffer is not pooled either, so destroying it inline is
+    # safe and the `isa` guard keeps this from throwing inside a finalizer.
+    let c = buf.ctx
+        if c isa VkContext
+            bq = c.default_bq
+            if Threads.threadid() != bq.owning_thread
+                lock(bq.deferred_frees_lock) do
+                    push!(bq.deferred_frees, buf)
+                end
+                return
+            end
+        end
+    end
+
     destroy_buffer!(buf)
 end
 
