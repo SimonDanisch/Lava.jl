@@ -39,14 +39,24 @@ const KA = KernelAbstractions
     @inbounds d[I...] = 1.0f0
 end
 
-"Fraction of `ndrange` actually written, launching `mode`."
-function coverage(nd, wg, mode; fallback::Bool = true)
+"""
+Fraction of `ndrange` actually written, launching `mode`.
+
+`limit` raises [`Lava.WORKGROUP_LIMIT`](@ref) for the call. The characterisation
+testsets below deliberately launch workgroups past it — they are measuring how
+much of the output survives, so a guard that refuses the launch would hide the
+very thing they exist to pin. Every other launch in this file stays under it.
+"""
+function coverage(nd, wg, mode; fallback::Bool = true, limit::Int = Lava.WORKGROUP_LIMIT[])
     old = Lava.WORKGROUP_FALLBACK[]
+    oldlim = Lava.WORKGROUP_LIMIT[]
     Lava.WORKGROUP_FALLBACK[] = fallback
+    Lava.WORKGROUP_LIMIT[] = limit
     try
         return coverage_(nd, wg, mode)
     finally
         Lava.WORKGROUP_FALLBACK[] = old
+        Lava.WORKGROUP_LIMIT[] = oldlim
     end
 end
 
@@ -89,12 +99,26 @@ end
         @test coverage((250, 250), (32, 4), :typed) == 1.0
         @test coverage((72, 64, 64), (32, 4, 1), :typed) == 1.0
         @test coverage((8, 8, 8, 8, 8), (8, 1, 1, 1, 1), :typed) == 1.0
-        # Was the documented failure; correct now even with the guard OFF.
-        @test coverage((72, 256, 8, 16), (32, 4, 1, 1), :typed; fallback = false) == 1.0
-        @test coverage((72, 8, 1, 1), (32, 4, 1, 1), :typed; fallback = false) == 1.0
     end
 
-    @testset "workitems[3] == 1 was the trigger; no longer" begin
+    # ── the fault itself, with the guard OFF ──────────────────────────────────
+    #
+    # These three testsets asserted, with the guard off, that the codegen fault
+    # had gone away — "was the trigger; no longer", "Full now". **It has not.**
+    # Re-measured 2026-07-31, every shape still loses exactly the documented
+    # fraction, and `min(1, b3/b2)` reproduces on all five cells of the grid.
+    #
+    # They are written as assertions of the fault rather than `@test_broken` so
+    # they say something a fix must contradict: if a driver or LLVM update
+    # repairs the block decode, these go red, and that is the signal to delete
+    # `trailing_unit_ndrange`, `interior_unit_workgroup` and the fallback with
+    # them. `@test_broken` would go quietly green and tell nobody.
+    #
+    # Lava is *correct* through all of this — the guard is on by default, and
+    # "WORKGROUP_FALLBACK makes the typed form correct everywhere" below is what
+    # covers the shipped behaviour.
+
+    @testset "workitems[3] == 1 is still the trigger" begin
         # Sharpest form of the bug. At rank 4 the typed spelling is wrong IFF the
         # THIRD workgroup extent is 1; `wg[4]` is irrelevant. With `wg[3] > 1`
         # every block grid is correct, so a unit interior workitem extent is what
@@ -102,35 +126,33 @@ end
         # dimension's `(g-1)*1 + 1` term and taking dimension 2's divisor with it.
         ND = (64, 256, 8, 2)
         for wg in ((32, 4, 2, 1), (32, 4, 4, 1))
-            @test coverage(ND, wg, :typed; fallback = false) == 1.0   # wg[3] > 1: fine
+            # 512 threads for the second: past the limit, and deliberately so.
+            @test coverage(ND, wg, :typed; fallback = false, limit = 512) == 1.0
         end
-        # These once wrote only min(1, b3/b2) of the output. Full now.
         for wg in ((32, 4, 1, 1), (32, 4, 1, 2), (32, 1, 1, 1), (32, 8, 1, 1))
-            @test coverage(ND, wg, :typed; fallback = false) == 1.0
+            @test coverage(ND, wg, :typed; fallback = false) < 1.0
         end
     end
 
-    @testset "an INTERIOR unit extent was the trigger; no longer" begin
+    @testset "an INTERIOR unit extent is still the trigger" begin
         # Generalises past rank 4 and explains the whole pattern: ranks 1-3 look
         # clean because `(32,4,1)`'s unit extent is trailing, and the rank-5 case
-        # that passed earlier did so because it satisfied b2 <= b3, not because
-        # rank 5 is immune.
+        # that passed did so because it satisfied b2 <= b3, not because rank 5 is
+        # immune.
         ND5 = (32, 128, 8, 4, 2)
-        @test coverage(ND5, (16, 4, 1, 1, 1), :typed; fallback = false) == 1.0  # dims 3,4 unit, interior
-        @test coverage(ND5, (16, 4, 2, 1, 1), :typed; fallback = false) == 1.0  # dim 4 unit, interior
+        @test coverage(ND5, (16, 4, 1, 1, 1), :typed; fallback = false) < 1.0  # dims 3,4 unit, interior
+        @test coverage(ND5, (16, 4, 2, 1, 1), :typed; fallback = false) < 1.0  # dim 4 unit, interior
         @test coverage(ND5, (16, 4, 2, 2, 1), :typed) == 1.0  # only dim 5, trailing
     end
 
-    @testset "the old failure law min(1, b3/b2) no longer holds" begin
-        # Not decoration — this is the sharpest statement of the bug and the
-        # thing a fix has to explain. Dimension 2 of the BLOCK grid is decoded
-        # with dimension 3's extent as its divisor, so its component ranges over
-        # `0:b3-1` instead of `0:b2-1` and exactly `b3/b2` of the output is
-        # written. Verified over a 6x5 grid; a few representative cells here.
+    @testset "the failure law is exactly min(1, b3/b2)" begin
+        # The sharpest statement of the bug and the thing a fix has to explain.
+        # Dimension 2 of the BLOCK grid is decoded with dimension 3's extent as
+        # its divisor, so its component ranges over `0:b3-1` instead of `0:b2-1`
+        # and exactly `b3/b2` of the output is written.
         law(b2, b3) = coverage((64, 4b2, b3, 2), (32, 4, 1, 1), :typed; fallback = false)
-        # Every one of these used to write exactly min(1, b3/b2) of the output.
         for (b2, b3) in ((2, 1), (4, 2), (8, 1), (16, 4), (64, 8))
-            @test law(b2, b3) == 1.0
+            @test law(b2, b3) == min(1, b3 / b2)
         end
         # …and it is correct exactly when b2 <= b3.
         for (b2, b3) in ((2, 2), (4, 4), (8, 16), (2, 8))
@@ -204,6 +226,83 @@ end
             wg = Lava.staticgroup(sz)
             @test prod(wg) <= 256
             @test Lava.interior_unit_workgroup(wg)   # so the fallback fires
+        end
+    end
+end
+
+# ── a SECOND trigger for the same silent fault ────────────────────────────────
+#
+# `interior_unit_workgroup` was written for a workgroup with an interior unit
+# extent. It is not the only shape that miscompiles: a workgroup in the kernel's
+# TYPE, on an ndrange whose **last extent is 1**, at rank >= 5, also writes part
+# of its output and reports nothing. `(16,2,2,2,2,1)` has no interior unit extent,
+# so the original guard never fired.
+#
+# Found through `permutedims!`, which returned wrong data for SAM 2's rank-6
+# window-partition shapes — `(576,16,4,16,4,1)` and friends — while the ordinary
+# broadcast of the same permutation stayed correct, because a broadcast uses a
+# linear ndrange and never reaches this path. Measured written fractions were
+# 0.500 and 0.062 on shapes differing only in extents, so the trigger is pinned
+# here and no law is claimed about how much survives.
+@kernel cpu=false function markall!(d)
+    I = @index(Global, NTuple)
+    @inbounds d[I...] = 1.0f0
+end
+
+@testset "trailing unit ndrange" begin
+    backend = LavaBackend()
+    written(sz, wg) = begin
+        d = KernelAbstractions.allocate(backend, Float32, sz...)
+        fill!(d, 0.0f0)
+        markall!(backend, wg)(d; ndrange = sz)
+        KernelAbstractions.synchronize(backend)
+        count(==(1.0f0), Array(d)) / length(d)
+    end
+
+    @testset "the predicate matches the measured trigger" begin
+        @test Lava.trailing_unit_ndrange((64, 4, 4, 4, 1))          # rank 5, fires
+        @test Lava.trailing_unit_ndrange((576, 16, 16, 4, 4, 1))    # rank 6, fires
+        @test !Lava.trailing_unit_ndrange((64, 4, 4, 4, 4, 2))      # last extent 2
+        @test !Lava.trailing_unit_ndrange((256, 256, 144, 1))       # rank 4 is unaffected
+        @test !Lava.trailing_unit_ndrange((64, 4, 4))
+    end
+
+    @testset "every element is written" begin
+        for (sz, wg) in [((576, 16, 16, 4, 4, 1), (16, 2, 2, 2, 2, 1)),
+                         ((288, 4, 4, 32, 32, 1), (16, 2, 2, 2, 2, 1)),
+                         ((64, 4, 4, 4, 4, 1),    (16, 2, 2, 2, 2, 1)),
+                         ((64, 4, 4, 4, 1),       (16, 2, 2, 2, 1)),
+                         ((64, 4, 4, 4, 4, 2),    (16, 2, 2, 2, 2, 1))]   # control
+            @test written(sz, wg) == 1.0
+        end
+    end
+
+    @testset "the fault is still there underneath" begin
+        # The guard is load-bearing, not decorative: with it off, the same launch
+        # loses data. If this ever stops failing, the codegen fault is fixed and
+        # `trailing_unit_ndrange` can go.
+        prev = Lava.WORKGROUP_FALLBACK[]
+        try
+            Lava.WORKGROUP_FALLBACK[] = false
+            @test written((576, 16, 16, 4, 4, 1), (16, 2, 2, 2, 2, 1)) < 1.0
+            @test written((64, 4, 4, 4, 1), (16, 2, 2, 2, 1)) < 1.0
+        finally
+            Lava.WORKGROUP_FALLBACK[] = prev
+        end
+    end
+
+    @testset "permutedims! is correct on the shapes that found this" begin
+        for (sz, perm) in [((576, 16, 4, 16, 4, 1), (1, 2, 4, 3, 5, 6)),
+                           ((288, 4, 32, 4, 32, 1), (1, 2, 4, 3, 5, 6)),
+                           ((72, 8, 256, 16),       (1, 3, 2, 4))]
+            h = reshape(collect(Float32.(1:prod(sz))), sz)
+            src = KernelAbstractions.allocate(backend, Float32, sz...)
+            copyto!(src, h)
+            dest = KernelAbstractions.allocate(backend, Float32,
+                                               ntuple(d -> sz[perm[d]], length(sz))...)
+            permutedims!(dest, src, perm)
+            KernelAbstractions.synchronize(backend)
+            @test Array(dest) == permutedims(h, perm)
         end
     end
 end

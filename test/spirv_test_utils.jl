@@ -9,7 +9,17 @@ module SPIRVTestUtils
 
 using Test
 using Lava
-using SPIRV_Tools_jll
+
+# Reached through `Lava`, not `using SPIRV_Tools_jll`, so the suite runs from
+# whatever environment loaded Lava rather than only from Lava's own test target.
+# It is a main dependency of Lava — the package calls `spirv_val` and `spirv_dis`
+# itself — so this always resolves, and it pins the tests to the same binaries
+# the package uses. Asking for it by name is what made the suite unrunnable from
+# the project env, which is the one it is developed in.
+const SPIRV_Tools_jll = Lava.SPIRV_Tools_jll
+
+# The llc oracle is genuinely optional and stays a test-target dep; every use is
+# already behind `HAS_LLC`.
 const HAS_LLC = try
     using SPIRV_LLVM_Backend_jll
     true
