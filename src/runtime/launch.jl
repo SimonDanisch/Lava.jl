@@ -575,6 +575,9 @@ end
 
 function get_arg_buffer(bq::BatchQueue, nbytes::Integer)
     @assert Threads.threadid() == bq.owning_thread  "BatchQueue is single-writer; cross-thread arg-buf alloc forbidden"
+    # Rewind here rather than at end-of-frame: safe exactly when the GPU has
+    # passed every batch that allocated from the pool (see `arg_pool_in_use!`).
+    reclaim_arg_buffer_pool!(bq)
     aligned_size = (max(Int(nbytes), 16) + ARG_SLAB_ALIGN - 1) & ~(ARG_SLAB_ALIGN - 1)
     ensure_arg_slab!(bq, aligned_size)
     slab = bq.arg_slabs[bq.arg_slab_idx]::LavaArray{UInt8,1}
@@ -611,11 +614,41 @@ function reserve_arg_slabs!(bq::BatchQueue)
     return
 end
 
+"""
+    arg_pool_in_use!(bq, signal_value)
+
+Record that everything allocated from `bq`'s arg pool is read by batches up to
+`signal_value`; the pool may be rewound once the timeline passes it.
+
+The pool is a bump allocator whose addresses are baked into command buffers as
+push constants, so rewinding it while a batch that allocated from it is still
+executing hands the next caller memory an in-flight shader is still reading.
+Rewinding at end-of-frame did exactly that: geometry corruption over a static
+scene, intermittent, hidden by any full sync, and invisible to validation —
+overwriting your own host-mapped memory is perfectly legal.
+"""
+arg_pool_in_use!(bq::BatchQueue, signal_value::Integer) =
+    (bq.arg_pool_frontier = UInt64(signal_value); nothing)
+
+"""
+Rewind the arg pool if — and only if — the GPU has finished with everything
+allocated from it. Cheap: one non-blocking timeline query, and only when there is
+a frontier to clear.
+"""
+function reclaim_arg_buffer_pool!(bq::BatchQueue)
+    bq.arg_pool_frontier == UInt64(0) && return false
+    query_timeline(bq) >= bq.arg_pool_frontier || return false
+    reset_arg_buffer_pool!(bq)
+    bq.arg_pool_frontier = UInt64(0)
+    return true
+end
+
 """Reset arg buffer slab allocator for `bq` after its in_flight batches drained."""
 function reset_arg_buffer_pool!(bq::BatchQueue)
     bq.arg_slab_idx = get(RESERVED_ARG_SLABS, bq, 0) + 1
     bq.arg_slab_offset = 0
     bq.arg_alloc_count = 0
+    bq.arg_pool_frontier = UInt64(0)
 end
 
 """Lazy-grow `bq.indirect_slabs` with a LavaArray{UInt32,1} backed by

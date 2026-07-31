@@ -331,7 +331,16 @@ function vk_draw!(bq::BatchQueue,
         # Transition color image to COLOR_ATTACHMENT_OPTIMAL
         transition_image!(cmd, color_image,
             Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            Vulkan.PIPELINE_STAGE_TOP_OF_PIPE_BIT, Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            # srcStage is COLOR_ATTACHMENT_OUTPUT, not TOP_OF_PIPE. On a swapchain
+            # image the submit waits on the semaphore `vkAcquireNextImageKHR`
+            # signals, at COLOR_ATTACHMENT_OUTPUT — and a barrier whose srcStage is
+            # TOP_OF_PIPE creates NO execution dependency with that wait, so this
+            # transition (and the writes behind it) can run while the presentation
+            # engine still owns the image. Synchronization validation reports it as
+            # "WRITE_AFTER_READ hazard … previously accessed by vkAcquireNextImageKHR";
+            # on screen it is bands of stale pixels that vanish under any full sync.
+            Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
             Vulkan.AccessFlag(0), Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
 
         # Transition depth image to DEPTH_STENCIL_ATTACHMENT_OPTIMAL
@@ -478,7 +487,16 @@ function vk_begin_pass!(bq::BatchQueue,
         # Clear mode: discard old content, start fresh
         transition_image!(cmd, color_image,
             Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            Vulkan.PIPELINE_STAGE_TOP_OF_PIPE_BIT, Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            # srcStage is COLOR_ATTACHMENT_OUTPUT, not TOP_OF_PIPE. On a swapchain
+            # image the submit waits on the semaphore `vkAcquireNextImageKHR`
+            # signals, at COLOR_ATTACHMENT_OUTPUT — and a barrier whose srcStage is
+            # TOP_OF_PIPE creates NO execution dependency with that wait, so this
+            # transition (and the writes behind it) can run while the presentation
+            # engine still owns the image. Synchronization validation reports it as
+            # "WRITE_AFTER_READ hazard … previously accessed by vkAcquireNextImageKHR";
+            # on screen it is bands of stale pixels that vanish under any full sync.
+            Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
             Vulkan.AccessFlag(0), Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
 
         clear_val = Vulkan.ClearValue(Vulkan.ClearColorValue(clear_color))

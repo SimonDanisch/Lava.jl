@@ -408,8 +408,9 @@ function present_frame!(bq::BatchQueue, win::RenderWindow)
         # Signal timeline for in-Lava lifetime tracking:
         Vulkan.SemaphoreSubmitInfo(bq.timeline_sem, batch.signal_value, UInt32(0);
             stage_mask=Vulkan.PIPELINE_STAGE_2_ALL_COMMANDS_BIT),
-        # Signal render_finished for the subsequent present operation:
-        Vulkan.SemaphoreSubmitInfo(win.render_finished[fi], UInt64(0), UInt32(0);
+        # Signal render_finished for the subsequent present operation. Indexed by
+        # IMAGE, not frame slot — see the comment where these are created.
+        Vulkan.SemaphoreSubmitInfo(win.render_finished[win.current_image_idx + 1], UInt64(0), UInt32(0);
             stage_mask=Vulkan.PIPELINE_STAGE_2_ALL_COMMANDS_BIT),
     ]
     cb_info = Vulkan.CommandBufferSubmitInfo(cmd, UInt32(0))
@@ -425,7 +426,10 @@ function present_frame!(bq::BatchQueue, win::RenderWindow)
 
     drain_deferred_frees!(bq)
     drain_deferred_as_frees!(bq)
-    reset_arg_buffer_pool!(bq)
+    # NOT a rewind: this frame is still executing and its shaders read their
+    # arguments out of the pool. Record how far the GPU must get before the pool
+    # can be reused; `get_arg_buffer` rewinds once the timeline passes it.
+    arg_pool_in_use!(bq, batch.signal_value)
 
     # Present
     present!(win)

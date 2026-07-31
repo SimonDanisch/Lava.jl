@@ -122,6 +122,12 @@ mutable struct BatchQueue
     arg_slab_idx::Int
     arg_slab_offset::Int
     arg_alloc_count::Int
+    # Timeline value the GPU must reach before the pool may be rewound: the
+    # newest batch that allocated from it. 0 = nothing outstanding. Rewinding
+    # earlier hands the next caller bytes an in-flight shader is still reading,
+    # since a dispatch's arg address is baked into its command buffer as a push
+    # constant (see `arg_pool_in_use!`).
+    arg_pool_frontier::UInt64
     # Per-BQ indirect-dispatch buffer slab pool.  Element type is
     # `LavaArray{UInt32,1}` (unified + INDIRECT_BUFFER_BIT).  Reset by
     # `reset_indirect_buffer_pool!(bq)`.
@@ -181,7 +187,7 @@ function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32, 
                     timeline_sem, UInt64(0),
                     Any[], Any[],    # deferred_frees, deferred_as_frees
                     Base.Threads.SpinLock(),  # deferred_frees_lock
-                    Any[], 1, 0, 0,  # arg_slabs: idx=1, offset=0, count=0
+                    Any[], 1, 0, 0, UInt64(0),  # arg_slabs: idx=1, offset=0, count=0, frontier=0
                     Any[], 1, 0,     # indirect_slabs: idx=1, offset=0
                     nothing,         # staging (lazy)
                     ctx,             # owning VkContext (required)

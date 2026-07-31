@@ -170,7 +170,14 @@ function create_swapchain!(win::RenderWindow; vsync::Bool=true)
     # Create per-frame sync primitives (one set per swapchain image)
     n = length(win.images)
     win.image_available = [Vulkan.Semaphore(dev) for _ in 1:n]
-    win.render_finished = [Vulkan.Semaphore(dev) for _ in 1:n]
+    # One per swapchain IMAGE, not per frame-in-flight slot. A binary semaphore
+    # used in a present cannot be reused until the image it was presented with is
+    # re-acquired, and acquire hands back image indices in whatever order it
+    # likes (observed: 3, 2, 1, 0, 3, 2, 1, 3). Keying this by frame slot signals
+    # a semaphore the presentation engine still owns — sync validation calls it
+    # "may still be in use by VkSwapchainKHR", and on screen it is tearing into
+    # bands of stale pixels that any full GPU sync hides.
+    win.render_finished = [Vulkan.Semaphore(dev) for _ in 1:length(win.images)]
     win.in_flight = [Vulkan.Fence(dev; flags=Vulkan.FENCE_CREATE_SIGNALED_BIT) for _ in 1:n]
     win.frame_batches = Union{Nothing, CommandBatch}[nothing for _ in 1:n]
     win.current_frame = 1
@@ -206,9 +213,16 @@ function acquire_next_image!(win::RenderWindow)
         win.frame_batches[fi] = nothing
     end
 
-    idx, _ = throw_if_error(ctx, "vkAcquireNextImageKHR",
-        Vulkan.acquire_next_image_khr(dev, win.swapchain,
-            typemax(UInt64); semaphore=win.image_available[fi]))
+    # Same on acquire: a stale swapchain is a condition to recover from, not an
+    # error to die on.
+    acq = Vulkan.acquire_next_image_khr(dev, win.swapchain,
+        typemax(UInt64); semaphore=win.image_available[fi])
+    if iserror(acq) && unwrap_error(acq).code == Vulkan.ERROR_OUT_OF_DATE_KHR
+        resize!(win)
+        acq = Vulkan.acquire_next_image_khr(dev, win.swapchain,
+            typemax(UInt64); semaphore=win.image_available[fi])
+    end
+    idx, _ = throw_if_error(ctx, "vkAcquireNextImageKHR", acq)
 
     win.current_image_idx = idx
     win.acquired = true
@@ -226,12 +240,24 @@ function present!(win::RenderWindow)
     ctx = win.ctx
     fi = win.current_frame
     present_info = Vulkan.PresentInfoKHR(
-        [win.render_finished[fi]],
+        [win.render_finished[win.current_image_idx + 1]],
         [win.swapchain],
         [win.current_image_idx],
     )
-    throw_if_error(ctx, "vkQueuePresentKHR",
-        Vulkan.queue_present_khr(ctx.default_bq.queue, present_info))
+    # OUT_OF_DATE / SUBOPTIMAL are not failures: the surface changed under us
+    # (a resize, or the compositor remapping the window — it routinely happens on
+    # the very first present) and the swapchain has to be rebuilt. Throwing here
+    # turned an ordinary condition into a crash on startup.
+    result = Vulkan.queue_present_khr(ctx.default_bq.queue, present_info)
+    if iserror(result)
+        code = unwrap_error(result).code
+        if code == Vulkan.ERROR_OUT_OF_DATE_KHR || code == Vulkan.SUBOPTIMAL_KHR
+            win.acquired = false
+            resize!(win)                 # rebuild the swapchain; caller draws the next frame
+            return nothing
+        end
+        throw_if_error(ctx, "vkQueuePresentKHR", result)
+    end
 
     win.acquired = false
     # Advance to next frame-in-flight slot

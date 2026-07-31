@@ -20,6 +20,7 @@ export GraphicsPipeline, Rasterizer, TrianglePipeline, LinePipeline
 export RenderWindow, LavaFramebuffer, WindowTarget, OffscreenTarget
 export CompiledGraphicsPipeline, LavaGfxShader
 export draw!, blit!, present_frame!, acquire_next_image!, readback_framebuffer, readback_window
+export copy_framebuffer!
 export vk_begin_pass!, vk_draw_in_pass!, vk_draw_indexed_in_pass!, vk_end_pass!
 export pack_gfx_args, ensure_compiled!, transition_image!
 export LavaTexture2D, LavaTexture1D, LavaSampler, SampledTexture, LavaTexture

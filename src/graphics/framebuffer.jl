@@ -173,6 +173,53 @@ function readback_framebuffer(fb::LavaFramebuffer)
 end
 
 """
+    copy_framebuffer!(dst::LavaArray{UInt8, 1}, fb::LavaFramebuffer) -> dst
+
+Copy `fb`'s colour attachment into a DEVICE-LOCAL buffer — the same image copy
+[`readback_framebuffer`](@ref) does, without the host round trip.
+
+`readback_framebuffer` targets host-visible staging and returns a `Matrix`, which
+is what a screenshot wants and exactly what a second GPU pass does not: a
+postprocessing pass that reads its input back through the CPU pays a full
+download and upload per frame. This writes straight into a buffer a kernel (or
+[`blit!`](@ref)) can read.
+
+`dst` must hold `width * height * format_pixel_size(fb.color_format)` bytes; the
+pixels land tightly packed in row order, so element `(x, y)` of a
+`(width, height)` view is at linear index `(y - 1) * width + x`.
+"""
+function copy_framebuffer!(dst::LavaArray{UInt8, 1}, fb::LavaFramebuffer)
+    ctx = fb.ctx
+    bq = ctx.default_bq
+    nbytes = fb.width * fb.height * format_pixel_size(fb.color_format)
+    length(dst) >= nbytes ||
+        error("destination holds $(length(dst)) bytes, need $nbytes")
+
+    batch = ensure_active_batch!(bq)
+    cmd = batch.cmd_buf
+
+    transition_image!(cmd, fb.color_image,
+        Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, Vulkan.PIPELINE_STAGE_TRANSFER_BIT,
+        Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT, Vulkan.ACCESS_TRANSFER_READ_BIT)
+
+    managed = dst.buf[]
+    region = Vulkan.BufferImageCopy(
+        UInt64(managed.pool_offset + dst.offset), UInt32(0), UInt32(0),
+        Vulkan.ImageSubresourceLayers(Vulkan.IMAGE_ASPECT_COLOR_BIT,
+            UInt32(0), UInt32(0), UInt32(1)),
+        Vulkan.Offset3D(0, 0, 0),
+        Vulkan.Extent3D(UInt32(fb.width), UInt32(fb.height), UInt32(1)),
+    )
+    Vulkan.cmd_copy_image_to_buffer(cmd, fb.color_image,
+        Vulkan.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, managed.buffer, [region])
+
+    pin!(batch, fb)
+    pin!(batch, dst)
+    return dst
+end
+
+"""
     readback_window(win::RenderWindow) -> Matrix{NTuple{4, UInt8}}
 
 Read back the current swapchain image to CPU memory.
