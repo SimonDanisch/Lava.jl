@@ -720,6 +720,15 @@ function vk_free!(buf::VkManagedBuffer)
     #
     # Deferring costs one entry on a list that `drain_deferred_frees!` empties at
     # the next flush or submit; destroying early costs the device.
+    #
+    # **Not certainly the last of it.** After this landed the hang was seen once
+    # more, under `with_dispatch_timing`, against roughly 90 clean trials across
+    # every reproduction that used to fail in ten or fewer (60 probe-decodes with
+    # the collector live, 8 encode+decodes with the trim forced, 6 and 10 timing
+    # runs). So the dominant path is closed and the residual rate is low, but
+    # either a second window exists or something rarer shares this one. If it
+    # recurs, the next thing to check is whether a buffer can be reached by an
+    # open batch through something `pins` does not count either.
     let bqa = (buf.ctx::VkContext).default_bq
         if (@atomic :acquire buf.last_write) === nothing &&
            bqa.active_batch !== nothing && bqa.active_batch.recording
