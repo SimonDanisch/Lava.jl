@@ -705,6 +705,31 @@ function vk_free!(buf::VkManagedBuffer)
     # current counter is already >= val, the GPU is done and free is safe.
     # Otherwise the buffer stays in DEFERRED state on that BQ's deferred-free
     # list; it will be destroyed next time the BQ sweeps completed batches.
+    # **A never-submitted buffer is not an idle buffer.** Everything below keys
+    # off `last_write`, which `sync_access!` only writes at submit — so a buffer
+    # the *currently recording* batch references, but which has never been
+    # through a submit, reads as `nothing` here and falls through to immediate
+    # destruction while an open command buffer still names it.
+    #
+    # The `pins > 0` path above covers the case where something took an explicit
+    # reference. This covers the rest, and the rest is what a GC landing in the
+    # middle of a recording finds: collect during `decode` and the queue wedges
+    # with four batches holding timeline values nothing signals. Confining
+    # collections to safe points made that 60/60 clean where it otherwise hung
+    # within 15, which is what pointed here.
+    #
+    # Deferring costs one entry on a list that `drain_deferred_frees!` empties at
+    # the next flush or submit; destroying early costs the device.
+    let bqa = (buf.ctx::VkContext).default_bq
+        if (@atomic :acquire buf.last_write) === nothing &&
+           bqa.active_batch !== nothing && bqa.active_batch.recording
+            lock(bqa.deferred_frees_lock) do
+                push!(bqa.deferred_frees, buf)
+            end
+            return    # stays DEFERRED; the drain transitions it to DEAD
+        end
+    end
+
     lw = @atomic :acquire buf.last_write
     if lw !== nothing
         bq = lw[1]::BatchQueue
