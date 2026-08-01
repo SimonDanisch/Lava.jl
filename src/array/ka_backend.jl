@@ -1199,6 +1199,31 @@ anywhere, which is only available if the layout is a parameter here too.
                      m::AcceleratedMatrix) =
     coopmat_store(dst.ptr, offset, stride, m)
 
+"""
+    copyto!(shared, offset, stride, m, Val(true))   # row-major
+
+The layout operand for a shared-memory *store*, the mirror of the load above.
+
+The load has taken a layout since the staged GEMM needed one; the store did not,
+which left the pair asymmetric for no reason — the emitter has always written
+whichever `MemoryLayout` the intrinsic name carries, for stores as much as loads.
+
+What it is for: the shape a tile is stored in decides how the scalar code that
+reads it next can be parallelised. A tile produced with rows down one axis and
+reduced along a row wants to be stored row-major, or the row's elements sit a
+whole stride apart and land in one shared-memory bank.
+
+`DNNKernels`' attention kernel is where that came up and it does **not** use
+this: giving each subgroup a row and each lane a key measured 5% slower than the
+thread-per-row loop it replaced, so the score tile went back to column-major.
+The operand stays because the asymmetry was a gap rather than a decision, and
+because the next kernel to want it should not have to discover that the emitter
+was ready all along.
+"""
+@inline Base.copyto!(dst::LavaSharedArray, offset::Integer, stride::Integer,
+                     m::AcceleratedMatrix, rowmajor::Val) =
+    coopmat_store(dst.ptr, offset, stride, m, rowmajor)
+
 # Column-major linear index from an N-d cartesian index, fully constant-folded
 # (both `dims` and the index arity are compile-time constants here).
 @inline function lava_shared_linear(dims::NTuple{N,Int}, I::NTuple{N,Integer}) where N

@@ -134,8 +134,9 @@ end
 
 @generated function coopmat_store(ptr::Core.LLVMPtr{S,3}, offset::Integer,
                                   stride::Integer,
-                                  m::AcceleratedMatrix{T,M,N,U}) where {S,T,M,N,U}
-    fname = coopmat_intrinsic_name("storew", T, M, N, U)
+                                  m::AcceleratedMatrix{T,M,N,U},
+                                  ::Val{RM} = Val(false)) where {S,T,M,N,U,RM}
+    fname = coopmat_intrinsic_name("storew", T, M, N, U; rowmajor = RM)
     ir = """
         declare void @$fname(ptr addrspace(3), i32, i32, i32) #0
         define void @entry(ptr addrspace(3) %p, i32 %o, i32 %s, i32 %h) #0 {

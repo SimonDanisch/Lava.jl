@@ -176,3 +176,42 @@ end
         @test reshape(Array(out), 16, 16) == h
     end
 end
+
+# The layout operand on a *store* into `@localmem`, which the load has taken
+# since the staged GEMM needed it and the store did not.
+#
+# Stated as a transpose, because that is the whole observable difference: load a
+# tile column-major, store it back row-major, and what lands in shared is the
+# transpose of what came in. A store that ignored the operand would return the
+# tile unchanged and pass any test that only checked "it wrote something".
+@kernel cpu=false function coopmat_store_rowmajor!(out, @Const(inp))
+    tile = @localmem Float16 (16 * 16,)
+    i = @index(Local, Linear)
+    @inbounds for k in 0:7
+        j = i + k * 32
+        tile[j] = inp[j]
+    end
+    @synchronize
+    m = AcceleratedMatrix{Float16,16,16,MatrixA}(tile, 1, 16)
+    @synchronize                      # nothing may overwrite the tile mid-load
+    copyto!(tile, 1, 16, m, Val(true))
+    @synchronize
+    @inbounds for k in 0:7
+        j = i + k * 32
+        out[j] = tile[j]
+    end
+end
+
+@testset "row-major cooperative-matrix store into @localmem" begin
+    backend = LavaBackend()
+    if !Lava.coopmat_gemm_available()
+        @info "skipping: no cooperative-matrix support on this device"
+    else
+        h = Float16.(reshape(1:256, 16, 16))
+        A = LavaArray(vec(h))
+        out = LavaArray(fill(Float16(-1), 256))
+        coopmat_store_rowmajor!(backend, 32)(out, A; ndrange = 32)
+        KernelAbstractions.synchronize(backend)
+        @test reshape(Array(out), 16, 16) == permutedims(h)
+    end
+end
