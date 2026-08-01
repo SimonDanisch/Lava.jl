@@ -140,10 +140,17 @@ Every entry is checked by `test_gemm_staged.jl` at ten values of K, and that is
 not a formality: 96 x 128 silently lost 4 of every 32 k-terms per row until the
 staging index stopped going through a real division. See `splitidx` and
 `test_shared_index_division.jl`.
+
+**The 28.3-vs-27.x ordering above was an artefact of averaging.** 96 x 128 is the
+faster kernel on four of SAM 2's six shapes, by 8.6% to 21.0%; it loses only on
+`576 x 4096 x 2304`, and it loses there by 18.3%, which is enough to take the
+weighted mean with it because that shape is 24.4% of the arithmetic. Swept over K
+with everything else fixed, the loss is not a trend but a wall — see
+`gemm_aliasing`. Per-shape, the mean was hiding the opposite conclusion.
 """
 const GEMM_TILINGS = GemmTiling[
+    (3, 2, 2, 4, 32, 8),    #  96 x 128, 8 warps — faster wherever it is allowed
     (2, 2, 2, 4, 32, 8),    #  64 x 128, 8 warps
-    (3, 2, 2, 4, 32, 8),    #  96 x 128, 8 warps
     (2, 2, 2, 2, 32, 8),    #  64 x  64, 4 warps
     (1, 2, 2, 4, 32, 8),    #  32 x 128, 8 warps
     (1, 1, 2, 4, 32, 8),    #  32 x  64, 8 warps — one tile per warp, widest reach
@@ -179,6 +186,36 @@ register-blocked kernel is the answer for those.
 @inline gemm_divides(c::GemmTiling, M::Int, N::Int, K::Int) =
     M % gemm_bm(c) == 0 && N % gemm_bn(c) == 0 && K % gemm_bk(c) == 0
 
+"""
+    gemm_aliasing(c, K) -> Bool
+
+Whether this tiling hits the stride pathology at this `K`, and must be passed
+over even though its block divides the shape.
+
+The 96-row block collapses when `K` is a multiple of 256, and only then. Swept at
+M = 576, N = 4096 with everything but `K` fixed, it runs 14-22% *faster* than the
+64-row block at K = 576, 1152, 1728, 2016, 2112, 2208, 2400, 2496, 2880 and 3456
+— and 10-18% slower at 1024, 1280, 1536, 2048, 2304, 2560 and 3072. Every value
+in the second list is a multiple of 256 and no value in the first is. It is not a
+crossover: at the bad K its throughput pins at 30-33 TFLOP/s no matter how large
+K grows, while the 64-row block scales normally past 40.
+
+`A` is `M x K`, so its row stride is `2K` bytes and a `K` divisible by 256 makes
+that a multiple of 512 — the classic power-of-two-stride aliasing shape, where
+the rows of a staged tile collide in a few cache sets. That is the suspected
+mechanism and it is *not* confirmed: both blocks are register-limited to two
+workgroups per SM (120 and 128 registers, neither spilling, measured through
+`VK_KHR_pipeline_executable_properties`), so it is not occupancy, and the 96-row
+block reads less global memory than the 64-row one, so it is not traffic either.
+Pinning it further needs Nsight.
+
+Keyed on the block not being a power of two rather than on the literal 96,
+because that is the property the suspected mechanism turns on. The generalisation
+is untested for other non-power-of-two blocks — but it can only ever *decline* a
+tiling in favour of one that was measured, so its failure mode is a missed win.
+"""
+@inline gemm_aliasing(c::GemmTiling, K::Int) = !ispow2(gemm_bm(c)) && K % 256 == 0
+
 @inline function gemm_tiling(M::Int, N::Int, K::Int)
     forced = GEMM_TILING[]
     # A forced tiling still has to divide the shape. Skipping that check makes a
@@ -188,7 +225,7 @@ register-blocked kernel is the answer for those.
     # did.
     forced === nothing || return gemm_divides(forced, M, N, K) ? forced : nothing
     for c in GEMM_TILINGS
-        gemm_divides(c, M, N, K) && return c
+        gemm_divides(c, M, N, K) && !gemm_aliasing(c, K) && return c
     end
     return nothing
 end

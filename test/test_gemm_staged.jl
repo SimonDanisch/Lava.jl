@@ -164,3 +164,53 @@ end
         end
     end
 end
+
+@testset "the aliasing rule keeps the 96-row block off its bad stride" begin
+    # `gemm_aliasing` exists because a *weighted mean over shapes* said the wrong
+    # thing: 96 x 128 is the faster block on four of SAM 2's six `addmm` shapes
+    # and collapses on the fifth, and the fifth was heavy enough to lose it the
+    # average. The collapse is exactly at `K % 256 == 0` — measured at seventeen
+    # values of K on either side of it, with everything but K held fixed.
+    #
+    # Asserted as *selection*, not as speed: a timing assertion on this card is a
+    # coin flip (the clock idles at 210 MHz of 2265) and would fail for reasons
+    # that have nothing to do with the rule.
+    old = (Lava.GEMM_STAGED[], Lava.GEMM_TILING[])
+    try
+        Lava.GEMM_STAGED[], Lava.GEMM_TILING[] = true, nothing
+
+        c96 = (3, 2, 2, 4, 32, 8)
+        @test Lava.gemm_bm(c96) == 96 && !ispow2(Lava.gemm_bm(c96))
+        @test Lava.gemm_aliasing(c96, 2304)          # 256 * 9
+        @test Lava.gemm_aliasing(c96, 1024)
+        @test !Lava.gemm_aliasing(c96, 2208)         # one step below, and fine
+        @test !Lava.gemm_aliasing(c96, 2400)         # one step above, and fine
+        # A power-of-two block is never refused, whatever K does.
+        for c in Lava.GEMM_TILINGS, K in (256, 1024, 2304, 4096)
+            ispow2(Lava.gemm_bm(c)) && @test !Lava.gemm_aliasing(c, K)
+        end
+
+        # The rule as the picker applies it: no shape whose K is a multiple of
+        # 256 may come back with a non-power-of-two block.
+        for K in (256, 512, 1024, 1536, 2048, 2304, 2560, 3072), M in (576, 1152, 2304)
+            c = Lava.gemm_tiling(M, 4096, K)
+            c === nothing && continue
+            @test ispow2(Lava.gemm_bm(c))
+        end
+        # ...and where it is allowed, the 96-row block is what gets picked, since
+        # it now leads the table.
+        for K in (576, 1152, 1728, 2880), M in (576, 1152, 2304)
+            @test Lava.gemm_tiling(M, 4096, K) == c96
+        end
+
+        # SAM 2's own six, as the encoder runs them.
+        @test Lava.gemm_tiling(2304, 4096,  576) == c96
+        @test Lava.gemm_tiling( 576, 4096, 2304) == (2, 2, 2, 4, 32, 8)   # the bad K
+        @test Lava.gemm_tiling(1728, 4096,  576) == c96
+        @test Lava.gemm_tiling( 576, 4096,  576) == c96
+        @test Lava.gemm_tiling( 288, 16384, 1152) == c96
+        @test Lava.gemm_tiling(1152, 16384,  288) == c96
+    finally
+        Lava.GEMM_STAGED[], Lava.GEMM_TILING[] = old
+    end
+end
