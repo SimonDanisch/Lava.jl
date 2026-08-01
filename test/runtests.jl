@@ -151,6 +151,10 @@ end
         include(joinpath(@__DIR__, "test_coopmat_epilogue.jl"))
     end
 
+    @testset "shared stores through a divided index" begin
+        include(joinpath(@__DIR__, "test_shared_index_division.jl"))
+    end
+
     @testset "staged GEMM" begin
         include(joinpath(@__DIR__, "test_gemm_staged.jl"))
     end

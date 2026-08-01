@@ -183,6 +183,13 @@ module Op
     const OpCompositeExtract        = UInt16(81)
     const OpVectorExtractDynamic    = UInt16(77)
     const OpCompositeConstruct      = UInt16(80)
+    # `emit.jl` has always *used* `Op.OpCompositeInsert` — it was simply never
+    # declared here, so every kernel that reached that path died with
+    # `UndefVarError: OpCompositeInsert not defined in Lava.Op` instead of
+    # compiling. Building a vector value element by element is enough to hit it,
+    # which is how it surfaced: `@localmem NTuple{2,VecElement{Float16}}`, the
+    # shape a `vec2`-wide GEMM staging buffer needs.
+    const OpCompositeInsert         = UInt16(82)
     # Ray tracing (SPV_KHR_ray_tracing)
     const OpTraceRayKHR             = UInt16(4445)
     const OpExecuteCallableKHR      = UInt16(4446)
@@ -472,6 +479,42 @@ module MemSem
     const MakeAvailableKHR  = UInt32(0x2000)   # Vulkan memory model: make writes available
     const MakeVisibleKHR    = UInt32(0x4000)   # Vulkan memory model: make writes visible
 end
+
+# ---- Memory Operand (on OpLoad / OpStore / OpCooperativeMatrix{Load,Store}KHR) ----
+#
+# Not the same enum as `MemSem` above, which is what a barrier or an atomic
+# carries. This one qualifies a single access.
+#
+# `NonPrivatePointer` is the one that matters and the one that was missing.
+# Lava emits `OpMemoryModel ... Vulkan`, and under the **Vulkan memory model** a
+# barrier's `MakeAvailable`/`MakeVisible` apply *only* to accesses tagged
+# non-private: an untagged access is by definition invisible to other
+# invocations, so a workgroup barrier grants it nothing. Every `@localmem` store
+# and load was untagged, which makes a staged kernel's whole premise — write
+# shared, barrier, read what another invocation wrote — unenforced. It happened
+# to work, until a cooperative-matrix GEMM at a 96-row block read stale shared
+# memory and silently lost 4 of 32 k-terms per row.
+#
+# glslang tags every `shared` and buffer access this way when the Vulkan memory
+# model is on, which is why the reference shaders do not hit it.
+module MemOp
+    const None              = UInt32(0x00)
+    const Aligned           = UInt32(0x02)   # followed by a literal alignment
+    const NonPrivatePointer = UInt32(0x20)
+end
+
+"""
+    nonprivate(sc) -> MemOp.NonPrivatePointer | MemOp.None
+
+The `NonPrivatePointer` bit for an access in storage class `sc`.
+
+`Workgroup` is the storage every invocation in a group can see, so an access to
+it has to say so; `Function` is per-invocation by construction and tagging it
+would claim a sharing that does not exist. Global (`PhysicalStorageBuffer`)
+accesses are left alone: they are made visible across *dispatches* by the API's
+own barriers, which sit outside the shader memory model entirely.
+"""
+@inline nonprivate(sc::UInt32) = sc == SC.Workgroup ? MemOp.NonPrivatePointer : MemOp.None
 
 # ---- Function Control ----
 module FuncControl

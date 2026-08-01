@@ -235,6 +235,36 @@ function insert_cfg_trampoline!(f::LLVM.Function, src::LLVM.BasicBlock,
     return
 end
 
+# ── `loop-rotate`: tried, measured, NOT added ────────────────────────────────
+#
+# The obvious suspect for the barrier hazard in `test_shared_index_division.jl`
+# was that this pipeline never rotates loops, where AMD's — which the sequence
+# below otherwise mirrors — gets rotation from the general optimisation pipeline
+# long before structurization. A top-tested `while` was structurizing into a loop
+# whose header branches to the *continue target* to exit; a counted `for`, which
+# Julia already lowers rotated, did not, and only the `while` lost workgroup
+# memory across its barrier.
+#
+# Adding it is three lines — it is a loop pass, so it needs the
+# `function(loop(loop-rotate))` nesting rather than a bare `LLVM.run!`:
+#
+#     @dispose pb = LLVM.NewPMPassBuilder() begin
+#         LLVM.add!(pb, LLVM.NewPMFunctionPassManager()) do fpm
+#             LLVM.add!(fpm, LLVM.NewPMLoopPassManager()) do lpm
+#                 LLVM.add!(lpm, LLVM.LoopRotatePass())
+#             end
+#         end
+#         LLVM.run!(pb, mod)
+#     end
+#
+# **It works and it does not help.** The `while` loop's header does come out with
+# an unconditional `OpBranch` into the body afterwards — the rotation happened —
+# and the shared block is still corrupted exactly as before. The GEMM measured
+# 1.53x against the register-blocked kernel with it and 1.52x without, i.e. a
+# wash. So the loop shape is not the mechanism, and a transform pass in a
+# structurization pipeline with no benefit is a mysterious regression waiting to
+# happen. Left out, recorded here so it is not re-derived.
+
 """
     run_structurize_cfg_pipeline!(mod::LLVM.Module)
 
@@ -255,26 +285,51 @@ pre-StructurizeCFG fixup pass inserted:
 8. InstCombine - cleanup bitcasts from StructurizeCFG's reg2mem patterns
    NOTE: Do NOT run SimplifyCFG after StructurizeCFG -- it destroys structured flow!
 9. fixup_post_structurize! - insert trampolines for continue-target merge conflicts
+
+Deliberately NOT here: `loop-rotate`. See the note above it.
+
+# Bisecting this pipeline
+
+`LAVA_SKIP_PASSES` takes a comma-separated list of the names below and drops
+those passes. It exists because the pipeline's failure mode is a *miscompile* —
+a kernel that compiles, validates and computes the wrong answer — and the only
+handle on one of those is to find which pass introduces it. Dropping a pass will
+often produce invalid SPIR-V instead, and that is a useful answer too: it says
+the pass is load-bearing rather than implicated.
+
+    LAVA_SKIP_PASSES=InstCombine julia --project=. …
+
+Not a `Ref`, so nothing has to be threaded through or reset, and a stale setting
+cannot survive a process. Read per call; the cost is one `get(ENV, …)` per
+kernel compile.
 """
+function skip_pass(name::AbstractString)
+    skips = get(ENV, "LAVA_SKIP_PASSES", "")
+    isempty(skips) && return false
+    name in split(skips, ',')
+end
+
 function run_structurize_cfg_pipeline!(mod::LLVM.Module)
     checkpoint = PhaseTimer("        [structurize] ")
-    LLVM.run!(LLVM.SimplifyCFGPass(), mod);            checkpoint("SimplifyCFG")
-    fixup_structured_cfg!(mod);                        checkpoint("fixup_structured_cfg!")
-    LLVM.run!(LLVM.LowerSwitchPass(), mod);            checkpoint("LowerSwitch")
-    LLVM.run!(LLVM.UnifyFunctionExitNodesPass(), mod); checkpoint("UnifyFunctionExitNodes")
-    LLVM.run!(LLVM.FixIrreduciblePass(), mod);         checkpoint("FixIrreducible")
-    LLVM.run!(LLVM.LoopSimplifyPass(), mod);           checkpoint("LoopSimplify")
-    LLVM.run!(LLVM.StructurizeCFGPass(), mod);         checkpoint("StructurizeCFG")
-    LLVM.run!(LLVM.InstCombinePass(), mod);            checkpoint("InstCombine")
+    run_or_skip(name, f) = skip_pass(name) ? nothing : (f(); checkpoint(name))
+    run_or_skip("SimplifyCFG",            () -> LLVM.run!(LLVM.SimplifyCFGPass(), mod))
+    run_or_skip("fixup_structured_cfg",   () -> fixup_structured_cfg!(mod))
+    run_or_skip("LowerSwitch",            () -> LLVM.run!(LLVM.LowerSwitchPass(), mod))
+    run_or_skip("UnifyFunctionExitNodes", () -> LLVM.run!(LLVM.UnifyFunctionExitNodesPass(), mod))
+    run_or_skip("FixIrreducible",         () -> LLVM.run!(LLVM.FixIrreduciblePass(), mod))
+    run_or_skip("LoopSimplify",           () -> LLVM.run!(LLVM.LoopSimplifyPass(), mod))
+    run_or_skip("StructurizeCFG",         () -> LLVM.run!(LLVM.StructurizeCFGPass(), mod))
+    run_or_skip("InstCombine",            () -> LLVM.run!(LLVM.InstCombinePass(), mod))
     # Collapse duplicated loop-carried phis that StructurizeCFG introduces for
     # loops containing `continue`. See merge_equivalent_loop_phis! docstring.
-    merge_equivalent_loop_phis!(mod);                  checkpoint("merge_equivalent_loop_phis!")
+    run_or_skip("merge_equivalent_loop_phis", () -> merge_equivalent_loop_phis!(mod))
     # Replace `undef` scalar phi operands introduced by StructurizeCFG with
     # constant zeros so the SPIR-V emitter doesn't emit OpUndef — which RADV
     # interprets non-deterministically and causes guard phis to pick the wrong
     # branch. See replace_undef_phi_operands_with_constants! docstring.
-    replace_undef_phi_operands_with_constants!(mod);   checkpoint("replace_undef_phi_operands!")
-    fixup_post_structurize!(mod);                      checkpoint("fixup_post_structurize!")
+    run_or_skip("replace_undef_phi_operands",
+                () -> replace_undef_phi_operands_with_constants!(mod))
+    run_or_skip("fixup_post_structurize", () -> fixup_post_structurize!(mod))
 end
 
 # Post-StructurizeCFG fixup: insert trampolines for SPIR-V continue-construct conflicts.

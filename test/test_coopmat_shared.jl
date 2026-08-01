@@ -120,3 +120,59 @@ end
         end
     end
 end
+
+# ── A `vec2`-typed staging buffer ────────────────────────────────────────────
+#
+# `mul_mm.comp` stages into `FLOAT_TYPEV2 buf_a[]` and counts `SHMEM_STRIDE` in
+# `vec2`, so every shared access is 32 bits wide. Lava's staged GEMM stages into
+# `@localmem Float16`, which makes them 16 — and widening only the *global* load
+# without widening the shared array loses to bank conflicts at every width
+# (scalar 1.04-1.09x, 2-wide 0.80-0.92x, 4-wide 0.69-0.81x; see `array/gemm.jl`).
+#
+# Two things had to exist for the reference's form to be reachable, and both are
+# checked here because each was missing:
+#
+#   * a **vector-typed `@localmem`**. `Op.OpCompositeInsert` was used by the
+#     emitter and never declared, so building a vector value element by element
+#     died with `UndefVarError` instead of compiling.
+#   * a **cooperative-matrix load whose pointer addresses that vector**.
+#     `OpCooperativeMatrixLoadKHR` permits a vector pointee whose component type
+#     matches the matrix and counts `Stride` in those vectors; the emitter built
+#     the access chain to the *scalar* component type unconditionally. `loadw2`
+#     is the variant that does not.
+#
+# This is the capability, not the integration: `gemm.jl` still stages scalar.
+const CMV2 = NTuple{2,VecElement{Float16}}
+
+@kernel cpu=false unsafe_indices=true function coopmat_vec2_tile!(out, @Const(A))
+    sh = @localmem CMV2 (8 * 16,)      # a 16x16 fp16 tile = 8 vec2 per column
+    t = @index(Local, Linear) - 1
+    @inbounds begin
+        if t < 128
+            i2 = t % 8; j = t ÷ 8
+            # one 32-bit store per lane where the scalar form needs two 16-bit
+            sh[1 + i2 + j * 8] = (VecElement(A[1 + 2i2 + j * 16]),
+                                  VecElement(A[1 + 2i2 + 1 + j * 16]))
+        end
+        @synchronize
+        if t < 32
+            # stride counted in vec2, hence 8 rather than 16
+            a = AcceleratedMatrix{Float16,16,16,MatrixA}(sh, 1, 8)
+            copyto!(pointer(out), 1, 16, a)
+        end
+    end
+end
+
+@testset "cooperative matrix from a vec2-typed @localmem" begin
+    backend = LavaBackend()
+    if !Lava.coopmat_gemm_available()
+        @info "skipping: no cooperative-matrix support on this device"
+    else
+        h = Float16.(reshape(1:256, 16, 16))
+        A = LavaArray(vec(h))
+        out = LavaArray(fill(Float16(-1), 256))
+        coopmat_vec2_tile!(backend, 128)(out, A; ndrange = 128)
+        KernelAbstractions.synchronize(backend)
+        @test reshape(Array(out), 16, 16) == h
+    end
+end

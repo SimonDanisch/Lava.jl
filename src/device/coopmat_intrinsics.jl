@@ -89,11 +89,33 @@ expression rather than an instruction, so no test on the LLVM node kind
 distinguished the two reliably. Passing the index through means the emitter
 always sees the same shape and always emits exactly one `OpAccessChain`.
 """
+# Whether a `@localmem` element type is a 2-wide vector of the matrix's component
+# type, i.e. the `f16vec2` staging buffer `mul_mm.comp` uses.
+#
+# `OpCooperativeMatrixLoadKHR` allows a pointer to a *vector* whose component type
+# matches the matrix's, with the stride counted in those vectors — which is how the
+# reference gets 32-bit shared accesses out of an fp16 tile. `@localmem Float16`
+# gives 16-bit ones, and widening only the global load without widening the shared
+# array loses to bank conflicts (scalar 1.04-1.09x, 2-wide 0.80-0.92x, 4-wide
+# 0.69-0.81x — see the note in `array/gemm.jl`).
+#
+# A comment, not a docstring: this sits between the docstring below and the
+# function it documents, and two adjacent string literals make `@doc` try to
+# document the second one.
+coopmat_vec2(::Type{NTuple{2,VecElement{T}}}, ::Type{T}) where {T} = true
+coopmat_vec2(::Type, ::Type) = false
+
 @generated function coopmat_load(::Type{AcceleratedMatrix{T,M,N,U}},
                                  ptr::Core.LLVMPtr{S,3},
                                  offset::Integer, stride::Integer,
                                  ::Val{RM} = Val(false)) where {T,M,N,U,S,RM}
-    fname = coopmat_intrinsic_name("loadw", T, M, N, U; rowmajor = RM)
+    S === T || coopmat_vec2(S, T) ||
+        throw(ArgumentError("coopmat_load: a Workgroup array of $S cannot back a \
+                             cooperative matrix of $T; use $T or NTuple{2,VecElement{$T}}"))
+    # `loadw2` when the shared array is a vector of `T`: same instruction, but the
+    # emitter has to build a pointer to the *vector* rather than to `T`.
+    fname = coopmat_intrinsic_name(S === T ? "loadw" : "loadw2", T, M, N, U;
+                                   rowmajor = RM)
     ir = """
         declare i32 @$fname(ptr addrspace(3), i32, i32) #0
         define i32 @entry(ptr addrspace(3) %p, i32 %o, i32 %s) #0 {
@@ -206,9 +228,9 @@ end
 # this keeps GPUCompiler's unknown-intrinsic check happy for the common shapes.
 for T in (Float16, Float32), U in (MatrixA, MatrixB, Accumulator),
     (M, N) in ((16, 16), (16, 8)),
-    op in ("load", "store", "zero", "muladd", "loadw", "storew", "convert")
+    op in ("load", "store", "zero", "muladd", "loadw", "loadw2", "storew", "convert")
     push!(KNOWN_INTRINSICS, coopmat_intrinsic_name(op, T, M, N, U))
-    op in ("load", "loadw", "store", "storew") &&
+    op in ("load", "loadw", "loadw2", "store", "storew") &&
         push!(KNOWN_INTRINSICS, coopmat_intrinsic_name(op, T, M, N, U; rowmajor = true))
 end
 

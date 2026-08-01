@@ -2031,15 +2031,17 @@ function emit_globals!(state::SPIRVEmitterState, llvm_mod::LLVM.Module)
         end
     end
 
-    # Emit ALL workgroup (@localmem) globals as members of a SINGLE Block struct.
-    # Multiple *separate* Block-decorated Workgroup variables must each carry the
-    # `Aliased` decoration (SPV_KHR_workgroup_memory_explicit_layout spec rule) and
-    # are then permitted to overlap the same storage — which lavapipe does, so a
-    # kernel with two @localmem buffers silently corrupts (the second aliases the
-    # first). One combined Block with distinct member offsets gives every @localmem
-    # its own storage and needs no Aliased.
+    # Workgroup (@localmem) globals: one plain variable each where their types allow
+    # it, otherwise all of them as members of a SINGLE Block struct — separate
+    # *Block-decorated* Workgroup variables must each carry `Aliased`
+    # (SPV_KHR_workgroup_memory_explicit_layout spec rule) and are then permitted to
+    # overlap the same storage, which lavapipe does. See the note on `emit_workgroup_globals!`.
+    #
+    # Every variable goes in the interface list, not just the first: SPIR-V 1.4+
+    # requires all globals an entry point uses to be listed, and a plain path with
+    # two `@localmem` buffers otherwise fails validation on the second.
     if !isempty(wg_globals)
-        push!(interface_ids, emit_combined_workgroup_block!(state, wg_globals))
+        append!(interface_ids, emit_workgroup_globals!(state, wg_globals))
     end
 
     return interface_ids
@@ -2086,35 +2088,69 @@ function emit_push_constant_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVar
 end
 
 """
+    emit_workgroup_globals!(state, wg_globals) -> Vector{UInt32}
+
+Emit every `@localmem` global, and return the ids for the entry point's interface.
+
+# The plain glslang form: tried, and it does not work here
+
+glslang emits one *undecorated* `Workgroup` `OpVariable` per `shared` array, where
+Lava puts them all in one `Block`-decorated struct under
+`SPV_KHR_workgroup_memory_explicit_layout`. That difference was the leading
+suspect for the store-dropping bug in `test_shared_index_division.jl`, so the
+plain form was implemented — `wg_needs_explicit_layout(ty)` on the array types,
+plain variables when nothing needed a spelled-out layout, and a `WG_VAR_UNWRAPPED`
+marker so the preamble used the variable directly instead of drilling into a
+struct member. **It changed nothing** — the cause was `OpUDiv`, not the layout.
+
+It also does not validate, and the reason is worth keeping. Explicit-layout
+decorations are *invalid* on a plain `Workgroup` variable's type, so the plain
+path needs a second, undecorated SPIR-V type id for the same LLVM type — and
+every other lookup for that type still resolves to the decorated one. The two
+meet, and `spirv-val` says so:
+
+    OpSelect %_ptr_Workgroup__arr_float_uint_128_0 ... %lava_shared___static_shmem
+      error: Expected both objects to be of Result Type
+    OpAccessChain %_ptr_Workgroup__arr_double_uint_3_1 ...
+      error: result type does not match the type that results from indexing the base
+
+Doing it properly means making explicit-layout a **module-wide** decision that
+every `map_workgroup_type!` in that module honours, not a per-call-site one.
+That is a real change with, on the evidence above, no benefit — so this stayed
+with the Block struct and the note stayed here.
+"""
+function emit_workgroup_globals!(state::SPIRVEmitterState,
+                                 wg_globals::Vector{<:LLVM.GlobalVariable})
+    member_lly = LLVM.LLVMType[LLVM.global_value_type(gv) for gv in wg_globals]
+    return UInt32[emit_combined_workgroup_block!(state, wg_globals, member_lly)]
+end
+
+"""
 Emit ALL workgroup (shared memory / @localmem) globals as members of a single
 Block-decorated struct backed by ONE Workgroup OpVariable.
 
 Why combined rather than one variable per global: under
-`SPV_KHR_workgroup_memory_explicit_layout` (which we always enable, since struct
-and 8-bit workgroup types need it), the spec requires that if more than one
-Workgroup variable points to a Block-decorated type, *all* of them be decorated
-`Aliased` — and `Aliased` then permits them to share storage. Conformant
-software rasterizers (lavapipe) take that permission and overlap the variables,
-so a kernel with two `@localmem` buffers has its second buffer alias the first
-(silent corruption; RADV happened to keep them separate, masking the bug).
+`SPV_KHR_workgroup_memory_explicit_layout`, the spec requires that if more than
+one Workgroup variable points to a Block-decorated type, *all* of them be
+decorated `Aliased` — and `Aliased` then permits them to share storage.
+Conformant software rasterizers (lavapipe) take that permission and overlap the
+variables, so a kernel with two `@localmem` buffers has its second buffer alias
+the first (silent corruption; RADV happened to keep them separate, masking the
+bug). The rule is about *Block-decorated* types, so it does not reach the plain
+variables `emit_plain_workgroup_vars!` emits.
 
 A single Block struct with one member per `@localmem`, each at a distinct
 explicit Offset, gives every buffer its own storage with no `Aliased`. The
 function preamble drills to member `i` (instead of member 0) for the i-th global.
-Fresh workgroup type IDs (`map_workgroup_type!`) keep these layout-decoration-free
-types separate from the PSB-decorated main cache.
+Fresh workgroup type IDs (`map_workgroup_type!`) keep these types separate from
+the PSB-decorated main cache.
 """
 function emit_combined_workgroup_block!(state::SPIRVEmitterState,
-                                        wg_globals::Vector{<:LLVM.GlobalVariable})
+                                        wg_globals::Vector{<:LLVM.GlobalVariable},
+                                        member_lly::Vector{LLVM.LLVMType})
     mod = state.mod
 
-    member_spirv = UInt32[]
-    member_lly = LLVM.LLVMType[]
-    for gv in wg_globals
-        ty = LLVM.global_value_type(gv)
-        push!(member_spirv, map_workgroup_type!(state.type_ctx, ty))
-        push!(member_lly, ty)
-    end
+    member_spirv = UInt32[map_workgroup_type!(state.type_ctx, ty) for ty in member_lly]
 
     # OpTypeStruct with one member per @localmem buffer.
     block_id = fresh_id!(mod)

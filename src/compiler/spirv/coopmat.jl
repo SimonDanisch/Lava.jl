@@ -161,17 +161,36 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
     # `loadw`/`storew` address `@localmem` through a Workgroup pointer. The only
     # difference is how the pointer is produced — the instruction, the layout and
     # the stride are identical — so the two share everything below.
-    if op == "load" || op == "loadw"
+    # `loadw`/`storew` address `@localmem`, which every invocation in the group
+    # can see, so the access must say so — under the Vulkan memory model an
+    # untagged access is private and a workgroup barrier grants it nothing. This
+    # is the whole correctness of a staged GEMM: without it the tiles a
+    # cooperative-matrix load reads are whatever the driver felt like leaving in
+    # shared memory. See `nonprivate` and the barrier in `emit.jl`.
+    if op == "load" || op == "loadw" || op == "loadw2"
         comp_ty = coopmat_component_type!(state, dtype)
-        # `loadw` carries an extra element-index argument; see below.
-        ptr_id, stride_arg = op == "loadw" ?
-            (coopmat_workgroup_pointer!(state, args[1], args[2], comp_ty), args[3]) :
+        # `loadw2` addresses a `@localmem` of 2-wide vectors, so the access chain
+        # must yield a pointer to the *vector*: `OpCooperativeMatrixLoadKHR`
+        # accepts a vector pointee whose component type matches the matrix, and
+        # counts `Stride` in those vectors. That is how `mul_mm.comp` gets 32-bit
+        # shared accesses out of an fp16 tile. See `coopmat_vec2`.
+        pointee = op == "loadw2" ?
+            emit_type_vector!(mod, comp_ty, UInt32(2)) : comp_ty
+        # `loadw`/`loadw2` carry an extra element-index argument; see below.
+        ptr_id, stride_arg = op != "load" ?
+            (coopmat_workgroup_pointer!(state, args[1], args[2], pointee), args[3]) :
             (coopmat_base_pointer!(state, args[1], comp_ty), args[2])
         stride_id = get_value_id!(state, stride_arg)
         layout_id = emit_constant_u32!(mod, layout)
         id = fresh_id!(mod)
-        encode_instruction!(mod.functions, Op.OpCooperativeMatrixLoadKHR,
-                            mat_ty, id, ptr_id, layout_id, stride_id)
+        if op != "load"
+            encode_instruction!(mod.functions, Op.OpCooperativeMatrixLoadKHR,
+                                mat_ty, id, ptr_id, layout_id, stride_id,
+                                MemOp.NonPrivatePointer)
+        else
+            encode_instruction!(mod.functions, Op.OpCooperativeMatrixLoadKHR,
+                                mat_ty, id, ptr_id, layout_id, stride_id)
+        end
         state.value_map[inst] = id
         state.coopmat_value_types[inst] = mat_ty
 
@@ -183,8 +202,14 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         stride_id = get_value_id!(state, stride_arg)
         obj_id = get_value_id!(state, obj_arg)
         layout_id = emit_constant_u32!(mod, layout)
-        encode_instruction!(mod.functions, Op.OpCooperativeMatrixStoreKHR,
-                            ptr_id, obj_id, layout_id, stride_id)
+        if op == "storew"
+            encode_instruction!(mod.functions, Op.OpCooperativeMatrixStoreKHR,
+                                ptr_id, obj_id, layout_id, stride_id,
+                                MemOp.NonPrivatePointer)
+        else
+            encode_instruction!(mod.functions, Op.OpCooperativeMatrixStoreKHR,
+                                ptr_id, obj_id, layout_id, stride_id)
+        end
 
     elseif op == "zero"
         id = fresh_id!(mod)

@@ -1338,7 +1338,8 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
         end
         if sc == SC.Workgroup || sc == SC.Function
             wg_load_align = get_alignment_for_type(needs_bitcast ? actual_load_ty : load_ty)
-            encode_instruction!(state.mod.functions, Op.OpLoad, spirv_load_ty, load_id, ptr_id, UInt32(0x02), wg_load_align)
+            encode_instruction!(state.mod.functions, Op.OpLoad, spirv_load_ty, load_id, ptr_id,
+                                MemOp.Aligned | nonprivate(sc), wg_load_align)
         else
             encode_instruction!(state.mod.functions, Op.OpLoad, spirv_load_ty, load_id, ptr_id)
         end
@@ -2144,7 +2145,8 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
         end
         if sc == SC.Workgroup || sc == SC.Function
             wg_store_align = get_alignment_for_type(store_ty)
-            encode_instruction!(state.mod.functions, Op.OpStore, ptr_id, val_id, UInt32(0x02), wg_store_align)
+            encode_instruction!(state.mod.functions, Op.OpStore, ptr_id, val_id,
+                                MemOp.Aligned | nonprivate(sc), wg_store_align)
         else
             encode_instruction!(state.mod.functions, Op.OpStore, ptr_id, val_id)
         end
@@ -6998,6 +7000,11 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
         # to be visible across invocations (unlike GLSL450 where barrier() implies this).
         # Semantics: AcquireRelease (0x8) | WorkgroupMemory (0x100)
         #          | MakeAvailableKHR (0x2000) | MakeVisibleKHR (0x4000) = 0x6108
+        #
+        # These two bits are only half of it, and for a long time they were the
+        # only half present: they apply exclusively to accesses tagged
+        # `NonPrivatePointer`, so a barrier here made nothing visible until the
+        # `Workgroup` loads and stores were tagged too. See `nonprivate`.
         u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
         scope_wg = map_constant!(state.type_ctx, LLVM.ConstantInt(LLVM.IntType(32), 2))   # Workgroup = 2
         semantics = map_constant!(state.type_ctx, LLVM.ConstantInt(LLVM.IntType(32), 0x6108))  # AcquireRelease|WorkgroupMemory|MakeAvailable|MakeVisible

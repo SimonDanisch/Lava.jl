@@ -21,7 +21,7 @@ const GEMM_BLOCK = 4       # register block: 4×4 accumulators per subgroup
 const GEMM_WORKGROUP = 64  # 2 subgroups; 32 loses latency hiding, 256 spills
 const GEMM_MAXBLOCK = 4    # largest register block `@nexprs` is unrolled for
 
-# ── the staged kernel, and why it is OFF ─────────────────────────────────────
+# ── the staged kernel ────────────────────────────────────────────────────────
 #
 # The kernel above loads every cooperative matrix straight from global memory,
 # so with a 4×4 register block each A tile is read four times and each B tile
@@ -29,85 +29,183 @@ const GEMM_MAXBLOCK = 4    # largest register block `@nexprs` is unrolled for
 # high-performance implementation instead stages a block of A and a block of B
 # into workgroup memory once and loads the matrices from there — llama.cpp's
 # Vulkan backend (`ggml-vulkan/vulkan-shaders/mul_mm.comp`, MIT) does exactly
-# that, with BM=BN=64, BK=32, 4 subgroups, and `+4` elements of leading-dimension
-# padding against bank conflicts. So does cuBLAS, which reaches 44.6 TFLOP/s on
-# these shapes against our ~20.
+# that, and so does cuBLAS, which reaches 44.6 TFLOP/s on these shapes.
 #
-# **It does not help here.** Measured on SAM 2's six `addmm` shapes, both
-# configurations, best-of-50 after a 2-second warm-up so the clock is up:
+# **The first port of it was a wash, and the reason was measurable.** With
+# `VK_KHR_pipeline_executable_properties` the driver reports, per pipeline,
+# registers and workgroup memory — and workgroup memory is where NVIDIA puts a
+# cooperative matrix it cannot keep in registers:
 #
-#                        register-blocked   staged 64×64   staged 128×128
-#   2304×4096×576              20.1              20.5            6.3
-#    576×4096×2304             22.5              22.0           22.3
-#   1728×4096×576              19.1              20.0           19.1
-#    576×4096×576              16.9              17.3           17.2
-#    288×16384×1152            14.2              13.9           14.3
-#   1152×16384×288             21.1              20.9            5.5
-#   ────────────────────────────────────────────────────────────────────
-#   weighted total              1.00x            1.03x          0.56x
+#                       registers   shared/WG   of which ours
+#   direct 4×4 block      255 (cap)     25344         0
+#   staged 2×2             96            8960      8960
+#   staged 4×4            255 (cap)     48896     17664
 #
-# 64×64 is a wash and 128×128 is a loss: at 17.2 KB of workgroup memory only two
-# workgroups fit per SM, which is 256 threads and nowhere near enough to hide
-# latency. The premise — that repeated global tile loads were costing us — is
-# simply false on this hardware. NVIDIA's L1 serves them, and what staging adds
-# is two barriers per k-step and occupancy pressure.
-#
-# Kept, switched off, because it cost a real capability to build (cooperative
-# matrices could not address `Workgroup` memory at all before it) and because
-# that capability is what a flash-attention kernel needs — which the kernel
-# table says is now the larger target. Turning it on is one `Ref`.
-const GEMM_STAGED_WG = 128          # 4 subgroups, arranged 2 x 2
+# The direct kernel spills its entire 4×4 accumulator block — it declares no
+# `@localmem` at all and the driver still gives it 25 KB — and the staged 4×4,
+# which is exactly `mul_mm.comp`'s shipped configuration, spills 31 KB on top of
+# its blocks and lands at 4.6 TFLOP/s. Neither is a tiling problem. Both are one
+# structural difference from the reference: the first port held `ST` A-fragments
+# **and** `ST` B-fragments live across a 2-way k-unroll, sixteen fragments at
+# ST=4, where `mul_mm.comp` keeps exactly one of each and reloads B inside the
+# innermost loop. Sixteen 16×16 fp16 fragments is 64 registers on top of the
+# accumulator block's 128, and 255 is the cap.
 const GEMM_BK = 32
 const GEMM_PAD = 4                  # bank-conflict padding, in elements
 
 """
-    GEMM_SUBTILES[] :: Int
+A staged-GEMM tiling: `(STM, STN, WM, WN, BK, PAD)`.
 
-Cooperative-matrix tiles per subgroup per axis in the staged kernel — the warp
-level of `mul_mm.comp`'s block -> warp -> thread, and the one number that decides
-how much arithmetic each staged byte pays for.
+The three levels of `mul_mm.comp`'s block -> warp -> tile, as parameters rather
+than as constants, because which one wins is a property of the device and not of
+the algorithm — and because the previous version hardcoded its `@nexprs` counts
+to the value it shipped with, so the "4 measured worse" recorded beside the
+constant had never actually run a 4×4 warp tile.
 
-At `ST` the workgroup covers `32*ST` square, so per `GEMM_BK` k-step it stages
-`2*32*ST*BK` elements and does `(32*ST)^2 * BK * 2` flops — **intensity grows
-linearly with ST**. That is the whole argument for the reference's warp level,
-and it is why the direct kernel's 4x4 register block beats 2x2 and 1x1 (16.8 /
-12.9 / 7.1 TFLOP/s): this kernel wants work in flight per thread, not more
-threads. Its occupancy is already 17% and lowering it further has not hurt.
+  * `WM × WN` subgroups per workgroup, arranged with `WM` down the M axis;
+  * each subgroup owns `STM × STN` cooperative-matrix tiles;
+  * so the workgroup covers `BM = 16*STM*WM` by `BN = 16*STN*WN` of C, walking K
+    in steps of `BK`, and its shared blocks carry `PAD` elements of
+    leading-dimension padding against bank conflicts.
 
-`2` was the shipped value with "4 measured worse" recorded beside it — but the
-body's `@nexprs` were hardcoded to 2, so raising the constant only moved the tile
-offsets and computed the wrong thing. It is a real parameter now.
+Arithmetic intensity is what the warp tile buys: per k-step a workgroup stages
+`(BM + BN) * BK` elements and does `BM * BN * BK * 2` flops, so widening the
+*warp* tile raises the ratio without touching the staging cost at all — provided
+the accumulators still fit in registers, which is the whole difficulty.
 """
-const GEMM_SUBTILES = Ref(2)
+const GemmTiling = NTuple{6,Int}
 
-@inline gemm_bm(ST) = GEMM_TILE * ST * 2        # 2 subgroups down
-@inline gemm_lda(ST) = gemm_bm(ST) + GEMM_PAD
-@inline gemm_ldb(::Any) = GEMM_BK + GEMM_PAD
+"""
+    splitidx(idx, ::Val{N}) -> (idx % N, idx ÷ N)
+
+Decompose a flat staging index, **without ever emitting `OpUDiv`**.
+
+That is a correctness requirement, not a micro-optimisation. A staging loop whose
+shared-store address goes through a real division by a non-power-of-two constant
+*loses stores* on this driver once the loop is unrollable and a cooperative-matrix
+`muladd` is in scope: at `BM = 96`, 2184 of 3072 slots end up holding another
+row's value and 392 are never written at all. The two emitted modules for
+`BM = 112` (lossy) and `BM = 128` (exact) have **identical opcode sequences except
+that one contains `OpUDiv` and the other `OpShiftRightLogical` + `OpBitwiseAnd`**,
+which is what identified the division. Replacing it with the magic-number form
+below makes every geometry exact at every K.
+
+`FastDiv32` is the same `init_fastdiv_values` port the broadcast path uses, so
+this costs nothing — a high multiply and a shift are cheaper than a divide, which
+is why it was ported in the first place. A power-of-two `N` keeps the mask and
+shift it would have had anyway.
+"""
+@generated function splitidx(idx::Integer, ::Val{N}) where {N}
+    ispow2(N) && return :((Int(idx) & $(N - 1), Int(idx) >> $(trailing_zeros(N))))
+    fd = FastDiv32(N)
+    quote
+        u = UInt32(idx)
+        q = Int((UInt32((UInt64(u) * $(UInt64(fd.mp))) >> 32) + u) >> $(fd.L))
+        (Int(u) - q * $N, q)
+    end
+end
+
+@inline gemm_bm(c::GemmTiling) = GEMM_TILE * c[1] * c[3]
+@inline gemm_bn(c::GemmTiling) = GEMM_TILE * c[2] * c[4]
+@inline gemm_wg(c::GemmTiling) = c[3] * c[4] * COOPMAT_SUBGROUP
+@inline gemm_bk(c::GemmTiling) = c[5]
+@inline gemm_lda(c::GemmTiling) = gemm_bm(c) + c[6]
+@inline gemm_ldb(c::GemmTiling) = gemm_bk(c) + c[6]
+
+"""
+    GEMM_TILINGS
+
+The tilings a kernel is generated for, **fastest first** — `gemm_tiling` takes
+the first whose block divides the shape, so the order is the preference and the
+last entries exist for coverage rather than for speed.
+
+One compiled `@kernel` per entry, so the list is short on purpose. Measured on an
+RTX 4000 Ada over SAM 2's six `addmm` shapes, weighted by their share of the
+encoder's GEMM arithmetic, against the register-blocked kernel's 20.5:
+
+     64 x 128, 8 warps   28.3      <- shipped default
+     64 x  64, 4 warps   26.1
+    128 x  64, 8 warps   22.3
+     32 x 128, 8 warps   19.8      but 20.7 against 13.9 on the one shape that
+                                      only it divides
+
+**Widening the warp grid wins; widening the warp tile loses.** A 2x4 warp *tile*
+(same block, 4 warps) runs at 7.3 and `mul_mm.comp`'s own 4x4 at 5.9, because a
+16x16 fp32 accumulator is 8 registers per lane and sixteen of them do not fit —
+the driver spills them into workgroup memory, 31 KB of it. This kernel wants
+warps in flight, not work per warp, which is the opposite of what the reference
+is tuned for and is worth re-measuring on any other device.
+
+Every entry is checked by `test_gemm_staged.jl` at ten values of K, and that is
+not a formality: 96 x 128 silently lost 4 of every 32 k-terms per row until the
+staging index stopped going through a real division. See `splitidx` and
+`test_shared_index_division.jl`.
+"""
+const GEMM_TILINGS = GemmTiling[
+    (2, 2, 2, 4, 32, 8),    #  64 x 128, 8 warps
+    (3, 2, 2, 4, 32, 8),    #  96 x 128, 8 warps
+    (2, 2, 2, 2, 32, 8),    #  64 x  64, 4 warps
+    (1, 2, 2, 4, 32, 8),    #  32 x 128, 8 warps
+    (1, 1, 2, 4, 32, 8),    #  32 x  64, 8 warps — one tile per warp, widest reach
+]
+
+"""
+    GEMM_TILING[]
+
+Force one tiling instead of letting `gemm_tiling` choose, or `nothing` for the
+shape-driven choice. A `Ref` so a comparison runs interleaved in one session on
+one set of buffers, which is the only form of it that means anything on a card
+whose clock drifts during the run.
+"""
+const GEMM_TILING = Ref{Union{Nothing,GemmTiling}}(nothing)
 
 """
     GEMM_STAGED[]
 
-Use the workgroup-staged kernel where the shape allows it. **Off**: it measured
-a wash at 64×64 and a 0.56x loss at 128×128 — see the table above. Switchable
-so the comparison can be re-run in one session on the same shapes, which is the
-only form of it that means anything.
+Use the workgroup-staged kernel where the shape allows it.
 """
-const GEMM_STAGED = Ref(false)
+const GEMM_STAGED = Ref(true)
 
-"""Whether the staged kernel covers this shape: it masks nothing, so every
-block extent has to divide exactly. SAM 2's four dominant `addmm` shapes all
-do; anything else falls back to the register-blocked kernel."""
-@inline function staged_gemm_applicable(M::Int, N::Int, K::Int, nbatch::Int, splitk::Int)
-    GEMM_STAGED[] && nbatch == 1 || return false
+"""
+    gemm_tiling(M, N, K) -> GemmTiling | nothing
+
+The fastest tiling whose block divides `M x N x K`, or `nothing` if none does.
+
+The kernel masks nothing — a cooperative-matrix load is one instruction with no
+bounds check to hang a predicate on — so a block that does not divide exactly is
+not a slow case, it is an out-of-range read. Falling through to the
+register-blocked kernel is the answer for those.
+"""
+@inline gemm_divides(c::GemmTiling, M::Int, N::Int, K::Int) =
+    M % gemm_bm(c) == 0 && N % gemm_bn(c) == 0 && K % gemm_bk(c) == 0
+
+@inline function gemm_tiling(M::Int, N::Int, K::Int)
+    forced = GEMM_TILING[]
+    # A forced tiling still has to divide the shape. Skipping that check makes a
+    # benchmark quietly lie: a 288-row product forced onto a 64-row block computes
+    # 256 rows, reads past the operands for the rest, and reports a number for
+    # work it did not do — which is exactly what the first run of this comparison
+    # did.
+    forced === nothing || return gemm_divides(forced, M, N, K) ? forced : nothing
+    for c in GEMM_TILINGS
+        gemm_divides(c, M, N, K) && return c
+    end
+    return nothing
+end
+
+"""Which tiling this call may use, or `nothing` for the register-blocked kernel."""
+@inline function staged_gemm_tiling(M::Int, N::Int, K::Int, nbatch::Int, splitk::Int)
+    GEMM_STAGED[] && nbatch == 1 || return nothing
     # **The staged kernel does not split K** — it walks the whole of it and writes
     # one plane. If the caller's plan says otherwise it has allocated `splitk`
     # partial planes and will sum them, so the other planes' stale scratch lands
     # in the result. Latent while `GEMM_STAGED` was off, and invisible on the
     # shapes it was measured on because they all choose `splitk == 1`; at
     # 64x64x64 the plan picks 4 and the answer comes back 0.83 relative error.
-    splitk == 1 || return false
-    bm = gemm_bm(GEMM_SUBTILES[])
-    return M % bm == 0 && N % bm == 0 && K % GEMM_BK == 0
+    splitk == 1 || return nothing
+    c = gemm_tiling(M, N, K)
+    c === nothing && return nothing
+    return haskey(GEMM_STAGED_KERNELS, c) ? c : nothing
 end
 
 """Does this device implement the tile `mul!` wants?"""
@@ -279,15 +377,26 @@ for BLK in (1, 2, 4)
     end
 end
 
-# One workgroup computes a `2*GEMM_TILE*ST` square block of C, staging A and B
-# through workgroup memory.
+# One workgroup computes a `BM x BN` block of C, staging A and B through
+# workgroup memory: fill shared, barrier, multiply out of shared, barrier.
 #
-# The loop is the reference's: fill shared, barrier, multiply out of shared,
-# barrier. Each of the four subgroups owns a quadrant, which is an `ST x ST` block
-# of cooperative-matrix tiles, and the two `GEMM_BK ÷ GEMM_TILE` k-tiles inside a
-# stage are unrolled — so one staged block feeds `ST*ST*2` `muladd`s per subgroup
-# off `ST` A-loads and `ST` B-loads from shared, where the global-loading kernel
-# pays for those loads out of L2 every time.
+# **The innermost loop is the reference's, and its shape is the point.**
+# `mul_mm.comp` walks (k-tile, tile row, tile column) with a single `cache_a` and
+# a single `cache_b`, reloading B from shared for every `coopMatMulAdd`:
+#
+#     for (i = 0; i < BK; i += TK)
+#       for (cm_row ...)  { coopMatLoad(cache_a, ...);
+#         for (cm_col ...) { coopMatLoad(cache_b, ...);
+#                            sums[..] = coopMatMulAdd(cache_a, cache_b, sums[..]); } }
+#
+# That reads as redundant work and is the opposite: a 16×16 fp16 fragment is four
+# registers per lane, so hoisting `STM` A-fragments and `STN` B-fragments out of
+# the loop — which is what the first port did, across a 2-way k-unroll on top —
+# costs 64 registers at 4×4 against an accumulator block that already wants 128.
+# The driver then spills the accumulators into workgroup memory (31 KB of it,
+# reported by `VK_KHR_pipeline_executable_properties`) and the kernel runs at a
+# quarter speed. Shared memory is fast; reloading from it is the cheap side of
+# that trade, and it is why the reference can afford a 4×4 warp tile at all.
 #
 # Both staging loops are written so that consecutive lanes read consecutive
 # *global* addresses — `i` fastest for A, `k` fastest for B — because that is the
@@ -319,90 +428,236 @@ end
 # ordering is the conflict count, not noise.
 #
 # The reference does not hit this because it widens the *shared array* at the
-# same time — `FLOAT_TYPEV2 buf_a[]`, with `SHMEM_STRIDE` counted in `vec2`. To
-# port that here needs a wide store into `Workgroup` memory, which `@localmem`
-# does not expose, and a cooperative-matrix load that reads a `vec2`-typed shared
-# array (our `loadw` intrinsic is typed by the matrix's `Float16`). That is the
-# real next step; half of it is worse than none.
+# same time — `FLOAT_TYPEV2 buf_a[]`, with `SHMEM_STRIDE` counted in `vec2`.
+#
+# **That capability now exists**; this kernel simply does not use it yet. Two
+# pieces were missing and both are in, with a device test in
+# `test_coopmat_shared.jl`:
+#
+#   * `@localmem NTuple{2,VecElement{Float16}}` — `Op.OpCompositeInsert` was used
+#     by the emitter and never declared, so building a vector value element by
+#     element died with `UndefVarError` rather than compiling;
+#   * `loadw2`, a cooperative-matrix load whose access chain addresses the vector
+#     rather than the scalar component. `OpCooperativeMatrixLoadKHR` permits a
+#     vector pointee whose component type matches the matrix and counts `Stride`
+#     in those vectors.
+#
+# What remains is the integration, and it is mechanical: declare `sA`/`sB` as
+# vec2 arrays, halve `LDA`/`LDB` and the coopmat strides, and have each lane
+# store one packed pair instead of two halves — `AREPS`/`BREPS` halve with it.
+# A is packed along `m` and B along `k`, which is the contiguous axis on each, so
+# both stay coalesced on the global side and neither needs a transpose. The
+# `test_gemm_staged.jl` K-sweep is what should catch it if the index maths slips.
 
-const GEMM_STAGED_KERNELS = Dict{Int,Any}()
+const GEMM_STAGED_KERNELS = Dict{GemmTiling,Any}()
 
-for ST in (2, 4)
-    kname = Symbol("coopmat_gemm_staged_kernel_", ST, "!")
-    BM = GEMM_TILE * ST * 2
-    LDA = BM + GEMM_PAD
-    LDB = GEMM_BK + GEMM_PAD
-    AREPS = (BM * GEMM_BK) ÷ GEMM_STAGED_WG
-    BREPS = (GEMM_BK * BM) ÷ GEMM_STAGED_WG
+"""
+`vec2`-typed staging buffers, the shape `mul_mm.comp` uses.
+
+Every shared access becomes 32 bits instead of 16: the staging store writes one
+packed pair per lane, and the cooperative-matrix load addresses the vector with
+its stride counted in vectors. A packs along `m` and B along `k` — the contiguous
+axis on each — so both stay coalesced globally and neither needs a transpose.
+
+**On, and worth 1.09x.** Measured interleaved over SAM 2's six `addmm` shapes,
+weighted by their share of the encoder's GEMM arithmetic:
+
+    register-blocked   21.0 TFLOP/s
+    scalar staging     32.3
+    vec2 staging       35.3      <- 1.09x over scalar, 1.68x over register-blocked
+
+which is **79% of cuBLAS's 44.6**, from 70%. The gain is largest exactly where
+staging is largest relative to arithmetic: the 288-row shape, which needs the
+32 x 128 tiling, goes 18.7 -> 28.3, a 1.51x.
+
+A `Ref` because the only measurement worth having is the scalar and vec2 kernels
+interleaved in one session on one set of buffers. Both are generated; this picks
+which runs. A tiling with no vec2 twin falls back to its scalar kernel.
+"""
+const GEMM_VEC2 = Ref(true)
+
+"""`vec2`-staged twins of `GEMM_STAGED_KERNELS`, keyed the same way."""
+const GEMM_STAGED_V2_KERNELS = Dict{GemmTiling,Any}()
+
+"A 2-wide fp16 vector, i.e. `f16vec2`; see `Lava.coopmat_vec2`."
+const GemmV2 = NTuple{2,VecElement{Float16}}
+
+for (ci, cfg) in enumerate(GEMM_TILINGS)
+    STM, STN, WM, WN, BK, PAD = cfg
+    BM, BN = GEMM_TILE * STM * WM, GEMM_TILE * STN * WN
+    WG = WM * WN * COOPMAT_SUBGROUP
+    LDA, LDB = BM + PAD, BK + PAD
+    NKT = BK ÷ GEMM_TILE
+    (BM * BK) % WG == 0 && (BK * BN) % WG == 0 ||
+        error("gemm tiling $cfg: staging does not divide the workgroup")
+    # There is deliberately no "BM must divide WG" constraint here. There was one,
+    # because every geometry whose `BM` divided the workgroup was exact and four
+    # that did not lost staged data — but that was the symptom, not the cause. The
+    # dividing geometries were the ones whose `idx % BM` / `idx ÷ BM` folded to a
+    # mask and a shift; the rest emitted `OpUDiv`, and that is what loses stores.
+    # `splitidx` removes the division, so any `BM` is safe again. See its
+    # docstring and `test_shared_index_division.jl`.
+    AREPS, BREPS = (BM * BK) ÷ WG, (BK * BN) ÷ WG
+    kname = Symbol("coopmat_gemm_staged_kernel_", ci, "!")
     @eval begin
-        @kernel cpu=false function $kname(C, @Const(A), @Const(B), bias,
+        # `unsafe_indices=true` drops KA's `__validindex` guard. It is dead here —
+        # `coopmat_gemm!` launches an exact multiple of the workgroup size, and the
+        # kernel derives every index from the group and local ids rather than from
+        # a global one — and it is not free: with the k-loop written as a counted
+        # `for`, the structurizer failed to flatten the guard and left the
+        # `muladd` under an `OpSelectionMerge`, which cost **3x** (8.8 against 26.1
+        # TFLOP/s weighted). The guard is why the two loop forms structurize
+        # differently at all.
+        @kernel cpu=false unsafe_indices=true function $kname(
+                                          C, @Const(A), @Const(B), bias,
                                           ::Val{M}, ::Val{N}, ::Val{K}) where {M,N,K}
-            sA = @localmem Float16 ($LDA * GEMM_BK,)
-            sB = @localmem Float16 ($LDB * $BM,)
+            sA = @localmem Float16 ($LDA * $BK,)
+            sB = @localmem Float16 ($LDB * $BN,)
 
             tid = @index(Local, Linear) - 1
             blk = @index(Group, Linear) - 1
             nblk_m = M ÷ $BM
             tm = (blk % nblk_m) * $BM
-            tn = (blk ÷ nblk_m) * $BM
+            tn = (blk ÷ nblk_m) * $BN
 
             s = tid ÷ 32                # subgroup within the workgroup
-            sm = (s % 2) * $ST          # its first tile row, in tiles
-            sn = (s ÷ 2) * $ST          # its first tile column, in tiles
+            sm = (s % $WM) * $STM       # its first tile row, in tiles
+            sn = (s ÷ $WM) * $STN       # its first tile column, in tiles
 
             bp = bias === nothing ? bias : pointer(bias)
-            Base.Cartesian.@nexprs $ST nt -> Base.Cartesian.@nexprs $ST mt ->
+            Base.Cartesian.@nexprs $STN nt -> Base.Cartesian.@nexprs $STM mt ->
                 c_mt_nt = accinit(bias, bp, 1 + tm + (sm + mt - 1) * GEMM_TILE)
 
-            k0 = 0
-            while k0 < K
+            # A counted `for` rather than `while k0 < K`. This looked for a while
+            # like it mattered for correctness — it does not, and the note in
+            # `test_shared_index_division.jl` records the measurement that showed
+            # both forms lose stores and both are exact once `splitidx` removes
+            # the division. Kept because the trip count is known here anyway.
+            for kb in 0:(K ÷ $BK - 1)
+                k0 = kb * $BK
                 # One element per lane per step, and it stays that way — see the
-                # note on `vload2` above. Widening the global load without
-                # widening the shared array loses: at 2 elements a lane issues
-                # two scalar shared stores whose addresses stride by 2 across the
-                # warp, which is a 2-way bank conflict, where this stride-1 form
-                # has none. Measured against the register-blocked kernel:
-                # scalar 1.04-1.09x, 2-wide 0.80-0.92x, 4-wide 0.69-0.81x.
+                # note on wide staging loads above.
                 #
                 # A block: rows [tm, tm+BM) × cols [k0, k0+BK), column-major both sides.
                 @inbounds for r in 0:($AREPS - 1)
-                    idx = tid + r * GEMM_STAGED_WG
-                    i = idx % $BM
-                    kk = idx ÷ $BM
+                    idx = tid + r * $WG
+                    i, kk = splitidx(idx, Val($BM))
                     sA[1 + i + kk * $LDA] = A[1 + (tm + i) + (k0 + kk) * M]
                 end
                 # B block: rows [k0, k0+BK) × cols [tn, tn+BN).
                 @inbounds for r in 0:($BREPS - 1)
-                    idx = tid + r * GEMM_STAGED_WG
-                    kk = idx % GEMM_BK
-                    j = idx ÷ GEMM_BK
+                    idx = tid + r * $WG
+                    kk, j = splitidx(idx, Val($BK))
                     sB[1 + kk + j * $LDB] = B[1 + (k0 + kk) + (tn + j) * K]
                 end
                 @synchronize
 
-                Base.Cartesian.@nexprs 2 u -> begin
-                    kt_u = (u - 1) * GEMM_TILE
-                    Base.Cartesian.@nexprs $ST mt -> a_mt_u =
-                        AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixA}(
-                            sA, 1 + (sm + mt - 1) * GEMM_TILE + kt_u * $LDA, $LDA)
-                    Base.Cartesian.@nexprs $ST nt -> b_nt_u =
-                        AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixB}(
-                            sB, 1 + kt_u + (sn + nt - 1) * GEMM_TILE * $LDB, $LDB)
-                    Base.Cartesian.@nexprs $ST nt -> Base.Cartesian.@nexprs $ST mt ->
-                        c_mt_nt = muladd(a_mt_u, b_nt_u, c_mt_nt)
+                # One A fragment and one B fragment live, both reassigned — the
+                # reference's ordering. See the note above on why reloading beats
+                # hoisting here.
+                Base.Cartesian.@nexprs $NKT u -> begin
+                    kt = (u - 1) * GEMM_TILE
+                    Base.Cartesian.@nexprs $STM mt -> begin
+                        a = AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixA}(
+                                sA, 1 + (sm + mt - 1) * GEMM_TILE + kt * $LDA, $LDA)
+                        Base.Cartesian.@nexprs $STN nt -> begin
+                            b = AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixB}(
+                                    sB, 1 + kt + (sn + nt - 1) * GEMM_TILE * $LDB, $LDB)
+                            c_mt_nt = muladd(a, b, c_mt_nt)
+                        end
+                    end
                 end
                 @synchronize   # nothing may refill shared until every subgroup is done
-
-                k0 += GEMM_BK
             end
 
-            Base.Cartesian.@nexprs $ST nt -> Base.Cartesian.@nexprs $ST mt ->
+            Base.Cartesian.@nexprs $STN nt -> Base.Cartesian.@nexprs $STM mt ->
                 accstore!(C,
                           1 + (tm + (sm + mt - 1) * GEMM_TILE) +
                               (tn + (sn + nt - 1) * GEMM_TILE) * M,
                           M, c_mt_nt)
         end
-        GEMM_STAGED_KERNELS[$ST] = $kname
+        GEMM_STAGED_KERNELS[$cfg] = $kname
+    end
+
+    # ── the same kernel with `vec2` staging buffers ──────────────────────────
+    #
+    # Identical arithmetic; only the staging width changes. Each lane stores one
+    # packed pair rather than two halves, so the trip counts halve, and the
+    # cooperative-matrix loads address the vector with their stride counted in
+    # vectors — `LDA2`/`LDB2` and the tile offsets are all the scalar values
+    # divided by two, which is exact because every one of them is even by
+    # construction (`GEMM_TILE` is 16, `BK` and `PAD` are even).
+    if iseven(BM) && iseven(BK) && iseven(LDA) && iseven(LDB) &&
+       ((BM * BK) ÷ 2) % WG == 0 && ((BK * BN) ÷ 2) % WG == 0
+        LDA2, LDB2 = LDA ÷ 2, LDB ÷ 2
+        AREPS2, BREPS2 = (BM * BK) ÷ 2 ÷ WG, (BK * BN) ÷ 2 ÷ WG
+        BM2, BK2 = BM ÷ 2, BK ÷ 2
+        kv2 = Symbol("coopmat_gemm_staged_kernel_", ci, "_v2!")
+        @eval begin
+            @kernel cpu=false unsafe_indices=true function $kv2(
+                                              C, @Const(A), @Const(B), bias,
+                                              ::Val{M}, ::Val{N}, ::Val{K}) where {M,N,K}
+                sA = @localmem GemmV2 ($LDA2 * $BK,)
+                sB = @localmem GemmV2 ($LDB2 * $BN,)
+
+                tid = @index(Local, Linear) - 1
+                blk = @index(Group, Linear) - 1
+                nblk_m = M ÷ $BM
+                tm = (blk % nblk_m) * $BM
+                tn = (blk ÷ nblk_m) * $BN
+
+                s = tid ÷ 32
+                sm = (s % $WM) * $STM
+                sn = (s ÷ $WM) * $STN
+
+                bp = bias === nothing ? bias : pointer(bias)
+                Base.Cartesian.@nexprs $STN nt -> Base.Cartesian.@nexprs $STM mt ->
+                    c_mt_nt = accinit(bias, bp, 1 + tm + (sm + mt - 1) * GEMM_TILE)
+
+                for kb in 0:(K ÷ $BK - 1)
+                    k0 = kb * $BK
+                    # A: pairs along `m`, the contiguous axis, so consecutive
+                    # lanes still read consecutive global addresses.
+                    @inbounds for r in 0:($AREPS2 - 1)
+                        idx = tid + r * $WG
+                        p, kk = splitidx(idx, Val($BM2))
+                        g = 1 + (tm + 2p) + (k0 + kk) * M
+                        sA[1 + p + kk * $LDA2] = (VecElement(A[g]), VecElement(A[g + 1]))
+                    end
+                    # B: pairs along `k`, contiguous here for the same reason.
+                    @inbounds for r in 0:($BREPS2 - 1)
+                        idx = tid + r * $WG
+                        q, j = splitidx(idx, Val($BK2))
+                        g = 1 + (k0 + 2q) + (tn + j) * K
+                        sB[1 + q + j * $LDB2] = (VecElement(B[g]), VecElement(B[g + 1]))
+                    end
+                    @synchronize
+
+                    Base.Cartesian.@nexprs $NKT u -> begin
+                        kt = (u - 1) * GEMM_TILE
+                        Base.Cartesian.@nexprs $STM mt -> begin
+                            a = AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixA}(
+                                    sA, 1 + (sm + mt - 1) * ($(GEMM_TILE ÷ 2)) +
+                                        kt * $LDA2, $LDA2)
+                            Base.Cartesian.@nexprs $STN nt -> begin
+                                b = AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixB}(
+                                        sB, 1 + (kt ÷ 2) +
+                                            (sn + nt - 1) * GEMM_TILE * $LDB2, $LDB2)
+                                c_mt_nt = muladd(a, b, c_mt_nt)
+                            end
+                        end
+                    end
+                    @synchronize
+                end
+
+                Base.Cartesian.@nexprs $STN nt -> Base.Cartesian.@nexprs $STM mt ->
+                    accstore!(C,
+                              1 + (tm + (sm + mt - 1) * GEMM_TILE) +
+                                  (tn + (sn + nt - 1) * GEMM_TILE) * M,
+                              M, c_mt_nt)
+            end
+            GEMM_STAGED_V2_KERNELS[$cfg] = $kv2
+        end
     end
 end
 
@@ -653,12 +908,14 @@ function coopmat_gemm!(C, A, B, M::Int, N::Int, K::Int;
     # shapes it divides exactly and only where the plan wants a single plane —
     # which includes all four of SAM 2's dominant `addmm` shapes, i.e. 72.7% of
     # the encoder's arithmetic.
-    if staged_gemm_applicable(M, N, K, nbatch, splitk)
-        st = GEMM_SUBTILES[]
-        bm = gemm_bm(st)
-        GEMM_STAGED_KERNELS[st](backend, GEMM_STAGED_WG)(
+    c = staged_gemm_tiling(M, N, K, nbatch, splitk)
+    if c !== nothing
+        wg = gemm_wg(c)
+        kern = GEMM_VEC2[] ? get(GEMM_STAGED_V2_KERNELS, c, GEMM_STAGED_KERNELS[c]) :
+                             GEMM_STAGED_KERNELS[c]
+        kern(backend, wg)(
             C, A, B, bias, Val(M), Val(N), Val(K);
-            ndrange = (M ÷ bm) * (N ÷ bm) * GEMM_STAGED_WG)
+            ndrange = (M ÷ gemm_bm(c)) * (N ÷ gemm_bn(c)) * wg)
         return C
     end
     span = GEMM_TILE * blk
