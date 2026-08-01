@@ -1174,6 +1174,26 @@ should say the same thing whether `tile` is shared or global.
                                    stride::Integer) where {T,M,N,U} =
     coopmat_load(AcceleratedMatrix{T,M,N,U}, src.ptr, offset, stride)
 
+"""
+    AcceleratedMatrix{T,M,N,U}(shared, offset, stride, Val(true))   # row-major
+
+The `MemoryLayout` operand for a shared-memory load.
+
+The global-pointer form has taken this since the staged GEMM needed A `RowMajor`
+and B `ColumnMajor` out of one block, but the `@localmem` form did not, so a
+kernel wanting a row-major operand out of shared memory got a method lookup
+failure — which surfaces as `jl_f_throw_methoderror` in the middle of otherwise
+valid GPU code rather than as a missing method at the call site.
+
+Attention needs it in both directions. With `q`, `k`, `v` laid out `(E, L, H, B)`
+the score product reads Q row-major and Kᵀ column-major from the same staging
+stride, and the value product reads P and V both row-major — no transpose
+anywhere, which is only available if the layout is a parameter here too.
+"""
+@inline AcceleratedMatrix{T,M,N,U}(src::LavaSharedArray, offset::Integer,
+                                   stride::Integer, rowmajor::Val) where {T,M,N,U} =
+    coopmat_load(AcceleratedMatrix{T,M,N,U}, src.ptr, offset, stride, rowmajor)
+
 """Store a cooperative matrix into `@localmem`; see the load above."""
 @inline Base.copyto!(dst::LavaSharedArray, offset::Integer, stride::Integer,
                      m::AcceleratedMatrix) =
