@@ -175,6 +175,12 @@ end
         include(joinpath(@__DIR__, "test_static_workgroup.jl"))
     end
 
+    # The buffer-lifetime case behind the intermittent flush hang. Asserted on
+    # the state machine, not by provoking the hang — see the file.
+    @testset "free during recording" begin
+        include(joinpath(@__DIR__, "test_free_during_recording.jl"))
+    end
+
     # ── Previously unregistered test files ──
     #
     # These existed in test/ but were never included here. That is not neutral:
