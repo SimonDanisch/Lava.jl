@@ -853,17 +853,14 @@ function destroy_buffer!(buf::VkManagedBuffer)
         buf.size = 0
         return
     end
-    if buf.mapped_ptr != Ptr{UInt8}(0)
-        try
-            Vulkan.unmap_memory(ctx.device, buf.memory)
-        catch
-            # unmap may fail if the driver released the memory first — log it
-            # loudly (finalizer-safe via jl_safe_printf) so we can notice driver
-            # misbehaviour, but don't propagate (finalizers must not throw).
-            safe_fin_log("Lava destroy_buffer!: unmap_memory failed\n")
-        end
-        buf.mapped_ptr = Ptr{UInt8}(0)
-    end
+    # PORTABILITY EXPERIMENT (not a proposed fix yet): skip the explicit unmap.
+    #
+    # vkFreeMemory implicitly unmaps, so this call is redundant before
+    # memory.destructor() below. It is also the observed crash site on RADV, and
+    # the try/catch above it could never have helped: an invalid unmap
+    # (VUID-vkUnmapMemory-memory-00689 requires the memory be currently mapped)
+    # is undefined behaviour, and a SIGSEGV is not a catchable Julia exception.
+    buf.mapped_ptr = Ptr{UInt8}(0)
     try
         buf.buffer.destructor()
         buf.memory.destructor()
