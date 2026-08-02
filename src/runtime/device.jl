@@ -405,6 +405,28 @@ mutable struct VkContext
     # Persistent VkPipelineCache. Seeded from disk on init, passed to every
     # vkCreate*Pipelines call, snapshotted back on vk_reset_device! + atexit.
     pipeline_cache::Vulkan.PipelineCache
+    # A stable identity for this device, for as long as it exists.
+    #
+    # Four caches hold device-owned Vulkan handles at module scope and were keyed
+    # without the device, so two devices running the same kernel produced the
+    # SAME key and the second got the first's `VkPipeline` — bound into a command
+    # buffer on a different `VkDevice`, which is undefined behaviour
+    # (`GUARDRAILS.md` §8). This is the missing part of every one of those keys.
+    #
+    # A counter rather than `objectid(ctx)`: object ids are reused after the
+    # collector reclaims, and a *reused* id is exactly the failure this exists to
+    # prevent — a fresh device silently inheriting a dead one's pipelines. It
+    # also survives `vk_reset_device!`, which builds a new context, so entries
+    # from before a reset can never be handed to after it.
+    #
+    # Note what this is NOT. `GUARDRAILS.md` §8 says device state goes ON
+    # `VkContext`, and that is still the better shape. It is not what landed,
+    # because the cached VALUE types (`LavaComputePipeline`, `LaunchPlan`,
+    # `CompiledGraphicsPipeline`) live in files included after this one, so a
+    # field here would have to be `Any` — which costs inference on the hottest
+    # path in the library, a cache lookup per dispatch. Keying is the same
+    # correctness with the types kept.
+    id::UInt64
 
     # Inner constructor: two-phase init via `new()` so we can hand a live
     # `ctx` reference to `BatchQueue(...)` while finishing the ctx's own
@@ -483,6 +505,7 @@ mutable struct VkContext
         # Seed a persistent VkPipelineCache from disk (if any). The header is
         # validated against this physical device before the driver sees it —
         # `vkCreatePipelineCache` is not a safe place to discover a mismatch.
+        ctx.id = (VK_CONTEXT_COUNTER[] += 1)
         ctx.pipeline_cache = create_lava_pipeline_cache(
             device, lava_pipeline_cache_path(device_name, driver_version), physical_device)
         _register_pipeline_cache_atexit!()
@@ -585,6 +608,12 @@ mark_device_lost!(ctx::VkContext) = (ctx.device_lost = true; nothing)
 
 # Callbacks for vk_reset_device! — registered by later-included files (pipeline.jl,
 # command.jl, launch.jl, memory.jl) to clear their module-level caches.
+"""
+Hands out `VkContext.id`. Monotonic and never reused, so a device destroyed and
+recreated cannot inherit cache entries keyed to its predecessor.
+"""
+const VK_CONTEXT_COUNTER = Ref{UInt64}(0)
+
 const RESET_CALLBACKS = Function[]
 
 """

@@ -54,35 +54,15 @@ pinned on purpose (the caller wants those exact queues, e.g. an async
 upload queue).
 """
 struct LavaBackend <: KA.GPU
-    # The device this backend runs on, or `nothing` for "whichever is current".
-    #
-    # `LavaBackend(ctx)` used to keep `ctx.default_bq` and DISCARD `ctx`, and a
-    # `BatchQueue` holds a `Vulkan.Device`, not the `VkContext` that owns it — so
-    # there was no path at all from a backend to its context. Everything above
-    # Lava that wants a per-device answer (`DNNKernels.Device`, and the four
-    # module-scope caches this branch is about to key by device) needs exactly
-    # that path, and both project briefs asserted it already existed.
-    #
-    # A buffer has always known: `KA.get_backend(::LavaArray)` below reads
-    # `a.buf[].ctx`. It was only the backend that forgot.
-    #
-    # `nothing` still means "resolve through `vk_context()` at each access", for
-    # the same reason the queues do — see the docstring above. This field does
-    # not change that default, it makes the PINNED case expressible.
-    ctx::Union{VkContext, Nothing}
     # nothing = "use vk_context().default_bq at each access" (survives resets)
     # non-nothing = caller pinned this specific queue
     dispatch_bq::Union{BatchQueue, Nothing}
     upload_bq::Union{BatchQueue, Nothing}
 end
 
-# The queue-only forms keep working and stay context-agnostic: a caller pinning
-# an upload queue is not thereby pinning a device.
-LavaBackend(d::Union{BatchQueue,Nothing}, u::Union{BatchQueue,Nothing}) =
-    LavaBackend(nothing, d, u)
-LavaBackend() = LavaBackend(nothing, nothing, nothing)
-LavaBackend(ctx::VkContext) = (let bq = ctx.default_bq; LavaBackend(ctx, bq, bq); end)
-LavaBackend(bq::BatchQueue) = LavaBackend(nothing, bq, bq)
+LavaBackend() = LavaBackend(nothing, nothing)
+LavaBackend(ctx::VkContext) = (let bq = ctx.default_bq; LavaBackend(bq, bq); end)
+LavaBackend(bq::BatchQueue) = LavaBackend(bq, bq)
 
 """
     vk_context(backend) -> VkContext
@@ -90,15 +70,24 @@ LavaBackend(bq::BatchQueue) = LavaBackend(nothing, bq, bq)
 
 The device a backend or an array belongs to.
 
-This is the accessor the rest of the stack should reach for instead of calling
+The accessor the rest of the stack should reach for instead of calling
 `vk_context()` and hoping. `vk_context()` stays as the convenience default for
 the single-device case; what has to stop is code *depending* on it, because a
 global cannot answer "which device" once there are two.
 
-For an unpinned backend the answer is still the current context — so this
-changes nothing today, and is the one place that has to be correct tomorrow.
+**No new state.** Both are derived from what these objects already carried:
+`BatchQueue.ctx` for a backend and `Buffer.ctx` for an array. That is worth
+saying because it was briefly got wrong in the other direction — a `ctx` field
+was added to `LavaBackend` on the belief that no path existed, which came from
+reading the first half of `BatchQueue`'s field list, where `ctx::Any` sits
+sixty-odd lines down. A second copy of a fact the queue already holds can only
+ever disagree with it, so this derives instead.
+
+`b.dispatch_bq` resolves through `vk_context()` when the backend is unpinned, so
+an unpinned backend answers "whichever device is current" — which is the correct
+answer for it, and the reason the queue-only constructors need nothing extra.
 """
-vk_context(b::LavaBackend) = b.ctx
+vk_context(b::LavaBackend) = (b.dispatch_bq.ctx)::VkContext
 vk_context(a::LavaArray) = (a.buf[].ctx)::VkContext
 
 # Property access resolves a `nothing`-pinned queue through the live
@@ -106,10 +95,7 @@ vk_context(a::LavaArray) = (a.buf[].ctx)::VkContext
 # working across `vk_reset_device!()`. `:bq` stays a back-compat alias for
 # `:dispatch_bq`.
 function Base.getproperty(b::LavaBackend, s::Symbol)
-    if s === :ctx
-        f = getfield(b, :ctx)
-        return f === nothing ? vk_context() : f
-    elseif s === :dispatch_bq
+    if s === :dispatch_bq
         f = getfield(b, :dispatch_bq)
         return f === nothing ? vk_context().default_bq : f
     elseif s === :upload_bq
@@ -726,14 +712,22 @@ struct LaunchPlan
     ray_query::Bool
 end
 
-const LAUNCH_PLAN_CACHE = IdDict{DataType,Vector{LaunchPlan}}()
+# Per device: a `LaunchPlan` holds a `VkPipeline` (GUARDRAILS §8). Same shape as
+# `LINKED_KERNEL_CACHE` — an outer dict keyed by `ctx.id`, so the inner one keeps
+# the `DataType` key that makes the lookup a pointer compare.
+const LAUNCH_PLAN_CACHE = Dict{UInt64, IdDict{DataType,Vector{LaunchPlan}}}()
 push!(RESET_CALLBACKS, () -> empty!(LAUNCH_PLAN_CACHE))
+
+@inline launch_plan_cache(ctx) =
+    get!(() -> IdDict{DataType,Vector{LaunchPlan}}(), LAUNCH_PLAN_CACHE, ctx.id)
 
 @inline function launch_plan(bq::BatchQueue, @nospecialize(f), all_args::Tuple,
                              wg::NTuple{3,Int}, ray_query::Bool)
     key = typeof(all_args)
     world = Base.get_world_counter()
-    v = get(LAUNCH_PLAN_CACHE, key, nothing)
+    # `bq.ctx` — the queue has always carried its context; see `vk_context`.
+    cache = launch_plan_cache(bq.ctx)
+    v = get(cache, key, nothing)
     if v !== nothing
         for p in v
             (p.world === world && p.wg === wg && p.ray_query === ray_query) && return p
@@ -754,7 +748,7 @@ end
     p = LaunchPlan(compiled, pipeline, offsets, byval_sizes, base,
                    base + compute_inline_extra_from_byval(byval_sizes),
                    world, wg, ray_query)
-    v = get!(() -> LaunchPlan[], LAUNCH_PLAN_CACHE, key)
+    v = get!(() -> LaunchPlan[], launch_plan_cache(bq.ctx), key)
     filter!(q -> q.world === world, v)   # entries from a superseded world are dead
     push!(v, p)
     p

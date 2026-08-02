@@ -1,23 +1,23 @@
 """
-A backend knows which device it runs on.
+A backend knows which device it runs on, and it always did.
 
-This is the one field the multi-device work rests on, and it did not exist. Both
-project briefs asserted it did — "`LavaBackend(ctx)` pins a context, `BatchQueue`
-carries `ctx`" — and neither was true: `LavaBackend(ctx)` kept `ctx.default_bq`
-and **discarded `ctx`**, while a `BatchQueue` holds a `Vulkan.Device`, not the
-`VkContext` that owns it. So nothing above Lava could ask a backend which device
-it meant, and the four module-scope caches that hold device-owned handles
-(`PIPELINE_CACHE`, `LINKED_KERNEL_CACHE`, `LAUNCH_PLAN_CACHE`,
-`GFX_PIPELINE_CACHE`) had no key to be keyed by.
+`vk_context(backend)` and `vk_context(array)` name a path that already existed:
+`BatchQueue.ctx` and `Buffer.ctx`. The value here is the name, not new state —
+the four module-scope caches that hold device-owned handles (`PIPELINE_CACHE`,
+`LINKED_KERNEL_CACHE`, `LAUNCH_PLAN_CACHE`, `GFX_PIPELINE_CACHE`) need a device
+to key by, and every call site reaching for `b.dispatch_bq.ctx` by hand is a
+place that can quietly reach for `vk_context()` instead.
 
-The asymmetry worth remembering: a **buffer** always knew. `KA.get_backend` has
-been reading `a.buf[].ctx` all along. It was only the backend that forgot, which
-is why this looked like a design problem and was a one-field omission.
+**A correction is recorded here rather than in a commit message, because the
+wrong version briefly shipped.** A `ctx` field was added to `LavaBackend` on the
+belief that no path existed — read out of the first half of `BatchQueue`'s field
+list, where `ctx::Any` sits sixty-odd lines down past the command-buffer pools.
+Both project briefs said the carrier existed and both were right. The field was
+removed: a second copy of a fact the queue already holds can only disagree with
+it, and the disagreement would be silent.
 
-Nothing here needs a second GPU. What it pins is that the *distinction* between
-"this device" and "whichever device is current" is expressible and survives a
-round trip — which is the part a second device would rely on, and the part that
-cannot be added later without touching every call site.
+Nothing here needs a second GPU. What it pins is that a backend, however
+constructed, resolves to the device it will actually dispatch on.
 """
 
 using Test, Lava, KernelAbstractions
@@ -26,23 +26,18 @@ const KA = KernelAbstractions
 @testset "a backend knows its device" begin
     ctx = Lava.vk_context()
 
+    # ── Every construction form resolves to the device it dispatches on.
+    @test Lava.vk_context(LavaBackend(ctx))                          === ctx
+    @test Lava.vk_context(LavaBackend(ctx.default_bq))               === ctx
+    @test Lava.vk_context(LavaBackend(ctx.default_bq, ctx.default_bq)) === ctx
+
+    # ── Including the unpinned one, which stores no queue at all and resolves
+    #    through `vk_context()` at access — the property that lets a
+    #    module-level `const BACKEND = LavaBackend()` survive `vk_reset_device!`.
     unpinned = LavaBackend()
     pinned   = LavaBackend(ctx)
-
-    # ── Pinned means pinned: the context handed in is the one kept.
-    @test getfield(pinned, :ctx) !== nothing
-    @test Lava.vk_context(pinned) === ctx
-
-    # ── Unpinned means "whichever is current", and stores nothing, so a
-    #    module-level `const BACKEND = LavaBackend()` still survives
-    #    `vk_reset_device!()` — the reason the queues resolve lazily too.
-    @test getfield(unpinned, :ctx) === nothing
+    @test getfield(unpinned, :dispatch_bq) === nothing
     @test Lava.vk_context(unpinned) === ctx
-
-    # ── A queue-only backend is NOT thereby pinned to a device. Pinning an
-    #    upload queue is a statement about scheduling, not about which GPU.
-    @test getfield(LavaBackend(ctx.default_bq), :ctx) === nothing
-    @test getfield(LavaBackend(ctx.default_bq, ctx.default_bq), :ctx) === nothing
 
     # ── The round trip that makes it useful: an array knows its device, and the
     #    backend derived from it agrees. This is the path a per-device cache key

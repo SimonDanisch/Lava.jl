@@ -26,6 +26,13 @@ const KA = KernelAbstractions
 
 "Relative error of `matmul!` against a Float32 CPU reference, over a slice."
 function gemmerr(backend, ws, M, N, K; staged::Bool, withbias::Bool)
+    # `matmul!` takes a context, not a `(backend, ws)` pair — DNNKernels'
+    # kernel-library refactor moved every entry point onto `Ctx`, which is one
+    # argument where there were two. This test is in the OTHER repo and so was
+    # not caught by that change's own suite; the symptom here was a MethodError
+    # per shape, then a device loss from the repeated failures, which reads like
+    # a Lava bug and is not one.
+    ctx = DNNKernels.Ctx(backend; ws)
     hA = rand(Float16, M, K) .- Float16(0.5)
     hB = rand(Float16, K, N) .- Float16(0.5)
     hbias = Float16.(rand(M) .- 0.5)
@@ -42,7 +49,7 @@ function gemmerr(backend, ws, M, N, K; staged::Bool, withbias::Bool)
     try
         Lava.GEMM_STAGED[] = staged
         DNNKernels.reset!(ws)
-        DNNKernels.matmul!(out, A, B, bias; ws)
+        DNNKernels.matmul!(ctx, out, A, B, bias)
         KA.synchronize(backend)
     finally
         Lava.GEMM_STAGED[] = old

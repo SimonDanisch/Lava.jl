@@ -304,7 +304,15 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
                                pipeline_cache=nothing)
     # `spirv_content_hash`, NOT `hash(spirv_bytes)` — see its docstring. The
     # length goes in too, so a truncation cannot alias a prefix.
-    cache_key = hash((spirv_content_hash(spirv_bytes), length(spirv_bytes),
+    #
+    # `ctx.id` leads, because a `LavaComputePipeline` owns a `VkPipeline`, a
+    # `VkShaderModule`, a pipeline layout and a descriptor-set layout, and every
+    # one of those belongs to the `VkDevice` that made it. Without the device in
+    # the key, two devices compiling the same kernel produce the same key and the
+    # second is handed the first's handles to bind into its own command buffer —
+    # undefined behaviour, and the same class as the `hash(spirv_bytes)` collision
+    # this line already carries a warning about (`GUARDRAILS.md` §8).
+    cache_key = hash((ctx.id, spirv_content_hash(spirv_bytes), length(spirv_bytes),
                       entry_name, push_constant_size, needs_tlas_descriptor))
     cached = get(PIPELINE_CACHE, cache_key, nothing)
     if cached !== nothing

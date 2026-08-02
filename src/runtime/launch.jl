@@ -29,7 +29,21 @@ end
 
 # Cache shape matches `GPUCompiler.cached_compilation`'s expectation:
 # `Dict{Any, LavaLinkedKernel}` with keys like `(objectid(ci), world, cfg)`.
-const LINKED_KERNEL_CACHE = Dict{Any, LavaLinkedKernel}()
+# Per device, because a `LavaLinkedKernel` owns a `VkPipeline` (GUARDRAILS §8).
+#
+# An outer dict rather than a wider key, because the inner one is handed to
+# `GPUCompiler.cached_compilation`, which derives the key from `(source, config)`
+# itself — there is no device to add to it from here. One dict per device is the
+# same guarantee at the level we do control.
+const LINKED_KERNEL_CACHE = Dict{UInt64, Dict{Any, LavaLinkedKernel}}()
+
+"""
+    linked_kernel_cache(ctx) -> Dict
+
+This device's compiled-kernel cache, created on first use.
+"""
+@inline linked_kernel_cache(ctx) =
+    get!(() -> Dict{Any, LavaLinkedKernel}(), LINKED_KERNEL_CACHE, ctx.id)
 
 # Register cleanup callback for vk_reset_device!.  Arg slabs are per-BQ
 # now, so they die with the old ctx automatically; only the global shader
@@ -518,7 +532,7 @@ function get_compiled_kernel_and_pipeline(ctx::VkContext, @nospecialize(f), @nos
     # it. This runs once per kernel; the dispatch is free next to compiling one.
     config = lava_compiler_config(; workgroup_size, enable_ray_query)
     source = GPUCompiler.methodinstance(typeof(f), tt)
-    linked = Base.invokelatest(GPUCompiler.cached_compilation, LINKED_KERNEL_CACHE,
+    linked = Base.invokelatest(GPUCompiler.cached_compilation, linked_kernel_cache(ctx),
                                source, config, lava_kernel_compile, LavaLinker(ctx))::LavaLinkedKernel
     frozen_store(f, tt, workgroup_size, linked.compiled)
 
