@@ -84,8 +84,11 @@ end
 @testset "cooperative-matrix per-element and component-wise ops" begin
     ctx = Lava.vk_context()
     back = LavaBackend()
-    # The subgroup is 32 lanes here; a workgroup smaller than one has undefined
-    # cooperative-matrix behaviour, so the launches below are 32 wide.
+    # A cooperative matrix is subgroup-scoped, and a workgroup smaller than one
+    # subgroup has undefined behaviour — so the launches below are exactly one
+    # subgroup wide. This must be asked, not assumed: it is 32 on Ada and 64 on
+    # RDNA 3.5, and the hardcoded 32 this replaced was half a subgroup there.
+    WGpe = Lava.device_subgroup_size(ctx)
     A = KA.allocate(back, Float32, TILEpe, TILEpe)
     copyto!(A, Float32.(reshape(1:TILEpe^2, TILEpe, TILEpe)))
     a = Array(A)
@@ -96,7 +99,7 @@ end
         else
             for base in Int32.((0, TILEpe))
                 C = KA.zeros(back, Float32, TILEpe, TILEpe)
-                fmul_rowscale!(back, (32,))(C, A, base; ndrange = (32,))
+                fmul_rowscale!(back, (WGpe,))(C, A, base; ndrange = (WGpe,))
                 KA.synchronize(back)
                 add = base == 0 ? 0.0f0 : 100.0f0
                 want = [a[i, j] * (Float32(i) + add) for i in 1:TILEpe, j in 1:TILEpe]
@@ -110,7 +113,7 @@ end
     else
         @testset "the callback sees the element's own row and column" begin
             C = KA.zeros(back, Float32, TILEpe, TILEpe)
-            pe_rowcol!(back, (32,))(C, A; ndrange = (32,))
+            pe_rowcol!(back, (WGpe,))(C, A; ndrange = (WGpe,))
             KA.synchronize(back)
             # SPIR-V row/column are 0-based and map to the Julia array's row and
             # column index minus one.
@@ -121,7 +124,7 @@ end
         @testset "extras reach the callback, and its signature survives" begin
             for base in Int32.((0, TILEpe))
                 C = KA.zeros(back, Float32, TILEpe, TILEpe)
-                pe_extras!(back, (32,))(C, A, base; ndrange = (32,))
+                pe_extras!(back, (WGpe,))(C, A, base; ndrange = (WGpe,))
                 KA.synchronize(back)
                 add = base == 0 ? 0.0f0 : 100.0f0
                 want = [a[i, j] * (Float32(i) + add) for i in 1:TILEpe, j in 1:TILEpe]
@@ -132,8 +135,8 @@ end
         @testset "the two rescales agree exactly" begin
             C1 = KA.zeros(back, Float32, TILEpe, TILEpe)
             C2 = KA.zeros(back, Float32, TILEpe, TILEpe)
-            pe_extras!(back, (32,))(C1, A, Int32(0); ndrange = (32,))
-            fmul_rowscale!(back, (32,))(C2, A, Int32(0); ndrange = (32,))
+            pe_extras!(back, (WGpe,))(C1, A, Int32(0); ndrange = (WGpe,))
+            fmul_rowscale!(back, (WGpe,))(C2, A, Int32(0); ndrange = (WGpe,))
             KA.synchronize(back)
             @test Array(C1) == Array(C2)
         end
