@@ -256,6 +256,15 @@ function replay!(seq::CapturedSequence)
     isempty(seq.cmd_bufs) && return
     device_lost(bq.ctx::VkContext) && throw(LavaError(
         "replay!", "Vulkan device is lost — cannot replay", "Call Lava.vk_reset_device!()"))
+    # Close any batch still being recorded, FIRST. `ensure_active_batch!` hands a
+    # new batch `bq.next_timeline + 1` as its signal value and `submit!` asserts
+    # that reservation still holds — so bumping the shared counter here while a
+    # batch is open makes it stale and the next `submit!` dies with
+    # "batch signal desync: N vs N+1". It costs nothing in the intended usage
+    # (a replay after a drained queue) and it is the only thing that makes
+    # replaying *interleaved* with ordinary recording legal, which is exactly
+    # what a decoder replaying per click inside a live editor does.
+    bq.active_batch !== nothing && bq.active_batch.recording && submit!(bq)
     bq.next_timeline += 1
     v = bq.next_timeline
     prev = get(REPLAY_WATERMARK, bq, UInt64(0))

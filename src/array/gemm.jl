@@ -325,15 +325,43 @@ matmul time on shapes where `splitk == 1` and there is nothing to reduce. For an
 fp32 destination `convert` is the identity and this is what it always was.
 """
 @inline accstore!(C, off, ld, c::AcceleratedMatrix{Float32,GEMM_TILE,GEMM_TILE,Accumulator}) =
-    copyto!(pointer(C), off, ld,
-            convert(AcceleratedMatrix{eltype(C),GEMM_TILE,GEMM_TILE,Accumulator}, c))
+    accstore!(C, off, ld, c, identity)
+
+"""
+Store an accumulator tile, applying `f` to every component on the way out.
+
+`f` is an ordinary unary function passed as a kernel argument — a singleton, so
+it inlines and costs nothing when it is `identity`, and the `F === typeof(identity)`
+test below folds away with it. Keeping the activation on the caller's side is
+what stops a GEMM in the runtime from having to know what a `gelu` is; the
+component access it needs is the general capability, see `coopmat_getcomp`.
+
+**Applied after the conversion, not before.** The accumulator is fp32 and the
+destination is usually fp16, and an activation on the fp32 value is a *different
+function* from the same activation on the rounded one — more accurate, and not
+what an exported graph computed when it rounded between the matmul and the
+activation. Matching the graph is the point; being closer to the real number is
+not.
+"""
+@inline function accstore!(C, off, ld,
+                           c::AcceleratedMatrix{Float32,GEMM_TILE,GEMM_TILE,Accumulator},
+                           f::F) where {F}
+    m = convert(AcceleratedMatrix{eltype(C),GEMM_TILE,GEMM_TILE,Accumulator}, c)
+    if F !== typeof(identity)
+        n = coopmat_length(AcceleratedMatrix{eltype(C),GEMM_TILE,GEMM_TILE,Accumulator})
+        for i in Int32(0):(n - Int32(1))
+            m = coopmat_setcomp(m, i, f(coopmat_getcomp(m, i)))
+        end
+    end
+    copyto!(pointer(C), off, ld, m)
+end
 
 const GEMM_BLOCK_KERNELS = Dict{Int,Any}()
 
 for BLK in (1, 2, 4)
     kname = Symbol("coopmat_gemm_kernel_", BLK, "!")
     @eval begin
-        @kernel cpu=false function $kname(C, @Const(A), @Const(B), bias,
+        @kernel cpu=false function $kname(C, @Const(A), @Const(B), bias, epi,
                                 ::Val{M}, ::Val{N}, ::Val{K},
                                 ::Val{KPER}) where {M,N,K,KPER}
             lane = @index(Global, Linear) - 1
@@ -408,7 +436,7 @@ for BLK in (1, 2, 4)
             Base.Cartesian.@nexprs $BLK j -> Base.Cartesian.@nexprs $BLK i ->
                 accstore!(C, 1 + coff + tm + (i - 1) * GEMM_TILE +
                              (tn + (j - 1) * GEMM_TILE) * M + sk * M * N,
-                          M, c_i_j)
+                          M, c_i_j, epi)
         end
         GEMM_BLOCK_KERNELS[$BLK] = $kname
     end
@@ -516,6 +544,48 @@ const GEMM_VEC2 = Ref(true)
 """`vec2`-staged twins of `GEMM_STAGED_KERNELS`, keyed the same way."""
 const GEMM_STAGED_V2_KERNELS = Dict{GemmTiling,Any}()
 
+"""
+Whether every linear index the narrow kernel forms fits in an `Int32`: `M*K` for
+the A staging, `K*N` for B, `M*N` for the store.
+
+`widemul`, because the products are the thing being range-checked and computing
+them in `Int` to test them is how a range check overflows itself. Strictly `<`
+rather than `<=`: the indices are 1-based, so the largest the A staging forms is
+`M*K + 1`, not `M*K`.
+"""
+@inline gemm_fits32(M::Integer, N::Integer, K::Integer) =
+    widemul(Int(M), Int(K)) < typemax(Int32) && widemul(Int(K), Int(N)) < typemax(Int32) &&
+    widemul(Int(M), Int(N)) < typemax(Int32)
+
+"""Narrow-index twins of `GEMM_STAGED_V2_KERNELS`. See [`GEMM_NARROW`](@ref)."""
+const GEMM_STAGED_V2N_KERNELS = Dict{GemmTiling,Any}()
+
+"""
+    GEMM_NARROW[] :: Bool
+
+Compute the staging addresses in `Int32` instead of `Int`.
+
+Julia hands out `Int64` indices and Lava emits them as-is, but NVIDIA has no
+64-bit integer unit: adds and multiplies are emulated. The same narrowing was
+worth **1.56x** in `im2col_kernel!`, which is why it was tried here.
+
+It does **not** work the way that suggests. The register count goes *up*
+(118 -> 124) and the occupancy is unchanged at 2 workgroups an SM, so whatever it
+buys is instruction count in the staging loop, not residency. Measured
+interleaved in one session, both orders, over SAM 2's eight `addmm` shapes
+weighted by call count: **-1.2%**, from -4.9% to +0.9%, results bit-identical.
+
+The gap between that and the 3.5-9% a *cross-session* comparison first showed is
+the reason the rule exists — the earlier baseline was a different process on a
+differently-warmed card, and it inflated the effect by 4x.
+
+Kept anyway: it is free and never wrong. Both kernels exist because the narrow
+one is only *legal* while `M*K`, `K*N` and `M*N` fit in an `Int32`
+(`gemm_fits32`), and the wide one is the fallback for anything larger, so the
+duplication is a correctness requirement and not only a measurement convenience.
+"""
+const GEMM_NARROW = Ref(true)
+
 "A 2-wide fp16 vector, i.e. `f16vec2`; see `Lava.coopmat_vec2`."
 const GemmV2 = NTuple{2,VecElement{Float16}}
 
@@ -546,7 +616,7 @@ for (ci, cfg) in enumerate(GEMM_TILINGS)
         # TFLOP/s weighted). The guard is why the two loop forms structurize
         # differently at all.
         @kernel cpu=false unsafe_indices=true function $kname(
-                                          C, @Const(A), @Const(B), bias,
+                                          C, @Const(A), @Const(B), bias, epi,
                                           ::Val{M}, ::Val{N}, ::Val{K}) where {M,N,K}
             sA = @localmem Float16 ($LDA * $BK,)
             sB = @localmem Float16 ($LDB * $BN,)
@@ -611,7 +681,7 @@ for (ci, cfg) in enumerate(GEMM_TILINGS)
                 accstore!(C,
                           1 + (tm + (sm + mt - 1) * GEMM_TILE) +
                               (tn + (sn + nt - 1) * GEMM_TILE) * M,
-                          M, c_mt_nt)
+                          M, c_mt_nt, epi)
         end
         GEMM_STAGED_KERNELS[$cfg] = $kname
     end
@@ -632,7 +702,7 @@ for (ci, cfg) in enumerate(GEMM_TILINGS)
         kv2 = Symbol("coopmat_gemm_staged_kernel_", ci, "_v2!")
         @eval begin
             @kernel cpu=false unsafe_indices=true function $kv2(
-                                              C, @Const(A), @Const(B), bias,
+                                              C, @Const(A), @Const(B), bias, epi,
                                               ::Val{M}, ::Val{N}, ::Val{K}) where {M,N,K}
                 sA = @localmem GemmV2 ($LDA2 * $BK,)
                 sB = @localmem GemmV2 ($LDB2 * $BN,)
@@ -691,9 +761,80 @@ for (ci, cfg) in enumerate(GEMM_TILINGS)
                     accstore!(C,
                               1 + (tm + (sm + mt - 1) * GEMM_TILE) +
                                   (tn + (sn + nt - 1) * GEMM_TILE) * M,
-                              M, c_mt_nt)
+                              M, c_mt_nt, epi)
             end
             GEMM_STAGED_V2_KERNELS[$cfg] = $kv2
+        end
+
+        kv2n = Symbol("coopmat_gemm_staged_kernel_", ci, "_v2n!")
+        @eval begin
+            @kernel cpu=false unsafe_indices=true function $kv2n(
+                                              C, @Const(A), @Const(B), bias, epi,
+                                              ::Val{M}, ::Val{N}, ::Val{K}) where {M,N,K}
+                sA = @localmem GemmV2 ($LDA2 * $BK,)
+                sB = @localmem GemmV2 ($LDB2 * $BN,)
+
+                tid = Int32(@index(Local, Linear) - 1)
+                blk = Int32(@index(Group, Linear) - 1)
+                nblk_m = Int32(M ÷ $BM)
+                tm = (blk % nblk_m) * Int32($BM)
+                tn = (blk ÷ nblk_m) * Int32($BN)
+
+                s = tid ÷ Int32(32)
+                sm = (s % Int32($WM)) * Int32($STM)
+                sn = (s ÷ Int32($WM)) * Int32($STN)
+
+                bp = bias === nothing ? bias : pointer(bias)
+                Base.Cartesian.@nexprs $STN nt -> Base.Cartesian.@nexprs $STM mt ->
+                    c_mt_nt = accinit(bias, bp, 1 + tm + (sm + mt - 1) * GEMM_TILE)
+
+                for kb in Int32(0):Int32(K ÷ $BK - 1)
+                    k0 = kb * Int32($BK)
+                    # A: pairs along `m`, the contiguous axis, so consecutive
+                    # lanes still read consecutive global addresses.
+                    @inbounds for r in Int32(0):Int32($AREPS2 - 1)
+                        idx = tid + r * Int32($WG)
+                        p, kk = splitidx(idx, Val($BM2))
+                        g = Int32(1) + (tm + Int32(2) * Int32(p)) +
+                            (k0 + Int32(kk)) * Int32(M)
+                        sA[1 + Int(p) + Int(kk) * $LDA2] =
+                            (VecElement(A[g]), VecElement(A[g + Int32(1)]))
+                    end
+                    # B: pairs along `k`, contiguous here for the same reason.
+                    @inbounds for r in Int32(0):Int32($BREPS2 - 1)
+                        idx = tid + r * Int32($WG)
+                        q, j = splitidx(idx, Val($BK2))
+                        g = Int32(1) + (k0 + Int32(2) * Int32(q)) +
+                            (tn + Int32(j)) * Int32(K)
+                        sB[1 + Int(q) + Int(j) * $LDB2] =
+                            (VecElement(B[g]), VecElement(B[g + Int32(1)]))
+                    end
+                    @synchronize
+
+                    Base.Cartesian.@nexprs $NKT u -> begin
+                        kt = (u - 1) * GEMM_TILE
+                        Base.Cartesian.@nexprs $STM mt -> begin
+                            a = AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixA}(
+                                    sA, 1 + (sm + mt - 1) * ($(GEMM_TILE ÷ 2)) +
+                                        kt * $LDA2, $LDA2)
+                            Base.Cartesian.@nexprs $STN nt -> begin
+                                b = AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixB}(
+                                        sB, 1 + (kt ÷ 2) +
+                                            (sn + nt - 1) * GEMM_TILE * $LDB2, $LDB2)
+                                c_mt_nt = muladd(a, b, c_mt_nt)
+                            end
+                        end
+                    end
+                    @synchronize
+                end
+
+                Base.Cartesian.@nexprs $STN nt -> Base.Cartesian.@nexprs $STM mt ->
+                    accstore!(C,
+                              1 + Int(tm + (sm + mt - 1) * Int32(GEMM_TILE)) +
+                                  (tn + (sn + nt - 1) * GEMM_TILE) * M,
+                              M, c_mt_nt, epi)
+            end
+            GEMM_STAGED_V2N_KERNELS[$cfg] = $kv2n
         end
     end
 end
@@ -933,7 +1074,8 @@ load) because a cooperative-matrix load has no bounds check.
 function coopmat_gemm!(C, A, B, M::Int, N::Int, K::Int;
                        nbatch::Int = 1,
                        blk_split = coopmat_gemm_shape(M, N, K; nbatch),
-                       partials = nothing, reduce::Bool = true, bias = nothing)
+                       partials = nothing, reduce::Bool = true, bias = nothing,
+                       epilogue = identity)
     backend = LavaBackend()
     # A bias goes into the accumulator's initial value, so it must land exactly
     # once — with `splitk > 1` every plane would carry its own copy and the
@@ -948,10 +1090,22 @@ function coopmat_gemm!(C, A, B, M::Int, N::Int, K::Int;
     c = staged_gemm_tiling(M, N, K, nbatch, splitk)
     if c !== nothing
         wg = gemm_wg(c)
-        kern = GEMM_VEC2[] ? get(GEMM_STAGED_V2_KERNELS, c, GEMM_STAGED_KERNELS[c]) :
-                             GEMM_STAGED_KERNELS[c]
+        # The narrow kernel addresses in `Int32`, so it is only legal while every
+        # linear index it forms stays inside one: `M*K` for the A staging, `K*N`
+        # for B, `M*N` for the store. Far outside anything this repo runs — the
+        # largest is 18.9M against a 2.1e9 limit — but it is a silent wrong
+        # answer rather than an error if it is ever not, so it is checked.
+        narrow = GEMM_NARROW[] && gemm_fits32(M, N, K)
+        kern = if !GEMM_VEC2[]
+            GEMM_STAGED_KERNELS[c]
+        elseif narrow
+            get(GEMM_STAGED_V2N_KERNELS, c,
+                get(GEMM_STAGED_V2_KERNELS, c, GEMM_STAGED_KERNELS[c]))
+        else
+            get(GEMM_STAGED_V2_KERNELS, c, GEMM_STAGED_KERNELS[c])
+        end
         kern(backend, wg)(
-            C, A, B, bias, Val(M), Val(N), Val(K);
+            C, A, B, bias, epilogue, Val(M), Val(N), Val(K);
             ndrange = (M ÷ gemm_bm(c)) * (N ÷ gemm_bn(c)) * wg)
         return C
     end
@@ -959,8 +1113,13 @@ function coopmat_gemm!(C, A, B, M::Int, N::Int, K::Int;
     ntiles = (M ÷ span) * (N ÷ span)
     dst = splitk == 1 ? C :
           (partials === nothing ? splitscratch(M, N, splitk * nbatch) : partials)
+    # A split-K plane is a PARTIAL sum, so an activation on it would be applied
+    # to a fraction of the dot product and then summed — wrong, and silently so.
+    # The epilogue belongs to whoever reduces the planes.
+    epilogue === identity || splitk == 1 ||
+        throw(ArgumentError("coopmat_gemm!: an epilogue needs splitk == 1, got $splitk"))
     GEMM_BLOCK_KERNELS[blk](backend, GEMM_WORKGROUP)(
-        dst, A, B, bias, Val(M), Val(N), Val(K),
+        dst, A, B, bias, epilogue, Val(M), Val(N), Val(K),
         Val((K ÷ GEMM_TILE) ÷ splitk); ndrange = ntiles * splitk * 32 * nbatch)
     splitk == 1 && return C
     # `reduce=false` hands the partial planes back untouched, for a caller whose

@@ -69,7 +69,7 @@ function stagedcount(backend, cfg, K; blocks = 2)
     C = KA.allocate(backend, Float16, M, N); fill!(C, Float16(-1))
     wg = Lava.gemm_wg(cfg)
     Lava.GEMM_STAGED_KERNELS[cfg](backend, wg)(
-        C, A, B, nothing, Val(M), Val(N), Val(K);
+        C, A, B, nothing, identity, Val(M), Val(N), Val(K);
         ndrange = (M ÷ Lava.gemm_bm(cfg)) * (N ÷ Lava.gemm_bn(cfg)) * wg)
     KA.synchronize(backend)
     g = Float32.(Array(C))
@@ -212,5 +212,93 @@ end
         @test Lava.gemm_tiling(1152, 16384,  288) == c96
     finally
         Lava.GEMM_STAGED[], Lava.GEMM_TILING[] = old
+    end
+end
+
+@testset "the vec2 switch's other side still compiles and agrees" begin
+    # `GEMM_VEC2` picks between two staged kernels, and `coopmat_gemm!` falls
+    # back to the v1 one for any config with no v2 variant — so v1 is reachable
+    # in a default build, not only when the switch is flipped. It had been
+    # unreachable in practice for long enough that adding an argument to the
+    # kernel family missed it, and the miss surfaced as a `MethodError` at
+    # launch: "no method matching ... ::typeof(identity), ::Val{288}".
+    #
+    # A switch whose other side is broken is not a switch. This runs it.
+    old = (Lava.GEMM_VEC2[], Lava.GEMM_TILING[], Lava.GEMM_STAGED[])
+    try
+        Lava.GEMM_STAGED[] = true
+        # `blk_split = (1, 1)` below because the default plan splits K four ways
+        # at this size, and an epilogue on a split-K plane is refused — correctly,
+        # a plane is a partial sum. Forcing one plane is what puts this on the
+        # staged path at all, which is the path under test.
+        M, N, K = 256, 256, 128
+        hA = rand(Float16, M, K) .- Float16(0.5)
+        hB = rand(Float16, K, N) .- Float16(0.5)
+        A, B = Lava.LavaArray(hA), Lava.LavaArray(hB)
+        bias = Lava.LavaArray(rand(Float16, M) .- Float16(0.5))
+        for withbias in (false, true), epi in (identity, x -> x * 2.0f0)
+            outs = map((true, false)) do vec2
+                Lava.GEMM_VEC2[] = vec2
+                C = KA.allocate(LavaBackend(), Float32, M, N); fill!(C, 0f0)
+                Lava.coopmat_gemm!(C, A, B, M, N, K; blk_split = (1, 1),
+                                   bias = withbias ? bias : nothing, epilogue = epi)
+                KA.synchronize(LavaBackend())
+                Array(C)
+            end
+            @test maximum(abs, outs[1]) > 1e-3          # both computed something
+            # The two stage through differently shaped shared tiles but do the
+            # same arithmetic in the same order, so this is exact.
+            @test outs[1] == outs[2]
+        end
+        A = B = bias = nothing; GC.gc()
+    finally
+        Lava.GEMM_VEC2[], Lava.GEMM_TILING[], Lava.GEMM_STAGED[] = old
+    end
+end
+
+@testset "the narrow-index kernel agrees with the wide one" begin
+    # `GEMM_NARROW` swaps the staging addresses to `Int32`. It is worth -1.2%
+    # weighted over SAM 2's shapes, which is small enough that the only thing
+    # standing between it and a silent wrong answer is this: the two kernels must
+    # produce **bit-identical** output, not merely close output. They compute the
+    # same products in the same order, so anything other than equality is a bug
+    # in the address arithmetic, and a narrowing bug shows up as a few wrong
+    # tiles rather than as garbage.
+    back = LavaBackend()
+    old = Lava.GEMM_NARROW[]
+    try
+        @testset "M$M N$N K$K" for (M, N, K) in
+                [(4096, 2304, 576), (4096, 576, 2304), (1024, 1152, 288),
+                 (256, 256, 256), (512, 128, 64), (2048, 576, 576)]
+            A = Lava.LavaArray(Float16.(reshape(0.2 .* sin.(range(0, 9, M * K)), M, K)))
+            B = Lava.LavaArray(Float16.(reshape(0.2 .* cos.(range(0, 7, K * N)), K, N)))
+            C = KA.allocate(back, Float16, M, N)
+
+            Lava.GEMM_NARROW[] = false
+            fill!(C, Float16(0)); Lava.coopmat_gemm!(C, A, B, M, N, K)
+            KA.synchronize(back); wide = copy(Array(C))
+
+            Lava.GEMM_NARROW[] = true
+            fill!(C, Float16(0)); Lava.coopmat_gemm!(C, A, B, M, N, K)
+            KA.synchronize(back); narrow = copy(Array(C))
+
+            @test narrow == wide
+            @test any(!iszero, wide)          # and both actually computed something
+            A = B = C = nothing; GC.gc()
+        end
+
+        # The guard that decides which one may run. `M*K`, `K*N` and `M*N` all
+        # have to fit an Int32; the wide kernel is the fallback above that.
+        @test Lava.gemm_fits32(4096, 2304, 576)
+        @test Lava.gemm_fits32(16384, 1152, 288)             # the largest here, 18.9M
+        @test !Lava.gemm_fits32(65536, 65536, 65536)
+        @test !Lava.gemm_fits32(1 << 16, 2, 1 << 16)         # M*K alone overflows
+        @test !Lava.gemm_fits32(2, 1 << 16, 1 << 16)         # K*N alone overflows
+        @test !Lava.gemm_fits32(1 << 16, 1 << 16, 2)         # M*N alone overflows
+        # The boundary is exclusive because the indices are 1-based.
+        @test !Lava.gemm_fits32(typemax(Int32), 1, 1)
+        @test Lava.gemm_fits32(typemax(Int32) - 1, 1, 1)
+    finally
+        Lava.GEMM_NARROW[] = old
     end
 end
