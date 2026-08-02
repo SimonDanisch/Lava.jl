@@ -960,7 +960,12 @@ function LinearAlgebra.mul!(C::LavaArray{T,2}, A::AbstractVecOrMat,
     N = size(B, 2)
     size(B, 1) == K && size(C) == (M, N) ||
         throw(DimensionMismatch("mul!: $(size(C)) = $(size(A)) * $(size(B))"))
-    backend = LavaBackend()
+    # `KA.get_backend(C)`, NOT `LavaBackend()`. An unpinned backend resolves
+    # its queue through `vk_context()`, so on a second device this dispatches on
+    # whichever context happens to be global — the work lands on the wrong GPU
+    # and the buffer's own device never sees it. `get_backend` derives the
+    # context from the array's buffer, which has always carried it.
+    backend = KernelAbstractions.get_backend(C)
 
     if T === Float32 && eltype(A) === Float16 && eltype(B) === Float16 &&
        isone(α) && iszero(β) && A isa LavaArray && B isa LavaArray &&
@@ -1076,7 +1081,12 @@ function coopmat_gemm!(C, A, B, M::Int, N::Int, K::Int;
                        blk_split = coopmat_gemm_shape(M, N, K; nbatch),
                        partials = nothing, reduce::Bool = true, bias = nothing,
                        epilogue = identity)
-    backend = LavaBackend()
+    # `KA.get_backend(C)`, NOT `LavaBackend()`. An unpinned backend resolves
+    # its queue through `vk_context()`, so on a second device this dispatches on
+    # whichever context happens to be global — the work lands on the wrong GPU
+    # and the buffer's own device never sees it. `get_backend` derives the
+    # context from the array's buffer, which has always carried it.
+    backend = KernelAbstractions.get_backend(C)
     # A bias goes into the accumulator's initial value, so it must land exactly
     # once — with `splitk > 1` every plane would carry its own copy and the
     # reduction would sum them. The caller keeps its own epilogue there.
@@ -1147,7 +1157,8 @@ function gemmlaunch!(C, A, B, M, N, K, α, β)
     b = gemmstrides(B)
     b === nothing && (b = gemmstrides(densify(B)))
     c = gemmstrides(C)
-    strided_gemm_kernel!(LavaBackend())(c[1], a[1], b[1], Val(K),
+    # See the note in `mul!` above: the backend comes from the destination.
+    strided_gemm_kernel!(KernelAbstractions.get_backend(c[1]))(c[1], a[1], b[1], Val(K),
                                         c[2], c[3], c[4],
                                         a[2], a[3], a[4],
                                         b[2], b[3], b[4],

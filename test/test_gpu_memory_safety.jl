@@ -70,7 +70,7 @@ end
         drain!()
         baseline_bytes    = Lava.GPU_LIVE_BYTES[]
         baseline_buffers  = length(Lava.LIVE_BUFFERS)
-        baseline_pool     = length(Lava.POOL_BLOCKS)
+        baseline_pool     = length(Lava.pool(Lava.vk_context()).blocks)
 
         for _ in 1:500
             a = Lava.LavaArray(Float32.(ones(4096)))
@@ -82,7 +82,7 @@ end
         @test length(Lava.LIVE_BUFFERS)  == baseline_buffers
         # Pool blocks can grow once or twice under transient pressure but must
         # not keep growing — anything looser stops being a real leak test.
-        @test length(Lava.POOL_BLOCKS)   <= baseline_pool + 2
+        @test length(Lava.pool(Lava.vk_context()).blocks)   <= baseline_pool + 2
     end
 
     # ── 3b. Dispatch-then-free stress (the actual WaterLily pattern) ──
@@ -190,7 +190,7 @@ end
     # pool_alloc should now bound this. Stress it.
     @testset "pool blocks bounded under bursty alloc" begin
         drain!()
-        baseline_pool = length(Lava.POOL_BLOCKS)
+        baseline_pool = length(Lava.pool(Lava.vk_context()).blocks)
         # Allocate + free 8 MiB arrays repeatedly. Each alloc hits the pool
         # (< 64 MiB pool block size), and frees go to deferred_frees.
         for _ in 1:50
@@ -198,7 +198,7 @@ end
             Lava.unsafe_free!(a)
         end
         drain!()
-        @test length(Lava.POOL_BLOCKS) <= baseline_pool + 1
+        @test length(Lava.pool(Lava.vk_context()).blocks) <= baseline_pool + 1
     end
 
     # ── 8. Deferred-free lists drain on submit ──

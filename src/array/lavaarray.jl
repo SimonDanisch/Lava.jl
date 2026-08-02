@@ -122,7 +122,12 @@ function (::Type{LavaArray{T,N}})(s::UniformScaling, dims::Tuple{Int,Int}) where
             @inbounds res[ilin] = val
         end
     end
-    kernel = identity_kernel!(LavaBackend())
+    # `KA.get_backend(res)`, NOT `LavaBackend()`. An unpinned backend resolves
+    # its queue through `vk_context()`, so on a second device this dispatches on
+    # whichever context happens to be global — the work lands on the wrong GPU
+    # and the buffer's own device never sees it. `get_backend` derives the
+    # context from the array's buffer, which has always carried it.
+    kernel = identity_kernel!(KernelAbstractions.get_backend(res))
     kernel(res, size(res, 1), T(s.λ); ndrange=minimum(dims))
     return res
 end

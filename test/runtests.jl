@@ -181,6 +181,16 @@ end
         include(joinpath(@__DIR__, "test_backend_context.jl"))
     end
 
+    # Two live devices in one process — the real GPU and lavapipe, which the
+    # loader enumerates together, so this needs no second card. Asserts both
+    # compute correctly AND that one kernel compiles twice: a shared pipeline
+    # can still give the right answer by luck. See the file for the five
+    # separate pieces of module-scope device state it found.
+    @testset "two devices in one process" begin
+        include(joinpath(@__DIR__, "twodevice_probe.jl"))
+        probe()
+    end
+
     # Catches an invalid module that the driver accepts and runs correctly, so it
     # is invisible to every other test unless LAVA_VALIDATION=1 is set.
     @testset "no OpBitcast on a logical pointer" begin

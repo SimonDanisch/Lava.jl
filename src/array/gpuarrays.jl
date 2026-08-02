@@ -415,7 +415,12 @@ function GPUArrays._copyto!(dest::AnyLavaArray, bc::Broadcast.Broadcasted)
     axes(dest) == axes(bc) || Broadcast.throwdm(axes(dest), axes(bc))
     isempty(dest) && return dest
     n = length(dest)
-    backend = LavaBackend()
+    # `KA.get_backend(dest)`, NOT `LavaBackend()`. An unpinned backend resolves
+    # its queue through `vk_context()`, so on a second device this dispatches on
+    # whichever context happens to be global — the work lands on the wrong GPU
+    # and the buffer's own device never sees it. `get_backend` derives the
+    # context from the array's buffer, which has always carried it.
+    backend = KernelAbstractions.get_backend(dest)
     wg, u, nd = broadcastlaunch(n)
     if ndims(dest) > 1 && IndexStyle(dest) === IndexLinear() && flatok(dest, bc)
         probe_broadcast!(:flat, dest, bc)
@@ -533,7 +538,12 @@ function Base.fill!(a::LavaArray{T}, val) where T
         I = @index(Global)
         @inbounds A[I] = v
     end
-    k = fill_kernel!(LavaBackend())
+    # From the array, not the global context. `fill!` on an array belonging to a
+    # second device was dispatching on whichever context was global: the write
+    # landed on the wrong queue, the array read back as zeros, and Lava's own
+    # `sync_access!` guard caught it later as "buffer was last written on a
+    # BatchQueue from a DIFFERENT VkContext" — a long way from the cause.
+    k = fill_kernel!(KernelAbstractions.get_backend(a))
     k(a, v; ndrange=length(a))
     return a
 end

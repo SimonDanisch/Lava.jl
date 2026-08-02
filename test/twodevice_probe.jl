@@ -3,9 +3,8 @@ Two devices in one process: the acceptance probe for `GUARDRAILS.md` §8.
 
     julia --project=<env> dev/Lava/test/twodevice_probe.jl
 
-**Deliberately NOT in `runtests.jl`.** It currently segfaults, and a segfault
-takes the whole suite with it — including everything that would have run after.
-It goes back in the suite when it passes.
+**It passes**, and is in `runtests.jl`. It was held out while it segfaulted,
+because a segfault takes the whole suite with it.
 
 ## Why this is possible now, and was not before
 
@@ -25,7 +24,10 @@ its first run — **not sufficient**. Module-scope device state is a larger
 category than the cache list, and the only way to enumerate it honestly is to
 run two devices and see what breaks.
 
-## What it has found so far
+## What it found, in the order it found them
+
+Each was fixed and the probe re-run, which is why the list is ordered: nothing
+below was visible until everything above it was fixed.
 
 1. **`CMD_PIPELINE_BARRIER_FPTR`** — FIXED, now `VkContext.cmd_pipeline_barrier_fptr`.
    A device function pointer is per device: `vkGetDeviceProcAddr` returns one
@@ -49,7 +51,7 @@ run two devices and see what breaks.
    every tiling decision keyed on it would be made for the other device, and
    nothing would crash.
 
-4. **THE ALLOCATOR — open, and the reason this probe still fails.**
+4. **THE ALLOCATOR** — the one that actually mattered. FIXED.
 
    `POOL_BLOCKS` and `POOL_FREE_LISTS` are module-level, and `PoolBlock` carries
    no device:
@@ -67,17 +69,34 @@ run two devices and see what breaks.
    reads back **0.0** — it wrote into memory that device does not own — and in a
    different call order it segfaults instead.
 
-   **This is a bigger class than anything in `GUARDRAILS.md` §8, which lists four
-   caches holding pipeline handles.** The allocator hands out *memory*, so the
-   failure is silent data corruption rather than a bad handle, and no amount of
-   cache keying reaches it. Fixing it means a per-device pool, which is its own
-   piece of work.
+   **A bigger class than anything in `GUARDRAILS.md` §8, which lists four caches
+   holding pipeline handles.** The allocator hands out *memory*, so the failure
+   is silent data corruption rather than a bad handle, and no amount of cache
+   keying reaches it.
 
-   Remaining after that, unaudited: `TIMESTAMP_POOL` (a `Vulkan.QueryPool`),
-   `BLIT_PIPELINE`, `GEMM_SPLIT_SCRATCH`, `WORKGROUP_LIMIT`.
+   Now `DevicePool` per device, with each `PoolBlock` carrying a back-reference
+   to its pool so `return_to_pool!` — which runs from a **finalizer**, where a
+   lookup must not allocate and must not be able to miss — is a field hop.
 
-   The list above was produced by RUNNING two devices. Reading produced a list of
-   four caches, and none of the four is the one that actually breaks it.
+5. **`LavaBackend()` built inside the library, six places.** An unpinned backend
+   resolves its queue through `vk_context()`, so `fill!`, `mul!`,
+   `coopmat_gemm!`, broadcast `_copyto!` and the identity-matrix constructor all
+   dispatched on whichever context was global rather than on the array's own.
+   The array read back as zeros and Lava's `sync_access!` guard caught it much
+   later as *"buffer was last written on a BatchQueue from a DIFFERENT
+   VkContext"* — a good error a long way from its cause. All six now derive the
+   backend from the data with `KA.get_backend`.
+
+   That guard existing and firing is worth noting: the library already knew this
+   was possible and said so precisely.
+
+Unaudited, because nothing here exercises them: `TIMESTAMP_POOL` (a
+`Vulkan.QueryPool`), `BLIT_PIPELINE`, `GEMM_SPLIT_SCRATCH`, `WORKGROUP_LIMIT`.
+Graphics and profiling are not on this path; extend the probe before trusting
+them on a second device.
+
+The list above was produced by RUNNING two devices. Reading produced a list of
+four caches, and **none of the four was what actually broke it.**
 """
 
 using Lava, KernelAbstractions

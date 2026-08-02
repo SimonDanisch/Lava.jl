@@ -192,7 +192,7 @@ end
 function snapshot_state()
     gpu_bytes  = Lava.GPU_LIVE_BYTES[]
     n_buffers  = length(Lava.LIVE_BUFFERS)
-    n_pool     = length(Lava.POOL_BLOCKS)
+    n_pool     = length(Lava.pool(Lava.vk_context()).blocks)
     (gpu_bytes=gpu_bytes, live_bufs=n_buffers, pool_blocks=n_pool)
 end
 
