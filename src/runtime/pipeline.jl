@@ -378,8 +378,25 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
     # kernels were tuned on.
     stage_next = C_NULL
     if spirv_declares_capability(spirv_bytes, Cap.CooperativeMatrixKHR) &&
-       device_subgroup_size(ctx) != COOPMAT_SUBGROUP &&
-       can_require_subgroup_size(ctx, COOPMAT_SUBGROUP)
+       device_subgroup_size(ctx) != COOPMAT_SUBGROUP
+        # And where it does NOT, refuse. Creating the pipeline anyway gives a
+        # kernel that indexes `tid ÷ 32` on a wave64 device — it launches, it
+        # returns, and every subgroup past the first reads another's fragment.
+        # Wrong numbers with no error is the worst outcome available here, and on
+        # a device nobody has run yet it would be blamed on the kernel.
+        #
+        # Reachable only on hardware that has cooperative matrices AND cannot pin
+        # a 32-lane subgroup. RDNA 3.5 supports `VK_EXT_subgroup_size_control`
+        # with `minSubgroupSize == 32`, so this is a guard, not a limitation —
+        # but it is a guard the first non-NVIDIA run should hit loudly if the
+        # assumption is wrong.
+        can_require_subgroup_size(ctx, COOPMAT_SUBGROUP) ||
+            error("""
+                  $(ctx.device_name) runs $(device_subgroup_size(ctx))-lane subgroups and \
+                  cannot pin them to $COOPMAT_SUBGROUP, which every cooperative-matrix \
+                  kernel here assumes (see COOPMAT_SUBGROUP). Refusing to build a \
+                  pipeline that would return wrong results silently. Route this shape \
+                  to a non-cooperative-matrix path.""")
         stage_next = Vulkan.PipelineShaderStageRequiredSubgroupSizeCreateInfo(
             UInt32(COOPMAT_SUBGROUP))
     end
