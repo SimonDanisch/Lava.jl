@@ -847,6 +847,29 @@ end
 #
 # `K` is passed rather than read from `axes(A, 2)` for the same reason — the host
 # knows the extent, so the kernel need not query anything.
+
+"""
+    gemmaccumtype(T) -> Type
+
+Element type a scalar GEMM accumulates in, given the promoted type of its
+operands and destination.
+
+`Float16` accumulates in `Float32`, and everything else in itself. A dot product
+of length `K` in a `p`-bit format carries a relative error of roughly
+`sqrt(K) * eps(T) / 2`; at `K = 5120` in `Float16` that is 3.5e-2, and it was
+measured at 4.8e-2 — a **234x** larger error than the same kernel writing a
+`Float32` destination and rounding afterwards (2.1e-4). Whisper's `fc2` is
+exactly that shape.
+
+This is what the other two implementations of this operation already do — Lava's
+cooperative-matrix path accumulates `Float32` for half operands, and DNNKernels'
+`mm2` widens through its own `accum` — so the scalar path taking `eltype(C)` was
+the odd one out. It matters because `mm_coopmat_applicable` declines whenever an
+operand arrives wrapped, which in a raw exported graph is every `addmm`.
+"""
+gemmaccumtype(::Type{Float16}) = Float32
+gemmaccumtype(::Type{T}) where {T} = T
+
 @kernel cpu=false function strided_gemm_kernel!(C, @Const(A), @Const(B), ::Val{K},
                                       co, cr, cc, ao, ar, ac, bo, br, bc,
                                       α, β, M, ntot) where {K}
@@ -859,7 +882,10 @@ end
     i = (Int32(lin) - Int32(1)) % Int32(M) + Int32(1)
     j = (Int32(lin) - Int32(1)) ÷ Int32(M) + Int32(1)
     @inbounds begin
-        T = eltype(C)
+        Tc = eltype(C)
+        # NOT `eltype(C)`: see `gemmaccumtype`. A half destination must not drag
+        # the accumulator down with it.
+        T = gemmaccumtype(promote_type(Tc, eltype(A), eltype(B)))
         acc = zero(T)
         ai = ao + (i - 1) * ar
         bj = bo + (j - 1) * bc
@@ -882,7 +908,10 @@ end
             k += 1
         end
         ci = co + (i - 1) * cr + (j - 1) * cc
-        C[ci] = iszero(β) ? acc * α : muladd(acc, α, C[ci] * β)
+        # The scaling stays in the accumulator's precision too, and only the
+        # single store rounds — a `β * C[ci]` term evaluated in half would give
+        # back a chunk of what the wide accumulator just bought.
+        C[ci] = Tc(iszero(β) ? acc * T(α) : muladd(acc, T(α), T(C[ci]) * T(β)))
     end
     end
 end
