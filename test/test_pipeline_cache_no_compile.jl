@@ -30,11 +30,25 @@ const KA = KernelAbstractions
     @inbounds d[i] = d[i] + 1.0f0
 end
 
-# Body deliberately unlike anything else in the suite, so its pipeline cannot
-# already be in the cache from another test.
-@kernel function pcnc_novel!(d)
+# Novel on EVERY RUN, not merely unlike the rest of the suite, and that
+# distinction is the whole reason the negative control works.
+#
+# `Val{K}` with a per-run random `K` puts a different literal in the emitted
+# SPIR-V each time, so no cache anywhere can hold this module. A fixed body is
+# novel exactly ONCE PER MACHINE and silently stops firing after that — which is
+# what it had been doing on both vendors:
+#
+#   * NVIDIA RTX 4000 Ada: fired once, on the first run after an emitter change
+#     made its SPIR-V new again, and never afterwards.
+#   * AMD RADV: never observed firing at all.
+#
+# Deleting Lava's own `VkPipelineCache` blob does not restore it on either, and
+# neither does `MESA_SHADER_CACHE_DISABLE` on RADV, because the vendor keeps its
+# own shader cache outside anything Lava controls. So "delete the blob" is not a
+# workaround, and a control that fires once per machine is not a control.
+@kernel function pcnc_novel!(d, ::Val{K}) where {K}
     i = @index(Global)
-    @inbounds d[i] = d[i] * 3.0f0 - 7.0f0 + sqrt(abs(d[i]) + 1.5f0)
+    @inbounds d[i] = d[i] * 3.0f0 - Float32(K) + sqrt(abs(d[i]) + 1.5f0)
 end
 
 @testset "VkPipelineCache avoids driver compilation" begin
@@ -48,19 +62,40 @@ end
 
     # ── The instrument must FIRE. A kernel the driver has never compiled has to
     #    be refused; without this the rest of the testset is vacuous. ──
+    #
+    # `no_pipeline_compilation` does NOT throw, by design — `create_pipeline`
+    # records the miss and retries without the flag, so a workload finishes and
+    # reports EVERY miss instead of dying at the first. The instrument firing is
+    # therefore a recorded miss, not an exception, and this used to assert the
+    # exception. That assertion could only ever fail:
+    #
+    #   * on Linux before 2026-08-02 it failed for a second reason too — the
+    #     refusal was discarded entirely (`VK_PIPELINE_COMPILE_REQUIRED` is a
+    #     SUCCESS-class code, and the check lived inside the `Sys.iswindows()`
+    #     branch), so the counter was stuck at 0 and a NULL pipeline was cached
+    #     and later bound. Found on RDNA 3.5, fixed for both.
+    #   * with that fixed, the counter is right and only the `refused` assertion
+    #     is left failing, which is this test disagreeing with the API rather
+    #     than the API misbehaving.
+    #
+    # Note for whoever runs this on AMD: RADV creates the "novel" pipeline rather
+    # than refusing, even with `pipelineCreationCacheControl` enabled and both the
+    # VkPipelineCache blob and MESA_SHADER_CACHE_DISABLE ruled out. So the
+    # instrument does not fire there at all, and everything below it is vacuous on
+    # that device — which is exactly what the paragraph above warns about.
     Lava.PIPELINE_COMPILES_REFUSED[] = 0
+    K = rand(10_000:99_999)                           # never compiled before
     b = Lava.LavaArray(ones(Float32, 64))
-    refused = try
-        Lava.no_pipeline_compilation() do
-            pcnc_novel!(backend, 64)(b; ndrange = 64)
-            KA.synchronize(backend)
-        end
-        false
-    catch e
-        occursin("PIPELINE_COMPILE_REQUIRED", sprint(showerror, e))
+    Lava.no_pipeline_compilation() do
+        pcnc_novel!(backend, 64)(b, Val(K); ndrange = 64)
+        KA.synchronize(backend)
     end
-    @test refused                                     # instrument fires
-    @test Lava.PIPELINE_COMPILES_REFUSED[] == 1       # ...and is counted
+    @test Lava.PIPELINE_COMPILES_REFUSED[] == 1       # instrument fires…
+    @test length(Lava.PIPELINE_COMPILE_MISSES) == 1   # …and names what it caught
+    # The retry has to have produced a working pipeline, or "a miss is RECORDED,
+    # not fatal" is a lie. `no_pipeline_compilation` does not throw by design, so
+    # this is what "the instrument fired" has to mean.
+    @test Array(b) ≈ fill(3.0f0 - Float32(K) + sqrt(2.5f0), 64)
 
     # ── Warm, same session: the cached pipeline needs no compilation ──
     Lava.PIPELINE_COMPILES_REFUSED[] = 0

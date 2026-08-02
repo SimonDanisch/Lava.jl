@@ -401,8 +401,14 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
         if PIPELINE_NO_COMPILE[] && occursin("PIPELINE_COMPILE_REQUIRED", sprint(showerror, e))
             # Every Lava kernel's entry point is "main", so the name alone does not
             # identify anything. Record the SPIR-V hash and size, which do.
+            # `spirv_content_hash`, NOT `hash`: `Base.hash` SAMPLES a large
+            # Vector, so two modules differing in one byte report as the same
+            # miss. That is the bug that read as a 256-lane device cap for
+            # months (see `spirv_content_hash`), here in the one instrument
+            # whose job is to say WHICH module was not in the cache.
             push!(PIPELINE_COMPILE_MISSES,
-                  string(entry_name, " spirv=", string(hash(spirv_bytes), base=16),
+                  string(entry_name, " spirv=",
+                         string(spirv_content_hash(spirv_bytes), base=16),
                          " (", length(spirv_bytes), " bytes)",
                          pipeline_cache === nothing ? "" : " [per-kernel cache]"))
             old_flag = PIPELINE_NO_COMPILE[]
