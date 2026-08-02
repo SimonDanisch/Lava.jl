@@ -175,6 +175,12 @@ end
         include(joinpath(@__DIR__, "test_static_workgroup.jl"))
     end
 
+    # The one field the multi-device work rests on. Needs no second GPU: what it
+    # pins is that "this device" and "whichever is current" stay distinguishable.
+    @testset "a backend knows its device" begin
+        include(joinpath(@__DIR__, "test_backend_context.jl"))
+    end
+
     # Catches an invalid module that the driver accepts and runs correctly, so it
     # is invisible to every other test unless LAVA_VALIDATION=1 is set.
     @testset "no OpBitcast on a logical pointer" begin

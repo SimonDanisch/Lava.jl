@@ -54,22 +54,62 @@ pinned on purpose (the caller wants those exact queues, e.g. an async
 upload queue).
 """
 struct LavaBackend <: KA.GPU
+    # The device this backend runs on, or `nothing` for "whichever is current".
+    #
+    # `LavaBackend(ctx)` used to keep `ctx.default_bq` and DISCARD `ctx`, and a
+    # `BatchQueue` holds a `Vulkan.Device`, not the `VkContext` that owns it — so
+    # there was no path at all from a backend to its context. Everything above
+    # Lava that wants a per-device answer (`DNNKernels.Device`, and the four
+    # module-scope caches this branch is about to key by device) needs exactly
+    # that path, and both project briefs asserted it already existed.
+    #
+    # A buffer has always known: `KA.get_backend(::LavaArray)` below reads
+    # `a.buf[].ctx`. It was only the backend that forgot.
+    #
+    # `nothing` still means "resolve through `vk_context()` at each access", for
+    # the same reason the queues do — see the docstring above. This field does
+    # not change that default, it makes the PINNED case expressible.
+    ctx::Union{VkContext, Nothing}
     # nothing = "use vk_context().default_bq at each access" (survives resets)
     # non-nothing = caller pinned this specific queue
     dispatch_bq::Union{BatchQueue, Nothing}
     upload_bq::Union{BatchQueue, Nothing}
 end
 
-LavaBackend() = LavaBackend(nothing, nothing)
-LavaBackend(ctx::VkContext) = (let bq = ctx.default_bq; LavaBackend(bq, bq); end)
-LavaBackend(bq::BatchQueue) = LavaBackend(bq, bq)
+# The queue-only forms keep working and stay context-agnostic: a caller pinning
+# an upload queue is not thereby pinning a device.
+LavaBackend(d::Union{BatchQueue,Nothing}, u::Union{BatchQueue,Nothing}) =
+    LavaBackend(nothing, d, u)
+LavaBackend() = LavaBackend(nothing, nothing, nothing)
+LavaBackend(ctx::VkContext) = (let bq = ctx.default_bq; LavaBackend(ctx, bq, bq); end)
+LavaBackend(bq::BatchQueue) = LavaBackend(nothing, bq, bq)
+
+"""
+    vk_context(backend) -> VkContext
+    vk_context(a::LavaArray) -> VkContext
+
+The device a backend or an array belongs to.
+
+This is the accessor the rest of the stack should reach for instead of calling
+`vk_context()` and hoping. `vk_context()` stays as the convenience default for
+the single-device case; what has to stop is code *depending* on it, because a
+global cannot answer "which device" once there are two.
+
+For an unpinned backend the answer is still the current context — so this
+changes nothing today, and is the one place that has to be correct tomorrow.
+"""
+vk_context(b::LavaBackend) = b.ctx
+vk_context(a::LavaArray) = (a.buf[].ctx)::VkContext
 
 # Property access resolves a `nothing`-pinned queue through the live
 # `vk_context()` so a module-level `const BACKEND = LavaBackend()` keeps
 # working across `vk_reset_device!()`. `:bq` stays a back-compat alias for
 # `:dispatch_bq`.
 function Base.getproperty(b::LavaBackend, s::Symbol)
-    if s === :dispatch_bq
+    if s === :ctx
+        f = getfield(b, :ctx)
+        return f === nothing ? vk_context() : f
+    elseif s === :dispatch_bq
         f = getfield(b, :dispatch_bq)
         return f === nothing ? vk_context().default_bq : f
     elseif s === :upload_bq
