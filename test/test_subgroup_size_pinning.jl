@@ -61,8 +61,12 @@ function sgp_run(be, want::Int)
     # The gate is `device_subgroup_size(ctx) != COOPMAT_SUBGROUP`. Telling Lava the
     # device is already 32 suppresses the pin, so the module runs at the hardware
     # default; leaving the true value (64) makes the pin fire and request 32.
-    saved = Lava.DEVICE_SUBGROUP_SIZE[]
-    Lava.DEVICE_SUBGROUP_SIZE[] = want == Lava.COOPMAT_SUBGROUP ? saved : Lava.COOPMAT_SUBGROUP
+    # Per device since the two-device work: DEVICE_SUBGROUP_SIZE is a
+    # Dict{UInt64,Int} keyed by ctx.id, not a Ref. Query through the accessor so
+    # the entry exists before it is overridden.
+    saved = Lava.device_subgroup_size(ctx)
+    Lava.DEVICE_SUBGROUP_SIZE[ctx.id] =
+        want == Lava.COOPMAT_SUBGROUP ? saved : Lava.COOPMAT_SUBGROUP
     # ALL THREE caches, not just PIPELINE_CACHE. The required subgroup size is part
     # of the pipeline's create-info but NOT part of `get_compute_pipeline`'s cache
     # key, and the KA launch path caches a LaunchPlan that owns a pipeline on top
@@ -82,7 +86,7 @@ function sgp_run(be, want::Int)
         (sz = Int.(Array(sz)), lane = Int.(Array(lane)),
          red = Array(red), indep = Array(indep))
     finally
-        Lava.DEVICE_SUBGROUP_SIZE[] = saved
+        Lava.DEVICE_SUBGROUP_SIZE[ctx.id] = saved
         sgp_clear_caches!()
     end
 end
