@@ -6045,6 +6045,57 @@ function emit_select!(state::SPIRVEmitterState, inst::LLVM.SelectInst)
     else
         map_type!(state.type_ctx, llvm_ty)
     end
+    # A LOGICAL pointer cannot be OpBitcast either. Vulkan mandates the Logical
+    # addressing model, under which OpBitcast may neither produce nor consume a
+    # pointer: spirv-val rejects it with "Instruction may not have a logical
+    # pointer operand" (VUID-StandaloneSpirv-Logical pointer-OpBitcast, surfaced
+    # as VUID-VkShaderModuleCreateInfo-pCode-08737). The PSB case below already
+    # knew bitcasting pointers was wrong and routed around it; every other
+    # storage class fell through to the bitcast and produced an invalid module.
+    #
+    # The case that actually occurs is a clamped ternary over shared memory,
+    #     l = lid == 1 ? sh[lid] : sh[lid - 1]
+    # which LLVM lowers to a select between the array base pointer and an element
+    # pointer, followed by a GEP [0]. The emitter used to reinterpret the element
+    # pointer as "an array starting here":
+    #
+    #     %99  = OpBitcast %_ptr_Workgroup__arr_float_128 %98      <- illegal
+    #     %100 = OpSelect  %_ptr_Workgroup__arr_float_128 %93 %34 %99
+    #
+    # Drilling is the legal direction: an aggregate pointer can reach its first
+    # element with OpAccessChain, so make BOTH operands element pointers and let
+    # the select carry the element type.
+    if llvm_ty isa LLVM.PointerType
+        sc_sel = get_pointer_storage_class(ops[2])
+        if sc_sel != SC.PhysicalStorageBuffer
+            pte(v) = begin
+                p = get(state.value_emitted_pointee, v, nothing)
+                p === nothing ? get_pointee_type(state.type_ctx.ptm, v) : p
+            end
+            t_pte, f_pte = pte(ops[2]), pte(ops[3])
+            if t_pte !== nothing && f_pte !== nothing && t_pte != f_pte
+                agg_is_true = t_pte isa LLVM.ArrayType && LLVM.eltype(t_pte) == f_pte
+                agg_is_false = f_pte isa LLVM.ArrayType && LLVM.eltype(f_pte) == t_pte
+                if agg_is_true || agg_is_false
+                    elem = agg_is_true ? f_pte : t_pte
+                    elem_ptr_ty = map_pointer_type!(state.type_ctx,
+                                                    map_type!(state.type_ctx, elem), sc_sel)
+                    zero_id = emit_constant_u32!(state.mod, UInt32(0))
+                    drilled = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpAccessChain, elem_ptr_ty,
+                                        drilled, agg_is_true ? true_val : false_val, zero_id)
+                    agg_is_true ? (true_val = drilled) : (false_val = drilled)
+                    set_pointee_type!(state.type_ctx.ptm, inst, elem; priority=60)
+                    state.value_emitted_pointee[inst] = elem
+                    result_id = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpSelect, elem_ptr_ty,
+                                        result_id, cond, true_val, false_val)
+                    state.value_map[inst] = result_id
+                    return
+                end
+            end
+        end
+    end
     # For pointer selects, ensure both operands have the same SPIR-V type as result.
     # LLVM opaque pointers are all `ptr`, but SPIR-V has distinct typed pointers.
     # Try to map each operand's pointer type; if it differs from result_ty, bitcast.
