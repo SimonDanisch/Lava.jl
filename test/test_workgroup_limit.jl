@@ -1,25 +1,39 @@
 """
-A workgroup above 256 silently runs fewer invocations than it declares.
+Workgroups above 256 used to write part of their output, silently.
 
-The device accepts `LocalSize 512 1 1`, reports no resource problem, and then
-executes only local invocations 1–256. Lava computes the grid from the size it
-asked for, so the launch comes back with three quarters or half of its output
-never written — and a kernel that skips work looks like a speed-up, which is how
-this was found (a "3.4x" permuted copy that had written a quarter of its
-destination).
+The recorded diagnosis was hardware: "above 256 this driver silently runs fewer
+invocations than the shader declares". It was wrong, and the way it was wrong is
+the reason these tests exist in this shape.
 
-`Lava.WORKGROUP_LIMIT` turns that into a throw. These tests pin both halves: the
-limit rejects the size, and lifting the limit reproduces the truncation, so if a
-driver update fixes it the second testset fails and says so.
+The cause was one line in `get_compute_pipeline`:
+
+    cache_key = hash((spirv_bytes, ...))
+
+`Base.hash` on a large `Vector` **samples** elements rather than reading all of
+them. The 256- and 512-wide modules of one kernel differ at **exactly one byte**
+— the `LocalSize` operand — and collide. The 512 launch then looked up the 256
+pipeline, dispatched a 256-thread shader over a grid computed for 512, and wrote
+exactly `256/wg` of its output. Everything that made it look like a hardware lane
+cap follows from that: whichever size compiled first won ("order dependence"),
+whether a given body's two modules happened to collide decided if it reproduced
+("body dependence"), and adding any unrelated store changed enough bytes to miss
+the collision (the "fix" that made no sense).
+
+Three things are pinned here, so a regression is loud:
+
+  * the hardware runs every lane it is given, at every size;
+  * full coverage at every size on **both** launch spellings;
+  * and directly, that two modules differing in one byte get different cache
+    keys — the property the whole thing rests on.
 """
 
 using Test, Lava, KernelAbstractions
-const KA = KernelAbstractions
 
-# 64 simultaneously live values. The count matters and is not a round number by
-# accident: 32 stays in registers and is fine at every size, 128 spills and is
-# also fine, and 64 is the shape that truncates — with the *same* driver-reported
-# Register Count (40) as the 128 case, which is why no statistic can predict it.
+const KA = KernelAbstractions
+const Atomixwg = Lava.Atomix
+
+# 64 simultaneously live values — the body whose two modules collided. 32 and 128
+# did not, which is why the old cap could not be predicted from any statistic.
 @kernel cpu=false function wglimit_probe!(out, ::Val{K}) where {K}
     I = @index(Global, Linear)
     acc = ntuple(k -> Int32(I) * Int32(k) + Int32(k * k), Val(K))
@@ -30,11 +44,23 @@ const KA = KernelAbstractions
     @inbounds out[I] = Float16((s & Int32(3)) + Int32(1))   # never zero
 end
 
+# No KA index machinery: the raw builtin, an unconditional store, an atomic
+# tally. This is what answered "does the hardware run the lanes at all".
+@kernel cpu=false unsafe_indices=true function wglimit_raw!(who, ran)
+    li = Lava.lava_local_invocation_index()
+    Atomixwg.@atomic ran[1] += Int32(1)
+    @inbounds who[1 + li] = Int32(1)
+end
+
 "Fraction of a single workgroup's output that actually got written."
-function groupcoverage(backend, K, wg)
+function groupcoverage(backend, K, wg; static::Bool)
     out = KA.allocate(backend, Float16, wg)
     fill!(out, zero(Float16))
-    wglimit_probe!(backend)(out, Val(K); ndrange = wg, workgroupsize = wg)
+    if static
+        wglimit_probe!(backend, wg)(out, Val(K); ndrange = wg)
+    else
+        wglimit_probe!(backend)(out, Val(K); ndrange = wg, workgroupsize = wg)
+    end
     KA.synchronize(backend)
     count(!=(zero(Float16)), Array(out)) / wg
 end
@@ -42,31 +68,51 @@ end
 @testset "workgroup limit" begin
     backend = LavaBackend()
 
-    @testset "the limit rejects what the device will not honour" begin
-        @test Lava.WORKGROUP_LIMIT[] == 256
-        out = KA.allocate(backend, Float16, 512)
-        @test_throws ArgumentError wglimit_probe!(backend)(out, Val(64);
-                                                          ndrange = 512, workgroupsize = 512)
-        # At or below the limit every lane runs, whatever the body costs.
-        for K in (32, 64, 128), wg in (64, 128, 256)
-            @test groupcoverage(backend, K, wg) == 1.0
+    @testset "a one-byte difference is a different pipeline" begin
+        # The regression test for the actual bug, independent of any device
+        # behaviour: `Base.hash` collides on these, `spirv_content_hash` must not.
+        a = rand(UInt8, 9260)
+        b = copy(a); b[230] = a[230] ⊻ 0x02
+        @test Lava.spirv_content_hash(a) != Lava.spirv_content_hash(b)
+        # Every byte must matter, not just one position.
+        for i in (1, 4096, length(a))
+            c = copy(a); c[i] = a[i] ⊻ 0xff
+            @test Lava.spirv_content_hash(a) != Lava.spirv_content_hash(c)
+        end
+        # And it must be a pure function of the content.
+        @test Lava.spirv_content_hash(a) == Lava.spirv_content_hash(copy(a))
+    end
+
+    @testset "the hardware runs every lane it is given" begin
+        for wg in (256, 384, 512, 768, 1024)
+            who = KA.zeros(backend, Int32, wg)
+            ran = KA.zeros(backend, Int32, 1)
+            wglimit_raw!(backend, wg)(who, ran; ndrange = wg)
+            KA.synchronize(backend)
+            @test Array(ran)[1] == wg
+            @test sum(Array(who)) == wg
         end
     end
 
-    @testset "above it, invocations go missing (driver behaviour, pinned)" begin
-        old = Lava.WORKGROUP_LIMIT[]
-        try
-            Lava.WORKGROUP_LIMIT[] = 1024
-            # Exactly 256 lanes participate regardless of the size asked for, so
-            # the coverage is 256/wg. If a driver update fixes this, these two
-            # become 1.0 and the limit above can be raised.
-            @test groupcoverage(backend, 64, 512) == 0.5
-            @test groupcoverage(backend, 64, 1024) == 0.25
-            # Not every body triggers it — which is the reason the limit is a
-            # flat cap rather than a per-kernel prediction.
-            @test groupcoverage(backend, 128, 512) == 1.0
-        finally
-            Lava.WORKGROUP_LIMIT[] = old
+    @testset "full coverage at every size, both launch spellings" begin
+        @test Lava.WORKGROUP_LIMIT[] == 1024
+        for K in (32, 64, 128), wg in (64, 128, 256, 512, 1024)
+            @test groupcoverage(backend, K, wg; static = true) == 1.0
+            @test groupcoverage(backend, K, wg; static = false) == 1.0
         end
+    end
+
+    @testset "compile order does not change the answer" begin
+        # 256 before 512 is the order that used to poison the cache.
+        @test groupcoverage(backend, 96, 256; static = false) == 1.0
+        @test groupcoverage(backend, 96, 512; static = false) == 1.0
+        @test groupcoverage(backend, 97, 512; static = false) == 1.0
+        @test groupcoverage(backend, 97, 256; static = false) == 1.0
+    end
+
+    @testset "past the device limit it still throws" begin
+        out = KA.allocate(backend, Float16, 2048)
+        @test_throws ArgumentError wglimit_probe!(backend)(out, Val(64);
+                                                          ndrange = 2048, workgroupsize = 2048)
     end
 end

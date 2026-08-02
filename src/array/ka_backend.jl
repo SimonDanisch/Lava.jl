@@ -147,37 +147,41 @@ Adapt.adapt_storage(::Type{<:LavaArray}, a::LavaArray) = a
 
 Largest workgroup Lava will ask the device for. Requesting more throws.
 
-**Above 256 this driver silently runs fewer invocations than the shader
-declares, and the missing ones write nothing.** Measured on the RTX 4000 Ada
-(driver 595.80): one workgroup of 512, `LocalSize 512 1 1` in the SPIR-V, and
-exactly local invocations 1–256 store. At 1024 it is still 256. The grid is
-computed from the size that was *asked* for, so the output comes back with a
-periodic hole — every element whose local index is ≥ 256 keeps its old value.
+Now the device's own `maxComputeWorkGroupInvocations`. It sat at **256** for a
+long time, on a diagnosis that was wrong in an instructive way and is worth
+keeping written down.
 
-Everything that would explain it has been ruled out on a minimal reproducer
-(`test/test_workgroup_limit.jl`):
+The recorded claim was that "above 256 this driver silently runs fewer
+invocations than the shader declares" — a workgroup of 512 wrote half its output,
+1024 wrote a quarter, no error anywhere. Everything about it pointed at hardware:
+`spirv-val` passed, the SPIR-V declared `LocalSize 512 1 1`, the driver reported
+identical Register Count for a body that failed and one that did not, and it was
+body-dependent (64 simultaneously live values failed, 32 and 128 did not).
 
-  * not the index arithmetic — the participating invocations compute the right
-    global index and write the right value; only the upper lanes are absent
-  * not `spirv-opt` — the same with optimisation disabled
-  * not a stale pipeline — reproduces when that size is the first ever compiled
-  * not invalid SPIR-V — `spirv-val --target-env vulkan1.3` passes
-  * not `LocalSize` — the module is byte-identical to the working one except
-    that one execution mode, and there is no `WorkgroupSize` builtin to override it
-  * **not a resource limit** — `VK_KHR_pipeline_executable_properties` reports
-    *identical* Register Count (40), Stack Size (0), Local Memory (16) and
-    Shared Memory (0) for a body that fails at 512 and one that succeeds at 1024
+**None of it was the device.** A kernel reading `lava_local_invocation_index()`
+with an unconditional store reports every lane running and writing at 256, 384,
+512, 768 and 1024. The real cause was one line in `get_compute_pipeline`:
 
-So there is no statistic to predicate a per-shader decision on: two kernels with
-the same reported cost behave differently. What is left is a limit that holds
-for every shape measured, and 256 is it.
+    cache_key = hash((spirv_bytes, ...))
 
-Nothing in this repo is affected — `launchgroup` and `staticgroup` both target
-256, so every existing launch is at or below the limit. Raise this only after
-verifying full output coverage for the specific kernel; a bigger workgroup that
-writes three quarters of its output looks like a 4x speed-up.
+`Base.hash` on a large `Vector` *samples* elements rather than reading all of
+them. The 256- and 512-wide modules of one kernel differ at **exactly one byte**
+— the `LocalSize` operand — and collide. So the 512 launch looked up the 256
+pipeline, dispatched a 256-thread shader over a grid computed for 512, and wrote
+`256/wg` of its output. Whichever size compiled first won, which is the whole of
+the "order dependence"; whether a given body's two modules happened to collide is
+the whole of the "body dependence"; and adding an unrelated store "fixed" it by
+changing enough bytes to miss the collision.
+
+See [`spirv_content_hash`](@ref), which reads every byte. `test/test_workgroup_limit.jl`
+pins the coverage at every size on both launch spellings, and asserts directly
+that two one-byte-different modules no longer share a cache key.
+
+The lesson generalises past workgroups: **any** two SPIR-V modules differing only
+in bytes the sampling hash skips shared a pipeline. That is a silent
+wrong-results bug for any pair of kernel instantiations that differ in a literal.
 """
-const WORKGROUP_LIMIT = Ref(256)
+const WORKGROUP_LIMIT = Ref(1024)
 
 "The extents behind a KA size parameter, or `nothing` when they are dynamic."
 @inline statictuple(::Type{<:KA.NDIteration.StaticSize{S}}) where {S} = S
@@ -190,16 +194,14 @@ Loud rather than clamped: a kernel that stages into `@localmem` sizes its tile t
 the workgroup it asked for, so quietly handing it a smaller one trades a wrong
 answer for a different wrong answer.
 """
-@inline check_workgroup(::Nothing) = nothing
-@inline function check_workgroup(wg)
+@inline check_workgroup(::Nothing; static::Bool = false) = nothing
+@inline function check_workgroup(wg; static::Bool = false)
     n = prod(wg)
     n > WORKGROUP_LIMIT[] || return wg
     throw(ArgumentError("""
-        workgroupsize $wg has $n threads, above Lava's limit of $(WORKGROUP_LIMIT[]).
-        This device silently runs only part of a larger workgroup — the launch would
-        return partial output rather than fail. See `Lava.WORKGROUP_LIMIT` for the
-        measurements. If you have verified full output coverage for this kernel at
-        this size, raise it with `Lava.WORKGROUP_LIMIT[] = $n`."""))
+        workgroupsize $wg has $n threads, above Lava's limit of $(WORKGROUP_LIMIT[]),
+        which is the device's `maxComputeWorkGroupInvocations`. Asking for more is
+        a validation error, not a slow launch. See `Lava.WORKGROUP_LIMIT`."""))
 end
 
 function KA.launch_config(kernel::KA.Kernel{LavaBackend}, ndrange, workgroupsize)
@@ -232,9 +234,11 @@ function KA.launch_config(kernel::KA.Kernel{LavaBackend}, ndrange, workgroupsize
     else
         # Both spellings land here, and only one of them is in `workgroupsize`:
         # `kernel(backend, wg)` puts the size in the kernel's TYPE and passes the
-        # keyword as `nothing`, so checking the keyword alone would miss it.
-        check_workgroup(workgroupsize === nothing ? statictuple(KA.workgroupsize(kernel)) :
-                        workgroupsize)
+        # keyword as `nothing`, so checking the keyword alone would miss it. Which
+        # of the two it is also decides the cap — see `check_workgroup`.
+        static = workgroupsize === nothing
+        check_workgroup(static ? statictuple(KA.workgroupsize(kernel)) : workgroupsize;
+                        static = static)
         KA.partition(kernel, ndrange, workgroupsize)
     end
 
