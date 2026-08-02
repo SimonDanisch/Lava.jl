@@ -333,21 +333,27 @@ multiple of them is a decode that produces nothing, with no error reported.
 function video_capabilities(ctx)
     hp, pr, pl = video_profile(nothing)
     e0 = C.VkExtent2D(0, 0)
-    GC.@preserve hp pr pl begin
-        cp = Ref(C.VkVideoCapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR, C_NULL, UInt32(0),
-                 UInt64(0), UInt64(0), e0, e0, e0, UInt32(0), UInt32(0),
-                 C.VkExtensionProperties(ntuple(_ -> Cchar(0), 256), UInt32(0))))
-        GC.@preserve cp begin
-            ccall(Vk.function_pointer(ctx.instance, "vkGetPhysicalDeviceVideoCapabilitiesKHR"),
-                  Int32, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
-                  ctx.physical_device.vks, pc(pr), pc(cp))
-        end
-        c = cp[]
-        return (minBitstreamBufferOffsetAlignment = Int(c.minBitstreamBufferOffsetAlignment),
-                minBitstreamBufferSizeAlignment   = Int(c.minBitstreamBufferSizeAlignment),
-                maxDpbSlots                       = Int(c.maxDpbSlots),
-                maxActiveReferencePictures        = Int(c.maxActiveReferencePictures))
+    # A decode profile REQUIRES both VkVideoDecodeCapabilitiesKHR and the
+    # codec-specific VkVideoDecodeH264CapabilitiesKHR in the pNext chain
+    # (VUID-vkGetPhysicalDeviceVideoCapabilitiesKHR-pVideoProfile-07183/-07185).
+    # Passing C_NULL here segfaulted inside RADV, which writes the codec caps
+    # unconditionally through a chain entry that was not there.
+    hc = Ref(C.VkVideoDecodeH264CapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_CAPABILITIES_KHR, C_NULL,
+                                                C.StdVideoH264LevelIdc(0), C.VkOffset2D(0, 0)))
+    dc = Ref(C.VkVideoDecodeCapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR, pc(hc), UInt32(0)))
+    cp = Ref(C.VkVideoCapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR, pc(dc), UInt32(0),
+             UInt64(0), UInt64(0), e0, e0, e0, UInt32(0), UInt32(0),
+             C.VkExtensionProperties(ntuple(_ -> Cchar(0), 256), UInt32(0))))
+    GC.@preserve hp pr pl hc dc cp begin
+        ccall(Vk.function_pointer(ctx.instance, "vkGetPhysicalDeviceVideoCapabilitiesKHR"),
+              Int32, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+              ctx.physical_device.vks, pc(pr), pc(cp))
     end
+    c = cp[]
+    return (minBitstreamBufferOffsetAlignment = Int(c.minBitstreamBufferOffsetAlignment),
+            minBitstreamBufferSizeAlignment   = Int(c.minBitstreamBufferSizeAlignment),
+            maxDpbSlots                       = Int(c.maxDpbSlots),
+            maxActiveReferencePictures        = Int(c.maxActiveReferencePictures))
 end
 
 """
