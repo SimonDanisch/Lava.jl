@@ -515,7 +515,19 @@ function create_compute_pipeline(dev::Vulkan.Device, ci::Vulkan.ComputePipelineC
         destructor = x -> Vulkan._destroy_pipeline(parent, x)
         return Vulkan.Pipeline(raw_pipeline, destructor, dev)
     else
-        pipelines, _ = @vk_checked "vkCreateComputePipelines" Vulkan.create_compute_pipelines(dev, [ci]; pipeline_cache)
+        # The return code is NOT discardable here. VK_PIPELINE_COMPILE_REQUIRED is
+        # a SUCCESS-class code, so `@check` inside Vulkan.jl does not raise and
+        # `unwrap` returns normally — with pPipelines[1] left at VK_NULL_HANDLE.
+        # Dropping the code therefore hands back a null pipeline that segfaults
+        # later at vkCmdBindPipeline, a long way from the cause. This check used to
+        # exist only in the LARGE_STACK (Windows) branch above.
+        pipelines, code = @vk_checked "vkCreateComputePipelines" Vulkan.create_compute_pipelines(dev, [ci]; pipeline_cache)
+        if code == Vulkan.PIPELINE_COMPILE_REQUIRED
+            PIPELINE_COMPILES_REFUSED[] += 1
+            error("vkCreateComputePipelines returned VK_PIPELINE_COMPILE_REQUIRED: this " *
+                  "pipeline is NOT in the cache and would have been compiled. " *
+                  "(PIPELINE_NO_COMPILE is set; see no_pipeline_compilation.)")
+        end
         return pipelines[1]
     end
 end
