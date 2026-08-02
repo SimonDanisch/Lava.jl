@@ -204,6 +204,12 @@ end
         include(joinpath(@__DIR__, "test_logical_pointer_bitcast.jl"))
     end
 
+    # Only meaningful on a device whose subgroup width is not fixed — on wave32
+    # hardware "requested" and "default" are the same number and nothing is proved.
+    @testset "pinned subgroup width" begin
+        include(joinpath(@__DIR__, "test_subgroup_size_pinning.jl"))
+    end
+
     # The buffer-lifetime case behind the intermittent flush hang. Asserted on
     # the state machine, not by provoking the hang — see the file.
     @testset "free during recording" begin
