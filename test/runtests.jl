@@ -175,6 +175,12 @@ end
         include(joinpath(@__DIR__, "test_static_workgroup.jl"))
     end
 
+    # Catches an invalid module that the driver accepts and runs correctly, so it
+    # is invisible to every other test unless LAVA_VALIDATION=1 is set.
+    @testset "no OpBitcast on a logical pointer" begin
+        include(joinpath(@__DIR__, "test_logical_pointer_bitcast.jl"))
+    end
+
     # The buffer-lifetime case behind the intermittent flush hang. Asserted on
     # the state machine, not by provoking the hang — see the file.
     @testset "free during recording" begin
