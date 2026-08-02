@@ -90,16 +90,28 @@ below was visible until everything above it was fixed.
    That guard existing and firing is worth noting: the library already knew this
    was possible and said so precisely.
 
-Unaudited, because nothing here exercises them: `TIMESTAMP_POOL` (a
-`Vulkan.QueryPool`), `BLIT_PIPELINE`, `GEMM_SPLIT_SCRATCH`, `WORKGROUP_LIMIT`.
-Graphics and profiling are not on this path; extend the probe before trusting
-them on a second device.
+6. **`GEMM_SPLIT_SCRATCH`** — FIXED, and now exercised above. A single `Ref`
+   holding device memory: the memory pool's defect in miniature, and it would
+   only have fired on a split-K GEMM, which is why the first version of this
+   probe missed it. The probe now runs a GEMM and a reduction on each device
+   rather than a bare dispatch, because a global that only some kernels touch is
+   invisible to a probe that only runs one kernel.
+
+7. **`_REDUCE_SCRATCH`** — FIXED. It was already an `IdDict` keyed by context,
+   and still allocated its buffer on `vk_context()`. Keyed right, allocated
+   wrong — which reads as correct on any machine with one device, and is the
+   subtlest shape in this whole list.
+
+Still unaudited, because nothing on this path reaches them: `TIMESTAMP_POOL` (a
+`Vulkan.QueryPool`), `BLIT_PIPELINE` and `GFX_SHADER_CACHE` (graphics), and
+`WORKGROUP_LIMIT` (a policy limit, not a queried one). Extend the probe before
+trusting a second device for graphics or dispatch profiling.
 
 The list above was produced by RUNNING two devices. Reading produced a list of
 four caches, and **none of the four was what actually broke it.**
 """
 
-using Lava, KernelAbstractions
+using Lava, KernelAbstractions, LinearAlgebra
 const KA = KernelAbstractions
 
 @kernel function twodev!(d, s)
@@ -120,12 +132,36 @@ function probe()
     before = length(Lava.PIPELINE_CACHE)
     for (name, ctx) in (("gpu", gpu), ("cpu", cpu))
         b = LavaBackend(ctx)
+
+        # ── a dispatch, and the fill! that feeds it
         a = KA.allocate(b, Float32, 64)
         fill!(a, 1.0f0)
         twodev!(b, 64)(a, 3.0f0; ndrange = 64)
         KA.synchronize(b)
         got = Array(a)
-        println("  $name: ", all(got .== 5.0f0) ? "correct" : "WRONG ($(got[1]))")
+        ok = all(got .== 5.0f0)
+
+        # ── a reduction: `_REDUCE_SCRATCH` is keyed by context but used to
+        #    ALLOCATE on the global one, so the second device's entry held the
+        #    first device's buffer. Keyed right, allocated wrong.
+        r = Lava.vk_reduce_sum(a)
+        okr = r ≈ 64 * 5.0f0
+
+        # ── a GEMM big enough to split K: `GEMM_SPLIT_SCRATCH` was one `Ref`
+        #    holding device memory, i.e. the memory pool's defect in miniature.
+        m = 64
+        A = KA.allocate(b, Float16, m, m); fill!(A, Float16(1))
+        B = KA.allocate(b, Float16, m, m); fill!(B, Float16(2))
+        C = KA.allocate(b, Float32, m, m); fill!(C, 0.0f0)
+        LinearAlgebra.mul!(C, A, B)
+        KA.synchronize(b)
+        okg = all(Array(C) .== Float32(2 * m))
+
+        println("  $name: dispatch ", ok  ? "ok" : "WRONG ($(got[1]))",
+                "   reduce ", okr ? "ok" : "WRONG ($r)",
+                "   gemm ",   okg ? "ok" : "WRONG ($(Array(C)[1]))")
+        (ok && okr && okg) || error("$name produced a wrong result")
+        A = B = C = a = nothing
     end
 
     # The load-bearing assertion. One kernel on two devices must compile TWICE:

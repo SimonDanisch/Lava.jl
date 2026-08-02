@@ -56,7 +56,13 @@ tree-reduce path's multiple CPU readbacks.
 const _REDUCE_SCRATCH = IdDict{Any, LavaArray{Float32, 1}}()
 
 @inline function _reduce_scratch(ctx)
-    get!(() -> LavaArray{Float32}(undef, (1,); unified=true), _REDUCE_SCRATCH, ctx)
+    # `bq = ctx.default_bq`, not the default. The dict was already keyed by
+    # context, but the allocation went to `vk_context()` — so with two devices
+    # live, the entry stored under the SECOND context held a buffer belonging to
+    # the first. Keyed right, allocated wrong, which reads as correct until
+    # there are two devices.
+    get!(() -> LavaArray{Float32}(undef, (1,); unified=true, bq=(ctx::VkContext).default_bq),
+         _REDUCE_SCRATCH, ctx)
 end
 
 # Clear scratch on device reset so we don't dangle a freed buffer.

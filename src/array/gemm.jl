@@ -1052,19 +1052,35 @@ result is `sync_access!: buffer is not ALIVE`. One buffer that only ever grows
 avoids both. Callers that already own scratch (the convolution's `Workspace`)
 pass `partials` and never touch this.
 """
-const GEMM_SPLIT_SCRATCH = Ref{Any}(nothing)
+# Per device. This holds DEVICE MEMORY, so a single `Ref` shared across contexts
+# is the same defect the memory pool had: the second device is handed a buffer
+# that belongs to the first. `_REDUCE_SCRATCH` in `mapreduce.jl` was already
+# keyed this way and is the pattern followed here.
+const GEMM_SPLIT_SCRATCH = IdDict{Any, LavaArray{Float32,1}}()
 const GEMM_SPLIT_RETIRED = Any[]
 
-function splitscratch(M::Int, N::Int, splitk::Int)
+push!(RESET_CALLBACKS, function()
+    empty!(GEMM_SPLIT_SCRATCH)
+    empty!(GEMM_SPLIT_RETIRED)
+end)
+
+"""
+Scratch for a split-K GEMM's partial sums, on `C`'s own device.
+
+`C` rather than a bare size, because the buffer has to come from the device the
+GEMM will run on and only the destination knows which that is.
+"""
+function splitscratch(C, M::Int, N::Int, splitk::Int)
     n = M * N * splitk
-    buf = GEMM_SPLIT_SCRATCH[]
+    ctx = vk_context(KernelAbstractions.get_backend(C))
+    buf = get(GEMM_SPLIT_SCRATCH, ctx, nothing)
     if buf === nothing || length(buf)::Int < n
         # Retain, don't drop: dispatches already recorded point into the old
         # buffer and its finalizer would pull it out from under them. Growth is
         # geometric and stops once the largest product has been seen.
         buf === nothing || push!(GEMM_SPLIT_RETIRED, buf)
-        buf = LavaArray{Float32}(undef, n + n ÷ 2)
-        GEMM_SPLIT_SCRATCH[] = buf
+        buf = LavaArray{Float32}(undef, n + n ÷ 2; bq = ctx.default_bq)
+        GEMM_SPLIT_SCRATCH[ctx] = buf
     end
     GPUArrays.derive(Float32, buf::LavaArray{Float32,1}, (M, N, splitk), 0)
 end
@@ -1122,7 +1138,7 @@ function coopmat_gemm!(C, A, B, M::Int, N::Int, K::Int;
     span = GEMM_TILE * blk
     ntiles = (M ÷ span) * (N ÷ span)
     dst = splitk == 1 ? C :
-          (partials === nothing ? splitscratch(M, N, splitk * nbatch) : partials)
+          (partials === nothing ? splitscratch(C, M, N, splitk * nbatch) : partials)
     # A split-K plane is a PARTIAL sum, so an activation on it would be applied
     # to a fraction of the dot product and then summed — wrong, and silently so.
     # The epilogue belongs to whoever reduces the planes.
