@@ -379,14 +379,20 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         # what turns an N-component update from N spills into one.
         state.coopmat_var_contents[var_id] = id
 
-    elseif op == "mul"
-        # `OpFMul` on two cooperative matrices of the same type is defined
-        # component-wise. Nothing is materialised: it is the one way to apply a
-        # per-element factor without reaching for a component at all.
+    elseif op == "mul" || op == "add"
+        # `OpFMul` and `OpFAdd` on two cooperative matrices of the same type are
+        # defined component-wise. Nothing is materialised: this is the one way to
+        # combine two matrices without reaching for a component at all.
+        #
+        # `add` is what lets a GEMM start from a bias AND a residual — two
+        # accumulator loads, one at stride 0 for the bias broadcast and one at
+        # the residual's real leading dimension, summed before the k-loop. See
+        # `accinit`.
         a_id = get_value_id!(state, args[1])
         b_id = get_value_id!(state, args[2])
         id = fresh_id!(mod)
-        encode_instruction!(mod.functions, Op.OpFMul, mat_ty, id, a_id, b_id)
+        encode_instruction!(mod.functions, op == "mul" ? Op.OpFMul : Op.OpFAdd,
+                            mat_ty, id, a_id, b_id)
         state.value_map[inst] = id
         state.coopmat_value_types[inst] = mat_ty
 

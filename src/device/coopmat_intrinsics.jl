@@ -338,6 +338,37 @@ also what AMD's RDNA3 WMMA path gets.
     end
 end
 
+"""
+    coopmat_add(a, b) -> AcceleratedMatrix
+
+Component-wise sum — plain `OpFAdd`, which `SPV_KHR_cooperative_matrix` defines
+to act component-wise exactly as `OpFMul` does.
+
+The reason it exists: a GEMM's accumulator can be started from `bias + residual`
+rather than from zero, which makes a transformer's residual add the tensor
+cores' own accumulate instead of a separate pass over `M x N`. The two operands
+are both accumulator loads — the bias at **stride 0** so every column reads the
+same vector, the residual at its real leading dimension. See `accinit`.
+
+Same portability as `coopmat_mul`: KHR, not `VK_NV_cooperative_matrix2`.
+"""
+@generated function coopmat_add(a::AcceleratedMatrix{T,M,N,U},
+                                b::AcceleratedMatrix{T,M,N,U}) where {T,M,N,U}
+    fname = coopmat_intrinsic_name("add", T, M, N, U)
+    ir = """
+        declare i32 @$fname(i32, i32) #0
+        define i32 @entry(i32 %a, i32 %b) #0 {
+            %r = call i32 @$fname(i32 %a, i32 %b)
+            ret i32 %r
+        }
+        attributes #0 = { alwaysinline convergent }
+    """
+    quote
+        h = Base.llvmcall(($ir, "entry"), Int32, Tuple{Int32,Int32}, a.handle, b.handle)
+        AcceleratedMatrix{$T,$M,$N,$U}(h)
+    end
+end
+
 """LLVM type for a value that travels through `coopmat_keepparam`."""
 function coopmat_keep_irtype(::Type{T}) where {T}
     T <: Core.LLVMPtr && return ("ptr addrspace($(T.parameters[2]))", "p$(T.parameters[2])")
@@ -500,7 +531,7 @@ end
 for T in (Float16, Float32), U in (MatrixA, MatrixB, Accumulator),
     (M, N) in ((16, 16), (16, 8)),
     op in ("load", "store", "zero", "muladd", "loadw", "loadw2", "storew", "convert",
-           "length", "getcomp", "setcomp", "perelem", "mul")
+           "length", "getcomp", "setcomp", "perelem", "mul", "add")
     push!(KNOWN_INTRINSICS, coopmat_intrinsic_name(op, T, M, N, U))
     op in ("load", "loadw", "loadw2", "store", "storew") &&
         push!(KNOWN_INTRINSICS, coopmat_intrinsic_name(op, T, M, N, U; rowmajor = true))
