@@ -57,6 +57,40 @@ end
     """, "entry"), UInt32, Tuple{})
 end
 
+# ── 1D Builtins: subgroup size and lane index ──
+#
+# Both are 0-based hardware values and are deliberately NOT converted to Julia's
+# 1-based convention: they are lane *selectors*, and every subgroup op that
+# consumes one (shuffle, broadcast, rotate) is specified in terms of the raw
+# SPIR-V numbering. Adding one here would make `subgroup_shuffle(v, lane())`
+# read the neighbouring lane.
+#
+# `lava_subgroup_size()` is the real running width, which is 32 on this NVIDIA
+# card but 32 *or* 64 on RDNA3 depending on how the driver compiled the shader.
+# Nothing may hard-code it — see the `lane ÷ 32` note at COOPMAT_SUBGROUP.
+
+@inline function lava_subgroup_size()
+    Base.llvmcall(("""
+        @__spirv_BuiltInSubgroupSize = external addrspace(7) global i32
+        define i32 @entry() #0 {
+            %val = load i32, ptr addrspace(7) @__spirv_BuiltInSubgroupSize, align 4
+            ret i32 %val
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), UInt32, Tuple{})
+end
+
+@inline function lava_subgroup_local_id()
+    Base.llvmcall(("""
+        @__spirv_BuiltInSubgroupLocalInvocationId = external addrspace(7) global i32
+        define i32 @entry() #0 {
+            %val = load i32, ptr addrspace(7) @__spirv_BuiltInSubgroupLocalInvocationId, align 4
+            ret i32 %val
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), UInt32, Tuple{})
+end
+
 # ── Workgroup Barrier ──
 
 @inline function lava_workgroup_barrier()

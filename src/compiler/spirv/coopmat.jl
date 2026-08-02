@@ -110,6 +110,64 @@ function coopmat_base_pointer!(state::SPIRVEmitterState, addr_val::LLVM.Value,
     return ptr_id
 end
 
+
+"""
+Get or create the `Function`-storage `OpVariable` that backs component access for
+one cooperative-matrix type.
+
+SPIR-V has no "extract component N" instruction for a cooperative matrix. What it
+has is a rule that a matrix in a `Function` variable may be indexed by
+`OpAccessChain`, one index, yielding a pointer to a component — which is what
+GLSL's `mat[i]` compiles to. So component access needs somewhere to put the
+matrix, and that somewhere has to be a variable in the entry block's preamble,
+not a value.
+
+One variable per *type*, cached, and reused by every get and set: a matrix is an
+SSA value, so a variable holding one is scratch, not storage, and two different
+matrices of the same type never need to be in it at once — each access writes
+before it reads.
+"""
+function coopmat_component_var!(state::SPIRVEmitterState, mat_ty::UInt32)
+    cached = get(state.coopmat_component_vars, mat_ty, nothing)
+    cached === nothing || return cached
+    mod = state.mod
+    ptr_ty = fresh_id!(mod)
+    encode_instruction!(mod.types_constants, Op.OpTypePointer, ptr_ty,
+                        SC.Function, mat_ty)
+    var_id = fresh_id!(mod)
+    encode_instruction!(state.entry_function_locals, Op.OpVariable, ptr_ty, var_id,
+                        SC.Function)
+    state.coopmat_component_vars[mat_ty] = var_id
+    return var_id
+end
+
+"""
+Allocate the component-access variable for every matrix type this function reads
+or writes components of, **before** any block is emitted.
+
+The same hazard `prescan_function_for_rayquery!` exists for: the `OpVariable`
+words are buffered in `state.entry_function_locals` and injected into the entry
+block's preamble, so allocating one lazily from inside a loop body emits an
+`OpStore` to an id that is not defined yet. `spirv-val` catches it — "ID '96' has
+not been defined" — which is how this was found, and it is the reason this
+pre-scan is not optional.
+"""
+function prescan_function_for_coopmat_components!(state::SPIRVEmitterState,
+                                                  fn::LLVM.Function)
+    isempty(LLVM.blocks(fn)) && return nothing
+    for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+        inst isa LLVM.CallInst || continue
+        callee = LLVM.called_operand(inst)
+        callee isa LLVM.Function || continue
+        parsed = parse_coopmat_name(LLVM.name(callee))
+        parsed === nothing && continue
+        op, dtype, M, N, use, _ = parsed
+        (op == "getcomp" || op == "setcomp") || continue
+        coopmat_component_var!(state, emit_coopmat_type!(state, dtype, M, N, use))
+    end
+    return nothing
+end
+
 """
 Pointer to the tile's first element in `Workgroup` memory — the `loadw`/`storew`
 half of the intrinsics.
@@ -135,6 +193,44 @@ function coopmat_workgroup_pointer!(state::SPIRVEmitterState, ptr_val::LLVM.Valu
     id = fresh_id!(mod)
     encode_instruction!(mod.functions, Op.OpAccessChain, ptr_ty, id, src_id, idx_id)
     return id
+end
+
+"""
+    coopmat_spill_once!(state, var_id, m_id) -> nothing
+
+Put matrix `m_id` into the component variable `var_id`, unless it is already
+there.
+
+A cooperative matrix can only be indexed through a `Function`-storage variable,
+so both `getcomp` and `setcomp` have to spill the whole tile before they can
+reach one component. Done literally that is quadratic in the obvious usage: an
+epilogue or a rescale that touches all `n` components spills and reloads the
+entire matrix `n` times to change `n` values.
+
+**This is worth doing and it bought no measured time.** It was built to explain
+why holding SAM 2's attention `O` in accumulators loses, and it does not: the
+flash kernel measured 4.955 ms before and 4.950 after, the GEMM's gelu epilogue
+is unchanged at 255 registers, and the real cause turned out to be occupancy
+(see `DNNKernels`' `FLASHCM_HELD`). NVIDIA's shader compiler evidently coalesces
+these stores itself. Kept because emitting `n` stores of a tile to change `n` of
+its components is indefensible on its own terms and another driver need not be as
+forgiving — but do not expect it to move a number, and do not let its existence
+imply it once did.
+
+The variable is scratch and only these two ops write it, so within a basic block
+its contents are known exactly. `setcomp` records the value it loaded back, and
+the next access on that value finds it already resident and emits nothing. What
+remains is one store, `n` access-chain pairs, and one load — the loads in between
+have no consumer left and the driver drops them.
+
+Sound only inside one block: `emit_block!` clears the tracking at every
+`OpLabel`, because a branch can arrive with the variable holding anything.
+"""
+function coopmat_spill_once!(state::SPIRVEmitterState, var_id::UInt32, m_id::UInt32)
+    get(state.coopmat_var_contents, var_id, nothing) === m_id && return nothing
+    encode_instruction!(state.mod.functions, Op.OpStore, var_id, m_id)
+    state.coopmat_var_contents[var_id] = m_id
+    return nothing
 end
 
 """
@@ -239,8 +335,168 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         state.value_map[inst] = id
         state.coopmat_value_types[inst] = mat_ty
 
+    elseif op == "length"
+        # Takes the matrix TYPE, not a value — the component count is a property
+        # of how the implementation splits the type across the subgroup.
+        u32 = emit_type_int!(mod, UInt32(32), UInt32(0))
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpCooperativeMatrixLengthKHR,
+                            u32, id, mat_ty)
+        state.value_map[inst] = id
+
+    elseif op == "getcomp"
+        comp_ty = coopmat_component_type!(state, dtype)
+        var_id = coopmat_component_var!(state, mat_ty)
+        m_id = get_value_id!(state, args[1])
+        i_id = get_value_id!(state, args[2])
+        coopmat_spill_once!(state, var_id, m_id)
+        ptr_ty = map_pointer_type!(state.type_ctx, comp_ty, SC.Function)
+        ptr_id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpAccessChain, ptr_ty, ptr_id,
+                            var_id, i_id)
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpLoad, comp_ty, id, ptr_id)
+        state.value_map[inst] = id
+
+    elseif op == "setcomp"
+        comp_ty = coopmat_component_type!(state, dtype)
+        var_id = coopmat_component_var!(state, mat_ty)
+        m_id = get_value_id!(state, args[1])
+        i_id = get_value_id!(state, args[2])
+        v_id = get_value_id!(state, args[3])
+        coopmat_spill_once!(state, var_id, m_id)
+        ptr_ty = map_pointer_type!(state.type_ctx, comp_ty, SC.Function)
+        ptr_id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpAccessChain, ptr_ty, ptr_id,
+                            var_id, i_id)
+        encode_instruction!(mod.functions, Op.OpStore, ptr_id, v_id)
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpLoad, mat_ty, id, var_id)
+        state.value_map[inst] = id
+        state.coopmat_value_types[inst] = mat_ty
+        # The variable now holds what this load produced, so a `getcomp` or a
+        # further `setcomp` on the result needs no store of its own. This is
+        # what turns an N-component update from N spills into one.
+        state.coopmat_var_contents[var_id] = id
+
+    elseif op == "mul"
+        # `OpFMul` on two cooperative matrices of the same type is defined
+        # component-wise. Nothing is materialised: it is the one way to apply a
+        # per-element factor without reaching for a component at all.
+        a_id = get_value_id!(state, args[1])
+        b_id = get_value_id!(state, args[2])
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpFMul, mat_ty, id, a_id, b_id)
+        state.value_map[inst] = id
+        state.coopmat_value_types[inst] = mat_ty
+
+    elseif op == "perelem"
+        # `OpCooperativeMatrixPerElementOpNV` — apply a function to every element
+        # of the matrix, with the element's (row, column) handed to it.
+        #
+        # The whole point is that the driver reaches the elements itself. Written
+        # with `getcomp`/`setcomp` the same rescale costs a `Function`-storage
+        # variable holding the entire tile, which on SAM 2's attention took the
+        # kernel from 123 registers to 192 and so from two resident workgroups per
+        # SM to one — see `FLASHCM_HELD` in DNNKernels.
+        #
+        # The callback travels as the SECOND argument, and it is not a value: it
+        # is a *call* to the callback, placed there by `coopmat_perelement` purely
+        # so the callee appears in the LLVM call graph. `emit_call!` drops that
+        # call (see `coopmat_perelement_marker`); here we resolve it back to the
+        # callee's SPIR-V function id, which `spirv_from_llvm!` pre-allocated for
+        # every function with a body.
+        require_capability!(mod, Cap.CooperativeMatrixPerElementOperationsNV)
+        require_extension!(mod, "SPV_NV_cooperative_matrix2")
+        m_id = get_value_id!(state, args[1])
+        marker = args[2]
+        marker isa LLVM.CallInst ||
+            error("cooperative-matrix per-element callback did not survive as a call; " *
+                  "the callback must be a top-level `@noinline` function of " *
+                  "(::UInt32, ::UInt32, ::$dtype), not a closure")
+        callee = LLVM.called_operand(marker)
+        callee isa LLVM.Function ||
+            error("cooperative-matrix per-element callback is an indirect call")
+        func_id = get(state.value_map, callee, nothing)
+        func_id === nothing &&
+            error("cooperative-matrix per-element callback $(LLVM.name(callee)) has no " *
+                  "SPIR-V function; it was probably inlined away")
+        # Everything the callback needs beyond (row, col, element) rides along as
+        # a trailing operand. They are read off the marker call, where they are
+        # the real values — only the first three arguments there are dummies.
+        # A CallInst's operand list ends with the callee, hence `end - 1`.
+        margs = LLVM.operands(marker)
+        extras = UInt32[get_value_id!(state, margs[k]) for k in 4:(length(margs) - 1)]
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpCooperativeMatrixPerElementOpNV,
+                            mat_ty, id, m_id, func_id, extras...)
+        state.value_map[inst] = id
+        state.coopmat_value_types[inst] = mat_ty
+
     else
         error("unknown cooperative-matrix op: $op")
+    end
+    return nothing
+end
+
+"""
+    coopmat_perelement_marker(inst) -> Bool
+
+True when `inst` exists only to name the callback of an
+`OpCooperativeMatrixPerElementOpNV`, and must therefore not be emitted as a call.
+
+There is no way to hand an LLVM function to `Base.llvmcall` as an operand, so
+`coopmat_perelement` calls the callback once, with `(0, 0, zero(T))`, and passes
+the result to the intrinsic. That call is a *marker*: it puts the callee in the
+call graph so the emitter gives it an `OpFunction`, and its value is never used
+for anything else. Emitting it as well would run the callback an extra time per
+matrix, inside the loop the whole exercise is meant to make cheaper.
+
+Deliberately narrow: the call is dropped only when **every** use of it is a
+per-element intrinsic. A callback whose result is genuinely used elsewhere keeps
+its call, and the pattern degrades to a redundant evaluation rather than to a
+missing one.
+"""
+function coopmat_perelement_marker(inst::LLVM.CallInst)
+    callee = LLVM.called_operand(inst)
+    callee isa LLVM.Function || return false
+    startswith(LLVM.name(callee), "_lava_") && return false
+    n = 0
+    for use in LLVM.uses(inst)
+        user = LLVM.user(use)
+        user isa LLVM.CallInst || return false
+        target = LLVM.called_operand(user)
+        target isa LLVM.Function || return false
+        parsed = parse_coopmat_name(LLVM.name(target))
+        (parsed !== nothing && parsed[1] == "perelem") || return false
+        n += 1
+    end
+    return n > 0
+end
+
+"""
+    collect_perelement_callbacks!(state, llvm_mod) -> nothing
+
+Record every function that an `OpCooperativeMatrixPerElementOpNV` will name.
+
+Runs over the whole module before any function is emitted, because a callback is
+emitted *ahead of* the entry function that names it and `emit_function!` has to
+already know not to mark it `DontInline`. See `perelement_callbacks`.
+"""
+function collect_perelement_callbacks!(state::SPIRVEmitterState, llvm_mod::LLVM.Module)
+    for fn in LLVM.functions(llvm_mod)
+        isempty(LLVM.blocks(fn)) && continue
+        for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+            inst isa LLVM.CallInst || continue
+            callee = LLVM.called_operand(inst)
+            callee isa LLVM.Function || continue
+            parsed = parse_coopmat_name(LLVM.name(callee))
+            (parsed !== nothing && parsed[1] == "perelem") || continue
+            marker = LLVM.operands(inst)[2]
+            marker isa LLVM.CallInst || continue
+            cb = LLVM.called_operand(marker)
+            cb isa LLVM.Function && push!(state.perelement_callbacks, cb)
+        end
     end
     return nothing
 end

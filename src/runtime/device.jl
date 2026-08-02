@@ -202,6 +202,40 @@ function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32, 
 end
 
 """
+    CoopMat2Caps
+
+The sub-features of `VK_NV_cooperative_matrix2`, as enabled on this device.
+`available` is false when the extension itself is missing, in which case every
+other field is false too — so a kernel may test the single field it needs.
+
+The extension is NVIDIA-only. On AMD (RDNA3 exposes WMMA through the portable
+`VK_KHR_cooperative_matrix`) all of these are false and kernels must fall back
+to the plain KHR path, which is the one that ships today.
+
+| field | what it adds | who wants it |
+|:--|:--|:--|
+| `workgroup_scope` | matrices spanning the whole workgroup, not one subgroup | wider GEMM tiles |
+| `flexible_dimensions` | M/N/K free of the driver's fixed shape list | `E = 72` without padding to 80 |
+| `reductions` | row/column reduce on an accumulator in place | flash softmax row max/sum |
+| `conversions` | element conversion without a round trip through memory | mixed-precision staging |
+| `per_element_operations` | a callback per element, given `(row, col)` | the flash rescale of a held `O` |
+| `tensor_addressing` | a tensor descriptor drives the addressing | hand-coded root+stride staging |
+| `block_loads` | load a tile straight from a descriptor | ditto |
+"""
+struct CoopMat2Caps
+    available::Bool
+    workgroup_scope::Bool
+    flexible_dimensions::Bool
+    reductions::Bool
+    conversions::Bool
+    per_element_operations::Bool
+    tensor_addressing::Bool
+    block_loads::Bool
+end
+
+CoopMat2Caps() = CoopMat2Caps(false, false, false, false, false, false, false, false)
+
+"""
     VkContext
 
 Persistent Vulkan context. Batch-based command recording goes through
@@ -259,6 +293,23 @@ mutable struct VkContext
     coopmat_available::Bool
     coopmat_shapes::Vector{NamedTuple{(:M, :N, :K, :ab_type, :c_type, :scope),
                                       Tuple{Int, Int, Int, UInt32, UInt32, UInt32}}}
+    # VK_NV_cooperative_matrix2, per sub-feature. NVIDIA-only; every kernel that
+    # branches on one of these must keep a path that runs with all of them false,
+    # because that is what AMD (RDNA3 WMMA via the plain KHR extension) gets.
+    coopmat2::CoopMat2Caps
+    # VK_NV_cooperative_vector: matrix x vector at subgroup scope, for the shapes
+    # where a cooperative *matrix* would waste most of its tile (`Lq = 23`).
+    # NVIDIA-only.
+    coopvec_available::Bool
+    # VK_KHR_shader_maximal_reconvergence + VK_KHR_shader_subgroup_uniform_control_flow.
+    # Together they make a spin-wait on a shared flag well-defined, which is how
+    # a producer/consumer (warp-specialised) kernel is written without Vulkan
+    # having named barriers. KHR, so RDNA3 has them too.
+    maximal_reconvergence_available::Bool
+    subgroup_uniform_control_flow_available::Bool
+    # VK_KHR_shader_subgroup_rotate: OpGroupNonUniformRotateKHR, a shuffle by a
+    # subgroup-uniform delta. KHR, promoted to Vulkan 1.4.
+    subgroup_rotate_available::Bool
     # Whether VK_EXT_memory_budget is enabled. When true, OOM error reporting
     # queries the driver's real per-heap budget vs usage via
     # VkPhysicalDeviceMemoryBudgetPropertiesEXT.
@@ -308,6 +359,11 @@ mutable struct VkContext
                        ser_available::Bool=false,
                        coopmat_available::Bool=false,
                        coopmat_shapes=nothing,
+                       coopmat2::CoopMat2Caps=CoopMat2Caps(),
+                       coopvec_available::Bool=false,
+                       maximal_reconvergence_available::Bool=false,
+                       subgroup_uniform_control_flow_available::Bool=false,
+                       subgroup_rotate_available::Bool=false,
                        memory_budget_available::Bool=false,
                        external_memory_available::Bool=false,
                        gpu_assisted::Bool=false,
@@ -337,6 +393,11 @@ mutable struct VkContext
         ctx.coopmat_available = coopmat_available
         ctx.coopmat_shapes = coopmat_shapes === nothing ?
             eltype(fieldtype(VkContext, :coopmat_shapes))[] : coopmat_shapes
+        ctx.coopmat2 = coopmat2
+        ctx.coopvec_available = coopvec_available
+        ctx.maximal_reconvergence_available = maximal_reconvergence_available
+        ctx.subgroup_uniform_control_flow_available = subgroup_uniform_control_flow_available
+        ctx.subgroup_rotate_available = subgroup_rotate_available
         ctx.memory_budget_available = memory_budget_available
         ctx.external_memory_available = external_memory_available
         ctx.video_decode_available = video_decode_available
@@ -687,6 +748,22 @@ function init_vulkan!()
     #
     # Uses the portable VK_KHR_cooperative_matrix.
     has_coopmat = has_extension(phys_dev, "VK_KHR_cooperative_matrix")
+    # VK_NV_cooperative_matrix2 layers per-element operations, row reductions,
+    # flexible dimensions and tensor addressing onto the KHR matrices. Which of
+    # its seven sub-features are actually on is read back below, after device
+    # creation, rather than assumed from the extension being present.
+    # NVIDIA-only; kernels keep their KHR path for everyone else.
+    has_coopmat2 = has_coopmat && has_extension(phys_dev, "VK_NV_cooperative_matrix2")
+    # Matrix x vector at subgroup scope. Wanted for the shapes where a
+    # cooperative matrix wastes most of its tile. NVIDIA-only.
+    has_coopvec = has_extension(phys_dev, "VK_NV_cooperative_vector")
+    # A defined reconvergence point (KHR, and RDNA3 has it). Needed before a
+    # kernel may spin on a shared flag, i.e. before producer/consumer staging.
+    has_max_reconv = has_extension(phys_dev, "VK_KHR_shader_maximal_reconvergence")
+    has_subgroup_ucf = has_extension(phys_dev, "VK_KHR_shader_subgroup_uniform_control_flow")
+    # OpGroupNonUniformRotateKHR: shuffle by a subgroup-uniform delta, which is
+    # the cheap form of a butterfly reduction. KHR, promoted to Vulkan 1.4.
+    has_subgroup_rotate = has_extension(phys_dev, "VK_KHR_shader_subgroup_rotate")
 
     # Device extensions
     extensions = String[
@@ -724,6 +801,21 @@ function init_vulkan!()
     end
     if has_coopmat
         push!(extensions, "VK_KHR_cooperative_matrix")
+    end
+    if has_coopmat2
+        push!(extensions, "VK_NV_cooperative_matrix2")
+    end
+    if has_coopvec
+        push!(extensions, "VK_NV_cooperative_vector")
+    end
+    if has_max_reconv
+        push!(extensions, "VK_KHR_shader_maximal_reconvergence")
+    end
+    if has_subgroup_ucf
+        push!(extensions, "VK_KHR_shader_subgroup_uniform_control_flow")
+    end
+    if has_subgroup_rotate
+        push!(extensions, "VK_KHR_shader_subgroup_rotate")
     end
     # External-memory export (opaque fds for GL/other-API interop). Enabling
     # the extension has no effect until an ExternalImage is created.
@@ -909,6 +1001,71 @@ function init_vulkan!()
         )
         feature_chain = cm_features
     end
+    # Ask the driver which sub-features it actually has before requesting them:
+    # `vkCreateDevice` fails outright if a feature struct turns on a bit the
+    # device does not support, and an advertised extension does not imply
+    # every bit. Everything below follows that shape.
+    coopmat2_caps = CoopMat2Caps()
+    if has_coopmat2
+        q = Vulkan.get_physical_device_features_2(phys_dev,
+            Vulkan.PhysicalDeviceCooperativeMatrix2FeaturesNV).next
+        coopmat2_caps = CoopMat2Caps(
+            true,
+            q.cooperative_matrix_workgroup_scope,
+            q.cooperative_matrix_flexible_dimensions,
+            q.cooperative_matrix_reductions,
+            q.cooperative_matrix_conversions,
+            q.cooperative_matrix_per_element_operations,
+            q.cooperative_matrix_tensor_addressing,
+            q.cooperative_matrix_block_loads,
+        )
+        feature_chain = Vulkan.PhysicalDeviceCooperativeMatrix2FeaturesNV(
+            coopmat2_caps.workgroup_scope,
+            coopmat2_caps.flexible_dimensions,
+            coopmat2_caps.reductions,
+            coopmat2_caps.conversions,
+            coopmat2_caps.per_element_operations,
+            coopmat2_caps.tensor_addressing,
+            coopmat2_caps.block_loads;
+            next=feature_chain
+        )
+    end
+    if has_coopvec
+        q = Vulkan.get_physical_device_features_2(phys_dev,
+            Vulkan.PhysicalDeviceCooperativeVectorFeaturesNV).next
+        has_coopvec = q.cooperative_vector
+        if has_coopvec
+            feature_chain = Vulkan.PhysicalDeviceCooperativeVectorFeaturesNV(
+                true,                             # cooperative_vector
+                q.cooperative_vector_training;    # (inference-only is legal)
+                next=feature_chain
+            )
+        end
+    end
+    if has_max_reconv
+        q = Vulkan.get_physical_device_features_2(phys_dev,
+            Vulkan.PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR).next
+        has_max_reconv = q.shader_maximal_reconvergence
+        has_max_reconv && (feature_chain =
+            Vulkan.PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR(true; next=feature_chain))
+    end
+    if has_subgroup_ucf
+        q = Vulkan.get_physical_device_features_2(phys_dev,
+            Vulkan.PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR).next
+        has_subgroup_ucf = q.shader_subgroup_uniform_control_flow
+        has_subgroup_ucf && (feature_chain =
+            Vulkan.PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR(true; next=feature_chain))
+    end
+    if has_subgroup_rotate
+        q = Vulkan.get_physical_device_features_2(phys_dev,
+            Vulkan.PhysicalDeviceShaderSubgroupRotateFeaturesKHR).next
+        has_subgroup_rotate = q.shader_subgroup_rotate
+        has_subgroup_rotate && (feature_chain =
+            Vulkan.PhysicalDeviceShaderSubgroupRotateFeaturesKHR(
+                true,                             # shader_subgroup_rotate
+                q.shader_subgroup_rotate_clustered;
+                next=feature_chain))
+    end
 
     # Enable shader int64, float64, geometry/tessellation shaders, wide lines
     core_features = Vulkan.PhysicalDeviceFeatures(
@@ -1016,6 +1173,11 @@ function init_vulkan!()
         has_ser,
         has_coopmat,
         coopmat_shapes,
+        coopmat2_caps,
+        has_coopvec,
+        has_max_reconv,
+        has_subgroup_ucf,
+        has_subgroup_rotate,
         has_memory_budget,
         has_external_memory,
         gpu_assisted,

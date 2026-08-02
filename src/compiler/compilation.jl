@@ -223,7 +223,10 @@ function dump_spirv_to_disk(spirv_bytes::Vector{UInt8},
     dir = get(ENV, "LAVA_SPIRV_DUMP_DIR", "")
     isempty(dir) && return nothing
     isdir(dir) || mkpath(dir)
-    h = string(hash(spirv_bytes); base=16, pad=16)
+    # `spirv_content_hash`, not `hash` — the sampling hash collides for modules
+    # that differ in a few bytes, so two distinct dumps used to overwrite each
+    # other and a triage session would compare a file with itself.
+    h = string(spirv_content_hash(spirv_bytes); base=16, pad=16)
     sanitize(s) = replace(s, r"[^A-Za-z0-9_]" => "_")
     # Mangled GPUCompiler names can run to several hundred chars (every
     # type parameter is encoded in the symbol).  Filesystems cap filenames
@@ -1883,6 +1886,8 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
         end
     end
 
+    collect_perelement_callbacks!(state, llvm_mod)
+
     # Emit global variables (if any — needed for builtin inputs, etc.)
     interface_ids = emit_globals!(state, llvm_mod)
 
@@ -2235,6 +2240,15 @@ const SPIRV_BUILTIN_MAP = Dict{String, UInt32}(
     "__spirv_BuiltInNumWorkgroups"        => BuiltIn.NumWorkgroups,
     "__spirv_BuiltInWorkgroupSize"        => BuiltIn.WorkgroupSize,
     "__spirv_BuiltInLocalInvocationIndex" => BuiltIn.LocalInvocationIndex,
+    # Both need Cap.GroupNonUniform, added by `emit_builtin_global!` below.
+    "__spirv_BuiltInSubgroupSize"              => BuiltIn.SubgroupSize,
+    "__spirv_BuiltInSubgroupLocalInvocationId" => BuiltIn.SubgroupLocalInvocationId,
+)
+
+# Builtins that are not Vulkan 1.0 core and carry a capability requirement.
+const SPIRV_BUILTIN_CAPABILITY = Dict{String, UInt32}(
+    "__spirv_BuiltInSubgroupSize"              => Cap.GroupNonUniform,
+    "__spirv_BuiltInSubgroupLocalInvocationId" => Cap.GroupNonUniform,
 )
 
 """
@@ -2265,6 +2279,9 @@ function emit_builtin_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariable)
 
     # Add BuiltIn decoration
     emit_decorate!(mod, var_id, Dec.BuiltIn, builtin_id)
+
+    cap = get(SPIRV_BUILTIN_CAPABILITY, gv_name, nothing)
+    cap === nothing || require_capability!(mod, cap)
 
     # Add debug name
     emit_name!(mod, var_id, gv_name)

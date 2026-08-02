@@ -92,6 +92,35 @@ mutable struct SPIRVEmitterState
     # that derives a SPIR-V type from the LLVM type (phis above all) has to
     # consult this instead, or it emits `OpPhi %uint` over coopmat operands.
     coopmat_value_types::Dict{LLVM.Value, UInt32}
+    # `Function`-storage OpVariable backing component access, keyed by matrix
+    # type id. SPIR-V can only index a cooperative matrix through a variable, so
+    # `getcomp`/`setcomp` need one; it is scratch, written before every read, so
+    # one per type is enough. Reset per function alongside the ray-query var.
+    coopmat_component_vars::Dict{UInt32, UInt32}
+    # Which matrix value each of those variables currently holds, keyed by
+    # variable id. `getcomp`/`setcomp` each began by storing the whole matrix
+    # into the variable, so a loop that touches N components spilled and
+    # reloaded the entire tile N times to change N values — 1.93 ms of SAM 2's
+    # attention, and the reason holding `O` in accumulators lost. A chain of
+    # accesses on the same value now stores once: the second `getcomp` sees the
+    # variable already holds its operand and skips the store, which leaves the
+    # intermediate `OpLoad`s unused for the driver to drop.
+    #
+    # Cleared at every `OpLabel`. The tracking is only sound inside one basic
+    # block, since a branch can arrive with the variable holding anything.
+    coopmat_var_contents::Dict{UInt32, UInt32}
+    # LLVM functions that are the callback of an `OpCooperativeMatrixPerElementOpNV`.
+    # Filled by `collect_perelement_callbacks!` before any function is emitted,
+    # because the callback is emitted *before* the entry function that names it.
+    #
+    # They exist as separate functions only so the instruction has something to
+    # point at, and the driver is meant to inline them — so this set is what stops
+    # `emit_function!` stamping them `DontInline`, which it otherwise would:
+    # `coopmat_perelement`'s thunk is `@noinline` in Julia for the sole purpose of
+    # surviving as a function. Left as `DontInline` the driver honours it and pays
+    # a real call per element; on SAM 2's global attention that was 5.525 ms
+    # against the portable path's 4.938, i.e. the feature reading as a 12% loss.
+    perelement_callbacks::Set{LLVM.Function}
     # ── Ray-query state (compute kernels with enable_ray_query=true) ──
     # Cached OpTypeRayQueryKHR id, allocated lazily.
     ray_query_type_id::Union{Nothing, UInt32}
@@ -178,6 +207,9 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         false,
         Dict{Tuple{String, Int, Int, UInt32}, UInt32}(),  # coopmat types
         Dict{LLVM.Value, UInt32}(),                       # coopmat-typed values
+        Dict{UInt32, UInt32}(),                           # coopmat component vars
+        Dict{UInt32, UInt32}(),                           # coopmat var contents
+        Set{LLVM.Function}(),                             # per-element callbacks
         nothing, nothing, UInt32[], UInt32[],  # ray-query state
         nothing,  # gfx_io
         Dict{Tuple{UInt32, UInt32}, UInt32}(), UInt32(0),
@@ -526,6 +558,11 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
     empty!(state.deferred_phis)
     empty!(state.psb_ptr_to_u64)
     state.current_ray_query_var = nothing
+    # Same reasoning as the ray-query variable: the OpVariable lives in THIS
+    # function's preamble, so carrying the id across functions would reference
+    # a variable that is not in scope.
+    empty!(state.coopmat_component_vars)
+    empty!(state.coopmat_var_contents)
     empty!(state.entry_function_locals)
 
     # Pre-scan: if the function uses ray-query intrinsics, eagerly allocate the
@@ -534,6 +571,7 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
     # this, the first lazy allocation happens deep inside a non-first block and
     # would produce an OpVariable referenced before its definition.
     prescan_function_for_rayquery!(state, fn)
+    prescan_function_for_coopmat_components!(state, fn)
 
     fn_ty = LLVM.function_type(fn)
     ret_ty = LLVM.return_type(fn_ty)
@@ -576,10 +614,16 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
     # inliner to leave the function alone, preserving the call boundary the
     # author asked for. Without it, spirv-opt's `-O` pipeline inlines small
     # helpers and the multi-OpFunction split disappears at the SPIR-V level.
+    #
+    # A per-element callback is the exception and gets `Inline` instead: it is
+    # `@noinline` in Julia only so it survives as a function for
+    # `OpCooperativeMatrixPerElementOpNV` to name, and the driver is supposed to
+    # inline it into its own element loop. See `perelement_callbacks`.
     noinline_kind = LLVM.API.LLVMGetEnumAttributeKindForName("noinline", 8)
     has_noinline = any(a -> a isa LLVM.EnumAttribute && LLVM.kind(a) == noinline_kind,
                         collect(LLVM.function_attributes(fn)))
-    fc = (is_entry || !has_noinline) ? FuncControl.None : FuncControl.DontInline
+    fc = fn in state.perelement_callbacks ? FuncControl.Inline :
+         (is_entry || !has_noinline) ? FuncControl.None : FuncControl.DontInline
     encode_instruction!(state.mod.functions, Op.OpFunction, ret_spirv, func_id, fc, func_type_id)
 
     # OpFunctionParameter for each parameter
@@ -670,7 +714,17 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
         if !entry_label_emitted
             entry_label_emitted = true
             if !isempty(state.entry_function_locals)
-                append!(preamble_words, state.entry_function_locals)
+                # PREPEND, not append. `preamble_words` is already
+                # `[alloca OpVariables..., @localmem unwrapping OpAccessChains...]`,
+                # and SPIR-V requires *all* `OpVariable` in a function to be the
+                # first instructions of the first block — appending puts these
+                # after the access chains and `spirv-val` rejects the module
+                # ("All OpVariable instructions in a function must be the first
+                # instructions in the first block"). Latent until now because the
+                # only user was the ray-query variable, and a ray-query kernel
+                # has no `@localmem` to unwrap; a cooperative-matrix component
+                # variable in a staged GEMM has both.
+                prepend!(preamble_words, state.entry_function_locals)
             end
             if !isempty(preamble_words)
                 # The entry block's OpLabel was emitted at `entry_label_pos`.
@@ -717,6 +771,10 @@ function emit_block!(state::SPIRVEmitterState, bb::LLVM.BasicBlock)
 
     # Track current block for PSB conversion cache
     state.current_block_label = label_id
+
+    # A new block may be reached from anywhere, so nothing is known about what
+    # the cooperative-matrix component variables hold. See the field's comment.
+    empty!(state.coopmat_var_contents)
 
     # Reset RT block termination flag for this block
     state.rt_block_terminated = false
@@ -6487,6 +6545,10 @@ end
 function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     called = LLVM.called_operand(inst)
 
+    # A call that exists only to name a cooperative-matrix per-element callback
+    # is not a call. See `coopmat_perelement_marker`.
+    coopmat_perelement_marker(inst) && return nothing
+
     if called isa LLVM.Function
         fn_name = LLVM.name(called)
 
@@ -6509,6 +6571,12 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
         # Cooperative matrix → OpCooperativeMatrix{Load,Store,MulAdd}KHR
         if startswith(fn_name, "_lava_coopmat_")
             return emit_coopmat_call!(state, inst, fn_name)
+        end
+
+        # A parameter pinned against dead-argument elimination: the call exists
+        # only so LLVM keeps the argument. See `coopmat_keepparam`.
+        if startswith(fn_name, "_lava_keepparam_")
+            return nothing
         end
 
         # Check for RT intrinsics → OpTraceRayKHR, payload load/store
@@ -6736,6 +6804,46 @@ function emit_lava_subgroup!(state::SPIRVEmitterState, inst::LLVM.CallInst, name
             result_ty, result_id, subgroup_scope_id, pred_id)
         state.value_map[inst] = result_id
         return
+    end
+
+    # ── Shuffle family (value from a *named* lane → this lane) ──
+    # All five take (value, lane-selector) and differ only in how the selector
+    # is read.  `broadcast` needs its id to be dynamically uniform; the other
+    # four accept a per-lane selector.  Reading an inactive lane is undefined,
+    # which is why these are `convergent` on the Julia side.
+    #
+    #   shuffle(v, id)       lane `id`                          absolute
+    #   shuffle_xor(v, mask) lane `laneid ⊻ mask`                butterfly
+    #   shuffle_up(v, d)     lane `laneid - d`, clamped          scan
+    #   shuffle_down(v, d)   lane `laneid + d`, clamped          scan
+    #   rotate(v, d)         lane `(laneid + d) % subgroupSize`  wraps
+    #
+    # `up`/`down` returning an *undefined* value rather than clamping when the
+    # source lane is out of range is the trap here — the SPIR-V spec says the
+    # result is undefined, not zero, so a reduction built on them has to mask.
+    # `shuffle_xor` and `rotate` never leave the subgroup and need no mask.
+    let m = match(r"^_lava_subgroup_(shuffle_xor|shuffle_up|shuffle_down|shuffle|rotate|broadcast)_[a-z0-9]+$", name)
+        if m !== nothing
+            kindname = m.captures[1]
+            opcode, cap = kindname == "shuffle"      ? (Op.OpGroupNonUniformShuffle,     Cap.GroupNonUniformShuffle) :
+                          kindname == "shuffle_xor"  ? (Op.OpGroupNonUniformShuffleXor,  Cap.GroupNonUniformShuffle) :
+                          kindname == "shuffle_up"   ? (Op.OpGroupNonUniformShuffleUp,   Cap.GroupNonUniformShuffleRelative) :
+                          kindname == "shuffle_down" ? (Op.OpGroupNonUniformShuffleDown, Cap.GroupNonUniformShuffleRelative) :
+                          kindname == "rotate"       ? (Op.OpGroupNonUniformRotateKHR,   Cap.GroupNonUniformRotateKHR) :
+                                                       (Op.OpGroupNonUniformBroadcast,   Cap.GroupNonUniformBallot)
+            if kindname == "rotate"
+                require_extension!(state.mod, "SPV_KHR_subgroup_rotate")
+            end
+            require_capability!(state.mod, cap)
+            result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+            result_id = fresh_id!(state.mod)
+            val_id = get_value_id!(state, ops[1])
+            sel_id = get_value_id!(state, ops[2])
+            encode_instruction!(state.mod.functions, opcode,
+                result_ty, result_id, subgroup_scope_id, val_id, sel_id)
+            state.value_map[inst] = result_id
+            return
+        end
     end
 
     # ── All/Any boolean vote ──

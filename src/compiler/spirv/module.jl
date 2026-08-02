@@ -162,6 +162,10 @@ module Op
     const OpGroupNonUniformShuffleXor           = UInt16(346)
     const OpGroupNonUniformShuffleUp            = UInt16(347)
     const OpGroupNonUniformShuffleDown          = UInt16(348)
+    # SPV_KHR_subgroup_rotate: shuffle by a *delta*, where the source lane wraps
+    # inside the subgroup (or inside a cluster). ShuffleUp/Down clamp instead of
+    # wrapping, so a butterfly reduction needs this one or ShuffleXor.
+    const OpGroupNonUniformRotateKHR            = UInt16(4431)
     const OpGroupNonUniformIAdd                 = UInt16(349)
     const OpGroupNonUniformFAdd                 = UInt16(350)
     const OpGroupNonUniformIMul                 = UInt16(351)
@@ -215,6 +219,13 @@ module Op
     const OpCooperativeMatrixStoreKHR                     = UInt16(4458)
     const OpCooperativeMatrixMulAddKHR                    = UInt16(4459)
     const OpCooperativeMatrixLengthKHR                    = UInt16(4460)
+    # SPV_NV_cooperative_matrix2. Both take a *function* <id> as an operand:
+    #   OpCooperativeMatrixReduceNV     %type %res %matrix <reduce-mask literal> %func
+    #   OpCooperativeMatrixPerElementOpNV %type %res %matrix %func [%extra...]
+    # Numbers taken from what glslang emits for `coopMatPerElementNV` /
+    # `coopMatReduceNV`, not from a remembered table.
+    const OpCooperativeMatrixReduceNV                     = UInt16(5366)
+    const OpCooperativeMatrixPerElementOpNV               = UInt16(5369)
     # VK_KHR_ray_query opcodes (SPV_KHR_ray_query)
     const OpTypeRayQueryKHR                               = UInt16(4472)
     const OpRayQueryInitializeKHR                         = UInt16(4473)
@@ -306,6 +317,14 @@ module Cap
     const GroupNonUniformShuffleRelative = UInt32(66)
     const GroupNonUniformClustered      = UInt32(67)
     const GroupNonUniformQuad           = UInt32(68)
+    # SPV_KHR_subgroup_rotate (promoted to Vulkan 1.4). Needs the extension
+    # declared as well as the capability.
+    const GroupNonUniformRotateKHR      = UInt32(6026)
+    # SPV_NV_cooperative_matrix2. Each sub-feature is a separate capability and
+    # each has its own VkPhysicalDeviceCooperativeMatrix2FeaturesNV bit; see
+    # `CoopMat2Caps` in runtime/device.jl. NVIDIA-only.
+    const CooperativeMatrixReductionsNV            = UInt32(5430)
+    const CooperativeMatrixPerElementOperationsNV  = UInt32(5432)
     const RayQueryKHR                   = UInt32(4472)
     const CooperativeMatrixKHR          = UInt32(6022)
     # SER (SPV_NV_shader_invocation_reorder).  Value per the SPIR-V unified1
