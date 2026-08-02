@@ -771,7 +771,20 @@ function vk_reset_device!()
     # Persist the VkPipelineCache before tearing the device down so the
     # next session can skip AMDVLK's SPIR-V → ISA recompile.
     let old = VK_CONTEXT_REF[]
-        old === nothing || save_pipeline_cache!(old)
+        if old !== nothing
+            save_pipeline_cache!(old)
+            # RETIRE it. The comment below assumed `device_lost` was already true,
+            # which holds only when the reset was TRIGGERED by a DEVICE_LOST —
+            # something else set the flag on the way in. A proactive
+            # `vk_reset_device!` (test_pipeline_cache_no_compile.jl does exactly
+            # this) leaves it false, and every pre-reset VkManagedBuffer still
+            # carries `last_write = (old_bq, val)`. When GC later finalizes one,
+            # vk_free! (memory.jl:754) checks `device_lost(bq.ctx)`, reads false,
+            # and calls query_timeline -> vkGetSemaphoreCounterValue on a
+            # destroyed VkDevice. SIGSEGV, from a finalizer, at whatever point GC
+            # happened to run — which is why it looked like a floating race.
+            mark_device_lost!(old)
+        end
     end
     # Retire the old context BEFORE dropping it. Pre-reset `VkManagedBuffer`s
     # hold a strong ref to it, and their finalizers gate every Vulkan call on
@@ -1033,6 +1046,19 @@ function init_vulkan!(; select = pick_physical_device)
                 Vulkan.PhysicalDeviceVulkan12Features).next
         (buffer = q.shader_buffer_int_64_atomics, shared = q.shader_shared_int_64_atomics)
     end
+    # Subgroup ops on anything other than 32-bit types. `subgroup_shuffle` and the
+    # rest are bound for Int64/UInt64/Float64 (test_subgroup_shuffle.jl's
+    # "every element type round-trips"), and SPIR-V group operations on 8-, 16- or
+    # 64-bit types REQUIRE this feature: VUID-RuntimeSpirv-None-06275. Hardcoded
+    # false, so those shuffles were undefined — GPU-assisted validation reports
+    # "OpGroupNonUniformShuffle is using a 64-bit int scalar but
+    # shaderSubgroupExtendedTypes was not enabled". Asked, not assumed, for the
+    # same reason as the atomics above.
+    has_subgroup_extended = let
+        q = Vulkan.get_physical_device_features_2(phys_dev,
+                Vulkan.PhysicalDeviceVulkan12Features).next
+        q.shader_subgroup_extended_types
+    end
     has_pipeline_exec_props = has_extension(phys_dev, "VK_KHR_pipeline_executable_properties")
     # VK_EXT_memory_budget — lets us read VkPhysicalDeviceMemoryBudgetPropertiesEXT
     # for real heap utilisation, used in OOM error reporting.
@@ -1169,7 +1195,7 @@ function init_vulkan!(; select = pick_physical_device)
         true,   # scalar_block_layout  ← BDA struct layout
         false,  # imageless_framebuffer
         false,  # uniform_buffer_standard_layout
-        false,  # shader_subgroup_extended_types
+        has_subgroup_extended,  # shader_subgroup_extended_types ← 64-bit subgroup shuffles
         false,  # separate_depth_stencil_layouts
         false,  # host_query_reset
         true,   # timeline_semaphore  ← REQUIRED for explicit-queue cross-queue sync
