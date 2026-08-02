@@ -39,23 +39,45 @@ run two devices and see what breaks.
    function table. A stale handle is undefined behaviour; a foreign function
    pointer is an immediate jump into another driver.
 
-2. **The next one is still open.** With (1) fixed the GPU dispatch is correct and
-   the crash moves to the lavapipe dispatch. Candidates, all module-scope and all
-   device-owned, in descending order of suspicion:
+2. **`PREPARE_INDIRECT_*`** — FIXED. Four `Ref`s holding one compiled pipeline
+   and its layout, now one `PrepareIndirect` per device.
 
-       PREPARE_INDIRECT_PIPELINE_REF   a LavaComputePipeline, bound at dispatch
-       PREPARE_INDIRECT_OFFSETS_REF    its layout, same lifetime
-       TIMESTAMP_POOL                  a Vulkan.QueryPool
-       BLIT_PIPELINE                   a graphics pipeline
-       GEMM_SPLIT_SCRATCH              device memory
-       DEVICE_SUBGROUP_SIZE            a device property cached globally —
-                                       wrong answer rather than a crash, and so
-                                       the one most likely to survive unnoticed
-       SUBGROUP_SIZE_CONTROL           same
-       WORKGROUP_LIMIT                 same
+3. **`DEVICE_SUBGROUP_SIZE` and `SUBGROUP_SIZE_CONTROL`** — FIXED, now per-device
+   dicts. These differ from the handle caches in a way worth keeping in mind: a
+   stale pipeline is undefined behaviour and usually crashes, while a stale
+   device *property* just returns the wrong number. 32 here, 64 on RDNA 3.5 —
+   every tiling decision keyed on it would be made for the other device, and
+   nothing would crash.
 
-   That list is the phase-2 worklist, and it was produced by running rather than
-   by reading — which matters, because reading produced a list of four.
+4. **THE ALLOCATOR — open, and the reason this probe still fails.**
+
+   `POOL_BLOCKS` and `POOL_FREE_LISTS` are module-level, and `PoolBlock` carries
+   no device:
+
+       mutable struct PoolBlock
+           buffer, memory, base_address, capacity, bump, live_count
+       end
+
+   Measured: allocate on the GPU (one 64 MiB block is created), then allocate on
+   lavapipe — `length(POOL_BLOCKS)` is **still 1**. The lavapipe array was carved
+   out of the NVIDIA device's block. `buf.ctx` correctly says `cpu`; the memory
+   underneath belongs to the other device.
+
+   That is both observed symptoms at once. `fill!` on the second context then
+   reads back **0.0** — it wrote into memory that device does not own — and in a
+   different call order it segfaults instead.
+
+   **This is a bigger class than anything in `GUARDRAILS.md` §8, which lists four
+   caches holding pipeline handles.** The allocator hands out *memory*, so the
+   failure is silent data corruption rather than a bad handle, and no amount of
+   cache keying reaches it. Fixing it means a per-device pool, which is its own
+   piece of work.
+
+   Remaining after that, unaudited: `TIMESTAMP_POOL` (a `Vulkan.QueryPool`),
+   `BLIT_PIPELINE`, `GEMM_SPLIT_SCRATCH`, `WORKGROUP_LIMIT`.
+
+   The list above was produced by RUNNING two devices. Reading produced a list of
+   four caches, and none of the four is the one that actually breaks it.
 """
 
 using Lava, KernelAbstractions
@@ -98,4 +120,6 @@ function probe()
     println("\nPASS")
 end
 
-abspath(PROGRAM_FILE) == @__FILE__ && probe()
+if abspath(PROGRAM_FILE) == @__FILE__
+    probe()
+end

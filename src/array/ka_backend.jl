@@ -808,31 +808,36 @@ end
 # so we compile once and cache everything. Saves ~30K lava_launch! calls per render
 # (hash lookups, validation, auto-flush, keep_alive, etc.).
 
-const PREPARE_INDIRECT_PIPELINE_REF = Ref{Union{Nothing, LavaComputePipeline}}(nothing)
-const PREPARE_INDIRECT_OFFSETS_REF = Ref{Union{Nothing, Vector{Int}}}(nothing)
-const PREPARE_INDIRECT_BYVAL_REF = Ref{Union{Nothing, Vector{Int}}}(nothing)
-const PREPARE_INDIRECT_ARG_BUF_SIZE_REF = Ref{Int}(0)
+"""
+The compiled prepare-indirect kernel for one device.
+
+It owns a `VkPipeline`, so it is per device (`GUARDRAILS.md` §8) — four separate
+`Ref`s before, which meant four things that had to be reset together and were
+reachable from the wrong device in exactly the same way. Bundling them makes the
+per-device dict hold one value instead of four parallel ones.
+"""
+struct PrepareIndirect
+    pipeline::LavaComputePipeline
+    offsets::Vector{Int}
+    byval_sizes::Vector{Int}
+    arg_buffer_size::Int
+end
+
+const PREPARE_INDIRECT = Dict{UInt64, PrepareIndirect}()
 
 # Register cleanup callback for vk_reset_device!
-push!(RESET_CALLBACKS, function()
-    PREPARE_INDIRECT_PIPELINE_REF[] = nothing
-    PREPARE_INDIRECT_OFFSETS_REF[] = nothing
-    PREPARE_INDIRECT_BYVAL_REF[] = nothing
-    PREPARE_INDIRECT_ARG_BUF_SIZE_REF[] = 0
-end)
+push!(RESET_CALLBACKS, () -> empty!(PREPARE_INDIRECT))
 
 function init_prepare_indirect_pipeline!(ctx::VkContext)
-    PREPARE_INDIRECT_PIPELINE_REF[] !== nothing && return
+    haskey(PREPARE_INDIRECT, ctx.id) && return
     # Kernel signature (post-adapt): indirect::LavaDeviceArray{UInt32,1},
     # ndrange_buf::LavaDeviceArray{Int32,1}, ws::UInt32.
     tt = Tuple{LavaDeviceArray{UInt32,1}, LavaDeviceArray{Int32,1}, UInt32}
     ws = (1, 1, 1)
     compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(
         ctx, prepare_indirect_kernel, tt, ws)
-    PREPARE_INDIRECT_PIPELINE_REF[] = pipeline
-    PREPARE_INDIRECT_OFFSETS_REF[] = offsets
-    PREPARE_INDIRECT_BYVAL_REF[] = byval_sizes
-    PREPARE_INDIRECT_ARG_BUF_SIZE_REF[] = compiled.push_info.arg_buffer_size
+    PREPARE_INDIRECT[ctx.id] = PrepareIndirect(pipeline, offsets, byval_sizes,
+                                               compiled.push_info.arg_buffer_size)
 end
 
 """
@@ -846,12 +851,12 @@ function fast_prepare_indirect!(bq::BatchQueue,
                                 indirect::LavaArray{UInt32,1},
                                 ndrange_buf::LavaArray{<:Integer},
                                 workgroup_size::Integer)
-    init_prepare_indirect_pipeline!(bq.ctx::VkContext)
+    ctx = bq.ctx::VkContext
+    init_prepare_indirect_pipeline!(ctx)
 
-    pipeline = PREPARE_INDIRECT_PIPELINE_REF[]
-    offsets = PREPARE_INDIRECT_OFFSETS_REF[]
-    byval_sizes = PREPARE_INDIRECT_BYVAL_REF[]
-    arg_size = PREPARE_INDIRECT_ARG_BUF_SIZE_REF[]
+    pi = PREPARE_INDIRECT[ctx.id]
+    pipeline, offsets = pi.pipeline, pi.offsets
+    byval_sizes, arg_size = pi.byval_sizes, pi.arg_buffer_size
 
     batch = ensure_active_batch!(bq)
     adaptor = LavaAdaptor(batch)

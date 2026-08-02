@@ -190,17 +190,29 @@ struct SubgroupSizeControl
     compute::Bool   # COMPUTE present in requiredSubgroupSizeStages
 end
 
-const SUBGROUP_SIZE_CONTROL = Ref{Union{Nothing,SubgroupSizeControl}}(nothing)
+# Per device, for the same reason as `DEVICE_SUBGROUP_SIZE` above: RDNA 3.5
+# reports min 32 / max 64 where this card reports 32 / 32, and answering the
+# first for the second decides wrongly whether a pipeline may be pinned.
+const SUBGROUP_SIZE_CONTROL = Dict{UInt64,SubgroupSizeControl}()
 
 # The device's DEFAULT subgroup width, as opposed to the min/max it can be pinned
 # to. Queried once; cleared on device reset with the rest.
-const DEVICE_SUBGROUP_SIZE = Ref(0)
+# Per device, keyed by `ctx.id`. It was a single `Ref`, which is a property of
+# ONE device answered for all of them — 32 on this desktop and 64 on RDNA 3.5,
+# so a second context got the first's width.
+#
+# This class differs from the handle caches in a way worth stating: a stale
+# pipeline is undefined behaviour and usually crashes, while a stale device
+# PROPERTY just returns the wrong number. Every tiling decision keyed on the
+# subgroup width would then be silently made for the other device.
+const DEVICE_SUBGROUP_SIZE = Dict{UInt64,Int}()
 
 function device_subgroup_size(ctx::VkContext = vk_context())
-    DEVICE_SUBGROUP_SIZE[] != 0 && return DEVICE_SUBGROUP_SIZE[]
-    props = Vulkan.get_physical_device_properties_2(ctx.physical_device,
-                                                    Vulkan.PhysicalDeviceSubgroupProperties)
-    DEVICE_SUBGROUP_SIZE[] = Int(props.next.subgroup_size)
+    get!(DEVICE_SUBGROUP_SIZE, ctx.id) do
+        props = Vulkan.get_physical_device_properties_2(ctx.physical_device,
+                                                        Vulkan.PhysicalDeviceSubgroupProperties)
+        Int(props.next.subgroup_size)
+    end
 end
 
 """
@@ -210,16 +222,14 @@ The device's `VkPhysicalDeviceSubgroupSizeControlProperties`, queried once.
 `compute` says whether a compute pipeline may pin its own subgroup size.
 """
 function subgroup_size_control(ctx::VkContext = vk_context())
-    cached = SUBGROUP_SIZE_CONTROL[]
-    cached === nothing || return cached
-    p = Vulkan.get_physical_device_properties_2(
-            ctx.physical_device, Vulkan.PhysicalDeviceSubgroupSizeControlProperties).next
-    c = SubgroupSizeControl(
-        Int(p.min_subgroup_size), Int(p.max_subgroup_size),
-        (UInt32(p.required_subgroup_size_stages) &
-         UInt32(Vulkan.SHADER_STAGE_COMPUTE_BIT)) != 0)
-    SUBGROUP_SIZE_CONTROL[] = c
-    return c
+    get!(SUBGROUP_SIZE_CONTROL, ctx.id) do
+        p = Vulkan.get_physical_device_properties_2(
+                ctx.physical_device, Vulkan.PhysicalDeviceSubgroupSizeControlProperties).next
+        SubgroupSizeControl(
+            Int(p.min_subgroup_size), Int(p.max_subgroup_size),
+            (UInt32(p.required_subgroup_size_stages) &
+             UInt32(Vulkan.SHADER_STAGE_COMPUTE_BIT)) != 0)
+    end
 end
 
 """Whether a compute pipeline on this device can be pinned to `n` lanes per subgroup."""
@@ -253,8 +263,8 @@ end
 push!(RESET_CALLBACKS, function()
     empty!(PIPELINE_CACHE)
     empty!(PIPELINE_INSERTION_ORDER)
-    SUBGROUP_SIZE_CONTROL[] = nothing   # re-query: the next device may differ
-    DEVICE_SUBGROUP_SIZE[]  = 0
+    empty!(SUBGROUP_SIZE_CONTROL)       # re-query: the next device may differ
+    empty!(DEVICE_SUBGROUP_SIZE)
 end)
 
 """
