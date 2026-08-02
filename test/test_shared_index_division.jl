@@ -43,6 +43,43 @@ whatever unrolls it and drops stores is downstream of us. `splitidx` removes the
 `OpUDiv` and with it the whole question, which is why `gemm.jl` uses it for every
 staging index rather than only where a divisor is awkward.
 
+## 2026-08-02: three candidate mechanisms measured and DISPROVED
+
+The condition above says "a cooperative-matrix `muladd` must be in scope", which
+invites three explanations. All three were tested by building the same kernel
+without a coopmat and reading the driver's own register count
+(`VK_KHR_pipeline_executable_properties`), and all three are wrong.
+
+    variant                                     survivors/3072   registers
+    coopmat, muladd in the k-loop                    240             64
+    no coopmat, 0 live fp32 accumulators            3072             26
+    no coopmat, 32 live fp32 accumulators           3072             60
+    no coopmat, 48 live fp32 accumulators           3072             76
+    coopmat present, muladd OUTSIDE the loop        3072             37
+    coopmat, muladd in loop, acc NOT live
+      across the barrier                             240             64
+
+1. **Not register pressure.** The no-coopmat kernel at 48 accumulators uses
+   **76 registers — more than the coopmat kernel's 64 — and loses nothing.**
+   Worth stating because the sibling bug next door
+   (`test_int32_cartesian_miscompile.jl`) *is* register pressure, so the obvious
+   guess here is that they share a mechanism. They do not.
+
+2. **Not the capability, and not the fragments.** Declaring
+   `CooperativeMatrixKHR`, constructing `MatrixA`/`MatrixB`/`Accumulator` and
+   doing a `muladd` — all present — is exact when the `muladd` sits *after* the
+   k-loop instead of inside it.
+
+3. **Not a cooperative-matrix value living across the barrier.** Producing and
+   consuming the accumulator inside one iteration, so nothing coopmat-shaped
+   crosses `@synchronize`, still loses exactly as much.
+
+What survives all three: **an `OpCooperativeMatrixMulAddKHR` executed in the same
+loop iteration as the divided-index shared store.** Tighter than "in scope", and
+it rules out the explanations that would have made this reproducible without
+cooperative matrices — which matters, because it means lavapipe cannot be the
+second consumer and the two routes below are the only ones left.
+
 **And it cannot be settled on this machine.** The sibling miscompile in
 `test_int32_cartesian_miscompile.jl` was attributed to NVIDIA in one command, by
 running the identical module on lavapipe — but that does not work here, because a
@@ -54,8 +91,11 @@ cooperative matrices.
 Two things would settle it, and they are worth naming because the second
 generalises:
 
-  * a **second coopmat-capable device** — AMD RDNA3+ under RADV, or another
-    NVIDIA generation — i.e. vary the *consumer*, which is what worked next door;
+  * a **second coopmat-capable device** — and one now exists in the fleet: the
+    AMD laptop's Radeon 8060S (RDNA 3.5, RADV) reports 14 cooperative-matrix
+    shapes, `Float16 x Float16 -> Float32` among them, which is exactly this
+    kernel's. That is the cheapest remaining step and it is one `julia` command
+    on a machine we have. Vary the *consumer*, which is what worked next door;
   * **glslang as an independent producer** — write this kernel in GLSL, compile
     it with glslang, and run that module on the same NVIDIA driver. Correct there
     means our SPIR-V differs from glslang's in a way that matters; wrong there
