@@ -967,10 +967,18 @@ function LinearAlgebra.mul!(C::LavaArray{T,2}, A::AbstractVecOrMat,
     # context from the array's buffer, which has always carried it.
     backend = KernelAbstractions.get_backend(C)
 
+    # …and `vk_context(C)` for the same reason, which the line above got right and
+    # this one did not. A no-argument `coopmat_gemm_available()` asks whichever
+    # context is global, so on a second device it answered for the FIRST one:
+    # lavapipe (8-lane subgroups, no pinning to 32) was told it had tensor cores
+    # because the NVIDIA card does, took the cooperative-matrix path, and returned
+    # the right answer only because 32 lanes of redundant subgroups happen to
+    # agree. The two-device probe found it; a capability query is exactly as
+    # device-specific as the handle caches are.
     if T === Float32 && eltype(A) === Float16 && eltype(B) === Float16 &&
        isone(α) && iszero(β) && A isa LavaArray && B isa LavaArray &&
        K % GEMM_TILE == 0 && M % GEMM_TILE == 0 && N % GEMM_TILE == 0 &&
-       coopmat_gemm_available()
+       coopmat_gemm_available(vk_context(C))
         return coopmat_gemm!(C, A, B, M, N, K)
     end
 
