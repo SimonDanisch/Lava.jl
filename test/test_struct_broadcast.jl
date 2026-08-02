@@ -73,10 +73,12 @@ end
 
     # Test that byval_llvm_sizes are populated during compilation
     @testset "byval_llvm_sizes populated" begin
-        # After running broadcasts above, linked cache should have entries
+        # After running broadcasts above, linked cache should have entries.
+        # Two levels: the cache is keyed by device first, then by kernel.
         @test !isempty(Lava.LINKED_KERNEL_CACHE)
+        @test !isempty(Lava.linked_kernel_cache(Lava.vk_context()))
         # All byval_sizes should be non-negative
-        for (k, linked) in Lava.LINKED_KERNEL_CACHE
+        for (_, percontext) in Lava.LINKED_KERNEL_CACHE, (_, linked) in percontext
             @test all(s -> s >= 0, linked.byval_sizes)
         end
     end

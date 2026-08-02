@@ -123,10 +123,16 @@ kernel involved.
 render!(vp, scene, film, camera)
 sort(Lava.list_compiled_kernels(); by=k -> -k.spirv.bytes)  # biggest first
 ```
+
+Every device's kernels, not just the current one: the cache became two levels
+deep when it was keyed by device, and this walked the OUTER level — so `linked`
+was another `Dict` and `kernel_stats` reached for a field on it. Nothing in the
+library calls this, which is why a suite that ran it caught it and a suite that
+only used it would not have.
 """
 function list_compiled_kernels()
     stats = KernelStats[]
-    for (_, linked) in LINKED_KERNEL_CACHE
+    for (_, percontext) in LINKED_KERNEL_CACHE, (_, linked) in percontext
         push!(stats, kernel_stats(linked))
     end
     return stats

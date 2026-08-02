@@ -273,7 +273,10 @@ function gpu_memory_usage()
      deferred_frees = bq_deferred,
      ARG_SLABS = n_arg_slabs,
      pipelines_cached = length(PIPELINE_CACHE),
-     kernels_cached = length(LINKED_KERNEL_CACHE))
+     # Kernels, not devices: `LINKED_KERNEL_CACHE` is keyed by device and then
+     # by kernel, so its own `length` is the number of contexts that have ever
+     # compiled anything — which on one machine reads as a plausible "1".
+     kernels_cached = sum(length, values(LINKED_KERNEL_CACHE); init = 0))
 end
 
 """
