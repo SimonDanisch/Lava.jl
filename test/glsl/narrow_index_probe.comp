@@ -1,0 +1,36 @@
+#version 460
+#extension GL_EXT_buffer_reference        : require
+#extension GL_EXT_buffer_reference2       : require
+#extension GL_EXT_scalar_block_layout     : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer U64 { uint64_t v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer F32 { float    v[]; };
+layout(push_constant, scalar) uniform PC { uint64_t argbuf; } pc;
+void main() {
+    U64 args = U64(pc.argbuf);
+    uint64_t ndrange = U64(args.v[0]).v[0];
+    uint64_t destp   = U64(args.v[1]).v[0];
+    uint64_t cisp    = args.v[3];
+    int64_t  n       = int64_t(args.v[4]);
+    int64_t e1 = int64_t(U64(cisp     ).v[0]);
+    int64_t e2 = int64_t(U64(cisp + 8 ).v[0]);
+    int64_t I = int64_t(gl_WorkGroupID.x) * 64L + int64_t(gl_LocalInvocationID.x) + 1L;
+    if (I > 0L && I <= int64_t(ndrange) && I <= n) {
+        int64_t z  = I - 1L;
+        int64_t q1 = z / e1;          // first  64-bit division
+        int64_t q2 = q1 / e2;         // second 64-bit division, depends on the first
+        int64_t c2 = (q1 + 1L) - q2 * e2;
+        // 32-bit control: identical shape, 32-bit divisions
+        int z32 = int(z), E1 = int(e1), E2 = int(e2);
+        int p1 = z32 / E1;
+        int p2 = p1 / E2;
+        int c2_32 = (p1 + 1) - p2 * E2;
+        int base = int(gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x);
+        int N = int(n);
+        F32(destp).v[base]       = float(q1);      // q1, read directly
+        F32(destp).v[base + N]   = float(q2);      // q2
+        F32(destp).v[base + 2*N] = float(c2);      // c2 from 64-bit divisions
+        F32(destp).v[base + 3*N] = float(c2_32);   // c2 from 32-bit divisions
+    }
+}

@@ -1,0 +1,63 @@
+#version 460
+#extension GL_EXT_buffer_reference        : require
+#extension GL_EXT_buffer_reference2       : require
+#extension GL_EXT_scalar_block_layout     : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8  : require
+
+// Hand-written equivalent of Lava's `narrow_index!` for a rank-3 plain array:
+//   J    = CartesianIndices(sz)[I % Int32]
+//   dest[I] = bc[J]                     (bc = identity over an Extruded rank-3 array)
+// Same push constant (one 64-bit arg-buffer address), same argument layout,
+// same struct offsets as the Julia-derived module.
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer U64 { uint64_t v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer F32 { float    v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 1) buffer U8  { uint8_t  v[]; };
+
+layout(push_constant, scalar) uniform PC { uint64_t argbuf; } pc;
+
+void main() {
+    U64 args = U64(pc.argbuf);
+
+    uint64_t ndrange = U64(args.v[0]).v[0];       // KA ctx: ndrange at +0
+    uint64_t destp   = U64(args.v[1]).v[0];       // dest LavaDeviceArray: data ptr at +0
+    uint64_t bcp     = args.v[2];                 // &Broadcasted
+    uint64_t cisp    = args.v[3];                 // &CartesianIndices
+    int64_t  n       = int64_t(args.v[4]);
+
+    // Extruded{LavaDeviceArray{Float32,3}, NTuple{3,Bool}, NTuple{3,Int}}
+    uint64_t srcp = U64(bcp).v[0];                // +0   data ptr
+    int64_t  d1   = int64_t(U64(bcp + 8 ).v[0]);  // +8   dims[1]
+    int64_t  d2   = int64_t(U64(bcp + 16).v[0]);  // +16  dims[2]
+    uint8_t  k1   = U8 (bcp + 32).v[0];           // +32  keeps
+    uint8_t  k2   = U8 (bcp + 33).v[0];
+    uint8_t  k3   = U8 (bcp + 34).v[0];
+    int64_t  f1   = int64_t(U64(bcp + 40).v[0]);  // +40  defaults
+    int64_t  f2   = int64_t(U64(bcp + 48).v[0]);
+    int64_t  f3   = int64_t(U64(bcp + 56).v[0]);
+
+    int64_t e1 = int64_t(U64(cisp     ).v[0]);    // CartesianIndices extents
+    int64_t e2 = int64_t(U64(cisp + 8 ).v[0]);
+
+    int64_t I = int64_t(gl_WorkGroupID.x) * 64L + int64_t(gl_LocalInvocationID.x) + 1L;
+    if (I > 0L && I <= int64_t(ndrange) && I <= n) {
+        int64_t Inarrow = int64_t(int(I));        // I % Int32, sign-extended back
+        int64_t z  = Inarrow - 1L;
+        int64_t q1 = z / e1;
+        int64_t c1 = Inarrow - q1 * e1;
+        int64_t q2 = q1 / e2;
+        int64_t c2 = (q1 + 1L) - q2 * e2;
+        int64_t c3 = q2 + 1L;
+
+        int64_t j1 = (k1 == uint8_t(0)) ? f1 : c1;
+        int64_t j2 = (k2 == uint8_t(0)) ? f2 : c2;
+        int64_t j3 = (k3 == uint8_t(0)) ? f3 : c3;
+
+        int64_t off = j1 + ((j2 - 1L) + (j3 - 1L) * d2) * d1 - 1L;
+        float   val = F32(srcp).v[int(off)];
+        F32(destp).v[int(gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x)] = val;
+    }
+}
