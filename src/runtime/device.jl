@@ -236,6 +236,76 @@ end
 CoopMat2Caps() = CoopMat2Caps(false, false, false, false, false, false, false, false)
 
 """
+    DeviceCompute
+
+How much compute the device actually has, for kernels that must size a launch
+against it rather than against the problem.
+
+A grid that does not fill the device is the dominant cost on small shapes — SAM
+2's decode runs one attention at 8 workgroups on 48 SMs — so "how many
+workgroups before the device is busy" is a number kernels need, and until this
+struct existed they hardcoded it.
+
+`sm_count` and `warps_per_sm` are **0 when the device does not report them**.
+Vulkan has no core query: NVIDIA exposes it through `VK_NV_shader_sm_builtins`,
+AMD through `VK_AMD_shader_core_properties2`, and everyone else through nothing
+at all. Use [`shader_core_count`](@ref) rather than this field — it returns
+`nothing` for unknown, so a missing fallback is a `MethodError` at the first
+arithmetic rather than a silently empty grid.
+
+`max_shared_memory` is a core limit and is always known.
+"""
+struct DeviceCompute
+    sm_count::Int           # 0 = the device does not report it
+    warps_per_sm::Int       # 0 = ditto; the occupancy denominator when known
+    max_shared_memory::Int  # VkPhysicalDeviceLimits::maxComputeSharedMemorySize
+end
+
+DeviceCompute() = DeviceCompute(0, 0, 0)
+
+"""
+    query_device_compute(phys_dev, phys_props) -> DeviceCompute
+
+Read the SM/CU count once, at device creation.
+
+Vendor coverage follows llama.cpp's `ggml-vulkan.cpp:6138-6146`, which is the
+same question asked by the same kind of code. Neither extension is *enabled* on
+the logical device — these are physical-device property queries and enabling
+would be pointless — but the chained struct is only filled for an extension the
+device advertises, so each is guarded by `has_extension`.
+
+The chain is also only filled when the instance opted into
+`vkGetPhysicalDeviceProperties2`: core in Vulkan 1.1, or the
+`VK_KHR_get_physical_device_properties2` instance extension before that. Lava's
+instance asks for 1.4 (see `create_vulkan_context`), so this holds — but note the
+failure is silent if it ever stops holding. The base properties still come back
+fully populated and only the `next` chain is dropped, with no return code to
+check, because `vkGetPhysicalDeviceProperties2` returns void.
+"""
+function query_device_compute(phys_dev, phys_props)
+    smcount, warps = 0, 0
+    if has_extension(phys_dev, "VK_NV_shader_sm_builtins")
+        try
+            p = Vulkan.get_physical_device_properties_2(
+                    phys_dev, Vulkan.PhysicalDeviceShaderSMBuiltinsPropertiesNV).next
+            smcount, warps = Int(p.shader_sm_count), Int(p.shader_warps_per_sm)
+        catch err
+            @debug "VK_NV_shader_sm_builtins query failed; SM count unknown" err
+        end
+    elseif has_extension(phys_dev, "VK_AMD_shader_core_properties2")
+        try
+            p = Vulkan.get_physical_device_properties_2(
+                    phys_dev, Vulkan.PhysicalDeviceShaderCoreProperties2AMD).next
+            smcount = Int(p.active_compute_unit_count)
+        catch err
+            @debug "VK_AMD_shader_core_properties2 query failed; CU count unknown" err
+        end
+    end
+    DeviceCompute(smcount, warps,
+                  Int(phys_props.limits.max_compute_shared_memory_size))
+end
+
+"""
     VkContext
 
 Persistent Vulkan context. Batch-based command recording goes through
@@ -274,6 +344,9 @@ mutable struct VkContext
     # Cached physical-device properties (avoid re-querying on every alloc/dispatch).
     memory_properties::Vulkan.PhysicalDeviceMemoryProperties
     max_wg_dims::NTuple{3, Int}
+    # SM/CU count, warps per SM, shared-memory ceiling. Read once at creation;
+    # see `DeviceCompute` and prefer the `shader_core_count` accessor.
+    compute::DeviceCompute
     # Alignment (bytes) for BDAs passed as `pScratchData` in AS builds.
     # Picked by `bda_alignment_for(ctx, scratch=true)`.
     as_scratch_align::UInt64
@@ -370,7 +443,8 @@ mutable struct VkContext
                        driver_version::AbstractString="unknown",
                        video_decode_available::Bool=false,
                        video_decode_queue::Union{Nothing, Vulkan.Queue}=nothing,
-                       video_decode_queue_family_index::Union{Nothing, UInt32}=nothing)
+                       video_decode_queue_family_index::Union{Nothing, UInt32}=nothing,
+                       compute::DeviceCompute=DeviceCompute())
         ctx = new()
         ctx.instance = instance
         ctx.physical_device = physical_device
@@ -387,6 +461,7 @@ mutable struct VkContext
         ctx.device_lost = device_lost
         ctx.memory_properties = memory_properties
         ctx.max_wg_dims = max_wg_dims
+        ctx.compute = compute
         ctx.as_scratch_align = as_scratch_align
         ctx.ray_query_available = ray_query_available
         ctx.ser_available = ser_available
@@ -417,6 +492,43 @@ mutable struct VkContext
         return ctx
     end
 end
+
+"""
+    shader_core_count(ctx = vk_context()) -> Union{Nothing,Int}
+
+Streaming multiprocessors (NVIDIA) or active compute units (AMD), or `nothing`
+when the device does not report it.
+
+`nothing` rather than `0` on purpose. The number's whole job is to be a
+denominator — llama.cpp derives its flash-attention split count as
+`shader_core_count * 2 / total_workgroups` — and a `0` there yields zero splits
+silently, which is a wrong launch that still produces a plausible-looking answer.
+`nothing` cannot be divided, so an unguarded use fails immediately.
+
+Supply the fallback explicitly:
+
+    cores = something(shader_core_count(), 16)
+"""
+shader_core_count(ctx::VkContext = vk_context()) =
+    ctx.compute.sm_count == 0 ? nothing : ctx.compute.sm_count
+
+"""
+    shader_warps_per_sm(ctx = vk_context()) -> Union{Nothing,Int}
+
+Maximum resident subgroups per SM — the denominator for an occupancy figure.
+`nothing` when unreported; NVIDIA-only in practice (`VK_NV_shader_sm_builtins`).
+"""
+shader_warps_per_sm(ctx::VkContext = vk_context()) =
+    ctx.compute.warps_per_sm == 0 ? nothing : ctx.compute.warps_per_sm
+
+"""
+    max_shared_memory(ctx = vk_context()) -> Int
+
+`maxComputeSharedMemorySize`: the per-workgroup shared-memory ceiling, in bytes.
+Core Vulkan, so this one is always a real number — a kernel that sizes its
+`@localmem` against a budget should read it here rather than assume 48 KB.
+"""
+max_shared_memory(ctx::VkContext = vk_context()) = ctx.compute.max_shared_memory
 
 # Ring buffer of recent validation messages for context on DEVICE_LOST
 const VALIDATION_MESSAGES = String[]
@@ -1183,6 +1295,7 @@ function init_vulkan!()
         gpu_assisted,
         string(phys_props.driver_version),
         has_video_decode, video_decode_queue, video_qf_idx,
+        query_device_compute(phys_dev, phys_props),
     )
     return ctx
 end

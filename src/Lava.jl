@@ -12,6 +12,9 @@ export CompilationResult, lava_compile, optimize_spirv
 export vk_reset_device!, dump_state, gpu_memory_usage, trim_gpu_pool!,
        allocate_batch_queue!
 export ExternalImage, memoryfd
+# Device capability queries: API, but not exported — a kernel library reaches
+# them as `Lava.shader_core_count()`, alongside `Lava.device_subgroup_size()`.
+public shader_core_count, shader_warps_per_sm, max_shared_memory, DeviceCompute
 export set_dispatch_logging!, get_dispatch_log
 export concurrent_dispatch_group, concurrent_indirect_group
 export enable_gpu_av, disable_gpu_av, verify_gpu_av, activate_all_debugging

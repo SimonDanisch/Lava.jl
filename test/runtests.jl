@@ -373,6 +373,10 @@ end
             include(joinpath(@__DIR__, "test_diagonal_mul.jl"))
         end
 
+        @testset "device compute properties" begin
+            include(joinpath(@__DIR__, "test_device_compute.jl"))
+        end
+
         @testset "coopmat shape query" begin
             include(joinpath(@__DIR__, "test_coopmat_shape.jl"))
         end
