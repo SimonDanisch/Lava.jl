@@ -850,6 +850,18 @@ function init_vulkan!()
     # Check for workgroup memory explicit layout (needed for mixed-type shared memory structs)
     has_wg_explicit = has_extension(phys_dev, "VK_KHR_workgroup_memory_explicit_layout")
     has_atomic_float = has_extension(phys_dev, "VK_EXT_shader_atomic_float")
+    # 64-bit atomics. These were hardcoded `false` below while the emitter happily
+    # declared the `Int64Atomics` SPIR-V capability, so any kernel using one built a
+    # module whose capability had no enabled feature behind it — undefined, and
+    # reported by the validation layer as
+    # VUID-VkShaderModuleCreateInfo-pCode-08740. Ask the device instead of
+    # assuming, in both directions: enabling an unsupported feature fails device
+    # creation, and leaving a supported one off is what caused this.
+    has_int64_atomics = let
+        q = Vulkan.get_physical_device_features_2(phys_dev,
+                Vulkan.PhysicalDeviceVulkan12Features).next
+        (buffer = q.shader_buffer_int_64_atomics, shared = q.shader_shared_int_64_atomics)
+    end
     has_pipeline_exec_props = has_extension(phys_dev, "VK_KHR_pipeline_executable_properties")
     # VK_EXT_memory_budget — lets us read VkPhysicalDeviceMemoryBudgetPropertiesEXT
     # for real heap utilisation, used in OOM error reporting.
@@ -957,8 +969,8 @@ function init_vulkan!()
         false,  # storage_buffer_8_bit_access
         false,  # uniform_and_storage_buffer_8_bit_access
         false,  # storage_push_constant_8
-        false,  # shader_buffer_int_64_atomics
-        false,  # shader_shared_int_64_atomics
+        has_int64_atomics.buffer,  # shader_buffer_int_64_atomics ← the emitter declares Int64Atomics
+        has_int64_atomics.shared,  # shader_shared_int_64_atomics ← ditto, for @localmem
         true,   # shader_float_16  ← REQUIRED (Float16 types in SPIR-V)
         true,   # shader_int_8  ← REQUIRED (i8 types in SPIR-V)
         false,  # descriptor_indexing
