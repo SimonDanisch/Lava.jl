@@ -2161,30 +2161,112 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
                 elseif val_ty != pointee_ty && pointee_ty isa LLVM.IntegerType &&
                        (val_ty isa LLVM.IntegerType || val_ty isa LLVM.FloatingPointType) &&
                        !val_was_bitcasted
-                    # Bitcast pointer to match value type. Covers int-int width
-                    # mismatches and the MVector{N, T<:AbstractFloat} case where
-                    # Julia/LLVM packs the alloca as [N x i64] but writes typed
-                    # float/double values at GEP-derived offsets.
-                    # Skip when bitcast_store_value_if_needed! already converted
-                    # the value to match pointee_ty — would otherwise generate
-                    # a contradictory pointer bitcast.
-                    val_spirv_ty = map_type!(state.type_ctx, val_ty)
-                    new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
-                    cast_id = fresh_id!(state.mod)
-                    encode_instruction!(state.mod.functions, Op.OpBitcast, new_ptr_ty, cast_id, ptr_id)
-                    ptr_id = cast_id
+                    # Covers int-int width mismatches and the MVector{N,T<:AbstractFloat}
+                    # case where Julia/LLVM packs the alloca as [N x i64] but writes
+                    # typed float/double values at GEP-derived offsets.
+                    #
+                    # This used to OpBitcast the POINTER to match the value type, which
+                    # Vulkan forbids: the Logical addressing model gives no way to make
+                    # a differently-typed pointer to the same address, and spirv-val
+                    # says so — "Instruction may not have a logical pointer operand"
+                    # (VUID-VkShaderModuleCreateInfo-pCode-08737). Reproduced by a
+                    # sliced setindex over Complex eltypes, which stores a uint into a
+                    # Function-scope [2 x ulong] alloca.
+                    #
+                    # Fix on the VALUE side, which is where a width mismatch belongs:
+                    #   equal width  -> OpBitcast the value (legal; only pointers are not)
+                    #   narrower     -> read-modify-write, so the untouched high bits of
+                    #                   the slot are preserved exactly as the old
+                    #                   narrow pointer store left them
+                    # A wider value would overflow the field, so it keeps the previous
+                    # behaviour rather than silently truncating; `emit.jl`'s widening
+                    # LOAD branch refuses the mirror case for the same reason.
+                    pw = LLVM.width(pointee_ty)
+                    vw = val_ty isa LLVM.IntegerType ? LLVM.width(val_ty) :
+                         val_ty isa LLVM.LLVMHalf   ? 16 :
+                         val_ty isa LLVM.LLVMFloat  ? 32 :
+                         val_ty isa LLVM.LLVMDouble ? 64 : pw
+                    pointee_spirv = emit_type_int!(state.mod, UInt32(spirv_int_width(pw)), UInt32(0))
+                    if vw == pw
+                        bc = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, Op.OpBitcast, pointee_spirv, bc, val_id)
+                        val_id = bc
+                    elseif vw < pw
+                        # value -> same-width int -> zero-extend -> splice into the slot
+                        vint_ty = emit_type_int!(state.mod, UInt32(spirv_int_width(vw)), UInt32(0))
+                        vint = val_id
+                        if !(val_ty isa LLVM.IntegerType)
+                            vint = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpBitcast, vint_ty, vint, val_id)
+                        end
+                        wide = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, Op.OpUConvert, pointee_spirv, wide, vint)
+                        old = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, Op.OpLoad, pointee_spirv, old, ptr_id)
+                        keep = pw >= 64 ? emit_constant_u64!(state.mod, ~UInt64(0) << vw) :
+                                          emit_constant_u32!(state.mod, UInt32(~UInt32(0) << vw))
+                        hi = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, Op.OpBitwiseAnd, pointee_spirv, hi, old, keep)
+                        merged = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, Op.OpBitwiseOr, pointee_spirv, merged, hi, wide)
+                        val_id = merged
+                    else
+                        val_spirv_ty = map_type!(state.type_ctx, val_ty)
+                        new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
+                        cast_id = fresh_id!(state.mod)
+                        encode_instruction!(state.mod.functions, Op.OpBitcast, new_ptr_ty, cast_id, ptr_id)
+                        ptr_id = cast_id
+                    end
                 elseif val_ty != pointee_ty && pointee_ty isa LLVM.ArrayType &&
                        !(val_ty isa LLVM.PointerType) && !(val_ty isa LLVM.ArrayType) &&
                        !(val_ty isa LLVM.StructType) &&
                        !val_was_bitcasted
                     # Storing a scalar directly into an array-typed alloca pointer
                     # (SROA folded the leading `gep T, ptr %alloca, 0` away).
-                    # Bitcast the pointer to scalar — symmetric with the load fix.
-                    val_spirv_ty = map_type!(state.type_ctx, val_ty)
-                    new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
-                    cast_id = fresh_id!(state.mod)
-                    encode_instruction!(state.mod.functions, Op.OpBitcast, new_ptr_ty, cast_id, ptr_id)
-                    ptr_id = cast_id
+                    #
+                    # DRILL, do not bitcast. `OpAccessChain ptr, 0` reaches the first
+                    # element and is the one legal way to change a logical pointer's
+                    # type; bitcasting it is not (see the branch above). If the element
+                    # is still wider than the value — a uint into [2 x ulong], which is
+                    # what the Complex sliced-setindex reproducer produces — splice it
+                    # in with a read-modify-write so the high bits survive.
+                    elem_ty = LLVM.eltype(pointee_ty)
+                    elem_spirv = map_type!(state.type_ctx, elem_ty)
+                    elem_ptr_ty = map_pointer_type!(state.type_ctx, elem_spirv, sc)
+                    zero_id = emit_constant_u32!(state.mod, UInt32(0))
+                    drill = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpAccessChain, elem_ptr_ty, drill, ptr_id, zero_id)
+                    ptr_id = drill
+                    if elem_ty isa LLVM.IntegerType && val_ty != elem_ty
+                        ew = LLVM.width(elem_ty)
+                        vw = val_ty isa LLVM.IntegerType ? LLVM.width(val_ty) :
+                             val_ty isa LLVM.LLVMHalf   ? 16 :
+                             val_ty isa LLVM.LLVMFloat  ? 32 :
+                             val_ty isa LLVM.LLVMDouble ? 64 : ew
+                        if vw == ew
+                            bc = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpBitcast, elem_spirv, bc, val_id)
+                            val_id = bc
+                        elseif vw < ew
+                            vint_ty = emit_type_int!(state.mod, UInt32(spirv_int_width(vw)), UInt32(0))
+                            vint = val_id
+                            if !(val_ty isa LLVM.IntegerType)
+                                vint = fresh_id!(state.mod)
+                                encode_instruction!(state.mod.functions, Op.OpBitcast, vint_ty, vint, val_id)
+                            end
+                            wide = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpUConvert, elem_spirv, wide, vint)
+                            old = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpLoad, elem_spirv, old, ptr_id)
+                            keep = ew >= 64 ? emit_constant_u64!(state.mod, ~UInt64(0) << vw) :
+                                              emit_constant_u32!(state.mod, UInt32(~UInt32(0) << vw))
+                            hi = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpBitwiseAnd, elem_spirv, hi, old, keep)
+                            merged = fresh_id!(state.mod)
+                            encode_instruction!(state.mod.functions, Op.OpBitwiseOr, elem_spirv, merged, hi, wide)
+                            val_id = merged
+                        end
+                    end
                 end
             end
         end
