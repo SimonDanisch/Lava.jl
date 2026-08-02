@@ -389,7 +389,7 @@ end
 """
     clear_kernel_cache!()
 
-Evict this device's in-session kernel + pipeline cache so the next dispatch of
+Evict this device's in-session kernel + pipeline caches so the next dispatch of
 each kernel recompiles from Julia source.
 
 Use this after editing a Julia kernel under Revise — Revise invalidates the
@@ -397,9 +397,19 @@ Julia method, but Lava's hash-keyed kernel cache stays populated with the old
 SPIR-V because `hash(f, tt, workgroup_size)` doesn't change when the method
 body changes. Unlike `vk_reset_device!()`, this keeps all existing
 `LavaArray`s and the Vulkan context alive.
+
+**Both** caches have to go. `caches.launchplans` holds its own `VkPipeline`
+and is consulted *before* `caches.linked` on every dispatch, so emptying
+only the latter left the old pipeline running with no symptom — the function
+silently did nothing. That is not hypothetical: it made a SPIR-V A/B harness
+report "no difference" for six variants on 2026-08-02, including one that had
+its `OpStore` deleted. The Revise path happened to work anyway, because a
+method redefinition moves the world counter and `launch_plan` rejects plans
+from a superseded world; a caller who only clears the cache had no such luck.
 """
 function clear_kernel_cache!(ctx::VkContext = vk_context())
     empty!(ctx.caches.linked)
+    empty!(ctx.caches.launchplans)
     return nothing
 end
 
