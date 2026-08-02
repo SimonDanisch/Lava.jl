@@ -106,7 +106,10 @@ import Vulkan.VkCore: VkMemoryBarrier, VK_STRUCTURE_TYPE_MEMORY_BARRIER,
     VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
     VK_PIPELINE_STAGE_TRANSFER_BIT, VkDependencyFlags
 # Function pointer for vkCmdPipelineBarrier — initialized in _init_vulkan!
-const CMD_PIPELINE_BARRIER_FPTR = Ref{Ptr{Nothing}}(C_NULL)
+# Was `const CMD_PIPELINE_BARRIER_FPTR = Ref{Ptr{Nothing}}(C_NULL)`. A device
+# function pointer is per device, so it lives on `VkContext` now — see the field
+# there for what a global one did the first time two contexts existed.
+@inline barrier_fptr(bq::BatchQueue) = (bq.ctx::VkContext).cmd_pipeline_barrier_fptr
 
 # Despite the `_2_` in its name, Vulkan.jl types PIPELINE_STAGE_2_ALL_COMMANDS_BIT
 # as the *sync1* `PipelineStageFlag`, while `CommandBatch.wait_semaphores` is
@@ -687,7 +690,7 @@ end
             VK_STRUCTURE_TYPE_MEMORY_BARRIER, C_NULL,
             VkAccessFlags(VK_ACCESS_SHADER_WRITE_BIT), dst_access))
         GC.@preserve barrier_ref begin
-            ccall(CMD_PIPELINE_BARRIER_FPTR[], Cvoid,
+            ccall(barrier_fptr(bq), Cvoid,
                   (Ptr{Nothing}, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
                    UInt32, Ptr{VkMemoryBarrier}, UInt32, Ptr{Nothing}, UInt32, Ptr{Nothing}),
                   cmd.vks,
@@ -809,7 +812,7 @@ end
                 UInt32(base_x), UInt32(base_y), UInt32(base_z),
                 UInt32(gx), UInt32(gy), UInt32(gz))
         end
-        maybe_write_dispatch_end_timestamp!(cmd, ts_slot)
+        maybe_write_dispatch_end_timestamp!(cmd, ts_slot, barrier_fptr(bq))
     end
 end
 
@@ -861,7 +864,7 @@ atomically-claimed queue slots)."""
         byte_offset = UInt64(indirect.offset)
         ts_slot = maybe_write_dispatch_start_timestamp!(cmd, LAST_DISPATCH_INFO[])
         Vulkan.cmd_dispatch_indirect(cmd, mb.buffer, byte_offset)
-        maybe_write_dispatch_end_timestamp!(cmd, ts_slot)
+        maybe_write_dispatch_end_timestamp!(cmd, ts_slot, barrier_fptr(bq))
         pin!(batch, indirect)
     end
 end
@@ -1530,7 +1533,7 @@ function cmd_copy_buffer!(bq::BatchQueue, src, dst, nbytes::Integer;
             VkAccessFlags(VK_ACCESS_SHADER_WRITE_BIT),
             VkAccessFlags(VK_ACCESS_TRANSFER_READ_BIT)))
         GC.@preserve barrier_ref begin
-            ccall(CMD_PIPELINE_BARRIER_FPTR[], Cvoid,
+            ccall(barrier_fptr(bq), Cvoid,
                   (Ptr{Nothing}, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
                    UInt32, Ptr{VkMemoryBarrier}, UInt32, Ptr{Nothing}, UInt32, Ptr{Nothing}),
                   cmd.vks,
@@ -1567,8 +1570,8 @@ function cmd_copy_buffer!(bq::BatchQueue, src, dst, nbytes::Integer;
         VkAccessFlags(VK_ACCESS_TRANSFER_WRITE_BIT),
         VkAccessFlags(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT)))
-    CMD_PIPELINE_BARRIER_FPTR[] == C_NULL || GC.@preserve barrier_post begin
-        ccall(CMD_PIPELINE_BARRIER_FPTR[], Cvoid,
+    barrier_fptr(bq) == C_NULL || GC.@preserve barrier_post begin
+        ccall(barrier_fptr(bq), Cvoid,
               (Ptr{Nothing}, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
                UInt32, Ptr{VkMemoryBarrier}, UInt32, Ptr{Nothing}, UInt32, Ptr{Nothing}),
               cmd.vks,

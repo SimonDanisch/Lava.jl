@@ -405,6 +405,21 @@ mutable struct VkContext
     # Persistent VkPipelineCache. Seeded from disk on init, passed to every
     # vkCreate*Pipelines call, snapshotted back on vk_reset_device! + atexit.
     pipeline_cache::Vulkan.PipelineCache
+    # `vkCmdPipelineBarrier`, resolved for THIS device.
+    #
+    # Device function pointers are per device — `vkGetDeviceProcAddr` returns a
+    # pointer valid only for the device it was asked about. This was a module
+    # global (`CMD_PIPELINE_BARRIER_FPTR`), so creating a second context
+    # overwrote it, and the FIRST device's command buffers were then recorded
+    # through the SECOND device's driver.
+    #
+    # That is an immediate segfault rather than a wrong answer, which makes it
+    # the most dangerous piece of module-scope device state in the library and
+    # the one `GUARDRAILS.md` §8 did not list — it names four caches holding
+    # handles and does not mention the function table. Found the first time two
+    # contexts existed at once: the crash was inside `libvulkan_lvp.so` while
+    # dispatching on the NVIDIA context.
+    cmd_pipeline_barrier_fptr::Ptr{Nothing}
     # A stable identity for this device, for as long as it exists.
     #
     # Four caches hold device-owned Vulkan handles at module scope and were keyed
@@ -506,6 +521,10 @@ mutable struct VkContext
         # validated against this physical device before the driver sees it —
         # `vkCreatePipelineCache` is not a safe place to discover a mismatch.
         ctx.id = (VK_CONTEXT_COUNTER[] += 1)
+        # Filled by `init_vulkan!` once the device exists; null until then so a
+        # barrier recorded before that point is skipped rather than jumping to
+        # whatever the field happened to contain.
+        ctx.cmd_pipeline_barrier_fptr = C_NULL
         ctx.pipeline_cache = create_lava_pipeline_cache(
             device, lava_pipeline_cache_path(device_name, driver_version), physical_device)
         _register_pipeline_cache_atexit!()
@@ -702,7 +721,26 @@ Always takes the queue explicitly — no implicit default_bq lookup.
 """
 has_active_recording(bq::BatchQueue) = bq.active_batch !== nothing
 
-function init_vulkan!()
+"""
+    init_vulkan!(; select = pick_physical_device) -> VkContext
+
+Build a context. **Does not install it** as the global — `vk_context()` is what
+does that, and it is the only caller that should.
+
+`select` receives the enumerated physical devices and returns one, so a caller
+can ask for a device other than the one `pick_physical_device` prefers. That is
+what makes a two-device test possible on a single-GPU machine: the loader
+enumerates the real GPU *and* lavapipe from one instance, so
+
+    gpu = vk_context()
+    cpu = init_vulkan!(select = devs -> only(filter(islavapipe, devs)))
+
+gives two live contexts with two distinct `id`s, which is the pair every
+per-device cache key has to be checked against (`GUARDRAILS.md` §8). Before this
+there was no way to ask for the second device at all, so the acceptance test the
+briefs describe could not be written.
+"""
+function init_vulkan!(; select = pick_physical_device)
     # Create instance — target Vulkan 1.4 (device supports 1.4.335 on RADV).
     # Bumping API version unlocks 1.3/1.4 core features we enable below.
     app_info = Vulkan.ApplicationInfo(
@@ -827,7 +865,7 @@ function init_vulkan!()
         "No Vulkan-capable GPU found",
         "Ensure Vulkan drivers are installed"))
 
-    phys_dev = pick_physical_device(phys_devs)
+    phys_dev = select(phys_devs)
     props = Vulkan.get_physical_device_properties(phys_dev)
     dev_name = String(filter(!=('\0'), collect(props.device_name)))
 
@@ -1286,8 +1324,10 @@ function init_vulkan!()
     # vkCreateDevice that would otherwise block the first shader compilation.
     clear_validation_messages!()
 
-    # Initialize zero-alloc Vulkan function pointers for hot paths
-    CMD_PIPELINE_BARRIER_FPTR[] = Vulkan.function_pointer(device, "vkCmdPipelineBarrier")
+    # Zero-alloc Vulkan function pointers for hot paths. Per device — see the
+    # field's comment on `VkContext`; a global here crashed the first two-device
+    # run. Kept in a local until the context exists, and assigned below.
+    cmd_barrier_fptr = Vulkan.function_pointer(device, "vkCmdPipelineBarrier")
 
     mem_props = Vulkan.get_physical_device_memory_properties(phys_dev)
     phys_props = Vulkan.get_physical_device_properties(phys_dev)
@@ -1338,6 +1378,10 @@ function init_vulkan!()
         has_video_decode, video_decode_queue, video_qf_idx,
         query_device_compute(phys_dev, phys_props),
     )
+    # After construction, because it is resolved from THIS device and the inner
+    # constructor has no access to the local. Per device — a module-global one
+    # sent the first device's command buffers through the second device's driver.
+    ctx.cmd_pipeline_barrier_fptr = cmd_barrier_fptr
     return ctx
 end
 
@@ -1364,6 +1408,10 @@ function allocate_batch_queue!(ctx::VkContext)
     end
     return BatchQueue(ctx.device, queue, ctx.queue_family_index, ctx)
 end
+
+"""Whether this is Mesa's software rasteriser, which every machine here has."""
+islavapipe(dev) = occursin("llvmpipe",
+    String(filter(!=('\0'), collect(Vulkan.get_physical_device_properties(dev).device_name))))
 
 function pick_physical_device(devs)
     # Prefer discrete GPU

@@ -286,7 +286,7 @@ function rt_dispatch!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::LavaTLAS,
             pipeline.raygen_region, pipeline.miss_region,
             pipeline.hit_region, pipeline.callable_region,
             UInt32(width), UInt32(height), UInt32(depth))
-        maybe_write_dispatch_end_timestamp!(cmd, ts_slot;
+        maybe_write_dispatch_end_timestamp!(cmd, ts_slot, barrier_fptr(bq);
             stage = Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
             stage_mask = UInt32(VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR))
     end
@@ -329,7 +329,7 @@ function rt_dispatch_indirect!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::L
             pipeline.raygen_region, pipeline.miss_region,
             pipeline.hit_region, pipeline.callable_region,
             bda_address(indirect))
-        maybe_write_dispatch_end_timestamp!(cmd, ts_slot;
+        maybe_write_dispatch_end_timestamp!(cmd, ts_slot, barrier_fptr(bq);
             stage = Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
             stage_mask = UInt32(VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR))
         pin!(batch, indirect)

@@ -375,7 +375,11 @@ end
 # dispatches were unaffected; the symptom only showed on indirect because
 # indirect-dispatch parameters are read at dispatch time and workgroup
 # launches are visibly deferred.
-function maybe_write_dispatch_end_timestamp!(cb::VK.CommandBuffer, start_slot::Int;
+# `barrier_fptr` is passed in rather than read from a global: `vkCmdPipelineBarrier`
+# is resolved per device, and a global one records the wrong driver's barrier
+# into the other device's command buffer. See `VkContext.cmd_pipeline_barrier_fptr`.
+function maybe_write_dispatch_end_timestamp!(cb::VK.CommandBuffer, start_slot::Int,
+                                             barrier_fptr::Ptr{Nothing} = C_NULL;
                                              stage = VK.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                              stage_mask::UInt32 = UInt32(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT))
     start_slot < 0 && return
@@ -394,8 +398,8 @@ function maybe_write_dispatch_end_timestamp!(cb::VK.CommandBuffer, start_slot::I
     # serialised, and the overlap you give up is not attributable to any one
     # kernel anyway. Timing runs are therefore slower than production runs — use
     # them for the breakdown, not for the step rate.
-    if CMD_PIPELINE_BARRIER_FPTR[] != C_NULL
-        ccall(CMD_PIPELINE_BARRIER_FPTR[], Cvoid,
+    if barrier_fptr != C_NULL
+        ccall(barrier_fptr, Cvoid,
               (Ptr{Nothing}, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
                UInt32, Ptr{VkMemoryBarrier}, UInt32, Ptr{Nothing}, UInt32, Ptr{Nothing}),
               cb.vks,
