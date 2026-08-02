@@ -172,6 +172,18 @@ function probe()
     println("LINKED_KERNEL_CACHE device keys: ", sort(collect(keys(Lava.LINKED_KERNEL_CACHE))))
     println("LAUNCH_PLAN_CACHE   device keys: ", sort(collect(keys(Lava.LAUNCH_PLAN_CACHE))))
     grew >= 2 || error("the two devices shared a pipeline")
+
+    # Retire the context this probe built. Nothing else can: `init_vulkan!(;
+    # select)` deliberately does NOT install it as the global, so it is the
+    # caller's, and `vk_reset_device!` — which retires the context it replaces —
+    # never sees it.
+    #
+    # Without this the arrays above outlive the probe, and their finalizers run
+    # at whatever GC comes next — in practice `ijl_atexit_hook`, against a
+    # lavapipe device Vulkan.jl has already torn down. The suite printed its
+    # summary and then the process died with SIGSEGV in `libvulkan_lvp.so`,
+    # which reads as "the tests crashed" and is a long way from this line.
+    Lava.mark_device_lost!(cpu)
     println("\nPASS")
 end
 

@@ -171,6 +171,13 @@ end
         include(joinpath(@__DIR__, "test_pipeline_cache_no_compile.jl"))
     end
 
+    # Straight after the reset above, and before `test_static_workgroup.jl` —
+    # which is where this crashed, because that file calls `GC.gc()` explicitly
+    # and so ran whichever finalizer the reset had stranded.
+    @testset "a buffer may outlive a device reset" begin
+        include(joinpath(@__DIR__, "test_device_reset_finalizer.jl"))
+    end
+
     @testset "static workgroup indexing" begin
         include(joinpath(@__DIR__, "test_static_workgroup.jl"))
     end

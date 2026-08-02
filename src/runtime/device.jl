@@ -622,7 +622,23 @@ device_lost() = let ctx = VK_CONTEXT_REF[]
     ctx === nothing ? false : ctx.device_lost
 end
 
-"""Mark `ctx`'s device as lost. All subsequent finalizers will skip Vulkan calls."""
+"""
+Mark `ctx`'s device as lost. All subsequent finalizers will skip Vulkan calls.
+
+Two things reach this state, and only the first is a fault:
+
+ 1. `ERROR_DEVICE_LOST` from any Vulkan call — see `mark_if_device_lost!`.
+ 2. **Retirement**: a context nobody will call into again, whose buffers are
+    still alive in Julia and whose finalizers must therefore not touch it.
+    `vk_reset_device!` retires the context it replaces; anything that builds a
+    context of its own with `init_vulkan!(; select)` owns retiring it.
+
+The flag means the same thing to every consumer either way — *do not call into
+this device* — which is why the second case reuses it rather than adding a
+parallel one. A context that is dropped without being retired hands its
+finalizers a device that Vulkan.jl's own handle finalizers may already have
+destroyed, and the crash lands inside the driver at whatever GC runs next.
+"""
 mark_device_lost!(ctx::VkContext) = (ctx.device_lost = true; nothing)
 
 # Callbacks for vk_reset_device! — registered by later-included files (pipeline.jl,
@@ -687,9 +703,29 @@ function vk_reset_device!()
     let old = VK_CONTEXT_REF[]
         old === nothing || save_pipeline_cache!(old)
     end
-    # Drop the context ref; a fresh one will be created lazily. Pre-reset
-    # VkManagedBuffers hold a strong ref to the OLD ctx whose `device_lost`
-    # is already true, so their finalizers will skip Vulkan calls.
+    # Retire the old context BEFORE dropping it. Pre-reset `VkManagedBuffer`s
+    # hold a strong ref to it, and their finalizers gate every Vulkan call on
+    # `device_lost` — so marking it here is what makes that gate true.
+    #
+    # It used to be assumed rather than set, and the assumption only held on the
+    # path that *caused* it: a reset after `ERROR_DEVICE_LOST` finds the flag
+    # already true, while a voluntary `vk_reset_device!()` left it false. Then
+    # dropping the ref below made the old context garbage — and its buffers
+    # garbage in the SAME collection, where Julia does not order finalizers. Run
+    # the context's first and `Vulkan.Device`'s own finalizer destroys the
+    # device; the buffer's `vk_free!` then calls `query_timeline` on it and the
+    # driver takes a SIGSEGV inside `vkGetSemaphoreCounterValue`.
+    #
+    #     d = KA.allocate(LavaBackend(), Float32, 1000); fill!(d, 1f0)
+    #     Lava.vk_reset_device!(); d = nothing; GC.gc()   # <- segfault
+    #
+    # A retired context is one nothing may call into: every array that predates
+    # the reset holds memory belonging to a device that is gone, so there is no
+    # case where skipping is wrong. `mark_device_lost!` is the same flag the
+    # `VkResult` rule sets, and this is the second way to reach it.
+    let old = VK_CONTEXT_REF[]
+        old === nothing || mark_device_lost!(old)
+    end
     VK_CONTEXT_REF[] = nothing
     # Don't destroy old Vulkan handles — they're invalid after DEVICE_LOST.
     # GC will eventually try to destroy them; _destroy_buffer! skips when
