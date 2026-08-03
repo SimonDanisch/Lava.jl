@@ -19,14 +19,6 @@
 # its built-in disk cache doesn't trigger for them). The `linker` function
 # creates the session-dependent `VkPipeline` via `link_kernel(ctx, ...)`.
 
-# Linked result: session-dependent, stored in the cache Dict.
-struct LavaLinkedKernel
-    compiled::LavaGPUKernel        # SPIR-V bytes + push_info (serializable)
-    pipeline::LavaComputePipeline  # VkPipeline (session-dependent, NOT serializable)
-    offsets::Vector{Int}           # arg layout offsets (derived from push_info)
-    byval_sizes::Vector{Int}      # LLVM byval sizes (derived from push_info)
-end
-
 # Cache shape matches `GPUCompiler.cached_compilation`'s expectation:
 # `Dict{Any, LavaLinkedKernel}` with keys like `(objectid(ci), world, cfg)`.
 # Per device, because a `LavaLinkedKernel` owns a `VkPipeline` (GUARDRAILS §8).

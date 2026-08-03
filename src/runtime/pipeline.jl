@@ -97,20 +97,6 @@ function create_compute_pipeline_large_stack(device::Ptr{Cvoid},
 end
 
 """
-    LavaComputePipeline
-
-A compiled compute pipeline ready for dispatch.
-"""
-struct LavaComputePipeline
-    shader_module::Vulkan.ShaderModule
-    pipeline_layout::Vulkan.PipelineLayout
-    pipeline::Vulkan.Pipeline
-    push_constant_size::UInt32
-    needs_tlas_descriptor::Bool
-    descriptor_set_layout::Union{Nothing, Vulkan.DescriptorSetLayout}
-end
-
-"""
     PIPELINE_NO_COMPILE
 
 When set, compute pipelines are created with
@@ -183,12 +169,6 @@ const MAX_PIPELINE_CACHE_SIZE = Ref(1024)
 # wider wave those lanes do not form a subgroup and the kernel writes only part
 # of its output tile.
 const COOPMAT_SUBGROUP = 32
-
-struct SubgroupSizeControl
-    min::Int
-    max::Int
-    compute::Bool   # COMPUTE present in requiredSubgroupSizeStages
-end
 
 # Per device, for the same reason as `DEVICE_SUBGROUP_SIZE` above: RDNA 3.5
 # reports min 32 / max 64 where this card reports 32 / 32, and answering the

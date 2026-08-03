@@ -4,30 +4,6 @@
 # Staging buffer for CPU↔GPU transfers.
 
 
-"""
-    VkManagedBuffer
-
-A GPU buffer with a known device address (BDA).
-When `mapped_ptr` is non-null, the buffer is in BAR memory (host-visible + device-local)
-and can be read/written directly from the CPU without staging copies.
-"""
-mutable struct PoolBlock
-    buffer::Vulkan.Buffer
-    memory::Vulkan.DeviceMemory
-    base_address::UInt64       # BDA of the start of this block
-    capacity::Int              # Total bytes in this block
-    bump::Int                  # Next free byte offset (bump pointer for initial carving)
-    live_count::Int            # Number of live sub-allocations
-    # The `DevicePool` this block belongs to. `Any` because `DevicePool` holds a
-    # `Vector{PoolBlock}` and Julia has no forward declaration; every use site
-    # asserts `::DevicePool`, the same shape as `bq.ctx::VkContext`.
-    #
-    # A back-reference rather than a lookup because `return_to_pool!` runs from a
-    # FINALIZER. A finalizer must not allocate and must not be able to fail on a
-    # missing key, so the free path is a field hop and nothing else.
-    pool::Any
-end
-
 # Debug instrumentation for iter6 cross-scene cascade investigation.
 # All off by default — opt-in via the *_ENABLED Refs.
 
@@ -89,44 +65,6 @@ const BUF_STATE_ALIVE    = UInt8(0)
 const BUF_STATE_DEFERRED = UInt8(1)
 const BUF_STATE_DEAD     = UInt8(2)
 
-
-mutable struct VkManagedBuffer
-    buffer::Vulkan.Buffer
-    memory::Vulkan.DeviceMemory
-    address::UInt64     # BDA for PhysicalStorageBuffer access
-    mapped_ptr::Ptr{UInt8}  # Non-null for unified/BAR memory
-    size::Int
-    pool_offset::Int    # Byte offset within pool block (0 for non-pooled)
-    pool_block::Union{Nothing, PoolBlock}  # Back-reference for pool free (nothing = non-pooled)
-    # Cross-queue synchronization: records which BatchQueue last wrote to
-    # this buffer, at which timeline value. Consumed by sync_access! to
-    # auto-insert semaphore waits when a dispatch on a different queue
-    # takes this buffer as an argument. Nothing = never written.
-    # Typed as Any so BatchQueue (defined later) doesn't force a cyclic include.
-    # @atomic so the finalizer thread (vk_free!) and main thread (record /
-    # sync_access!) can read/write it safely.
-    @atomic last_write::Union{Nothing, Tuple{Any, UInt64}}
-    # Lifecycle state — see BUF_STATE_* constants above.  @atomic CAS is the
-    # single point where double-free / use-after-free is ruled out.
-    @atomic state::UInt8
-    # Number of live CommandBatches that have `pin!`ed an array backed by this
-    # buffer.  Incremented at pin time, decremented when the batch releases its
-    # pins (`release_pinned_refs!`, i.e. the batch completed or its submit
-    # failed).  A buffer with pins > 0 is REACHABLE BY A BATCH THAT CAN STILL
-    # SUBMIT, so `vk_free!` must not touch it — not even to mark it DEFERRED,
-    # because `sync_access!` asserts the buffer is ALIVE at submit.
-    #
-    # This is what makes the guarantee structural rather than a timing accident:
-    # `last_write` only tells us about work already *submitted*, so a buffer
-    # pinned into a still-open batch looks idle to the timeline check.
-    @atomic pins::Int
-    # A free was requested while pins > 0.  The free is not lost, just owed: the
-    # last `unpin_buffer!` performs it.
-    @atomic free_requested::Bool
-    # Owning VkContext — so upload!/download!/vk_free! don't need the global.
-    # Loose type because VkContext is declared in device.jl, included first.
-    ctx::Any
-end
 
 # Strong references to keep Vulkan handles alive until explicit free
 const LIVE_BUFFERS = Set{VkManagedBuffer}()
@@ -1054,31 +992,6 @@ const POOL_NUM_SIZE_CLASSES = POOL_POW2_CLASSES + 16 * POOL_SUBDIV
 # on it cannot see sub-pool overruns; with this flag on, each LavaArray's bounds are
 # checked individually. Slow — leave off in production.
 const POOL_DISABLED = Ref{Bool}(false)
-
-"""
-One device's memory: its 64 MiB blocks and its per-size-class free lists.
-
-**This was two module-level globals**, `POOL_BLOCKS` and `POOL_FREE_LISTS`, and
-`PoolBlock` carried no device. So an allocation on a second device was served out
-of the first device's block — measured directly: allocate on the GPU (one block
-created), then allocate on lavapipe, and `length(POOL_BLOCKS)` was *still 1*.
-
-The buffer's `ctx` was right and the memory under it belonged to the other
-device, which is the worst shape a bug can have: `fill!` on the second context
-read back **0.0** because it wrote into memory that device does not own, and the
-same sequence in a different order segfaulted instead.
-
-Worth separating from `GUARDRAILS.md` §8, which lists four caches holding
-pipeline *handles*. This hands out *memory*. A stale handle is undefined
-behaviour the driver usually catches; memory from the wrong device is silent
-corruption, and no amount of cache keying reaches it. Every one of those four
-caches was keyed per device before this, and two devices still did not work.
-"""
-mutable struct DevicePool
-    blocks::Vector{PoolBlock}
-    # index i holds reusable VkManagedBuffer objects of size class i
-    free_lists::Vector{Vector{VkManagedBuffer}}
-end
 
 DevicePool() = DevicePool(PoolBlock[],
                           [VkManagedBuffer[] for _ in 1:POOL_NUM_SIZE_CLASSES])

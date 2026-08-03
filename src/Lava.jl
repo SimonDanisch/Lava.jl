@@ -145,6 +145,11 @@ include("device/printf.jl")          # @lava_printf → NonSemantic.DebugPrintf
 # atomics.jl is included after lavaarray.jl (needs LavaDeviceArray)
 
 # ---- Vulkan runtime ----
+# Types before the context that names them. `VkContext` holds its per-device
+# state in concrete fields, so every struct in those fields has to exist first —
+# and only the `struct` blocks moved, because include order constrains types and
+# not methods.
+include("runtime/coretypes.jl")
 include("runtime/device.jl")
 include("runtime/memory.jl")
 include("runtime/pipeline.jl")

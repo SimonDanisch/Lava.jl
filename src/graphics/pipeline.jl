@@ -3,23 +3,6 @@
 # Creates VkGraphicsPipeline using VK_KHR_dynamic_rendering (no VkRenderPass).
 # Pipeline state (blend, cull, depth, topology) configured via dispatch on config types.
 
-"""
-    CompiledGraphicsPipeline
-
-A compiled graphics pipeline ready for draw commands.
-"""
-struct CompiledGraphicsPipeline
-    pipeline::Vulkan.Pipeline
-    pipeline_layout::Vulkan.PipelineLayout
-    modules::Vector{Vulkan.ShaderModule}
-    push_constant_size::UInt32
-    descriptor_set_layout::Union{Nothing, Vulkan.DescriptorSetLayout}
-    push_stage_flags::Vulkan.ShaderStageFlag
-    # Pipeline state (for debug/inspection)
-    color_format::Vulkan.Format
-    has_depth::Bool
-end
-
 const GFX_PIPELINE_CACHE = Dict{UInt64, CompiledGraphicsPipeline}()
 
 # Clear graphics pipeline cache on vk_reset_device!

@@ -681,37 +681,6 @@ Internal launch function for KA kernels. Compiles and dispatches the GPU functio
 """
 const DBG_LAUNCH_COUNT = Ref(0)
 
-"""
-Everything a dispatch needs that depends only on the *types* of its arguments.
-
-`ka_launch!` used to rebuild `Tuple{map(arg_sigtype, tail(all_args))...}` on
-every single dispatch and hand it to `GPUCompiler.methodinstance`: that interns
-a fresh `Type` object, does a method lookup, and then two hash lookups keyed on
-that type and a freshly built compiler config — all to rediscover a pipeline it
-had already compiled. Types hash and compare slowly, and at ~2000 dispatches per
-MatAnyone inference step this was the largest single host cost in the loop.
-
-`typeof(all_args)` is available for free and types are interned, so an `IdDict`
-keyed on it is a pointer hash. Everything downstream — pipeline, arg layout,
-buffer size — is a function of exactly that, so it is all cached together.
-
-The world counter is stored with the entry and checked on each hit. It moves on
-any method definition, so redefining a kernel (Revise, or a first-time
-specialisation) drops back to the slow path for one call and re-caches; a stale
-pipeline can never be served.
-"""
-struct LaunchPlan
-    compiled::LavaGPUKernel
-    pipeline::LavaComputePipeline
-    offsets::Vector{Int}
-    byval_sizes::Vector{Int}
-    arg_buffer_size::Int
-    total_size::Int
-    world::UInt64
-    wg::NTuple{3,Int}
-    ray_query::Bool
-end
-
 # Per device: a `LaunchPlan` holds a `VkPipeline` (GUARDRAILS §8). Same shape as
 # `LINKED_KERNEL_CACHE` — an outer dict keyed by `ctx.id`, so the inner one keeps
 # the `DataType` key that makes the lookup a pointer compare.
@@ -807,21 +776,6 @@ end
 # The prepare-indirect kernel is always the same function with the same types,
 # so we compile once and cache everything. Saves ~30K lava_launch! calls per render
 # (hash lookups, validation, auto-flush, keep_alive, etc.).
-
-"""
-The compiled prepare-indirect kernel for one device.
-
-It owns a `VkPipeline`, so it is per device (`GUARDRAILS.md` §8) — four separate
-`Ref`s before, which meant four things that had to be reset together and were
-reachable from the wrong device in exactly the same way. Bundling them makes the
-per-device dict hold one value instead of four parallel ones.
-"""
-struct PrepareIndirect
-    pipeline::LavaComputePipeline
-    offsets::Vector{Int}
-    byval_sizes::Vector{Int}
-    arg_buffer_size::Int
-end
 
 const PREPARE_INDIRECT = Dict{UInt64, PrepareIndirect}()
 

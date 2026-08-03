@@ -1,0 +1,205 @@
+"""
+The types `VkContext` has to name, hoisted ahead of it.
+
+Nothing here is new and nothing here has behaviour — these are the `struct`
+blocks that used to sit beside the functions that use them, moved so that
+`VkContext` can hold its per-device state in **concrete typed fields** instead of
+module-level dictionaries keyed by `ctx.id`.
+
+That keying was the shortcut: it made two devices work without touching call
+sites, and the probe that followed found seven real defects. But it left twelve
+globals whose entries outlive the device they describe, and a `RESET_CALLBACKS`
+mechanism whose entire job was emptying them. State owned by the context needs
+neither.
+
+Only the definitions moved. Every constructor, method and comment about
+*behaviour* stayed where it was, because include order constrains types and not
+methods — Julia resolves a call at the first invocation, long after every file
+is loaded.
+
+Two `Any` fields survive, and both predate this: `PoolBlock.pool` (a `DevicePool`
+holds a `Vector{PoolBlock}`, so one direction must be untyped) and
+`VkManagedBuffer.ctx`/`last_write` (a `VkContext` is what owns the pool that owns
+the buffer). Those are genuine cycles; the rest were only ordering.
+"""
+
+"""
+    LavaComputePipeline
+
+A compiled compute pipeline ready for dispatch.
+"""
+struct LavaComputePipeline
+    shader_module::Vulkan.ShaderModule
+    pipeline_layout::Vulkan.PipelineLayout
+    pipeline::Vulkan.Pipeline
+    push_constant_size::UInt32
+    needs_tlas_descriptor::Bool
+    descriptor_set_layout::Union{Nothing, Vulkan.DescriptorSetLayout}
+end
+
+struct SubgroupSizeControl
+    min::Int
+    max::Int
+    compute::Bool   # COMPUTE present in requiredSubgroupSizeStages
+end
+
+"""
+    PoolBlock
+
+One 64 MiB slab carved by bump pointer, and the count of live sub-allocations in
+it. A block with `live_count == 0` is reusable.
+
+(The docstring here described `VkManagedBuffer` — it had been attached to this
+struct rather than that one since before the hoist, so it is corrected rather
+than carried across.)
+"""
+mutable struct PoolBlock
+    buffer::Vulkan.Buffer
+    memory::Vulkan.DeviceMemory
+    base_address::UInt64       # BDA of the start of this block
+    capacity::Int              # Total bytes in this block
+    bump::Int                  # Next free byte offset (bump pointer for initial carving)
+    live_count::Int            # Number of live sub-allocations
+    # The `DevicePool` this block belongs to. `Any` because `DevicePool` holds a
+    # `Vector{PoolBlock}` and Julia has no forward declaration; every use site
+    # asserts `::DevicePool`, the same shape as `bq.ctx::VkContext`.
+    #
+    # A back-reference rather than a lookup because `return_to_pool!` runs from a
+    # FINALIZER. A finalizer must not allocate and must not be able to fail on a
+    # missing key, so the free path is a field hop and nothing else.
+    pool::Any
+end
+
+mutable struct VkManagedBuffer
+    buffer::Vulkan.Buffer
+    memory::Vulkan.DeviceMemory
+    address::UInt64     # BDA for PhysicalStorageBuffer access
+    mapped_ptr::Ptr{UInt8}  # Non-null for unified/BAR memory
+    size::Int
+    pool_offset::Int    # Byte offset within pool block (0 for non-pooled)
+    pool_block::Union{Nothing, PoolBlock}  # Back-reference for pool free (nothing = non-pooled)
+    # Cross-queue synchronization: records which BatchQueue last wrote to
+    # this buffer, at which timeline value. Consumed by sync_access! to
+    # auto-insert semaphore waits when a dispatch on a different queue
+    # takes this buffer as an argument. Nothing = never written.
+    # Typed as Any so BatchQueue (defined later) doesn't force a cyclic include.
+    # @atomic so the finalizer thread (vk_free!) and main thread (record /
+    # sync_access!) can read/write it safely.
+    @atomic last_write::Union{Nothing, Tuple{Any, UInt64}}
+    # Lifecycle state — see BUF_STATE_* constants above.  @atomic CAS is the
+    # single point where double-free / use-after-free is ruled out.
+    @atomic state::UInt8
+    # Number of live CommandBatches that have `pin!`ed an array backed by this
+    # buffer.  Incremented at pin time, decremented when the batch releases its
+    # pins (`release_pinned_refs!`, i.e. the batch completed or its submit
+    # failed).  A buffer with pins > 0 is REACHABLE BY A BATCH THAT CAN STILL
+    # SUBMIT, so `vk_free!` must not touch it — not even to mark it DEFERRED,
+    # because `sync_access!` asserts the buffer is ALIVE at submit.
+    #
+    # This is what makes the guarantee structural rather than a timing accident:
+    # `last_write` only tells us about work already *submitted*, so a buffer
+    # pinned into a still-open batch looks idle to the timeline check.
+    @atomic pins::Int
+    # A free was requested while pins > 0.  The free is not lost, just owed: the
+    # last `unpin_buffer!` performs it.
+    @atomic free_requested::Bool
+    # Owning VkContext — so upload!/download!/vk_free! don't need the global.
+    # Loose type because VkContext is declared in device.jl, included first.
+    ctx::Any
+end
+
+"""
+One device's memory: its 64 MiB blocks and its per-size-class free lists.
+
+**This was two module-level globals**, `POOL_BLOCKS` and `POOL_FREE_LISTS`, and
+`PoolBlock` carried no device. So an allocation on a second device was served out
+of the first device's block — measured directly: allocate on the GPU (one block
+created), then allocate on lavapipe, and `length(POOL_BLOCKS)` was *still 1*.
+
+The buffer's `ctx` was right and the memory under it belonged to the other
+device, which is the worst shape a bug can have: `fill!` on the second context
+read back **0.0** because it wrote into memory that device does not own, and the
+same sequence in a different order segfaulted instead.
+
+Worth separating from `GUARDRAILS.md` §8, which lists four caches holding
+pipeline *handles*. This hands out *memory*. A stale handle is undefined
+behaviour the driver usually catches; memory from the wrong device is silent
+corruption, and no amount of cache keying reaches it. Every one of those four
+caches was keyed per device before this, and two devices still did not work.
+"""
+mutable struct DevicePool
+    blocks::Vector{PoolBlock}
+    # index i holds reusable VkManagedBuffer objects of size class i
+    free_lists::Vector{Vector{VkManagedBuffer}}
+end
+
+# Linked result: session-dependent, stored in the cache Dict.
+struct LavaLinkedKernel
+    compiled::LavaGPUKernel        # SPIR-V bytes + push_info (serializable)
+    pipeline::LavaComputePipeline  # VkPipeline (session-dependent, NOT serializable)
+    offsets::Vector{Int}           # arg layout offsets (derived from push_info)
+    byval_sizes::Vector{Int}      # LLVM byval sizes (derived from push_info)
+end
+
+"""
+Everything a dispatch needs that depends only on the *types* of its arguments.
+
+`ka_launch!` used to rebuild `Tuple{map(arg_sigtype, tail(all_args))...}` on
+every single dispatch and hand it to `GPUCompiler.methodinstance`: that interns
+a fresh `Type` object, does a method lookup, and then two hash lookups keyed on
+that type and a freshly built compiler config — all to rediscover a pipeline it
+had already compiled. Types hash and compare slowly, and at ~2000 dispatches per
+MatAnyone inference step this was the largest single host cost in the loop.
+
+`typeof(all_args)` is available for free and types are interned, so an `IdDict`
+keyed on it is a pointer hash. Everything downstream — pipeline, arg layout,
+buffer size — is a function of exactly that, so it is all cached together.
+
+The world counter is stored with the entry and checked on each hit. It moves on
+any method definition, so redefining a kernel (Revise, or a first-time
+specialisation) drops back to the slow path for one call and re-caches; a stale
+pipeline can never be served.
+"""
+struct LaunchPlan
+    compiled::LavaGPUKernel
+    pipeline::LavaComputePipeline
+    offsets::Vector{Int}
+    byval_sizes::Vector{Int}
+    arg_buffer_size::Int
+    total_size::Int
+    world::UInt64
+    wg::NTuple{3,Int}
+    ray_query::Bool
+end
+
+"""
+The compiled prepare-indirect kernel for one device.
+
+It owns a `VkPipeline`, so it is per device (`GUARDRAILS.md` §8) — four separate
+`Ref`s before, which meant four things that had to be reset together and were
+reachable from the wrong device in exactly the same way. Bundling them makes the
+per-device dict hold one value instead of four parallel ones.
+"""
+struct PrepareIndirect
+    pipeline::LavaComputePipeline
+    offsets::Vector{Int}
+    byval_sizes::Vector{Int}
+    arg_buffer_size::Int
+end
+
+"""
+    CompiledGraphicsPipeline
+
+A compiled graphics pipeline ready for draw commands.
+"""
+struct CompiledGraphicsPipeline
+    pipeline::Vulkan.Pipeline
+    pipeline_layout::Vulkan.PipelineLayout
+    modules::Vector{Vulkan.ShaderModule}
+    push_constant_size::UInt32
+    descriptor_set_layout::Union{Nothing, Vulkan.DescriptorSetLayout}
+    push_stage_flags::Vulkan.ShaderStageFlag
+    # Pipeline state (for debug/inspection)
+    color_format::Vulkan.Format
+    has_depth::Bool
+end
