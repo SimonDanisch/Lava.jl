@@ -223,6 +223,12 @@ end
         include(joinpath(@__DIR__, "test_tolerated_alloc_failure.jl"))
     end
 
+    # The frozen path is the one the runners ship, and the profiler could not see
+    # it: 0 kernels reported against 45 live dispatches.
+    @testset "frozen kernels are visible to the profiler" begin
+        include(joinpath(@__DIR__, "test_frozen_kernels_visible.jl"))
+    end
+
     # The buffer-lifetime case behind the intermittent flush hang. Asserted on
     # the state machine, not by provoking the hang — see the file.
     @testset "free during recording" begin
