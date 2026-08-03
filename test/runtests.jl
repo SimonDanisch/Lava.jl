@@ -229,6 +229,11 @@ end
         include(joinpath(@__DIR__, "test_frozen_kernels_visible.jl"))
     end
 
+    # `vk_context` had methods for three of AnyLavaArray's six wrappers.
+    @testset "vk_context through array wrappers" begin
+        include(joinpath(@__DIR__, "test_vk_context_wrappers.jl"))
+    end
+
     # The buffer-lifetime case behind the intermittent flush hang. Asserted on
     # the state machine, not by provoking the hang — see the file.
     @testset "free during recording" begin
