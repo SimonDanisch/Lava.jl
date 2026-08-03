@@ -526,6 +526,91 @@ The `f(...)` call below is a marker, not the work — see `coopmat_perelement_ma
     end
 end
 
+"""
+`OpCooperativeMatrixReduceNV`'s reduce mask. `Row` and `Column` are bits, so
+`RowAndColumn` is their union — which `flash_attn_cm2.comp` uses as
+`gl_CooperativeMatrixReduceRowAndColumnNV`, and which is how `Column = 2` is
+known without the extension spec to hand. `TwoByTwo` is the remaining bit and is
+**unverified**; nothing here uses it yet.
+"""
+module CoopMatReduce
+const Row          = UInt32(1)
+const Column       = UInt32(2)
+const RowAndColumn = UInt32(3)
+const TwoByTwo     = UInt32(4)
+end
+
+"""
+The combiner the instruction actually names, wrapping the user's `f`.
+
+Same job as [`coopmat_perelement_thunk`](@ref) and the same reason: the SPIR-V
+rules fix this function's signature at `(T, T) -> T`, while LLVM is free to
+rewrite the signature of a Julia function it can see every caller of. A combiner
+that ignores one argument — `smearReduce(x, y) = x`, which the reference uses to
+broadcast rather than reduce — would otherwise lose that parameter to
+dead-argument elimination and emit a module the validator rejects.
+"""
+@noinline function coopmat_reduce_thunk(f::F, x::T, y::T) where {F,T}
+    coopmat_keepparam(x)
+    coopmat_keepparam(y)
+    f(x, y)
+end
+
+"""
+    coopmat_reduce(f, AcceleratedMatrix{T,M,N,U}, m, mask) -> AcceleratedMatrix
+
+Combine `m` along `mask` with the binary function `f`, into a matrix of the
+**destination** type — `OpCooperativeMatrixReduceNV`, from
+`VK_NV_cooperative_matrix2`.
+
+Two things about the semantics, both taken from `flash_attn_cm2.comp` rather than
+from the extension spec, and both easy to guess wrong:
+
+  * **`f` is a binary combiner**, `(x, y) -> z`, not the `(row, col, element)` of
+    [`coopmat_perelement`](@ref). A row maximum is `max`.
+  * **The result is not a vector.** It has the destination's shape with the
+    reduced value repeated along the reduced axis. The reference leans on that
+    twice: `rowmax` is `Br x Bc` and gets compared elementwise against the whole
+    score tile, and `smearReduce(x, y) = x` reduces nothing at all — it exists so
+    a `Br x Bc` matrix can be *resized* to `Br x HSV_pad` with the value smeared.
+    That second use also needs a destination whose extent differs, i.e. flexible
+    dimensions; a same-shape reduce does not.
+
+The destination type is explicit because it is not derivable from `m`.
+
+`f` must be a **top-level** function, not a closure, for the reason spelled out
+on `coopmat_perelement`: a closure is passed an environment pointer and there is
+no operand slot for it. Do not mark it `@noinline` — the thunk already is, and a
+`DontInline` callback costs a real function call per element.
+
+Check `vk_context().coopmat2.reductions` before compiling a kernel that uses this.
+"""
+@generated function coopmat_reduce(f::F, ::Type{AcceleratedMatrix{T,M,N,U}},
+                                   m::AcceleratedMatrix{S,MM,NN,UU},
+                                   ::Val{MASK}) where {F,T,M,N,U,S,MM,NN,UU,MASK}
+    fname = coopmat_intrinsic_name("reduce$(UInt32(MASK))", T, M, N, U)
+    irty = COOPMAT_IR_TYPE[T]
+    ir = """
+        declare i32 @$fname(i32, $irty) #0
+        define i32 @entry(i32 %m, $irty %p) #0 {
+            %r = call i32 @$fname(i32 %m, $irty %p)
+            ret i32 %r
+        }
+        attributes #0 = { alwaysinline convergent }
+    """
+    # `compilerbarrier` for the same reason as `coopmat_perelement`: without it
+    # Julia concrete-evaluates `f(zero(T), zero(T))` to a literal, the callee
+    # loses its only call site, no `OpFunction` is emitted, and the emitter
+    # reports "did not survive as a call".
+    quote
+        probe = coopmat_reduce_thunk(f,
+                  Base.compilerbarrier(:const, zero($T)),
+                  Base.compilerbarrier(:const, zero($T)))
+        h = Base.llvmcall(($ir, "entry"), Int32, Tuple{Int32,$T}, m.handle, probe)
+        AcceleratedMatrix{$T,$M,$N,$U}(h)
+    end
+end
+
 # The emitter matches on the prefix, so individual names need no registration;
 # this keeps GPUCompiler's unknown-intrinsic check happy for the common shapes.
 # `(8, 8)` is not a shape any kernel here ships: it is what **lavapipe** offers,
@@ -534,7 +619,9 @@ end
 for T in (Float16, Float32), U in (MatrixA, MatrixB, Accumulator),
     (M, N) in ((16, 16), (16, 8), (8, 8)),
     op in ("load", "store", "zero", "muladd", "loadw", "loadw2", "storew", "convert",
-           "length", "getcomp", "setcomp", "perelem", "mul", "add")
+           "length", "getcomp", "setcomp", "perelem", "mul", "add",
+           # one name per reduce mask, since the mask is a literal operand
+           "reduce1", "reduce2", "reduce3", "reduce4")
     push!(KNOWN_INTRINSICS, coopmat_intrinsic_name(op, T, M, N, U))
     op in ("load", "loadw", "loadw2", "store", "storew") &&
         push!(KNOWN_INTRINSICS, coopmat_intrinsic_name(op, T, M, N, U; rowmajor = true))

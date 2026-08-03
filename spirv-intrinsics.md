@@ -158,16 +158,37 @@ opcodes are in this state; the ones that matter here:
 
 ## D. Not present at all — grouped by the item that needs it
 
-### Item 17 — coopmat2 reductions
+### ~~Item 17 — coopmat2 reductions~~ — **DONE 2026-08-03**, see section A
 
-- `OpCooperativeMatrixReduceNV` = **5366**, operands `%type %result %matrix <reduce-mask literal> %func`
-- capability `CooperativeMatrixReductionsNV` = **5430**, extension `SPV_NV_cooperative_matrix2`
-- reduce mask: Row = 1 (from `gl_CooperativeMatrixReduceRowNV`); Column / RowAndColumn / 2x2 not yet confirmed
+`coopmat_reduce`, `CoopMatReduce.{Row,Column,RowAndColumn,TwoByTwo}`,
+`test_coopmat_reduce.jl` (5 asserts). It was the cheapest of the five as
+predicted: a new `op ==` branch plus a binding, reusing the marker /
+`coopmat_keepparam` / thunk machinery that `coopmat_perelement` had already paid
+for.
 
-**Cheapest of the five.** It takes a function operand exactly like
-`OpCooperativeMatrixPerElementOpNV`, so the marker / `coopmat_keepparam` / thunk
-machinery in section E already exists and is tested — this is a new `op ==`
-branch plus a binding, not new infrastructure.
+Three things it established that the notes had wrong or open, all measured:
+
+- **Subgroup scope is accepted.** Every use in `flash_attn_cm2.comp` is
+  `gl_ScopeWorkgroup`, and if the driver had refused a `Subgroup`-scoped reduce
+  this item would have needed workgroup-scope matrices first — a much larger
+  change, and it would have taken K3 with it. It does not refuse.
+- **The callback is a binary combiner** `(x, y) -> z`, not the
+  `(row, col, element)` of the per-element op.
+- **The combine order is unspecified per output element**, so `f` must be
+  associative and commutative. `max` and `+` are; the reference's
+  `smearReduce(x, y) = x` is not, and on a row of `200..215` it returns
+  `[200..207, 200..207]` — the whole row *is* reduced (a `sum` returns the exact
+  full-row total) but different output positions combine it in different orders.
+  That does not contradict the reference: it only ever hands `smearReduce` a
+  matrix already uniform along the row, where it reduces nothing and exists purely
+  to RESIZE. Verified both ways.
+
+Mask values: `Row = 1`, `Column = 2`, `RowAndColumn = 3` — the reference uses the
+union, which is how `Column` is known without the spec. `TwoByTwo = 4` is the
+remaining bit and is **unverified**.
+
+The resize half of the reference's usage — `Br x Bc` reduced into `Br x HSV_pad`
+— still needs **item 18**, flexible dimensions. A same-shape reduce does not.
 
 ### Item 18 — flexible dimensions
 

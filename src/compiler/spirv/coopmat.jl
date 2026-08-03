@@ -439,6 +439,51 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         state.value_map[inst] = id
         state.coopmat_value_types[inst] = mat_ty
 
+    elseif startswith(op, "reduce")
+        # `OpCooperativeMatrixReduceNV` — combine elements along an axis with a
+        # binary function, then SMEAR the result across the destination.
+        #
+        # Semantics taken from `flash_attn_cm2.comp`, which is the only reference
+        # implementation to hand and uses all of them:
+        #
+        #     coopMatReduceNV(rowmax, S, gl_CooperativeMatrixReduceRowNV, maxReduce)
+        #     ACC_TYPE maxReduce(const in ACC_TYPE x, const in ACC_TYPE y) { return max(x, y); }
+        #
+        # Two things that are not obvious and cost a wrong guess each:
+        #
+        #  * the callback is a BINARY COMBINER `(x, y) -> z`, not the per-element
+        #    `(row, col, elem)` of `OpCooperativeMatrixPerElementOpNV`;
+        #  * the result is not a vector. It has the destination matrix's shape,
+        #    with the reduced value repeated along the reduced axis — which is why
+        #    the reference has a `smearReduce(x, y) = x` that reduces nothing and
+        #    exists purely to broadcast. Its `eM` is `Br x Bc` and its `eMdiag` is
+        #    `Br x HSV_pad`, so the destination may also have a DIFFERENT extent
+        #    along that axis; that half needs flexible dimensions.
+        #
+        # The mask is a literal operand, so it rides in the intrinsic name
+        # (`reduce1`, `reduce3`, …) rather than as an argument — the same reason
+        # the component type and extents do.
+        require_capability!(mod, Cap.CooperativeMatrixReductionsNV)
+        require_extension!(mod, "SPV_NV_cooperative_matrix2")
+        mask = parse(UInt32, op[length("reduce")+1:end])
+        m_id = get_value_id!(state, args[1])
+        marker = args[2]
+        marker isa LLVM.CallInst ||
+            error("cooperative-matrix reduce callback did not survive as a call; " *
+                  "it must be a top-level function of (::$dtype, ::$dtype), not a closure")
+        callee = LLVM.called_operand(marker)
+        callee isa LLVM.Function ||
+            error("cooperative-matrix reduce callback is an indirect call")
+        func_id = get(state.value_map, callee, nothing)
+        func_id === nothing &&
+            error("cooperative-matrix reduce callback $(LLVM.name(callee)) has no " *
+                  "SPIR-V function; it was probably inlined away")
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpCooperativeMatrixReduceNV,
+                            mat_ty, id, m_id, mask, func_id)
+        state.value_map[inst] = id
+        state.coopmat_value_types[inst] = mat_ty
+
     else
         error("unknown cooperative-matrix op: $op")
     end
