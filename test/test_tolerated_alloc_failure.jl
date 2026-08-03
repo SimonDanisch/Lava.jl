@@ -7,8 +7,8 @@
 # those are the caller's to absorb — the failure was expected and handled.
 #
 # It absorbed them incorrectly. The callback writes into a lock-free ring
-# (`VAL_RING_*`); `VALIDATION_MESSAGES` is only populated when
-# `drain_validation_messages!` moves entries out of that ring. `try_vk_alloc`
+# (`ctx.validation`, per device since 49f3f17); its `.messages` list is only
+# populated when `drain_validation_messages!` moves entries out. `try_vk_alloc`
 # emptied the drained list WITHOUT draining first, so its own messages stayed in
 # the ring and the next `check_validation_errors!` — belonging to entirely
 # unrelated code — drained them and threw.
@@ -38,8 +38,8 @@ const KA = KernelAbstractions
         @test_skip validating
     else
         # Start from a known-clean queue, so what we observe is what we caused.
-        Lava.drain_validation_messages!()
-        empty!(Lava.VALIDATION_MESSAGES)
+        Lava.drain_validation_messages!(ctx)
+        empty!(ctx.validation.messages)
 
         # Larger than `maxBufferSize` AND larger than any heap, so it is refused
         # rather than merely unlucky.
@@ -50,8 +50,8 @@ const KA = KernelAbstractions
         # The ring must be empty too, not just the drained list. Draining is what
         # the buggy version skipped, so this is the assertion with teeth: it fails
         # if the messages are still in the ring waiting to ambush someone else.
-        Lava.drain_validation_messages!()
-        @test isempty(Lava.VALIDATION_MESSAGES)
+        Lava.drain_validation_messages!(ctx)
+        @test isempty(ctx.validation.messages)
 
         # And the next unrelated operation must survive — this is the shape of the
         # original symptom, a small upload that has nothing to do with the 40 GB.
