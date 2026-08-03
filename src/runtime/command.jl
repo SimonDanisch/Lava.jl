@@ -34,14 +34,12 @@ const DISPATCH_LOG = String[]
 const MAX_DISPATCH_LOG = 2000
 
 # Toggle dispatch logging (disabled by default for zero-alloc dispatch path).
-# Enable with Lava.DISPATCH_LOGGING_ENABLED[] = true for debugging.
+# Enable with `ctx.diag.dispatch_logging = true` for debugging.
 # On DEVICE_LOST, the error handler re-enables logging automatically.
-const DISPATCH_LOGGING_ENABLED = Ref{Bool}(false)
 # TEMP DEBUG: if true, submit! waits for the batch it just submitted to complete
 # and records wall-clock GPU time in BATCH_WAIT_TIMES. This SERIALIZES the pipeline
 # — only for measurement, not production. Used to identify batches whose actual
 # GPU execution time is near the amdgpu TDR threshold (~10 s).
-const BATCH_TIMING_ENABLED = Ref{Bool}(false)
 const BATCH_WAIT_TIMES = Float64[]  # seconds
 const BATCH_WAIT_INFO  = String[]   # last kernel in batch at wait time
 const BATCH_WAIT_DISPATCHES = Int[] # dispatch count for each measured batch
@@ -59,7 +57,6 @@ hung.
 Off by default — it is a write and a flush per dispatch, on a path whose whole
 point is to allocate nothing.
 """
-const DISPATCH_LOG_FILE = Ref{Union{Nothing,String}}(nothing)
 
 """
 Build a dispatch's log string, behind an `invokelatest`.
@@ -74,13 +71,14 @@ It only runs when dispatch logging is on, so the dynamic call is free.
 """
 @noinline dispatch_log_string(args...) = string(args...)
 
-function log_dispatch!(info::String)
-    DISPATCH_LOGGING_ENABLED[] || return
+function log_dispatch!(bq::BatchQueue, info::String)
+    d = (bq.ctx::VkContext).diag
+    d.dispatch_logging || return
     if length(DISPATCH_LOG) >= MAX_DISPATCH_LOG
         popfirst!(DISPATCH_LOG)
     end
     push!(DISPATCH_LOG, info)
-    f = DISPATCH_LOG_FILE[]
+    f = d.dispatch_log_file
     f === nothing || open(io -> (println(io, info); flush(io)), f, "a")
     return
 end
@@ -92,7 +90,8 @@ push!(RESET_CALLBACKS, function()
     LAST_DISPATCH_INFO[] = ""
     PREV_DISPATCH_INFO[] = ""
     empty!(DISPATCH_LOG)
-    DISPATCH_LOGGING_ENABLED[] = false
+    # `dispatch_logging` is a `ctx.diag` field now, so a reset brings a fresh
+    # `Diagnostics` with it already off — nothing to clear here.
 end)
 
 # Pre-allocated barrier buffer using raw VkMemoryBarrier (isbits).
@@ -708,9 +707,9 @@ end
     batch.dispatch_count += 1
     batch.segment_dispatches += 1
     batch.last_was_rt = is_rt
-    if DISPATCH_LOGGING_ENABLED[]
+    if (bq.ctx::VkContext).diag.dispatch_logging
         Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, 1)
-        log_dispatch!(Base.invokelatest(dispatch_log_string,
+        log_dispatch!(bq, Base.invokelatest(dispatch_log_string,
                                         TOTAL_DISPATCH_COUNTER[], " ", info)::String)
     end
 
@@ -784,7 +783,7 @@ end
 @inline function vk_dispatch_base!(bq::BatchQueue, pipeline::LavaComputePipeline, push_bda::UInt64,
                             base_x::Int, base_y::Int, base_z::Int,
                             gx::Int, gy::Int, gz::Int, ::Nothing=nothing)
-    dispatch_info = DISPATCH_LOGGING_ENABLED[] ?
+    dispatch_info = (bq.ctx::VkContext).diag.dispatch_logging ?
         Base.invokelatest(dispatch_log_string, LAST_DISPATCH_INFO[], " base=(",
                           base_x, ",", base_y, ",", base_z, ") g=(",
                           gx, ",", gy, ",", gz, ")")::String : ""
@@ -839,7 +838,7 @@ atomically-claimed queue slots)."""
                                             indirect,  # LavaArray{UInt32,1}
                                             ::Nothing=nothing;
                                             first_in_group::Bool=true)
-    dispatch_info = DISPATCH_LOGGING_ENABLED[] ?
+    dispatch_info = (bq.ctx::VkContext).diag.dispatch_logging ?
         Base.invokelatest(dispatch_log_string, LAST_DISPATCH_INFO[], " (indirect)")::String : ""
     record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
@@ -1084,27 +1083,27 @@ function submit!(bq::BatchQueue)
     end
 
     # Pre-submit safety scan: catch stale-BDA-in-arg-slab corruption BEFORE
-    # the GPU sees it.  Off by default (Lava.PRESUBMIT_SCAN_ENABLED[] = true to
+    # the GPU sees it.  Off by default (`ctx.diag.presubmit_scan = true` to
     # turn on for debugging).  Cost ~hundreds-of-µs per submit; never on by
     # default.
-    if PRESUBMIT_SCAN_ENABLED[]
+    if (bq.ctx::VkContext).diag.presubmit_scan
         unknowns = scan_slabs_for_unknown_bdas(bq)
         if !isempty(unknowns)
             @warn "Pre-submit found $(length(unknowns)) unknown BDA(s) in arg slabs"
             for u in unknowns
                 @warn "  STALE: slab=$(u.slab) idx=$(u.idx) offset=$(u.offset) val=0x$(string(u.val, base=16, pad=16))"
             end
-            if PRESUBMIT_SCAN_THROWS[]
+            if (bq.ctx::VkContext).diag.presubmit_scan_throws
                 throw(LavaError("submit!", "stale BDA in arg slab", "see warnings"))
             end
         end
     end
 
-    # SLAB DUMP for cascade investigation: if SLAB_DUMP_TARGET[] is non-zero,
+    # SLAB DUMP for cascade investigation: if `ctx.diag.slab_dump_target` is non-zero,
     # search the active arg slab for any UInt64 == target and log offsets.
-    if SLAB_DUMP_TARGET[] != UInt64(0) &&
+    if (bq.ctx::VkContext).diag.slab_dump_target != UInt64(0) &&
        !isempty(bq.arg_slabs) && bq.arg_slab_idx <= length(bq.arg_slabs)
-        target = SLAB_DUMP_TARGET[]
+        target = (bq.ctx::VkContext).diag.slab_dump_target
         slab = bq.arg_slabs[bq.arg_slab_idx]
         mb = slab.buf[]
         mp = mb.mapped_ptr
@@ -1150,12 +1149,12 @@ function submit!(bq::BatchQueue)
     bq.active_batch = nothing
     LAST_DISPATCH_INFO[] = "$saved_dispatch_count dispatches ($(saved_last_was_rt ? "RT" : "compute"))"
     Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, saved_dispatch_count)
-    if DISPATCH_LOGGING_ENABLED[]
+    if (bq.ctx::VkContext).diag.dispatch_logging
         append!(DISPATCH_LOG, batch.dispatch_log)
     end
     # DEBUG: synchronous per-batch wall-clock timing. Serializes the pipeline
     # but lets us see GPU execution time per batch. Guarded by opt-in flag.
-    if BATCH_TIMING_ENABLED[]
+    if (bq.ctx::VkContext).diag.batch_timing
         t0 = time()
         wr = Vulkan.wait_semaphores(bq.device,
             Vulkan.SemaphoreWaitInfo([bq.timeline_sem], [batch.signal_value]),
@@ -1328,8 +1327,8 @@ function flush!(bq::BatchQueue, device::Vulkan.Device)
                             "timed out after $(round(waited / 1e9, digits = 1)) s waiting for " *
                             "timeline value $target on $(length(bq.in_flight)) in-flight batch(es)\n" *
                             flush_stall_report(bq, target),
-                            "A dispatch is not completing. Set Lava.DISPATCH_LOGGING_ENABLED[] = true " *
-                            "(and Lava.DISPATCH_LOG_FILE[] to keep it across a restart) to see which " *
+                            "A dispatch is not completing. Set `ctx.diag.dispatch_logging = true` " *
+                            "(and `ctx.diag.dispatch_log_file` to keep it across a restart) to see which " *
                             "kernel, or raise `bq.flush_timeout_ns` if the work is genuinely this long."))
         end
     end
@@ -1591,8 +1590,12 @@ end
 """Throw a LavaError enriched with recent validation layer messages and dispatch log."""
 function throw_with_validation_context(call_name::String, err_result,
         dispatch_count::Int=0, last_was_rt::Bool=false)
-    # Re-enable dispatch logging so the next run captures debug info
-    DISPATCH_LOGGING_ENABLED[] = true
+    # Re-enable dispatch logging so the next run captures debug info. No `bq` in
+    # scope on this error path — it is reached from a raw `VkResult` check — so
+    # the current context is the honest source.
+    let c = VK_CONTEXT_REF[]
+        c === nothing || (c.diag.dispatch_logging = true)
+    end
     vk_err = unwrap_error(err_result)
     msgs = get_validation_messages()
     validation_detail = if isempty(msgs)
@@ -1632,7 +1635,8 @@ Enable or disable dispatch name logging. When enabled, each dispatch records
 its kernel name and parameters for crash debugging. Disabled by default for
 zero-alloc performance. Auto-enabled on DEVICE_LOST.
 """
-set_dispatch_logging!(enabled::Bool) = (DISPATCH_LOGGING_ENABLED[] = enabled)
+set_dispatch_logging!(enabled::Bool, ctx::VkContext = vk_context()) =
+    (ctx.diag.dispatch_logging = enabled)
 
 """
     get_dispatch_log() -> Vector{String}

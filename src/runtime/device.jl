@@ -468,6 +468,10 @@ mutable struct VkContext
     # `vk_reset_device!` has nothing to clear.
     caches::DeviceCaches
 
+    # Every debugging and instrumentation toggle, owned by the device it
+    # instruments. Was eighteen module-level `Ref`s; see `Diagnostics`.
+    diag::Diagnostics
+
     # Inner constructor: two-phase init via `new()` so we can hand a live
     # `ctx` reference to `BatchQueue(...)` while finishing the ctx's own
     # field assignments.  There is no public ctor that can leave `default_bq`
@@ -547,6 +551,7 @@ mutable struct VkContext
         # `vkCreatePipelineCache` is not a safe place to discover a mismatch.
         ctx.id = (VK_CONTEXT_COUNTER[] += 1)
         ctx.caches = DeviceCaches()
+        ctx.diag = Diagnostics()
         # Filled by `init_vulkan!` once the device exists; null until then so a
         # barrier recorded before that point is skipped rather than jumping to
         # whatever the field happened to contain.

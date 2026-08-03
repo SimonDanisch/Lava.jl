@@ -927,7 +927,7 @@ end
 @inline function vk_dispatch_base!(bq::BatchQueue, pipeline::LavaComputePipeline, push_bda::UInt64,
                                    base_x::Int, base_y::Int, base_z::Int,
                                    gx::Int, gy::Int, gz::Int, tlas::HWTLAS)
-    dispatch_info = DISPATCH_LOGGING_ENABLED[] ?
+    dispatch_info = (bq.ctx::VkContext).diag.dispatch_logging ?
         "$(LAST_DISPATCH_INFO[]) base=($base_x,$base_y,$base_z) g=($gx,$gy,$gz)" : ""
     record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -953,7 +953,7 @@ end
                                             push_bda::UInt64,
                                             indirect, tlas::HWTLAS;
                                             first_in_group::Bool=true)
-    dispatch_info = DISPATCH_LOGGING_ENABLED[] ?
+    dispatch_info = (bq.ctx::VkContext).diag.dispatch_logging ?
         "$(LAST_DISPATCH_INFO[]) (indirect)" : ""
     record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,

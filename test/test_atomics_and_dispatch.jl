@@ -200,13 +200,13 @@ end
     end
 
     @testset "dispatch counter increments" begin
-        Lava.DISPATCH_LOGGING_ENABLED[] = true
+        Lava.vk_context().diag.dispatch_logging = true
         before = Lava.TOTAL_DISPATCH_COUNTER[]
         a = Lava.LavaArray(Float32[1, 2, 3])
         _ = a .+ Float32(1)
         Lava.vk_flush!(Lava.vk_context())
         @test Lava.TOTAL_DISPATCH_COUNTER[] > before
-        Lava.DISPATCH_LOGGING_ENABLED[] = false
+        Lava.vk_context().diag.dispatch_logging = false
     end
 
     @testset "KA.synchronize flushes GPU work" begin
@@ -261,13 +261,13 @@ end
     end
 
     @testset "dispatch log records entries" begin
-        Lava.DISPATCH_LOGGING_ENABLED[] = true
+        Lava.vk_context().diag.dispatch_logging = true
         empty!(Lava.DISPATCH_LOG)
         a = Lava.LavaArray(Float32[1, 2, 3])
         _ = a .+ Float32(1)
         Lava.vk_flush!(Lava.vk_context())
         @test !isempty(Lava.DISPATCH_LOG)
-        Lava.DISPATCH_LOGGING_ENABLED[] = false
+        Lava.vk_context().diag.dispatch_logging = false
     end
 end
 

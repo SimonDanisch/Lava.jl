@@ -50,16 +50,19 @@ This device's compiled-kernel cache, created on first use.
 # ── Launch argument validation ──
 
 """
-    validate_launch_args(args)
+    validate_launch_args(bq.ctx::VkContext, args)
 
 Check that buffer arguments are valid (not freed, not poisoned).
-Runs by default; disable with `Lava.LAUNCH_ARG_VALIDATION[] = false`.
+Runs by default; disable with `ctx.diag.launch_arg_validation = false`.
 """
-const LAUNCH_ARG_VALIDATION = Ref(true)
 
-@generated function validate_launch_args(args::T) where T <: Tuple
+@generated function validate_launch_args(ctx::VkContext, args::T) where T <: Tuple
     exprs = Expr[]
-    push!(exprs, :((LAUNCH_ARG_VALIDATION[] || return)))
+    # The toggle is read at RUNTIME inside the generated body, so it can come off
+    # the context the caller already has — it does not need to be a global to be
+    # cheap. `@generated` constrains what is known at *compile* time, and this is
+    # not one of those things.
+    push!(exprs, :((ctx.diag.launch_arg_validation || return)))
     for i in 1:fieldcount(T)
         Ti = fieldtype(T, i)
         if Ti <: LavaArray
@@ -112,7 +115,7 @@ function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
                        ndrange::Union{Integer, NTuple{3,<:Integer}},
                        workgroup_size::NTuple{3,Int} = (64, 1, 1),
                        tlas=nothing)  # Union{Nothing, HWTLAS} — declared later in raytracing/hwtlas.jl
-    validate_launch_args(args)
+    validate_launch_args(bq.ctx::VkContext, args)
     if ndrange isa Integer
         ndrange_3d = (Int(ndrange), 1, 1)
     else
@@ -160,7 +163,7 @@ function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
     pack_args_direct!(bq, arg_buf.mapped_ptr, arg_buf.address, offsets,
                        compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
-    if DISPATCH_LOGGING_ENABLED[]
+    if (bq.ctx::VkContext).diag.dispatch_logging
         LAST_DISPATCH_INFO[] = "compute f=$(nameof(typeof(converted_f))) groups=$groups"
     end
     vk_dispatch!(bq, pipeline, arg_buf.address, groups, tlas)
@@ -247,7 +250,7 @@ end
                            offset::Int, byval_size::Int, inline_offset::Int,
                            batch::CommandBatch)
     pin!(batch, buf)
-    if PACK_ARG_ASSERT_LIVE[]
+    if (buf.ctx::VkContext).diag.pack_arg_assert_live
         st = @atomic :acquire buf.state
         if st != BUF_STATE_ALIVE
             throw(LavaError("pack_arg!",
@@ -299,8 +302,6 @@ before us).
     end
 end
 
-const SPIRV_DUMP_DIR = Ref("")
-const SPIRV_DUMP_COUNTER = Ref(0)
 
 # ── Lava disk cache ──
 # GPUCompiler's disk cache only works for precompiled package code (needs build_id).
@@ -523,10 +524,11 @@ function get_compiled_kernel_and_pipeline(ctx::VkContext, @nospecialize(f), @nos
     frozen_store(ctx, f, tt, workgroup_size, linked.compiled)
 
     # Dump SPIR-V if dump dir is set
-    if !isempty(SPIRV_DUMP_DIR[])
-        SPIRV_DUMP_COUNTER[] += 1
+    dd = ctx.diag.spirv_dump_dir
+    if dd !== nothing && !isempty(dd)
+        ctx.diag.spirv_dump_counter += 1
         fname = string(nameof(typeof(f)))
-        path = joinpath(SPIRV_DUMP_DIR[], "$(lpad(SPIRV_DUMP_COUNTER[], 3, '0'))_$(fname).spv")
+        path = joinpath(dd, "$(lpad(ctx.diag.spirv_dump_counter, 3, '0'))_$(fname).spv")
         write(path, linked.compiled.spirv_bytes)
     end
 

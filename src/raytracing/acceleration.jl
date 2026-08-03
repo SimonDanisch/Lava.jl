@@ -254,7 +254,7 @@ function build_blas(ctx::ASBuildContext, vertices::Vector{NTuple{3,Float32}}, in
 
     addr_info = Vulkan.AccelerationStructureDeviceAddressInfoKHR(accel)
     as_addr = Vulkan.get_acceleration_structure_device_address_khr(dev, addr_info)
-    if Lava.ALLOC_DEBUG_ENABLED[]
+    if (ctx.bq.ctx::Lava.VkContext).diag.alloc_debug
         push!(Lava.ALLOC_DEBUG_LOG, (kind=:blas_as, addr=as_addr, size=0, pool=false))
     end
     blas = LavaBLAS(accel, storage, as_addr, blas_preserves)
@@ -325,7 +325,7 @@ function build_blas_aabb(ctx::ASBuildContext, aabbs::Vector{AABB}; opaque::Bool=
 
     addr_info = Vulkan.AccelerationStructureDeviceAddressInfoKHR(accel)
     as_addr   = Vulkan.get_acceleration_structure_device_address_khr(dev, addr_info)
-    if Lava.ALLOC_DEBUG_ENABLED[]
+    if (ctx.bq.ctx::Lava.VkContext).diag.alloc_debug
         push!(Lava.ALLOC_DEBUG_LOG, (kind=:blas_aabb_as, addr=as_addr, size=0, pool=false))
     end
     blas = LavaBLAS(accel, storage, as_addr, blas_preserves)
@@ -643,7 +643,7 @@ function create_as_input_pool(ctx::VkContext, nbytes::UInt64)
     # DEBUG: log AS-input host-visible buffer addresses (separate memory heap
     # from device-local pool), to correlate with cross-scene cascade fault
     # addresses in the 0x8000_xxxx_xxxx range.
-    if Lava.ALLOC_DEBUG_ENABLED[]
+    if ctx.diag.alloc_debug
         push!(Lava.ALLOC_DEBUG_LOG,
               (kind=:as_input_pool, addr=addr, size=Int(nbytes), pool=false))
     end
@@ -1118,7 +1118,7 @@ function build_blas_pooled(all_vertices::Vector{Vector{NTuple{3,Float32}}},
         accel = Vulkan.AccelerationStructureKHR(dev, as_ci)
         addr_info = Vulkan.AccelerationStructureDeviceAddressInfoKHR(accel)
         as_addr = Vulkan.get_acceleration_structure_device_address_khr(dev, addr_info)
-        if Lava.ALLOC_DEBUG_ENABLED[]
+        if (bq.ctx::Lava.VkContext).diag.alloc_debug
             push!(Lava.ALLOC_DEBUG_LOG, (kind=:blas_as_pool, addr=as_addr, size=0, pool=true))
         end
         # All pooled BLASes share `as_pool_arr` as their storage. They
@@ -1380,7 +1380,7 @@ function build_hw_accel_from_tlas(tlas;
         accel = Vulkan.AccelerationStructureKHR(dev, as_ci)
         addr_info = Vulkan.AccelerationStructureDeviceAddressInfoKHR(accel)
         as_addr = Vulkan.get_acceleration_structure_device_address_khr(dev, addr_info)
-        if Lava.ALLOC_DEBUG_ENABLED[]
+        if ctx.diag.alloc_debug
             push!(Lava.ALLOC_DEBUG_LOG, (kind=:blas_as_pool2, addr=as_addr, size=0, pool=true))
         end
         blas = LavaBLAS(accel, as_pool_arr, as_addr, LavaArray[])

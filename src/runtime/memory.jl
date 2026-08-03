@@ -8,36 +8,28 @@
 # All off by default — opt-in via the *_ENABLED Refs.
 
 # Per-finalizer destruction trace
-const FREE_DEBUG_ENABLED = Ref{Bool}(false)
 const FREE_DEBUG_LOG = NamedTuple[]
 
 # Per-allocation trace
-const ALLOC_DEBUG_ENABLED = Ref{Bool}(false)
 const ALLOC_DEBUG_LOG = NamedTuple[]
 
 # When enabled, vk_free! scans every live BatchQueue's arg/indirect slabs for
 # any UInt64 == buf.address.  Hits are logged + zeroed so the GPU faults on a
 # clean null reference instead of corrupting random memory.  Optionally
-# throws a LavaError instead of just logging (DESTROY_FREED_BDAS_THROWS[]).
-const FREED_BDA_SCAN_ENABLED = Ref{Bool}(false)
+# throws a LavaError instead of just logging (`ctx.diag.destroy_freed_bdas_throws`).
 const FREED_BDA_SCAN_LOG = NamedTuple[]
-const DESTROY_FREED_BDAS_THROWS = Ref{Bool}(false)
 
 # Pre-submit unknown-BDA scan: scans the active arg slab region for any
 # BDA-shaped UInt64 that isn't in LIVE_BUFFERS or any pool block / slab.
 # Optionally throws a LavaError instead of just warning.
-const PRESUBMIT_SCAN_ENABLED = Ref{Bool}(false)
-const PRESUBMIT_SCAN_THROWS = Ref{Bool}(false)
 
 # When true, pack_arg!(::VkManagedBuffer, ...) asserts the buffer's state ==
 # ALIVE before packing its BDA.  Catches use-after-free where a stale buffer
 # reference makes it through to a kernel arg.
-const PACK_ARG_ASSERT_LIVE = Ref{Bool}(false)
 
 # When set to a non-zero target BDA, every submit! scans the active arg slab
 # for the target value and logs (submit_idx, offsets) to SLAB_DUMP_LOG.  Used
 # to track when a known-stale address enters/leaves the arg slab.
-const SLAB_DUMP_TARGET = Ref{UInt64}(UInt64(0))
 const SLAB_DUMP_LOG = NamedTuple[]
 
 """
@@ -558,7 +550,7 @@ function try_vk_alloc(bq::BatchQueue, nbytes::Integer;
     result = VkManagedBuffer(buf, memory, address, mapped_ptr, Int(nbytes), 0, nothing, nothing, BUF_STATE_ALIVE, 0, false, ctx)
     push!(LIVE_BUFFERS, result)
     Threads.atomic_add!(GPU_LIVE_BYTES, nbytes)
-    if ALLOC_DEBUG_ENABLED[]
+    if (bq.ctx::VkContext).diag.alloc_debug
         push!(ALLOC_DEBUG_LOG,
               (kind=:direct, addr=address, size=Int(nbytes), pool=false,
                mtype=Int(mem_type_idx), unified=unified, usage=UInt32(usage)))
@@ -630,7 +622,7 @@ function vk_free!(buf::VkManagedBuffer)
 
     delete!(LIVE_BUFFERS, buf)
 
-    if FREE_DEBUG_ENABLED[]
+    if (buf.ctx::VkContext).diag.free_debug
         bqd = buf.ctx.default_bq
         active_dbg = (bqd.active_batch !== nothing) && bqd.active_batch.recording
         push!(FREE_DEBUG_LOG,
@@ -719,9 +711,9 @@ function vk_free!(buf::VkManagedBuffer)
     # slab, that's a use-after-free waiting to happen.  Log it and zero the
     # slot so the GPU faults on a null reference (BDA_POISON) instead of
     # corrupting whatever memory is mapped at the old address.
-    if FREED_BDA_SCAN_ENABLED[]
+    if (buf.ctx::VkContext).diag.freed_bda_scan
         hits = scan_arg_slabs_for_bda!(buf)
-        if hits > 0 && DESTROY_FREED_BDAS_THROWS[]
+        if hits > 0 && (buf.ctx::VkContext).diag.destroy_freed_bdas_throws
             throw(LavaError("vk_free!",
                 "destroying buffer at 0x$(string(buf.address, base=16, pad=16)) but its BDA still appears $(hits)× in live arg slabs",
                 "an unpinned reference is leaking — see FREED_BDA_SCAN_LOG"))
@@ -1223,7 +1215,7 @@ function alloc_pool_block(bq::BatchQueue)
     # Don't subtract from GPU_LIVE_BYTES — the block IS live memory.
     # Individual chunks don't add to GPU_LIVE_BYTES since the block already accounts for it.
     push!(p.blocks, block)
-    if ALLOC_DEBUG_ENABLED[]
+    if (bq.ctx::VkContext).diag.alloc_debug
         push!(ALLOC_DEBUG_LOG, (kind=:pool_block, addr=buf_result.address,
                                 size=POOL_BLOCK_SIZE, pool=true))
     end

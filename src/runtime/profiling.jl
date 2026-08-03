@@ -157,7 +157,6 @@ struct DispatchTiming
     gpu_ns::Float64            # filled in on read-back; 0.0 during recording
 end
 
-const DISPATCH_TIMING_ENABLED = Ref(false)
 
 # Two query slots per dispatch (start + end).  Default size is conservative;
 # auto-grows on first activation if `MAX_DISPATCH_LOG` was bumped.
@@ -177,8 +176,8 @@ path is unchanged. Equivalent to (and used by) `with_dispatch_timing(f)`.
 If timing is being turned ON for the first time in this session, the
 timestamp query pool is created lazily inside `vk_dispatch!`.
 """
-function enable_dispatch_timing!(enable::Bool=true)
-    DISPATCH_TIMING_ENABLED[] = enable
+function enable_dispatch_timing!(enable::Bool=true, ctx::VkContext = vk_context())
+    ctx.diag.dispatch_timing = enable
     return enable
 end
 
@@ -284,21 +283,22 @@ for r in report
 end
 ```
 """
-function with_dispatch_timing(f)
-    prev_timing = DISPATCH_TIMING_ENABLED[]
+function with_dispatch_timing(f, ctx::VkContext = vk_context())
+    d = ctx.diag
+    prev_timing = d.dispatch_timing
     # `ka_launch!` only writes `LAST_DISPATCH_INFO[]` when dispatch logging is on
     # (it's behind a flag for the production hot path).  We need that name to
     # tag timing records, so flip dispatch logging on for the duration too.
-    prev_logging = DISPATCH_LOGGING_ENABLED[]
-    reset_dispatch_timing!()
-    DISPATCH_TIMING_ENABLED[] = true
-    DISPATCH_LOGGING_ENABLED[] = true
+    prev_logging = d.dispatch_logging
+    reset_dispatch_timing!(ctx)
+    d.dispatch_timing = true
+    d.dispatch_logging = true
     try
         f()
-        return dispatch_timing_report(; flush_first=true)
+        return dispatch_timing_report(ctx; flush_first=true)
     finally
-        DISPATCH_TIMING_ENABLED[] = prev_timing
-        DISPATCH_LOGGING_ENABLED[] = prev_logging
+        d.dispatch_timing = prev_timing
+        d.dispatch_logging = prev_logging
     end
 end
 
@@ -333,7 +333,7 @@ end
 function maybe_write_dispatch_start_timestamp!(ctx::VkContext, cb::VK.CommandBuffer,
                                                kernel_name::AbstractString;
                                                stage = VK.PIPELINE_STAGE_COMPUTE_SHADER_BIT)
-    DISPATCH_TIMING_ENABLED[] || return -1
+    ctx.diag.dispatch_timing || return -1
     pool = ensure_timestamp_pool!(ctx)
     slot = ctx.caches.timestamp_next_slot
     if slot == 0
@@ -421,14 +421,11 @@ function maybe_write_dispatch_end_timestamp!(ctx::VkContext, cb::VK.CommandBuffe
     return nothing
 end
 
-# The pool and slot counter are `VkContext` fields, so a reset makes fresh ones
-# and there is nothing to clear. Only the module-level record list and the enable
-# flag — which are genuinely global, being a diagnostic buffer and a toggle —
-# still need it.
-push!(RESET_CALLBACKS, function()
-    empty!(RECORDED_DISPATCHES)
-    DISPATCH_TIMING_ENABLED[] = false
-end)
+# The pool, the slot counter and the enable flag are all `VkContext` fields now,
+# so a reset makes fresh ones and there is nothing to clear. Only the record list
+# is genuinely module-level — it is a host-side diagnostic buffer, not device
+# state — and dropping it is the whole callback.
+push!(RESET_CALLBACKS, () -> empty!(RECORDED_DISPATCHES))
 
 # ============================================================================
 # 3. VK_KHR_pipeline_executable_properties — driver-side stats

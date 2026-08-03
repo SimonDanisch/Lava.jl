@@ -7,6 +7,9 @@
 #   lava_compile_to_spirv() — returns validated SPIR-V binary
 
 # Debug counter for unique kernel file naming
+# Genuinely process-level, and staying: it indexes the numbered IR files the
+# compiler writes to `tmp_kernels/`, and compilation happens before a device is
+# chosen — there is no context to hang it on. Not device state.
 const KERNEL_DEBUG_COUNTER = Ref(0)
 
 """

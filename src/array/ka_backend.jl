@@ -89,6 +89,13 @@ answer for it, and the reason the queue-only constructors need nothing extra.
 """
 vk_context(b::LavaBackend) = (b.dispatch_bq.ctx)::VkContext
 vk_context(a::LavaArray) = (a.buf[].ctx)::VkContext
+# A view of a device array is still on that device. `probe_broadcast!` is handed
+# `dest`, which the broadcast machinery may hand it as a `SubArray` or a
+# `ReshapedArray` — walking to the parent is the whole answer, and it is the same
+# `AnyLavaArray` nest `_copyto!` already understands.
+vk_context(a::SubArray) = vk_context(parent(a))
+vk_context(a::Base.ReshapedArray) = vk_context(parent(a))
+vk_context(a::Base.PermutedDimsArray) = vk_context(parent(a))
 
 # Property access resolves a `nothing`-pinned queue through the live
 # `vk_context()` so a module-level `const BACKEND = LavaBackend()` keeps
@@ -541,7 +548,10 @@ the kernels measured), and that is the trade until the codegen fault is fixed.
 end
 
 function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=nothing)
-    validate_launch_args(args)
+    # `vk_context(obj.backend)`, not the global: a KA kernel carries the backend
+    # it was built for, and that backend knows its device. This is the accessor
+    # `test_backend_context.jl` exists to pin.
+    validate_launch_args(vk_context(obj.backend), args)
     # A static workgroup with an interior unit extent miscompiles; take the
     # dynamic path instead. Checked on the TYPE, so it folds away for every
     # kernel that is not affected.
@@ -741,7 +751,7 @@ function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple,
                        plan.arg_buffer_size, plan.byval_sizes, all_args)
 
     # Dispatch with N-D block grid (preserves KA's block dimensions)
-    if DISPATCH_LOGGING_ENABLED[]
+    if (bq.ctx::VkContext).diag.dispatch_logging
         LAST_DISPATCH_INFO[] = Base.invokelatest(dispatch_log_string, "ka f=",
                                    dispatch_name(f, all_args), " groups=", block_dims)::String
     end
@@ -890,7 +900,7 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
 
     indirect_view = get_indirect_buffer(bq)
 
-    if DISPATCH_LOGGING_ENABLED[]
+    if (bq.ctx::VkContext).diag.dispatch_logging
         LAST_DISPATCH_INFO[] = Base.invokelatest(dispatch_log_string, "indirect f=",
                                    dispatch_name(obj.f, all_args))::String
     end

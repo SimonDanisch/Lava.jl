@@ -227,6 +227,55 @@ struct CompiledGraphicsPipeline
     has_depth::Bool
 end
 
+"""
+    Diagnostics
+
+Every debugging and instrumentation toggle Lava has, owned by the context they
+describe.
+
+**These were eighteen module-level `Ref`s.** They are the same mistake as the
+caches and the pool policy one level up, with a milder symptom: turning on
+allocation tracing or dispatch logging did it for *every* device in the process,
+and a second device could not be instrumented independently of the first. Two of
+them carry counters (`spirv_dump_counter`, `kernel_debug_counter`) whose values
+were shared across devices that emit different kernels.
+
+`DNNKernels` did exactly this in its own step 3 — `OPTIMES`, `OPDOUBLE`,
+`OPDOUBLEFILTER`, `PLAN_MISSES` and `LAUNCH_PROBE` became `Ctx.diag` — and the
+argument there applies here: two differently-instrumented runs at once become
+possible, and nothing has to be reset.
+
+Off by default, and free when off: every read is a field load behind a branch the
+compiler hoists, which is what the `Ref`s cost too.
+"""
+mutable struct Diagnostics
+    # ── allocation / free
+    alloc_debug::Bool
+    free_debug::Bool
+    freed_bda_scan::Bool
+    destroy_freed_bdas_throws::Bool
+    presubmit_scan::Bool
+    presubmit_scan_throws::Bool
+    pack_arg_assert_live::Bool
+    slab_dump_target::Any
+    # ── dispatch / batch
+    batch_timing::Bool
+    dispatch_logging::Bool
+    dispatch_log_file::Union{Nothing,String}
+    dispatch_timing::Bool
+    # ── compiler / cache
+    frozen_log_misses::Bool
+    launch_arg_validation::Bool
+    spirv_dump_dir::Union{Nothing,String}
+    spirv_dump_counter::Int
+    kernel_debug_counter::Int
+    broadcast_probe::Any
+end
+
+Diagnostics() = Diagnostics(false, false, false, false, false, false, false, nothing,
+                            false, false, nothing, false,
+                            false, true, nothing, 0, 0, nothing)
+
 # ── Per-device state ─────────────────────────────────────────────────────────
 
 """

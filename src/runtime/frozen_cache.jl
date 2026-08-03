@@ -72,7 +72,7 @@ const FROZEN_STORES = Ref(0)
 const FROZEN_MISSES = Ref(0)
 
 """
-    FROZEN_LOG_MISSES[]
+    ctx.diag.frozen_log_misses
 
 Print the key of every kernel that falls through to a compile.
 
@@ -81,10 +81,16 @@ A miss is invisible otherwise — the answer is still right, it just cost second
 is exactly the filename that *would* have been read, which is directly
 comparable against a directory listing.
 """
-const FROZEN_LOG_MISSES = Ref(false)
 
 """Whether to log keys, from the env so precompilation can be traced too."""
-frozen_logging() = FROZEN_LOG_MISSES[] || get(ENV, "LAVA_FROZEN_LOG", "") == "1"
+frozen_logging(ctx::VkContext) =
+    ctx.diag.frozen_log_misses || get(ENV, "LAVA_FROZEN_LOG", "") == "1"
+# The RT path compiles before a device is chosen — `lava_compile_rt_shader` takes
+# no context — so there is genuinely none to ask. Fall back to the current one if
+# it exists, and to the environment variable if it does not.
+frozen_logging() = let c = VK_CONTEXT_REF[]
+    (c !== nothing && c.diag.frozen_log_misses) || get(ENV, "LAVA_FROZEN_LOG", "") == "1"
+end
 
 """Where frozen entries live: one directory, shared by every package."""
 function frozen_cache_dir()
@@ -212,7 +218,7 @@ function frozen_load(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workgr
     key = frozen_key(f, tt, workgroup_size)
     path = frozen_path(key)
     if !isfile(path)
-        frozen_logging() && println("frozen MISS: ", key, " || ", typestring(tt))
+        frozen_logging(ctx) && println("frozen MISS: ", key, " || ", typestring(tt))
         return nothing
     end
     compiled = try
@@ -259,7 +265,7 @@ function frozen_store(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workg
         let pc = ctx.caches.frozen_last_pcache
             pc === nothing || frozen_store_bin(ctx, key, pc)
         end
-        frozen_logging() &&
+        frozen_logging(ctx) &&
             println("frozen STORE: ", basename(path)[1:end-6], " || ", typestring(tt))
     catch ex
         @debug "Lava: frozen cache store failed" path exception = ex

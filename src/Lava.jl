@@ -313,7 +313,7 @@ function dump_state(; io::IO=stdout)
     end
     println(io, "Flushes: $(FLUSH_COUNTER[])")
     println(io, "Total dispatches: $(TOTAL_DISPATCH_COUNTER[])")
-    println(io, "Dispatch logging: $(DISPATCH_LOGGING_ENABLED[])")
+    ctx === nothing || println(io, "Dispatch logging: $(ctx.diag.dispatch_logging)")
     if !isempty(DISPATCH_LOG)
         println(io, "Last dispatch: ", last(DISPATCH_LOG))
     end

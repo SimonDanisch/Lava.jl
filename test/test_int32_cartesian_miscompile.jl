@@ -249,7 +249,7 @@
 # formed. Combined with the Heisenbug behaviour above, that points at the
 # scheduling/liveness of those extra `OpIMul`/`OpISub` values rather than at any
 # single instruction being wrong. Dumping both with
-# `Lava.SPIRV_DUMP_DIR[] = "..."` and diffing is how to pick this up again.
+# `Lava.vk_context().diag.spirv_dump_dir = "..."` and diffing is how to pick this up again.
 
 using Test, Lava, KernelAbstractions
 using Lava: FastDiv32, cart32

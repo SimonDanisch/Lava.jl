@@ -340,7 +340,7 @@ end
 # Recorded rather than kept: the addressing is not the cost, so anything that
 # helps has to change the access pattern — a tiled staging transpose, as
 # `DNNKernels`' `toLE_tiled` does — rather than the index arithmetic.
-# `BROADCAST_PROBE[]` below is what identified the shapes.
+# `ctx.diag.broadcast_probe` below is what identified the shapes.
 
 
 """
@@ -384,7 +384,7 @@ flat1(x::AbstractArray) = reshape(x, length(x))
 flat1(bc::Broadcast.Broadcasted) = Broadcast.broadcasted(bc.f, map(flat1, bc.args)...)
 
 """
-    BROADCAST_PROBE[] :: Union{Nothing,Dict}
+    ctx.diag.broadcast_probe :: Union{Nothing,Dict}
 
 Set to a dict to record which broadcast kernel each `.=` takes, keyed by
 `(path, dest size, leaf sizes)`. Off by default and free when off.
@@ -395,7 +395,6 @@ broadcast lands on is decided by operand *shapes*, invisibly. On SAM 2's encoder
 element — is 203 dispatches and 40 ms, the third-largest kernel family, and this
 is how to find out what is feeding it.
 """
-const BROADCAST_PROBE = Ref{Any}(nothing)
 
 leafsizes(x) = Any[]
 leafsizes(x::AbstractArray) = Any[(size(x), nameof(typeof(x)), IndexStyle(x) === IndexLinear())]
@@ -404,7 +403,9 @@ leafsizes(x::Broadcast.Extruded) = leafsizes(x.x)
 leafsizes(bc::Broadcast.Broadcasted) = reduce(vcat, map(leafsizes, bc.args); init = Any[])
 
 function probe_broadcast!(path, dest, bc)
-    p = BROADCAST_PROBE[]
+    # `dest` is a LavaArray, so the device that owns this broadcast is reachable
+    # without asking which one happens to be global.
+    p = vk_context(dest).diag.broadcast_probe
     p === nothing && return
     key = (path, size(dest), Tuple(unique(leafsizes(bc))))
     p[key] = get(p, key, 0) + 1

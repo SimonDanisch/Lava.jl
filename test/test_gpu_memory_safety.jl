@@ -241,14 +241,14 @@ end
 
     # ── 10. Arg-validation on/off toggle ──
     @testset "launch arg validation toggle" begin
-        @test Lava.LAUNCH_ARG_VALIDATION[] == true
-        Lava.LAUNCH_ARG_VALIDATION[] = false
+        @test Lava.vk_context().diag.launch_arg_validation == true
+        Lava.vk_context().diag.launch_arg_validation = false
         try
-            @test Lava.LAUNCH_ARG_VALIDATION[] == false
+            @test Lava.vk_context().diag.launch_arg_validation == false
         finally
-            Lava.LAUNCH_ARG_VALIDATION[] = true
+            Lava.vk_context().diag.launch_arg_validation = true
         end
-        @test Lava.LAUNCH_ARG_VALIDATION[] == true
+        @test Lava.vk_context().diag.launch_arg_validation == true
     end
 
     # ── 11. BatchQueue state stays bounded across a long session ──
