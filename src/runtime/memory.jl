@@ -524,7 +524,22 @@ function try_vk_alloc(bq::BatchQueue, nbytes::Integer;
         if e isa Vulkan.VulkanError &&
            (e.code == Vulkan.ERROR_OUT_OF_DEVICE_MEMORY ||
             e.code == Vulkan.ERROR_OUT_OF_HOST_MEMORY)
-            empty!((bq.ctx::VkContext).validation.messages)
+            # DRAIN, then empty. The validation callback writes into a ring
+            # (`ctx.validation`, per device since 49f3f17) and only
+            # `drain_validation_messages!` moves entries out of it into
+            # `.messages`. Emptying the drained list alone leaves this failure's
+            # own messages sitting in the ring, where the next
+            # `check_validation_errors!` picks them up and blames its own caller.
+            #
+            # Observed exactly that way: test_source_mapping.jl:699 asks for 40 GB
+            # deliberately, and the error surfaced 40 lines later at :739 as a
+            # `LavaError during vk_flush!` on a FOUR-ELEMENT upload. An oversized
+            # allocation is the intended, handled outcome here, so its messages
+            # belong to it.
+            let c = bq.ctx::VkContext
+                drain_validation_messages!(c)
+                empty!(c.validation.messages)
+            end
             return AllocFailure(e.code, op, Int(nbytes), mem_type_idx_local)
         end
         # DEVICE_LOST during alloc is a hard fault — mark + propagate so the
