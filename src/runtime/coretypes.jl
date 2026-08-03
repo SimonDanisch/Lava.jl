@@ -131,6 +131,29 @@ mutable struct DevicePool
     blocks::Vector{PoolBlock}
     # index i holds reusable VkManagedBuffer objects of size class i
     free_lists::Vector{Vector{VkManagedBuffer}}
+
+    # ── Policy. These were eleven module-level `Ref`s, which is the same mistake
+    # as the caches one level up: a second device would have been trimmed,
+    # capped and garbage-collected according to the first one's numbers. They are
+    # defaults, so they stay mutable — but they are this pool's defaults.
+    disabled::Bool
+    accounting::Bool
+    soft_cap::Int
+    trim_threshold::Int
+    trim_min_interval::Float64
+    trim_full_gc_interval::Float64
+    gc_mingap::Float64
+    gc_full_mingap::Float64
+    track_allocs::Bool
+
+    # ── Bookkeeping: when this pool last trimmed or collected, and how long it
+    # has spent doing it. Per device for the obvious reason — one device's
+    # collection must not suppress another's.
+    last_trim::Float64
+    last_full_gc::Float64
+    gc_last::Float64
+    gc_full_last::Float64
+    gc_seconds::Float64
 end
 
 # Linked result: session-dependent, stored in the cache Dict.
@@ -248,6 +271,16 @@ mutable struct DeviceCaches
     timestamp_pool::Union{Nothing,Vulkan.QueryPool}
     timestamp_next_slot::Int
     timestamp_period_ns::Float64
+    # The frozen kernel cache's session memo, holding `LavaLinkedKernel`s — each
+    # of which owns a `VkPipeline`. Same §8 class as the caches above, and missed
+    # for the same reason `BLIT_PIPELINE` was: nothing on the two-device probe's
+    # path enables the frozen cache. Its RT sibling `FROZEN_RT_MEM` stays a
+    # global on purpose — a `LavaRTShader` is bytes and metadata, no handle.
+    frozen_mem::Dict{Tuple{DataType,DataType,Any},Any}
+    # A baton, not a cache: `frozen_link_recording` leaves the per-kernel
+    # `VkPipelineCache` here for `frozen_store` to snapshot. Narrow window, but a
+    # driver object all the same, and two devices recording at once would swap it.
+    frozen_last_pcache::Any
 end
 
 # `DevicePool()` resolves at call time, long after `memory.jl` is loaded.
@@ -256,4 +289,5 @@ DeviceCaches() = DeviceCaches(
     Dict{Any,LavaLinkedKernel}(), IdDict{DataType,Vector{LaunchPlan}}(),
     nothing, DevicePool(), 0, nothing, false,
     Dict{UInt64,CompiledGraphicsPipeline}(), Dict{UInt64,LavaGfxShader}(),
-    nothing, nothing, 0, 1.0)
+    nothing, nothing, 0, 1.0,
+    Dict{Tuple{DataType,DataType,Any},Any}(), nothing)

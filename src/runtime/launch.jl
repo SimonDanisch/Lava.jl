@@ -475,10 +475,10 @@ end
         catch
             nothing
         end
-        FROZEN_LAST_PCACHE[] = pc
+        l.ctx.caches.frozen_last_pcache = pc
         return link_kernel(l.ctx, compiled; pipeline_cache=pc)
     end
-    FROZEN_LAST_PCACHE[] = nothing
+    l.ctx.caches.frozen_last_pcache = nothing
     return link_kernel(l.ctx, compiled)
 end
 
@@ -520,7 +520,7 @@ function get_compiled_kernel_and_pipeline(ctx::VkContext, @nospecialize(f), @nos
     source = GPUCompiler.methodinstance(typeof(f), tt)
     linked = Base.invokelatest(GPUCompiler.cached_compilation, linked_kernel_cache(ctx),
                                source, config, lava_kernel_compile, LavaLinker(ctx))::LavaLinkedKernel
-    frozen_store(f, tt, workgroup_size, linked.compiled)
+    frozen_store(ctx, f, tt, workgroup_size, linked.compiled)
 
     # Dump SPIR-V if dump dir is set
     if !isempty(SPIRV_DUMP_DIR[])

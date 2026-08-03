@@ -12,7 +12,7 @@ handed it straight back and the caller recorded into it. That is undefined
 behaviour, and the NVIDIA driver takes it as a SIGSEGV — which is how it was
 actually found: a segfault inside `vkCmdPipelineBarrier` while SAM 2's weights
 uploaded in the video editor, three frames removed from the real bug, and only
-once `AUTO_SUBMIT_THRESHOLD` (64) put a submit in the middle of a recording.
+once `bq.auto_submit_threshold` (64) put a submit in the middle of a recording.
 
 So this checks both halves: that the wait can be pushed at all, and that a
 throwing `sync_access!` can never again leave a live batch pointing at an ended

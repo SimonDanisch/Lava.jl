@@ -19,7 +19,7 @@ const KA = KernelAbstractions
     ctx = Lava.vk_context()
 
     # Grow the pool past the trim threshold, then drop every reference.
-    target = Lava.POOL_TRIM_THRESHOLD[] + 256 * 1024 * 1024
+    target = Lava.pool(Lava.vk_context()).trim_threshold + 256 * 1024 * 1024
     let arrays = Lava.LavaArray[]
         while Lava.GPU_LIVE_BYTES[] < target
             a = KA.allocate(be, Float32, 4_000_000)   # 16 MB each
@@ -31,15 +31,15 @@ const KA = KernelAbstractions
     end
 
     grown = Lava.GPU_LIVE_BYTES[]
-    @test grown >= Lava.POOL_TRIM_THRESHOLD[]
+    @test grown >= Lava.pool(Lava.vk_context()).trim_threshold
 
     # Defeat the rate limiter so the test doesn't depend on wall-clock timing.
-    Lava.LAST_POOL_TRIM[] = 0.0
+    Lava.pool(Lava.vk_context()).last_trim = 0.0
     Lava.maybe_trim_pool!(ctx)
 
     trimmed = Lava.GPU_LIVE_BYTES[]
     @test trimmed < grown                     # capacity actually came back
-    @test trimmed < Lava.POOL_TRIM_THRESHOLD[]
+    @test trimmed < Lava.pool(Lava.vk_context()).trim_threshold
 
     # And the allocator still works afterwards — blocks were returned, not corrupted.
     b = KA.allocate(be, Float32, 1024)
@@ -50,7 +50,7 @@ end
 
 @testset "trim is rate-limited" begin
     ctx = Lava.vk_context()
-    Lava.LAST_POOL_TRIM[] = time()            # just trimmed
+    Lava.pool(Lava.vk_context()).last_trim = time()            # just trimmed
     before = Lava.GPU_LIVE_BYTES[]
     Lava.maybe_trim_pool!(ctx)                # must be a no-op, not a stall
     @test Lava.GPU_LIVE_BYTES[] == before

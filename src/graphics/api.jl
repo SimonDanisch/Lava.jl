@@ -65,11 +65,12 @@ end
 
 function ensure_compiled!(pipeline::GraphicsPipeline, vert_fn, frag_fn, tt_vertex, tt_fragment;
                               color_format=Vulkan.FORMAT_B8G8R8A8_SRGB,
-                              descriptor_set_layout=nothing)
+                              descriptor_set_layout=nothing,
+                              ctx::VkContext = vk_context())
     # Cache key includes type tuples — different arg types get different compiled pipelines
     cache_key = hash((vert_fn, frag_fn, tt_vertex, tt_fragment, color_format,
                        descriptor_set_layout !== nothing))
-    cached = get(vk_context().caches.gfx_pipelines, cache_key, nothing)
+    cached = get(ctx.caches.gfx_pipelines, cache_key, nothing)
     cached !== nothing && return cached::CompiledGraphicsPipeline
 
     # Compile vertex shader
@@ -113,16 +114,17 @@ function ensure_compiled!(pipeline::GraphicsPipeline, vert_fn, frag_fn, tt_verte
         tess_config=tess_cfg,
         descriptor_set_layout=descriptor_set_layout)
 
-    vk_context().caches.gfx_pipelines[cache_key] = compiled
+    ctx.caches.gfx_pipelines[cache_key] = compiled
     return compiled
 end
 
-function get_or_compile_gfx(@nospecialize(f), @nospecialize(tt), stage::Symbol; config=nothing)
+function get_or_compile_gfx(@nospecialize(f), @nospecialize(tt), stage::Symbol;
+                            config=nothing, ctx::VkContext = vk_context())
     key = hash((f, tt, stage, config))
-    cached = get(vk_context().caches.gfx_shaders, key, nothing)
+    cached = get(ctx.caches.gfx_shaders, key, nothing)
     cached !== nothing && return cached
     shader = lava_compile_gfx_shader(f, tt; stage, config)
-    vk_context().caches.gfx_shaders[key] = shader
+    ctx.caches.gfx_shaders[key] = shader
     return shader
 end
 
@@ -326,9 +328,11 @@ function blit!(bq::BatchQueue, target::RenderTarget, source::LavaArray;
         error("blit! only supports WindowTarget and OffscreenTarget")
     end
 
-    # Create or reuse blit pipeline
-    if vk_context().caches.blit === nothing
-        vk_context().caches.blit = GraphicsPipeline(;
+    # Create or reuse blit pipeline. `bq.ctx`, not `vk_context()`: this pipeline
+    # is a device-owned handle and the queue we are recording on names its device.
+    ctx = bq.ctx::VkContext
+    if ctx.caches.blit === nothing
+        ctx.caches.blit = GraphicsPipeline(;
             vertex=blit_vertex,
             fragment=blit_fragment,
             blend=Opaque(),
@@ -337,7 +341,7 @@ function blit!(bq::BatchQueue, target::RenderTarget, source::LavaArray;
         )
     end
 
-    pipeline = vk_context().caches.blit
+    pipeline = ctx.caches.blit
 
     # Fragment shader takes: (buffer::LavaDeviceArray, width::Int32, height::Int32)
     # Use the fragment shader's push_info for arg packing since vertex has no args.

@@ -383,7 +383,7 @@ function get_or_build_iter_plan(obj::KA.Kernel{LavaBackend}, ndrange, workgroups
 end
 
 """
-    BARRIER_ELISION[] :: Bool
+    bq.barrier_elision :: Bool
 
 Drop the barrier in front of a dispatch whose buffers are disjoint from every
 buffer touched since the last barrier.
@@ -398,7 +398,6 @@ which is real host cost. It is meant to be turned on around `Lava.capture`: the
 analysis is then paid once and every `replay!` gets the shorter command buffer
 for free. On the MatAnyone step barriers are 3.35 ms of an 11.07 ms replay.
 """
-const BARRIER_ELISION = Ref{Bool}(false)
 
 # Flat [lo₁,hi₁,lo₂,hi₂,…] of everything touched since the last barrier, and a
 # scratch list for the dispatch being recorded. Reused, never reallocated.
@@ -590,11 +589,11 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     # Same tree the pins just walked, so every buffer this dispatch can reach is
     # covered. Decided here rather than in `record_dispatch!` because this is the
     # last point that still has the pre-adapt arguments.
-    if BARRIER_ELISION[]
+    if bq.barrier_elision
         empty!(DISPATCH_RANGES)
         range_leaves!(DISPATCH_RANGES, obj.f)
         range_leaves!(DISPATCH_RANGES, args)
-        NEXT_SKIP_BARRIER[] = !barrier_needed!(DISPATCH_RANGES)
+        bq.next_skip_barrier = !barrier_needed!(DISPATCH_RANGES)
         RANGES_DECLARED[] = true
     end
     adaptor = LavaAdaptor(batch)

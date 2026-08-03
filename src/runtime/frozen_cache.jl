@@ -60,14 +60,12 @@ const FROZEN_RECORDING = Ref(false)
 
 # Session-local, keyed by the same types the disk key is derived from, so a
 # repeat launch costs a tuple hash rather than building a filename.
-const FROZEN_MEM = Dict{Tuple{DataType, DataType, Any}, Any}()
 
 """
 The per-kernel `VkPipelineCache` the pipeline for the kernel being recorded was
 built with, so `frozen_store` can snapshot exactly that kernel's ISA rather than
 the device-wide accumulation.
 """
-const FROZEN_LAST_PCACHE = Ref{Any}(nothing)
 
 const FROZEN_HITS = Ref(0)
 const FROZEN_STORES = Ref(0)
@@ -209,7 +207,7 @@ asking Julia to infer anything.
 function frozen_load(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workgroup_size)
     isempty(FROZEN_VERSION[]) && return nothing
     memkey = (typeof(f), tt, workgroup_size)
-    hit = get(FROZEN_MEM, memkey, nothing)
+    hit = get(ctx.caches.frozen_mem, memkey, nothing)
     hit === nothing || return hit
     key = frozen_key(f, tt, workgroup_size)
     path = frozen_path(key)
@@ -227,17 +225,17 @@ function frozen_load(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workgr
     # Level 2: hand the pipeline this kernel's own driver blob when there is a
     # matching one, so the driver reuses its ISA instead of recompiling.
     linked = link_kernel(ctx, compiled; pipeline_cache = frozen_pipeline_cache(ctx, key))
-    FROZEN_MEM[memkey] = linked
+    ctx.caches.frozen_mem[memkey] = linked
     FROZEN_HITS[] += 1
     return linked
 end
 
 """
-    frozen_store(f, tt, workgroup_size, compiled)
+    frozen_store(ctx, f, tt, workgroup_size, compiled)
 
 Write a compiled kernel under its frozen key. Only while recording.
 """
-function frozen_store(@nospecialize(f), @nospecialize(tt), workgroup_size,
+function frozen_store(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workgroup_size,
                       compiled::LavaGPUKernel)
     (FROZEN_RECORDING[] && !isempty(FROZEN_VERSION[])) || return nothing
     dir = frozen_cache_dir()
@@ -257,9 +255,9 @@ function frozen_store(@nospecialize(f), @nospecialize(tt), workgroup_size,
         FROZEN_STORES[] += 1
         # …and the driver's ISA for it, from a cache holding only this kernel.
         # Recording builds the pipeline through `frozen_link_recording`, which
-        # leaves the per-kernel cache in `FROZEN_LAST_PCACHE`.
-        let pc = FROZEN_LAST_PCACHE[]
-            pc === nothing || frozen_store_bin(vk_context(), key, pc)
+        # leaves the per-kernel cache in `ctx.caches.frozen_last_pcache`.
+        let pc = ctx.caches.frozen_last_pcache
+            pc === nothing || frozen_store_bin(ctx, key, pc)
         end
         frozen_logging() &&
             println("frozen STORE: ", basename(path)[1:end-6], " || ", typestring(tt))
@@ -292,8 +290,9 @@ frozen_reset_stats!() = (FROZEN_HITS[] = 0; FROZEN_STORES[] = 0; FROZEN_MISSES[]
 Delete every on-disk entry for `version`, and the session's memory of them.
 The one supported way to invalidate, short of bumping the version.
 """
-function frozen_clear!(; version::AbstractString = FROZEN_VERSION[])
-    empty!(FROZEN_MEM)
+function frozen_clear!(; version::AbstractString = FROZEN_VERSION[],
+                        ctx::VkContext = vk_context())
+    empty!(ctx.caches.frozen_mem)
     empty!(FROZEN_RT_MEM)
     dir = frozen_cache_dir()
     isdir(dir) || return 0
@@ -308,7 +307,14 @@ function frozen_clear!(; version::AbstractString = FROZEN_VERSION[])
 end
 
 # RT entries key on (F, tt, stage, payload, push_size) — five fields, so they
-# cannot share `FROZEN_MEM`, whose key type is fixed at three.
+# cannot share `frozen_mem`, whose key type is fixed at three.
+#
+# **Module-level on purpose, unlike `frozen_mem`.** A `LavaRTShader` is SPIR-V
+# bytes, a stage, push-constant info and IR text — no `VkPipeline`, no device
+# handle of any kind — and the key is device-independent. So this is a
+# compile-result memo, and sharing it across devices is correct rather than a
+# §8 defect. `frozen_mem` holds `LavaLinkedKernel`s, which own a pipeline; that
+# is why only that one moved onto the context.
 const FROZEN_RT_MEM = Dict{Tuple{DataType, DataType, Symbol, Symbol, Int}, Any}()
 
 # ── Ray-tracing shaders ──

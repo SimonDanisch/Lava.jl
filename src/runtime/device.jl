@@ -24,7 +24,7 @@ end
     CommandBatch
 
 A single recording batch that may span multiple Vulkan command buffers.
-When the number of dispatches in the current CB segment exceeds `CB_SPLIT_THRESHOLD`,
+When the number of dispatches in the current CB segment exceeds `bq.cb_split_threshold`,
 the CB is sealed and a fresh one is started. At flush time, all sealed CBs + the
 active CB are submitted in a single `vkQueueSubmit` call.
 
@@ -149,6 +149,22 @@ mutable struct BatchQueue
     # it is running on this thread — an accidental cross-thread call trips
     # the assert immediately instead of silently corrupting state.
     owning_thread::Int
+
+    # ── Recording policy. These were six module-level `Ref`s, which made them
+    # process-wide settings for something that is per queue: two BatchQueues on
+    # one device already disagree about how much work to batch before submitting,
+    # and a second device made it worse. They are still mutable defaults — that
+    # is what they are for — but they are now this queue's.
+    #
+    # `auto_submit_threshold` at 64 rather than 0 is the +44% measured in
+    # `perf-plan.md`: at 0, recording and execution never overlapped.
+    auto_submit_threshold::Int
+    cb_split_threshold::Int
+    flush_timeout_ns::UInt64
+    barrier_mode::Symbol
+    barrier_elision::Bool
+    # One-shot, consumed by exactly the next dispatch on THIS queue.
+    next_skip_barrier::Bool
 end
 
 function init_batch(cb::Vulkan.CommandBuffer)
@@ -191,7 +207,9 @@ function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32, 
                     Any[], 1, 0,     # indirect_slabs: idx=1, offset=0
                     nothing,         # staging (lazy)
                     ctx,             # owning VkContext (required)
-                    Threads.threadid())  # owning_thread
+                    Threads.threadid(),  # owning_thread
+                    64, 3000, UInt64(120) * 1_000_000_000,  # auto-submit, CB split, flush timeout
+                    :memory, false, false)                  # barrier mode / elision / one-shot skip
     # Plug the back-reference into every pre-allocated batch so `batch.bq`
     # is non-nothing as soon as the bq is returned.  Future batches allocated
     # lazily (alloc_cmd_buf → init_batch) must set .bq themselves.

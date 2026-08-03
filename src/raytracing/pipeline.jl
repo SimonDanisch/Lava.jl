@@ -280,13 +280,13 @@ function rt_dispatch!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::LavaTLAS,
         # that is where nearly all the GPU time goes, so a report built only
         # from `cmd_dispatch` accounts for a small fraction of the frame and
         # invites the wrong conclusion about what is slow.
-        ts_slot = maybe_write_dispatch_start_timestamp!(cmd, LAST_DISPATCH_INFO[];
+        ts_slot = maybe_write_dispatch_start_timestamp!(bq.ctx::VkContext, cmd, LAST_DISPATCH_INFO[];
                                                  stage = Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR)
         Vulkan.cmd_trace_rays_khr(cmd,
             pipeline.raygen_region, pipeline.miss_region,
             pipeline.hit_region, pipeline.callable_region,
             UInt32(width), UInt32(height), UInt32(depth))
-        maybe_write_dispatch_end_timestamp!(cmd, ts_slot, barrier_fptr(bq);
+        maybe_write_dispatch_end_timestamp!(bq.ctx::VkContext, cmd, ts_slot, barrier_fptr(bq);
             stage = Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
             stage_mask = UInt32(VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR))
     end
@@ -323,13 +323,13 @@ function rt_dispatch_indirect!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::L
 
         # bda_address(indirect) includes the view's element offset, so the
         # address we pass to Vulkan points exactly at the 3-UInt32 command.
-        ts_slot = maybe_write_dispatch_start_timestamp!(cmd, LAST_DISPATCH_INFO[];
+        ts_slot = maybe_write_dispatch_start_timestamp!(bq.ctx::VkContext, cmd, LAST_DISPATCH_INFO[];
                                                  stage = Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR)
         Vulkan.cmd_trace_rays_indirect_khr(cmd,
             pipeline.raygen_region, pipeline.miss_region,
             pipeline.hit_region, pipeline.callable_region,
             bda_address(indirect))
-        maybe_write_dispatch_end_timestamp!(cmd, ts_slot, barrier_fptr(bq);
+        maybe_write_dispatch_end_timestamp!(bq.ctx::VkContext, cmd, ts_slot, barrier_fptr(bq);
             stage = Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
             stage_mask = UInt32(VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR))
         pin!(batch, indirect)

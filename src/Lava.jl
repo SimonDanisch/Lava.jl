@@ -309,7 +309,7 @@ function dump_state(; io::IO=stdout)
         bq = ctx.default_bq
         println(io, "Free batches: $(length(bq.free_batches))")
         println(io, "Free cmd bufs: $(length(bq.free_cmd_bufs))")
-        println(io, "CB split threshold: $(CB_SPLIT_THRESHOLD[])")
+        ctx === nothing || println(io, "CB split threshold: $(ctx.default_bq.cb_split_threshold)")
     end
     println(io, "Flushes: $(FLUSH_COUNTER[])")
     println(io, "Total dispatches: $(TOTAL_DISPATCH_COUNTER[])")

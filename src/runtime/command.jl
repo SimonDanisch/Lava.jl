@@ -123,7 +123,6 @@ const STAGE2_ALL_COMMANDS = Vulkan.PipelineStageFlag2(Vulkan.PIPELINE_STAGE_2_AL
 # (30k+ dispatches) while maintaining single-submit efficiency.
 # Default 3000 ≈ 1 Hikari volpath sample (50 bounces × 60 dispatches/bounce).
 # Set to 0 to disable splitting.
-const CB_SPLIT_THRESHOLD = Ref{Int}(3000)
 
 # Auto-submit threshold: submit the current batch (starting a new one on the
 # next dispatch) when its dispatch count reaches this value. Measured per-batch
@@ -146,7 +145,6 @@ const CB_SPLIT_THRESHOLD = Ref{Int}(3000)
 # retire sweep) starts to show, above 128 the overlap window shrinks back.
 # Workloads with fewer than 64 dispatches per flush never reach it and are
 # unaffected.
-const AUTO_SUBMIT_THRESHOLD = Ref{Int}(64)
 
 
 # ── Capture / replay ──
@@ -195,7 +193,6 @@ to survive, so it gets a budget: long enough that no legitimate submission comes
 near it (a whole VAE decode is ~30 s of device work), short enough that a hang
 is a diagnosable error instead of a wedged session.
 """
-const FLUSH_TIMEOUT_NS = Ref{UInt64}(UInt64(120) * 1_000_000_000)
 
 """Poll interval inside that budget, so a TDR is noticed without waiting it out."""
 const FLUSH_WAIT_QUANTUM_NS = UInt64(2) * 1_000_000_000
@@ -213,7 +210,6 @@ that anything since the last barrier touched (`ka_backend.jl`), and consumed by
 `record_dispatch!`. A plain `Ref` is the right shape here for the same reason
 `CONCURRENT_GROUP_ACTIVE` is: a `BatchQueue` is single-writer by construction.
 """
-const NEXT_SKIP_BARRIER = Ref{Bool}(false)
 
 """Begin-flags for a command buffer: reusable while capturing, one-shot otherwise."""
 @inline cb_begin_flags() = CAPTURING[] === nothing ?
@@ -410,7 +406,7 @@ end
 """
     maybe_split_cb!(batch, ctx)
 
-If the current CB segment has reached `CB_SPLIT_THRESHOLD` dispatches, seal it
+If the current CB segment has reached `bq.cb_split_threshold` dispatches, seal it
 and start a fresh CB. The sealed CB is stored in `batch.sealed_cmd_bufs` and will
 be submitted alongside the active CB in `vk_flush!`.
 
@@ -418,7 +414,7 @@ Barriers work across CB boundaries per Vulkan spec — submission order defines
 the scope of pipeline barriers, not command buffer boundaries.
 """
 function maybe_split_cb!(batch::CommandBatch, bq::BatchQueue)
-    threshold = CB_SPLIT_THRESHOLD[]
+    threshold = bq.cb_split_threshold
     threshold <= 0 && return
     batch.segment_dispatches < threshold && return
 
@@ -490,7 +486,7 @@ const CONCURRENT_GROUP_ACTIVE  = Threads.Atomic{Bool}(false)
 const CONCURRENT_GROUP_STARTED = Threads.Atomic{Bool}(false)
 
 """
-    BARRIER_MODE[] :: Symbol
+    bq.barrier_mode :: Symbol
 
 How `record_dispatch!` orders one dispatch against the previous one.
 
@@ -508,7 +504,6 @@ barrier and ~3 µs without one, so on a 2500-dispatch inference step the barrier
 alone are the majority of the wall time. Knowing which half of the barrier that
 cost sits in is what this knob is for.
 """
-const BARRIER_MODE = Ref{Symbol}(:memory)
 
 """
     concurrent_dispatch_group(f)
@@ -658,16 +653,16 @@ end
     # callers, indirect prepares) is opaque to the elision tracker: it must take
     # its barrier, and nothing after it may elide until a barrier clears the
     # poison.
-    if BARRIER_ELISION[] && !RANGES_DECLARED[]
-        NEXT_SKIP_BARRIER[] = false
+    if bq.barrier_elision && !RANGES_DECLARED[]
+        bq.next_skip_barrier = false
         poison_barrier_elision!()
     end
     RANGES_DECLARED[] = false
 
-    effective_skip = (skip_pre_barrier || NEXT_SKIP_BARRIER[] ||
+    effective_skip = (skip_pre_barrier || bq.next_skip_barrier ||
                       (CONCURRENT_GROUP_ACTIVE[] && CONCURRENT_GROUP_STARTED[])) &&
                      !force_pre_barrier
-    NEXT_SKIP_BARRIER[] = false      # one-shot: consumed by exactly this dispatch
+    bq.next_skip_barrier = false     # one-shot: consumed by exactly this dispatch
     if CONCURRENT_GROUP_ACTIVE[]
         CONCURRENT_GROUP_STARTED[] = true
     end
@@ -676,7 +671,7 @@ end
     # synchronisation point, which it is not: `submit!` adds no wait on the
     # previous submission, so without this the first dispatch of every new batch
     # could read what the last dispatch of the previous one was still writing.
-    # Harmless while nothing submitted mid-stream; `AUTO_SUBMIT_THRESHOLD` makes
+    # Harmless while nothing submitted mid-stream; `bq.auto_submit_threshold` makes
     # it happen every 64 dispatches. After a `flush!` the queue is drained and
     # `in_flight` is empty, so the genuinely-first dispatch still skips.
     needs_boundary_barrier = batch.dispatch_count == 0 && !isempty(bq.in_flight)
@@ -685,7 +680,7 @@ end
             VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR :
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
         dst_access = VkAccessFlags(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT) | VkAccessFlags(extra_dst_access)
-        nmem = BARRIER_MODE[] === :execution ? UInt32(0) : UInt32(1)
+        nmem = bq.barrier_mode === :execution ? UInt32(0) : UInt32(1)
         barrier_ref = Ref(VkMemoryBarrier(
             VK_STRUCTURE_TYPE_MEMORY_BARRIER, C_NULL,
             VkAccessFlags(VK_ACCESS_SHADER_WRITE_BIT), dst_access))
@@ -728,7 +723,7 @@ end
     # `ensure_active_batch!` a fresh batch.  Cross-batch buffer synchronisation
     # is already handled via `sync_access!` writing `buf.last_write` and
     # wait_semaphores picking it up on the next pin.
-    threshold = AUTO_SUBMIT_THRESHOLD[]
+    threshold = bq.auto_submit_threshold
     if threshold > 0 && batch.dispatch_count >= threshold
         submit!(bq)
     end
@@ -804,7 +799,7 @@ end
         # Profiling: optional GPU-side timestamp around the dispatch.  Returns
         # -1 (and does nothing) when `with_dispatch_timing` is not active, so
         # the hot path stays unperturbed.
-        ts_slot = maybe_write_dispatch_start_timestamp!(cmd, LAST_DISPATCH_INFO[])
+        ts_slot = maybe_write_dispatch_start_timestamp!(bq.ctx::VkContext, cmd, LAST_DISPATCH_INFO[])
         if base_x == 0 && base_y == 0 && base_z == 0
             Vulkan.cmd_dispatch(cmd, UInt32(gx), UInt32(gy), UInt32(gz))
         else
@@ -812,7 +807,7 @@ end
                 UInt32(base_x), UInt32(base_y), UInt32(base_z),
                 UInt32(gx), UInt32(gy), UInt32(gz))
         end
-        maybe_write_dispatch_end_timestamp!(cmd, ts_slot, barrier_fptr(bq))
+        maybe_write_dispatch_end_timestamp!(bq.ctx::VkContext, cmd, ts_slot, barrier_fptr(bq))
     end
 end
 
@@ -862,9 +857,9 @@ atomically-claimed queue slots)."""
         push_constants_bda!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_bda)
         mb = indirect.buf[]::VkManagedBuffer
         byte_offset = UInt64(indirect.offset)
-        ts_slot = maybe_write_dispatch_start_timestamp!(cmd, LAST_DISPATCH_INFO[])
+        ts_slot = maybe_write_dispatch_start_timestamp!(bq.ctx::VkContext, cmd, LAST_DISPATCH_INFO[])
         Vulkan.cmd_dispatch_indirect(cmd, mb.buffer, byte_offset)
-        maybe_write_dispatch_end_timestamp!(cmd, ts_slot, barrier_fptr(bq))
+        maybe_write_dispatch_end_timestamp!(bq.ctx::VkContext, cmd, ts_slot, barrier_fptr(bq))
         pin!(batch, indirect)
     end
 end
@@ -1306,7 +1301,7 @@ function flush!(bq::BatchQueue, device::Vulkan.Device)
         target = max(target, b.signal_value)
     end
     target == UInt64(0) && return
-    budget = FLUSH_TIMEOUT_NS[]
+    budget = bq.flush_timeout_ns
     quantum = budget == 0 ? typemax(UInt64) : min(budget, FLUSH_WAIT_QUANTUM_NS)
     waited = UInt64(0)
     while true
@@ -1335,7 +1330,7 @@ function flush!(bq::BatchQueue, device::Vulkan.Device)
                             flush_stall_report(bq, target),
                             "A dispatch is not completing. Set Lava.DISPATCH_LOGGING_ENABLED[] = true " *
                             "(and Lava.DISPATCH_LOG_FILE[] to keep it across a restart) to see which " *
-                            "kernel, or raise Lava.FLUSH_TIMEOUT_NS[] if the work is genuinely this long."))
+                            "kernel, or raise `bq.flush_timeout_ns` if the work is genuinely this long."))
         end
     end
     sweep_retired_batches!(bq)
@@ -1520,7 +1515,7 @@ function cmd_copy_buffer!(bq::BatchQueue, src, dst, nbytes::Integer;
     # tracker can simply start clean rather than poison. (Poisoning here would
     # force a redundant barrier on the next dispatch and, worse, on every
     # dispatch until one fired.)
-    BARRIER_ELISION[] && reset_barrier_elision!()
+    bq.barrier_elision && reset_barrier_elision!()
 
     # Barrier: shader writes → transfer read. Only needed if we already
     # recorded dispatches into this batch (barrier across those writes).

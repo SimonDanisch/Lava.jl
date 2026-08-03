@@ -207,9 +207,6 @@ caller is about to do a heavy synchronous operation anyway.
 # So trim on absolute dead capacity as well, rate-limited so a render loop can't
 # pay for it repeatedly. Blocks only become empty once the GC has run their
 # sub-allocations' finalizers, hence the collection before the scan.
-const POOL_TRIM_THRESHOLD = Ref{Int}(1024 * 1024 * 1024)   # 1 GiB of pool capacity
-const POOL_TRIM_MIN_INTERVAL = Ref{Float64}(5.0)           # seconds
-const LAST_POOL_TRIM = Ref{Float64}(0.0)
 
 # A sub-allocation is returned to its block by a **finalizer**, so a block only
 # becomes empty once those have run — which is what the paragraph above says, and
@@ -228,22 +225,21 @@ const LAST_POOL_TRIM = Ref{Float64}(0.0)
 # part (tens of ms on a heap this size) and a render loop must not pay it every
 # five seconds; unbounded pool growth is the worse of the two, but not by so much
 # that it justifies a hitch per frame.
-const POOL_TRIM_FULL_GC_INTERVAL = Ref{Float64}(30.0)      # seconds
-const LAST_POOL_FULL_GC = Ref{Float64}(0.0)
 
 function maybe_trim_pool!(ctx::VkContext)
-    GPU_LIVE_BYTES[] < POOL_TRIM_THRESHOLD[] && return
+    p = pool(ctx)
+    GPU_LIVE_BYTES[] < p.trim_threshold && return
     now = time()
-    now - LAST_POOL_TRIM[] < POOL_TRIM_MIN_INTERVAL[] && return
-    LAST_POOL_TRIM[] = now
+    now - p.last_trim < p.trim_min_interval && return
+    p.last_trim = now
 
     GC.gc(false)
-    if !any(b -> b.live_count == 0, pool(ctx).blocks)
+    if !any(b -> b.live_count == 0, p.blocks)
         # Nothing reclaimable *yet*; the finalizers may simply not have run.
-        now - LAST_POOL_FULL_GC[] < POOL_TRIM_FULL_GC_INTERVAL[] && return
-        LAST_POOL_FULL_GC[] = now
+        now - p.last_full_gc < p.trim_full_gc_interval && return
+        p.last_full_gc = now
         GC.gc(true)
-        any(b -> b.live_count == 0, pool(ctx).blocks) || return
+        any(b -> b.live_count == 0, p.blocks) || return
     end
     bq = ctx.default_bq
     quiesce_before_reclaim!(bq)
@@ -257,7 +253,7 @@ end
 
 Hand every empty pool block back to the driver, now.
 
-The automatic path ([`POOL_TRIM_THRESHOLD`](@ref)) is rate-limited and only runs
+The automatic path (`pool(ctx).trim_threshold`) is rate-limited and only runs
 while something is allocating, so it is the wrong tool for "I have finished a
 batch of work and want the memory back" — and for measuring, where dead pool
 capacity otherwise counts as live and makes a VRAM figure depend on GC timing
@@ -414,7 +410,7 @@ function vk_alloc(bq::BatchQueue, nbytes::Integer;
         "vk_alloc",
         "Vulkan device is lost — cannot allocate new buffers",
         "Call Lava.vk_reset_device!() to reinitialize, or restart Julia."))
-    if TRACK_ALLOCS[]
+    if pool(bq.ctx::VkContext).track_allocs
         _record_alloc_site!(Int(nbytes))
     end
     # Phase 7 P2: reclaim retired in-flight batches on THIS queue before
@@ -991,10 +987,15 @@ const POOL_NUM_SIZE_CLASSES = POOL_POW2_CLASSES + 16 * POOL_SUBDIV
 # per array). GPU-AV's BDA OOB validation tracks ranges per VkBuffer, so with the pool
 # on it cannot see sub-pool overruns; with this flag on, each LavaArray's bounds are
 # checked individually. Slow — leave off in production.
-const POOL_DISABLED = Ref{Bool}(false)
 
+# Defaults live here, next to the pool they configure, rather than in eleven
+# module-level `Ref`s. `2 GiB` soft cap, trim above 1 GiB and no more than every
+# 5 s, a full GC no more than every 30 s.
 DevicePool() = DevicePool(PoolBlock[],
-                          [VkManagedBuffer[] for _ in 1:POOL_NUM_SIZE_CLASSES])
+                          [VkManagedBuffer[] for _ in 1:POOL_NUM_SIZE_CLASSES],
+                          false, false, 2 * 1024^3, 1024 * 1024 * 1024,
+                          5.0, 30.0, 0.02, 0.5, false,
+                          0.0, 0.0, 0.0, 0.0, 0.0)
 
 """
     pool(ctx) -> DevicePool
@@ -1071,7 +1072,7 @@ end
 @inline size_class_bytes(nbytes::Int) = size_class(nbytes)[2]
 
 """
-    POOL_ACCOUNTING[] :: Bool
+    pool(ctx).accounting :: Bool
 
 Record what the pool is asked for against what it hands out. Off by default;
 the counters below are only meaningful while it is on.
@@ -1080,7 +1081,6 @@ Power-of-two size classes waste up to 2x per chunk, and the pool is the reason
 SAM 2 holds far more VRAM than its live tensors. Whether that rounding is the
 cause or a red herring is a measurement, not a guess — hence these.
 """
-const POOL_ACCOUNTING = Ref(false)
 const POOL_REQUESTED = Threads.Atomic{Int}(0)
 const POOL_ROUNDED = Threads.Atomic{Int}(0)
 const POOL_NALLOC = Threads.Atomic{Int}(0)
@@ -1107,15 +1107,15 @@ end
 #
 # Two mechanisms, two jobs, and they are not interchangeable:
 #
-#   * [`POOL_SOFT_CAP`] stops the pool GROWING. On the allocation path, cheap,
+#   * `soft_cap` stops the pool GROWING. On the allocation path, cheap,
 #     no queue drain — the memory comes back as free-list chunks the caller
 #     takes immediately.
-#   * [`POOL_TRIM_THRESHOLD`] RELEASES capacity that is already dead, back to
+#   * `trim_threshold` RELEASES capacity that is already dead, back to
 #     the driver. Periodic, expensive, and the only thing that helps when the
 #     pressure is on memory the rest of the machine needs.
 
 """
-    POOL_SOFT_CAP[]
+    pool(ctx).soft_cap
 
 Pool footprint in bytes past which `pool_alloc` collects *before* committing
 another block. `0` disables it.
@@ -1152,23 +1152,18 @@ case here, not a dedicated one.
 The graph's own live set is 26 blocks, so a cap below ~30 leaves nothing to
 collect and every allocation past it pays for a collection and grows anyway.
 """
-const POOL_SOFT_CAP = Ref(2 * 1024^3)
 
 # Rate limits. The incremental collection is cheap enough to run between graph
 # steps; the full one is not, and only it sweeps the old generation that
 # long-lived activations reach.
-const POOL_GC_MINGAP = Ref(0.02)
-const POOL_GC_FULL_MINGAP = Ref(0.5)
-const POOL_GC_LAST = Ref(0.0)
-const POOL_GC_FULL_LAST = Ref(0.0)
 const POOL_GC_COUNT = Threads.Atomic{Int}(0)
-const POOL_GC_SECONDS = Ref(0.0)
 
 """Collections run by the soft cap, and the seconds they cost."""
-pool_gc_stats() = (; count = POOL_GC_COUNT[], seconds = POOL_GC_SECONDS[])
+pool_gc_stats(ctx::VkContext = vk_context()) =
+    (; count = POOL_GC_COUNT[], seconds = pool(ctx).gc_seconds)
 
 function reset_pool_gc_stats!()
-    POOL_GC_COUNT[] = 0; POOL_GC_SECONDS[] = 0.0
+    POOL_GC_COUNT[] = 0; pool(ctx).gc_seconds = 0.0
     return
 end
 
@@ -1183,18 +1178,19 @@ buffer freed while the GPU still referenced it went to the deferred list rather
 than the pool, and until it is drained the memory is dead to everyone.
 """
 function collect_for_pool!(bq::BatchQueue)
+    p = pool(bq.ctx::VkContext)
     now = time()
-    now - POOL_GC_LAST[] < POOL_GC_MINGAP[] && return false
+    now - p.gc_last < p.gc_mingap && return false
     t0 = time_ns()
     GC.gc(false)
     drain_deferred_frees!(bq)
-    if now - POOL_GC_FULL_LAST[] >= POOL_GC_FULL_MINGAP[]
+    if now - p.gc_full_last >= p.gc_full_mingap
         GC.gc(true)
         drain_deferred_frees!(bq)
-        POOL_GC_FULL_LAST[] = now
+        p.gc_full_last = now
     end
-    POOL_GC_LAST[] = time()
-    POOL_GC_SECONDS[] += (time_ns() - t0) / 1e9
+    p.gc_last = time()
+    p.gc_seconds += (time_ns() - t0) / 1e9
     Threads.atomic_add!(POOL_GC_COUNT, 1)
     return true
 end
@@ -1235,10 +1231,9 @@ function alloc_pool_block(bq::BatchQueue)
 end
 
 # Diagnostic: track allocation call sites during recording.
-# Set TRACK_ALLOCS[] = true to record stack traces of every allocation while the
+# Set `pool(ctx).track_allocs = true` to record stack traces of every allocation while the
 # active batch is recording. Used to find per-frame allocations leaking into the
 # render loop. Reads are merged into ALLOC_TRACE; query via dump_alloc_trace().
-const TRACK_ALLOCS = Ref(false)
 # site => (count, bytes). Bytes as well as counts because the two rank call
 # sites completely differently — a hot site allocating 4 KiB matters far less
 # than one full-size tensor per layer.
@@ -1304,7 +1299,8 @@ function pool_alloc(bq::BatchQueue, nbytes::Integer; extra_usage::UInt32=UInt32(
         "Vulkan device is lost — cannot allocate new buffers",
         "Call Lava.vk_reset_device!() to reinitialize, or restart Julia."))
     nbytes = max(Int(nbytes), POOL_MIN_SIZE)
-    if TRACK_ALLOCS[]
+    p = pool(ctx)
+    if p.track_allocs
         _record_alloc_site!(nbytes)
     end
     sweep_retired_batches!(bq)
@@ -1315,7 +1311,7 @@ function pool_alloc(bq::BatchQueue, nbytes::Integer; extra_usage::UInt32=UInt32(
     # AK benchmarks regressed on.
     maybe_collect(ctx)
 
-    if POOL_DISABLED[] || nbytes > POOL_LARGE_THRESHOLD || extra_usage != UInt32(0)
+    if p.disabled || nbytes > POOL_LARGE_THRESHOLD || extra_usage != UInt32(0)
         return vk_alloc(bq, nbytes; extra_usage)
     end
 
@@ -1325,7 +1321,7 @@ function pool_alloc(bq::BatchQueue, nbytes::Integer; extra_usage::UInt32=UInt32(
     # handed a buffer smaller than it asked for — a BoundsError is the better
     # failure.
     idx, alloc_size = size_class(nbytes)
-    if POOL_ACCOUNTING[]
+    if p.accounting
         Threads.atomic_add!(POOL_REQUESTED, nbytes)
         Threads.atomic_add!(POOL_ROUNDED, alloc_size)
         Threads.atomic_add!(POOL_NALLOC, 1)
@@ -1378,7 +1374,7 @@ function pool_alloc(bq::BatchQueue, nbytes::Integer; extra_usage::UInt32=UInt32(
     # Both rate limits and the cap are there so this is not that: under the cap
     # this path is exactly as it was, and above it a collection runs at most
     # every `POOL_GC_MINGAP` seconds.
-    if POOL_SOFT_CAP[] > 0 && length(pool(ctx).blocks) * POOL_BLOCK_SIZE >= POOL_SOFT_CAP[] &&
+    if p.soft_cap > 0 && length(p.blocks) * POOL_BLOCK_SIZE >= p.soft_cap &&
        collect_for_pool!(bq)
         buf = try_reuse_or_bump()
         buf === nothing || return buf

@@ -36,10 +36,12 @@ the current driver.
 function enable_gpu_av(; pool_disabled::Bool=false)
     ENV["LAVA_VALIDATION"] = "1"
     ENV["LAVA_GPU_AV"]     = "1"
-    POOL_DISABLED[] = pool_disabled
     # vk_reset_device! tears down the old instance and lazily creates a new one
-    # via vk_context(), which re-reads the env vars above.
+    # via vk_context(), which re-reads the env vars above. The pool belongs to
+    # that new context, so the flag is set AFTER the reset — before it, it would
+    # have configured the pool that is about to be thrown away.
     vk_reset_device!()
+    pool(vk_context()).disabled = pool_disabled
     ctx = vk_context()
     if !ctx.gpu_assisted
         @warn "Lava.enable_gpu_av: layer accepted but gpu_assisted flag is false — VK_EXT_validation_features may be unavailable on this loader/driver"
@@ -60,8 +62,11 @@ function disable_gpu_av()
     ENV["LAVA_SYNC_VAL"]   = "0"
     ENV["LAVA_BEST"]       = "0"
     ENV["LAVA_DEBUG_PRINTF"] = "0"
-    POOL_DISABLED[] = false
     vk_reset_device!()
+    # A fresh context brings a fresh pool, which is enabled by default — so
+    # "pool re-enabled" is now a property of the reset rather than a flag to
+    # clear. Set it explicitly anyway: the message claims it.
+    pool(vk_context()).disabled = false
     @info "Lava: validation + GPU-AV disabled, pool re-enabled" device=vk_context().device_name
     return nothing
 end
@@ -227,9 +232,9 @@ function activate_all_debugging(; verify::Bool=true, pool_disabled::Bool=true)
     ENV["LAVA_GPU_AV"]     = "1"
     ENV["LAVA_SYNC_VAL"]   = "1"
     ENV["LAVA_BEST"]       = "1"
-    POOL_DISABLED[]        = pool_disabled
     vk_reset_device!()
     ctx = vk_context()
+    pool(ctx).disabled = pool_disabled
     if !ctx.gpu_assisted
         throw(LavaError("activate_all_debugging",
             "validation instance created but gpu_assisted=false — GPU-AV did not attach",

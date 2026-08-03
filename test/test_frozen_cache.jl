@@ -121,7 +121,7 @@ end
         entry = first(filter(f -> endswith(f, "_v$(version).spirv") &&
                                   occursin("frozentest_scale", f), readdir(dir)))
         write(joinpath(dir, entry), rand(UInt8, 64))     # not a serialized kernel
-        empty!(Lava.FROZEN_MEM)
+        empty!(Lava.vk_context().caches.frozen_mem)
         Lava.use_frozen_kernels(version)
         fill!(out, 0.0f0)
         frozentest_scale!(back)(out, a, 4.0f0; ndrange = 256)   # must not throw

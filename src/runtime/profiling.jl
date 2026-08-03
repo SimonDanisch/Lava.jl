@@ -188,9 +188,9 @@ end
 Clear recorded timings and reset the slot counter. Called automatically by
 `with_dispatch_timing(f)`.
 """
-function reset_dispatch_timing!()
+function reset_dispatch_timing!(ctx::VkContext = vk_context())
     empty!(RECORDED_DISPATCHES)
-    vk_context().caches.timestamp_next_slot = 0
+    ctx.caches.timestamp_next_slot = 0
     return nothing
 end
 
@@ -225,16 +225,15 @@ dispatches' timestamps are written to the pool before read-back. Pass
 `false` only if you've already synchronized and want to inspect a partial
 record.
 """
-function dispatch_timing_report(; flush_first::Bool=true)
-    pool = vk_context().caches.timestamp_pool
+function dispatch_timing_report(ctx::VkContext = vk_context(); flush_first::Bool=true)
+    pool = ctx.caches.timestamp_pool
     pool === nothing && return KernelTimingReport[]
     isempty(RECORDED_DISPATCHES) && return KernelTimingReport[]
     if flush_first
-        vk_flush!(vk_context().default_bq)
+        vk_flush!(ctx.default_bq)
     end
-    n_slots = vk_context().caches.timestamp_next_slot
+    n_slots = ctx.caches.timestamp_next_slot
     n_slots == 0 && return KernelTimingReport[]
-    ctx = vk_context()
     raw = Vector{UInt64}(undef, n_slots)
     flags = VK.QUERY_RESULT_64_BIT | VK.QUERY_RESULT_WAIT_BIT
     GC.@preserve raw begin
@@ -242,7 +241,7 @@ function dispatch_timing_report(; flush_first::Bool=true)
                                   sizeof(raw), Ptr{Nothing}(pointer(raw)),
                                   UInt64(sizeof(UInt64)); flags=flags)
     end
-    period = vk_context().caches.timestamp_period_ns
+    period = ctx.caches.timestamp_period_ns
     # Apply the actual ns values back into the records.
     sized = DispatchTiming[]
     for d in RECORDED_DISPATCHES
@@ -304,22 +303,26 @@ function with_dispatch_timing(f)
 end
 
 # Internal: ensure the timestamp pool exists. Called from `vk_dispatch!`.
-function ensure_timestamp_pool!()
-    vk_context().caches.timestamp_pool !== nothing && return vk_context().caches.timestamp_pool
-    ctx = vk_context()
+#
+# Takes the context rather than asking `vk_context()` for it. A query pool is a
+# device-owned handle, and this runs per dispatch: reaching for the global here
+# would put the wrong device's pool on the recording command buffer as surely as
+# the caches did before they became fields.
+function ensure_timestamp_pool!(ctx::VkContext)
+    ctx.caches.timestamp_pool === nothing || return ctx.caches.timestamp_pool
     # Capture the device's timestamp period (ns per tick) once.
     props = VK.get_physical_device_properties(ctx.physical_device)
-    vk_context().caches.timestamp_period_ns = Float64(props.limits.timestamp_period)
+    ctx.caches.timestamp_period_ns = Float64(props.limits.timestamp_period)
     info = VK.QueryPoolCreateInfo(VK.QUERY_TYPE_TIMESTAMP, UInt32(TIMESTAMP_POOL_SIZE[]))
     pool = VK.unwrap(VK.create_query_pool(ctx.device, info))
-    vk_context().caches.timestamp_pool = pool
+    ctx.caches.timestamp_pool = pool
     return pool
 end
 
 # Internal: reset the pool between captures (must happen on a command buffer).
 # Called from `vk_dispatch!` when slot index hits 0.
-function reset_timestamp_pool_on_cb!(cb::VK.CommandBuffer)
-    pool = vk_context().caches.timestamp_pool
+function reset_timestamp_pool_on_cb!(ctx::VkContext, cb::VK.CommandBuffer)
+    pool = ctx.caches.timestamp_pool
     pool === nothing && return
     VK.cmd_reset_query_pool(cb, pool, UInt32(0), UInt32(TIMESTAMP_POOL_SIZE[]))
     return nothing
@@ -327,13 +330,14 @@ end
 
 # Internal: write the START timestamp before a dispatch.  Returns the start
 # slot, or -1 if timing is off or the pool is full.
-function maybe_write_dispatch_start_timestamp!(cb::VK.CommandBuffer, kernel_name::AbstractString;
+function maybe_write_dispatch_start_timestamp!(ctx::VkContext, cb::VK.CommandBuffer,
+                                               kernel_name::AbstractString;
                                                stage = VK.PIPELINE_STAGE_COMPUTE_SHADER_BIT)
     DISPATCH_TIMING_ENABLED[] || return -1
-    pool = ensure_timestamp_pool!()
-    slot = vk_context().caches.timestamp_next_slot
+    pool = ensure_timestamp_pool!(ctx)
+    slot = ctx.caches.timestamp_next_slot
     if slot == 0
-        reset_timestamp_pool_on_cb!(cb)
+        reset_timestamp_pool_on_cb!(ctx, cb)
     end
     if slot + 2 > TIMESTAMP_POOL_SIZE[]
         return -1  # pool full; the END writer also checks this
@@ -363,7 +367,7 @@ function maybe_write_dispatch_start_timestamp!(cb::VK.CommandBuffer, kernel_name
     # trusting a breakdown; if they do not roughly add up, something is not
     # being timestamped.
     VK.cmd_write_timestamp(cb, stage, pool, UInt32(slot))
-    vk_context().caches.timestamp_next_slot = slot + 2
+    ctx.caches.timestamp_next_slot = slot + 2
     push!(RECORDED_DISPATCHES, DispatchTiming(String(kernel_name), slot, 0.0))
     return slot
 end
@@ -382,12 +386,13 @@ end
 # `barrier_fptr` is passed in rather than read from a global: `vkCmdPipelineBarrier`
 # is resolved per device, and a global one records the wrong driver's barrier
 # into the other device's command buffer. See `VkContext.cmd_pipeline_barrier_fptr`.
-function maybe_write_dispatch_end_timestamp!(cb::VK.CommandBuffer, start_slot::Int,
+function maybe_write_dispatch_end_timestamp!(ctx::VkContext, cb::VK.CommandBuffer,
+                                             start_slot::Int,
                                              barrier_fptr::Ptr{Nothing} = C_NULL;
                                              stage = VK.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                              stage_mask::UInt32 = UInt32(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT))
     start_slot < 0 && return
-    pool = vk_context().caches.timestamp_pool
+    pool = ctx.caches.timestamp_pool
     pool === nothing && return
     # The barrier this comment has always described was missing from the code.
     # Without it, consecutive dispatches overlap and each measured interval spans
@@ -416,10 +421,11 @@ function maybe_write_dispatch_end_timestamp!(cb::VK.CommandBuffer, start_slot::I
     return nothing
 end
 
-# Register cleanup so a fresh device session resets timing state.
+# The pool and slot counter are `VkContext` fields, so a reset makes fresh ones
+# and there is nothing to clear. Only the module-level record list and the enable
+# flag — which are genuinely global, being a diagnostic buffer and a toggle —
+# still need it.
 push!(RESET_CALLBACKS, function()
-    vk_context().caches.timestamp_pool = nothing
-    vk_context().caches.timestamp_next_slot = 0
     empty!(RECORDED_DISPATCHES)
     DISPATCH_TIMING_ENABLED[] = false
 end)
