@@ -1166,6 +1166,111 @@ end
 # Memory Operations
 # ================================================================
 
+"""
+    scalar_bit_width(ty) -> Int or nothing
+
+Bit width of an LLVM scalar for the purpose of reconciling a load/store against a
+differently-typed slot. `nothing` for anything that is not a plain integer or float.
+"""
+function scalar_bit_width(ty)
+    ty isa LLVM.IntegerType && return Int(LLVM.width(ty))
+    ty isa LLVM.LLVMHalf    && return 16
+    ty isa LLVM.LLVMFloat   && return 32
+    ty isa LLVM.LLVMDouble  && return 64
+    return nothing
+end
+
+"""
+    emit_reconciled_scalar_load!(state, ptr_id, slot_ty, want_ty, sc) -> id
+
+Load `want_ty` out of a pointer whose pointee is the integer `slot_ty`, without ever
+touching the pointer's type.
+
+Vulkan mandates the Logical addressing model, in which `OpBitcast` may neither produce
+nor consume a pointer (VUID-VkShaderModuleCreateInfo-pCode-08737), and there is no other
+way to name a differently-typed pointer to the same address. A width mismatch between a
+slot and the value read out of it is therefore reconciled on the VALUE side: load the
+slot at its true width, `OpUConvert` to the requested width (SPIR-V defines OpUConvert as
+truncate-or-zero-extend, so this covers narrowing and widening alike), then `OpBitcast`
+the result if the caller wanted a float rather than an integer. A value `OpBitcast` is
+legal; only a pointer one is not.
+
+Widening reads only what the slot actually holds, so it cannot run off the end of the
+field — the bits above the slot were undefined in LLVM's semantics anyway. This is the
+mirror of the store-side reconciliation in `emit_store!`.
+"""
+function emit_reconciled_scalar_load!(state::SPIRVEmitterState, ptr_id::UInt32,
+                                      slot_ty::LLVM.IntegerType, want_ty, sc)
+    slot_w = Int(LLVM.width(slot_ty))
+    slot_spirv = emit_type_int!(state.mod, spirv_int_width(slot_w), UInt32(0))
+    raw = fresh_id!(state.mod)
+    if sc == SC.Workgroup || sc == SC.Function
+        encode_instruction!(state.mod.functions, Op.OpLoad, slot_spirv, raw, ptr_id,
+                            MemOp.Aligned | nonprivate(sc), get_alignment_for_type(slot_ty))
+    else
+        encode_instruction!(state.mod.functions, Op.OpLoad, slot_spirv, raw, ptr_id)
+    end
+
+    # i1 is OpTypeBool, not a 1-bit integer, so it cannot be reached by convert/bitcast.
+    # `trunc iN to i1` keeps the low bit, which is `(x & 1) != 0`.
+    if want_ty isa LLVM.IntegerType && LLVM.width(want_ty) == 1
+        one_id = spirv_int_width(slot_w) >= UInt32(64) ?
+                 emit_constant_u64!(state.mod, UInt64(1)) :
+                 emit_constant_u32!(state.mod, UInt32(1))
+        masked = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpBitwiseAnd, slot_spirv, masked, raw, one_id)
+        zero_id = spirv_int_width(slot_w) >= UInt32(64) ?
+                  emit_constant_u64!(state.mod, UInt64(0)) :
+                  emit_constant_u32!(state.mod, UInt32(0))
+        bool_ty = emit_type_bool!(state.mod)
+        res = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpINotEqual, bool_ty, res, masked, zero_id)
+        return res
+    end
+
+    want_w = scalar_bit_width(want_ty)
+    want_w === nothing && return raw          # caller guarantees this cannot happen
+    want_int_spirv = emit_type_int!(state.mod, spirv_int_width(want_w), UInt32(0))
+    val = raw
+    if spirv_int_width(want_w) != spirv_int_width(slot_w)
+        conv = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpUConvert, want_int_spirv, conv, val)
+        val = conv
+    end
+    if !(want_ty isa LLVM.IntegerType)
+        want_spirv = map_type!(state.type_ctx, want_ty)
+        bc = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpBitcast, want_spirv, bc, val)
+        val = bc
+    end
+    return val
+end
+
+"""
+    finish_reconciled_load!(state, inst, val_id, actual_load_ty, load_ty, result_ty, needs_bitcast)
+
+Record a value produced by one of the reconciled load paths, applying the same
+loaded-type → requested-type conversion the ordinary `OpLoad` tail applies. Kept in step
+with that tail deliberately: a reconciled load that skipped it would leave the value at
+`actual_load_ty` where the rest of the function expects `load_ty`.
+"""
+function finish_reconciled_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst, val_id::UInt32,
+                                 actual_load_ty, load_ty, result_ty::UInt32, needs_bitcast::Bool)
+    if !needs_bitcast
+        state.value_map[inst] = val_id
+        return
+    end
+    result_id = fresh_id!(state.mod)
+    if actual_load_ty isa LLVM.PointerType && load_ty isa LLVM.IntegerType
+        encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, result_ty, result_id, val_id)
+    elseif actual_load_ty isa LLVM.IntegerType && load_ty isa LLVM.PointerType
+        encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ty, result_id, val_id)
+    else
+        encode_instruction!(state.mod.functions, Op.OpBitcast, result_ty, result_id, val_id)
+    end
+    state.value_map[inst] = result_id
+end
+
 function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
     ptr = LLVM.operands(inst)[1]
     load_ty = LLVM.value_type(inst)
@@ -1325,58 +1430,54 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                     load_as_int_then_convert_to_ptr = true
                     spirv_load_ty = emit_type_int!(state.mod, UInt32(64), UInt32(0))
                 elseif eff_load_ty != pointee_ty && pointee_ty isa LLVM.IntegerType &&
-                       (eff_load_ty isa LLVM.IntegerType || eff_load_ty isa LLVM.FloatingPointType)
-                    # Choose between widening and narrowing strategies.
-                    pointee_w = LLVM.width(pointee_ty)
-                    eff_w = eff_load_ty isa LLVM.IntegerType ? LLVM.width(eff_load_ty) :
-                            eff_load_ty isa LLVM.LLVMHalf   ? 16 :
-                            eff_load_ty isa LLVM.LLVMFloat  ? 32 :
-                            eff_load_ty isa LLVM.LLVMDouble ? 64 : pointee_w
-                    if eff_w > pointee_w && eff_load_ty isa LLVM.IntegerType
-                        # Widening load (e.g. load i32 from a 1-byte uchar field
-                        # plus padding).  Bitcasting the pointer to a wider type
-                        # would read past the field's actual size.  Some drivers
-                        # (RADV/ACO) reject this with an "Unimplemented intrinsic
-                        # @store_deref" assertion at pipeline-creation time.
-                        # Instead, load the pointee's true size and zero-extend
-                        # to the requested width — padding bytes were already
-                        # undefined, so zero-extension matches LLVM's semantics.
-                        small_w = UInt32(spirv_int_width(pointee_w))
-                        small_ty = emit_type_int!(state.mod, small_w, UInt32(0))
-                        small_id = fresh_id!(state.mod)
-                        small_align = get_alignment_for_type(pointee_ty)
-                        encode_instruction!(state.mod.functions, Op.OpLoad, small_ty, small_id, ptr_id, UInt32(0x02), small_align)
-                        wide_w = UInt32(spirv_int_width(eff_w))
-                        wide_ty = emit_type_int!(state.mod, wide_w, UInt32(0))
-                        ext_id = fresh_id!(state.mod)
-                        encode_instruction!(state.mod.functions, Op.OpUConvert, wide_ty, ext_id, small_id)
-                        state.value_map[inst] = ext_id
-                        return
-                    end
-                    # Narrowing or equal-width path: bitcast pointer to match
-                    # load type.  Covers int-int width mismatches and
-                    # float/double loads from [N x i64]-packed MVector allocas.
-                    val_spirv_ty = map_type!(state.type_ctx, eff_load_ty)
-                    new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
-                    cast_id = fresh_id!(state.mod)
-                    encode_instruction!(state.mod.functions, Op.OpBitcast, new_ptr_ty, cast_id, ptr_id)
-                    ptr_id = cast_id
+                       (eff_load_ty isa LLVM.IntegerType || eff_load_ty isa LLVM.FloatingPointType) &&
+                       !needs_ptr_bitcast
+                    # The slot is an integer and the load wants a different width, or the
+                    # same width under a different type (float/double out of an
+                    # [N x i64]-packed MVector alloca).
+                    #
+                    # This used to OpBitcast the POINTER whenever the load was narrower,
+                    # which Vulkan forbids on a logical pointer:
+                    # "Instruction may not have a logical pointer operand"
+                    # (VUID-VkShaderModuleCreateInfo-pCode-08737). The widening case was
+                    # already handled value-side, for the separate reason that a wider
+                    # pointer reads past the field; `emit_reconciled_scalar_load!` now does
+                    # both directions, so narrowing gets the legal treatment too and the
+                    # two no longer have to agree by hand.
+                    val_id = emit_reconciled_scalar_load!(state, ptr_id, pointee_ty, eff_load_ty, sc)
+                    finish_reconciled_load!(state, inst, val_id, actual_load_ty, load_ty,
+                                            result_ty, needs_bitcast)
+                    return
                 elseif eff_load_ty != pointee_ty && pointee_ty isa LLVM.ArrayType &&
                        !(eff_load_ty isa LLVM.PointerType) && !(eff_load_ty isa LLVM.ArrayType) &&
-                       !(eff_load_ty isa LLVM.StructType)
-                    # Loading a scalar (int / float / vector) directly from an
-                    # alloca pointer typed as an array — happens when SROA folds
-                    # the leading `gep T, ptr %alloca, 0` away and leaves a bare
-                    # `load T, ptr %alloca`.  Without intervention the emitter
-                    # produces `OpLoad %scalar %alloca`, which spirv-val rejects
-                    # because the pointer's pointee type is the array.
-                    # Bitcast the pointer to a scalar pointer of the load type
-                    # (matches the existing int-int / float/int branches above).
-                    val_spirv_ty = map_type!(state.type_ctx, eff_load_ty)
-                    new_ptr_ty = map_pointer_type!(state.type_ctx, val_spirv_ty, sc)
-                    cast_id = fresh_id!(state.mod)
-                    encode_instruction!(state.mod.functions, Op.OpBitcast, new_ptr_ty, cast_id, ptr_id)
-                    ptr_id = cast_id
+                       !(eff_load_ty isa LLVM.StructType) && !needs_ptr_bitcast &&
+                       scalar_bit_width(eff_load_ty) !== nothing
+                    # Loading a scalar directly from an alloca pointer typed as an array —
+                    # SROA folded the leading `gep T, ptr %alloca, 0` away and left a bare
+                    # `load T, ptr %alloca`.
+                    #
+                    # DRILL, do not bitcast. `OpAccessChain ptr, 0` reaches the first
+                    # element and is the one legal way to retype a logical pointer;
+                    # bitcasting it is not (see the branch above). If the element is still
+                    # a differently-sized integer, reconcile that on the value side.
+                    #
+                    # A vector load cannot be served from one drilled element, so it is
+                    # left alone rather than silently given the wrong address.
+                    elem_ty = LLVM.eltype(pointee_ty)
+                    elem_spirv = map_type!(state.type_ctx, elem_ty)
+                    elem_ptr_ty = map_pointer_type!(state.type_ctx, elem_spirv, sc)
+                    zero_id = emit_constant_u32!(state.mod, UInt32(0))
+                    drill = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpAccessChain, elem_ptr_ty, drill, ptr_id, zero_id)
+                    ptr_id = drill
+                    if elem_ty isa LLVM.IntegerType && elem_ty != eff_load_ty
+                        val_id = emit_reconciled_scalar_load!(state, ptr_id, elem_ty, eff_load_ty, sc)
+                        finish_reconciled_load!(state, inst, val_id, actual_load_ty, load_ty,
+                                                result_ty, needs_bitcast)
+                        return
+                    end
+                    # Element type already matches the load; the ordinary OpLoad below
+                    # now has a correctly-typed pointer.
                 end
             end
         end
