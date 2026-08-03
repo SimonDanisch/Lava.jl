@@ -1334,9 +1334,14 @@ function flush!(bq::BatchQueue, device::Vulkan.Device)
                             "(counter stuck at $(query_timeline(bq)), " *
                             "$(length(bq.in_flight)) batch(es) in flight)",
                             "The GPU faulted — a dispatch wrote out of bounds or hung. " *
-                            "Raising `bq.flush_timeout_ns` cannot help. Re-run with " *
-                            "`LAVA_GPU_AV=1` to find the faulting dispatch, then " *
-                            "`Lava.vk_reset_device!()` to reinitialize."))
+                            "Raising `bq.flush_timeout_ns` cannot help; call " *
+                            "`Lava.vk_reset_device!()` to reinitialize. To find the " *
+                            "dispatch: `journalctl -k` for an NVIDIA Xid names the fault " *
+                            "class, and `LAVA_VALIDATION=1 LAVA_GPU_AV=1 " *
+                            "LAVA_GPU_AV_SAFE=1` instruments the shaders — but note " *
+                            "GPU-AV can itself crash on a workload that kills the " *
+                            "device (measured: it does on MatAnyone's step, Safe Mode " *
+                            "included), so narrow with `LAVA_GPU_AV_SHADERS=` first."))
         end
         if budget != UInt64(0) && waited >= budget
             throw(LavaError("vkWaitSemaphores",

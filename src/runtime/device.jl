@@ -913,6 +913,23 @@ function init_vulkan!(; select = pick_physical_device)
     want_gpu_av  = want_gpu_av && !want_printf   # printf takes precedence
     want_sync_val= get(ENV, "LAVA_SYNC_VAL","0") != "0"
     want_best    = get(ENV, "LAVA_BEST",    "0") != "0"
+    # Safe Mode exists BECAUSE GPU-AV crashes. Khronos' own docs: "Safe Mode will
+    # have GPU-AV try and prevent crashes, but will be much slower to validate,
+    # and when using Safe Mode, selective shader instrumentation is recommended
+    # to only instrument the shaders/pipelines causing issues."
+    # We shipped GPU-AV with neither, which is why reaching for it to debug
+    # something has mostly produced a SIGSEGV instead of a report.
+    want_gpuav_safe = get(ENV, "LAVA_GPU_AV_SAFE", "0") != "0"
+    # Comma-separated shader names to instrument, e.g. LAVA_GPU_AV_SHADERS=step_kernel.
+    # Empty instruments everything, which on ~99 kernels is both slow and the
+    # configuration most likely to fall over.
+    gpuav_shaders = split(get(ENV, "LAVA_GPU_AV_SHADERS", ""), ',', keepempty = false)
+
+    # Asking for GPU-AV and silently not getting it wastes a debugging session:
+    # a clean run then means "the instrument was off", not "no fault found".
+    if get(ENV, "LAVA_GPU_AV", "0") != "0" && !want_gpu_av
+        @warn "LAVA_GPU_AV is set but GPU-AV will NOT be enabled: LAVA_DEBUG_PRINTF takes precedence (both instrument shaders)."
+    end
     validation_features_reqs = Vulkan.ValidationFeatureEnableEXT[]
     if want_printf
         push!(validation_features_reqs,
@@ -935,11 +952,31 @@ function init_vulkan!(; select = pick_physical_device)
     if !isempty(validation_features_reqs) && has_validation && "VK_EXT_validation_features" in ext_names
         push!(inst_extensions, "VK_EXT_validation_features")
         validation_features = Vulkan.ValidationFeaturesEXT(validation_features_reqs, [])
+        # `VkValidationFeaturesEXT` cannot express Safe Mode or selective
+        # instrumentation — those are `VK_EXT_layer_settings` only, which is why
+        # they were missing. Chain the settings struct in front when either is
+        # asked for; the layer reads both.
+        nextchain = validation_features
+        if want_gpu_av && (want_gpuav_safe || !isempty(gpuav_shaders)) &&
+           "VK_EXT_layer_settings" in ext_names
+            push!(inst_extensions, "VK_EXT_layer_settings")
+            settings = Vulkan.LayerSettingEXT[]
+            if want_gpuav_safe
+                push!(settings, layer_setting_bool("gpuav_safe_mode", true))
+            end
+            if !isempty(gpuav_shaders)
+                push!(settings, layer_setting_bool("gpuav_select_instrumented_shaders", true))
+            end
+            nextchain = Vulkan.LayerSettingsCreateInfoEXT(settings; next = validation_features)
+            @info "GPU-AV layer settings" safe_mode=want_gpuav_safe shaders=gpuav_shaders
+        elseif want_gpu_av && (want_gpuav_safe || !isempty(gpuav_shaders))
+            @warn "GPU-AV Safe Mode / selective instrumentation requested but VK_EXT_layer_settings is not available; GPU-AV runs unconfigured and may crash."
+        end
         instance = Vulkan.Instance(
             layers,
             inst_extensions;
             application_info=app_info,
-            next=validation_features
+            next=nextchain
         )
         gpu_assisted = want_gpu_av
         sync_val     = want_sync_val
@@ -1728,6 +1765,26 @@ function drain_validation_messages!(ctx::Union{Nothing,VkContext} = VK_CONTEXT_R
     end
     r.read = write_idx
     return nothing
+end
+
+"""
+    layer_setting_bool(name, value) -> Vulkan.LayerSettingEXT
+
+One `VK_EXT_layer_settings` boolean for the Khronos validation layer.
+
+`VkLayerSettingEXT` takes a raw `pValues` pointer, so the storage has to outlive
+the `vkCreateInstance` call that reads it. `LAYER_SETTING_STORAGE` keeps every
+value alive for the process — a handful of bytes, set once at instance creation,
+and the alternative is a pointer into a collected `Ref`.
+"""
+const LAYER_SETTING_STORAGE = Any[]
+
+function layer_setting_bool(name::AbstractString, value::Bool)
+    r = Ref(Vulkan.VkBool32(value))
+    push!(LAYER_SETTING_STORAGE, r)
+    Vulkan.LayerSettingEXT("VK_LAYER_KHRONOS_validation", String(name),
+                           Vulkan.LAYER_SETTING_TYPE_BOOL32_EXT,
+                           Base.unsafe_convert(Ptr{Nothing}, Base.pointer_from_objref(r)))
 end
 
 function setup_debug_messenger(instance::Vulkan.Instance, ring::ValidationRing)
