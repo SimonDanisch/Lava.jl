@@ -771,20 +771,7 @@ function vk_reset_device!()
     # Persist the VkPipelineCache before tearing the device down so the
     # next session can skip AMDVLK's SPIR-V → ISA recompile.
     let old = VK_CONTEXT_REF[]
-        if old !== nothing
-            save_pipeline_cache!(old)
-            # RETIRE it. The comment below assumed `device_lost` was already true,
-            # which holds only when the reset was TRIGGERED by a DEVICE_LOST —
-            # something else set the flag on the way in. A proactive
-            # `vk_reset_device!` (test_pipeline_cache_no_compile.jl does exactly
-            # this) leaves it false, and every pre-reset VkManagedBuffer still
-            # carries `last_write = (old_bq, val)`. When GC later finalizes one,
-            # vk_free! (memory.jl:754) checks `device_lost(bq.ctx)`, reads false,
-            # and calls query_timeline -> vkGetSemaphoreCounterValue on a
-            # destroyed VkDevice. SIGSEGV, from a finalizer, at whatever point GC
-            # happened to run — which is why it looked like a floating race.
-            mark_device_lost!(old)
-        end
+        old === nothing || save_pipeline_cache!(old)
     end
     # Retire the old context BEFORE dropping it. Pre-reset `VkManagedBuffer`s
     # hold a strong ref to it, and their finalizers gate every Vulkan call on
