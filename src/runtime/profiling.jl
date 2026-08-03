@@ -152,7 +152,7 @@ end
 
 """Per-dispatch timing record. One entry per `vk_dispatch!` call while timing is on."""
 struct DispatchTiming
-    kernel_name::String        # from `LAST_DISPATCH_INFO[]` at dispatch time
+    kernel_name::String        # from `bq.last_dispatch_info` at dispatch time
     slot::Int                  # query pool slot of the START timestamp
     gpu_ns::Float64            # filled in on read-back; 0.0 during recording
 end
@@ -164,7 +164,6 @@ const TIMESTAMP_POOL_SIZE = Ref(MAX_DISPATCH_LOG * 2)
 # `timestamp_pool`, `timestamp_next_slot` and `timestamp_period_ns` are
 # `VkContext` fields — a query pool is a device-owned handle, and holding one
 # in a module `Ref` is the defect that corrupted the memory pool next door.
-const RECORDED_DISPATCHES = DispatchTiming[]
 
 """
     enable_dispatch_timing!(enable::Bool=true)
@@ -188,7 +187,7 @@ Clear recorded timings and reset the slot counter. Called automatically by
 `with_dispatch_timing(f)`.
 """
 function reset_dispatch_timing!(ctx::VkContext = vk_context())
-    empty!(RECORDED_DISPATCHES)
+    empty!(ctx.caches.recorded_dispatches)
     ctx.caches.timestamp_next_slot = 0
     return nothing
 end
@@ -227,7 +226,7 @@ record.
 function dispatch_timing_report(ctx::VkContext = vk_context(); flush_first::Bool=true)
     pool = ctx.caches.timestamp_pool
     pool === nothing && return KernelTimingReport[]
-    isempty(RECORDED_DISPATCHES) && return KernelTimingReport[]
+    isempty(ctx.caches.recorded_dispatches) && return KernelTimingReport[]
     if flush_first
         vk_flush!(ctx.default_bq)
     end
@@ -243,7 +242,7 @@ function dispatch_timing_report(ctx::VkContext = vk_context(); flush_first::Bool
     period = ctx.caches.timestamp_period_ns
     # Apply the actual ns values back into the records.
     sized = DispatchTiming[]
-    for d in RECORDED_DISPATCHES
+    for d in ctx.caches.recorded_dispatches::Vector{Any}
         s_start = d.slot
         s_end = d.slot + 1
         s_end < n_slots || continue   # slot wrap-around safety
@@ -286,7 +285,7 @@ end
 function with_dispatch_timing(f, ctx::VkContext = vk_context())
     d = ctx.diag
     prev_timing = d.dispatch_timing
-    # `ka_launch!` only writes `LAST_DISPATCH_INFO[]` when dispatch logging is on
+    # `ka_launch!` only writes `bq.last_dispatch_info` when dispatch logging is on
     # (it's behind a flag for the production hot path).  We need that name to
     # tag timing records, so flip dispatch logging on for the duration too.
     prev_logging = d.dispatch_logging
@@ -368,7 +367,7 @@ function maybe_write_dispatch_start_timestamp!(ctx::VkContext, cb::VK.CommandBuf
     # being timestamped.
     VK.cmd_write_timestamp(cb, stage, pool, UInt32(slot))
     ctx.caches.timestamp_next_slot = slot + 2
-    push!(RECORDED_DISPATCHES, DispatchTiming(String(kernel_name), slot, 0.0))
+    push!(ctx.caches.recorded_dispatches, DispatchTiming(String(kernel_name), slot, 0.0))
     return slot
 end
 
@@ -425,7 +424,6 @@ end
 # so a reset makes fresh ones and there is nothing to clear. Only the record list
 # is genuinely module-level — it is a host-side diagnostic buffer, not device
 # state — and dropping it is the whole callback.
-push!(RESET_CALLBACKS, () -> empty!(RECORDED_DISPATCHES))
 
 # ============================================================================
 # 3. VK_KHR_pipeline_executable_properties — driver-side stats

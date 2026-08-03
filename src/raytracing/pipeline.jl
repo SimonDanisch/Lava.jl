@@ -258,7 +258,7 @@ Record an RT trace dispatch into the batched command buffer.
 function rt_dispatch!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::LavaTLAS,
                       push_bda::UInt64, width::Integer, height::Integer;
                       depth::Integer=1)
-    LAST_DISPATCH_INFO[] = "rt_trace w=$width h=$height"
+    bq.last_dispatch_info = "rt_trace w=$width h=$height"
 
     record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
@@ -280,7 +280,7 @@ function rt_dispatch!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::LavaTLAS,
         # that is where nearly all the GPU time goes, so a report built only
         # from `cmd_dispatch` accounts for a small fraction of the frame and
         # invites the wrong conclusion about what is slow.
-        ts_slot = maybe_write_dispatch_start_timestamp!(bq.ctx::VkContext, cmd, LAST_DISPATCH_INFO[];
+        ts_slot = maybe_write_dispatch_start_timestamp!(bq.ctx::VkContext, cmd, bq.last_dispatch_info;
                                                  stage = Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR)
         Vulkan.cmd_trace_rays_khr(cmd,
             pipeline.raygen_region, pipeline.miss_region,
@@ -300,7 +300,7 @@ VkTraceRaysIndirectCommandKHR (3×UInt32), written by a previous GPU kernel.
 """
 function rt_dispatch_indirect!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::LavaTLAS,
                                push_bda::UInt64, indirect::LavaArray{UInt32,1})
-    LAST_DISPATCH_INFO[] = "rt_indirect"
+    bq.last_dispatch_info = "rt_indirect"
 
     record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
@@ -323,7 +323,7 @@ function rt_dispatch_indirect!(bq::BatchQueue, pipeline::LavaRTPipeline, tlas::L
 
         # bda_address(indirect) includes the view's element offset, so the
         # address we pass to Vulkan points exactly at the 3-UInt32 command.
-        ts_slot = maybe_write_dispatch_start_timestamp!(bq.ctx::VkContext, cmd, LAST_DISPATCH_INFO[];
+        ts_slot = maybe_write_dispatch_start_timestamp!(bq.ctx::VkContext, cmd, bq.last_dispatch_info;
                                                  stage = Vulkan.PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR)
         Vulkan.cmd_trace_rays_indirect_khr(cmd,
             pipeline.raygen_region, pipeline.miss_region,

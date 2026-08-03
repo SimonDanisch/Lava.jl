@@ -15,7 +15,7 @@ checked against the dividing path they replaced rather than against a reference
 computed the same way.
 """
 
-using Test, Lava, KernelAbstractions
+using Test, Lava, GPUArrays, KernelAbstractions
 const KA = KernelAbstractions
 
 # Every extent SAM 2 decomposes by, plus powers of two, primes, and the awkward
@@ -64,8 +64,7 @@ end
 
     @testset "kernels agree with the dividing path" begin
         backend = LavaBackend()
-        old = Lava.BROADCAST_FASTDIV[]
-        try
+        let
             # Ranks 2 to 7, the encoder's two permutation families, extents that
             # are not powers of two, and a length that is not a multiple of the
             # workgroup — the unrolled launch has a ragged tail and the index of
@@ -83,10 +82,14 @@ end
                 dsz = ntuple(i -> sz[perm[i]], length(sz))
                 want = permutedims(host, perm)
                 got = map((false, true)) do fd
-                    Lava.BROADCAST_FASTDIV[] = fd
                     d = KA.allocate(backend, Float32, dsz...)
                     fill!(d, 0.0f0)
-                    d .= PermutedDimsArray(a, perm)
+                    # Driving `_copyto!` directly is what lets both index paths
+                    # run without a process-wide switch: `d .= x` lowers to
+                    # exactly this call with the default.
+                    bc = Broadcast.instantiate(
+                             Broadcast.broadcasted(identity, PermutedDimsArray(a, perm)))
+                    GPUArrays._copyto!(d, bc; fastdiv = fd)
                     KA.synchronize(backend)
                     Array(d)
                 end
@@ -94,8 +97,6 @@ end
                 @test got[2] == want          # multiplying path
                 @test got[1] == got[2]
             end
-        finally
-            Lava.BROADCAST_FASTDIV[] = old
         end
     end
 end

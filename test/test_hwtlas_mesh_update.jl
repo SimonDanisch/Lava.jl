@@ -54,8 +54,8 @@ end
 
 """Snapshot GPU resource counters."""
 function snapshot_state_hw()
-    gpu_bytes  = Lava.GPU_LIVE_BYTES[]
-    live_bufs  = length(Lava.LIVE_BUFFERS)
+    gpu_bytes  = Lava.gpu_live_bytes()
+    live_bufs  = Lava.live_buffer_count()
     pool_blocks = length(Lava.pool(Lava.vk_context()).blocks)
     return (gpu_bytes=gpu_bytes, live_bufs=live_bufs, pool_blocks=pool_blocks)
 end

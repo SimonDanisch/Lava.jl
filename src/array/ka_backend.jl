@@ -355,37 +355,35 @@ end
     return acc
 end
 
-# Cached per-kernel iteration plan. Key = (typeof(obj), ndrange, workgroupsize).
-# The plan only depends on those — `typeof(obj)` carries the F type plus KA's
-# static NDRange / WG-size type parameters, so two Kernel instances with the same
-# shape share the plan. Built lazily on first launch.
-struct _IterPlan{Ctx}
-    ka_ctx::Ctx
-    block_dims::NTuple{3, Int}
-    ws_3d::NTuple{3, Int}
-    nblocks::Int
-end
-const KERNEL_ITER_PLAN_CACHE = Dict{Any, _IterPlan}()
-
+# Cached per-kernel iteration plan, on `vkctx.caches` — see `IterPlan`. Key =
+# (typeof(obj), ndrange, workgroupsize); `typeof(obj)` carries the F type plus
+# KA's static NDRange / WG-size type parameters, so two Kernel instances with the
+# same shape share the plan. Built lazily on first launch.
+#
+# The device is not in the key and does not need to be, now that the cache
+# belongs to one. As a process-wide dict it was a wrong-answer path: `block_dims`
+# is `pad_to_3d(vkctx, …)` over the device's `max_wg_dims`, so the first device
+# to launch a given kernel shape decided the block grid for every device after.
 function get_or_build_iter_plan(obj::KA.Kernel{LavaBackend}, ndrange, workgroupsize,
                                 vkctx::VkContext)
     key = (typeof(obj), ndrange, workgroupsize)
-    plan = get(KERNEL_ITER_PLAN_CACHE, key, nothing)
-    plan === nothing || return plan::_IterPlan
+    cache = vkctx.caches.iterplans
+    plan = get(cache, key, nothing)
+    plan === nothing || return plan::IterPlan
 
     ndr_canon, _ws, iterspace, _dyn = KA.launch_config(obj, ndrange, workgroupsize)
     ka_ctx  = KA.mkcontext(obj, ndr_canon, iterspace)
     blocks  = KA.blocks(iterspace)
     nblocks = length(blocks)
     if nblocks == 0
-        new_plan = _IterPlan(ka_ctx, (0, 0, 0), (0, 0, 0), 0)
+        new_plan = IterPlan(ka_ctx, (0, 0, 0), (0, 0, 0), 0)
     else
         block_dims = pad_to_3d(vkctx, size(blocks))
         nthreads   = length(KA.workitems(iterspace))
         ws_3d      = (nthreads, 1, 1)
-        new_plan   = _IterPlan(ka_ctx, block_dims, ws_3d, nblocks)
+        new_plan   = IterPlan(ka_ctx, block_dims, ws_3d, nblocks)
     end
-    KERNEL_ITER_PLAN_CACHE[key] = new_plan
+    cache[key] = new_plan
     return new_plan
 end
 
@@ -406,21 +404,18 @@ analysis is then paid once and every `replay!` gets the shorter command buffer
 for free. On the MatAnyone step barriers are 3.35 ms of an 11.07 ms replay.
 """
 
-# Flat [lo₁,hi₁,lo₂,hi₂,…] of everything touched since the last barrier, and a
-# scratch list for the dispatch being recorded. Reused, never reallocated.
-const TOUCHED_RANGES = UInt64[]
-const DISPATCH_RANGES = UInt64[]
-
-push!(RESET_CALLBACKS, function()
-    empty!(TOUCHED_RANGES)
-    empty!(DISPATCH_RANGES)
-end)
+# `bq.touched_ranges` is a flat [lo₁,hi₁,lo₂,hi₂,…] of everything touched since
+# the last barrier on that queue, and `bq.dispatch_ranges` is scratch for the
+# dispatch being recorded. Both live on the queue: the ranges describe one
+# command buffer's contents, so a second queue recording concurrently would
+# otherwise merge its writes into the first queue's set and let it elide a
+# barrier it needed.
 
 """Reset the elision state — call whenever the queue is known to be drained."""
-@inline reset_barrier_elision!() = (empty!(TOUCHED_RANGES); nothing)
+@inline reset_barrier_elision!(bq::BatchQueue) = (empty!(bq.touched_ranges); nothing)
 
 """
-    poison_barrier_elision!()
+    poison_barrier_elision!(bq)
 
 Record that something touched memory we cannot enumerate, so nothing may be
 elided until a barrier clears it.
@@ -436,27 +431,26 @@ plausible error a race gives you.
 Modelled as one range covering the whole address space: every subsequent
 dispatch overlaps it, takes its barrier, and clears it — no special cases.
 """
-@inline function poison_barrier_elision!()
-    empty!(TOUCHED_RANGES)
-    push!(TOUCHED_RANGES, UInt64(0))
-    push!(TOUCHED_RANGES, typemax(UInt64))
+@inline function poison_barrier_elision!(bq::BatchQueue)
+    touched = bq.touched_ranges
+    empty!(touched)
+    push!(touched, UInt64(0))
+    push!(touched, typemax(UInt64))
     nothing
 end
 
-"""Set by the KA launch path for the dispatch it is about to record."""
-const RANGES_DECLARED = Ref{Bool}(false)
-
 """
-True when `new` overlaps anything in `TOUCHED_RANGES`. On overlap the caller
-emits a barrier and `TOUCHED_RANGES` restarts from `new`; otherwise `new` is
-merged in and the barrier is skipped.
+True when `new` overlaps anything in `bq.touched_ranges`. On overlap the caller
+emits a barrier and the set restarts from `new`; otherwise `new` is merged in and
+the barrier is skipped.
 """
-function barrier_needed!(new::Vector{UInt64})
+function barrier_needed!(bq::BatchQueue, new::Vector{UInt64})
+    touched = bq.touched_ranges
     hit = false
     @inbounds for i in 1:2:length(new)
         lo, hi = new[i], new[i+1]
-        for j in 1:2:length(TOUCHED_RANGES)
-            if lo < TOUCHED_RANGES[j+1] && TOUCHED_RANGES[j] < hi
+        for j in 1:2:length(touched)
+            if lo < touched[j+1] && touched[j] < hi
                 hit = true
                 break
             end
@@ -466,11 +460,11 @@ function barrier_needed!(new::Vector{UInt64})
     # The set only clears when a barrier fires, so a long run of elided
     # dispatches would make this scan quadratic. Past the cap, force a barrier
     # and start over — conservative, so it can only cost performance.
-    if hit || length(TOUCHED_RANGES) > 512
-        empty!(TOUCHED_RANGES)
+    if hit || length(touched) > 512
+        empty!(touched)
         hit = true
     end
-    append!(TOUCHED_RANGES, new)
+    append!(touched, new)
     hit
 end
 
@@ -600,11 +594,12 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     # covered. Decided here rather than in `record_dispatch!` because this is the
     # last point that still has the pre-adapt arguments.
     if bq.barrier_elision
-        empty!(DISPATCH_RANGES)
-        range_leaves!(DISPATCH_RANGES, obj.f)
-        range_leaves!(DISPATCH_RANGES, args)
-        bq.next_skip_barrier = !barrier_needed!(DISPATCH_RANGES)
-        RANGES_DECLARED[] = true
+        ranges = bq.dispatch_ranges
+        empty!(ranges)
+        range_leaves!(ranges, obj.f)
+        range_leaves!(ranges, args)
+        bq.next_skip_barrier = !barrier_needed!(bq, ranges)
+        bq.ranges_declared = true
     end
     adaptor = LavaAdaptor(batch)
     converted_f = Adapt.adapt(adaptor, obj.f)
@@ -688,7 +683,6 @@ end
 """
 Internal launch function for KA kernels. Compiles and dispatches the GPU function.
 """
-const DBG_LAUNCH_COUNT = Ref(0)
 
 # Per device: a `LaunchPlan` holds a `VkPipeline` (GUARDRAILS §8). Same shape as
 # `LINKED_KERNEL_CACHE` — an outer dict keyed by `ctx.id`, so the inner one keeps
@@ -732,8 +726,6 @@ end
 function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple,
                     block_dims::NTuple{3,Int}, workgroup_size::NTuple{3,Int},
                     tlas=nothing)  # positional, Nothing default — hot path
-    DBG_LAUNCH_COUNT[] += 1
-
     # When `tlas` was auto-discovered from kernel args (e.g. an HWAdaptedAccel
     # was passed), enable ray_query so the SPIR-V emitter binds the TLAS
     # descriptor and accepts OpRayQueryInitializeKHR / Proceed / Get*KHR.
@@ -752,7 +744,7 @@ function ka_launch!(bq::BatchQueue, @nospecialize(f), all_args::Tuple,
 
     # Dispatch with N-D block grid (preserves KA's block dimensions)
     if (bq.ctx::VkContext).diag.dispatch_logging
-        LAST_DISPATCH_INFO[] = Base.invokelatest(dispatch_log_string, "ka f=",
+        bq.last_dispatch_info = Base.invokelatest(dispatch_log_string, "ka f=",
                                    dispatch_name(f, all_args), " groups=", block_dims)::String
     end
     vk_dispatch!(bq, plan.pipeline, arg_buf.address, block_dims, tlas)
@@ -901,10 +893,10 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
     indirect_view = get_indirect_buffer(bq)
 
     if (bq.ctx::VkContext).diag.dispatch_logging
-        LAST_DISPATCH_INFO[] = Base.invokelatest(dispatch_log_string, "indirect f=",
+        bq.last_dispatch_info = Base.invokelatest(dispatch_log_string, "indirect f=",
                                    dispatch_name(obj.f, all_args))::String
     end
-    deferred = DEFERRED_INDIRECT[]
+    deferred = bq.deferred_indirect
     if deferred !== nothing
         # Inside `concurrent_indirect_group`: record NOTHING here — both the
         # prepare (fused into one multi-prepare dispatch) and the indirect

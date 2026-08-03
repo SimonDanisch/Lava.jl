@@ -164,14 +164,12 @@ shape-driven choice. A `Ref` so a comparison runs interleaved in one session on
 one set of buffers, which is the only form of it that means anything on a card
 whose clock drifts during the run.
 """
-const GEMM_TILING = Ref{Union{Nothing,GemmTiling}}(nothing)
 
 """
     GEMM_STAGED[]
 
 Use the workgroup-staged kernel where the shape allows it.
 """
-const GEMM_STAGED = Ref(true)
 
 """
     gemm_tiling(M, N, K) -> GemmTiling | nothing
@@ -216,8 +214,12 @@ tiling in favour of one that was measured, so its failure mode is a missed win.
 """
 @inline gemm_aliasing(c::GemmTiling, K::Int) = !ispow2(gemm_bm(c)) && K % 256 == 0
 
-@inline function gemm_tiling(M::Int, N::Int, K::Int)
-    forced = GEMM_TILING[]
+# `coopmat_gemm!` and `staged_gemm_tiling` both default to this and have to
+# agree, so it gets a name. `vec2` and `narrow_ok` are read at exactly one call
+# site each and are written as literals there instead.
+const GEMM_STAGED_DEFAULT = true
+
+@inline function gemm_tiling(M::Int, N::Int, K::Int; forced = nothing)
     # A forced tiling still has to divide the shape. Skipping that check makes a
     # benchmark quietly lie: a 288-row product forced onto a 64-row block computes
     # 256 rows, reads past the operands for the rest, and reports a number for
@@ -231,8 +233,9 @@ tiling in favour of one that was measured, so its failure mode is a missed win.
 end
 
 """Which tiling this call may use, or `nothing` for the register-blocked kernel."""
-@inline function staged_gemm_tiling(M::Int, N::Int, K::Int, nbatch::Int, splitk::Int)
-    GEMM_STAGED[] && nbatch == 1 || return nothing
+@inline function staged_gemm_tiling(M::Int, N::Int, K::Int, nbatch::Int, splitk::Int;
+                                    staged::Bool = GEMM_STAGED_DEFAULT, tiling = nothing)
+    staged && nbatch == 1 || return nothing
     # **The staged kernel does not split K** — it walks the whole of it and writes
     # one plane. If the caller's plan says otherwise it has allocated `splitk`
     # partial planes and will sum them, so the other planes' stale scratch lands
@@ -240,7 +243,7 @@ end
     # shapes it was measured on because they all choose `splitk == 1`; at
     # 64x64x64 the plan picks 4 and the answer comes back 0.83 relative error.
     splitk == 1 || return nothing
-    c = gemm_tiling(M, N, K)
+    c = gemm_tiling(M, N, K; forced = tiling)
     c === nothing && return nothing
     return haskey(GEMM_STAGED_KERNELS, c) ? c : nothing
 end
@@ -539,7 +542,6 @@ A `Ref` because the only measurement worth having is the scalar and vec2 kernels
 interleaved in one session on one set of buffers. Both are generated; this picks
 which runs. A tiling with no vec2 twin falls back to its scalar kernel.
 """
-const GEMM_VEC2 = Ref(true)
 
 """`vec2`-staged twins of `GEMM_STAGED_KERNELS`, keyed the same way."""
 const GEMM_STAGED_V2_KERNELS = Dict{GemmTiling,Any}()
@@ -557,13 +559,10 @@ rather than `<=`: the indices are 1-based, so the largest the A staging forms is
     widemul(Int(M), Int(K)) < typemax(Int32) && widemul(Int(K), Int(N)) < typemax(Int32) &&
     widemul(Int(M), Int(N)) < typemax(Int32)
 
-"""Narrow-index twins of `GEMM_STAGED_V2_KERNELS`. See [`GEMM_NARROW`](@ref)."""
-const GEMM_STAGED_V2N_KERNELS = Dict{GemmTiling,Any}()
-
 """
-    GEMM_NARROW[] :: Bool
-
-Compute the staging addresses in `Int32` instead of `Int`.
+Narrow-index twins of `GEMM_STAGED_V2_KERNELS`: the ones `coopmat_gemm!`'s
+`narrow_ok` selects, which compute the staging addresses in `Int32` instead of
+`Int`.
 
 Julia hands out `Int64` indices and Lava emits them as-is, but NVIDIA has no
 64-bit integer unit: adds and multiplies are emulated. The same narrowing was
@@ -584,7 +583,7 @@ one is only *legal* while `M*K`, `K*N` and `M*N` fit in an `Int32`
 (`gemm_fits32`), and the wide one is the fallback for anything larger, so the
 duplication is a correctness requirement and not only a measurement convenience.
 """
-const GEMM_NARROW = Ref(true)
+const GEMM_STAGED_V2N_KERNELS = Dict{GemmTiling,Any}()
 
 "A 2-wide fp16 vector, i.e. `f16vec2`; see `Lava.coopmat_vec2`."
 const GemmV2 = NTuple{2,VecElement{Float16}}
@@ -1051,7 +1050,10 @@ every batch and silently return the wrong sum for all but the first.
 end
 
 """
-Scratch for split-K partial sums, grown monotonically and reused.
+    splitscratch(C, M, N, splitk)
+
+Scratch for a split-K GEMM's partial sums, on `C`'s own device, grown
+monotonically and reused.
 
 A fresh allocation per multiply is not merely wasteful here: the array is
 dropped as soon as `coopmat_gemm!` returns while the dispatches reading it are
@@ -1059,36 +1061,24 @@ still queued, and once the pool starts reclaiming blocks under that churn the
 result is `sync_access!: buffer is not ALIVE`. One buffer that only ever grows
 avoids both. Callers that already own scratch (the convolution's `Workspace`)
 pass `partials` and never touch this.
-"""
-# Per device. This holds DEVICE MEMORY, so a single `Ref` shared across contexts
-# is the same defect the memory pool had: the second device is handed a buffer
-# that belongs to the first. `_REDUCE_SCRATCH` in `mapreduce.jl` was already
-# keyed this way and is the pattern followed here.
-const GEMM_SPLIT_SCRATCH = IdDict{Any, LavaArray{Float32,1}}()
-const GEMM_SPLIT_RETIRED = Any[]
-
-push!(RESET_CALLBACKS, function()
-    empty!(GEMM_SPLIT_SCRATCH)
-    empty!(GEMM_SPLIT_RETIRED)
-end)
-
-"""
-Scratch for a split-K GEMM's partial sums, on `C`'s own device.
 
 `C` rather than a bare size, because the buffer has to come from the device the
-GEMM will run on and only the destination knows which that is.
+GEMM will run on and only the destination knows which that is — and it is stored
+on that device's `caches`, since a buffer handed to the wrong device is the
+defect the memory pool had.
 """
 function splitscratch(C, M::Int, N::Int, splitk::Int)
     n = M * N * splitk
     ctx = vk_context(KernelAbstractions.get_backend(C))
-    buf = get(GEMM_SPLIT_SCRATCH, ctx, nothing)
-    if buf === nothing || length(buf)::Int < n
+    caches = ctx.caches
+    buf = caches.gemm_split_scratch
+    if buf === nothing || length(buf::LavaArray{Float32,1})::Int < n
         # Retain, don't drop: dispatches already recorded point into the old
         # buffer and its finalizer would pull it out from under them. Growth is
         # geometric and stops once the largest product has been seen.
-        buf === nothing || push!(GEMM_SPLIT_RETIRED, buf)
+        buf === nothing || push!(caches.gemm_split_retired, buf)
         buf = LavaArray{Float32}(undef, n + n ÷ 2; bq = ctx.default_bq)
-        GEMM_SPLIT_SCRATCH[ctx] = buf
+        caches.gemm_split_scratch = buf
     end
     GPUArrays.derive(Float32, buf::LavaArray{Float32,1}, (M, N, splitk), 0)
 end
@@ -1104,7 +1094,15 @@ function coopmat_gemm!(C, A, B, M::Int, N::Int, K::Int;
                        nbatch::Int = 1,
                        blk_split = coopmat_gemm_shape(M, N, K; nbatch),
                        partials = nothing, reduce::Bool = true, bias = nothing,
-                       epilogue = identity)
+                       epilogue = identity,
+                       # Kernel selection, previously four module-level `Ref`s.
+                       # Defaults are the measured winners; a benchmark that wants
+                       # a different one passes it here rather than mutating the
+                       # process.
+                       staged::Bool = GEMM_STAGED_DEFAULT,
+                       vec2::Bool   = true,
+                       narrow_ok::Bool = true,
+                       tiling = nothing)
     # `KA.get_backend(C)`, NOT `LavaBackend()`. An unpinned backend resolves
     # its queue through `vk_context()`, so on a second device this dispatches on
     # whichever context happens to be global — the work lands on the wrong GPU
@@ -1121,7 +1119,7 @@ function coopmat_gemm!(C, A, B, M::Int, N::Int, K::Int;
     # shapes it divides exactly and only where the plan wants a single plane —
     # which includes all four of SAM 2's dominant `addmm` shapes, i.e. 72.7% of
     # the encoder's arithmetic.
-    c = staged_gemm_tiling(M, N, K, nbatch, splitk)
+    c = staged_gemm_tiling(M, N, K, nbatch, splitk; staged, tiling)
     if c !== nothing
         wg = gemm_wg(c)
         # The narrow kernel addresses in `Int32`, so it is only legal while every
@@ -1129,8 +1127,8 @@ function coopmat_gemm!(C, A, B, M::Int, N::Int, K::Int;
         # for B, `M*N` for the store. Far outside anything this repo runs — the
         # largest is 18.9M against a 2.1e9 limit — but it is a silent wrong
         # answer rather than an error if it is ever not, so it is checked.
-        narrow = GEMM_NARROW[] && gemm_fits32(M, N, K)
-        kern = if !GEMM_VEC2[]
+        narrow = narrow_ok && gemm_fits32(M, N, K)
+        kern = if !vec2
             GEMM_STAGED_KERNELS[c]
         elseif narrow
             get(GEMM_STAGED_V2N_KERNELS, c,

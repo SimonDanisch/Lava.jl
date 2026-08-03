@@ -192,38 +192,38 @@ end
     end
 
     @testset "flush counter increments" begin
-        before = Lava.FLUSH_COUNTER[]
+        before = Lava.vk_context().diag.flush_counter[]
         a = Lava.LavaArray(Float32[1, 2, 3])
         _ = a .+ Float32(1)
         Lava.vk_flush!(Lava.vk_context())
-        @test Lava.FLUSH_COUNTER[] > before
+        @test Lava.vk_context().diag.flush_counter[] > before
     end
 
     @testset "dispatch counter increments" begin
         Lava.vk_context().diag.dispatch_logging = true
-        before = Lava.TOTAL_DISPATCH_COUNTER[]
+        before = Lava.vk_context().diag.total_dispatches[]
         a = Lava.LavaArray(Float32[1, 2, 3])
         _ = a .+ Float32(1)
         Lava.vk_flush!(Lava.vk_context())
-        @test Lava.TOTAL_DISPATCH_COUNTER[] > before
+        @test Lava.vk_context().diag.total_dispatches[] > before
         Lava.vk_context().diag.dispatch_logging = false
     end
 
     @testset "KA.synchronize flushes GPU work" begin
         a = Lava.LavaArray(ones(Float32, 64))
-        before = Lava.FLUSH_COUNTER[]
+        before = Lava.vk_context().diag.flush_counter[]
         b = a .+ Float32(1)
         c = b .+ Float32(1)
         KernelAbstractions.synchronize(Lava.LavaBackend())
         # synchronize triggers a flush
-        @test Lava.FLUSH_COUNTER[] - before >= 1
+        @test Lava.vk_context().diag.flush_counter[] - before >= 1
         @test Array(c) == fill(Float32(3), 64)
     end
 
     @testset "empty flush is no-op" begin
-        before = Lava.FLUSH_COUNTER[]
+        before = Lava.vk_context().diag.flush_counter[]
         Lava.vk_flush!(Lava.vk_context())
-        @test Lava.FLUSH_COUNTER[] == before
+        @test Lava.vk_context().diag.flush_counter[] == before
     end
 
     @testset "barrier between dispatches preserves ordering" begin
@@ -262,11 +262,11 @@ end
 
     @testset "dispatch log records entries" begin
         Lava.vk_context().diag.dispatch_logging = true
-        empty!(Lava.DISPATCH_LOG)
+        empty!(Lava.vk_context().diag.dispatch_log)
         a = Lava.LavaArray(Float32[1, 2, 3])
         _ = a .+ Float32(1)
         Lava.vk_flush!(Lava.vk_context())
-        @test !isempty(Lava.DISPATCH_LOG)
+        @test !isempty(Lava.vk_context().diag.dispatch_log)
         Lava.vk_context().diag.dispatch_logging = false
     end
 end

@@ -20,17 +20,12 @@
 # batch's (bq, signal_value).
 
 # Flush counter for benchmarking (atomic for thread safety)
-const FLUSH_COUNTER = Threads.Atomic{Int}(0)
 
 # Global dispatch counter for debugging (total dispatches across all flushes)
-const TOTAL_DISPATCH_COUNTER = Threads.Atomic{Int}(0)
 
 # Dispatch info for debugging DEVICE_LOST
-const LAST_DISPATCH_INFO = Ref{String}("")
-const PREV_DISPATCH_INFO = Ref{String}("")
 
 # Ring buffer of last N dispatch names for crash debugging
-const DISPATCH_LOG = String[]
 const MAX_DISPATCH_LOG = 2000
 
 # Toggle dispatch logging (disabled by default for zero-alloc dispatch path).
@@ -40,9 +35,6 @@ const MAX_DISPATCH_LOG = 2000
 # and records wall-clock GPU time in BATCH_WAIT_TIMES. This SERIALIZES the pipeline
 # — only for measurement, not production. Used to identify batches whose actual
 # GPU execution time is near the amdgpu TDR threshold (~10 s).
-const BATCH_WAIT_TIMES = Float64[]  # seconds
-const BATCH_WAIT_INFO  = String[]   # last kernel in batch at wait time
-const BATCH_WAIT_DISPATCHES = Int[] # dispatch count for each measured batch
 
 """
 Path to mirror the dispatch log to, or `nothing`.
@@ -74,25 +66,17 @@ It only runs when dispatch logging is on, so the dynamic call is free.
 function log_dispatch!(bq::BatchQueue, info::String)
     d = (bq.ctx::VkContext).diag
     d.dispatch_logging || return
-    if length(DISPATCH_LOG) >= MAX_DISPATCH_LOG
-        popfirst!(DISPATCH_LOG)
+    log = d.dispatch_log
+    if length(log) >= MAX_DISPATCH_LOG
+        popfirst!(log)
     end
-    push!(DISPATCH_LOG, info)
+    push!(log, info)
     f = d.dispatch_log_file
     f === nothing || open(io -> (println(io, info); flush(io)), f, "a")
     return
 end
 
 # Register cleanup callback for vk_reset_device!
-push!(RESET_CALLBACKS, function()
-    FLUSH_COUNTER[] = 0
-    TOTAL_DISPATCH_COUNTER[] = 0
-    LAST_DISPATCH_INFO[] = ""
-    PREV_DISPATCH_INFO[] = ""
-    empty!(DISPATCH_LOG)
-    # `dispatch_logging` is a `ctx.diag` field now, so a reset brings a fresh
-    # `Diagnostics` with it already off — nothing to clear here.
-end)
 
 # Pre-allocated barrier buffer using raw VkMemoryBarrier (isbits).
 # Vulkan.jl's MemoryBarrier wrapper allocates ~1.2KB per cmd_pipeline_barrier call
@@ -175,11 +159,6 @@ mutable struct CapturedSequence
     submissions::Int             # submit! boundaries folded into one replay
 end
 
-const CAPTURING = Ref{Union{Nothing,CapturedSequence}}(nothing)
-# Highest timeline value signalled by a replay, per queue. `flush!` has to wait
-# on it: a replay puts no `CommandBatch` in `bq.in_flight`, so the in-flight scan
-# alone would return before the GPU had run any of it.
-const REPLAY_WATERMARK = IdDict{BatchQueue,UInt64}()
 
 """
 How long `flush!` waits for the queue to drain before it gives up, in
@@ -196,10 +175,6 @@ is a diagnosable error instead of a wedged session.
 """Poll interval inside that budget, so a TDR is noticed without waiting it out."""
 const FLUSH_WAIT_QUANTUM_NS = UInt64(2) * 1_000_000_000
 
-push!(RESET_CALLBACKS, function()
-    CAPTURING[] = nothing
-    empty!(REPLAY_WATERMARK)
-end)
 
 """
 One-shot request to drop the barrier in front of the very next dispatch.
@@ -211,7 +186,7 @@ that anything since the last barrier touched (`ka_backend.jl`), and consumed by
 """
 
 """Begin-flags for a command buffer: reusable while capturing, one-shot otherwise."""
-@inline cb_begin_flags() = CAPTURING[] === nothing ?
+@inline cb_begin_flags(bq::BatchQueue) = bq.capturing === nothing ?
     Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT :
     Vulkan.COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT
 
@@ -223,15 +198,15 @@ for `replay!`. `f` must not allocate device memory whose address it then
 dispatches against, or the replay will point at freed storage.
 """
 function capture(f, bq::BatchQueue)
-    CAPTURING[] === nothing || throw(LavaError("capture", "already capturing", "nested capture is not supported"))
+    bq.capturing === nothing || throw(LavaError("capture", "already capturing", "nested capture is not supported"))
     flush!(bq, bq.device)                       # start from a drained queue
     seq = CapturedSequence(bq, Vulkan.CommandBuffer[], Any[], 0)
-    CAPTURING[] = seq
+    bq.capturing = seq
     try
         f()
         submit!(bq)                             # close and collect the trailing batch
     finally
-        CAPTURING[] = nothing
+        bq.capturing = nothing
     end
     flush!(bq, bq.device)
     # Everything the capture recorded lives in the arg slabs it filled; move the
@@ -265,7 +240,7 @@ function replay!(seq::CapturedSequence)
     bq.active_batch !== nothing && bq.active_batch.recording && submit!(bq)
     bq.next_timeline += 1
     v = bq.next_timeline
-    prev = get(REPLAY_WATERMARK, bq, UInt64(0))
+    prev = bq.replay_watermark
     cb_infos = [Vulkan.CommandBufferSubmitInfo(cb, UInt32(0)) for cb in seq.cmd_bufs]
     waits = prev == UInt64(0) ? Vulkan.SemaphoreSubmitInfo[] :
         [Vulkan.SemaphoreSubmitInfo(bq.timeline_sem, prev, UInt32(0);
@@ -278,9 +253,9 @@ function replay!(seq::CapturedSequence)
     if iserror(res)
         mark_if_lost!(bq, res)
         bq.next_timeline -= 1
-        throw_with_validation_context("vkQueueSubmit2 (replay)", res, length(seq.cmd_bufs), false)
+        throw_with_validation_context("vkQueueSubmit2 (replay)", res, length(seq.cmd_bufs), false, bq)
     end
-    REPLAY_WATERMARK[bq] = v
+    bq.replay_watermark = v
     return
 end
 
@@ -312,7 +287,7 @@ function ensure_active_batch!(bq::BatchQueue)
         if !batch.recording
             throw_if_error(bq, "vkBeginCommandBuffer",
                 Vulkan.begin_command_buffer(batch.cmd_buf, Vulkan.CommandBufferBeginInfo(
-                    flags=cb_begin_flags()
+                    flags=cb_begin_flags(bq)
                 )))
             batch.recording = true
             # Fresh open on reused batch — assign the timeline value it will
@@ -332,7 +307,7 @@ function ensure_active_batch!(bq::BatchQueue)
 
     throw_if_error(bq, "vkBeginCommandBuffer",
         Vulkan.begin_command_buffer(batch.cmd_buf, Vulkan.CommandBufferBeginInfo(
-            flags=cb_begin_flags()
+            flags=cb_begin_flags(bq)
         )))
     batch.recording = true
     batch.signal_value = bq.next_timeline + 1
@@ -425,7 +400,7 @@ function maybe_split_cb!(batch::CommandBatch, bq::BatchQueue)
     batch.cmd_buf = alloc_cmd_buf(bq)
     throw_if_error(bq, "vkBeginCommandBuffer",
         Vulkan.begin_command_buffer(batch.cmd_buf, Vulkan.CommandBufferBeginInfo(
-            flags=cb_begin_flags()
+            flags=cb_begin_flags(bq)
         )))
     batch.segment_dispatches = 0
     # recording stays true; dispatch_count stays (for barrier logic + total tracking)
@@ -540,7 +515,7 @@ end
 #   1. While `f()` runs, `ka_launch_indirect!` packs args + allocates the
 #      indirect slot for each dispatch but records NOTHING — it defers
 #      (pipeline, args, indirect slot, queue-size buffer, workgroup size)
-#      into `DEFERRED_INDIRECT[]`.
+#      into `bq.deferred_indirect`.
 #   2. On exit, ONE fused multi-prepare dispatch writes every deferred
 #      indirect command (a single thread looping over the slots — same
 #      pattern as `empty_all!`). Its normal pre-barrier orders it after
@@ -558,7 +533,6 @@ end
 # group exit, a DIRECT dispatch recorded inside `f` lands BEFORE them in
 # the command stream regardless of lexical order.
 
-const DEFERRED_INDIRECT = Ref{Union{Nothing, Vector{Any}}}(nothing)
 
 # One thread writes every deferred VkDispatchIndirectCommand. Statically
 # unrolled over the tuples; compiled per arity via the normal kernel cache.
@@ -581,14 +555,14 @@ function multi_prepare_indirect_kernel(inds, sizes, wss)
     return nothing
 end
 
-function concurrent_indirect_group(f::F) where F
-    prev = DEFERRED_INDIRECT[]
+function concurrent_indirect_group(f::F, bq::BatchQueue = vk_context().default_bq) where F
+    prev = bq.deferred_indirect
     list = Any[]
-    DEFERRED_INDIRECT[] = list
+    bq.deferred_indirect = list
     try
         concurrent_dispatch_group(f)
     finally
-        DEFERRED_INDIRECT[] = prev
+        bq.deferred_indirect = prev
     end
     isempty(list) && return nothing
 
@@ -652,11 +626,11 @@ end
     # callers, indirect prepares) is opaque to the elision tracker: it must take
     # its barrier, and nothing after it may elide until a barrier clears the
     # poison.
-    if bq.barrier_elision && !RANGES_DECLARED[]
+    if bq.barrier_elision && !bq.ranges_declared
         bq.next_skip_barrier = false
-        poison_barrier_elision!()
+        poison_barrier_elision!(bq)
     end
-    RANGES_DECLARED[] = false
+    bq.ranges_declared = false
 
     effective_skip = (skip_pre_barrier || bq.next_skip_barrier ||
                       (CONCURRENT_GROUP_ACTIVE[] && CONCURRENT_GROUP_STARTED[])) &&
@@ -707,10 +681,12 @@ end
     batch.dispatch_count += 1
     batch.segment_dispatches += 1
     batch.last_was_rt = is_rt
-    if (bq.ctx::VkContext).diag.dispatch_logging
-        Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, 1)
-        log_dispatch!(bq, Base.invokelatest(dispatch_log_string,
-                                        TOTAL_DISPATCH_COUNTER[], " ", info)::String)
+    let d = (bq.ctx::VkContext).diag
+        if d.dispatch_logging
+            Threads.atomic_add!(d.total_dispatches, 1)
+            log_dispatch!(bq, Base.invokelatest(dispatch_log_string,
+                                            d.total_dispatches[], " ", info)::String)
+        end
     end
 
     # Split to a new CB if this segment is full
@@ -784,7 +760,7 @@ end
                             base_x::Int, base_y::Int, base_z::Int,
                             gx::Int, gy::Int, gz::Int, ::Nothing=nothing)
     dispatch_info = (bq.ctx::VkContext).diag.dispatch_logging ?
-        Base.invokelatest(dispatch_log_string, LAST_DISPATCH_INFO[], " base=(",
+        Base.invokelatest(dispatch_log_string, bq.last_dispatch_info, " base=(",
                           base_x, ",", base_y, ",", base_z, ") g=(",
                           gx, ",", gy, ",", gz, ")")::String : ""
     record_dispatch!(bq;
@@ -798,7 +774,7 @@ end
         # Profiling: optional GPU-side timestamp around the dispatch.  Returns
         # -1 (and does nothing) when `with_dispatch_timing` is not active, so
         # the hot path stays unperturbed.
-        ts_slot = maybe_write_dispatch_start_timestamp!(bq.ctx::VkContext, cmd, LAST_DISPATCH_INFO[])
+        ts_slot = maybe_write_dispatch_start_timestamp!(bq.ctx::VkContext, cmd, bq.last_dispatch_info)
         if base_x == 0 && base_y == 0 && base_z == 0
             Vulkan.cmd_dispatch(cmd, UInt32(gx), UInt32(gy), UInt32(gz))
         else
@@ -839,7 +815,7 @@ atomically-claimed queue slots)."""
                                             ::Nothing=nothing;
                                             first_in_group::Bool=true)
     dispatch_info = (bq.ctx::VkContext).diag.dispatch_logging ?
-        Base.invokelatest(dispatch_log_string, LAST_DISPATCH_INFO[], " (indirect)")::String : ""
+        Base.invokelatest(dispatch_log_string, bq.last_dispatch_info, " (indirect)")::String : ""
     record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
         extra_dst_access=Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT,
@@ -856,7 +832,7 @@ atomically-claimed queue slots)."""
         push_constants_bda!(cmd, pipeline.pipeline_layout, Vulkan.SHADER_STAGE_COMPUTE_BIT, push_bda)
         mb = indirect.buf[]::VkManagedBuffer
         byte_offset = UInt64(indirect.offset)
-        ts_slot = maybe_write_dispatch_start_timestamp!(bq.ctx::VkContext, cmd, LAST_DISPATCH_INFO[])
+        ts_slot = maybe_write_dispatch_start_timestamp!(bq.ctx::VkContext, cmd, bq.last_dispatch_info)
         Vulkan.cmd_dispatch_indirect(cmd, mb.buffer, byte_offset)
         maybe_write_dispatch_end_timestamp!(bq.ctx::VkContext, cmd, ts_slot, barrier_fptr(bq))
         pin!(batch, indirect)
@@ -1004,7 +980,7 @@ function submit!(bq::BatchQueue)
     batch === nothing && return nothing
     !batch.recording && return nothing
     @assert batch.bq === bq "batch.bq desync: batch was not bound to this BatchQueue"
-    Threads.atomic_add!(FLUSH_COUNTER, 1)
+    Threads.atomic_add!((bq.ctx::VkContext).diag.flush_counter, 1)
 
     throw_if_error(bq, "vkEndCommandBuffer", Vulkan.end_command_buffer(batch.cmd_buf))
 
@@ -1019,8 +995,8 @@ function submit!(bq::BatchQueue)
     # keeps `reclaim_batch!` from handing them back to the free pool, and swapping
     # in a fresh `cmd_buf` keeps the batch itself from re-recording over the one we
     # just captured — either would silently rewrite a sequence `replay!` still points at.
-    let cap = CAPTURING[]
-        if cap !== nothing && cap.bq === bq
+    let cap = bq.capturing
+        if cap !== nothing
             append!(cap.cmd_bufs, all_cmd_bufs)
             for obj in batch.pinned
                 push!(cap.pinned, obj)
@@ -1033,7 +1009,7 @@ function submit!(bq::BatchQueue)
 
     saved_dispatch_count = batch.dispatch_count
     saved_last_was_rt = batch.last_was_rt
-    PREV_DISPATCH_INFO[] = LAST_DISPATCH_INFO[]
+    bq.prev_dispatch_info = bq.last_dispatch_info
 
     # ensure_active_batch! pre-assigned batch.signal_value = next_timeline + 1;
     # bump the counter now and assert consistency.
@@ -1117,7 +1093,7 @@ function submit!(bq::BatchQueue)
                 end
             end
             if !isempty(hits)
-                push!(SLAB_DUMP_LOG, (sub=Int(bq.next_timeline)+1, target=target, offsets=hits))
+                push!((bq.ctx::VkContext).diag.slab_dump_log, (sub=Int(bq.next_timeline)+1, target=target, offsets=hits))
             end
         end
     end
@@ -1142,27 +1118,28 @@ function submit!(bq::BatchQueue)
         empty!(batch.wait_semaphores)
         bq.active_batch = nothing
         throw_with_validation_context("vkQueueSubmit2", submit_result,
-            saved_dispatch_count, saved_last_was_rt)
+            saved_dispatch_count, saved_last_was_rt, bq)
     end
 
     push!(bq.in_flight, batch)
     bq.active_batch = nothing
-    LAST_DISPATCH_INFO[] = "$saved_dispatch_count dispatches ($(saved_last_was_rt ? "RT" : "compute"))"
-    Threads.atomic_add!(TOTAL_DISPATCH_COUNTER, saved_dispatch_count)
-    if (bq.ctx::VkContext).diag.dispatch_logging
-        append!(DISPATCH_LOG, batch.dispatch_log)
+    bq.last_dispatch_info = "$saved_dispatch_count dispatches ($(saved_last_was_rt ? "RT" : "compute"))"
+    dg = (bq.ctx::VkContext).diag
+    Threads.atomic_add!(dg.total_dispatches, saved_dispatch_count)
+    if dg.dispatch_logging
+        append!(dg.dispatch_log, batch.dispatch_log)
     end
     # DEBUG: synchronous per-batch wall-clock timing. Serializes the pipeline
     # but lets us see GPU execution time per batch. Guarded by opt-in flag.
-    if (bq.ctx::VkContext).diag.batch_timing
+    if dg.batch_timing
         t0 = time()
         wr = Vulkan.wait_semaphores(bq.device,
             Vulkan.SemaphoreWaitInfo([bq.timeline_sem], [batch.signal_value]),
             typemax(UInt64))
         dt = time() - t0
-        push!(BATCH_WAIT_TIMES, dt)
-        push!(BATCH_WAIT_INFO, LAST_DISPATCH_INFO[])
-        push!(BATCH_WAIT_DISPATCHES, saved_dispatch_count)
+        push!(dg.batch_wait_times, dt)
+        push!(dg.batch_wait_info, bq.last_dispatch_info)
+        push!(dg.batch_wait_dispatches, saved_dispatch_count)
         # Don't throw from here — let the next call surface it normally — but
         # do mark device_lost so the next dispatcher gate fires.
         mark_if_lost!(bq, wr)
@@ -1226,7 +1203,7 @@ function sweep_retired_batches!(bq::BatchQueue)
     # against wrong pointers: no validation error, no device fault, just a kernel
     # that never returns. `capture` pins the range at the end via
     # `reserve_arg_slabs!`, which is too late to help the capture itself.
-    capturing_here = let c = CAPTURING[]; c !== nothing && c.bq === bq end
+    capturing_here = bq.capturing !== nothing
     active = bq.active_batch
     active_has_commands = active !== nothing && active.dispatch_count > 0
     if isempty(bq.in_flight) && !active_has_commands && !capturing_here
@@ -1275,7 +1252,7 @@ function flush_stall_report(bq::BatchQueue, target::UInt64)
     end
     println(io, "  timeline counter = ", cur === nothing ? "unreadable" : cur,
                 ", next_timeline = ", bq.next_timeline,
-                ", replay watermark = ", get(REPLAY_WATERMARK, bq, UInt64(0)))
+                ", replay watermark = ", bq.replay_watermark)
     for (i, b) in enumerate(bq.in_flight)
         waits = [v for (_, v, _) in b.wait_semaphores]
         done = cur !== nothing && b.signal_value <= cur
@@ -1295,7 +1272,7 @@ function flush!(bq::BatchQueue, device::Vulkan.Device)
     submit!(bq)
     # A replay signals the timeline without putting a batch in `in_flight`, so
     # the in-flight scan alone would return before the GPU had run any of it.
-    target = get(REPLAY_WATERMARK, bq, UInt64(0))
+    target = bq.replay_watermark
     for b in bq.in_flight
         target = max(target, b.signal_value)
     end
@@ -1311,7 +1288,7 @@ function flush!(bq::BatchQueue, device::Vulkan.Device)
             # generic wrapper can't.  The mark_if_dl! call is the single source of
             # truth for the device_lost flag.
             mark_if_lost!(bq, wait_result)
-            throw_with_validation_context("vkWaitSemaphores", wait_result, 0, false)
+            throw_with_validation_context("vkWaitSemaphores", wait_result, 0, false, bq)
         end
         unwrap(wait_result) == Vulkan.SUCCESS && break
         waited += quantum
@@ -1335,7 +1312,7 @@ function flush!(bq::BatchQueue, device::Vulkan.Device)
     sweep_retired_batches!(bq)
     # The queue is drained here, so nothing recorded next can race anything
     # recorded before: the elision tracker starts empty again.
-    reset_barrier_elision!()
+    reset_barrier_elision!(bq)
     check_validation_errors!("vk_flush!")
     return
 end
@@ -1514,7 +1491,7 @@ function cmd_copy_buffer!(bq::BatchQueue, src, dst, nbytes::Integer;
     # tracker can simply start clean rather than poison. (Poisoning here would
     # force a redundant barrier on the next dispatch and, worse, on every
     # dispatch until one fired.)
-    bq.barrier_elision && reset_barrier_elision!()
+    bq.barrier_elision && reset_barrier_elision!(bq)
 
     # Barrier: shader writes → transfer read. Only needed if we already
     # recorded dispatches into this batch (barrier across those writes).
@@ -1589,11 +1566,12 @@ end
 
 """Throw a LavaError enriched with recent validation layer messages and dispatch log."""
 function throw_with_validation_context(call_name::String, err_result,
-        dispatch_count::Int=0, last_was_rt::Bool=false)
-    # Re-enable dispatch logging so the next run captures debug info. No `bq` in
-    # scope on this error path — it is reached from a raw `VkResult` check — so
-    # the current context is the honest source.
-    let c = VK_CONTEXT_REF[]
+        dispatch_count::Int=0, last_was_rt::Bool=false,
+        bq::Union{Nothing,BatchQueue}=nothing)
+    # Re-enable dispatch logging so the next run captures debug info. `bq` when
+    # the caller has one — all three currently do — and the current context
+    # otherwise, since this is also reachable from a raw `VkResult` check.
+    let c = bq === nothing ? VK_CONTEXT_REF[] : bq.ctx::VkContext
         c === nothing || (c.diag.dispatch_logging = true)
     end
     vk_err = unwrap_error(err_result)
@@ -1605,16 +1583,20 @@ function throw_with_validation_context(call_name::String, err_result,
         "Last $n validation message(s):\n" * join(["  [$i] $(msgs[end-n+i])" for i in 1:n], "\n")
     end
 
-    dispatch_detail = if isempty(DISPATCH_LOG)
+    dlog = bq === nothing ? String[] : (bq.ctx::VkContext).diag.dispatch_log
+    dispatch_detail = if isempty(dlog)
         "No dispatches logged."
     else
-        "Recent dispatch log (last $(length(DISPATCH_LOG))):\n" *
-        join(["  $d" for d in DISPATCH_LOG], "\n")
+        "Recent dispatch log (last $(length(dlog))):\n" *
+        join(["  $d" for d in dlog], "\n")
     end
 
-    total = TOTAL_DISPATCH_COUNTER[]
-    prev_info = PREV_DISPATCH_INFO[]
-    curr_info = LAST_DISPATCH_INFO[]
+    total = bq === nothing ? 0 : (bq.ctx::VkContext).diag.total_dispatches[]
+    # Which kernel, on the queue that failed. Read process-wide these named
+    # whatever dispatched last anywhere, so a two-queue session could attribute
+    # one queue's DEVICE_LOST to another queue's kernel.
+    prev_info = bq === nothing ? "" : bq.prev_dispatch_info
+    curr_info = bq === nothing ? "" : bq.last_dispatch_info
     throw(LavaError(
         call_name,
         """$vk_err after $dispatch_count dispatches in batch ($total total, last_was_rt=$last_was_rt)
@@ -1643,4 +1625,4 @@ set_dispatch_logging!(enabled::Bool, ctx::VkContext = vk_context()) =
 
 Return a copy of the recent dispatch log (up to $MAX_DISPATCH_LOG entries).
 """
-get_dispatch_log() = copy(DISPATCH_LOG)
+get_dispatch_log(ctx::VkContext = vk_context()) = copy(ctx.diag.dispatch_log)

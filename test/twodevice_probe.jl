@@ -90,14 +90,16 @@ below was visible until everything above it was fixed.
    That guard existing and firing is worth noting: the library already knew this
    was possible and said so precisely.
 
-6. **`GEMM_SPLIT_SCRATCH`** — FIXED, and now exercised above. A single `Ref`
+6. **`GEMM_SPLIT_SCRATCH`** — FIXED (now `ctx.caches.gemm_split_scratch`), and
+   exercised above. It began as a single `Ref`
    holding device memory: the memory pool's defect in miniature, and it would
    only have fired on a split-K GEMM, which is why the first version of this
    probe missed it. The probe now runs a GEMM and a reduction on each device
    rather than a bare dispatch, because a global that only some kernels touch is
    invisible to a probe that only runs one kernel.
 
-7. **`_REDUCE_SCRATCH`** — FIXED. It was already an `IdDict` keyed by context,
+7. **`_REDUCE_SCRATCH`** — FIXED (now `ctx.caches.reduce_scratch`). It was an
+   `IdDict` keyed by context,
    and still allocated its buffer on `vk_context()`. Keyed right, allocated
    wrong — which reads as correct on any machine with one device, and is the
    subtlest shape in this whole list.
@@ -140,14 +142,15 @@ function probe()
         got = Array(a)
         ok = all(got .== 5.0f0)
 
-        # ── a reduction: `_REDUCE_SCRATCH` is keyed by context but used to
-        #    ALLOCATE on the global one, so the second device's entry held the
-        #    first device's buffer. Keyed right, allocated wrong.
+        # ── a reduction: the scratch was keyed by context but ALLOCATED on the
+        #    global one, so the second device's entry held the first device's
+        #    buffer. Keyed right, allocated wrong. Now `ctx.caches.reduce_scratch`.
         r = Lava.vk_reduce_sum(a)
         okr = r ≈ 64 * 5.0f0
 
-        # ── a GEMM big enough to split K: `GEMM_SPLIT_SCRATCH` was one `Ref`
+        # ── a GEMM big enough to split K: the split-K scratch was one `Ref`
         #    holding device memory, i.e. the memory pool's defect in miniature.
+        #    Now `ctx.caches.gemm_split_scratch`.
         m = 64
         A = KA.allocate(b, Float16, m, m); fill!(A, Float16(1))
         B = KA.allocate(b, Float16, m, m); fill!(B, Float16(2))

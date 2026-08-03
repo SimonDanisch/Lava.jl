@@ -21,7 +21,7 @@ const KA = KernelAbstractions
     # Grow the pool past the trim threshold, then drop every reference.
     target = Lava.pool(Lava.vk_context()).trim_threshold + 256 * 1024 * 1024
     let arrays = Lava.LavaArray[]
-        while Lava.GPU_LIVE_BYTES[] < target
+        while Lava.gpu_live_bytes() < target
             a = KA.allocate(be, Float32, 4_000_000)   # 16 MB each
             fill!(a, 1.0f0)
             push!(arrays, a)
@@ -30,14 +30,14 @@ const KA = KernelAbstractions
         empty!(arrays)
     end
 
-    grown = Lava.GPU_LIVE_BYTES[]
+    grown = Lava.gpu_live_bytes()
     @test grown >= Lava.pool(Lava.vk_context()).trim_threshold
 
     # Defeat the rate limiter so the test doesn't depend on wall-clock timing.
     Lava.pool(Lava.vk_context()).last_trim = 0.0
     Lava.maybe_trim_pool!(ctx)
 
-    trimmed = Lava.GPU_LIVE_BYTES[]
+    trimmed = Lava.gpu_live_bytes()
     @test trimmed < grown                     # capacity actually came back
     @test trimmed < Lava.pool(Lava.vk_context()).trim_threshold
 
@@ -51,7 +51,7 @@ end
 @testset "trim is rate-limited" begin
     ctx = Lava.vk_context()
     Lava.pool(Lava.vk_context()).last_trim = time()            # just trimmed
-    before = Lava.GPU_LIVE_BYTES[]
+    before = Lava.gpu_live_bytes()
     Lava.maybe_trim_pool!(ctx)                # must be a no-op, not a stall
-    @test Lava.GPU_LIVE_BYTES[] == before
+    @test Lava.gpu_live_bytes() == before
 end

@@ -35,8 +35,8 @@ end
     end
 end
 
-@testset "GPU_LIVE_BYTES is atomic" begin
-    @test Lava.GPU_LIVE_BYTES isa Threads.Atomic{Int}
+@testset "live_bytes is atomic" begin
+    @test Lava.pool(Lava.vk_context()).live_bytes isa Threads.Atomic{Int}
 end
 
 @testset "VkContext has no public nothing-default_bq path" begin

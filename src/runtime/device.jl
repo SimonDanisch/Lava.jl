@@ -165,6 +165,45 @@ mutable struct BatchQueue
     barrier_elision::Bool
     # One-shot, consumed by exactly the next dispatch on THIS queue.
     next_skip_barrier::Bool
+    # Set by the KA launch path for the dispatch it is about to record: "this
+    # dispatch enumerated its buffers, so the elision tracker saw everything it
+    # touches". Same one-shot shape as `next_skip_barrier`, and it was a global
+    # for the same reason — the hand-off is launch → `record_dispatch!` and both
+    # already have the queue.
+    ranges_declared::Bool
+    # The elision tracker itself. `touched_ranges` accumulates what recent
+    # dispatches in the current batch wrote; `dispatch_ranges` is scratch for the
+    # dispatch being recorded. Reused, never reallocated — and per queue, because
+    # two queues recording concurrently into their own command buffers were
+    # sharing one tracker, so a range written on one could elide a barrier on the
+    # other.
+    touched_ranges::Vector{UInt64}
+    dispatch_ranges::Vector{UInt64}
+    # Non-`nothing` inside `concurrent_indirect_group`: dispatches append here
+    # instead of recording, and the group's flush fuses them.
+    deferred_indirect::Union{Nothing,Vector{Any}}
+    # The `CapturedSequence` being recorded on THIS queue, or `nothing`. It was a
+    # module-level `Ref`, so every site that used it had to re-check `cap.bq ===
+    # bq` to find out whether the capture was even this queue's — and
+    # `cb_begin_flags` had no queue to check with, so a capture running on one
+    # queue silently made every OTHER queue's command buffers reusable.
+    # `Any` because `CapturedSequence` is declared in `command.jl`; use sites
+    # assert it, the same shape as `ctx`.
+    capturing::Any
+    # The high-water mark of arg slabs a capture reserved on this queue, so a
+    # replay does not overwrite arguments a recorded pipeline still points at.
+    reserved_arg_slabs::Int
+    # Highest timeline value signalled by a replay on this queue. `flush!` has to
+    # wait on it: a replay puts no `CommandBatch` in `in_flight`, so the in-flight
+    # scan alone would return before the GPU had run any of it. Was an
+    # `IdDict{BatchQueue,UInt64}` — a per-queue value in a process-wide dict keyed
+    # by the queue, which is the surrogate a field replaces.
+    replay_watermark::UInt64
+    # What the last dispatch on this queue was, for the dispatch log and for
+    # DEVICE_LOST diagnostics. Process-wide, these attributed one queue's crash
+    # to another queue's kernel.
+    last_dispatch_info::String
+    prev_dispatch_info::String
 end
 
 function init_batch(cb::Vulkan.CommandBuffer)
@@ -209,7 +248,10 @@ function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32, 
                     ctx,             # owning VkContext (required)
                     Threads.threadid(),  # owning_thread
                     64, 3000, UInt64(120) * 1_000_000_000,  # auto-submit, CB split, flush timeout
-                    :memory, false, false)                  # barrier mode / elision / one-shot skip
+                    :memory, false, false,                  # barrier mode / elision / one-shot skip
+                    false, UInt64[], UInt64[],              # ranges_declared + elision tracker
+                    nothing, nothing, 0, UInt64(0),         # deferred indirect, capture, reserved slabs, watermark
+                    "", "")                                 # last / prev dispatch info
     # Plug the back-reference into every pre-allocated batch so `batch.bq`
     # is non-nothing as soon as the bq is returned.  Future batches allocated
     # lazily (alloc_cmd_buf → init_batch) must set .bq themselves.
@@ -672,15 +714,23 @@ destroyed, and the crash lands inside the driver at whatever GC runs next.
 """
 mark_device_lost!(ctx::VkContext) = (ctx.device_lost = true; nothing)
 
-# Callbacks for vk_reset_device! — registered by later-included files (pipeline.jl,
-# command.jl, launch.jl, memory.jl) to clear their module-level caches.
 """
 Hands out `VkContext.id`. Monotonic and never reused, so a device destroyed and
 recreated cannot inherit cache entries keyed to its predecessor.
+
+Nothing in `src/` reads `ctx.id` any more — the dictionaries it keyed are
+`VkContext` fields now, which is what made it redundant. It survives as a cheap
+identity for diagnostics and for `twodevice_probe.jl`'s "two contexts must not
+share an id" assertion, and this counter with it.
 """
 const VK_CONTEXT_COUNTER = Ref{UInt64}(0)
 
-const RESET_CALLBACKS = Function[]
+# `RESET_CALLBACKS` was here: a list every later-included file pushed onto so
+# `vk_reset_device!` could empty its module-level caches. Deleted rather than
+# emptied — its entries were the symptom this refactor was diagnosing. State
+# that outlives the device it describes has to be told to go away; state a
+# `VkContext` owns simply does not. The last four went with the pool accounting,
+# the dispatch counters, the capture handle and the timing records.
 
 """
     vk_context() -> VkContext
@@ -757,7 +807,7 @@ function vk_reset_device!()
     let old = VK_CONTEXT_REF[]
         if old !== nothing
             # Its blocks, while it is still the thing that owns them. This used
-            # to be a `RESET_CALLBACKS` entry walking a global `POOLS` dict.
+            # to be a reset callback walking a global `POOLS` dict.
             destroy_pool!(old)
             mark_device_lost!(old)
         end
@@ -770,14 +820,6 @@ function vk_reset_device!()
     # The old messenger is gone; drop any undrained ring entries from it so a
     # later drain doesn't replay stale messages against the new instance.
     VAL_RING_READ[] = @inbounds VAL_RING_WRITE[1]
-    # Run cleanup callbacks registered by other modules
-    for cb in RESET_CALLBACKS
-        try
-            cb()
-        catch e
-            @warn "Lava: reset callback failed" exception=e
-        end
-    end
     # Re-initialize (lazy init on next vk_context() call)
     ctx = vk_context()
     @info "Lava: device reset complete" device=ctx.device_name

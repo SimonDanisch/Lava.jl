@@ -68,8 +68,8 @@ end
     # it isolates pool behavior from anything else.
     @testset "no GPU memory leak across 500 alloc+free cycles" begin
         drain!()
-        baseline_bytes    = Lava.GPU_LIVE_BYTES[]
-        baseline_buffers  = length(Lava.LIVE_BUFFERS)
+        baseline_bytes    = Lava.gpu_live_bytes()
+        baseline_buffers  = Lava.live_buffer_count()
         baseline_pool     = length(Lava.pool(Lava.vk_context()).blocks)
 
         for _ in 1:500
@@ -78,8 +78,8 @@ end
         end
         drain!()
 
-        @test Lava.GPU_LIVE_BYTES[]      == baseline_bytes
-        @test length(Lava.LIVE_BUFFERS)  == baseline_buffers
+        @test Lava.gpu_live_bytes()      == baseline_bytes
+        @test Lava.live_buffer_count()  == baseline_buffers
         # Pool blocks can grow once or twice under transient pressure but must
         # not keep growing — anything looser stops being a real leak test.
         @test length(Lava.pool(Lava.vk_context()).blocks)   <= baseline_pool + 2
@@ -99,7 +99,7 @@ end
         end
 
         drain!()
-        baseline_bytes = Lava.GPU_LIVE_BYTES[]
+        baseline_bytes = Lava.gpu_live_bytes()
 
         for _ in 1:50
             a = Lava.LavaArray(Float32.(ones(4096)))
@@ -113,7 +113,7 @@ end
         # on the first dispatch — those allocate once then reuse forever.
         # What we're catching is UNBOUNDED growth (50 × 16 KiB = 800 KiB per
         # leak), not steady-state slab allocations.
-        @test Lava.GPU_LIVE_BYTES[] <= baseline_bytes + 16 * 1024^2   # 16 MiB ceiling
+        @test Lava.gpu_live_bytes() <= baseline_bytes + 16 * 1024^2   # 16 MiB ceiling
     end
 
     # ── 4. GC.gc() during an open batch must not crash or UAF ──
@@ -166,12 +166,12 @@ end
 
     # ── 6. vk_reduce_sum does not leak per call ──
     #
-    # The scratch output is cached in _REDUCE_SCRATCH (1 entry per ctx). If we
+    # The scratch output is cached on `ctx.caches.reduce_scratch`. If we
     # accidentally re-allocate per call, GPU_LIVE_BYTES grows. This catches
     # the regression where scratch allocation was inside the hot function.
     @testset "vk_reduce_sum scratch is cached" begin
         drain!()
-        baseline = Lava.GPU_LIVE_BYTES[]
+        baseline = Lava.gpu_live_bytes()
         a = Lava.LavaArray(rand(Float32, 100_000))
         for _ in 1:1000
             Lava.vk_reduce_sum(a)
@@ -179,7 +179,7 @@ end
         drain!()
         # One call may allocate a 4-byte scratch the first time. After that it
         # must reuse the same LavaArray forever.
-        @test Lava.GPU_LIVE_BYTES[] <= baseline + 1 << 20  # generous 1 MiB ceiling
+        @test Lava.gpu_live_bytes() <= baseline + 1 << 20  # generous 1 MiB ceiling
         Lava.unsafe_free!(a)
     end
 

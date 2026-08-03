@@ -928,7 +928,7 @@ end
                                    base_x::Int, base_y::Int, base_z::Int,
                                    gx::Int, gy::Int, gz::Int, tlas::HWTLAS)
     dispatch_info = (bq.ctx::VkContext).diag.dispatch_logging ?
-        "$(LAST_DISPATCH_INFO[]) base=($base_x,$base_y,$base_z) g=($gx,$gy,$gz)" : ""
+        "$(bq.last_dispatch_info) base=($base_x,$base_y,$base_z) g=($gx,$gy,$gz)" : ""
     record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         extra_dst_access=Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
@@ -954,7 +954,7 @@ end
                                             indirect, tlas::HWTLAS;
                                             first_in_group::Bool=true)
     dispatch_info = (bq.ctx::VkContext).diag.dispatch_logging ?
-        "$(LAST_DISPATCH_INFO[]) (indirect)" : ""
+        "$(bq.last_dispatch_info) (indirect)" : ""
     record_dispatch!(bq;
         dst_stage=Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT | Vulkan.PIPELINE_STAGE_DRAW_INDIRECT_BIT,
         extra_dst_access=Vulkan.ACCESS_INDIRECT_COMMAND_READ_BIT |

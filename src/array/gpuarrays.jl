@@ -146,34 +146,28 @@ Base.Broadcast.BroadcastStyle(::Type{<:Base.ReshapedArray{T, N, <:AnyLavaArray}}
 end
 
 """
-    BROADCAST_UNROLL[] :: Int
-
-Elements per thread for the broadcast kernels; 1 restores one-element-per-thread.
-
-Exists to be flipped **inside one session**, because that is the only comparison
-this project accepts: an isolated benchmark showed 5-11% here and a
-dispatch-timing profile showed the elementwise bucket dropping 18 ms, while the
-free-running encode did not move at all across sessions. Setting this to 1 and
-back is how that gets decided instead of argued. Changing it recompiles the
-broadcast kernels once per new value, so warm up after each flip before timing.
-"""
-const BROADCAST_UNROLL = Ref(8)
-
-"""
     broadcastlaunch(n; wg, maxunroll, mingroups) -> (workgroupsize, Val(U), ndrange)
 
 Launch geometry for a flat broadcast over `n` elements.
 
-`U` elements per thread, backed off while the grid would be too small to occupy
-the device — 8 elements per thread over a 4096-element array is 2 workgroups,
-and a kernel that cannot fill the card is slow however well it reads memory.
-`mingroups` is a few per SM (48 here), so the back-off only triggers on arrays
-small enough that the whole launch is noise anyway.
+`maxunroll` is elements per thread; 1 restores one-element-per-thread. It was a
+module-level `Ref` so it could be flipped **inside one session**, because that is
+the only comparison this project accepts: an isolated benchmark showed 5-11% here
+and a dispatch-timing profile showed the elementwise bucket dropping 18 ms, while
+the free-running encode did not move at all across sessions. An argument does
+that without making the setting process-wide. Each new value recompiles the
+broadcast kernels, so warm up after each flip before timing.
+
+`U` is backed off while the grid would be too small to occupy the device — 8
+elements per thread over a 4096-element array is 2 workgroups, and a kernel that
+cannot fill the card is slow however well it reads memory. `mingroups` is a few
+per SM (48 here), so the back-off only triggers on arrays small enough that the
+whole launch is noise anyway.
 
 `ndrange` is rounded up to a whole number of workgroups; the kernels bound every
 access with `n` themselves, so the tail threads simply do nothing.
 """
-@inline function broadcastlaunch(n::Int; wg::Int = 256, maxunroll::Int = BROADCAST_UNROLL[],
+@inline function broadcastlaunch(n::Int; wg::Int = 256, maxunroll::Int = 8,
                                  mingroups::Int = 192)
     u = maxunroll
     while u > 1 && cld(n, wg * u) < mingroups
@@ -238,21 +232,21 @@ end
 end
 
 """
-    BROADCAST_FASTDIV[] :: Bool
+    broadcastextents(sz; fastdiv = false)
 
 Whether the broadcast kernels decompose the linear index by multiplying
 ([`FastDiv32`](@ref)) or by dividing. `false` restores the divisions.
 
-Here for the same reason as [`BROADCAST_UNROLL`](@ref): so the claim can be
+Here for the same reason as `broadcastlaunch`'s `maxunroll`: so the claim can be
 re-measured **inside one session** rather than against a number from another day.
 Two cross-session readings of the unroll disagreed by 38 ms in opposite
 directions, and both were noise.
 """
-const BROADCAST_FASTDIV = Ref(true)
+const BROADCAST_FASTDIV_DEFAULT = true
 
 "Extents in the form `cart32` should decompose them with."
-@inline broadcastextents(sz::Dims) =
-    BROADCAST_FASTDIV[] ? map(FastDiv32, sz) : map(Int32, sz)
+@inline broadcastextents(sz::Dims; fastdiv::Bool = BROADCAST_FASTDIV_DEFAULT) =
+    fastdiv ? map(FastDiv32, sz) : map(Int32, sz)
 
 # The kernels hand `cart32` an unsigned position; the dividing path still wants
 # the signed extents it was written for.
@@ -412,7 +406,11 @@ function probe_broadcast!(path, dest, bc)
     return
 end
 
-function GPUArrays._copyto!(dest::AnyLavaArray, bc::Broadcast.Broadcasted)
+# `fastdiv` is optional and defaulted, so GPUArrays' own two-argument call is
+# unchanged — but a test can drive both index paths without a global. It was
+# `BROADCAST_FASTDIV[]`, set and restored around the comparison.
+function GPUArrays._copyto!(dest::AnyLavaArray, bc::Broadcast.Broadcasted;
+                            fastdiv::Bool = BROADCAST_FASTDIV_DEFAULT)
     axes(dest) == axes(bc) || Broadcast.throwdm(axes(dest), axes(bc))
     isempty(dest) && return dest
     n = length(dest)
@@ -436,7 +434,7 @@ function GPUArrays._copyto!(dest::AnyLavaArray, bc::Broadcast.Broadcasted)
     # Extents as magic numbers, so `cart32` multiplies instead of dividing. Built
     # per launch on the host: three `UInt32` per axis and one `÷` each, against
     # the ~15 us per axis a real division costs across a 2.4 M-element dispatch.
-    sz = broadcastextents(size(dest))
+    sz = broadcastextents(size(dest); fastdiv)
     if linear
         probe_broadcast!(:linear1d, dest, bc)
         lava_broadcast_flat!(backend)(dest, bc, n, u, Val(wg);

@@ -164,7 +164,7 @@ function lava_launch!(bq::BatchQueue, @nospecialize(f), args...;
                        compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 
     if (bq.ctx::VkContext).diag.dispatch_logging
-        LAST_DISPATCH_INFO[] = "compute f=$(nameof(typeof(converted_f))) groups=$groups"
+        bq.last_dispatch_info = "compute f=$(nameof(typeof(converted_f))) groups=$groups"
     end
     vk_dispatch!(bq, pipeline, arg_buf.address, groups, tlas)
     return nothing
@@ -595,8 +595,11 @@ function get_arg_buffer(bq::BatchQueue, nbytes::Integer)
 end
 
 """
-Slabs a captured sequence still points at, per queue: `reset_arg_buffer_pool!`
-must not hand them out again.
+    reserve_arg_slabs!(bq)
+
+Move `bq`'s bump allocator past everything recorded so far and keep it there —
+`bq.reserved_arg_slabs` is the high-water mark `reset_arg_buffer_pool!` must not
+hand out again.
 
 A dispatch's arguments live in an arg slab and the slab address is baked into
 the command buffer as a push constant, so a replayed command buffer reads
@@ -605,13 +608,9 @@ slab 1 offset 0 once the queue drains, which would let the next recording
 overwrite exactly those bytes — the replay would then dispatch a live pipeline
 against another kernel's arguments. Capturing reserves the slabs it filled.
 """
-const RESERVED_ARG_SLABS = IdDict{BatchQueue,Int}()
-push!(RESET_CALLBACKS, () -> empty!(RESERVED_ARG_SLABS))
-
-"""Move the bump allocator past everything recorded so far and keep it there."""
 function reserve_arg_slabs!(bq::BatchQueue)
-    RESERVED_ARG_SLABS[bq] = max(get(RESERVED_ARG_SLABS, bq, 0), bq.arg_slab_idx)
-    bq.arg_slab_idx = RESERVED_ARG_SLABS[bq] + 1
+    bq.reserved_arg_slabs = max(bq.reserved_arg_slabs, bq.arg_slab_idx)
+    bq.arg_slab_idx = bq.reserved_arg_slabs + 1
     bq.arg_slab_offset = 0
     return
 end
@@ -647,7 +646,7 @@ end
 
 """Reset arg buffer slab allocator for `bq` after its in_flight batches drained."""
 function reset_arg_buffer_pool!(bq::BatchQueue)
-    bq.arg_slab_idx = get(RESERVED_ARG_SLABS, bq, 0) + 1
+    bq.arg_slab_idx = bq.reserved_arg_slabs + 1
     bq.arg_slab_offset = 0
     bq.arg_alloc_count = 0
     bq.arg_pool_frontier = UInt64(0)

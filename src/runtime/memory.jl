@@ -8,19 +8,16 @@
 # All off by default — opt-in via the *_ENABLED Refs.
 
 # Per-finalizer destruction trace
-const FREE_DEBUG_LOG = NamedTuple[]
 
 # Per-allocation trace
-const ALLOC_DEBUG_LOG = NamedTuple[]
 
 # When enabled, vk_free! scans every live BatchQueue's arg/indirect slabs for
 # any UInt64 == buf.address.  Hits are logged + zeroed so the GPU faults on a
 # clean null reference instead of corrupting random memory.  Optionally
 # throws a LavaError instead of just logging (`ctx.diag.destroy_freed_bdas_throws`).
-const FREED_BDA_SCAN_LOG = NamedTuple[]
 
 # Pre-submit unknown-BDA scan: scans the active arg slab region for any
-# BDA-shaped UInt64 that isn't in LIVE_BUFFERS or any pool block / slab.
+# BDA-shaped UInt64 that isn't in the pool's `live_buffers` or any pool block / slab.
 # Optionally throws a LavaError instead of just warning.
 
 # When true, pack_arg!(::VkManagedBuffer, ...) asserts the buffer's state ==
@@ -28,16 +25,15 @@ const FREED_BDA_SCAN_LOG = NamedTuple[]
 # reference makes it through to a kernel arg.
 
 # When set to a non-zero target BDA, every submit! scans the active arg slab
-# for the target value and logs (submit_idx, offsets) to SLAB_DUMP_LOG.  Used
+# for the target value and logs (submit_idx, offsets) to `diag.slab_dump_log`.  Used
 # to track when a known-stale address enters/leaves the arg slab.
-const SLAB_DUMP_LOG = NamedTuple[]
 
 """
     scan_arg_slabs_for_bda!(buf) -> Int
 
 Scan every live BatchQueue's `arg_slabs` (and `indirect_slabs`) for any
 UInt64 word matching `buf.address`.  For each hit, append a record to
-`FREED_BDA_SCAN_LOG` and overwrite the slot with 0 so the GPU faults
+`diag.freed_bda_scan_log` and overwrite the slot with 0 so the GPU faults
 cleanly on a null reference instead of touching the freed memory.
 Returns the number of hits found.
 
@@ -59,7 +55,6 @@ const BUF_STATE_DEAD     = UInt8(2)
 
 
 # Strong references to keep Vulkan handles alive until explicit free
-const LIVE_BUFFERS = Set{VkManagedBuffer}()
 
 # Poison value for freed buffer addresses — enables use-after-free detection
 # on the GPU side (a shader dereffing a freed BDA traps with this value).
@@ -71,14 +66,11 @@ const LIVE_BUFFERS = Set{VkManagedBuffer}()
 # arg buffer slots for `== 0`.
 const BDA_POISON = UInt64(0)
 
-# Register cleanup callback for vk_reset_device!.  Indirect slabs are per-BQ now
-# and die with the old ctx, so only the global memory stats need resetting.
-push!(RESET_CALLBACKS, function()
-    empty!(LIVE_BUFFERS)
-    GPU_LIVE_BYTES[] = 0
-    reset_memory_stats!()
-    # Per-BQ staging, indirect, and arg slabs die with the old ctx.
-end)
+# No reset callback: every counter above is a `DevicePool` field, and the pool
+# is a `VkContext` field, so all of it dies with the context `vk_reset_device!`
+# retires. Staging, indirect and arg slabs are per-`BatchQueue` and go the same
+# way. `reset_memory_stats!` is the one piece left, and `vk_reset_device!` calls
+# it directly.
 
 # ── GPU memory pressure tracking (ported from AMDGPU.jl) ──
 # Julia's GC doesn't know about GPU memory. LavaArray wrappers are ~50 bytes on
@@ -97,11 +89,10 @@ end)
 #   * EWMA on `last_gc_time` so a single slow GC doesn't permanently inhibit
 #     future GCs.
 #
-# `GPU_LIVE_BYTES` is incremented by `try_vk_alloc` (real Vulkan allocations,
+# `pool.live_bytes` is incremented by `try_vk_alloc` (real Vulkan allocations,
 # including pool blocks) and decremented by `destroy_buffer!`.  Sub-pool chunks
 # don't move this counter — the pool block they live in already accounts for
 # the VRAM.
-const GPU_LIVE_BYTES = Threads.Atomic{Int}(0)
 
 mutable struct MemoryStats
     # Estimated maximum bytes available to us on the device-local heap.
@@ -220,7 +211,7 @@ caller is about to do a heavy synchronous operation anyway.
 
 function maybe_trim_pool!(ctx::VkContext)
     p = pool(ctx)
-    GPU_LIVE_BYTES[] < p.trim_threshold && return
+    p.live_bytes[] < p.trim_threshold && return
     now = time()
     now - p.last_trim < p.trim_min_interval && return
     p.last_trim = now
@@ -284,7 +275,7 @@ function maybe_collect(ctx::VkContext; blocking::Bool=false)
     size = (@atomic stats.size)
     size > 0 || return  # haven't probed yet
 
-    live = GPU_LIVE_BYTES[]
+    live = pool(ctx).live_bytes[]
     pressure = live / size
     min_pressure = blocking ? 0.5 : 0.75
     pressure < min_pressure && return
@@ -305,10 +296,10 @@ function maybe_collect(ctx::VkContext; blocking::Bool=false)
 
     pre_gc_live = live
     gc_time = Base.@elapsed GC.gc(false)
-    post_gc_live = GPU_LIVE_BYTES[]
+    post_gc_live = pool(ctx).live_bytes[]
 
     # The GC just returned sub-allocations to their pool blocks, but a block is
-    # only handed back to the driver on an OOM retry.  `GPU_LIVE_BYTES` tracks
+    # only handed back to the driver on an OOM retry.  `pool.live_bytes` tracks
     # pool *capacity*, so without this the pressure signal never falls: we keep
     # collecting, relieve nothing, and the first thing to notice the pool is
     # holding gigabytes of dead blocks is an allocation failure — or, on an iGPU
@@ -323,7 +314,7 @@ function maybe_collect(ctx::VkContext; blocking::Bool=false)
         quiesce_before_reclaim!(bq)
         n_blocks, bytes_freed = reclaim_empty_pool_blocks!(bq)
         n_blocks > 0 && @debug "Lava: reclaimed empty pool blocks after GC" blocks=n_blocks MiB=(bytes_freed >> 20)
-        post_gc_live = GPU_LIVE_BYTES[]
+        post_gc_live = pool(ctx).live_bytes[]
     end
 
     @atomic stats.last_freed = pre_gc_live - post_gc_live
@@ -347,9 +338,9 @@ function format_oom_error(ctx::VkContext, fail::AllocFailure)
     io = IOBuffer()
     println(io, "Out of GPU memory.")
     req_mb = fail.nbytes ÷ (1024 * 1024)
-    live_mb = GPU_LIVE_BYTES[] ÷ (1024 * 1024)
+    live_mb = pool(ctx).live_bytes[] ÷ (1024 * 1024)
     println(io, "  Vulkan returned $(fail.code) from $(fail.op) for $(fail.nbytes) bytes ($(req_mb) MiB).")
-    println(io, "  Lava tracked state: $(live_mb) MiB live across $(length(LIVE_BUFFERS)) buffers.")
+    println(io, "  Lava tracked state: $(live_mb) MiB live across $(length(pool(ctx).live_buffers)) buffers.")
     if fail.mem_type_idx >= 0
         mem_props = ctx.memory_properties
         mt = mem_props.memory_types[fail.mem_type_idx + 1]
@@ -403,7 +394,7 @@ function vk_alloc(bq::BatchQueue, nbytes::Integer;
         "Vulkan device is lost — cannot allocate new buffers",
         "Call Lava.vk_reset_device!() to reinitialize, or restart Julia."))
     if pool(bq.ctx::VkContext).track_allocs
-        _record_alloc_site!(Int(nbytes))
+        record_alloc_site!(bq.ctx::VkContext, Int(nbytes))
     end
     # Phase 7 P2: reclaim retired in-flight batches on THIS queue before
     # allocating.  Multi-queue: each caller only drains its own queue's
@@ -452,18 +443,18 @@ batch-signal desync, or a segfault inside the driver's `vkCmdPipelineBarrier`.
 Flushing first makes the invariant unconditional — after it there is no
 recorded-but-unsubmitted work and everything submitted has completed — and it
 only runs once an allocation has already failed, so the stall is free in the
-steady state. `RECLAIMING` guards the re-entry through `flush!`'s own
+steady state. `pool.reclaiming` guards the re-entry through `flush!`'s own
 allocations.
 """
-const RECLAIMING = Threads.Atomic{Bool}(false)
 
 function quiesce_before_reclaim!(bq::BatchQueue)
-    if !RECLAIMING[] && !device_lost(bq.ctx::VkContext)
-        RECLAIMING[] = true
+    p = pool(bq.ctx::VkContext)
+    if !p.reclaiming[] && !device_lost(bq.ctx::VkContext)
+        p.reclaiming[] = true
         try
             flush!(bq, bq.device)
         finally
-            RECLAIMING[] = false
+            p.reclaiming[] = false
         end
     end
     GC.gc(true)
@@ -548,10 +539,12 @@ function try_vk_alloc(bq::BatchQueue, nbytes::Integer;
     address = Vulkan.get_buffer_device_address(dev, addr_info)
 
     result = VkManagedBuffer(buf, memory, address, mapped_ptr, Int(nbytes), 0, nothing, nothing, BUF_STATE_ALIVE, 0, false, ctx)
-    push!(LIVE_BUFFERS, result)
-    Threads.atomic_add!(GPU_LIVE_BYTES, nbytes)
+    let p = pool(ctx)
+        push!(p.live_buffers, result)
+        Threads.atomic_add!(p.live_bytes, nbytes)
+    end
     if (bq.ctx::VkContext).diag.alloc_debug
-        push!(ALLOC_DEBUG_LOG,
+        push!((bq.ctx::VkContext).diag.alloc_log,
               (kind=:direct, addr=address, size=Int(nbytes), pool=false,
                mtype=Int(mem_type_idx), unified=unified, usage=UInt32(usage)))
     end
@@ -620,12 +613,12 @@ function vk_free!(buf::VkManagedBuffer)
     _, ok = @atomicreplace buf.state BUF_STATE_ALIVE => BUF_STATE_DEFERRED
     ok || return  # already DEFERRED or DEAD — nothing to do
 
-    delete!(LIVE_BUFFERS, buf)
+    delete!(pool(buf.ctx::VkContext).live_buffers, buf)
 
     if (buf.ctx::VkContext).diag.free_debug
         bqd = buf.ctx.default_bq
         active_dbg = (bqd.active_batch !== nothing) && bqd.active_batch.recording
-        push!(FREE_DEBUG_LOG,
+        push!(buf.ctx.diag.free_log,
               (addr=buf.address, size=buf.size,
                pool=buf.pool_block !== nothing,
                lw=@atomic(:acquire, buf.last_write),
@@ -716,7 +709,7 @@ function vk_free!(buf::VkManagedBuffer)
         if hits > 0 && (buf.ctx::VkContext).diag.destroy_freed_bdas_throws
             throw(LavaError("vk_free!",
                 "destroying buffer at 0x$(string(buf.address, base=16, pad=16)) but its BDA still appears $(hits)× in live arg slabs",
-                "an unpinned reference is leaking — see FREED_BDA_SCAN_LOG"))
+                "an unpinned reference is leaking — see ctx.diag.freed_bda_scan_log"))
         end
     end
 
@@ -783,7 +776,7 @@ function destroy_buffer!(buf::VkManagedBuffer)
         # Device is gone — just poison the handle, don't call Vulkan APIs
         buf.mapped_ptr = Ptr{UInt8}(0)
         buf.address = BDA_POISON
-        Threads.atomic_sub!(GPU_LIVE_BYTES, buf.size)
+        Threads.atomic_sub!(pool(ctx).live_bytes, buf.size)
         buf.size = 0
         return
     end
@@ -802,7 +795,7 @@ function destroy_buffer!(buf::VkManagedBuffer)
         safe_fin_log("Lava destroy_buffer!: Vulkan destructor failed\n")
     end
     buf.address = BDA_POISON
-    Threads.atomic_sub!(GPU_LIVE_BYTES, buf.size)
+    Threads.atomic_sub!(pool(ctx).live_bytes, buf.size)
     buf.size = 0
 end
 
@@ -822,7 +815,7 @@ function scan_arg_slabs_for_bda!(buf::VkManagedBuffer)
             for k in 0:(n-1)
                 v = unsafe_load(p, k+1)
                 if v == target
-                    push!(FREED_BDA_SCAN_LOG,
+                    push!(buf.ctx.diag.freed_bda_scan_log,
                           (slab=kind, idx=i, offset=k*8, freed_bda=target,
                            buf_size=buf.size))
                     unsafe_store!(p, UInt64(0), k+1)
@@ -840,7 +833,7 @@ end
 Walk every UInt64 in every live arg/indirect slab.  Report any value that
 LOOKS like a BDA (in the upper half of the address space, i.e. high bit
 of bit 63 set OR top 16 bits = 0xffff) but is NOT the address of any
-buffer in `LIVE_BUFFERS` and is NOT 0.  Useful for catching stale BDAs
+buffer in the pool's `live_buffers` and is NOT 0.  Useful for catching stale BDAs
 that pin_leaves! / pack_args_direct! missed.
 
 Call this RIGHT BEFORE submit to catch problems before they reach the GPU.
@@ -848,7 +841,7 @@ Call this RIGHT BEFORE submit to catch problems before they reach the GPU.
 function scan_slabs_for_unknown_bdas(bq)
     bq === nothing && return NamedTuple[]
     live = Set{UInt64}()
-    for buf in LIVE_BUFFERS
+    for buf in pool(bq.ctx::VkContext).live_buffers
         push!(live, buf.address)
     end
     pool_ranges = Tuple{UInt64,UInt64}[]
@@ -987,7 +980,11 @@ DevicePool() = DevicePool(PoolBlock[],
                           [VkManagedBuffer[] for _ in 1:POOL_NUM_SIZE_CLASSES],
                           false, false, 2 * 1024^3, 1024 * 1024 * 1024,
                           5.0, 30.0, 0.02, 0.5, false,
-                          0.0, 0.0, 0.0, 0.0, 0.0)
+                          0.0, 0.0, 0.0, 0.0, 0.0,
+                          Threads.Atomic{Int}(0), Set{VkManagedBuffer}(),
+                          Threads.Atomic{Int}(0), Threads.Atomic{Int}(0),
+                          Threads.Atomic{Int}(0), Threads.Atomic{Int}(0),
+                          Threads.Atomic{Bool}(false))
 
 """
     pool(ctx) -> DevicePool
@@ -1073,21 +1070,31 @@ Power-of-two size classes waste up to 2x per chunk, and the pool is the reason
 SAM 2 holds far more VRAM than its live tensors. Whether that rounding is the
 cause or a red herring is a measurement, not a guess — hence these.
 """
-const POOL_REQUESTED = Threads.Atomic{Int}(0)
-const POOL_ROUNDED = Threads.Atomic{Int}(0)
-const POOL_NALLOC = Threads.Atomic{Int}(0)
 
 """Requested / handed-out bytes since `reset_pool_accounting!`, and the ratio."""
-function pool_accounting()
-    req = POOL_REQUESTED[]; rnd = POOL_ROUNDED[]
-    return (; nalloc = POOL_NALLOC[], requested = req, rounded = rnd,
+function pool_accounting(ctx::VkContext = vk_context())
+    p = pool(ctx)
+    req = p.requested[]; rnd = p.rounded[]
+    return (; nalloc = p.nalloc[], requested = req, rounded = rnd,
             efficiency = rnd == 0 ? 1.0 : req / rnd)
 end
 
-function reset_pool_accounting!()
-    POOL_REQUESTED[] = 0; POOL_ROUNDED[] = 0; POOL_NALLOC[] = 0
+function reset_pool_accounting!(ctx::VkContext = vk_context())
+    p = pool(ctx)
+    p.requested[] = 0; p.rounded[] = 0; p.nalloc[] = 0
     return
 end
+
+"""
+    gpu_live_bytes(ctx = vk_context()) -> Int
+    live_buffer_count(ctx = vk_context()) -> Int
+
+What this device currently holds: bytes the driver has handed Lava, and how many
+buffers they are spread over. Both read `ctx`'s own pool — they were module-level
+and so answered for every device at once.
+"""
+gpu_live_bytes(ctx::VkContext = vk_context()) = pool(ctx).live_bytes[]
+live_buffer_count(ctx::VkContext = vk_context()) = length(pool(ctx).live_buffers)
 
 # A block-count watermark used to live here, reclaiming on the allocation path
 # once the pool passed 48 blocks. It is gone: [`maybe_trim_pool!`] does the same
@@ -1148,14 +1155,16 @@ collect and every allocation past it pays for a collection and grows anyway.
 # Rate limits. The incremental collection is cheap enough to run between graph
 # steps; the full one is not, and only it sweeps the old generation that
 # long-lived activations reach.
-const POOL_GC_COUNT = Threads.Atomic{Int}(0)
 
 """Collections run by the soft cap, and the seconds they cost."""
 pool_gc_stats(ctx::VkContext = vk_context()) =
-    (; count = POOL_GC_COUNT[], seconds = pool(ctx).gc_seconds)
+    (; count = pool(ctx).gc_count[], seconds = pool(ctx).gc_seconds)
 
-function reset_pool_gc_stats!()
-    POOL_GC_COUNT[] = 0; pool(ctx).gc_seconds = 0.0
+# `ctx` was missing from this signature while the counter was global, so the body
+# referenced an undefined name and the function could only ever have thrown.
+function reset_pool_gc_stats!(ctx::VkContext = vk_context())
+    p = pool(ctx)
+    p.gc_count[] = 0; p.gc_seconds = 0.0
     return
 end
 
@@ -1183,7 +1192,7 @@ function collect_for_pool!(bq::BatchQueue)
     end
     p.gc_last = time()
     p.gc_seconds += (time_ns() - t0) / 1e9
-    Threads.atomic_add!(POOL_GC_COUNT, 1)
+    Threads.atomic_add!(p.gc_count, 1)
     return true
 end
 
@@ -1206,17 +1215,17 @@ function alloc_pool_block(bq::BatchQueue)
                 "Free unused LavaArrays, reduce problem size, or check for memory leaks with Lava.gpu_memory_usage()."))
         end
     end
-    # Extract Vulkan handles from the VkManagedBuffer, then remove it from LIVE_BUFFERS
+    # Extract Vulkan handles from the VkManagedBuffer, then remove it from `live_buffers`
     # (the pool block manages its own lifetime, not the per-chunk tracking)
     p = pool(bq.ctx::VkContext)
     block = PoolBlock(buf_result.buffer, buf_result.memory, buf_result.address,
                       POOL_BLOCK_SIZE, 0, 0, p)
-    delete!(LIVE_BUFFERS, buf_result)
-    # Don't subtract from GPU_LIVE_BYTES — the block IS live memory.
-    # Individual chunks don't add to GPU_LIVE_BYTES since the block already accounts for it.
+    delete!(p.live_buffers, buf_result)
+    # Don't subtract from `live_bytes` — the block IS live memory. Individual
+    # chunks don't add to it since the block already accounts for them.
     push!(p.blocks, block)
     if (bq.ctx::VkContext).diag.alloc_debug
-        push!(ALLOC_DEBUG_LOG, (kind=:pool_block, addr=buf_result.address,
+        push!((bq.ctx::VkContext).diag.alloc_log, (kind=:pool_block, addr=buf_result.address,
                                 size=POOL_BLOCK_SIZE, pool=true))
     end
     return block
@@ -1225,14 +1234,12 @@ end
 # Diagnostic: track allocation call sites during recording.
 # Set `pool(ctx).track_allocs = true` to record stack traces of every allocation while the
 # active batch is recording. Used to find per-frame allocations leaking into the
-# render loop. Reads are merged into ALLOC_TRACE; query via dump_alloc_trace().
+# render loop. Reads are merged into `ctx.diag.alloc_trace`; query via `dump_alloc_trace()`.
 # site => (count, bytes). Bytes as well as counts because the two rank call
 # sites completely differently — a hot site allocating 4 KiB matters far less
 # than one full-size tensor per layer.
-const ALLOC_TRACE = Dict{Symbol, Tuple{Int,Int}}()
-const ALLOC_TRACE_LOCK = ReentrantLock()
 
-function _record_alloc_site!(nbytes::Int)
+function record_alloc_site!(ctx::VkContext, nbytes::Int)
     bt = stacktrace(backtrace())
     # Capture full stack as a single key (truncated to first 6 user frames)
     user_frames = String[]
@@ -1251,15 +1258,17 @@ function _record_alloc_site!(nbytes::Int)
         length(user_frames) >= 4 && break
     end
     site = Symbol(isempty(user_frames) ? "unknown" : join(user_frames, " <- "))
-    lock(ALLOC_TRACE_LOCK) do
-        c, b = get(ALLOC_TRACE, site, (0, 0))
-        ALLOC_TRACE[site] = (c + 1, b + nbytes)
+    d = ctx.diag
+    lock(d.alloc_trace_lock) do
+        c, b = get(d.alloc_trace, site, (0, 0))
+        d.alloc_trace[site] = (c + 1, b + nbytes)
     end
 end
 
-function dump_alloc_trace()
-    lock(ALLOC_TRACE_LOCK) do
-        sorted = sort(collect(ALLOC_TRACE), by = x -> x[2][2], rev = true)
+function dump_alloc_trace(ctx::VkContext = vk_context())
+    d = ctx.diag
+    lock(d.alloc_trace_lock) do
+        sorted = sort(collect(d.alloc_trace), by = x -> x[2][2], rev = true)
         tot = sum(x -> x[2][2], sorted; init = 0)
         for (site, (count, bytes)) in sorted
             println("  ", lpad(string(round(bytes / 1e6, digits = 1)), 8), " MB  ",
@@ -1269,9 +1278,10 @@ function dump_alloc_trace()
     end
 end
 
-function clear_alloc_trace!()
-    lock(ALLOC_TRACE_LOCK) do
-        empty!(ALLOC_TRACE)
+function clear_alloc_trace!(ctx::VkContext = vk_context())
+    d = ctx.diag
+    lock(d.alloc_trace_lock) do
+        empty!(d.alloc_trace)
     end
 end
 
@@ -1293,7 +1303,7 @@ function pool_alloc(bq::BatchQueue, nbytes::Integer; extra_usage::UInt32=UInt32(
     nbytes = max(Int(nbytes), POOL_MIN_SIZE)
     p = pool(ctx)
     if p.track_allocs
-        _record_alloc_site!(nbytes)
+        record_alloc_site!(bq.ctx::VkContext, nbytes)
     end
     sweep_retired_batches!(bq)
     drain_deferred_frees!(bq)
@@ -1314,9 +1324,9 @@ function pool_alloc(bq::BatchQueue, nbytes::Integer; extra_usage::UInt32=UInt32(
     # failure.
     idx, alloc_size = size_class(nbytes)
     if p.accounting
-        Threads.atomic_add!(POOL_REQUESTED, nbytes)
-        Threads.atomic_add!(POOL_ROUNDED, alloc_size)
-        Threads.atomic_add!(POOL_NALLOC, 1)
+        Threads.atomic_add!(p.requested, nbytes)
+        Threads.atomic_add!(p.rounded, alloc_size)
+        Threads.atomic_add!(p.nalloc, 1)
     end
 
     # Try the free list first. If empty, run GC (which drains LavaArray
@@ -1437,10 +1447,10 @@ function reclaim_empty_pool_blocks!(bq::BatchQueue)
             end
         end
     end
-    # Pool blocks ARE counted in GPU_LIVE_BYTES (see alloc_pool_block —
+    # Pool blocks ARE counted in `live_bytes` (see alloc_pool_block —
     # we intentionally don't subtract per-chunk because the block is the
     # real live memory).  Subtract the reclaimed capacity here.
-    Threads.atomic_sub!(GPU_LIVE_BYTES, bytes_reclaimed)
+    Threads.atomic_sub!(pool(bq.ctx::VkContext).live_bytes, bytes_reclaimed)
     return (length(empty_blocks), bytes_reclaimed)
 end
 
@@ -1521,8 +1531,10 @@ function get_staging(bq::BatchQueue, nbytes::Integer)
     managed = VkManagedBuffer(vkbuf, memory, UInt64(0),   # no BDA needed for staging
                               mapped_ptr, Int(alloc_size),
                               0, nothing, nothing, BUF_STATE_ALIVE, 0, false, ctx)
-    push!(LIVE_BUFFERS, managed)
-    Threads.atomic_add!(GPU_LIVE_BYTES, managed.size)
+    let p = pool(ctx)
+        push!(p.live_buffers, managed)
+        Threads.atomic_add!(p.live_bytes, managed.size)
+    end
     bq.staging = managed
     return (vkbuf, memory, mapped_ptr, Int(alloc_size))
 end

@@ -55,7 +55,7 @@ end
 # sortperm must terminate (no mutual recursion) and not blow up the pool.
 @testset "sortperm terminates and does not balloon the pool" begin
     n = 100_000
-    before = Lava.GPU_LIVE_BYTES[]
+    before = Lava.gpu_live_bytes()
     h = rand(UInt32, n)
     v = Lava.LavaArray(copy(h))
     ix = Lava.LavaArray(collect(Int32(1):Int32(n)))
@@ -63,5 +63,5 @@ end
     Lava.vk_flush!(Lava.vk_context())
     @test h[Array(ix)] == sort(h)
     # Recursion used to grow the pool by tens of GB before dying.
-    @test Lava.GPU_LIVE_BYTES[] - before < 256_000_000
+    @test Lava.gpu_live_bytes() - before < 256_000_000
 end

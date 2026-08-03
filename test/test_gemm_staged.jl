@@ -25,7 +25,7 @@ using Test, Lava, DNNKernels, KernelAbstractions
 const KA = KernelAbstractions
 
 "Relative error of `matmul!` against a Float32 CPU reference, over a slice."
-function gemmerr(backend, ws, M, N, K; staged::Bool, withbias::Bool)
+function gemmerr(backend, ws, M, N, K; staged::Bool, withbias::Bool, gemmkw...)
     # `matmul!` takes a context, not a `(backend, ws)` pair — DNNKernels'
     # kernel-library refactor moved every entry point onto `Ctx`, which is one
     # argument where there were two. This test is in the OTHER repo and so was
@@ -43,17 +43,14 @@ function gemmerr(backend, ws, M, N, K; staged::Bool, withbias::Bool)
         bias = KA.allocate(backend, Float16, M)
         copyto!(bias, hbias)
     end
-    old = Lava.GEMM_STAGED[]
     out = KA.allocate(backend, Float16, M, N)
     fill!(out, zero(Float16))
-    try
-        Lava.GEMM_STAGED[] = staged
-        DNNKernels.reset!(ws)
-        DNNKernels.matmul!(ctx, out, A, B, bias)
-        KA.synchronize(backend)
-    finally
-        Lava.GEMM_STAGED[] = old
-    end
+    # Passed, not set. These were `Lava.GEMM_STAGED[]` and friends, saved and
+    # restored around the call — and a test that threw before the `finally` left
+    # the setting on for every later test in the process.
+    DNNKernels.reset!(ws)
+    DNNKernels.matmul!(ctx, out, A, B, bias; gemm = (; staged, gemmkw...))
+    KA.synchronize(backend)
     rows = 1:min(M, 24)
     ref = Float32.(hA[rows, :]) * Float32.(hB)
     withbias && (ref = ref .+ Float32.(hbias[rows]))
@@ -101,24 +98,19 @@ end
     end
 
     @testset "both staging widths accumulate every k-term, at every K" begin
-        # `GEMM_VEC2` picks between scalar and `vec2` staging buffers, and both
-        # are generated for every tiling — so both have to be swept, not just
-        # whichever is currently the default.
-        old = Lava.GEMM_VEC2[]
-        try
-            for v2 in (false, true)
-                Lava.GEMM_VEC2[] = v2
-                for cfg in Lava.GEMM_TILINGS,
-                    K in (32, 64, 96, 128, 288, 576, 2304)
-                    K % Lava.gemm_bk(cfg) == 0 || continue
-                    v2 && !haskey(Lava.GEMM_STAGED_V2_KERNELS, cfg) && continue
-                    @test gemmerr(backend, ws, Lava.gemm_bm(cfg) * 2,
-                                  Lava.gemm_bn(cfg) * 2, K;
-                                  staged = true, withbias = false) < 2.0f-2
-                end
+        # `vec2` picks between scalar and `vec2` staging buffers, and both are
+        # generated for every tiling — so both have to be swept, not just
+        # whichever is currently the default. Passed per call now; it used to be
+        # a global set inside a `try`.
+        for v2 in (false, true)
+            for cfg in Lava.GEMM_TILINGS,
+                K in (32, 64, 96, 128, 288, 576, 2304)
+                K % Lava.gemm_bk(cfg) == 0 || continue
+                v2 && !haskey(Lava.GEMM_STAGED_V2_KERNELS, cfg) && continue
+                @test gemmerr(backend, ws, Lava.gemm_bm(cfg) * 2,
+                              Lava.gemm_bn(cfg) * 2, K;
+                              staged = true, withbias = false, vec2 = v2) < 2.0f-2
             end
-        finally
-            Lava.GEMM_VEC2[] = old
         end
     end
 
@@ -137,38 +129,28 @@ end
     end
 
     @testset "the tiling chooser only returns blocks that divide the shape" begin
-        old = Lava.GEMM_TILING[]
-        try
-            Lava.GEMM_TILING[] = nothing
-            for (M, N, K) in vcat(shapes, [(288, 16384, 1152), (1152, 16384, 288),
-                                           (2304, 4096, 576), (48, 64, 64)])
-                c = Lava.gemm_tiling(M, N, K)
-                c === nothing && continue
-                @test M % Lava.gemm_bm(c) == 0
-                @test N % Lava.gemm_bn(c) == 0
-                @test K % Lava.gemm_bk(c) == 0
-                @test c in Lava.GEMM_TILINGS
-            end
-        finally
-            Lava.GEMM_TILING[] = old
+        # No save/restore: `gemm_tiling` takes the forced tiling as an argument,
+        # and not passing one IS the unforced case.
+        for (M, N, K) in vcat(shapes, [(288, 16384, 1152), (1152, 16384, 288),
+                                       (2304, 4096, 576), (48, 64, 64)])
+            c = Lava.gemm_tiling(M, N, K)
+            c === nothing && continue
+            @test M % Lava.gemm_bm(c) == 0
+            @test N % Lava.gemm_bn(c) == 0
+            @test K % Lava.gemm_bk(c) == 0
+            @test c in Lava.GEMM_TILINGS
         end
     end
 
     @testset "the guard names the calls the staged kernel may take" begin
-        old = (Lava.GEMM_STAGED[], Lava.GEMM_TILING[])
-        try
-            Lava.GEMM_STAGED[] = true
-            Lava.GEMM_TILING[] = nothing
-            for (M, N, K) in shapes
-                splitk = Lava.coopmat_gemm_shape(M, N, K)[2]
-                Lava.staged_gemm_tiling(M, N, K, 1, splitk) === nothing || @test splitk == 1
-            end
-            @test Lava.staged_gemm_tiling(64, 64, 64, 1, 4) === nothing   # split: refused
-            @test Lava.staged_gemm_tiling(64, 64, 64, 2, 1) === nothing   # batched: refused
-            @test Lava.staged_gemm_tiling(48, 40, 64, 1, 1) === nothing   # no block divides
-        finally
-            Lava.GEMM_STAGED[], Lava.GEMM_TILING[] = old
+        for (M, N, K) in shapes
+            splitk = Lava.coopmat_gemm_shape(M, N, K)[2]
+            Lava.staged_gemm_tiling(M, N, K, 1, splitk; staged = true) === nothing ||
+                @test splitk == 1
         end
+        @test Lava.staged_gemm_tiling(64, 64, 64, 1, 4; staged = true) === nothing  # split: refused
+        @test Lava.staged_gemm_tiling(64, 64, 64, 2, 1; staged = true) === nothing  # batched: refused
+        @test Lava.staged_gemm_tiling(48, 40, 64, 1, 1; staged = true) === nothing  # no block divides
     end
 end
 
@@ -182,10 +164,7 @@ end
     # Asserted as *selection*, not as speed: a timing assertion on this card is a
     # coin flip (the clock idles at 210 MHz of 2265) and would fail for reasons
     # that have nothing to do with the rule.
-    old = (Lava.GEMM_STAGED[], Lava.GEMM_TILING[])
-    try
-        Lava.GEMM_STAGED[], Lava.GEMM_TILING[] = true, nothing
-
+    let
         c96 = (3, 2, 2, 4, 32, 8)
         @test Lava.gemm_bm(c96) == 96 && !ispow2(Lava.gemm_bm(c96))
         @test Lava.gemm_aliasing(c96, 2304)          # 256 * 9
@@ -217,8 +196,6 @@ end
         @test Lava.gemm_tiling( 576, 4096,  576) == c96
         @test Lava.gemm_tiling( 288, 16384, 1152) == c96
         @test Lava.gemm_tiling(1152, 16384,  288) == c96
-    finally
-        Lava.GEMM_STAGED[], Lava.GEMM_TILING[] = old
     end
 end
 
@@ -231,9 +208,7 @@ end
     # launch: "no method matching ... ::typeof(identity), ::Val{288}".
     #
     # A switch whose other side is broken is not a switch. This runs it.
-    old = (Lava.GEMM_VEC2[], Lava.GEMM_TILING[], Lava.GEMM_STAGED[])
-    try
-        Lava.GEMM_STAGED[] = true
+    let
         # `blk_split = (1, 1)` below because the default plan splits K four ways
         # at this size, and an epilogue on a split-K plane is refused — correctly,
         # a plane is a partial sum. Forcing one plane is what puts this on the
@@ -245,10 +220,9 @@ end
         bias = Lava.LavaArray(rand(Float16, M) .- Float16(0.5))
         for withbias in (false, true), epi in (identity, x -> x * 2.0f0)
             outs = map((true, false)) do vec2
-                Lava.GEMM_VEC2[] = vec2
                 C = KA.allocate(LavaBackend(), Float32, M, N); fill!(C, 0f0)
-                Lava.coopmat_gemm!(C, A, B, M, N, K; blk_split = (1, 1),
-                                   bias = withbias ? bias : nothing, epilogue = epi)
+                Lava.coopmat_gemm!(C, A, B, M, N, K; blk_split = (1, 1), staged = true,
+                                   vec2, bias = withbias ? bias : nothing, epilogue = epi)
                 KA.synchronize(LavaBackend())
                 Array(C)
             end
@@ -258,8 +232,6 @@ end
             @test outs[1] == outs[2]
         end
         A = B = bias = nothing; GC.gc()
-    finally
-        Lava.GEMM_VEC2[], Lava.GEMM_TILING[], Lava.GEMM_STAGED[] = old
     end
 end
 
@@ -272,8 +244,7 @@ end
     # in the address arithmetic, and a narrowing bug shows up as a few wrong
     # tiles rather than as garbage.
     back = LavaBackend()
-    old = Lava.GEMM_NARROW[]
-    try
+    let
         @testset "M$M N$N K$K" for (M, N, K) in
                 [(4096, 2304, 576), (4096, 576, 2304), (1024, 1152, 288),
                  (256, 256, 256), (512, 128, 64), (2048, 576, 576)]
@@ -281,12 +252,10 @@ end
             B = Lava.LavaArray(Float16.(reshape(0.2 .* cos.(range(0, 7, K * N)), K, N)))
             C = KA.allocate(back, Float16, M, N)
 
-            Lava.GEMM_NARROW[] = false
-            fill!(C, Float16(0)); Lava.coopmat_gemm!(C, A, B, M, N, K)
+            fill!(C, Float16(0)); Lava.coopmat_gemm!(C, A, B, M, N, K; narrow_ok = false)
             KA.synchronize(back); wide = copy(Array(C))
 
-            Lava.GEMM_NARROW[] = true
-            fill!(C, Float16(0)); Lava.coopmat_gemm!(C, A, B, M, N, K)
+            fill!(C, Float16(0)); Lava.coopmat_gemm!(C, A, B, M, N, K; narrow_ok = true)
             KA.synchronize(back); narrow = copy(Array(C))
 
             @test narrow == wide
@@ -305,7 +274,5 @@ end
         # The boundary is exclusive because the indices are 1-based.
         @test !Lava.gemm_fits32(typemax(Int32), 1, 1)
         @test Lava.gemm_fits32(typemax(Int32) - 1, 1, 1)
-    finally
-        Lava.GEMM_NARROW[] = old
     end
 end

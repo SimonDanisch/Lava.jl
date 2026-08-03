@@ -154,6 +154,24 @@ mutable struct DevicePool
     gc_last::Float64
     gc_full_last::Float64
     gc_seconds::Float64
+
+    # ── Accounting. `live_bytes` is the numerator `gpu_memory_pressure` divides
+    # by the heap size, and `live_buffers` is every buffer this device handed
+    # out. Module-level, these were one number for two heaps: with a second
+    # device the pressure ratio, the trim threshold and the OOM retry all read
+    # the SUM of both devices against ONE device's capacity — so a busy discrete
+    # GPU would drive collection on an idle integrated one, and neither would
+    # report its own footprint. Atomics because `destroy_buffer!` is a finalizer.
+    live_bytes::Threads.Atomic{Int}
+    live_buffers::Set{VkManagedBuffer}
+    # Allocation counters, zeroed by `reset_pool_accounting!`.
+    requested::Threads.Atomic{Int}
+    rounded::Threads.Atomic{Int}
+    nalloc::Threads.Atomic{Int}
+    gc_count::Threads.Atomic{Int}
+    # Guards re-entry into reclamation through `flush!`'s own allocation path.
+    # Per pool: one device quiescing must not make another's reclaim a no-op.
+    reclaiming::Threads.Atomic{Bool}
 end
 
 # Linked result: session-dependent, stored in the cache Dict.
@@ -270,13 +288,61 @@ mutable struct Diagnostics
     spirv_dump_counter::Int
     kernel_debug_counter::Int
     broadcast_probe::Any
+
+    # ── The buffers the flags above fill. They were module-level `Vector`s and
+    # `Dict`s, which the census that drove this refactor could not see: it
+    # matched `= Ref` and these are collections. Same defect all the same — with
+    # two devices every log interleaved both, so the record of what one device
+    # allocated, dispatched or waited on was a record of neither.
+    alloc_log::Vector{NamedTuple}
+    free_log::Vector{NamedTuple}
+    freed_bda_scan_log::Vector{NamedTuple}
+    slab_dump_log::Vector{NamedTuple}
+    # Allocation totals by tag, filled when `track_allocs` is on.
+    alloc_trace::Dict{Symbol,Tuple{Int,Int}}
+    alloc_trace_lock::ReentrantLock
+    # The rolling dispatch log `throw_with_validation_context` prints, and the
+    # per-batch wait times behind `batch_timing`.
+    dispatch_log::Vector{String}
+    batch_wait_times::Vector{Float64}
+    batch_wait_info::Vector{String}
+    batch_wait_dispatches::Vector{Int}
+    # Pipelines this device compiled or refused to.
+    pipeline_compile_misses::Vector{String}
+    pipeline_compiles_refused::Int
+    # Lifetime dispatch counters. Atomics: `submit!` may run off the main thread.
+    flush_counter::Threads.Atomic{Int}
+    total_dispatches::Threads.Atomic{Int}
 end
 
 Diagnostics() = Diagnostics(false, false, false, false, false, false, false, nothing,
                             false, false, nothing, false,
-                            false, true, nothing, 0, 0, nothing)
+                            false, true, nothing, 0, 0, nothing,
+                            NamedTuple[], NamedTuple[], NamedTuple[], NamedTuple[],
+                            Dict{Symbol,Tuple{Int,Int}}(), ReentrantLock(),
+                            String[], Float64[], String[], Int[],
+                            String[], 0,
+                            Threads.Atomic{Int}(0), Threads.Atomic{Int}(0))
 
 # ── Per-device state ─────────────────────────────────────────────────────────
+
+"""
+    IterPlan
+
+A kernel's launch decomposition: the KA context, the 3-D block grid, the
+workgroup size, and the block count.
+
+Lives here rather than beside its only user in `ka_backend.jl` so
+`DeviceCaches.iterplans` can name its element type. `block_dims` comes from
+`pad_to_3d(ctx, …)`, which reads `ctx.max_wg_dims` — so a plan describes one
+device, and the cache holding it has to belong to that device.
+"""
+struct IterPlan{Ctx}
+    ka_ctx::Ctx
+    block_dims::NTuple{3, Int}
+    ws_3d::NTuple{3, Int}
+    nblocks::Int
+end
 
 """
     DeviceCaches
@@ -320,6 +386,11 @@ mutable struct DeviceCaches
     timestamp_pool::Union{Nothing,Vulkan.QueryPool}
     timestamp_next_slot::Int
     timestamp_period_ns::Float64
+    # The dispatches this device timestamped. `Any` because `DispatchTiming` is
+    # declared in `profiling.jl`; the slots it indexes are `timestamp_pool`'s, so
+    # a module-level vector was a list of one device's slot numbers read against
+    # whichever device's pool happened to be current.
+    recorded_dispatches::Vector{Any}
     # The frozen kernel cache's session memo, holding `LavaLinkedKernel`s — each
     # of which owns a `VkPipeline`. Same §8 class as the caches above, and missed
     # for the same reason `BLIT_PIPELINE` was: nothing on the two-device probe's
@@ -330,6 +401,22 @@ mutable struct DeviceCaches
     # `VkPipelineCache` here for `frozen_store` to snapshot. Narrow window, but a
     # driver object all the same, and two devices recording at once would swap it.
     frozen_last_pcache::Any
+    # Launch decompositions, keyed by (kernel type, ndrange, workgroupsize) — a
+    # key that does NOT name the device, while the value does: `block_dims` is
+    # `pad_to_3d(ctx, …)` over `ctx.max_wg_dims`. Two devices with different
+    # `maxComputeWorkGroupCount` therefore handed the second one the first one's
+    # block grid. Same class as the caches above; it survived the first sweep
+    # because that census matched `= Ref` and this is a `Dict`.
+    iterplans::Dict{Any,IterPlan}
+    # Scratch buffers. These hold DEVICE MEMORY, so a process-wide one is the
+    # defect the memory pool had: the second device is handed the first's buffer.
+    # Both were already keyed by context, which is the surrogate a field replaces.
+    reduce_scratch::Any          # one unified cell for `vk_reduce_sum`
+    gemm_split_scratch::Any      # split-K partials; grows, never shrinks
+    # Grown-past scratch, retained rather than dropped: dispatches already
+    # recorded point into the old buffer and its finalizer would pull it out
+    # from under them.
+    gemm_split_retired::Vector{Any}
 end
 
 # `DevicePool()` resolves at call time, long after `memory.jl` is loaded.
@@ -338,5 +425,6 @@ DeviceCaches() = DeviceCaches(
     Dict{Any,LavaLinkedKernel}(), IdDict{DataType,Vector{LaunchPlan}}(),
     nothing, DevicePool(), 0, nothing, false,
     Dict{UInt64,CompiledGraphicsPipeline}(), Dict{UInt64,LavaGfxShader}(),
-    nothing, nothing, 0, 1.0,
-    Dict{Tuple{DataType,DataType,Any},Any}(), nothing)
+    nothing, nothing, 0, 1.0, Any[],
+    Dict{Tuple{DataType,DataType,Any},Any}(), nothing,
+    Dict{Any,IterPlan}(), nothing, nothing, Any[])

@@ -148,18 +148,18 @@ using KernelAbstractions
     # `GPU_LIVE_BYTES / heap_size`.  Verify the live-bytes accounting still
     # increments on `vk_alloc` and decrements on `vk_free!`.
     @testset "GC pressure tracking" begin
-        @testset "GPU_LIVE_BYTES tracks vk_alloc / vk_free!" begin
+        @testset "live_bytes tracks vk_alloc / vk_free!" begin
             bq = Lava.vk_context().default_bq
-            before = Lava.GPU_LIVE_BYTES[]
+            before = Lava.gpu_live_bytes()
             buf = Lava.vk_alloc(bq, 1024)
-            after_alloc = Lava.GPU_LIVE_BYTES[]
+            after_alloc = Lava.gpu_live_bytes()
             @test after_alloc >= before + 1024
             Lava.vk_free!(buf)
             # Buffer may be deferred (timeline gate); a sync ensures destroy
             # actually runs and decrements GPU_LIVE_BYTES.
             Lava.vk_flush!(Lava.vk_context())
             Lava.drain_deferred_frees!(bq)
-            after_free = Lava.GPU_LIVE_BYTES[]
+            after_free = Lava.gpu_live_bytes()
             @test after_free <= after_alloc
         end
     end
@@ -216,7 +216,7 @@ using KernelAbstractions
     end
 
     # ── 9. Broadcast allocation stability ──
-    # `LIVE_BUFFERS` is still a global (collection). The old
+    # The live-buffer set is `pool(ctx).live_buffers` now. The old
     # `flush_deferred_frees!` wrapper was replaced by per-BQ
     # `drain_deferred_frees!` / `drain_deferred_as_frees!`.
     @testset "broadcast allocation stability" begin
@@ -227,7 +227,7 @@ using KernelAbstractions
             Lava.vk_flush!(ctx)
             Lava.drain_deferred_frees!(bq)
             Lava.drain_deferred_as_frees!(bq)
-            baseline = length(Lava.LIVE_BUFFERS)
+            baseline = Lava.live_buffer_count()
 
             for _ in 1:20
                 a = Lava.LavaArray(Float32.(rand(128)))
@@ -242,7 +242,7 @@ using KernelAbstractions
             Lava.vk_flush!(ctx)
             Lava.drain_deferred_frees!(bq)
             Lava.drain_deferred_as_frees!(bq)
-            after = length(Lava.LIVE_BUFFERS)
+            after = Lava.live_buffer_count()
             @test after == baseline
         end
     end

@@ -40,6 +40,29 @@ using Atomix
 end
 
 """
+    reduce_scratch(ctx) -> LavaArray{Float32,1}
+
+The one-cell scratch buffer `vk_reduce_sum` writes its result into, on `ctx`.
+
+Singleton because allocating a `LavaArray` per call was most of the per-call
+overhead at small sizes. One cell of BAR-mapped memory; its `mapped_ptr` stays
+valid for the lifetime of the context, which is now literally true — it is a
+field of the context, so it dies with it and no reset callback has to remember.
+
+It was an `IdDict` keyed by context, and the allocation went to `vk_context()`
+rather than to `ctx`, so with two devices live the entry stored under the SECOND
+context held a buffer belonging to the first. Keyed right, allocated wrong,
+which reads as correct until there are two devices.
+"""
+@inline function reduce_scratch(ctx::VkContext)
+    buf = ctx.caches.reduce_scratch
+    buf === nothing || return buf::LavaArray{Float32,1}
+    buf = LavaArray{Float32}(undef, (1,); unified=true, bq=ctx.default_bq)
+    ctx.caches.reduce_scratch = buf
+    return buf
+end
+
+"""
     vk_reduce_sum(A::LavaArray{Float32}) -> Float32
 
 Vulkan-native single-pass reduction sum for Float32. Launches one compute
@@ -49,31 +72,10 @@ dispatch that does:
 ONE fence wait, result read directly from mapped memory. Replaces the AK
 tree-reduce path's multiple CPU readbacks.
 """
-# Per-ctx singleton scratch buffer for the reduce output — avoids allocating
-# a new `LavaArray` on every vk_reduce_sum call (that alloc was most of the
-# per-call overhead at small array sizes). One cell of BAR-mapped memory; its
-# mapped_ptr stays valid for the lifetime of the context.
-const _REDUCE_SCRATCH = IdDict{Any, LavaArray{Float32, 1}}()
-
-@inline function _reduce_scratch(ctx)
-    # `bq = ctx.default_bq`, not the default. The dict was already keyed by
-    # context, but the allocation went to `vk_context()` — so with two devices
-    # live, the entry stored under the SECOND context held a buffer belonging to
-    # the first. Keyed right, allocated wrong, which reads as correct until
-    # there are two devices.
-    get!(() -> LavaArray{Float32}(undef, (1,); unified=true, bq=(ctx::VkContext).default_bq),
-         _REDUCE_SCRATCH, ctx)
-end
-
-# Clear scratch on device reset so we don't dangle a freed buffer.
-push!(RESET_CALLBACKS, function()
-    empty!(_REDUCE_SCRATCH)
-end)
-
 function vk_reduce_sum(A::LavaArray{Float32})
     n = length(A)
     ctx = A.buf[].ctx
-    out = _reduce_scratch(ctx)
+    out = reduce_scratch(ctx)
     # Zero the mapped cell directly — skips a fill! dispatch.
     out_ptr = Base.unsafe_convert(Ptr{Float32}, out.buf[].mapped_ptr)
     unsafe_store!(out_ptr, 0f0)

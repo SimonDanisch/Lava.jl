@@ -278,8 +278,8 @@ function gpu_memory_usage()
     # zeros rather than an error.
     n_pipelines = ctx === nothing ? 0 : length(ctx.caches.pipelines)
     n_kernels   = ctx === nothing ? 0 : length(ctx.caches.linked)
-    (live_bytes = GPU_LIVE_BYTES[],
-     LIVE_BUFFERS = length(LIVE_BUFFERS),
+    (live_bytes = ctx === nothing ? 0 : gpu_live_bytes(ctx),
+     live_buffers = ctx === nothing ? 0 : live_buffer_count(ctx),
      deferred_frees = bq_deferred,
      ARG_SLABS = n_arg_slabs,
      pipelines_cached = n_pipelines,
@@ -298,7 +298,7 @@ function dump_state(; io::IO=stdout)
     println(io, "Device lost: ", device_lost())
     mem = gpu_memory_usage()
     live_mb = mem.live_bytes ÷ (1024 * 1024)
-    println(io, "GPU memory: $(live_mb) MiB in $(mem.LIVE_BUFFERS) buffers ($(mem.deferred_frees) deferred)")
+    println(io, "GPU memory: $(live_mb) MiB in $(mem.live_buffers) buffers ($(mem.deferred_frees) deferred)")
     println(io, "Pipelines cached: $(mem.pipelines_cached) (max $(MAX_PIPELINE_CACHE_SIZE[]))")
     println(io, "Kernels cached: $(mem.kernels_cached)")
     if ctx !== nothing
@@ -311,24 +311,22 @@ function dump_state(; io::IO=stdout)
         println(io, "Free cmd bufs: $(length(bq.free_cmd_bufs))")
         ctx === nothing || println(io, "CB split threshold: $(ctx.default_bq.cb_split_threshold)")
     end
-    println(io, "Flushes: $(FLUSH_COUNTER[])")
-    println(io, "Total dispatches: $(TOTAL_DISPATCH_COUNTER[])")
+    println(io, "Flushes: $(ctx === nothing ? 0 : ctx.diag.flush_counter[])")
+    println(io, "Total dispatches: $(ctx === nothing ? 0 : ctx.diag.total_dispatches[])")
     ctx === nothing || println(io, "Dispatch logging: $(ctx.diag.dispatch_logging)")
-    if !isempty(DISPATCH_LOG)
-        println(io, "Last dispatch: ", last(DISPATCH_LOG))
+    dlog = ctx === nothing ? String[] : ctx.diag.dispatch_log
+    if !isempty(dlog)
+        println(io, "Last dispatch: ", last(dlog))
     end
     return nothing
 end
 
 function __init__()
-    # Reset runtime counters that should not survive precompilation.
-    # These Ref values get serialized into the pkgimage — a device crash
-    # during precompilation would permanently poison all future sessions.
-    FLUSH_COUNTER[] = 0
-    TOTAL_DISPATCH_COUNTER[] = 0
-    LAST_DISPATCH_INFO[] = ""
-    PREV_DISPATCH_INFO[] = ""
-    empty!(DISPATCH_LOG)
+    # Nothing to reset here any more. The counters and logs this used to zero
+    # were module-level `Ref`s and `Vector`s, which meant a device crash during
+    # precompilation serialised its wreckage into the pkgimage and poisoned every
+    # later session. They are `ctx.diag` fields now, built fresh with the context,
+    # so there is nothing that can survive into the image to clear.
     init_pipeline_thread!()
 
     # Mark device as lost during shutdown so GC finalizers don't call into
