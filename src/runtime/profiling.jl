@@ -115,24 +115,22 @@ end
 """
     list_compiled_kernels() -> Vector{KernelStats}
 
-Walk `LINKED_KERNEL_CACHE` and return stats for every kernel currently
-loaded in the session. Useful right after a render — you see every
-kernel involved.
+Stats for every kernel this device has compiled. Useful right after a render —
+you see every kernel involved.
 
 ```julia
 render!(vp, scene, film, camera)
 sort(Lava.list_compiled_kernels(); by=k -> -k.spirv.bytes)  # biggest first
 ```
 
-Every device's kernels, not just the current one: the cache became two levels
-deep when it was keyed by device, and this walked the OUTER level — so `linked`
-was another `Dict` and `kernel_stats` reached for a field on it. Nothing in the
-library calls this, which is why a suite that ran it caught it and a suite that
-only used it would not have.
+Takes a context, because there is no longer a global registry of them to walk —
+which is the point. This briefly read the OUTER level of a two-level dict and
+handed `kernel_stats` another `Dict`; a cache that belongs to a device cannot be
+iterated at the wrong depth.
 """
-function list_compiled_kernels()
+function list_compiled_kernels(ctx::VkContext = vk_context())
     stats = KernelStats[]
-    for (_, percontext) in LINKED_KERNEL_CACHE, (_, linked) in percontext
+    for (_, linked) in ctx.caches.linked
         push!(stats, kernel_stats(linked))
     end
     return stats
@@ -164,9 +162,9 @@ const DISPATCH_TIMING_ENABLED = Ref(false)
 # Two query slots per dispatch (start + end).  Default size is conservative;
 # auto-grows on first activation if `MAX_DISPATCH_LOG` was bumped.
 const TIMESTAMP_POOL_SIZE = Ref(MAX_DISPATCH_LOG * 2)
-const TIMESTAMP_POOL = Ref{Any}(nothing)               # Vulkan.QueryPool or nothing
-const TIMESTAMP_NEXT_SLOT = Ref(0)                     # next free slot index
-const TIMESTAMP_PERIOD_NS = Ref(1.0)                   # device's timestampPeriod (ns / tick)
+# `timestamp_pool`, `timestamp_next_slot` and `timestamp_period_ns` are
+# `VkContext` fields — a query pool is a device-owned handle, and holding one
+# in a module `Ref` is the defect that corrupted the memory pool next door.
 const RECORDED_DISPATCHES = DispatchTiming[]
 
 """
@@ -192,7 +190,7 @@ Clear recorded timings and reset the slot counter. Called automatically by
 """
 function reset_dispatch_timing!()
     empty!(RECORDED_DISPATCHES)
-    TIMESTAMP_NEXT_SLOT[] = 0
+    vk_context().caches.timestamp_next_slot = 0
     return nothing
 end
 
@@ -228,13 +226,13 @@ dispatches' timestamps are written to the pool before read-back. Pass
 record.
 """
 function dispatch_timing_report(; flush_first::Bool=true)
-    pool = TIMESTAMP_POOL[]
+    pool = vk_context().caches.timestamp_pool
     pool === nothing && return KernelTimingReport[]
     isempty(RECORDED_DISPATCHES) && return KernelTimingReport[]
     if flush_first
         vk_flush!(vk_context().default_bq)
     end
-    n_slots = TIMESTAMP_NEXT_SLOT[]
+    n_slots = vk_context().caches.timestamp_next_slot
     n_slots == 0 && return KernelTimingReport[]
     ctx = vk_context()
     raw = Vector{UInt64}(undef, n_slots)
@@ -244,7 +242,7 @@ function dispatch_timing_report(; flush_first::Bool=true)
                                   sizeof(raw), Ptr{Nothing}(pointer(raw)),
                                   UInt64(sizeof(UInt64)); flags=flags)
     end
-    period = TIMESTAMP_PERIOD_NS[]
+    period = vk_context().caches.timestamp_period_ns
     # Apply the actual ns values back into the records.
     sized = DispatchTiming[]
     for d in RECORDED_DISPATCHES
@@ -307,21 +305,21 @@ end
 
 # Internal: ensure the timestamp pool exists. Called from `vk_dispatch!`.
 function ensure_timestamp_pool!()
-    TIMESTAMP_POOL[] !== nothing && return TIMESTAMP_POOL[]
+    vk_context().caches.timestamp_pool !== nothing && return vk_context().caches.timestamp_pool
     ctx = vk_context()
     # Capture the device's timestamp period (ns per tick) once.
     props = VK.get_physical_device_properties(ctx.physical_device)
-    TIMESTAMP_PERIOD_NS[] = Float64(props.limits.timestamp_period)
+    vk_context().caches.timestamp_period_ns = Float64(props.limits.timestamp_period)
     info = VK.QueryPoolCreateInfo(VK.QUERY_TYPE_TIMESTAMP, UInt32(TIMESTAMP_POOL_SIZE[]))
     pool = VK.unwrap(VK.create_query_pool(ctx.device, info))
-    TIMESTAMP_POOL[] = pool
+    vk_context().caches.timestamp_pool = pool
     return pool
 end
 
 # Internal: reset the pool between captures (must happen on a command buffer).
 # Called from `vk_dispatch!` when slot index hits 0.
 function reset_timestamp_pool_on_cb!(cb::VK.CommandBuffer)
-    pool = TIMESTAMP_POOL[]
+    pool = vk_context().caches.timestamp_pool
     pool === nothing && return
     VK.cmd_reset_query_pool(cb, pool, UInt32(0), UInt32(TIMESTAMP_POOL_SIZE[]))
     return nothing
@@ -333,7 +331,7 @@ function maybe_write_dispatch_start_timestamp!(cb::VK.CommandBuffer, kernel_name
                                                stage = VK.PIPELINE_STAGE_COMPUTE_SHADER_BIT)
     DISPATCH_TIMING_ENABLED[] || return -1
     pool = ensure_timestamp_pool!()
-    slot = TIMESTAMP_NEXT_SLOT[]
+    slot = vk_context().caches.timestamp_next_slot
     if slot == 0
         reset_timestamp_pool_on_cb!(cb)
     end
@@ -365,7 +363,7 @@ function maybe_write_dispatch_start_timestamp!(cb::VK.CommandBuffer, kernel_name
     # trusting a breakdown; if they do not roughly add up, something is not
     # being timestamped.
     VK.cmd_write_timestamp(cb, stage, pool, UInt32(slot))
-    TIMESTAMP_NEXT_SLOT[] = slot + 2
+    vk_context().caches.timestamp_next_slot = slot + 2
     push!(RECORDED_DISPATCHES, DispatchTiming(String(kernel_name), slot, 0.0))
     return slot
 end
@@ -389,7 +387,7 @@ function maybe_write_dispatch_end_timestamp!(cb::VK.CommandBuffer, start_slot::I
                                              stage = VK.PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                              stage_mask::UInt32 = UInt32(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT))
     start_slot < 0 && return
-    pool = TIMESTAMP_POOL[]
+    pool = vk_context().caches.timestamp_pool
     pool === nothing && return
     # The barrier this comment has always described was missing from the code.
     # Without it, consecutive dispatches overlap and each measured interval spans
@@ -420,8 +418,8 @@ end
 
 # Register cleanup so a fresh device session resets timing state.
 push!(RESET_CALLBACKS, function()
-    TIMESTAMP_POOL[] = nothing
-    TIMESTAMP_NEXT_SLOT[] = 0
+    vk_context().caches.timestamp_pool = nothing
+    vk_context().caches.timestamp_next_slot = 0
     empty!(RECORDED_DISPATCHES)
     DISPATCH_TIMING_ENABLED[] = false
 end)

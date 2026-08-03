@@ -3,12 +3,8 @@
 # Creates VkGraphicsPipeline using VK_KHR_dynamic_rendering (no VkRenderPass).
 # Pipeline state (blend, cull, depth, topology) configured via dispatch on config types.
 
-const GFX_PIPELINE_CACHE = Dict{UInt64, CompiledGraphicsPipeline}()
 
-# Clear graphics pipeline cache on vk_reset_device!
-push!(RESET_CALLBACKS, function()
-    empty!(GFX_PIPELINE_CACHE)
-end)
+# The graphics pipeline cache is a `VkContext` field; a reset makes a new one.
 
 """
     create_graphics_pipeline(vertex_spirv, fragment_spirv;

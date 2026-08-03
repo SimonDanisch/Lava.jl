@@ -129,7 +129,6 @@ function probe()
     gpu.cmd_pipeline_barrier_fptr == cpu.cmd_pipeline_barrier_fptr &&
         error("both devices report the same vkCmdPipelineBarrier — the global is back")
 
-    before = length(Lava.PIPELINE_CACHE)
     for (name, ctx) in (("gpu", gpu), ("cpu", cpu))
         b = LavaBackend(ctx)
 
@@ -164,14 +163,27 @@ function probe()
         A = B = C = a = nothing
     end
 
-    # The load-bearing assertion. One kernel on two devices must compile TWICE:
-    # a single new entry means the second device was handed the first's pipeline,
-    # which is the §8 defect and can still produce a right answer by luck.
-    grew = length(Lava.PIPELINE_CACHE) - before
-    println("\nPIPELINE_CACHE grew by $grew (1 means the devices SHARED a pipeline)")
-    println("LINKED_KERNEL_CACHE device keys: ", sort(collect(keys(Lava.LINKED_KERNEL_CACHE))))
-    println("LAUNCH_PLAN_CACHE   device keys: ", sort(collect(keys(Lava.LAUNCH_PLAN_CACHE))))
-    grew >= 2 || error("the two devices shared a pipeline")
+    # The assertion this probe was built around — "one kernel on two devices must
+    # compile TWICE, because a single new entry means the second device was handed
+    # the first's pipeline" — counted entries in a global dict. There is no global
+    # dict now: each context owns its caches, so a shared pipeline is not a thing
+    # that can happen, and counting cannot express it.
+    #
+    # What replaces it is weaker as a test and stronger as a guarantee. Assert
+    # that the caches are DISTINCT OBJECTS and that each device populated its
+    # own, which is what "keyed correctly" was always trying to approximate.
+    println()
+    for (name, ctx) in (("gpu", gpu), ("cpu", cpu))
+        println("  $name: pipelines=$(length(ctx.caches.pipelines)) ",
+                "linked=$(length(ctx.caches.linked)) ",
+                "launchplans=$(length(ctx.caches.launchplans)) ",
+                "pool blocks=$(length(ctx.caches.pool.blocks))")
+    end
+    gpu.caches === cpu.caches && error("both contexts share one DeviceCaches")
+    gpu.caches.pipelines === cpu.caches.pipelines && error("both contexts share one pipeline cache")
+    gpu.caches.pool === cpu.caches.pool && error("both contexts share one memory pool")
+    isempty(gpu.caches.pipelines) && error("the gpu compiled nothing")
+    isempty(cpu.caches.pipelines) && error("lavapipe compiled nothing")
 
     # Retire the context this probe built. Nothing else can: `init_vulkan!(;
     # select)` deliberately does NOT install it as the global, so it is the

@@ -684,11 +684,8 @@ const DBG_LAUNCH_COUNT = Ref(0)
 # Per device: a `LaunchPlan` holds a `VkPipeline` (GUARDRAILS §8). Same shape as
 # `LINKED_KERNEL_CACHE` — an outer dict keyed by `ctx.id`, so the inner one keeps
 # the `DataType` key that makes the lookup a pointer compare.
-const LAUNCH_PLAN_CACHE = Dict{UInt64, IdDict{DataType,Vector{LaunchPlan}}}()
-push!(RESET_CALLBACKS, () -> empty!(LAUNCH_PLAN_CACHE))
 
-@inline launch_plan_cache(ctx) =
-    get!(() -> IdDict{DataType,Vector{LaunchPlan}}(), LAUNCH_PLAN_CACHE, ctx.id)
+@inline launch_plan_cache(ctx) = ctx.caches.launchplans
 
 @inline function launch_plan(bq::BatchQueue, @nospecialize(f), all_args::Tuple,
                              wg::NTuple{3,Int}, ray_query::Bool)
@@ -777,20 +774,18 @@ end
 # so we compile once and cache everything. Saves ~30K lava_launch! calls per render
 # (hash lookups, validation, auto-flush, keep_alive, etc.).
 
-const PREPARE_INDIRECT = Dict{UInt64, PrepareIndirect}()
 
 # Register cleanup callback for vk_reset_device!
-push!(RESET_CALLBACKS, () -> empty!(PREPARE_INDIRECT))
 
 function init_prepare_indirect_pipeline!(ctx::VkContext)
-    haskey(PREPARE_INDIRECT, ctx.id) && return
+    ctx.caches.prepare_indirect === nothing || return
     # Kernel signature (post-adapt): indirect::LavaDeviceArray{UInt32,1},
     # ndrange_buf::LavaDeviceArray{Int32,1}, ws::UInt32.
     tt = Tuple{LavaDeviceArray{UInt32,1}, LavaDeviceArray{Int32,1}, UInt32}
     ws = (1, 1, 1)
     compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(
         ctx, prepare_indirect_kernel, tt, ws)
-    PREPARE_INDIRECT[ctx.id] = PrepareIndirect(pipeline, offsets, byval_sizes,
+    ctx.caches.prepare_indirect = PrepareIndirect(pipeline, offsets, byval_sizes,
                                                compiled.push_info.arg_buffer_size)
 end
 
@@ -808,7 +803,7 @@ function fast_prepare_indirect!(bq::BatchQueue,
     ctx = bq.ctx::VkContext
     init_prepare_indirect_pipeline!(ctx)
 
-    pi = PREPARE_INDIRECT[ctx.id]
+    pi = ctx.caches.prepare_indirect::PrepareIndirect
     pipeline, offsets = pi.pipeline, pi.offsets
     byval_sizes, arg_size = pi.byval_sizes, pi.arg_buffer_size
 

@@ -28,13 +28,13 @@ using GPUCompiler
         b = Lava.LavaArray(zeros(Float32, 4))
 
         # Clear caches
-        empty!(Lava.LINKED_KERNEL_CACHE)
+        empty!(Lava.vk_context().caches.linked)
 
         # First dispatch populates both tiers
         tier_test_kernel(backend)(b, a; ndrange=4)
         KernelAbstractions.synchronize(backend)
 
-        @test length(Lava.LINKED_KERNEL_CACHE) >= 1
+        @test length(Lava.vk_context().caches.linked) >= 1
         # Disk cache should have written files
         dir = Lava.lava_disk_cache_dir()
         @test isdir(dir) && !isempty(filter(f -> endswith(f, ".jls"), readdir(dir)))
@@ -81,7 +81,7 @@ using GPUCompiler
         # `KERNEL_INSERTION_ORDER` was removed when the insertion-order
         # tracking was folded into LINKED_KERNEL_CACHE itself; clearing the
         # cache is the only access we need.
-        empty!(Lava.LINKED_KERNEL_CACHE)
+        empty!(Lava.vk_context().caches.linked)
         # LAUNCH_PLAN_CACHE sits ABOVE both tiers: `launch_plan` returns a
         # cached LaunchPlan without ever calling
         # `get_compiled_kernel_and_pipeline`, so with only Tier 1 cleared the
@@ -89,13 +89,13 @@ using GPUCompiler
         # the assertion below failed with `0 >= 1`. The plan cache postdates
         # this test (added by "perf: overlap recording with execution"), so drop
         # it too or the test measures nothing.
-        empty!(Lava.LAUNCH_PLAN_CACHE)
+        empty!(Lava.vk_context().caches.launchplans)
 
         # Next dispatch should hit Tier 2 and repopulate Tier 1
         repop_test_kernel(backend)(c, 99f0; ndrange=4)
         KernelAbstractions.synchronize(backend)
 
-        @test length(Lava.LINKED_KERNEL_CACHE) >= 1
+        @test length(Lava.vk_context().caches.linked) >= 1
         @test Array(c) == fill(99f0, 4)
     end
 
@@ -107,15 +107,15 @@ using GPUCompiler
 
         backend = Lava.LavaBackend()
         d = Lava.LavaArray(zeros(Float32, 64))
-        before = length(Lava.LINKED_KERNEL_CACHE)
+        before = length(Lava.vk_context().caches.linked)
 
         wg_test_kernel(backend)(d; ndrange=64, workgroupsize=32)
         KernelAbstractions.synchronize(backend)
-        after_32 = length(Lava.LINKED_KERNEL_CACHE)
+        after_32 = length(Lava.vk_context().caches.linked)
 
         wg_test_kernel(backend)(d; ndrange=64, workgroupsize=64)
         KernelAbstractions.synchronize(backend)
-        after_64 = length(Lava.LINKED_KERNEL_CACHE)
+        after_64 = length(Lava.vk_context().caches.linked)
 
         # Two different workgroup sizes should create two cache entries
         @test after_64 > after_32
@@ -123,7 +123,7 @@ using GPUCompiler
 
     @testset "LavaLinkedKernel has correct fields" begin
         # Check that the linked kernel has all expected data
-        for (key, linked) in Lava.LINKED_KERNEL_CACHE
+        for (key, linked) in Lava.vk_context().caches.linked
             @test linked isa Lava.LavaLinkedKernel
             @test !isempty(linked.compiled.spirv_bytes)
             @test !isempty(linked.compiled.entry_name)

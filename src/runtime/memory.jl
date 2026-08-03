@@ -996,8 +996,6 @@ const POOL_DISABLED = Ref{Bool}(false)
 DevicePool() = DevicePool(PoolBlock[],
                           [VkManagedBuffer[] for _ in 1:POOL_NUM_SIZE_CLASSES])
 
-const POOLS = Dict{UInt64, DevicePool}()
-
 """
     pool(ctx) -> DevicePool
 
@@ -1006,25 +1004,32 @@ This device's memory, created on first allocation.
 Never call this from a finalizer: it can insert. The free path reaches its pool
 through `buf.pool_block.pool` instead, which cannot allocate and cannot miss.
 """
-@inline pool(ctx::VkContext) = get!(DevicePool, POOLS, ctx.id)
+@inline pool(ctx::VkContext) = ctx.caches.pool
 
-push!(RESET_CALLBACKS, function()
-    # Destroy all pool blocks on device reset.  The reset callback runs after
-    # the device has been marked lost or torn down, so destructor failures are
-    # expected (driver may have released the handles already).  Log via
-    # jl_safe_printf — we never want to silently lose a destructor error.
-    for p in values(POOLS)
-        for block in p.blocks
-            try
-                block.buffer.destructor()
-                block.memory.destructor()
-            catch
-                safe_fin_log("Lava pool reset: destructor failed (ok during vk_reset_device!)\n")
-            end
+"""
+    destroy_pool!(ctx)
+
+Destroy this device's pool blocks. Called by `vk_reset_device!` on the context it
+is retiring — which is where the old context is actually in scope.
+
+It used to be a `RESET_CALLBACKS` entry walking a global `POOLS` dict, because
+the pool did not belong to anything. Destructor failures are expected and
+logged, not thrown: by the time this runs the device is marked lost or already
+torn down, so the driver may have released the handles itself.
+"""
+function destroy_pool!(ctx::VkContext)
+    for block in ctx.caches.pool.blocks
+        try
+            block.buffer.destructor()
+            block.memory.destructor()
+        catch
+            safe_fin_log("Lava pool reset: destructor failed (ok during vk_reset_device!)\n")
         end
     end
-    empty!(POOLS)
-end)
+    empty!(ctx.caches.pool.blocks)
+    foreach(empty!, ctx.caches.pool.free_lists)
+    return nothing
+end
 
 """
     size_class(nbytes) -> (idx, bytes)

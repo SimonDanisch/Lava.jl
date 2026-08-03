@@ -434,14 +434,21 @@ mutable struct VkContext
     # also survives `vk_reset_device!`, which builds a new context, so entries
     # from before a reset can never be handed to after it.
     #
-    # Note what this is NOT. `GUARDRAILS.md` §8 says device state goes ON
-    # `VkContext`, and that is still the better shape. It is not what landed,
-    # because the cached VALUE types (`LavaComputePipeline`, `LaunchPlan`,
-    # `CompiledGraphicsPipeline`) live in files included after this one, so a
-    # field here would have to be `Any` — which costs inference on the hottest
-    # path in the library, a cache lookup per dispatch. Keying is the same
-    # correctness with the types kept.
+    # It survives as an identity — for logging, and for the probe's assertion
+    # that two contexts are distinct — but it is no longer a cache key. It was
+    # one, and this comment used to argue that keying was as good as ownership
+    # because the cached value types are defined in files included after this
+    # one, so a field would have to be `Any` and cost inference on a lookup per
+    # dispatch. The premise was true and the conclusion was wrong: the fix is to
+    # move the nine type definitions ahead of this file (`coretypes.jl`), not to
+    # accept a surrogate key. `caches` below is concrete.
     id::UInt64
+
+    # Per-device state, owned by the device. See `DeviceCaches` for what was
+    # global before and why keying it by `id` was not the same thing: a field
+    # dies with its context, so nothing outlives the handles it describes and
+    # `vk_reset_device!` has nothing to clear.
+    caches::DeviceCaches
 
     # Inner constructor: two-phase init via `new()` so we can hand a live
     # `ctx` reference to `BatchQueue(...)` while finishing the ctx's own
@@ -521,6 +528,7 @@ mutable struct VkContext
         # validated against this physical device before the driver sees it —
         # `vkCreatePipelineCache` is not a safe place to discover a mismatch.
         ctx.id = (VK_CONTEXT_COUNTER[] += 1)
+        ctx.caches = DeviceCaches()
         # Filled by `init_vulkan!` once the device exists; null until then so a
         # barrier recorded before that point is skipped rather than jumping to
         # whatever the field happened to contain.
@@ -724,7 +732,12 @@ function vk_reset_device!()
     # case where skipping is wrong. `mark_device_lost!` is the same flag the
     # `VkResult` rule sets, and this is the second way to reach it.
     let old = VK_CONTEXT_REF[]
-        old === nothing || mark_device_lost!(old)
+        if old !== nothing
+            # Its blocks, while it is still the thing that owns them. This used
+            # to be a `RESET_CALLBACKS` entry walking a global `POOLS` dict.
+            destroy_pool!(old)
+            mark_device_lost!(old)
+        end
     end
     VK_CONTEXT_REF[] = nothing
     # Don't destroy old Vulkan handles — they're invalid after DEVICE_LOST.

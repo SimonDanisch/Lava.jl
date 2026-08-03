@@ -23,26 +23,20 @@
 # `Dict{Any, LavaLinkedKernel}` with keys like `(objectid(ci), world, cfg)`.
 # Per device, because a `LavaLinkedKernel` owns a `VkPipeline` (GUARDRAILS §8).
 #
-# An outer dict rather than a wider key, because the inner one is handed to
+# `Dict{Any, LavaLinkedKernel}` because the dict is handed to
 # `GPUCompiler.cached_compilation`, which derives the key from `(source, config)`
 # itself — there is no device to add to it from here. One dict per device is the
-# same guarantee at the level we do control.
-const LINKED_KERNEL_CACHE = Dict{UInt64, Dict{Any, LavaLinkedKernel}}()
+# guarantee at the level we do control, and it is a field on the device.
 
 """
     linked_kernel_cache(ctx) -> Dict
 
 This device's compiled-kernel cache, created on first use.
 """
-@inline linked_kernel_cache(ctx) =
-    get!(() -> Dict{Any, LavaLinkedKernel}(), LINKED_KERNEL_CACHE, ctx.id)
+@inline linked_kernel_cache(ctx) = ctx.caches.linked
 
-# Register cleanup callback for vk_reset_device!.  Arg slabs are per-BQ
-# now, so they die with the old ctx automatically; only the global shader
-# caches need explicit clearing here.
-push!(RESET_CALLBACKS, function()
-    empty!(LINKED_KERNEL_CACHE)
-end)
+# No reset callback: arg slabs are per-BQ and die with the old ctx, and the
+# kernel cache is now a field on it, so a reset produces a fresh one.
 
 # ── Type signature helper ──
 #
@@ -394,8 +388,8 @@ end
 """
     clear_kernel_cache!()
 
-Evict the in-session kernel + pipeline cache (`LINKED_KERNEL_CACHE`) so the
-next dispatch of each kernel recompiles from Julia source.
+Evict this device's in-session kernel + pipeline cache so the next dispatch of
+each kernel recompiles from Julia source.
 
 Use this after editing a Julia kernel under Revise — Revise invalidates the
 Julia method, but Lava's hash-keyed kernel cache stays populated with the old
@@ -403,8 +397,8 @@ SPIR-V because `hash(f, tt, workgroup_size)` doesn't change when the method
 body changes. Unlike `vk_reset_device!()`, this keeps all existing
 `LavaArray`s and the Vulkan context alive.
 """
-function clear_kernel_cache!()
-    empty!(LINKED_KERNEL_CACHE)
+function clear_kernel_cache!(ctx::VkContext = vk_context())
+    empty!(ctx.caches.linked)
     return nothing
 end
 

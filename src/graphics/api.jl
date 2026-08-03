@@ -49,12 +49,8 @@ LinePipeline(; vertex, fragment, kw...) = GraphicsPipeline(; vertex, fragment, t
 
 # ── Lazy Compilation ──
 
-const GFX_SHADER_CACHE = Dict{UInt64, LavaGfxShader}()
 
-# Clear graphics shader/pipeline caches on vk_reset_device!
-push!(RESET_CALLBACKS, function()
-    empty!(GFX_SHADER_CACHE)
-end)
+# The graphics shader cache is a `VkContext` field; a reset makes a new one.
 
 """Return (vert_shader::LavaGfxShader, compiled::CompiledGraphicsPipeline)."""
 function ensure_compiled_with_shader!(pipeline::GraphicsPipeline,
@@ -73,7 +69,7 @@ function ensure_compiled!(pipeline::GraphicsPipeline, vert_fn, frag_fn, tt_verte
     # Cache key includes type tuples — different arg types get different compiled pipelines
     cache_key = hash((vert_fn, frag_fn, tt_vertex, tt_fragment, color_format,
                        descriptor_set_layout !== nothing))
-    cached = get(GFX_PIPELINE_CACHE, cache_key, nothing)
+    cached = get(vk_context().caches.gfx_pipelines, cache_key, nothing)
     cached !== nothing && return cached::CompiledGraphicsPipeline
 
     # Compile vertex shader
@@ -117,16 +113,16 @@ function ensure_compiled!(pipeline::GraphicsPipeline, vert_fn, frag_fn, tt_verte
         tess_config=tess_cfg,
         descriptor_set_layout=descriptor_set_layout)
 
-    GFX_PIPELINE_CACHE[cache_key] = compiled
+    vk_context().caches.gfx_pipelines[cache_key] = compiled
     return compiled
 end
 
 function get_or_compile_gfx(@nospecialize(f), @nospecialize(tt), stage::Symbol; config=nothing)
     key = hash((f, tt, stage, config))
-    cached = get(GFX_SHADER_CACHE, key, nothing)
+    cached = get(vk_context().caches.gfx_shaders, key, nothing)
     cached !== nothing && return cached
     shader = lava_compile_gfx_shader(f, tt; stage, config)
-    GFX_SHADER_CACHE[key] = shader
+    vk_context().caches.gfx_shaders[key] = shader
     return shader
 end
 
@@ -300,11 +296,8 @@ function blit_fragment(buffer, width::Int32, height::Int32)
     return nothing
 end
 
-const BLIT_PIPELINE = Ref{Any}(nothing)
 
-push!(RESET_CALLBACKS, function()
-    BLIT_PIPELINE[] = nothing
-end)
+# Likewise the blit pipeline — see `DeviceCaches.blit`.
 
 """
     blit!(bq, target::RenderTarget, source::LavaArray; clear=true)
@@ -334,8 +327,8 @@ function blit!(bq::BatchQueue, target::RenderTarget, source::LavaArray;
     end
 
     # Create or reuse blit pipeline
-    if BLIT_PIPELINE[] === nothing
-        BLIT_PIPELINE[] = GraphicsPipeline(;
+    if vk_context().caches.blit === nothing
+        vk_context().caches.blit = GraphicsPipeline(;
             vertex=blit_vertex,
             fragment=blit_fragment,
             blend=Opaque(),
@@ -344,7 +337,7 @@ function blit!(bq::BatchQueue, target::RenderTarget, source::LavaArray;
         )
     end
 
-    pipeline = BLIT_PIPELINE[]
+    pipeline = vk_context().caches.blit
 
     # Fragment shader takes: (buffer::LavaDeviceArray, width::Int32, height::Int32)
     # Use the fragment shader's push_info for arg packing since vertex has no args.

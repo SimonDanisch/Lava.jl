@@ -103,7 +103,20 @@ declared since the beginning with no emitter case and no binding.
 `coopmat_load` / `loadw` / `loadw2`, `coopmat_store` / `storew`, `coopmat_zero`,
 `coopmat_muladd`, `coopmat_convert`, `coopmat_length`, `coopmat_getcomp` /
 `setcomp`, and **new 2026-08-02** `coopmat_mul` (`OpFMul`, component-wise, plain
-KHR) and `coopmat_perelement` (`OpCooperativeMatrixPerElementOpNV`).
+KHR), `coopmat_add` (`OpFAdd`, likewise) and `coopmat_perelement`
+(`OpCooperativeMatrixPerElementOpNV`).
+
+`coopmat_add` exists so a GEMM accumulator can start from `bias + residual`
+instead of zero — the bias at **stride 0** so one vector broadcasts across the
+tile, the residual at the destination's leading dimension — which would make a
+transformer's residual add the tensor cores' own accumulate. The GEMM plumbing
+is not written: of SAM 2's 98 residual adds the 51 that are structurally
+foldable turned out to be the *cheap* half, so the measurement did not justify
+the surgery. The instruction is portable and tested either way.
+
+Extents registered: `16x16`, `16x8`, and `8x8`. Nothing ships `8x8` — it is what
+**lavapipe** offers, and having it lets a cooperative-matrix reproducer run on a
+second, independent consumer. That is what settled `test_shared_index_division.jl`.
 
 Component types: **`f16 f32 f64 i8 u8 i32 u32`**. Note `i8`/`u8` are wired, and
 the device offers int8 at **K32** — so the "does K32 double throughput" question

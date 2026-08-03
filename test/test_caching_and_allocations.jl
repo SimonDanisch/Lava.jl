@@ -78,8 +78,8 @@ using KernelAbstractions
             pk5!(Lava.LavaBackend())(a; ndrange=16)
             Lava.vk_flush!(Lava.vk_context())
 
-            @test length(Lava.PIPELINE_CACHE) <= 3
-            @test length(Lava.PIPELINE_INSERTION_ORDER) <= 3
+            @test length(Lava.vk_context().caches.pipelines) <= 3
+            @test length(Lava.vk_context().caches.pipeline_order) <= 3
 
             # Latest pipeline still works
             @test Array(a)[1] ≈ 5.0f0

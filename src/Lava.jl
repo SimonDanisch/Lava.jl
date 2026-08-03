@@ -273,15 +273,17 @@ function gpu_memory_usage()
         bq_deferred = length(bq.deferred_frees) + length(bq.deferred_as_frees)
         n_arg_slabs = length(bq.arg_slabs)
     end
+    # Both counts come off the context now, so both are guarded by the same
+    # `ctx !== nothing` as the queue fields above — a caller with no device gets
+    # zeros rather than an error.
+    n_pipelines = ctx === nothing ? 0 : length(ctx.caches.pipelines)
+    n_kernels   = ctx === nothing ? 0 : length(ctx.caches.linked)
     (live_bytes = GPU_LIVE_BYTES[],
      LIVE_BUFFERS = length(LIVE_BUFFERS),
      deferred_frees = bq_deferred,
      ARG_SLABS = n_arg_slabs,
-     pipelines_cached = length(PIPELINE_CACHE),
-     # Kernels, not devices: `LINKED_KERNEL_CACHE` is keyed by device and then
-     # by kernel, so its own `length` is the number of contexts that have ever
-     # compiled anything — which on one machine reads as a plausible "1".
-     kernels_cached = sum(length, values(LINKED_KERNEL_CACHE); init = 0))
+     pipelines_cached = n_pipelines,
+     kernels_cached = n_kernels)
 end
 
 """

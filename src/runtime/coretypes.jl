@@ -203,3 +203,57 @@ struct CompiledGraphicsPipeline
     color_format::Vulkan.Format
     has_depth::Bool
 end
+
+# ── Per-device state ─────────────────────────────────────────────────────────
+
+"""
+    DeviceCaches
+
+Everything a `VkContext` caches, owned by the context that owns the handles.
+
+**These were twelve module-level globals.** Ten had been keyed by `ctx.id` to
+make two devices work, which fixed the sharing but not the ownership: entries
+outlived the device they described, `ctx.id` was a surrogate for "the object I
+should have stored this on", and `RESET_CALLBACKS` existed almost entirely to
+empty them. A field dies with its context, so none of that is needed.
+
+The last two — `BLIT_PIPELINE` and `TIMESTAMP_POOL` — were never keyed at all.
+They are module-level `Ref`s holding device-owned handles, which is precisely the
+shape that produced the function-pointer crash and the memory-pool corruption;
+they survived only because the two-device probe's path (dispatch, reduction,
+GEMM) reaches neither graphics nor dispatch profiling.
+
+`blit` is `Any` because `GraphicsPipeline` is defined near the end of the include
+list — no worse than the `Ref{Any}` it replaces, and the only field that is not
+concrete.
+"""
+mutable struct DeviceCaches
+    # Compute pipelines, keyed by SPIR-V content hash. The key no longer needs
+    # `ctx.id` mixed in: two devices cannot collide when they do not share a dict.
+    pipelines::Dict{UInt64,LavaComputePipeline}
+    pipeline_order::Vector{UInt64}
+    # `Dict{Any,…}` because GPUCompiler.cached_compilation derives the key itself.
+    linked::Dict{Any,LavaLinkedKernel}
+    launchplans::IdDict{DataType,Vector{LaunchPlan}}
+    prepare_indirect::Union{Nothing,PrepareIndirect}
+    pool::DevicePool
+    # 0 means "not yet queried" — the device never reports 0.
+    subgroup_size::Int
+    subgroup_control::Union{Nothing,SubgroupSizeControl}
+    # One warning per device about a subgroup width that cannot be pinned.
+    coopmat_warned::Bool
+    gfx_pipelines::Dict{UInt64,CompiledGraphicsPipeline}
+    gfx_shaders::Dict{UInt64,LavaGfxShader}
+    blit::Any
+    timestamp_pool::Union{Nothing,Vulkan.QueryPool}
+    timestamp_next_slot::Int
+    timestamp_period_ns::Float64
+end
+
+# `DevicePool()` resolves at call time, long after `memory.jl` is loaded.
+DeviceCaches() = DeviceCaches(
+    Dict{UInt64,LavaComputePipeline}(), UInt64[],
+    Dict{Any,LavaLinkedKernel}(), IdDict{DataType,Vector{LaunchPlan}}(),
+    nothing, DevicePool(), 0, nothing, false,
+    Dict{UInt64,CompiledGraphicsPipeline}(), Dict{UInt64,LavaGfxShader}(),
+    nothing, nothing, 0, 1.0)

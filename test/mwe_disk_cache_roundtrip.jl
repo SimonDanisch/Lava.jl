@@ -38,7 +38,7 @@ println("  result[1:8] = ", ref[1:8])
 
 # Find the compiled kernel in the linked cache
 linked = nothing
-for (key, v) in Lava.LINKED_KERNEL_CACHE
+for (key, v) in Lava.vk_context().caches.linked
     if v.compiled.entry_name == "main" && length(v.compiled.spirv_bytes) > 0
         linked = v
     end
@@ -84,9 +84,9 @@ println("    des   byval_sizes: ", deserialized.push_info.byval_llvm_sizes)
 # by hash(spirv_bytes,…) and we'd just reuse the existing VkPipeline from
 # the fresh path — never actually exercising the driver on the cached bytes.
 println("\n=== Clear PIPELINE_CACHE + build pipeline from deserialized bytes ===")
-n_cached = length(Lava.PIPELINE_CACHE)
-empty!(Lava.PIPELINE_CACHE)
-empty!(Lava.PIPELINE_INSERTION_ORDER)
+n_cached = length(Lava.vk_context().caches.pipelines)
+empty!(Lava.vk_context().caches.pipelines)
+empty!(Lava.vk_context().caches.pipeline_order)
 println("  cleared $n_cached entries from PIPELINE_CACHE")
 ctx = Lava.vk_context()
 linked_des = Lava.link_kernel(ctx, deserialized)
@@ -106,14 +106,14 @@ println("  byval_sizes = ", linked_des.byval_sizes)
 buf2 = Lava.LavaArray(zeros(Float32, N))
 # Find the cache key whose linked kernel matches `linked` (the one we captured earlier)
 key_to_replace = nothing
-for (key, v) in Lava.LINKED_KERNEL_CACHE
+for (key, v) in Lava.vk_context().caches.linked
     if v === linked
         key_to_replace = key
     end
 end
 @assert key_to_replace !== nothing
-println("  replacing LINKED_KERNEL_CACHE[$key_to_replace] with reconstructed kernel")
-Lava.LINKED_KERNEL_CACHE[key_to_replace] = linked_des
+println("  replacing caches.linked[$key_to_replace] with reconstructed kernel")
+Lava.vk_context().caches.linked[key_to_replace] = linked_des
 
 Lava.lava_launch!(bq, rt_kernel!, buf2; ndrange=N, workgroup_size=(64, 1, 1))
 Lava.vk_flush!(bq)

@@ -144,7 +144,7 @@ end
 # ── Run 1: default multi-OpFunction emission ─────────────────────────────
 empty!(Lava.FORCE_INLINE_KERNEL_PATTERNS)
 Lava.clear_spirv_disk_cache!()
-empty!(Lava.LINKED_KERNEL_CACHE)
+empty!(Lava.vk_context().caches.linked)
 default_ok = try_run("default (multi-OpFunction)")
 
 # Reset between runs in case of crash
@@ -154,7 +154,7 @@ try Lava.vk_reset_device!() catch e; @warn "reset failed: $(first(sprint(showerr
 empty!(Lava.FORCE_INLINE_KERNEL_PATTERNS)
 push!(Lava.FORCE_INLINE_KERNEL_PATTERNS, "")  # empty matches everything
 Lava.clear_spirv_disk_cache!()
-empty!(Lava.LINKED_KERNEL_CACHE)
+empty!(Lava.vk_context().caches.linked)
 inlined_ok = try_run("force_inline_all=true")
 
 println("\n────────────────────────────────────────")

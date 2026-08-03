@@ -104,7 +104,7 @@ When set, compute pipelines are created with
 build a binary and returns `VK_PIPELINE_COMPILE_REQUIRED` instead. That turns
 "the pipeline cache was warm" from a wall-clock inference into something the
 driver asserts directly — a fast second run otherwise proves nothing, since it
-could just as easily be Lava's in-memory `PIPELINE_CACHE` rather than the
+could just as easily be Lava's in-memory `ctx.caches.pipelines` rather than the
 on-disk blob.
 
 Requires `pipelineCreationCacheControl`, which `vk_device!` enables as part of
@@ -131,7 +131,7 @@ pipeline that is not already in the cache makes creation fail loudly instead of
 quietly building a binary.
 
 This is how to prove a cache is doing its job. Timing cannot: a fast second run
-is equally explained by Lava's in-memory `PIPELINE_CACHE` dict, which never
+is equally explained by Lava's in-memory `ctx.caches.pipelines`, which never
 touches disk. Under this wrapper, a run that completes did zero driver
 compilation — the driver said so.
 
@@ -146,8 +146,13 @@ function no_pipeline_compilation(f)
     old = PIPELINE_NO_COMPILE[]
     old_refused = PIPELINE_COMPILES_REFUSED[]
     # Otherwise a hit on the Julia-side dict would mask a cold VkPipelineCache.
-    empty!(PIPELINE_CACHE)
-    empty!(PIPELINE_INSERTION_ORDER)
+    # `vk_context()` here rather than a parameter: this wrapper exists to prove a
+    # cache is warm on the device the caller is already using, and every caller
+    # is a test.
+    let c = vk_context().caches
+        empty!(c.pipelines)
+        empty!(c.pipeline_order)
+    end
     PIPELINE_NO_COMPILE[] = true
     PIPELINE_COMPILES_REFUSED[] = 0
     empty!(PIPELINE_COMPILE_MISSES)
@@ -159,8 +164,6 @@ function no_pipeline_compilation(f)
     end
 end
 
-const PIPELINE_CACHE = Dict{UInt64, LavaComputePipeline}()
-const PIPELINE_INSERTION_ORDER = UInt64[]
 const MAX_PIPELINE_CACHE_SIZE = Ref(1024)
 
 # Lava's cooperative-matrix kernels are written against a 32-lane subgroup: they
@@ -173,12 +176,10 @@ const COOPMAT_SUBGROUP = 32
 # Per device, for the same reason as `DEVICE_SUBGROUP_SIZE` above: RDNA 3.5
 # reports min 32 / max 64 where this card reports 32 / 32, and answering the
 # first for the second decides wrongly whether a pipeline may be pinned.
-const SUBGROUP_SIZE_CONTROL = Dict{UInt64,SubgroupSizeControl}()
 
 # One warning per device, not per pipeline: the message is about the device's
 # subgroup width, so a coopmat-heavy workload would otherwise repeat it hundreds
 # of times. Cleared with the other per-device tables on reset.
-const COOPMAT_SUBGROUP_WARNED = Dict{UInt64,Bool}()
 
 # The device's DEFAULT subgroup width, as opposed to the min/max it can be pinned
 # to. Queried once; cleared on device reset with the rest.
@@ -190,14 +191,13 @@ const COOPMAT_SUBGROUP_WARNED = Dict{UInt64,Bool}()
 # pipeline is undefined behaviour and usually crashes, while a stale device
 # PROPERTY just returns the wrong number. Every tiling decision keyed on the
 # subgroup width would then be silently made for the other device.
-const DEVICE_SUBGROUP_SIZE = Dict{UInt64,Int}()
 
 function device_subgroup_size(ctx::VkContext = vk_context())
-    get!(DEVICE_SUBGROUP_SIZE, ctx.id) do
-        props = Vulkan.get_physical_device_properties_2(ctx.physical_device,
-                                                        Vulkan.PhysicalDeviceSubgroupProperties)
-        Int(props.next.subgroup_size)
-    end
+    # 0 is the "not yet queried" sentinel; no device reports a 0-lane subgroup.
+    ctx.caches.subgroup_size != 0 && return ctx.caches.subgroup_size
+    props = Vulkan.get_physical_device_properties_2(ctx.physical_device,
+                                                    Vulkan.PhysicalDeviceSubgroupProperties)
+    ctx.caches.subgroup_size = Int(props.next.subgroup_size)
 end
 
 """
@@ -207,14 +207,14 @@ The device's `VkPhysicalDeviceSubgroupSizeControlProperties`, queried once.
 `compute` says whether a compute pipeline may pin its own subgroup size.
 """
 function subgroup_size_control(ctx::VkContext = vk_context())
-    get!(SUBGROUP_SIZE_CONTROL, ctx.id) do
-        p = Vulkan.get_physical_device_properties_2(
-                ctx.physical_device, Vulkan.PhysicalDeviceSubgroupSizeControlProperties).next
-        SubgroupSizeControl(
-            Int(p.min_subgroup_size), Int(p.max_subgroup_size),
-            (UInt32(p.required_subgroup_size_stages) &
-             UInt32(Vulkan.SHADER_STAGE_COMPUTE_BIT)) != 0)
-    end
+    c = ctx.caches.subgroup_control
+    c === nothing || return c
+    p = Vulkan.get_physical_device_properties_2(
+            ctx.physical_device, Vulkan.PhysicalDeviceSubgroupSizeControlProperties).next
+    ctx.caches.subgroup_control = SubgroupSizeControl(
+        Int(p.min_subgroup_size), Int(p.max_subgroup_size),
+        (UInt32(p.required_subgroup_size_stages) &
+         UInt32(Vulkan.SHADER_STAGE_COMPUTE_BIT)) != 0)
 end
 
 """Whether a compute pipeline on this device can be pinned to `n` lanes per subgroup."""
@@ -275,14 +275,10 @@ function spirv_local_size(spirv::Vector{UInt8})
     return 0
 end
 
-# Register cleanup callback for vk_reset_device!
-push!(RESET_CALLBACKS, function()
-    empty!(PIPELINE_CACHE)
-    empty!(PIPELINE_INSERTION_ORDER)
-    empty!(SUBGROUP_SIZE_CONTROL)       # re-query: the next device may differ
-    empty!(DEVICE_SUBGROUP_SIZE)
-    empty!(COOPMAT_SUBGROUP_WARNED)
-end)
+# No reset callback here any more. Every one of those five lived on `VkContext`
+# by the time this ran, and `vk_reset_device!` builds a new context — so a fresh
+# `DeviceCaches` is the reset. Clearing a global was the compensation for state
+# that outlived its device; owning it removes both.
 
 """
     spirv_content_hash(bytes) -> UInt64
@@ -339,9 +335,9 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
     # second is handed the first's handles to bind into its own command buffer —
     # undefined behaviour, and the same class as the `hash(spirv_bytes)` collision
     # this line already carries a warning about (`GUARDRAILS.md` §8).
-    cache_key = hash((ctx.id, spirv_content_hash(spirv_bytes), length(spirv_bytes),
+    cache_key = hash((spirv_content_hash(spirv_bytes), length(spirv_bytes),
                       entry_name, push_constant_size, needs_tlas_descriptor))
-    cached = get(PIPELINE_CACHE, cache_key, nothing)
+    cached = get(ctx.caches.pipelines, cache_key, nothing)
     if cached !== nothing
         return cached
     end
@@ -438,8 +434,8 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
             # `test_shared_index_division.jl`'s question closed.
             wg = spirv_local_size(spirv_bytes)
             sg = device_subgroup_size(ctx)
-            if !(0 < wg <= sg) && !get(COOPMAT_SUBGROUP_WARNED, ctx.id, false)
-                COOPMAT_SUBGROUP_WARNED[ctx.id] = true
+            if !(0 < wg <= sg) && !ctx.caches.coopmat_warned
+                ctx.caches.coopmat_warned = true
                 @warn """
                     $(ctx.device_name) runs $sg-lane subgroups and cannot pin them to \
                     $COOPMAT_SUBGROUP, and this module's workgroup is \
@@ -512,11 +508,11 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
 
     result = LavaComputePipeline(shader_mod, layout, pipeline, UInt32(push_constant_size),
                                   needs_tlas_descriptor, ds_layout)
-    PIPELINE_CACHE[cache_key] = result
-    push!(PIPELINE_INSERTION_ORDER, cache_key)
-    while length(PIPELINE_INSERTION_ORDER) > MAX_PIPELINE_CACHE_SIZE[]
-        old_key = popfirst!(PIPELINE_INSERTION_ORDER)
-        delete!(PIPELINE_CACHE, old_key)
+    ctx.caches.pipelines[cache_key] = result
+    push!(ctx.caches.pipeline_order, cache_key)
+    while length(ctx.caches.pipeline_order) > MAX_PIPELINE_CACHE_SIZE[]
+        old_key = popfirst!(ctx.caches.pipeline_order)
+        delete!(ctx.caches.pipelines, old_key)
         # No defensive pin needed: every dispatch pin!s its pipeline into
         # `batch.pinned`, so any in-flight batch that used this pipeline
         # holds a strong ref.  Once all such batches retire the ref drops
