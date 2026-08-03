@@ -1,4 +1,5 @@
-# A cooperative-matrix pipeline must refuse to build where 32 lanes cannot be pinned.
+# Cooperative-matrix pipelines and the 32-lane pin: pinned where possible, and
+# warned about where the workgroup spans more than one subgroup.
 #
 # `get_compute_pipeline` pins a module declaring `CooperativeMatrixKHR` to
 # `COOPMAT_SUBGROUP` whenever the device default is something else, and errors
@@ -64,51 +65,57 @@ end
 
         # ── the positive control ─────────────────────────────────────────────
         # Describe a device whose subgroups are 64 and cannot be narrowed, which
-        # is what an RDNA part without `VK_EXT_subgroup_size_control` would look
-        # like, and assert the refusal rather than a wrong answer.
-        saved_ctl  = get(Lava.SUBGROUP_SIZE_CONTROL, ctx.id, nothing)
+        # is what an RDNA part without `VK_EXT_subgroup_size_control` looks like.
+        #
+        # This asserts a WARNING, not a refusal, and the difference was earned by
+        # 328827f: refusing outright rejected a VALID 8-lane cooperative-matrix
+        # kernel on lavapipe, which turns out to be a second, independent coopmat
+        # consumer. A workgroup holding ONE subgroup is correct at any width —
+        # every lane computes `tid ÷ COOPMAT_SUBGROUP == 0` — so only a workgroup
+        # spanning more than one is dangerous. The gate that protects correctness
+        # is the capability query (`coopmat_gemm_available`, `flashcmfits`); this
+        # is the backstop for a hand-written kernel that bypasses them.
+        saved_ctl  = ctx.caches.subgroup_control
         saved_size = Lava.device_subgroup_size(ctx)
+        saved_warn = ctx.caches.coopmat_warned
         try
-            Lava.SUBGROUP_SIZE_CONTROL[ctx.id] = Lava.SubgroupSizeControl(64, 64, true)
-            Lava.DEVICE_SUBGROUP_SIZE[ctx.id]  = 64
+            ctx.caches.subgroup_control = Lava.SubgroupSizeControl(64, 64, true)
+            ctx.caches.subgroup_size    = 64
+            ctx.caches.coopmat_warned   = false     # one warning per device
             @test !Lava.can_require_subgroup_size(ctx, Lava.COOPMAT_SUBGROUP)
 
-            # Every cache that could hand back the pipeline built a moment ago,
-            # which would make the refusal unreachable and this assertion vacuous.
-            empty!(Lava.PIPELINE_CACHE)
-            empty!(Lava.PIPELINE_INSERTION_ORDER)
-            empty!(Lava.LAUNCH_PLAN_CACHE)
-            empty!(Lava.LINKED_KERNEL_CACHE)
-
-            # NOT through `mul!`. `coopmat_gemm_available` consults
-            # `can_require_subgroup_size` itself (gemm.jl:271), so with the cache
-            # faked it routes to the scalar GEMM and never asks for a coopmat
-            # pipeline at all — the refusal is a BACKSTOP behind that gate, and a
-            # test driven through `mul!` passes while proving nothing. Measured:
-            # `mul!` returned normally and computed the right answer.
-            #
-            # So launch a kernel that touches a cooperative matrix directly, which
-            # is what makes the module declare CooperativeMatrixKHR and is the
-            # condition `get_compute_pipeline` actually keys on.
-            err = try
-                out = KA.zeros(LavaBackend(), Float32, 64)
-                cmr_probe!(LavaBackend(), 64)(out; ndrange = 64)
-                KA.synchronize(LavaBackend())
-                nothing
-            catch e
-                e
+            let c = ctx.caches
+                empty!(c.pipelines); empty!(c.pipeline_order)
+                empty!(c.launchplans); empty!(c.linked)
+                # `frozen_mem` TOO: `get_compiled_kernel_and_pipeline` consults it
+                # first and RETURNS on a hit, so a frozen kernel never reaches
+                # `get_compute_pipeline` and the guard cannot fire at all.
+                empty!(c.frozen_mem); empty!(c.iterplans)
             end
-            @test err !== nothing
-            # And it must be THIS refusal, not any error that happens to be thrown.
-            @test occursin("cooperative-matrix", sprint(showerror, err))
+
+            # 128 threads against a faked 64-lane subgroup: two subgroups, which
+            # is the shape the warning exists for.
+            out2 = KA.zeros(LavaBackend(), Float32, 128)
+            @test_logs (:warn, r"cannot pin them to"i) match_mode = :any begin
+                cmr_probe!(LavaBackend(), 128)(out2; ndrange = 128)
+                KA.synchronize(LavaBackend())
+            end
+            @test ctx.caches.coopmat_warned          # and it latched, once
         finally
-            saved_ctl === nothing ? delete!(Lava.SUBGROUP_SIZE_CONTROL, ctx.id) :
-                                    (Lava.SUBGROUP_SIZE_CONTROL[ctx.id] = saved_ctl)
-            Lava.DEVICE_SUBGROUP_SIZE[ctx.id] = saved_size
-            empty!(Lava.PIPELINE_CACHE)
-            empty!(Lava.PIPELINE_INSERTION_ORDER)
-            empty!(Lava.LAUNCH_PLAN_CACHE)
-            empty!(Lava.LINKED_KERNEL_CACHE)
+            ctx.caches.subgroup_control = saved_ctl
+            ctx.caches.subgroup_size    = saved_size
+            ctx.caches.coopmat_warned   = saved_warn
+            let c = ctx.caches      # fields on the context since 28bf2de
+                # `frozen_mem` and `iterplans` TOO. `get_compiled_kernel_and_pipeline`
+                # consults the frozen memo first and RETURNS on a hit, so a cached
+                # frozen kernel never reaches `get_compute_pipeline` — and the
+                # refusal under test lives there. Leaving it populated made this
+                # positive control pass vacuously: no error, because no pipeline
+                # was ever built.
+                empty!(c.pipelines); empty!(c.pipeline_order)
+                empty!(c.launchplans); empty!(c.linked)
+                empty!(c.frozen_mem); empty!(c.iterplans)
+            end
         end
     end
 end

@@ -214,7 +214,7 @@ end
     # that the refusal fires when it would be. The second half is unreachable on
     # any device present, so it drives the capability cache instead.
     @testset "coopmat 32-lane pin" begin
-        include(joinpath(@__DIR__, "test_coopmat_subgroup_refusal.jl"))
+        include(joinpath(@__DIR__, "test_coopmat_subgroup_pin.jl"))
     end
 
     # A handled allocation failure must absorb its own validation messages, or it

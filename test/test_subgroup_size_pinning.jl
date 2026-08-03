@@ -24,7 +24,7 @@
 # CooperativeMatrixKHR and `device_subgroup_size(ctx) != 32`
 # (`pipeline.jl:363`). The kernel below touches a cooperative matrix so the
 # capability is declared, and the test drives that gate through the
-# `DEVICE_SUBGROUP_SIZE` Ref rather than editing the emitter.
+# `ctx.caches.subgroup_size` field rather than editing the emitter.
 
 using Test, Lava, KernelAbstractions
 const KA = KernelAbstractions
@@ -49,10 +49,10 @@ end
 
 "Drop every cache that can hand back a pipeline built for a different width."
 function sgp_clear_caches!()
-    empty!(Lava.PIPELINE_CACHE)
-    empty!(Lava.PIPELINE_INSERTION_ORDER)
-    empty!(Lava.LAUNCH_PLAN_CACHE)
-    empty!(Lava.LINKED_KERNEL_CACHE)
+    # Fields on the context since 28bf2de, not globals keyed by `ctx.id`.
+    c = Lava.vk_context().caches
+    empty!(c.pipelines); empty!(c.pipeline_order)
+    empty!(c.launchplans); empty!(c.linked)
 end
 
 "Run the probe with Lava's auto-pin gate driven to produce `want` lanes."
@@ -61,12 +61,13 @@ function sgp_run(be, want::Int)
     # The gate is `device_subgroup_size(ctx) != COOPMAT_SUBGROUP`. Telling Lava the
     # device is already 32 suppresses the pin, so the module runs at the hardware
     # default; leaving the true value (64) makes the pin fire and request 32.
-    # Per device since the two-device work: DEVICE_SUBGROUP_SIZE is a
-    # Dict{UInt64,Int} keyed by ctx.id, not a Ref. Query through the accessor so
-    # the entry exists before it is overridden.
+    # A FIELD on the context since 28bf2de — it was a Ref, then a Dict keyed by
+    # ctx.id, and is now `ctx.caches.subgroup_size`. Query through the accessor
+    # first so the lazy query has run before the value is overridden.
+    # `ctx.caches.subgroup_size` since 28bf2de: the per-device caches are fields
+    # on the context now, not globals keyed by `ctx.id`.
     saved = Lava.device_subgroup_size(ctx)
-    Lava.DEVICE_SUBGROUP_SIZE[ctx.id] =
-        want == Lava.COOPMAT_SUBGROUP ? saved : Lava.COOPMAT_SUBGROUP
+    ctx.caches.subgroup_size = want == Lava.COOPMAT_SUBGROUP ? saved : Lava.COOPMAT_SUBGROUP
     # ALL THREE caches, not just PIPELINE_CACHE. The required subgroup size is part
     # of the pipeline's create-info but NOT part of `get_compute_pipeline`'s cache
     # key, and the KA launch path caches a LaunchPlan that owns a pipeline on top
@@ -86,7 +87,7 @@ function sgp_run(be, want::Int)
         (sz = Int.(Array(sz)), lane = Int.(Array(lane)),
          red = Array(red), indep = Array(indep))
     finally
-        Lava.DEVICE_SUBGROUP_SIZE[ctx.id] = saved
+        ctx.caches.subgroup_size = saved
         sgp_clear_caches!()
     end
 end
