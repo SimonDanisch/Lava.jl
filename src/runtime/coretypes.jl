@@ -326,6 +326,83 @@ Diagnostics() = Diagnostics(false, false, false, false, false, false, false, not
 
 # ── Per-device state ─────────────────────────────────────────────────────────
 
+const VAL_RING_SLOTS      = 64
+const VAL_RING_SLOT_BYTES = 2048
+const MAX_VALIDATION_MESSAGES = 50
+const MAX_PRINTF_MESSAGES     = 4096
+
+"""
+    ValidationRingRaw
+
+The five pointers `debug_callback` needs, in a layout it can read off
+`pUserData` with one `unsafe_load`.
+
+`isbits`, so that load is a plain memory read: the callback runs on a driver
+thread, re-entrantly from inside a blocking `ccall` (GPU-AV reads back during
+`vkWaitSemaphores` with driver locks held), where allocating or entering the
+Julia runtime deadlocks or corrupts. That constraint is why the ring was raw
+preallocated arrays — it is not a reason for them to be *module-level*, which is
+what this replaces.
+"""
+struct ValidationRingRaw
+    buf::Ptr{UInt8}
+    len::Ptr{Cint}
+    sev::Ptr{UInt32}
+    typ::Ptr{UInt32}
+    write::Ptr{Int}
+end
+
+"""
+    ValidationRing
+
+One device's validation messages: a slot ring the debug-utils callback fills on
+a driver thread, and the drained strings the main thread reads.
+
+**This was eight module-level globals, and that was a two-device bug rather than
+untidiness.** `create_vulkan_context` builds a *fresh* `Vulkan.Instance` and
+`DebugUtilsMessengerEXT` per context — `VkContext` already holds both as fields —
+so two contexts meant two messengers writing into ONE ring. Device A's validation
+errors surfaced in device B's `get_validation_messages()`, and
+`check_validation_errors!` would raise one device's fault at the other device's
+call site. The drain cursor was shared too, so whichever device drained first
+consumed the other's messages.
+
+`VkDebugUtilsMessengerCreateInfoEXT` carries a `pUserData` pointer for exactly
+this, and `debug_callback` already took (and ignored) it.
+
+The arrays are allocated once and never resized, so the pointers cached in `raw`
+stay valid; `raw` is a `RefValue` because its own address is what gets handed to
+the driver, and Julia's GC does not move objects that something roots — here, the
+context.
+"""
+mutable struct ValidationRing
+    buf::Vector{UInt8}
+    len::Vector{Cint}
+    sev::Vector{UInt32}
+    typ::Vector{UInt32}
+    write::Vector{Int}      # 1 element; total messages written by the callback
+    read::Int               # main-thread drain cursor
+    raw::Base.RefValue{ValidationRingRaw}
+    # Drained, classified output. Hard errors for `check_validation_errors!`;
+    # `@lava_printf` text kept separate so a debug print is not an error.
+    messages::Vector{String}
+    printf::Vector{String}
+end
+
+function ValidationRing()
+    buf = zeros(UInt8,  VAL_RING_SLOTS * VAL_RING_SLOT_BYTES)
+    len = zeros(Cint,   VAL_RING_SLOTS)
+    sev = zeros(UInt32, VAL_RING_SLOTS)
+    typ = zeros(UInt32, VAL_RING_SLOTS)
+    wr  = zeros(Int, 1)
+    raw = Ref(ValidationRingRaw(pointer(buf), pointer(len), pointer(sev),
+                                pointer(typ), pointer(wr)))
+    ValidationRing(buf, len, sev, typ, wr, 0, raw, String[], String[])
+end
+
+"""The `pUserData` this ring is reached through. Stable for the ring's lifetime."""
+ring_user_data(r::ValidationRing) = Ptr{Cvoid}(pointer_from_objref(r.raw))
+
 """
     IterPlan
 

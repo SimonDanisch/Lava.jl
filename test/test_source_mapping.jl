@@ -699,7 +699,7 @@ end
     Lava.try_vk_alloc(Lava.vk_context().default_bq, 40_000_000_000)  # 40GB, will fail
 
     # Validation messages should be drained by the failed alloc
-    @test isempty(Lava.VALIDATION_MESSAGES)
+    @test isempty(Lava.vk_context().validation.messages)
 
     # Next compilation should succeed without stale validation errors
     r = lava_compile(Lava._srcmap_add!,

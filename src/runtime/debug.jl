@@ -78,7 +78,7 @@ Turn on the validation layer's debug-printf feature and reset the Vulkan device
 so `@lava_printf` calls in kernels produce output. Debug printf and GPU-AV both
 instrument shaders and cannot be active together, so this turns GPU-AV off.
 
-Output is captured into `PRINTF_MESSAGES`; read it with
+Output is captured into `ctx.validation.printf`; read it with
 `Lava.get_printf_output()` (and `Lava.clear_printf_output!()` to reset). The
 debug-utils callback also `@info`-logs each line as it arrives. As with all
 validation features this slows shader execution substantially — use it for
@@ -121,7 +121,7 @@ this proves the layer is alive whether `POOL_DISABLED` is true or false.
 
 Implementation: the flush after a GPU-AV-caught dispatch can hang in cleanup
 on some drivers (observed on AMDVLK Windows), so the flush is spawned on a
-worker task and the main task polls `VALIDATION_MESSAGES` until either the
+worker task and the main task polls `ctx.validation.messages` until either the
 expected message appears or the timeout expires. On success, the function
 calls `vk_reset_device!` to clear the half-flushed batch state.
 """
@@ -170,13 +170,13 @@ function verify_gpu_av(; timeout::Float64=30.0)
         Vulkan.wait_semaphores(dev,
             Vulkan.SemaphoreWaitInfo([bq.timeline_sem], [target]),
             UInt64(200_000_000))   # 200 ms — finite, so a non-signalling fault can't hang us
-        drain_validation_messages!()
-        for m in VALIDATION_MESSAGES
+        drain_validation_messages!(ctx)
+        for m in ctx.validation.messages
             matches(m) && (caught_msg = m; break)
         end
     end
     if isempty(caught_msg)
-        n = length(VALIDATION_MESSAGES)
+        n = length(ctx.validation.messages)
         vk_reset_device!()   # clear the half-flushed faulting batch
         throw(LavaError("verify_gpu_av",
             "GPU-AV did not report a known out-of-bounds write within $(timeout)s " *

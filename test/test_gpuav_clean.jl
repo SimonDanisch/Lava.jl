@@ -53,14 +53,15 @@ else
         vp(scene, gpu_film, camera)
         close(vp)
 
-        # The async debug callback writes into a ring; pull anything not yet
-        # surfaced by the render's own flushes into VALIDATION_MESSAGES.
-        Lava.drain_validation_messages!()
+        # The async debug callback writes into this context's ring; pull
+        # anything not yet surfaced by the render's own flushes.
+        ctx = Lava.vk_context()
+        Lava.drain_validation_messages!(ctx)
 
-        # `Lava.VALIDATION_MESSAGES` collects setup-noise warnings (validation
-        # layer adjusts settings on init) alongside real errors.  Filter to
-        # actual validation issues — the setup noise is harmless.
-        real_messages = filter(Lava.VALIDATION_MESSAGES) do m
+        # The drained list collects setup-noise warnings (validation layer
+        # adjusts settings on init) alongside real errors.  Filter to actual
+        # validation issues — the setup noise is harmless.
+        real_messages = filter(ctx.validation.messages) do m
             !occursin("adjusting settings", m) &&
             !occursin("VALIDATION-SETTINGS", m) &&
             !occursin("Loader Message", m)

@@ -524,7 +524,7 @@ function try_vk_alloc(bq::BatchQueue, nbytes::Integer;
         if e isa Vulkan.VulkanError &&
            (e.code == Vulkan.ERROR_OUT_OF_DEVICE_MEMORY ||
             e.code == Vulkan.ERROR_OUT_OF_HOST_MEMORY)
-            empty!(VALIDATION_MESSAGES)
+            empty!((bq.ctx::VkContext).validation.messages)
             return AllocFailure(e.code, op, Int(nbytes), mem_type_idx_local)
         end
         # DEVICE_LOST during alloc is a hard fault — mark + propagate so the

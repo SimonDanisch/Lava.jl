@@ -128,8 +128,22 @@ function probe()
     println("gpu id=$(gpu.id)  $(gpu.device_name)")
     println("cpu id=$(cpu.id)  $(cpu.device_name)")
     gpu.id == cpu.id && error("two contexts share an id — every per-device key is void")
-    gpu.cmd_pipeline_barrier_fptr == cpu.cmd_pipeline_barrier_fptr &&
-        error("both devices report the same vkCmdPipelineBarrier — the global is back")
+
+    # Two devices must resolve their own `vkCmdPipelineBarrier` — unless a layer
+    # is loaded. `vkGetDeviceProcAddr` then returns the LAYER's dispatch
+    # trampoline, which is one piece of code for every device by construction, so
+    # the pointers are legitimately equal and this says nothing about Lava.
+    #
+    # The check fired on exactly that: with `LAVA_VALIDATION=1` the probe aborted
+    # here, before reaching anything it exists to test — which is the one
+    # configuration you would want to run it in.
+    if gpu.debug_messenger === nothing && cpu.debug_messenger === nothing
+        gpu.cmd_pipeline_barrier_fptr == cpu.cmd_pipeline_barrier_fptr &&
+            error("both devices report the same vkCmdPipelineBarrier — the global is back")
+    else
+        println("  (validation layers active: skipping the fptr check — the layer's " *
+                "dispatch trampoline is shared by design)")
+    end
 
     for (name, ctx) in (("gpu", gpu), ("cpu", cpu))
         b = LavaBackend(ctx)
@@ -164,6 +178,24 @@ function probe()
                 "   gemm ",   okg ? "ok" : "WRONG ($(Array(C)[1]))")
         (ok && okr && okg) || error("$name produced a wrong result")
         A = B = C = a = nothing
+    end
+
+    # ── the validation ring, which was EIGHT module-level globals ────────────
+    #
+    # `create_vulkan_context` builds a fresh `Vulkan.Instance` and
+    # `DebugUtilsMessengerEXT` per context, so two contexts meant two messengers
+    # writing into one ring: device A's errors surfaced in device B's
+    # `get_validation_messages()`, and whichever drained first consumed the
+    # other's messages. The messenger now carries the ring's address as
+    # `pUserData`, which is what the callback reads.
+    gpu.validation === cpu.validation &&
+        error("both contexts share one ValidationRing — the global is back")
+    Lava.ring_user_data(gpu.validation) == Lava.ring_user_data(cpu.validation) &&
+        error("both messengers were handed the same pUserData")
+    for (name, ctx) in (("gpu", gpu), ("cpu", cpu))
+        Lava.drain_validation_messages!(ctx)
+        println("  $name: ring wrote $(ctx.validation.write[1]), " *
+                "drained $(length(ctx.validation.messages)) message(s)")
     end
 
     # The assertion this probe was built around — "one kernel on two devices must
