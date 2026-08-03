@@ -26,6 +26,18 @@
 using Test, Lava, KernelAbstractions
 const KA = KernelAbstractions
 
+# Exists only to make the module declare CooperativeMatrixKHR, which is the
+# condition `get_compute_pipeline`'s pin (and its refusal) keys on. The value is
+# written out so nothing optimises the matrix away.
+@kernel cpu=false unsafe_indices=true function cmr_probe!(out)
+    i = Lava.lava_local_invocation_index() + UInt32(1)
+    @inbounds begin
+        m = Lava.AcceleratedMatrix{Float32,Lava.GEMM_TILE,Lava.GEMM_TILE,Lava.Accumulator}(
+                pointer(out), 1, Lava.GEMM_TILE)
+        out[i] = Lava.coopmat_getcomp(m, Int32(0))
+    end
+end
+
 @testset "coopmat pipelines and the 32-lane pin" begin
     ctx = Lava.vk_context()
 
@@ -68,9 +80,19 @@ const KA = KernelAbstractions
             empty!(Lava.LAUNCH_PLAN_CACHE)
             empty!(Lava.LINKED_KERNEL_CACHE)
 
-            C2 = Lava.LavaArray(zeros(Float32, M, N))
+            # NOT through `mul!`. `coopmat_gemm_available` consults
+            # `can_require_subgroup_size` itself (gemm.jl:271), so with the cache
+            # faked it routes to the scalar GEMM and never asks for a coopmat
+            # pipeline at all — the refusal is a BACKSTOP behind that gate, and a
+            # test driven through `mul!` passes while proving nothing. Measured:
+            # `mul!` returned normally and computed the right answer.
+            #
+            # So launch a kernel that touches a cooperative matrix directly, which
+            # is what makes the module declare CooperativeMatrixKHR and is the
+            # condition `get_compute_pipeline` actually keys on.
             err = try
-                Lava.LinearAlgebra.mul!(C2, A, B)
+                out = KA.zeros(LavaBackend(), Float32, 64)
+                cmr_probe!(LavaBackend(), 64)(out; ndrange = 64)
                 KA.synchronize(LavaBackend())
                 nothing
             catch e
