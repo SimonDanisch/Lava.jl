@@ -55,6 +55,26 @@ it while developing kernels; leave it alone otherwise.
 """
 const FROZEN_VERSION = Ref("")
 
+"""
+    cache_io_error(ex) -> Bool
+
+Whether `ex` is a failure of the cache MEDIUM rather than of this library.
+
+A cache entry that is missing, truncated, or written by an older version is a
+recompile — never a failed session. Everything else is a bug here, and a bare
+`catch` that turns a `MethodError` in the deserializer into "cache miss" is how
+a cache silently stops working: every launch pays a recompile, every run is
+correct, and nothing ever says why.
+"""
+# No `Serialization.SerializationError` — the stdlib defines no such type, and
+# naming it made this function throw on its first call. `deserialize` on a
+# damaged or version-skewed entry surfaces as one of these instead: truncation is
+# `EOFError`, a type that no longer exists is `UndefVarError`, a changed field
+# layout is `TypeError` or `MethodError`.
+cache_io_error(ex) = ex isa Union{SystemError, Base.IOError, EOFError,
+                                  ArgumentError, UndefVarError, TypeError,
+                                  MethodError}
+
 """When true, kernels compiled the slow way are written to the frozen cache."""
 const FROZEN_RECORDING = Ref(false)
 
@@ -165,7 +185,8 @@ function frozen_pipeline_cache(ctx::VkContext, key::AbstractString)
     bytes = try
         read(path)
     catch ex
-        @debug "Lava: frozen pipeline blob unreadable" path exception = ex
+        cache_io_error(ex) || rethrow()
+        @warn "Lava: frozen pipeline blob unreadable; the driver will recompile its ISA" path exception = ex maxlog = 1
         return nothing
     end
     pipeline_cache_compatible(bytes, ctx.physical_device) || return nothing
@@ -178,7 +199,7 @@ function frozen_pipeline_cache(ctx::VkContext, key::AbstractString)
     catch ex
         # Passed the header check and still refused: keep the session, drop the
         # blob so the next run does not retry it.
-        @warn "Lava: frozen pipeline blob rejected; rebuilding from SPIR-V" path exception = ex
+        @warn "Lava: frozen pipeline blob rejected; rebuilding from SPIR-V" path exception = ex maxlog = 1
         rm(path; force = true)
         return nothing
     end
@@ -199,7 +220,8 @@ function frozen_store_bin(ctx::VkContext, key::AbstractString, pcache)
             Libc.free(ptr)
         end
     catch ex
-        @debug "Lava: frozen pipeline blob store failed" key exception = ex
+        cache_io_error(ex) || rethrow()
+        @warn "Lava: frozen pipeline blob store failed; level-2 cache will stay cold" key exception = ex maxlog = 1
     end
     return nothing
 end
@@ -224,8 +246,9 @@ function frozen_load(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workgr
     compiled = try
         open(Serialization.deserialize, path)::LavaGPUKernel
     catch ex
-        # A damaged entry costs a recompile, never the session.
-        @debug "Lava: frozen cache entry unreadable" path exception = ex
+        # A damaged entry costs a recompile, never the session — but it says so.
+        cache_io_error(ex) || rethrow()
+        @warn "Lava: frozen cache entry unreadable; recompiling this kernel" path exception = ex maxlog = 1
         return nothing
     end
     # Level 2: hand the pipeline this kernel's own driver blob when there is a
@@ -268,7 +291,8 @@ function frozen_store(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workg
         frozen_logging(ctx) &&
             println("frozen STORE: ", basename(path)[1:end-6], " || ", typestring(tt))
     catch ex
-        @debug "Lava: frozen cache store failed" path exception = ex
+        cache_io_error(ex) || rethrow()
+        @warn "Lava: frozen cache store failed; this kernel will recompile next session" path exception = ex maxlog = 1
     end
     return nothing
 end
@@ -372,7 +396,8 @@ function frozen_rt_load(@nospecialize(f), @nospecialize(tt), stage::Symbol,
     shader = try
         open(Serialization.deserialize, path)::LavaRTShader
     catch ex
-        @debug "Lava: frozen RT entry unreadable" path exception = ex
+        cache_io_error(ex) || rethrow()
+        @warn "Lava: frozen RT entry unreadable; recompiling this stage" path exception = ex maxlog = 1
         return nothing
     end
     FROZEN_RT_MEM[memkey] = shader
@@ -404,7 +429,8 @@ function frozen_rt_store(@nospecialize(f), @nospecialize(tt), stage::Symbol,
         frozen_logging() &&
             println("frozen RT STORE: ", basename(path)[1:end-6], " || ", typestring(tt))
     catch ex
-        @debug "Lava: frozen RT store failed" path exception = ex
+        cache_io_error(ex) || rethrow()
+        @warn "Lava: frozen RT store failed; this stage will recompile next session" path exception = ex maxlog = 1
     end
     return nothing
 end

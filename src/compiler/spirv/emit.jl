@@ -253,7 +253,15 @@ function extract_source_location(inst::LLVM.Instruction)
 
     loc = dbg
     while true
-        inlined = try LLVM.inlined_at(loc) catch; nothing end
+        # Walking the inline chain: LLVM returns null at the end, and older
+        # LLVM.jl throws instead of returning `nothing`. That is the tolerated
+        # case and the loop terminates on it; anything else is our bug.
+        inlined = try
+            LLVM.inlined_at(loc)
+        catch ex
+            ex isa Union{ArgumentError, MethodError, UndefRefError} || rethrow()
+            nothing
+        end
         (inlined === nothing || !(inlined isa LLVM.DILocation)) && break
         il = LLVM.line(inlined)
         il == 0 && break
@@ -284,7 +292,11 @@ function diloc_file(dbg::LLVM.DILocation)
             return string(name)
         end
         return string(dir, "/", name)
-    catch
+    catch ex
+        # Source location is debug decoration on emitted SPIR-V; a metadata node
+        # shaped differently than expected must not fail the compile. Narrowed to
+        # the shapes LLVM.jl actually raises for that.
+        ex isa Union{ArgumentError, MethodError, UndefRefError, BoundsError} || rethrow()
         ""
     end
 end

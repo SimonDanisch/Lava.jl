@@ -345,21 +345,18 @@ check, because `vkGetPhysicalDeviceProperties2` returns void.
 function query_device_compute(phys_dev, phys_props)
     smcount, warps = 0, 0
     if has_extension(phys_dev, "VK_NV_shader_sm_builtins")
-        try
-            p = Vulkan.get_physical_device_properties_2(
-                    phys_dev, Vulkan.PhysicalDeviceShaderSMBuiltinsPropertiesNV).next
-            smcount, warps = Int(p.shader_sm_count), Int(p.shader_warps_per_sm)
-        catch err
-            @debug "VK_NV_shader_sm_builtins query failed; SM count unknown" err
-        end
+        # No try: the extension was just confirmed present by `has_extension`,
+        # so a failure here is a bug in the query, not an absent capability.
+        # Swallowing it produced `sm_count = 0`, which every caller reads as "the
+        # device does not report it" — a wrong answer dressed as a fact.
+        p = Vulkan.get_physical_device_properties_2(
+                phys_dev, Vulkan.PhysicalDeviceShaderSMBuiltinsPropertiesNV).next
+        smcount, warps = Int(p.shader_sm_count), Int(p.shader_warps_per_sm)
     elseif has_extension(phys_dev, "VK_AMD_shader_core_properties2")
-        try
-            p = Vulkan.get_physical_device_properties_2(
-                    phys_dev, Vulkan.PhysicalDeviceShaderCoreProperties2AMD).next
-            smcount = Int(p.active_compute_unit_count)
-        catch err
-            @debug "VK_AMD_shader_core_properties2 query failed; CU count unknown" err
-        end
+        # Same reasoning as the NV branch above: advertised means queryable.
+        p = Vulkan.get_physical_device_properties_2(
+                phys_dev, Vulkan.PhysicalDeviceShaderCoreProperties2AMD).next
+        smcount = Int(p.active_compute_unit_count)
     end
     DeviceCompute(smcount, warps,
                   Int(phys_props.limits.max_compute_shared_memory_size))
@@ -1466,7 +1463,11 @@ function init_vulkan!(; select = pick_physical_device)
                                        scope=UInt32(p.scope)))
             end
         catch err
-            @debug "cooperative-matrix property query failed; treating as unsupported" err
+            # "Treating as unsupported" on ANY error is how a real fault becomes a
+            # silently slower path. Only an actual absence of the feature is
+            # tolerated; anything else is this library's bug and must surface.
+            err isa Vulkan.VulkanError || rethrow()
+            @warn "cooperative-matrix property query failed; treating as unsupported" exception = err
         end
     end
 

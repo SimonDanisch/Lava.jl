@@ -19,7 +19,15 @@ Called from compilation entry points to provide better user-facing errors.
 function wrap_gpu_compiler_error(@nospecialize(e), @nospecialize(f), @nospecialize(tt))
     e isa GPUCompiler.InvalidIRError || rethrow(e)
 
-    fname = try string(nameof(typeof(f))) catch; string(f) end
+    # `nameof` fails only for a callable without a name (a closure instance);
+    # anything else here is a bug in the error formatter and must not be masked
+    # while it is formatting somebody else's error.
+    fname = try
+        string(nameof(typeof(f)))
+    catch ex
+        ex isa Union{ArgumentError, MethodError} || rethrow()
+        string(f)
+    end
     err_str = sprint(showerror, e)
     suggestions = String[]
 
@@ -268,7 +276,14 @@ function lava_run(cmd::Base.AbstractCmd; timeout::Float64=180.0,
     end
     if !process_exited(p)
         @warn "Lava: $label did not report exit within $(round(Int, timeout))s — killing"
-        try kill(p) catch end
+        # The process may exit between the check and the signal, which is the
+        # only tolerated race; a permissions failure is real.
+        try
+            kill(p)
+        catch ex
+            ex isa Union{Base.IOError, ProcessFailedException} || rethrow()
+            @warn "Lava: could not kill $label after timeout" exception = ex
+        end
     end
     return p
 end
@@ -300,7 +315,11 @@ function run_spirv_opt(spirv_bytes::Vector{UInt8})
         end
         @debug "Lava: spirv-opt non-zero exit; returning unoptimized SPIR-V" exitcode=p.exitcode
     catch ex
-        @debug "Lava: spirv-opt invocation failed; returning unoptimized SPIR-V" exception=ex
+        # An external binary that is missing or unrunnable is the tolerated case;
+        # anything else is our bug. @warn, not @debug: silently shipping every
+        # module unoptimised is a large, invisible regression.
+        ex isa Union{Base.IOError, SystemError, Base.ProcessFailedException} || rethrow()
+        @warn "Lava: spirv-opt invocation failed; returning unoptimized SPIR-V" exception=ex
     finally
         rm(in_path; force=true)
         rm(out_path; force=true)
@@ -2498,7 +2517,12 @@ function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
         txt = (process_exited(pd) && pd.exitcode == 0 && isfile(dis_out)) ? read(dis_out, String) : ""
         rm(dis_out; force=true)
         txt
-    catch
+    catch ex
+        # Disassembly decorates a diagnostic; a missing or broken `spirv-dis` must
+        # not replace the message being built. Narrowed so an internal fault here
+        # still surfaces rather than silently producing an empty listing.
+        ex isa Union{Base.IOError, SystemError, ProcessFailedException} || rethrow()
+        @warn "Lava: spirv-dis failed; diagnostic will omit the disassembly" exception = ex
         ""
     end
     if !isempty(dis)
@@ -2629,7 +2653,13 @@ function print_julia_source_context(io::IO, file::String, line::Int)
             marker = j == line ? " >> " : "    "
             println(io, "      │$marker$j: ", src_lines[j])
         end
-    catch
+    catch ex
+        # This is decorating an error message with source context. Failing to read
+        # the file must not replace the diagnostic the caller is about to see, so
+        # the fallback is real — but it is narrowed to the file being unreadable,
+        # and it says so instead of printing nothing.
+        ex isa Union{SystemError, Base.IOError, ArgumentError, BoundsError} || rethrow()
+        println(io, "      │    (source unavailable: ", sprint(showerror, ex), ")")
     end
 end
 

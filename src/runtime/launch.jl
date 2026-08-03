@@ -343,7 +343,11 @@ function lava_disk_cache_load(source::Core.MethodInstance, workgroup_size)
     try
         entry = open(Serialization.deserialize, path)
     catch ex
-        @warn "Lava: disk cache load failed" path exception=(ex, catch_backtrace())
+        # Narrowed like the frozen cache's readers: a truncated or
+        # version-mismatched entry is a recompile, anything else is a bug here
+        # and must not be absorbed by a cache miss.
+        cache_io_error(ex) || rethrow()
+        @warn "Lava: disk cache load failed" path exception=(ex, catch_backtrace()) maxlog = 1
         return nothing
     end
     if string(entry.spec_types) == string(source.specTypes) && entry.workgroup_size == workgroup_size
@@ -376,7 +380,11 @@ function lava_disk_cache_store(source::Core.MethodInstance, workgroup_size, kern
         close(io)
         mv(tmppath, path; force=true)
     catch ex
-        @debug "Lava: disk cache store failed" path exception=ex
+        # A cache is an optimisation, so a failed WRITE may not take the session
+        # down — but it must be visible, or a permanently unwritable cache looks
+        # exactly like a working one. IO faults only; anything else is a bug here.
+        ex isa Union{SystemError, IOError, ArgumentError} || rethrow()
+        @warn "Lava: disk cache store failed; kernels will recompile next session" path exception = ex maxlog = 1
     end
 end
 
@@ -469,13 +477,14 @@ end
 # path and the device-wide cache is used as before.
 @inline function (l::LavaLinker)(::GPUCompiler.CompilerJob, compiled::LavaGPUKernel)
     if FROZEN_RECORDING[] && !isempty(FROZEN_VERSION[])
-        pc = try
-            Vulkan.PipelineCache(l.ctx.device,
-                                 Vulkan.PipelineCacheCreateInfo(Ptr{Cvoid}(C_NULL);
-                                                                initial_data_size=UInt64(0)))
-        catch
-            nothing
-        end
+        # No try. Creating an EMPTY pipeline cache cannot fail for any reason
+        # this code can handle: it takes no input to be malformed. The bare
+        # `catch nothing` here meant a failure produced `pc = nothing`, which
+        # `frozen_store` reads as "no ISA to snapshot" — so the frozen cache
+        # would silently degrade to level 1 forever, invisibly.
+        pc = Vulkan.PipelineCache(l.ctx.device,
+                                  Vulkan.PipelineCacheCreateInfo(Ptr{Cvoid}(C_NULL);
+                                                                 initial_data_size=UInt64(0)))
         l.ctx.caches.frozen_last_pcache = pc
         return link_kernel(l.ctx, compiled; pipeline_cache=pc)
     end

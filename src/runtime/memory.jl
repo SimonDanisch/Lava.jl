@@ -806,8 +806,11 @@ function destroy_buffer!(buf::VkManagedBuffer)
     try
         buf.buffer.destructor()
         buf.memory.destructor()
-    catch
-        safe_fin_log("Lava destroy_buffer!: Vulkan destructor failed\n")
+    catch ex
+        # A destructor may not throw, but it can name the fault: this printed
+        # fixed text, so a driver error and a bug in this file read identically.
+        safe_fin_log("Lava destroy_buffer!: Vulkan destructor failed: " *
+                     sprint(showerror, ex) * "\n")
     end
     buf.address = BDA_POISON
     Threads.atomic_sub!(pool(ctx).live_bytes, buf.size)
@@ -1027,8 +1030,11 @@ function destroy_pool!(ctx::VkContext)
         try
             block.buffer.destructor()
             block.memory.destructor()
-        catch
-            safe_fin_log("Lava pool reset: destructor failed (ok during vk_reset_device!)\n")
+        catch ex
+            # A destructor may not throw, but it can name the fault: this printed
+            # fixed text, so a driver error and a bug in this file read alike.
+            safe_fin_log("Lava pool reset: destructor failed (ok during vk_reset_device!): " *
+                         sprint(showerror, ex) * "\n")
         end
     end
     empty!(ctx.caches.pool.blocks)
@@ -1455,10 +1461,11 @@ function reclaim_empty_pool_blocks!(bq::BatchQueue)
             try
                 block.buffer.destructor()
                 block.memory.destructor()
-            catch
+            catch ex
                 # Match destroy_buffer!: don't propagate from destructors,
-                # but log loudly so driver misbehaviour is visible.
-                safe_fin_log("Lava reclaim_empty_pool_blocks!: Vulkan destructor failed\n")
+                # but log loudly AND name the fault.
+                safe_fin_log("Lava reclaim_empty_pool_blocks!: Vulkan destructor failed: " *
+                             sprint(showerror, ex) * "\n")
             end
         end
     end

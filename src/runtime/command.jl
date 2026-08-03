@@ -1245,12 +1245,18 @@ is monotonic, so once that value is reached every lower value is too.
 function flush_stall_report(bq::BatchQueue, target::UInt64)
     io = IOBuffer()
     ctx = bq.ctx::VkContext
+    # The one place a swallow is right, and it is narrowed to say why: this
+    # builds the diagnostic printed when a flush has ALREADY stalled, and the
+    # device may be lost. Failing to read the counter must not replace the report
+    # the caller is waiting for — but only a Vulkan error is tolerated, and the
+    # reason is printed rather than left blank.
     cur = try
         unwrap(Vulkan.get_semaphore_counter_value(ctx.device, bq.timeline_sem))
-    catch
-        nothing
+    catch err
+        err isa Vulkan.VulkanError || rethrow()
+        err
     end
-    println(io, "  timeline counter = ", cur === nothing ? "unreadable" : cur,
+    println(io, "  timeline counter = ", cur isa Exception ? "unreadable ($cur)" : cur,
                 ", next_timeline = ", bq.next_timeline,
                 ", replay watermark = ", bq.replay_watermark)
     for (i, b) in enumerate(bq.in_flight)

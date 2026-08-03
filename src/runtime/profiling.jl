@@ -80,16 +80,50 @@ driver-reported register/scratch numbers when pipeline-executable-properties
 are available.
 """
 struct KernelStats
-    name::String
+    name::String                     # SPIR-V entry point — always "main"; see `source`
+    source::String                   # the Julia kernel this came from, or "" if unknown
     workgroup_size::NTuple{3,Int}
     spirv::SPIRVOpStats
     registers::Union{Int,Nothing}    # filled from VK_KHR_pipeline_executable_properties when available
     scratch_bytes::Union{Int,Nothing}
 end
 
+"""
+    kernel_source_name(compiled) -> String
+
+The Julia kernel a compiled module came from, recovered from its LLVM IR.
+
+`entry_name` is the SPIR-V entry point, and Lava names every compute entry
+`main` — so a list of `KernelStats` was a list of identical `"main"`s and could
+not be attributed to anything. That is not cosmetic: it is what made
+`list_compiled_kernels` unusable for the question it exists to answer, and why a
+table joining GPU time to register counts had nothing to join *on*.
+
+NOT from the `define` line: by the time this IR exists the entry has already been
+renamed, so every module defines exactly one function and it is called `@main`.
+The original name survives further down, in the mangled symbol and in inlining
+labels — `_Z15gpu_fcpd_scale_16CompilerMetadataI...` and `julia_gpu_fcpd_scale`.
+
+`CompilerMetadata` is the anchor: KernelAbstractions gives every `@kernel` that
+as its first argument, so the name is exactly what precedes it in the mangled
+symbol. `julia_<name>` is the fallback for anything not shaped that way.
+
+Returns `""` rather than throwing when neither matches: a profiler must not be
+the thing that fails.
+"""
+function kernel_source_name(compiled)
+    ir = compiled.ir
+    isempty(ir) && return ""
+    m = match(r"_Z\d+([A-Za-z0-9_]+?)_?\d*CompilerMetadata", ir)
+    m === nothing && (m = match(r"\bjulia_([A-Za-z0-9_]+)", ir))
+    m === nothing && return ""
+    # Trailing specialisation numbers differ between sessions; the name does not.
+    return replace(m.captures[1], r"_\d+$" => "")
+end
+
 function Base.show(io::IO, ::MIME"text/plain", s::KernelStats)
     print(io, "KernelStats(")
-    print(io, "name=", s.name, ", ")
+    print(io, isempty(s.source) ? s.name : s.source, ", ")
     print(io, "wg=", s.workgroup_size, ", ")
     print(io, "spirv=", s.spirv.bytes, "B (", s.spirv.n_instructions, " ops, ", s.spirv.n_functions, " fns)")
     s.registers !== nothing && print(io, ", regs=", s.registers)
@@ -103,13 +137,26 @@ end
 Stats for a single compiled+linked kernel. Use this from a debugger or
 test when you already have a `LavaLinkedKernel` in hand.
 """
-function kernel_stats(linked::LavaLinkedKernel)
+function kernel_stats(linked::LavaLinkedKernel; source::AbstractString = "")
     c = linked.compiled
     spirv = spirv_op_stats(c.spirv_bytes)
     exec = pipeline_exec_stats(linked)
     regs = exec === nothing ? nothing : get(exec, :registers, nothing)
     scratch = exec === nothing ? nothing : get(exec, :scratch_bytes, nothing)
-    return KernelStats(c.entry_name, c.workgroup_size, spirv, regs, scratch)
+    # `source` given by the caller wins: a FROZEN entry has no IR to recover the
+    # name from — `frozen_store` writes `ir = ""` on purpose, the string being
+    # "session-specific and large" — but its cache KEY is
+    # `(typeof(f), tt, workgroup_size)`, which names the kernel outright.
+    name = isempty(source) ? kernel_source_name(c) : source
+    return KernelStats(c.entry_name, name, c.workgroup_size, spirv, regs, scratch)
+end
+
+"""Kernel name from a frozen-cache key, whose first element is `typeof(f)`."""
+function frozen_key_source_name(key)
+    key isa Tuple && !isempty(key) || return ""
+    K = key[1]
+    K isa DataType || return ""
+    return replace(string(nameof(K)), r"^#" => "", r"#\d+$" => "")
 end
 
 """
@@ -127,11 +174,31 @@ Takes a context, because there is no longer a global registry of them to walk �
 which is the point. This briefly read the OUTER level of a two-level dict and
 handed `kernel_stats` another `Dict`; a cache that belongs to a device cannot be
 iterated at the wrong depth.
+
+**Both of the context's caches, because the shipped path only populates one.**
+`get_compiled_kernel_and_pipeline` consults the frozen cache first and *returns*
+on a hit, so a kernel that came off disk never reaches
+`GPUCompiler.cached_compilation` and never enters `caches.linked`. Every runner
+calls `use_frozen_kernels` in its `__init__`, so for the configuration that
+actually ships `caches.linked` is empty and this returned an empty vector —
+measured on a Depth Anything forward: **0 kernels reported against 45 live
+dispatch names**, taking `kernel_stats`, `pipeline_exec_stats` and every
+register/scratch number with it. A profiler blind exactly where it is needed.
 """
 function list_compiled_kernels(ctx::VkContext = vk_context())
     stats = KernelStats[]
+    seen = Set{UInt64}()
     for (_, linked) in ctx.caches.linked
+        push!(seen, objectid(linked))
         push!(stats, kernel_stats(linked))
+    end
+    for (key, linked) in ctx.caches.frozen_mem
+        # `Any`-valued, and one kernel can land in both caches across a session.
+        linked isa LavaLinkedKernel && !(objectid(linked) in seen) || continue
+        push!(seen, objectid(linked))
+        # The frozen entry has no IR to recover a name from — `frozen_store`
+        # writes `ir = ""` on purpose — but its KEY is `(typeof(f), tt, wg)`.
+        push!(stats, kernel_stats(linked; source = frozen_key_source_name(key)))
     end
     return stats
 end
@@ -480,22 +547,27 @@ function pipeline_exec_stats(pipeline::LavaComputePipeline)
     ctx = vk_context()
     pipe = pipeline.pipeline
     # Discover the pipeline's executables.
+    # NO try/catch around either query, and that is the point.
+    #
+    # Both were wrapped in `catch ex; @debug; return nothing`, and it cost this
+    # project a day. `get_pipeline_executable_statistics_khr` was throwing an
+    # outright `ConstructionBase` error — Vulkan.jl could not even build the
+    # result struct, for every driver — and the swallow turned that into
+    # `registers = nothing`, which reads as "this driver declines to report
+    # statistics". It was written up as an AMD driver limitation. RADV in fact
+    # returns twenty statistics per pipeline, more than NVIDIA does.
+    #
+    # A profiler that hides its own failure is worse than one that has none: the
+    # absent numbers look like a fact about the hardware. `PIPELINE_EXEC_PROPERTIES_REQUESTED[]`
+    # above already covers "the caller did not ask for this", and the extension is
+    # only enabled when the device advertises it, so anything reaching here and
+    # failing is a bug that must be seen.
     exec_info = VK.PipelineInfoKHR(pipe)
-    execs = try
-        VK.unwrap(VK.get_pipeline_executable_properties_khr(ctx.device, exec_info))
-    catch ex
-        @debug "Lava: pipeline executable properties query failed" exception=ex
-        return nothing
-    end
+    execs = VK.unwrap(VK.get_pipeline_executable_properties_khr(ctx.device, exec_info))
     isempty(execs) && return nothing
     # For compute pipelines there is exactly one executable; query its stats.
     stats_info = VK.PipelineExecutableInfoKHR(pipe, UInt32(0))
-    stats = try
-        VK.unwrap(VK.get_pipeline_executable_statistics_khr(ctx.device, stats_info))
-    catch ex
-        @debug "Lava: pipeline executable statistics query failed" exception=ex
-        return nothing
-    end
+    stats = VK.unwrap(VK.get_pipeline_executable_statistics_khr(ctx.device, stats_info))
     raw = NamedTuple[]
     registers = nothing
     scratch = nothing
@@ -538,8 +610,19 @@ function pipeline_exec_stats(pipeline::LavaComputePipeline)
         end
         push!(raw, (; name, description=String(s.description), value=v))
         lname = lowercase(name)
-        # NVIDIA names vary by driver version; pattern-match conservatively.
-        if registers === nothing && occursin("register", lname) && v isa Int
+        # The statistic names are driver-defined and NOT portable. Matching only
+        # `"register"` found NVIDIA's "Register Count" and nothing on RADV, which
+        # names the same quantity `VGPRs` — so `registers` came back `nothing` for
+        # every kernel and the occupancy denominator looked unavailable on AMD
+        # when the driver was in fact reporting it.
+        #
+        # This is a NAME table, not a vendor branch: every spelling is tried on
+        # every driver, and a driver that uses two of them gets the first. VGPRs
+        # are the ones that bound occupancy on AMD (SGPRs are scalar and rarely
+        # the limit), so they are preferred where both appear.
+        if occursin("vgpr", lname) && !occursin("spill", lname) && !occursin("pre-sched", lname) && v isa Int
+            registers = v                                  # authoritative, overwrite
+        elseif registers === nothing && occursin("register", lname) && v isa Int
             registers = v
         end
         if scratch === nothing && (occursin("scratch", lname) || occursin("spill", lname)) && v isa Int
