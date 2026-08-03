@@ -75,31 +75,56 @@ without a coopmat and reading the driver's own register count
    crosses `@synchronize`, still loses exactly as much.
 
 What survives all three: **an `OpCooperativeMatrixMulAddKHR` executed in the same
-loop iteration as the divided-index shared store.** Tighter than "in scope", and
-it rules out the explanations that would have made this reproducible without
-cooperative matrices — which matters, because it means lavapipe cannot be the
-second consumer and the two routes below are the only ones left.
+loop iteration as the divided-index shared store.** Tighter than "in scope".
 
-**And it cannot be settled on this machine.** The sibling miscompile in
-`test_int32_cartesian_miscompile.jl` was attributed to NVIDIA in one command, by
-running the identical module on lavapipe — but that does not work here, because a
-cooperative-matrix `muladd` is one of this bug's necessary conditions and
-lavapipe reports `coopmat available: false` (subgroup size 8). This box has
-exactly two Vulkan devices, NVIDIA and llvmpipe, and only one of them has
-cooperative matrices.
+## 2026-08-02, later: SETTLED — the module is valid and NVIDIA miscompiles it
 
-Two things would settle it, and they are worth naming because the second
-generalises:
+This section previously said the bug "cannot be settled on this machine", because
+"lavapipe reports `coopmat available: false` (subgroup size 8)". **That was wrong,
+and it closed the cheapest route for no reason.** lavapipe reports
+`coopmat_available = true` with four 8x8x8 shapes, `Float16` among them, at
+subgroup scope. It is a second, independent cooperative-matrix consumer, and it
+was sitting on this box the whole time.
 
-  * a **second coopmat-capable device** — and one now exists in the fleet: the
-    AMD laptop's Radeon 8060S (RDNA 3.5, RADV) reports 14 cooperative-matrix
-    shapes, `Float16 x Float16 -> Float32` among them, which is exactly this
-    kernel's. That is the cheapest remaining step and it is one `julia` command
-    on a machine we have. Vary the *consumer*, which is what worked next door;
+Running this file's kernel on both — same `BM = 96`, `LDA = 104`, `BK = 32`,
+`WG = 256`, same global load addressed by the divided values, same `fa`/`fb` from
+a global pointer outside the loop — with only the cooperative matrix's extent
+taken from the device:
+
+    device      form       K=32    K=64   K=128   K=256
+    NVIDIA      udiv       3072     256     240     240    DROPS
+    NVIDIA      fastdiv    3072    3072    3072    3072    exact
+    lavapipe    udiv       3072    3072    3072    3072    exact
+    lavapipe    fastdiv    3072    3072    3072    3072    exact
+
+**The pattern is compiled correctly by an independent stack.** Our SPIR-V is
+therefore runnable as written, and what loses the stores is NVIDIA's compilation
+of it — the same conclusion the sibling bug in
+`test_int32_cartesian_miscompile.jl` reached the same way, by varying the
+consumer.
+
+Two honest limits on that. The modules are **not byte-identical**: lavapipe has
+no 16x16x16, so its tile is 8x8, and this varies the extent along with the
+consumer. And llvmpipe is a software rasteriser whose compilation strategy shares
+nothing with a GPU driver's, so "it does not perform the transform that breaks"
+is a weaker statement than "the transform is illegal". What it does establish is
+that the four conditions are not intrinsically unsafe, which is what the
+`@test_broken` above is waiting on.
+
+The other two routes remain, and both would strengthen it:
+
+  * a **third consumer**: the AMD laptop's Radeon 8060S (RDNA 3.5, RADV) reports
+    14 shapes including this kernel's exact `Float16 x Float16 -> Float32`, so it
+    can run the module byte-identically where lavapipe cannot;
   * **glslang as an independent producer** — write this kernel in GLSL, compile
     it with glslang, and run that module on the same NVIDIA driver. Correct there
-    means our SPIR-V differs from glslang's in a way that matters; wrong there
-    means the driver. When you cannot vary the consumer, vary the producer.
+    means our SPIR-V differs from glslang's in a way that matters.
+
+A note on the earlier attempt, because it cost an hour: a reworded reproducer —
+operands loaded from shared inside the loop, global load addressed linearly
+rather than by the divided values — came out **exact on NVIDIA**, i.e. carried no
+bug at all. The conditions in the prose above are necessary, not sufficient. Copy
+the kernel.
 
 **Audit of every `@localmem` kernel in Lava and DNNKernels**, since a bug that
 needs four coincidences is one nobody finds by testing the obvious thing. The
@@ -129,17 +154,20 @@ const KA = KernelAbstractions
 
 const SID_BM, SID_LDA, SID_BK, SID_WG = 96, 104, 32, 256
 
-for (name, fast) in (("udiv", false), ("fastdiv", true))
-    kn = Symbol("sid_", name, "!")
+# `TS` is the cooperative matrix's extent, and 8 exists so this runs on lavapipe
+# — a second, independent consumer, which is what settled where the dropped
+# stores come from. Nothing else differs between the two.
+for (name, fast) in (("udiv", false), ("fastdiv", true)), TS in (16, 8)
+    kn = Symbol("sid_", name, "_", TS, "!")
     split = fast ? :(splitidx(idx, Val($SID_BM))) :
                    :((idx % $SID_BM, idx ÷ $SID_BM))
     @eval @kernel cpu=false unsafe_indices=true function $kn(C, dump, @Const(A), @Const(G),
                                                              ::Val{M}, ::Val{K}) where {M,K}
         sh = @localmem Float16 ($SID_LDA * $SID_BK,)
         tid = @index(Local, Linear) - 1
-        acc = zero(AcceleratedMatrix{Float32,16,16,Accumulator})
-        fa = AcceleratedMatrix{Float16,16,16,MatrixA}(pointer(G), 1, 16)
-        fb = AcceleratedMatrix{Float16,16,16,MatrixB}(pointer(G), 1, 16)
+        acc = zero(AcceleratedMatrix{Float32,$TS,$TS,Accumulator})
+        fa = AcceleratedMatrix{Float16,$TS,$TS,MatrixA}(pointer(G), 1, $TS)
+        fb = AcceleratedMatrix{Float16,$TS,$TS,MatrixB}(pointer(G), 1, $TS)
         for kb in 0:(K ÷ $SID_BK - 1)
             k0 = kb * $SID_BK
             @inbounds for r in 0:(($SID_BM * $SID_BK) ÷ $SID_WG - 1)
@@ -157,16 +185,16 @@ for (name, fast) in (("udiv", false), ("fastdiv", true))
             j = tid + r * $SID_WG
             j < $SID_LDA * $SID_BK && (dump[1 + j] = sh[1 + j])
         end
-        copyto!(pointer(C), 1, 16, convert(AcceleratedMatrix{Float16,16,16,Accumulator}, acc))
+        copyto!(pointer(C), 1, $TS, convert(AcceleratedMatrix{Float16,$TS,$TS,Accumulator}, acc))
     end
 end
 
 "Elements of the staged block that survived, out of `SID_BM * SID_BK`."
-function sid_survivors(backend, kern, K)
+function sid_survivors(backend, kern, K; TS::Int = 16)
     hA = Float16.(reshape(0:(SID_BM * K - 1), SID_BM, K) .% 2048)
     A = KA.allocate(backend, Float16, SID_BM, K); copyto!(A, hA)
     G = KA.allocate(backend, Float16, 256); fill!(G, Float16(0.5))
-    C = KA.allocate(backend, Float16, 16, 16); fill!(C, Float16(-1))
+    C = KA.allocate(backend, Float16, TS, TS); fill!(C, Float16(-1))
     dump = KA.allocate(backend, Float16, SID_LDA * SID_BK); fill!(dump, Float16(-7))
     kern(backend, SID_WG)(C, dump, A, G, Val(SID_BM), Val(K); ndrange = SID_WG)
     KA.synchronize(backend)
@@ -183,7 +211,7 @@ end
         total = SID_BM * SID_BK
         @testset "splitidx keeps every store, at every trip count" begin
             for K in (32, 64, 128, 256)
-                @test sid_survivors(backend, sid_fastdiv!, K) == total
+                @test sid_survivors(backend, sid_fastdiv_16!, K) == total
             end
         end
 
@@ -191,10 +219,50 @@ end
         # broken rather than deleted: if a driver update fixes it this turns into
         # a failure, which is the signal that `splitidx` could be relaxed.
         @testset "the plain division form still drops stores" begin
-            @test sid_survivors(backend, sid_udiv!, 32) == total   # one trip is fine
+            @test sid_survivors(backend, sid_udiv_16!, 32) == total   # one trip is fine
             for K in (64, 128, 256)
-                @test_broken sid_survivors(backend, sid_udiv!, K) == total
+                @test_broken sid_survivors(backend, sid_udiv_16!, K) == total
             end
+        end
+    end
+end
+
+# The second consumer, and the testset that settled where the dropped stores come
+# from. It needs no second card: the Vulkan loader enumerates lavapipe alongside
+# the real GPU on every machine here, and lavapipe DOES have cooperative matrices
+# — four 8x8x8 shapes — which is the fact this file previously got wrong.
+@testset "the same pattern on a second cooperative-matrix consumer" begin
+    lp = try
+        Lava.init_vulkan!(select = devs -> only(filter(Lava.islavapipe, devs)))
+    catch e
+        @info "no lavapipe device; skipping the second-consumer check" exception=e
+        nothing
+    end
+    if lp === nothing
+    elseif !Lava.coopmat_shape(lp, Float16, 8, 8, 8)
+        @info "lavapipe has no 8x8x8 Float16 cooperative matrix here" lp.device_name
+        Lava.mark_device_lost!(lp)
+    else
+        try
+            back = LavaBackend(lp)
+            total = SID_BM * SID_BK
+            # The control first: if `splitidx` were lossy here the comparison
+            # below would mean nothing.
+            for K in (32, 64, 128, 256)
+                @test sid_survivors(back, sid_fastdiv_8!, K; TS = 8) == total
+            end
+            # And the form that drops on NVIDIA at every trip count above one.
+            # Exact here — which is the whole result. If this ever starts
+            # failing, a second stack has begun losing stores too and the bug
+            # moves back to being ours.
+            for K in (32, 64, 128, 256)
+                @test sid_survivors(back, sid_udiv_8!, K; TS = 8) == total
+            end
+        finally
+            # Nothing else can retire a context built with `init_vulkan!(; select)`,
+            # and its buffers' finalizers would otherwise run against a torn-down
+            # device at exit.
+            Lava.mark_device_lost!(lp)
         end
     end
 end

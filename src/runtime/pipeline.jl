@@ -195,6 +195,11 @@ end
 # first for the second decides wrongly whether a pipeline may be pinned.
 const SUBGROUP_SIZE_CONTROL = Dict{UInt64,SubgroupSizeControl}()
 
+# One warning per device, not per pipeline: the message is about the device's
+# subgroup width, so a coopmat-heavy workload would otherwise repeat it hundreds
+# of times. Cleared with the other per-device tables on reset.
+const COOPMAT_SUBGROUP_WARNED = Dict{UInt64,Bool}()
+
 # The device's DEFAULT subgroup width, as opposed to the min/max it can be pinned
 # to. Queried once; cleared on device reset with the rest.
 # Per device, keyed by `ctx.id`. It was a single `Ref`, which is a property of
@@ -259,12 +264,44 @@ function spirv_declares_capability(spirv::Vector{UInt8}, cap::UInt32)
     return false
 end
 
+"""
+    spirv_local_size(spirv) -> Int
+
+Threads per workgroup, read out of the module's `OpExecutionMode LocalSize`, or
+`0` when the module does not state one literally.
+
+`0` for `OpExecutionModeId`, where the extents are specialisation constants and
+are not known until the pipeline is created — the caller must treat that as
+"unknown", not as "small".
+"""
+function spirv_local_size(spirv::Vector{UInt8})
+    length(spirv) >= 20 && length(spirv) % 4 == 0 || return 0
+    w = reinterpret(UInt32, spirv)
+    w[1] == 0x07230203 || return 0
+    i = 6
+    @inbounds while i <= length(w)
+        count = w[i] >> 16
+        count == 0 && break
+        opcode = UInt16(w[i] & 0xffff)
+        # Past the debug/annotation sections there are no more execution modes.
+        opcode == Op.OpTypeVoid && break
+        # OpExecutionMode <entry> LocalSize x y z  — mode 17, so 6 words.
+        if opcode == Op.OpExecutionMode && count >= 6 && i + 5 <= length(w) &&
+           w[i+2] == UInt32(17)
+            return Int(w[i+3]) * Int(w[i+4]) * Int(w[i+5])
+        end
+        i += count
+    end
+    return 0
+end
+
 # Register cleanup callback for vk_reset_device!
 push!(RESET_CALLBACKS, function()
     empty!(PIPELINE_CACHE)
     empty!(PIPELINE_INSERTION_ORDER)
     empty!(SUBGROUP_SIZE_CONTROL)       # re-query: the next device may differ
     empty!(DEVICE_SUBGROUP_SIZE)
+    empty!(COOPMAT_SUBGROUP_WARNED)
 end)
 
 """
@@ -390,15 +427,48 @@ function get_compute_pipeline(ctx::VkContext, spirv_bytes::Vector{UInt8}, entry_
         # with `minSubgroupSize == 32`, so this is a guard, not a limitation —
         # but it is a guard the first non-NVIDIA run should hit loudly if the
         # assumption is wrong.
-        can_require_subgroup_size(ctx, COOPMAT_SUBGROUP) ||
-            error("""
-                  $(ctx.device_name) runs $(device_subgroup_size(ctx))-lane subgroups and \
-                  cannot pin them to $COOPMAT_SUBGROUP, which every cooperative-matrix \
-                  kernel here assumes (see COOPMAT_SUBGROUP). Refusing to build a \
-                  pipeline that would return wrong results silently. Route this shape \
-                  to a non-cooperative-matrix path.""")
-        stage_next = Vulkan.PipelineShaderStageRequiredSubgroupSizeCreateInfo(
-            UInt32(COOPMAT_SUBGROUP))
+        if can_require_subgroup_size(ctx, COOPMAT_SUBGROUP)
+            stage_next = Vulkan.PipelineShaderStageRequiredSubgroupSizeCreateInfo(
+                UInt32(COOPMAT_SUBGROUP))
+        else
+            # Cannot pin — but that is only fatal for a workgroup holding MORE
+            # THAN ONE subgroup. The assumption being violated is `tid ÷
+            # COOPMAT_SUBGROUP` as a subgroup index, and with a single subgroup
+            # every lane computes 0, which is right whatever the real width is.
+            #
+            # This distinction is load-bearing, not hypothetical: lavapipe runs
+            # 8-lane subgroups, cannot pin, and **does** have cooperative
+            # matrices — four 8x8x8 shapes, `Float16` among them. It is therefore
+            # a second, independent cooperative-matrix consumer on a machine that
+            # was documented as having only one, and refusing it outright would
+            # keep `test_shared_index_division.jl`'s open question closed for no
+            # reason. A single-subgroup workgroup is exactly what that
+            # investigation needs to run there.
+            #
+            # `spirv_local_size` returns 0 when the extents are specialisation
+            # constants; treat unknown as unsafe.
+            # A WARNING, not a refusal, and the distinction was earned. The gate
+            # that protects correctness is the capability query — `coopmat_gemm_
+            # available` and `flashcmfits` both check `can_require_subgroup_size`
+            # before routing anything here, which is what was actually broken
+            # (`mul!` asked the global context). A refusal at pipeline creation is
+            # redundant for those paths and, for a hand-written kernel that indexes
+            # no subgroup at all, simply wrong: it refused a valid 8-lane
+            # cooperative-matrix kernel on lavapipe and would have kept
+            # `test_shared_index_division.jl`'s question closed.
+            wg = spirv_local_size(spirv_bytes)
+            sg = device_subgroup_size(ctx)
+            if !(0 < wg <= sg) && !get(COOPMAT_SUBGROUP_WARNED, ctx.id, false)
+                COOPMAT_SUBGROUP_WARNED[ctx.id] = true
+                @warn """
+                    $(ctx.device_name) runs $sg-lane subgroups and cannot pin them to \
+                    $COOPMAT_SUBGROUP, and this module's workgroup is \
+                    $(wg == 0 ? "not a literal" : string(wg)) — more than one subgroup. A \
+                    kernel that indexes `tid ÷ $COOPMAT_SUBGROUP` will read another \
+                    subgroup's fragment here and return wrong results silently. Kernels \
+                    that derive their subgroup from `device_subgroup_size` are fine."""
+            end
+        end
     end
 
     # Create compute pipeline

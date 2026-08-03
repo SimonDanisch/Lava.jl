@@ -528,8 +528,11 @@ end
 
 # The emitter matches on the prefix, so individual names need no registration;
 # this keeps GPUCompiler's unknown-intrinsic check happy for the common shapes.
+# `(8, 8)` is not a shape any kernel here ships: it is what **lavapipe** offers,
+# and having it registered is what lets a cooperative-matrix reproducer run on a
+# second, independent compiler stack. See `test_shared_index_division.jl`.
 for T in (Float16, Float32), U in (MatrixA, MatrixB, Accumulator),
-    (M, N) in ((16, 16), (16, 8)),
+    (M, N) in ((16, 16), (16, 8), (8, 8)),
     op in ("load", "store", "zero", "muladd", "loadw", "loadw2", "storew", "convert",
            "length", "getcomp", "setcomp", "perelem", "mul", "add")
     push!(KNOWN_INTRINSICS, coopmat_intrinsic_name(op, T, M, N, U))
