@@ -210,6 +210,19 @@ end
         include(joinpath(@__DIR__, "test_subgroup_size_pinning.jl"))
     end
 
+    # Both halves of the coopmat 32-lane pin: that it is not needed here, and
+    # that the refusal fires when it would be. The second half is unreachable on
+    # any device present, so it drives the capability cache instead.
+    @testset "coopmat 32-lane pin" begin
+        include(joinpath(@__DIR__, "test_coopmat_subgroup_refusal.jl"))
+    end
+
+    # A handled allocation failure must absorb its own validation messages, or it
+    # aborts whatever unrelated code calls check_validation_errors! next.
+    @testset "tolerated alloc failure" begin
+        include(joinpath(@__DIR__, "test_tolerated_alloc_failure.jl"))
+    end
+
     # The buffer-lifetime case behind the intermittent flush hang. Asserted on
     # the state machine, not by provoking the hang — see the file.
     @testset "free during recording" begin
