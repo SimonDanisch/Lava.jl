@@ -9,7 +9,7 @@
 #     @lava_printf "tid=%u  sdx=%d  off=%lu\n" UInt32(i) sdx off
 #
 # Output appears via the validation layer's debug-printf messenger; enable it with
-# `Lava.enable_debug_printf!()` (resets the device with the layer feature on) and
+# `Lava.vk_reset_device!(debug = DebugConfig(printf = true))` and
 # read messages back with `Lava.get_validation_messages()` / they are also
 # @info-logged by the debug-utils callback.
 #
@@ -76,7 +76,7 @@ end
 
 Print from inside a GPU kernel via Vulkan debug printf. The format must be a
 string literal; arguments are matched positionally to its specifiers. Enable
-output with `Lava.enable_debug_printf!()`.
+output with `Lava.vk_reset_device!(debug = DebugConfig(printf = true))`.
 
 ```julia
 @kernel cpu=false function k!(out)
@@ -100,7 +100,7 @@ end
 # device so `@print` (the portable API, same as CUDA/AMDGPU) works on Lava: build a
 # printf format string with specifiers auto-selected from the runtime arg types and
 # route through the same DebugPrintf path as @lava_printf. Enable output with
-# `Lava.enable_debug_printf!()`.
+# `Lava.vk_reset_device!(debug = DebugConfig(printf = true))`.
 
 # Runtime value type → printf specifier, matching _lava_printf_impl's canonical width.
 @inline function _ka_print_spec(@nospecialize(T))

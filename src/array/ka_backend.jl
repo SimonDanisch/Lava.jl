@@ -89,6 +89,10 @@ answer for it, and the reason the queue-only constructors need nothing extra.
 """
 vk_context(b::LavaBackend) = (b.dispatch_bq.ctx)::VkContext
 vk_context(a::LavaArray) = (a.buf[].ctx)::VkContext
+# What a kernel library asks: `Lava.caps(backend)`, so a downstream package never
+# has to hold a `VkContext` to find out what the device it is launching on offers.
+caps(b::LavaBackend) = caps(vk_context(b))
+caps(a::LavaArray) = caps(vk_context(a))
 # A view of a device array is still on that device. `probe_broadcast!` is handed
 # `dest`, which the broadcast machinery may hand it as a `SubArray` or a
 # `ReshapedArray` — walking to the parent is the whole answer, and it is the same
@@ -176,13 +180,14 @@ Adapt.adapt_storage(::Type{<:LavaArray}, a::LavaArray) = a
 # ── Launch configuration ──
 
 """
-    WORKGROUP_LIMIT[] :: Int
+    caps(ctx).workgrouplimit :: Int
 
-Largest workgroup Lava will ask the device for. Requesting more throws.
+Largest workgroup Lava will ask the device for — its own
+`maxComputeWorkGroupInvocations`. Requesting more throws.
 
-Now the device's own `maxComputeWorkGroupInvocations`. It sat at **256** for a
-long time, on a diagnosis that was wrong in an instructive way and is worth
-keeping written down.
+This was a module-level `Ref(1024)` whose docstring said exactly the sentence
+above while being a hardcoded constant, and before that it sat at **256** on a
+diagnosis that was wrong in an instructive way and is worth keeping written down.
 
 The recorded claim was that "above 256 this driver silently runs fewer
 invocations than the shader declares" — a workgroup of 512 wrote half its output,
@@ -213,28 +218,32 @@ that two one-byte-different modules no longer share a cache key.
 The lesson generalises past workgroups: **any** two SPIR-V modules differing only
 in bytes the sampling hash skips shared a pipeline. That is a silent
 wrong-results bug for any pair of kernel instantiations that differ in a literal.
+
+See [`DeviceCaps`](@ref), which is where it lives now — the limit differs between
+devices, so a process-wide `Ref` answered one device's question for all of them.
 """
-const WORKGROUP_LIMIT = Ref(1024)
+workgroup_limit(ctx::VkContext = vk_context()) = caps(ctx).workgrouplimit
 
 "The extents behind a KA size parameter, or `nothing` when they are dynamic."
 @inline statictuple(::Type{<:KA.NDIteration.StaticSize{S}}) where {S} = S
 @inline statictuple(@nospecialize(_)) = nothing
 
 """
-Throw if `wg` exceeds [`WORKGROUP_LIMIT`](@ref).
+Throw if `wg` exceeds [`workgroup_limit`](@ref) for `ctx`.
 
 Loud rather than clamped: a kernel that stages into `@localmem` sizes its tile to
 the workgroup it asked for, so quietly handing it a smaller one trades a wrong
 answer for a different wrong answer.
 """
-@inline check_workgroup(::Nothing; static::Bool = false) = nothing
-@inline function check_workgroup(wg; static::Bool = false)
+@inline check_workgroup(ctx::VkContext, ::Nothing; static::Bool = false) = nothing
+@inline function check_workgroup(ctx::VkContext, wg; static::Bool = false)
     n = prod(wg)
-    n > WORKGROUP_LIMIT[] || return wg
+    lim = workgroup_limit(ctx)
+    n > lim || return wg
     throw(ArgumentError("""
-        workgroupsize $wg has $n threads, above Lava's limit of $(WORKGROUP_LIMIT[]),
-        which is the device's `maxComputeWorkGroupInvocations`. Asking for more is
-        a validation error, not a slow launch. See `Lava.WORKGROUP_LIMIT`."""))
+        workgroupsize $wg has $n threads, above this device's limit of $lim,
+        which is its `maxComputeWorkGroupInvocations`. Asking for more is
+        a validation error, not a slow launch. See `Lava.DeviceCaps`."""))
 end
 
 function KA.launch_config(kernel::KA.Kernel{LavaBackend}, ndrange, workgroupsize)
@@ -270,7 +279,10 @@ function KA.launch_config(kernel::KA.Kernel{LavaBackend}, ndrange, workgroupsize
         # keyword as `nothing`, so checking the keyword alone would miss it. Which
         # of the two it is also decides the cap — see `check_workgroup`.
         static = workgroupsize === nothing
-        check_workgroup(static ? statictuple(KA.workgroupsize(kernel)) : workgroupsize;
+        # `vk_context(kernel.backend)`, not the global: the limit is the device's
+        # and a KA kernel carries the backend it was built for.
+        check_workgroup(vk_context(kernel.backend),
+                        static ? statictuple(KA.workgroupsize(kernel)) : workgroupsize;
                         static = static)
         KA.partition(kernel, ndrange, workgroupsize)
     end

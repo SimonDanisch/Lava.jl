@@ -8,13 +8,13 @@ because a segfault takes the whole suite with it.
 
 ## Why this is possible now, and was not before
 
-`init_vulkan!(; select)` lets a caller choose the physical device and returns a
+`VkContext(; select)` lets a caller choose the physical device and returns a
 context **without** installing it as the global. The Vulkan loader enumerates the
 real GPU and lavapipe from one instance, so every machine here has a two-device
 pair with no second card:
 
     gpu = vk_context()
-    cpu = init_vulkan!(select = devs -> only(filter(islavapipe, devs)))
+    cpu = VkContext(select = devs -> only(filter(islavapipe, devs)))
 
 ## What it is for
 
@@ -104,10 +104,16 @@ below was visible until everything above it was fixed.
    wrong — which reads as correct on any machine with one device, and is the
    subtlest shape in this whole list.
 
+8. **`WORKGROUP_LIMIT`** — FIXED (now `caps(ctx).workgrouplimit`). Listed here as
+   "a policy limit, not a queried one", which was the whole defect: it was a
+   module-level `Ref(1024)` whose docstring said it was the device's
+   `maxComputeWorkGroupInvocations`. A device whose real limit is lower would
+   have been handed the other one's, and the launch fails validation rather than
+   returning a wrong answer — so this is the loud member of the list.
+
 Still unaudited, because nothing on this path reaches them: `TIMESTAMP_POOL` (a
-`Vulkan.QueryPool`), `BLIT_PIPELINE` and `GFX_SHADER_CACHE` (graphics), and
-`WORKGROUP_LIMIT` (a policy limit, not a queried one). Extend the probe before
-trusting a second device for graphics or dispatch profiling.
+`Vulkan.QueryPool`), and `BLIT_PIPELINE` / `GFX_SHADER_CACHE` (graphics). Extend
+the probe before trusting a second device for graphics or dispatch profiling.
 
 The list above was produced by RUNNING two devices. Reading produced a list of
 four caches, and **none of the four was what actually broke it.**
@@ -123,7 +129,7 @@ end
 
 function probe()
     gpu = Lava.vk_context()
-    cpu = Lava.init_vulkan!(select = devs -> only(filter(Lava.islavapipe, devs)))
+    cpu = Lava.VkContext(select = devs -> only(filter(Lava.islavapipe, devs)))
 
     println("gpu id=$(gpu.id)  $(gpu.device_name)")
     println("cpu id=$(cpu.id)  $(cpu.device_name)")
@@ -134,7 +140,7 @@ function probe()
     # trampoline, which is one piece of code for every device by construction, so
     # the pointers are legitimately equal and this says nothing about Lava.
     #
-    # The check fired on exactly that: with `LAVA_VALIDATION=1` the probe aborted
+    # The check fired on exactly that: with `debug = DebugConfig(validation = true)` the probe aborted
     # here, before reaching anything it exists to test — which is the one
     # configuration you would want to run it in.
     if gpu.debug_messenger === nothing && cpu.debug_messenger === nothing
@@ -220,7 +226,7 @@ function probe()
     isempty(gpu.caches.pipelines) && error("the gpu compiled nothing")
     isempty(cpu.caches.pipelines) && error("lavapipe compiled nothing")
 
-    # Retire the context this probe built. Nothing else can: `init_vulkan!(;
+    # Retire the context this probe built. Nothing else can: `VkContext(;
     # select)` deliberately does NOT install it as the global, so it is the
     # caller's, and `vk_reset_device!` — which retires the context it replaces —
     # never sees it.

@@ -47,7 +47,8 @@ against our own compiler before anyone reports anything upstream.
 Instruments, in this order, before the word "driver" is used at all:
 
 1. `spirv-val --target-env vulkan1.3`, then GPU-assisted validation
-   (`Lava.enable_gpu_av`). Cheap, and neither is run by default.
+   (`vk_reset_device!(debug = DebugConfig(gpu_av = true))`). Cheap, and neither
+   is run by default.
 2. Hunt undefined behaviour **in our own output**: out-of-range access,
    uninitialised reads, missing `NonPrivatePointer` or memory semantics on shared
    access, and signed-vs-unsigned comparisons that LLVM canonicalised under

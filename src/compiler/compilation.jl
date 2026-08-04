@@ -2195,7 +2195,7 @@ function emit_combined_workgroup_block!(state::SPIRVEmitterState,
     # An OpConstantNull initializer is the spec-sanctioned fix and applies to
     # every kernel, rather than each caller having to pre-fill its scratch.
     # Requires shaderZeroInitializeWorkgroupMemory (Vulkan 1.3 core), which
-    # `init_vulkan!` already enables.
+    # the `VkContext` constructor already enables.
     null_init = emit_constant_null!(mod, block_id)
     encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Workgroup, null_init)
     # Single Block Workgroup variable → no `Aliased` required; members are disjoint.

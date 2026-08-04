@@ -57,8 +57,6 @@ get_dispatch_log
 
 ```@docs
 @lava_printf
-Lava.enable_debug_printf!
-Lava.disable_debug_printf!
 Lava.get_printf_output
 Lava.clear_printf_output!
 ```

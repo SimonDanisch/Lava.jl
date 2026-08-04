@@ -42,21 +42,24 @@ end
 """
 Fraction of `ndrange` actually written, launching `mode`.
 
-`limit` raises [`Lava.WORKGROUP_LIMIT`](@ref) for the call. The characterisation
-testsets below deliberately launch workgroups past it — they are measuring how
-much of the output survives, so a guard that refuses the launch would hide the
-very thing they exist to pin. Every other launch in this file stays under it.
+`limit` raises the device's workgroup limit for the call, by swapping in a
+modified [`Lava.DeviceCaps`](@ref). The characterisation testsets below
+deliberately launch workgroups past the real limit — they are measuring how much
+of the output survives, so a guard that refuses the launch would hide the very
+thing they exist to pin. Every other launch in this file stays under it.
 """
-function coverage(nd, wg, mode; fallback::Bool = true, limit::Int = Lava.WORKGROUP_LIMIT[])
+function coverage(nd, wg, mode; fallback::Bool = true,
+                  limit::Int = Lava.caps(Lava.vk_context()).workgrouplimit)
+    ctx = Lava.vk_context()
     old = Lava.WORKGROUP_FALLBACK[]
-    oldlim = Lava.WORKGROUP_LIMIT[]
+    oldcaps = Lava.caps(ctx)
     Lava.WORKGROUP_FALLBACK[] = fallback
-    Lava.WORKGROUP_LIMIT[] = limit
+    ctx.caches.caps = Lava.DeviceCaps(oldcaps; workgrouplimit = limit)
     try
         return coverage_(nd, wg, mode)
     finally
         Lava.WORKGROUP_FALLBACK[] = old
-        Lava.WORKGROUP_LIMIT[] = oldlim
+        ctx.caches.caps = oldcaps
     end
 end
 

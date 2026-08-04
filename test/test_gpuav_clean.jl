@@ -18,14 +18,14 @@
 # # Why this test is gated
 #
 # GPU-AV slows compute dispatches by ~100x.  The test takes minutes per
-# render, so it's gated on `LAVA_GPU_AV=1` and excluded from the default
+# render, so it's gated on `LAVA_TEST_GPU_AV=1` and excluded from the default
 # `runtests.jl` flow.  CI should run a dedicated job with that env var set.
 
 using Test
 using Lava
 
-if get(ENV, "LAVA_GPU_AV", "0") != "1"
-    @info "test_gpuav_clean: skipped (set LAVA_GPU_AV=1 to enable; see test header)"
+if get(ENV, "LAVA_TEST_GPU_AV", "0") != "1"
+    @info "test_gpuav_clean: skipped (set LAVA_TEST_GPU_AV=1 to enable; see test header)"
 else
     using Hikari, Raycore, Adapt
     using GeometryBasics
@@ -77,7 +77,7 @@ else
         # If this fails, the SPIR-V emitter has regressed on alignment-tracking
         # for byte-offset GEPs — re-investigate via:
         #   ENV["LAVA_SPIRV_DUMP_DIR"] = "/tmp/lava_spv_debug"
-        #   ENV["LAVA_GPU_AV"] = "1"
+        #   Lava.vk_reset_device!(debug = Lava.DebugConfig(gpu_av = true))
         # then disassemble + scan via the script at the bottom of
         # docs/specs/2026-04-25-unaligned-bda-investigation.md.
         @test isempty(real_messages)
@@ -99,7 +99,7 @@ else
     # report it within a bounded time; if the callback regresses to allocating
     # or logging, this hangs (caught by a CI watchdog) or never surfaces the OOB.
     @testset "GPU-AV fault readback does not hang" begin
-        Lava.enable_gpu_av(pool_disabled=true)
+        Lava.vk_reset_device!(debug = Lava.DebugConfig(gpu_av = true, pool_disabled = true))
         ctx = Lava.vk_context()
         if !ctx.gpu_assisted
             @info "GPU-AV did not attach on this driver — skipping fault-readback test"
@@ -113,6 +113,6 @@ else
             # device rather than a wedged one.
             @test Lava.verify_gpu_av(timeout=30.0) == true
         end
-        Lava.disable_gpu_av()
+        Lava.vk_reset_device!(debug = Lava.DebugConfig())
     end
 end

@@ -332,6 +332,128 @@ const MAX_VALIDATION_MESSAGES = 50
 const MAX_PRINTF_MESSAGES     = 4096
 
 """
+    DebugConfig(; validation, gpu_av, gpu_av_safe, gpu_av_shaders,
+                  sync_val, best_practices, printf, pool_disabled)
+
+Every validation and instrumentation setting, chosen **at device construction**.
+
+    Lava.vk_reset_device!(debug = DebugConfig(gpu_av = true))   # replace the default device
+    ctx = VkContext(debug = DebugConfig(gpu_av = true))         # or build a separate one
+
+**That is the whole API.** There is no `enable_gpu_av()`, no environment
+variable, and no way to switch any of this on after the fact — all of these are
+properties of the `VkInstance`, fixed by `vkCreateInstance`, so a setting applied
+to a device that already exists cannot take effect. There were five preset
+functions and seven `LAVA_*` variables; every one of them is deleted, because
+each was another way to reach a configuration slightly different from the one you
+asked for.
+
+The two recipes worth knowing:
+
+    DebugConfig(validation = true)                       # core spec checks, cheap
+    DebugConfig(gpu_av = true, pool_disabled = true)     # + shader OOB, sub-pool visible
+
+After the second, call [`verify_gpu_av`](@ref). "GPU-AV is enabled" and "GPU-AV
+is catching errors" are not the same thing on every driver, and a clean run under
+an instrument that never fired reads exactly like a clean run.
+
+This was seven environment variables — `LAVA_VALIDATION`, `LAVA_GPU_AV`,
+`LAVA_GPU_AV_SAFE`, `LAVA_GPU_AV_SHADERS`, `LAVA_SYNC_VAL`, `LAVA_BEST`,
+`LAVA_DEBUG_PRINTF` — read here at instance creation. They are **deleted**, not
+deprecated, because the failure they produced was not occasional: setting one in
+an already-running session did nothing at all, and setting `LAVA_GPU_AV` without
+`LAVA_VALIDATION` produced a *clean run with the instrument switched off*, which
+reads exactly like "no fault found". Both are unrepresentable here.
+
+## The two rules, enforced in the constructor rather than warned about
+
+`validation` is implied by everything else. GPU-AV, sync validation,
+best practices and debug printf are all features **of** the Khronos validation
+layer, so asking for one turns the layer on. Passing `validation = true` alone
+means core spec checks with no shader instrumentation, which is the cheap mode.
+
+`gpu_av` and `printf` are mutually exclusive and **throw** together. The layer
+instruments shaders for each and cannot do both; the previous behaviour was to
+silently prefer printf and warn, which is one more way to get a clean run out of
+a disabled instrument.
+
+## Two settings that exist because GPU-AV crashes
+
+`gpu_av_safe` defaults to **true**, unlike everything else here. Khronos' own
+documentation: "Safe Mode will have GPU-AV try and prevent crashes, but will be
+much slower to validate, and when using Safe Mode, selective shader
+instrumentation is recommended to only instrument the shaders/pipelines causing
+issues." Lava shipped GPU-AV with neither for a long time, which is most of why
+reaching for it produced a SIGSEGV rather than a report.
+
+`gpu_av_shaders` names the kernels to instrument; empty means all of them, which
+on a ~99-kernel model is both very slow and the configuration most likely to fall
+over. Both need `VK_EXT_layer_settings` — `VkValidationFeaturesEXT` cannot
+express either.
+
+## `pool_disabled`, which is here because it is a debugging setting
+
+GPU-AV tracks buffer-device-address bounds **per `VkBuffer`**, and Lava's pool
+puts many `LavaArray`s into one shared 64 MiB block. So with the pool on, GPU-AV
+sees overruns past the whole block and is *blind to sub-pool overruns* — which
+are most of the bugs anyone turns it on to find. `pool_disabled = true` gives
+every array its own `VkBuffer`.
+
+Debug-only: allocation is much slower and the path is less exercised than the
+pooled one (the host-upload and flush-after-error paths may misbehave). It lives
+on this struct rather than as a separate `pool(ctx).disabled = true` step because
+a second step is a second way to get it wrong, and it applies to the device being
+built.
+"""
+struct DebugConfig
+    validation::Bool
+    gpu_av::Bool
+    gpu_av_safe::Bool
+    gpu_av_shaders::Vector{String}
+    sync_val::Bool
+    best_practices::Bool
+    printf::Bool
+    pool_disabled::Bool
+
+    function DebugConfig(; validation::Bool = false,
+                           gpu_av::Bool = false,
+                           gpu_av_safe::Bool = true,
+                           gpu_av_shaders::AbstractVector{<:AbstractString} = String[],
+                           sync_val::Bool = false,
+                           best_practices::Bool = false,
+                           printf::Bool = false,
+                           pool_disabled::Bool = false)
+        if gpu_av && printf
+            throw(ArgumentError("""
+                DebugConfig: `gpu_av` and `printf` cannot both be on — the validation
+                layer instruments shaders for each and does not do both at once.
+                Pick one: `DebugConfig(gpu_av = true)` to hunt out-of-bounds accesses,
+                or `DebugConfig(printf = true)` to read `@lava_printf` output."""))
+        end
+        # Implied, not required: every feature below is a feature OF the layer, so
+        # asking for one without it was the half-configuration that produced a
+        # clean run from a disabled instrument.
+        validation |= gpu_av || sync_val || best_practices || printf
+        new(validation, gpu_av, gpu_av_safe, collect(String, gpu_av_shaders),
+            sync_val, best_practices, printf, pool_disabled)
+    end
+end
+
+"""
+    DebugConfig(c::DebugConfig; kw...) -> DebugConfig
+
+`c` with named settings replaced. The two rules above are re-checked, so a copy
+cannot reach a state the constructor refuses.
+"""
+DebugConfig(c::DebugConfig;
+            validation = c.validation, gpu_av = c.gpu_av,
+            gpu_av_safe = c.gpu_av_safe, gpu_av_shaders = c.gpu_av_shaders,
+            sync_val = c.sync_val, best_practices = c.best_practices,
+            printf = c.printf, pool_disabled = c.pool_disabled) =
+    DebugConfig(; validation, gpu_av, gpu_av_safe, gpu_av_shaders,
+                  sync_val, best_practices, printf, pool_disabled)
+
+"""
     ValidationRingRaw
 
 The five pointers `debug_callback` needs, in a layout it can read off
@@ -422,6 +544,62 @@ struct IterPlan{Ctx}
 end
 
 """
+    DeviceCaps
+
+What a kernel needs to know about the device it is about to run on, answered once
+per device. Read it with [`caps`](@ref), which fills it lazily and leaves it on
+the context — the cooperative-matrix and subgroup answers need a live *logical*
+device, so this cannot be built from physical-device properties at selection time
+the way its predecessor was.
+
+Three things became this one: `DeviceCompute` (SM count, warps per SM,
+shared-memory ceiling), `WORKGROUP_LIMIT`, and `DNNKernels.Device`. They
+described the same thing at three scopes — a struct read once per device, a
+module-level `Ref(1024)` whose own docstring claimed to be "the device's own
+`maxComputeWorkGroupInvocations`" while being a constant, and a copy of the whole
+set rebuilt in a downstream package out of eight separate Lava lookups. Every
+number here belongs to the device, so the device is what carries them.
+
+`cores` and `warps` are **0 when the device does not report them**. Vulkan has no
+core query: NVIDIA exposes it through `VK_NV_shader_sm_builtins`, AMD through
+`VK_AMD_shader_core_properties2`, everyone else through nothing. Read them via
+[`shader_core_count`](@ref) / [`shader_warps_per_sm`](@ref), which return
+`nothing` for unknown — a missing fallback is then a `MethodError` at the first
+arithmetic rather than a silently empty grid.
+
+`coopmatsubgroup` is **not** `subgroup`. Lava pins any module declaring
+`CooperativeMatrixKHR` to `COOPMAT_SUBGROUP` through `VK_EXT_subgroup_size_control`
+(`pipeline.jl`), because a cooperative matrix is subgroup-scoped and the kernels
+index subgroups as `tid ÷ 32`. On RDNA 3.5 the device default is 64 while the
+pipeline still runs 32 — a coopmat workgroup sized in units of `subgroup` would
+ask for twice the threads the kernel indexes, and write part of its tile.
+"""
+struct DeviceCaps
+    coopmat::Bool          # cooperative-matrix GEMM usable here
+    tile::Int              # its tile extent (`GEMM_TILE`)
+    subgroup::Int          # lanes per subgroup — 32 on NVIDIA, 32 *or* 64 on RDNA3
+    coopmatsubgroup::Int   # …and the width a cooperative-matrix kernel gets
+    sharedbudget::Int      # maxComputeSharedMemorySize: bytes per workgroup
+    workgrouplimit::Int    # maxComputeWorkGroupInvocations: threads per workgroup
+    cores::Int             # SMs / active CUs; 0 when the device will not say
+    warps::Int             # max resident subgroups per SM; 0 = ditto
+end
+
+"""
+    DeviceCaps(c::DeviceCaps; kw...) -> DeviceCaps
+
+`c` with named fields replaced, for asking what a kernel would decide on a device
+that is not this one — a wave64 card, or this card with cooperative matrices
+switched off — without that device being present.
+"""
+DeviceCaps(c::DeviceCaps;
+           coopmat = c.coopmat, tile = c.tile, subgroup = c.subgroup,
+           coopmatsubgroup = c.coopmatsubgroup, sharedbudget = c.sharedbudget,
+           workgrouplimit = c.workgrouplimit, cores = c.cores, warps = c.warps) =
+    DeviceCaps(coopmat, tile, subgroup, coopmatsubgroup, sharedbudget,
+               workgrouplimit, cores, warps)
+
+"""
     DeviceCaches
 
 Everything a `VkContext` caches, owned by the context that owns the handles.
@@ -455,6 +633,9 @@ mutable struct DeviceCaches
     # 0 means "not yet queried" — the device never reports 0.
     subgroup_size::Int
     subgroup_control::Union{Nothing,SubgroupSizeControl}
+    # What kernels ask the device — see `DeviceCaps`. `nothing` until first read;
+    # built from this context, so a second device cannot be handed the first's.
+    caps::Union{Nothing,DeviceCaps}
     # One warning per device about a subgroup width that cannot be pinned.
     coopmat_warned::Bool
     gfx_pipelines::Dict{UInt64,CompiledGraphicsPipeline}
@@ -500,7 +681,7 @@ end
 DeviceCaches() = DeviceCaches(
     Dict{UInt64,LavaComputePipeline}(), UInt64[],
     Dict{Any,LavaLinkedKernel}(), IdDict{DataType,Vector{LaunchPlan}}(),
-    nothing, DevicePool(), 0, nothing, false,
+    nothing, DevicePool(), 0, nothing, nothing, false,
     Dict{UInt64,CompiledGraphicsPipeline}(), Dict{UInt64,LavaGfxShader}(),
     nothing, nothing, 0, 1.0, Any[],
     Dict{Tuple{DataType,DataType,Any},Any}(), nothing,

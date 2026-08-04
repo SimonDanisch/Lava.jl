@@ -233,7 +233,7 @@ end
 # — four 8x8x8 shapes — which is the fact this file previously got wrong.
 @testset "the same pattern on a second cooperative-matrix consumer" begin
     lp = try
-        Lava.init_vulkan!(select = devs -> only(filter(Lava.islavapipe, devs)))
+        Lava.VkContext(select = devs -> only(filter(Lava.islavapipe, devs)))
     catch e
         @info "no lavapipe device; skipping the second-consumer check" exception=e
         nothing
@@ -259,7 +259,7 @@ end
                 @test sid_survivors(back, sid_udiv_8!, K; TS = 8) == total
             end
         finally
-            # Nothing else can retire a context built with `init_vulkan!(; select)`,
+            # Nothing else can retire a context built with `VkContext(; select)`,
             # and its buffers' finalizers would otherwise run against a torn-down
             # device at exit.
             Lava.mark_device_lost!(lp)

@@ -90,7 +90,7 @@ function emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
     # Reading `ser_available` keeps the SPIR-V module valid on non-NVIDIA
     # hardware (where the capability would be a validation error).  Check
     # VK_CONTEXT_REF[] directly so emitter tests without a device don't
-    # trigger lazy `init_vulkan!()`.
+    # trigger a lazy `VkContext()`.
     if stage === :raygen
         ctx = VK_CONTEXT_REF[]
         if ctx !== nothing && ctx.ser_available

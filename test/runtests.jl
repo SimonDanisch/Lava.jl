@@ -199,7 +199,8 @@ end
     end
 
     # Catches an invalid module that the driver accepts and runs correctly, so it
-    # is invisible to every other test unless LAVA_VALIDATION=1 is set.
+    # is invisible to every other test unless the device carries
+    # `DebugConfig(validation = true)`.
     @testset "no OpBitcast on a logical pointer" begin
         include(joinpath(@__DIR__, "test_logical_pointer_bitcast.jl"))
     end
@@ -402,8 +403,20 @@ end
             include(joinpath(@__DIR__, "test_diagonal_mul.jl"))
         end
 
-        @testset "device compute properties" begin
-            include(joinpath(@__DIR__, "test_device_compute.jl"))
+        @testset "device capabilities" begin
+            include(joinpath(@__DIR__, "test_device_caps.jl"))
+        end
+
+        @testset "debug configuration" begin
+            include(joinpath(@__DIR__, "test_debug_config.jl"))
+        end
+
+        @testset "batched 1D FFT" begin
+            include(joinpath(@__DIR__, "test_fft.jl"))
+        end
+
+        @testset "batch-1 GEMV" begin
+            include(joinpath(@__DIR__, "test_gemv.jl"))
         end
 
         @testset "coopmat shape query" begin
@@ -492,8 +505,11 @@ end
         end
     end
 
-    # ── Tier 4: GPU-AV regression (gated on LAVA_GPU_AV=1; ~minutes) ──
-    if get(ENV, "LAVA_GPU_AV", "0") == "1"
+    # ── Tier 4: GPU-AV regression (gated on LAVA_TEST_GPU_AV=1; ~minutes) ──
+    #
+    # A TEST-SELECTION variable, not a Lava setting: it decides whether this tier
+    # runs, and the tier itself configures the device through `DebugConfig`.
+    if get(ENV, "LAVA_TEST_GPU_AV", "0") == "1"
         @testset "GPU-AV clean" begin
             include(joinpath(@__DIR__, "test_gpuav_clean.jl"))
         end

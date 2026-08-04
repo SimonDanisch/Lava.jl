@@ -88,7 +88,7 @@ import Vulkan.VkCore: VkMemoryBarrier, VK_STRUCTURE_TYPE_MEMORY_BARRIER,
     VkPipelineStageFlags, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
     VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
     VK_PIPELINE_STAGE_TRANSFER_BIT, VkDependencyFlags
-# Function pointer for vkCmdPipelineBarrier — initialized in _init_vulkan!
+# Function pointer for vkCmdPipelineBarrier — resolved in the VkContext constructor
 # Was `const CMD_PIPELINE_BARRIER_FPTR = Ref{Ptr{Nothing}}(C_NULL)`. A device
 # function pointer is per device, so it lives on `VkContext` now — see the field
 # there for what a global one did the first time two contexts existed.
@@ -1337,11 +1337,15 @@ function flush!(bq::BatchQueue, device::Vulkan.Device)
                             "Raising `bq.flush_timeout_ns` cannot help; call " *
                             "`Lava.vk_reset_device!()` to reinitialize. To find the " *
                             "dispatch: `journalctl -k` for an NVIDIA Xid names the fault " *
-                            "class, and `LAVA_VALIDATION=1 LAVA_GPU_AV=1 " *
-                            "LAVA_GPU_AV_SAFE=1` instruments the shaders — but note " *
-                            "GPU-AV can itself crash on a workload that kills the " *
-                            "device (measured: it does on MatAnyone's step, Safe Mode " *
-                            "included), so narrow with `LAVA_GPU_AV_SHADERS=` first."))
+                            "class, and " *
+                            "`Lava.vk_reset_device!(debug = DebugConfig(gpu_av = true, " *
+                            "gpu_av_shaders = [\"my_kernel\"], pool_disabled = true))` " *
+                            "instruments the shaders — that rebuilds the device, so every " *
+                            "LavaArray alive is invalid afterwards, and `Lava.verify_gpu_av()` " *
+                            "is what proves the layer actually fires. Narrow it with " *
+                            "`gpu_av_shaders` first: GPU-AV can itself crash on a workload " *
+                            "that kills the device (measured: it does on MatAnyone's step, " *
+                            "Safe Mode included)."))
         end
         if budget != UInt64(0) && waited >= budget
             throw(LavaError("vkWaitSemaphores",

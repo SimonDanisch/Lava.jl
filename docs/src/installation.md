@@ -43,11 +43,14 @@ A successful run prints the chosen GPU and whether hardware ray tracing is avail
 
 ## Picking a device
 
-If multiple Vulkan devices are present, Lava picks the first discrete GPU by default. To override:
+If multiple Vulkan devices are present, Lava picks the first discrete GPU by default. To choose another, build the context yourself with a `select` function — it receives the enumerated physical devices and returns one:
 
 ```julia
-ENV["LAVA_FORCE_DEVICE"] = "lavapipe"   # substring match against device name
 using Lava
+ctx = Lava.VkContext(select = devs -> only(filter(Lava.islavapipe, devs)))
+b = LavaBackend(ctx)          # a backend pinned to that device
 ```
 
-Common values: `"NVIDIA"`, `"RADV"`, `"Intel"`, `"llvmpipe"`, `"lavapipe"`, `"MoltenVK"`.
+`VkContext(; select)` returns the context **without** installing it as the process default, so this is also how two devices are held open at once (see `test/twodevice_probe.jl`).
+
+To match by name, write the predicate against `Vulkan.get_physical_device_properties(d).device_name` — `"NVIDIA"`, `"RADV"`, `"Intel"`, `"llvmpipe"`, `"lavapipe"`, `"MoltenVK"` are the usual substrings.

@@ -139,7 +139,7 @@ mutable struct BatchQueue
     # Loose type — VkManagedBuffer is declared later in memory.jl.
     staging::Union{Nothing, Any}
     # Back-reference to owning VkContext. Set post-construction by
-    # init_vulkan!/allocate_batch_queue!. `nothing` only during the brief
+    # the VkContext constructor / allocate_batch_queue!. `nothing` only during the brief
     # window of default_bq construction before VkContext exists.
     # Loose type — VkContext is declared below.
     ctx::Any
@@ -296,37 +296,14 @@ end
 CoopMat2Caps() = CoopMat2Caps(false, false, false, false, false, false, false, false)
 
 """
-    DeviceCompute
+    query_shader_cores(phys_dev) -> (cores, warps)
 
-How much compute the device actually has, for kernels that must size a launch
-against it rather than against the problem.
+The SM/CU count and warps per SM, or `(0, 0)` where the device will not say.
 
 A grid that does not fill the device is the dominant cost on small shapes — SAM
-2's decode runs one attention at 8 workgroups on 48 SMs — so "how many
-workgroups before the device is busy" is a number kernels need, and until this
-struct existed they hardcoded it.
-
-`sm_count` and `warps_per_sm` are **0 when the device does not report them**.
-Vulkan has no core query: NVIDIA exposes it through `VK_NV_shader_sm_builtins`,
-AMD through `VK_AMD_shader_core_properties2`, and everyone else through nothing
-at all. Use [`shader_core_count`](@ref) rather than this field — it returns
-`nothing` for unknown, so a missing fallback is a `MethodError` at the first
-arithmetic rather than a silently empty grid.
-
-`max_shared_memory` is a core limit and is always known.
-"""
-struct DeviceCompute
-    sm_count::Int           # 0 = the device does not report it
-    warps_per_sm::Int       # 0 = ditto; the occupancy denominator when known
-    max_shared_memory::Int  # VkPhysicalDeviceLimits::maxComputeSharedMemorySize
-end
-
-DeviceCompute() = DeviceCompute(0, 0, 0)
-
-"""
-    query_device_compute(phys_dev, phys_props) -> DeviceCompute
-
-Read the SM/CU count once, at device creation.
+2's decode runs one attention at 8 workgroups on 48 SMs — so "how many workgroups
+before the device is busy" is a number kernels need, and before it was queried
+they hardcoded it.
 
 Vendor coverage follows llama.cpp's `ggml-vulkan.cpp:6138-6146`, which is the
 same question asked by the same kind of code. Neither extension is *enabled* on
@@ -342,13 +319,12 @@ failure is silent if it ever stops holding. The base properties still come back
 fully populated and only the `next` chain is dropped, with no return code to
 check, because `vkGetPhysicalDeviceProperties2` returns void.
 """
-function query_device_compute(phys_dev, phys_props)
-    smcount, warps = 0, 0
+function query_shader_cores(phys_dev)
     if has_extension(phys_dev, "VK_NV_shader_sm_builtins")
         try
             p = Vulkan.get_physical_device_properties_2(
                     phys_dev, Vulkan.PhysicalDeviceShaderSMBuiltinsPropertiesNV).next
-            smcount, warps = Int(p.shader_sm_count), Int(p.shader_warps_per_sm)
+            return Int(p.shader_sm_count), Int(p.shader_warps_per_sm)
         catch err
             @debug "VK_NV_shader_sm_builtins query failed; SM count unknown" err
         end
@@ -356,14 +332,14 @@ function query_device_compute(phys_dev, phys_props)
         try
             p = Vulkan.get_physical_device_properties_2(
                     phys_dev, Vulkan.PhysicalDeviceShaderCoreProperties2AMD).next
-            smcount = Int(p.active_compute_unit_count)
+            return Int(p.active_compute_unit_count), 0
         catch err
             @debug "VK_AMD_shader_core_properties2 query failed; CU count unknown" err
         end
     end
-    DeviceCompute(smcount, warps,
-                  Int(phys_props.limits.max_compute_shared_memory_size))
+    return 0, 0
 end
+
 
 """
     VkContext
@@ -407,9 +383,6 @@ mutable struct VkContext
     # Cached physical-device properties (avoid re-querying on every alloc/dispatch).
     memory_properties::Vulkan.PhysicalDeviceMemoryProperties
     max_wg_dims::NTuple{3, Int}
-    # SM/CU count, warps per SM, shared-memory ceiling. Read once at creation;
-    # see `DeviceCompute` and prefer the `shader_core_count` accessor.
-    compute::DeviceCompute
     # Alignment (bytes) for BDAs passed as `pScratchData` in AS builds.
     # Picked by `bda_alignment_for(ctx, scratch=true)`.
     as_scratch_align::UInt64
@@ -460,9 +433,15 @@ mutable struct VkContext
     video_decode_available::Bool
     video_decode_queue::Union{Nothing, Vulkan.Queue}
     video_decode_queue_family_index::Union{Nothing, UInt32}
-    # Whether GPU-Assisted Validation is active on this instance. Captured
-    # so callers can check (e.g. verify_gpu_av) without re-reading env vars.
+    # Whether GPU-Assisted Validation is ACTIVE on this instance — what was
+    # achieved, which `debug` below is not: the layer or the extension can be
+    # missing, and then a requested `gpu_av` yields `gpu_assisted = false`.
+    # `verify_gpu_av` exists because even `true` here is not proof it fires.
     gpu_assisted::Bool
+    # What this device was ASKED for at construction. Kept so a caller can see
+    # the configuration without reconstructing it, and so `vk_reset_device!` can
+    # carry it across a recovery reset instead of silently disarming it.
+    debug::DebugConfig
     # Driver version (used to key the on-disk VkPipelineCache file).
     driver_version::String
     # Persistent VkPipelineCache. Seeded from disk on init, passed to every
@@ -552,11 +531,11 @@ mutable struct VkContext
                        memory_budget_available::Bool=false,
                        external_memory_available::Bool=false,
                        gpu_assisted::Bool=false,
+                       debug::DebugConfig=DebugConfig(),
                        driver_version::AbstractString="unknown",
                        video_decode_available::Bool=false,
                        video_decode_queue::Union{Nothing, Vulkan.Queue}=nothing,
-                       video_decode_queue_family_index::Union{Nothing, UInt32}=nothing,
-                       compute::DeviceCompute=DeviceCompute())
+                       video_decode_queue_family_index::Union{Nothing, UInt32}=nothing)
         ctx = new()
         ctx.instance = instance
         ctx.physical_device = physical_device
@@ -574,7 +553,6 @@ mutable struct VkContext
         ctx.device_lost = device_lost
         ctx.memory_properties = memory_properties
         ctx.max_wg_dims = max_wg_dims
-        ctx.compute = compute
         ctx.as_scratch_align = as_scratch_align
         ctx.ray_query_available = ray_query_available
         ctx.ser_available = ser_available
@@ -592,6 +570,7 @@ mutable struct VkContext
         ctx.video_decode_queue = video_decode_queue
         ctx.video_decode_queue_family_index = video_decode_queue_family_index
         ctx.gpu_assisted = gpu_assisted
+        ctx.debug = debug
         ctx.driver_version = driver_version
         # Seed a persistent VkPipelineCache from disk (if any). The header is
         # validated against this physical device before the driver sees it —
@@ -599,7 +578,7 @@ mutable struct VkContext
         ctx.id = (VK_CONTEXT_COUNTER[] += 1)
         ctx.caches = DeviceCaches()
         ctx.diag = Diagnostics()
-        # Filled by `init_vulkan!` once the device exists; null until then so a
+        # Filled by the constructor once the device exists; null until then so a
         # barrier recorded before that point is skipped rather than jumping to
         # whatever the field happened to contain.
         ctx.cmd_pipeline_barrier_fptr = C_NULL
@@ -611,6 +590,36 @@ mutable struct VkContext
         ctx.default_bq = BatchQueue(device, primary_queue, queue_family_index, ctx)
         return ctx
     end
+end
+
+"""
+    caps(ctx = vk_context()) -> DeviceCaps
+
+What kernels ask this device. Queried on first call and cached on the context.
+
+Lazy rather than filled by the constructor because half of it — whether a
+cooperative-matrix GEMM is usable, and at what subgroup width — is answered
+against the *logical* device and its enabled extensions, which do not exist while
+the context is still being built.
+
+Tests that want a kernel's decision for a device they do not have assign a
+modified copy: `ctx.caches.caps = DeviceCaps(caps(ctx); workgrouplimit = 512)`.
+Per context, so it cannot leak into another device the way the module-level
+`WORKGROUP_LIMIT` it replaces did.
+"""
+function caps(ctx::VkContext = vk_context())
+    c = ctx.caches.caps
+    c === nothing || return c
+    limits = Vulkan.get_physical_device_properties(ctx.physical_device).limits
+    cores, warps = query_shader_cores(ctx.physical_device)
+    ctx.caches.caps = DeviceCaps(
+        coopmat_gemm_available(ctx),
+        GEMM_TILE,
+        device_subgroup_size(ctx),
+        COOPMAT_SUBGROUP,
+        Int(limits.max_compute_shared_memory_size),
+        Int(limits.max_compute_work_group_invocations),
+        cores, warps)
 end
 
 """
@@ -630,7 +639,7 @@ Supply the fallback explicitly:
     cores = something(shader_core_count(), 16)
 """
 shader_core_count(ctx::VkContext = vk_context()) =
-    ctx.compute.sm_count == 0 ? nothing : ctx.compute.sm_count
+    (c = caps(ctx).cores) == 0 ? nothing : c
 
 """
     shader_warps_per_sm(ctx = vk_context()) -> Union{Nothing,Int}
@@ -639,7 +648,7 @@ Maximum resident subgroups per SM — the denominator for an occupancy figure.
 `nothing` when unreported; NVIDIA-only in practice (`VK_NV_shader_sm_builtins`).
 """
 shader_warps_per_sm(ctx::VkContext = vk_context()) =
-    ctx.compute.warps_per_sm == 0 ? nothing : ctx.compute.warps_per_sm
+    (w = caps(ctx).warps) == 0 ? nothing : w
 
 """
     max_shared_memory(ctx = vk_context()) -> Int
@@ -648,7 +657,7 @@ shader_warps_per_sm(ctx::VkContext = vk_context()) =
 Core Vulkan, so this one is always a real number — a kernel that sizes its
 `@localmem` against a budget should read it here rather than assume 48 KB.
 """
-max_shared_memory(ctx::VkContext = vk_context()) = ctx.compute.max_shared_memory
+max_shared_memory(ctx::VkContext = vk_context()) = caps(ctx).sharedbudget
 
 # ── Async-safe validation message capture ──────────────────────────────────
 #
@@ -669,7 +678,7 @@ max_shared_memory(ctx::VkContext = vk_context()) = ctx.compute.max_shared_memory
 # reaches them.
 
 const VK_CONTEXT_REF = Ref{Union{Nothing, VkContext}}(nothing)
-# Guards the lazy init below. `init_vulkan!` builds a whole VkDevice and has no
+# Guards the lazy init below. `VkContext(; …)` builds a whole VkDevice and has no
 # idempotency guard of its own, so two threads arriving together built TWO.
 const VK_CONTEXT_LOCK = ReentrantLock()
 
@@ -693,7 +702,7 @@ Two things reach this state, and only the first is a fault:
  2. **Retirement**: a context nobody will call into again, whose buffers are
     still alive in Julia and whose finalizers must therefore not touch it.
     `vk_reset_device!` retires the context it replaces; anything that builds a
-    context of its own with `init_vulkan!(; select)` owns retiring it.
+    context of its own with `VkContext(; select)` owns retiring it.
 
 The flag means the same thing to every consumer either way — *do not call into
 this device* — which is why the second case reuses it rather than adding a
@@ -730,7 +739,7 @@ function vk_context()
     ctx = VK_CONTEXT_REF[]
     ctx === nothing || return ctx::VkContext
     # Double-checked under a lock. Unlocked, two threads both saw `nothing` and
-    # both ran `init_vulkan!`, leaving two live VkDevices: the loser's context is
+    # both ran the constructor, leaving two live VkDevices: the loser's context is
     # still reachable from every buffer it allocated (`buf.last_write` retains
     # its BatchQueue), so the next cross-queue wait passed a semaphore from one
     # device to the other and the driver segfaulted with no Julia frame to show.
@@ -739,15 +748,15 @@ function vk_context()
         ctx = VK_CONTEXT_REF[]
         ctx === nothing || return ctx::VkContext
         # `invokelatest`, not a direct call: a direct one makes inference record
-        # a backedge from `vk_context` to `init_vulkan!`, and `getproperty(::
-        # LavaBackend, :bq)` goes through here, so EVERY Lava operation ends up
-        # inferring through Vulkan initialisation. Anything that invalidates
-        # `init_vulkan!` then invalidates the whole package — loading GLMakie
-        # does exactly that (FreeType adds a `Base.unsafe_load` method), and it
-        # cost 50 506 Lava MethodInstances and ~41 s of re-inference on the
-        # first GPU call afterwards. The dynamic dispatch is paid once, on the
-        # single call that creates the context.
-        ctx = Base.invokelatest(init_vulkan!)::VkContext
+        # a backedge from `vk_context` to the `VkContext(; …)` constructor, and
+        # `getproperty(::LavaBackend, :bq)` goes through here, so EVERY Lava
+        # operation ends up inferring through Vulkan initialisation. Anything
+        # that invalidates the constructor then invalidates the whole package —
+        # loading GLMakie does exactly that (FreeType adds a `Base.unsafe_load`
+        # method), and it cost 50 506 Lava MethodInstances and ~41 s of
+        # re-inference on the first GPU call afterwards. The dynamic dispatch is
+        # paid once, on the single call that creates the context.
+        ctx = Base.invokelatest(VkContext)::VkContext
         VK_CONTEXT_REF[] = ctx
         return ctx::VkContext
     finally
@@ -758,16 +767,40 @@ end
 vk_device() = vk_context().device
 
 """
-    vk_reset_device!()
+    vk_reset_device!(; select = pick_physical_device,
+                       debug = <the outgoing device's config>)
 
-Reinitialize the Vulkan device after DEVICE_LOST or other unrecoverable errors.
-Destroys the old context and creates a fresh one. Clears all caches (pipelines,
-kernels, arg buffers).
+Replace the process-default Vulkan device. Destroys the old context and creates a
+fresh one; clears all caches (pipelines, kernels, arg buffers).
+
+Two reasons to call it.
+
+1. **Recovery**, after `ERROR_DEVICE_LOST` or another unrecoverable error:
+   `vk_reset_device!()`. The debugging configuration carries across, so a reset in
+   the middle of a session does not silently turn the instruments off.
+
+2. **Switching validation on or off** — and this is the *only* way, because those
+   settings are fixed at `vkCreateInstance` and cannot be applied to a device
+   that already exists:
+
+       Lava.vk_reset_device!(debug = DebugConfig(gpu_av = true, pool_disabled = true))
+       Lava.verify_gpu_av()                     # prove the layer actually fires
+       Lava.vk_reset_device!(debug = DebugConfig())   # …and back to the fast path
+
+   See [`DebugConfig`](@ref). There is nothing else: no `enable_gpu_av`, no
+   environment variable, no post-hoc toggle. If you want a device *without*
+   installing it as the default — a second device, a lavapipe reference — build
+   it with `VkContext(; select, debug)` instead.
 
 **WARNING**: All existing `LavaArray`s become INVALID after reset — their backing
 GPU buffers no longer exist. You must reallocate all GPU data.
 """
-function vk_reset_device!()
+function vk_reset_device!(; select = pick_physical_device,
+                            debug::Union{Nothing,DebugConfig} = nothing)
+    cfg = debug !== nothing ? debug :
+          let old = VK_CONTEXT_REF[]
+              old === nothing ? DebugConfig() : old.debug
+          end
     # Persist the VkPipelineCache before tearing the device down so the
     # next session can skip AMDVLK's SPIR-V → ISA recompile.
     let old = VK_CONTEXT_REF[]
@@ -808,9 +841,19 @@ function vk_reset_device!()
     # Nothing to clear: the ring, its cursor and the drained messages are all
     # fields of the context being retired, and the new one brings a fresh
     # `ValidationRing` that its own messenger writes into.
-    # Re-initialize (lazy init on next vk_context() call)
-    ctx = vk_context()
-    @info "Lava: device reset complete" device=ctx.device_name
+    #
+    # Built here rather than left to `vk_context()`'s lazy path, because the
+    # configuration has to reach `vkCreateInstance` and the lazy path has no way
+    # to be told about it. `invokelatest` for the same backedge reason as there.
+    ctx = Base.invokelatest(VkContext; select, debug = cfg)::VkContext
+    VK_CONTEXT_REF[] = ctx
+    # `gpu_av` is what was ACHIEVED, not what was asked — the layer or the
+    # extension can be missing, and a run under an instrument that never attached
+    # reads exactly like a clean run. Logged so that is visible without asking.
+    @info "Lava: device reset complete" device=ctx.device_name validation=cfg.validation gpu_av=ctx.gpu_assisted pool_disabled=cfg.pool_disabled
+    if cfg.gpu_av && !ctx.gpu_assisted
+        @warn "GPU-AV was requested but did NOT attach (gpu_assisted=false) — a clean run now means the instrument was off, not that there is no fault. Check VK_EXT_validation_features + VK_LAYER_KHRONOS_validation on this loader/driver."
+    end
     return nothing
 end
 
@@ -824,10 +867,22 @@ Always takes the queue explicitly — no implicit default_bq lookup.
 has_active_recording(bq::BatchQueue) = bq.active_batch !== nothing
 
 """
-    init_vulkan!(; select = pick_physical_device) -> VkContext
+    VkContext(; select = pick_physical_device, debug = DebugConfig()) -> VkContext
 
-Build a context. **Does not install it** as the global — `vk_context()` is what
-does that, and it is the only caller that should.
+Build a device. **Does not install it** as the process default — `vk_context()`
+is what does that, and it is the only caller that should.
+
+This is the explicit constructor. Reach for it when you want a *specific* device,
+or a device with validation on; `vk_context()` is the lazy default for everything
+else.
+
+`debug` is where every validation and instrumentation setting is chosen, and the
+only place they can be: they configure the `VkInstance` and are fixed by
+`vkCreateInstance`, so nothing set afterwards reaches a device that already
+exists. See [`DebugConfig`](@ref) — it replaced seven environment variables that
+were read here, two of whose failure modes were silent.
+
+    ctx = VkContext(debug = DebugConfig(gpu_av = true, gpu_av_shaders = ["step_kernel"]))
 
 `select` receives the enumerated physical devices and returns one, so a caller
 can ask for a device other than the one `pick_physical_device` prefers. That is
@@ -835,14 +890,14 @@ what makes a two-device test possible on a single-GPU machine: the loader
 enumerates the real GPU *and* lavapipe from one instance, so
 
     gpu = vk_context()
-    cpu = init_vulkan!(select = devs -> only(filter(islavapipe, devs)))
+    cpu = VkContext(select = devs -> only(filter(islavapipe, devs)))
 
 gives two live contexts with two distinct `id`s, which is the pair every
 per-device cache key has to be checked against (`GUARDRAILS.md` §8). Before this
 there was no way to ask for the second device at all, so the acceptance test the
 briefs describe could not be written.
 """
-function init_vulkan!(; select = pick_physical_device)
+function VkContext(; select = pick_physical_device, debug::DebugConfig = DebugConfig())
     # Create instance — target Vulkan 1.4 (device supports 1.4.335 on RADV).
     # Bumping API version unlocks 1.3/1.4 core features we enable below.
     app_info = Vulkan.ApplicationInfo(
@@ -850,8 +905,7 @@ function init_vulkan!(; select = pick_physical_device)
         application_name="Lava.jl",
         engine_name="Lava"
     )
-    # Validation layers: opt-in via LAVA_VALIDATION=1 (default: off)
-    want_validation = get(ENV, "LAVA_VALIDATION", "0") != "0"
+    want_validation = debug.validation
     layers = String[]
     if want_validation
         available_layers = unwrap(Vulkan.enumerate_instance_layer_properties())
@@ -896,40 +950,26 @@ function init_vulkan!(; select = pick_physical_device)
         push!(inst_extensions, "VK_EXT_metal_surface")
     end
 
-    # Extended validation: opt-in via env vars, all require VK_EXT_validation_features.
-    #   LAVA_GPU_AV=1    → shader instrumentation (OOB descriptor access, ray query misuse);
-    #                      does NOT cover plain BDA ranges in current layers.
-    #   LAVA_SYNC_VAL=1  → synchronization validation (reads before writes, missing barriers,
-    #                      cross-submit hazards).  Catches shadow-ownership UAFs.
-    #   LAVA_BEST=1      → best-practices warnings (perf hints).
-    # All are very slow; use one or a combination as needed for triage.
+    # Extended validation, all of it requiring VK_EXT_validation_features:
+    #   gpu_av         → shader instrumentation (OOB descriptor access, ray query
+    #                    misuse); does NOT cover plain BDA ranges in current layers.
+    #   sync_val       → synchronization validation (reads before writes, missing
+    #                    barriers, cross-submit hazards). Catches shadow-ownership UAFs.
+    #   best_practices → API-misuse / perf warnings.
+    #   printf         → NonSemantic.DebugPrintf output from `@lava_printf`.
+    # All are very slow; use one or a combination as needed for triage. See
+    # `DebugConfig` — it enforces the two rules that used to be warnings here.
+    #
+    # `gpu_assisted` and `sync_val` below record what was ACHIEVED, which is not
+    # the same as `debug`, what was asked for: the extension may be missing.
     gpu_assisted = false
     sync_val     = false
-    #   LAVA_DEBUG_PRINTF=1 → enable NonSemantic.DebugPrintf output from kernels
-    #                      (@lava_printf). Mutually exclusive with GPU-AV in the
-    #                      layer (both instrument shaders), so it wins if both set.
-    want_gpu_av  = get(ENV, "LAVA_GPU_AV",  "0") != "0"
-    want_printf  = get(ENV, "LAVA_DEBUG_PRINTF", "0") != "0"
-    want_gpu_av  = want_gpu_av && !want_printf   # printf takes precedence
-    want_sync_val= get(ENV, "LAVA_SYNC_VAL","0") != "0"
-    want_best    = get(ENV, "LAVA_BEST",    "0") != "0"
-    # Safe Mode exists BECAUSE GPU-AV crashes. Khronos' own docs: "Safe Mode will
-    # have GPU-AV try and prevent crashes, but will be much slower to validate,
-    # and when using Safe Mode, selective shader instrumentation is recommended
-    # to only instrument the shaders/pipelines causing issues."
-    # We shipped GPU-AV with neither, which is why reaching for it to debug
-    # something has mostly produced a SIGSEGV instead of a report.
-    want_gpuav_safe = get(ENV, "LAVA_GPU_AV_SAFE", "0") != "0"
-    # Comma-separated shader names to instrument, e.g. LAVA_GPU_AV_SHADERS=step_kernel.
-    # Empty instruments everything, which on ~99 kernels is both slow and the
-    # configuration most likely to fall over.
-    gpuav_shaders = split(get(ENV, "LAVA_GPU_AV_SHADERS", ""), ',', keepempty = false)
-
-    # Asking for GPU-AV and silently not getting it wastes a debugging session:
-    # a clean run then means "the instrument was off", not "no fault found".
-    if get(ENV, "LAVA_GPU_AV", "0") != "0" && !want_gpu_av
-        @warn "LAVA_GPU_AV is set but GPU-AV will NOT be enabled: LAVA_DEBUG_PRINTF takes precedence (both instrument shaders)."
-    end
+    want_gpu_av     = debug.gpu_av
+    want_printf     = debug.printf
+    want_sync_val   = debug.sync_val
+    want_best       = debug.best_practices
+    want_gpuav_safe = debug.gpu_av_safe
+    gpuav_shaders   = debug.gpu_av_shaders
     validation_features_reqs = Vulkan.ValidationFeatureEnableEXT[]
     if want_printf
         push!(validation_features_reqs,
@@ -996,7 +1036,7 @@ function init_vulkan!(; select = pick_physical_device)
     validation = ValidationRing()
     debug_messenger = nothing
     if has_debug_utils
-        debug_messenger = setup_debug_messenger(instance, validation)
+        debug_messenger = setup_debug_messenger(instance, validation, debug)
     end
 
     # Pick physical device (prefer discrete GPU)
@@ -1515,14 +1555,19 @@ function init_vulkan!(; select = pick_physical_device)
         has_memory_budget,
         has_external_memory,
         gpu_assisted,
+        debug,
         string(phys_props.driver_version),
         has_video_decode, video_decode_queue, video_qf_idx,
-        query_device_compute(phys_dev, phys_props),
     )
     # After construction, because it is resolved from THIS device and the inner
     # constructor has no access to the local. Per device — a module-global one
     # sent the first device's command buffers through the second device's driver.
     ctx.cmd_pipeline_barrier_fptr = cmd_barrier_fptr
+    # The pool belongs to this context, so its debug setting is applied here
+    # rather than by the caller. It used to be a separate `pool(ctx).disabled =`
+    # line every caller had to remember after the reset — and forgetting it left
+    # GPU-AV blind to exactly the sub-pool overruns it was turned on to find.
+    pool(ctx).disabled = debug.pool_disabled
     return ctx
 end
 
@@ -1787,7 +1832,8 @@ function layer_setting_bool(name::AbstractString, value::Bool)
                            Base.unsafe_convert(Ptr{Nothing}, Base.pointer_from_objref(r)))
 end
 
-function setup_debug_messenger(instance::Vulkan.Instance, ring::ValidationRing)
+function setup_debug_messenger(instance::Vulkan.Instance, ring::ValidationRing,
+                               debug::DebugConfig)
     callback_ptr = @cfunction(
         debug_callback,
         UInt32,
@@ -1799,7 +1845,13 @@ function setup_debug_messenger(instance::Vulkan.Instance, ring::ValidationRing)
 
     # Debug printf is delivered at INFO severity, so subscribe down to INFO when
     # it's enabled; otherwise stay at WARNING to avoid info-level chatter.
-    min_sev = get(ENV, "LAVA_DEBUG_PRINTF", "0") != "0" ?
+    #
+    # Read from the config this device was built with, not from the environment.
+    # As `LAVA_DEBUG_PRINTF` it was the one env read that happened AFTER the
+    # instance existed, so exporting it mid-session moved the severity floor on
+    # a device whose instance had no printf feature — a subscription to messages
+    # that could never arrive.
+    min_sev = debug.printf ?
         Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT :
         Vulkan.DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT
     # `user_data` is what makes the ring per-device: the driver hands this
@@ -1841,7 +1893,7 @@ clear_validation_messages!(ctx::Union{Nothing,VkContext} = VK_CONTEXT_REF[]) =
     get_printf_output() -> Vector{String}
 
 Return captured `@lava_printf` output since the last clear. Drains the async
-callback ring first. Requires `enable_debug_printf!()` to have been called.
+callback ring first. Requires a device built with `DebugConfig(printf = true)`.
 """
 get_printf_output(ctx::Union{Nothing,VkContext} = VK_CONTEXT_REF[]) =
     ctx === nothing ? String[] :

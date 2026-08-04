@@ -76,25 +76,125 @@ Base.Broadcast.BroadcastStyle(::Type{<:LavaArray{T,N}}) where {T,N} = LavaArrayS
 Base.Broadcast.BroadcastStyle(::LavaArrayStyle{N}, ::LinearAlgebra.StructuredMatrixStyle{T}) where {N,T} = LavaArrayStyle{N}()
 Base.Broadcast.BroadcastStyle(::LinearAlgebra.StructuredMatrixStyle{T}, ::LavaArrayStyle{N}) where {N,T} = LavaArrayStyle{N}()
 
-# Wrapped GPU arrays (Transpose, Adjoint, SubArray, PermutedDimsArray) should
-# use LavaArrayStyle. Without an entry here the wrapper falls back to
+# Wrapped GPU arrays (Transpose, Adjoint, SubArray, PermutedDimsArray,
+# ReshapedArray) must use LavaArrayStyle. Without it the wrapper falls back to
 # DefaultArrayStyle, which iterates and therefore hits the scalar-indexing
 # guard — so `PermutedDimsArray(a, perm) .+ 1` threw rather than running.
-Base.Broadcast.BroadcastStyle(::Type{<:LinearAlgebra.Transpose{T, <:LavaArray{T}}}) where T = LavaArrayStyle{2}()
-Base.Broadcast.BroadcastStyle(::Type{<:LinearAlgebra.Adjoint{T, <:LavaArray{T}}}) where T = LavaArrayStyle{2}()
-Base.Broadcast.BroadcastStyle(::Type{<:SubArray{T, N, <:LavaArray}}) where {T, N} = LavaArrayStyle{N}()
-Base.Broadcast.BroadcastStyle(::Type{<:PermutedDimsArray{T, N, <:Any, <:Any, <:LavaArray}}) where {T, N} = LavaArrayStyle{N}()
+#
+# **Wrappers compose to arbitrary depth, so the check has to recurse.** Matching
+# on a *direct* `LavaArray` parent, or on a union one level deep, leaves anything
+# deeper on `DefaultArrayStyle`. That is not hypothetical: Kokoro's duration
+# encoder transposes on nearly every line, the graph converter folds each permute
+# into buffer metadata, and a layer norm arrived holding a **five-deep**
+# `PermutedDimsArray`. It reduced to a `MethodError` about ambiguity, which names
+# neither the depth nor the wrapper.
 
-# Wrappers compose: `reshape(PermutedDimsArray(a, perm), dims)` is a
-# ReshapedArray over a PermutedDimsArray over a LavaArray, and matching only on
-# a direct LavaArray parent leaves it on DefaultArrayStyle.
+"""
+    lavabacked(T) -> Bool
+
+Whether an array type bottoms out in a `LavaArray` through any stack of view
+wrappers. Recursive, and resolved at compile time for a concrete type.
+"""
+lavabacked(::Type{<:LavaArray}) = true
+lavabacked(::Type{<:PermutedDimsArray{<:Any, <:Any, <:Any, <:Any, P}}) where {P} = lavabacked(P)
+lavabacked(::Type{<:SubArray{<:Any, <:Any, P}}) where {P} = lavabacked(P)
+lavabacked(::Type{<:Base.ReshapedArray{<:Any, <:Any, P}}) where {P} = lavabacked(P)
+lavabacked(::Type{<:LinearAlgebra.Transpose{<:Any, P}}) where {P} = lavabacked(P)
+lavabacked(::Type{<:LinearAlgebra.Adjoint{<:Any, P}}) where {P} = lavabacked(P)
+lavabacked(::Type) = false
+
+# Non-Lava wrappers get exactly the answer Base would have given, so these add a
+# case rather than change one.
+lavastyle(::Type{W}, ::Val{N}) where {W, N} =
+    lavabacked(W) ? LavaArrayStyle{N}() : Base.Broadcast.DefaultArrayStyle{N}()
+
+Base.Broadcast.BroadcastStyle(::Type{W}) where {T, N, W <: PermutedDimsArray{T, N}} =
+    lavastyle(W, Val(N))
+Base.Broadcast.BroadcastStyle(::Type{W}) where {T, N, W <: SubArray{T, N}} =
+    lavastyle(W, Val(N))
+Base.Broadcast.BroadcastStyle(::Type{W}) where {T, N, W <: Base.ReshapedArray{T, N}} =
+    lavastyle(W, Val(N))
+Base.Broadcast.BroadcastStyle(::Type{W}) where {T, W <: LinearAlgebra.Transpose{T}} =
+    lavastyle(W, Val(2))
+Base.Broadcast.BroadcastStyle(::Type{W}) where {T, W <: LinearAlgebra.Adjoint{T}} =
+    lavastyle(W, Val(2))
+
+"""
+    lavaroot(x) -> LavaArray
+
+The device array underneath any stack of view wrappers.
+"""
+lavaroot(x::LavaArray) = x
+lavaroot(x::Union{PermutedDimsArray, SubArray, Base.ReshapedArray,
+                  LinearAlgebra.Transpose, LinearAlgebra.Adjoint}) = lavaroot(parent(x))
+
+"""
+    dense(x) -> LavaArray
+
+Materialise a wrapped device array into a dense one, on the device.
+
+**`Array(x)` does not work on a deeply wrapped device array, and this is why.**
+`Base.copyto!(::Array, ::PermutedDimsArray)` reaches `copyto_unaliased!`, which
+*iterates* the source — the scalar-indexing guard fires, and the message blames
+"an iterating implementation of a method" without naming the wrapper. GPUArrays
+covers `AbstractGPUArray`, and a `PermutedDimsArray` over a `PermutedDimsArray`
+over a `LavaArray` is not one.
+
+Broadcast, on the other hand, works at any depth (see `lavabacked`), so
+`y .= x` is the escape hatch and this wraps it. `Array(dense(x))` is the
+supported way to bring a graph output home; a non-wrapped array passes through
+untouched.
+"""
+dense(x::LavaArray) = x
+function dense(x::AbstractArray)
+    lavabacked(typeof(x)) || return x
+    y = similar(lavaroot(x), eltype(x), size(x))
+    y .= x                      # broadcast, NOT copyto! — copyto! iterates too
+    return y
+end
+
 const AnyLavaArray{T} = Union{LavaArray{T},
                               SubArray{T, <:Any, <:LavaArray},
                               PermutedDimsArray{T, <:Any, <:Any, <:Any, <:LavaArray},
                               Base.ReshapedArray{T, <:Any, <:LavaArray},
                               LinearAlgebra.Transpose{T, <:LavaArray},
                               LinearAlgebra.Adjoint{T, <:LavaArray}}
-Base.Broadcast.BroadcastStyle(::Type{<:Base.ReshapedArray{T, N, <:AnyLavaArray}}) where {T, N} = LavaArrayStyle{N}()
+
+"""
+Reducing a `PermutedDimsArray` into a device array is **ambiguous** without this.
+
+`Base.PermutedDimsArrays` specialises `mapreducedim!` on the *source* being a
+`PermutedDimsArray`, GPUArrays specialises it on the *destination* being a GPU
+array, and neither is more specific than the other:
+
+    mapreducedim!(f, op, R::AnyGPUArray, A::AbstractArray)              # GPUArrays
+    mapreducedim!(f, op, B::AbstractArray, A::PermutedDimsArray)        # Base
+
+So `sum(permuted; dims)` throws `MethodError: ... is ambiguous` rather than
+running. Fixing both argument positions at once is strictly more specific than
+either candidate, which is what resolves it; the body is GPUArrays' — Base's
+would iterate and trip the scalar-indexing guard.
+
+Found on Kokoro, whose duration encoder transposes on nearly every line: the
+graph converter folds each permute into buffer metadata, they nest, and the
+layer norm that reduces the result arrived holding a **five-deep**
+`PermutedDimsArray`. `Base.tail`-style unwrapping is not needed — the parent
+only has to bottom out in something GPUArrays can reduce.
+"""
+Base.mapreducedim!(f, op, R::LavaArray, A::PermutedDimsArray) =
+    GPUArrays.mapreducedim!(f, op, R, A)
+
+# ...and the same again, matching Base's *exact* constraints plus the device
+# destination. Specialising only on `R` is NOT enough: Base's method also pins
+# `op` to a union of seven reducers and requires `ndims(R) == ndims(A)`, so it
+# is more specific in two places where the method above is more specific in one,
+# and neither wins. This one is more specific in all three, which is what
+# actually settles it — `sum(::PermutedDimsArray; dims)` reaches here.
+const REDUCERS = Union{typeof(&), typeof(+), typeof(Base._extrema_rf),
+                       typeof(Base.add_sum), typeof(max), typeof(min), typeof(|)}
+Base.mapreducedim!(f, op::REDUCERS, R::LavaArray{T, N},
+                   A::PermutedDimsArray{S, N, perm, iperm}) where {T, S, N, perm, iperm} =
+    GPUArrays.mapreducedim!(f, op, R, A)
 
 # ── broadcast: always launch over a flat index space ──
 #
@@ -131,8 +231,10 @@ Base.Broadcast.BroadcastStyle(::Type{<:Base.ReshapedArray{T, N, <:AnyLavaArray}}
 #     (576,16,4,16,4,1)   73 ->  76
 #     (256,256,144,1)     45 -> 125
 #
-# Raising the *workgroup* instead does nothing (64 and 256 measure the same) and
-# above 256 is unsafe on this driver — see `Lava.WORKGROUP_LIMIT`.
+# Raising the *workgroup* instead does nothing (64 and 256 measure the same); the
+# ceiling is the device's `maxComputeWorkGroupInvocations`, see `Lava.DeviceCaps`.
+# (The "above 256 is unsafe on this driver" that used to be written here was the
+# pipeline-cache hash collision, not the device — see `workgroup_limit`.)
 @kernel cpu=false function lava_broadcast_flat!(dest, bc, n, ::Val{U}, ::Val{WG}) where {U, WG}
     l = @index(Local, Linear)
     g = @index(Group, Linear)

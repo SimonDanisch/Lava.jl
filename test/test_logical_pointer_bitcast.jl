@@ -20,7 +20,8 @@
 # 1. A pure runtime assertion does not work. The driver ACCEPTS the invalid
 #    module and returns the correct answer. `test_select_width_mismatch.jl` and
 #    `test_shared_memory_stress.jl` both passed for as long as the bug existed;
-#    only `LAVA_VALIDATION=1`, which is off by default, ever objected.
+#    only a validation-layer device (`DebugConfig(validation = true)`), which is
+#    not the default, ever objected.
 #
 # 2. A Tier 1 `compile_and_disasm` check on an equivalent hand-written function
 #    does not work either — it emits a VALID module. The illegal bitcast depends
