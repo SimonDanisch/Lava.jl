@@ -8,16 +8,24 @@ export BatchQueue
 # package needs one import to get both halves of the workload.
 export @setup_workload, @compile_workload
 export CompilationResult, lava_compile, optimize_spirv
-# Debugging & diagnostics
+# Debugging & diagnostics. `DebugConfig` is exported because it is the ONLY way
+# to switch validation on — see its docstring; there is no environment variable.
 export vk_reset_device!, dump_state, gpu_memory_usage, trim_gpu_pool!,
-       allocate_batch_queue!
+       allocate_batch_queue!, DebugConfig
 export ExternalImage, memoryfd
 # Device capability queries: API, but not exported — a kernel library reaches
-# them as `Lava.shader_core_count()`, alongside `Lava.device_subgroup_size()`.
-public shader_core_count, shader_warps_per_sm, max_shared_memory, DeviceCompute
+# them as `Lava.caps(backend)`, or the individual accessors where only one number
+# is wanted. `caps` is the one to reach for: a kernel deciding a tiling wants
+# several of these and they must all describe the same device.
+public caps, DeviceCaps, shader_core_count, shader_warps_per_sm, max_shared_memory,
+       workgroup_limit, device_subgroup_size
+public gemv, gemv!, gemv_config
+public dense, lavaroot, lavabacked
+public fft, fft!, rfft, rfft!, fftany!, fftmixed!, stft, hannwindow,
+       fftplan, fftplan_mixed, fftgroup
 export set_dispatch_logging!, get_dispatch_log
 export concurrent_dispatch_group, concurrent_indirect_group
-export enable_gpu_av, disable_gpu_av, verify_gpu_av, activate_all_debugging
+export verify_gpu_av
 
 # Graphics exports
 export GraphicsPipeline, Rasterizer, TrianglePipeline, LinePipeline
@@ -181,6 +189,8 @@ include("array/ka_backend.jl")
 include("array/gpuarrays.jl")
 include("array/gemm.jl")       # mul! for LavaArray — needs AnyLavaArray from gpuarrays.jl
 include("array/mapreduce.jl")
+include("array/fft.jl")     # batched 1D FFT — ported from dev/VkFFT
+include("array/gemv.jl")    # batch-1 GEMV — ported from llama.cpp mul_mat_vec.comp
 
 # ---- Debug / validation API (needs LavaArray + KA backend) ----
 include("runtime/debug.jl")
