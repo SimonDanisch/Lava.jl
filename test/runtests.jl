@@ -159,6 +159,12 @@ end
         include(joinpath(@__DIR__, "test_gemm_staged.jl"))
     end
 
+    # The scalar half of the same port: `mul!`'s fp32 path, which had no tiling
+    # at all and ran at 0.448 TFLOP/s where this reaches 4.301.
+    @testset "staged scalar GEMM" begin
+        include(joinpath(@__DIR__, "test_gemm_staged_scalar.jl"))
+    end
+
     @testset "whole-struct copy alignment" begin
         include(joinpath(@__DIR__, "test_struct_copy_alignment.jl"))
     end
