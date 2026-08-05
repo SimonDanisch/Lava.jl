@@ -124,13 +124,35 @@ typestring(@nospecialize(T)) = sprint(show, T; context = :module => nothing)
 
 The digest is over `typestring(tt)` and the workgroup size — a *string*, because
 `hash` of a type is object identity and changes between sessions, while its
-printed form does not. It is a filename, not a change detector: two different
-signatures must not collide, but a changed *body* under the same signature is
-explicitly not detected. That is what the version is for.
+printed form does not.
+
+**It also covers the build id of the module defining the kernel, and of `Lava`.**
+Without that the key describes a signature and not a body, so editing a kernel
+without bumping the version leaves the OLD SPIR-V reachable — and the symptom is
+not a wrong number, it is `device was lost ... a dispatch wrote out of bounds`,
+reported from whatever submit is in flight and nowhere near the edit. That cost
+an hour to diagnose once and then recurred immediately: nine hundred entries
+frozen during a bisecting session went stale the moment the code was restored.
+
+`Base.module_build_id` changes exactly when a module is recompiled, which is
+exactly when its kernels may have changed, so this is the invalidation signal
+already sitting in the runtime. `Lava`'s own id is included because a change in
+the emitter alters the SPIR-V of *every* kernel, whoever defined it.
+
+The cost is a re-freeze after any recompilation of `Lava` or the defining
+package. In development that is precisely what is wanted; for an installed
+package the id comes from the `.ji` and is stable across processes.
+
+`KERNELS_VERSION` remains for the deliberate, cross-package generation bump —
+this only removes the failure mode where a bump was *forgotten*.
 """
 function frozen_key(@nospecialize(f), @nospecialize(tt), workgroup_size)
     F = typeof(f)
-    h = hash(typestring(tt), hash(typestring(F), hash(workgroup_size)))
+    # `parentmodule(F)` is where the `@kernel` was written; `Lava` is where the
+    # SPIR-V for it is produced. A change in either invalidates the entry.
+    bids = hash(Base.module_build_id(parentmodule(F)),
+                hash(Base.module_build_id(@__MODULE__)))
+    h = hash(typestring(tt), hash(typestring(F), hash(workgroup_size, bids)))
     sanitize(s) = replace(s, r"[^A-Za-z0-9_]" => "_")
     mod = sanitize(string(parentmodule(F)))
     fn = sanitize(string(nameof(F)))
@@ -306,6 +328,59 @@ function frozen_clear!(; version::AbstractString = FROZEN_VERSION[],
     n = 0
     for f in readdir(dir)
         endswith(f, suffix) || continue
+        rm(joinpath(dir, f); force = true)
+        # The pipeline blob beside it, or it is orphaned forever: nothing else
+        # names a `.bin`, so one left behind is disk that is never reclaimed and
+        # never read. Measured: 56 of them had accumulated this way.
+        rm(joinpath(dir, replace(f, r"\.spirv$" => ".bin")); force = true)
+        n += 1
+    end
+    return n
+end
+
+"""
+    frozen_prune!(; keep = 2000, ctx = vk_context()) -> Int
+
+Delete all but the `keep` most recently modified frozen entries. Returns how many
+were removed.
+
+**Orphans are the normal outcome of editing kernels, not a malfunction.** An
+entry is keyed by signature, workgroup, version and the build id of the defining
+module (see [`frozen_key`](@ref)); recompiling that module makes every one of its
+entries unreachable but does not delete them. A development session that edits
+kernels a few times leaves hundreds behind — one measured session accumulated
+**6066**.
+
+They are harmless except for disk, because an unreachable entry is never loaded.
+This exists so the directory can be bounded when that matters, and is deliberately
+**not** called automatically: deleting a cache another package is about to hit
+turns a hit into a recompile, and that choice belongs to whoever knows the
+machine.
+
+`Lava.frozen_clear!(; version)` is the other tool — it removes one generation
+outright, which is what a deliberate `KERNELS_VERSION` bump obsoletes.
+"""
+function frozen_prune!(; keep::Int = 2000, ctx::VkContext = vk_context())
+    empty!(ctx.caches.frozen_mem)
+    empty!(FROZEN_RT_MEM)
+    dir = frozen_cache_dir()
+    isdir(dir) || return 0
+    spirv = filter(f -> endswith(f, ".spirv"), readdir(dir))
+    length(spirv) <= keep && return 0
+    # Oldest first, by the entry's own mtime.
+    sort!(spirv; by = f -> mtime(joinpath(dir, f)))
+    n = 0
+    for f in spirv[1:(length(spirv) - keep)]
+        rm(joinpath(dir, f); force = true)
+        rm(joinpath(dir, replace(f, r"\.spirv$" => ".bin")); force = true)
+        n += 1
+    end
+    # Sweep `.bin` blobs whose `.spirv` is already gone. `frozen_clear!` used to
+    # leave these behind, and nothing else names them.
+    live = Set(readdir(dir))
+    for f in readdir(dir)
+        endswith(f, ".bin") || continue
+        replace(f, r"\.bin$" => ".spirv") in live && continue
         rm(joinpath(dir, f); force = true)
         n += 1
     end
