@@ -96,3 +96,34 @@ end
     @test all(==(3), Array(c))
     @test all(==(4), Array(d))
 end
+
+# The same hazard, reached without any submit at all — which is the shape the
+# graphics path actually has. `pack_gfx_args` takes an arg buffer for a draw and
+# only then records the draw, and it calls `ensure_active_batch!` on the way in,
+# which sweeps opportunistically. With nothing in flight and no dispatch recorded
+# yet, the sweep used to reset the pool: the buffer just handed to draw k is
+# handed out again to draw k+1, and the frame submits with two draws pointing at
+# one argument buffer. On screen that is a null buffer device address and a GPUVM
+# fault at 0x0.
+#
+# It took a hundred plots and no per-frame flush to hit in the wild — many draws
+# per frame is what makes a sweep land between a handout and its draw. Here it is
+# three lines, because "has this batch recorded a dispatch" was never the right
+# question: what matters is whether anyone is holding pool memory.
+@testset "arg pool must not rewind under a handout (no submit in between)" begin
+    ctx = Lava.vk_context()
+    bq = ctx.default_bq
+    Lava.vk_flush!(ctx)                      # nothing in flight, nothing recorded
+
+    # A batch that has completed but has not been swept yet: that is what the
+    # sweep drains, and draining is what used to reset the cursors.
+    Lava.ensure_active_batch!(bq)
+    batch = Lava.submit!(bq)
+    while Lava.query_timeline(bq) < batch.signal_value; end   # polling does not sweep
+
+    a = Lava.get_arg_buffer(bq, 256)         # a draw's arguments, not yet recorded
+    Lava.ensure_active_batch!(bq)            # sweeps: in_flight drains to empty here
+    b = Lava.get_arg_buffer(bq, 256)         # the next draw's arguments
+
+    @test b.address >= a.address + 256       # pre-fix: b is handed a's very bytes
+end

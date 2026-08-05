@@ -421,7 +421,7 @@ function link_kernel(ctx::VkContext, compiled::LavaGPUKernel; pipeline_cache=not
                                     push_constant_size=compiled.push_info.push_size,
                                     needs_tlas_descriptor=compiled.enable_ray_query,
                                     pipeline_cache)
-    offsets = Int[p.first for p in compiled.push_info.arg_layout]
+    offsets = compiled.push_info.arg_offsets
     byval_sizes = compiled.push_info.byval_llvm_sizes
     return LavaLinkedKernel(compiled, pipeline, offsets, byval_sizes)
 end
@@ -637,16 +637,35 @@ Rewinding at end-of-frame did exactly that: geometry corruption over a static
 scene, intermittent, hidden by any full sync, and invisible to validation —
 overwriting your own host-mapped memory is perfectly legal.
 """
-arg_pool_in_use!(bq::BatchQueue, signal_value::Integer) =
-    (bq.arg_pool_frontier = UInt64(signal_value); nothing)
+function arg_pool_in_use!(bq::BatchQueue, signal_value::Integer)
+    bq.arg_pool_frontier = UInt64(signal_value)
+    # Everything handed out so far now belongs to a submitted batch, and the
+    # frontier covers it. The recording that starts next holds nothing yet, which
+    # is what `arg_alloc_count` means from here on.
+    bq.arg_alloc_count = 0
+    nothing
+end
 
 """
 Rewind the arg pool if — and only if — the GPU has finished with everything
-allocated from it. Cheap: one non-blocking timeline query, and only when there is
-a frontier to clear.
+allocated from it *and* the recording in progress holds none of it. Cheap: one
+non-blocking timeline query, and only when there is a frontier to clear.
+
+The second condition is not redundant, and leaving it out is a GPU crash. The
+timeline can cross the frontier *while a frame is being recorded*: draws 1..k have
+already had their arg buffer addresses baked into push constants, the GPU then
+finishes the previous frame, and the next `get_arg_buffer` rewinds to offset zero
+and hands the same bytes to draw k+1. The earlier draws are left reading whatever
+the later ones wrote — a null buffer device address, and a GPUVM fault at 0x0.
+
+It needs many draws in one frame for a reclaim to land mid-recording, and frames
+in flight for the timeline to move during it, which is why it appeared the day the
+per-frame flush went away and only with a hundred plots. `arg_alloc_count` is the
+count since the last submit, so it is exactly "this recording holds handouts".
 """
 function reclaim_arg_buffer_pool!(bq::BatchQueue)
     bq.arg_pool_frontier == UInt64(0) && return false
+    bq.arg_alloc_count == 0 || return false
     query_timeline(bq) >= bq.arg_pool_frontier || return false
     reset_arg_buffer_pool!(bq)
     bq.arg_pool_frontier = UInt64(0)

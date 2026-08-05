@@ -1123,6 +1123,11 @@ function submit!(bq::BatchQueue)
 
     push!(bq.in_flight, batch)
     bq.active_batch = nothing
+    # Everything handed out of the arg pool so far is read by this batch, and the
+    # pool may rewind once the timeline passes it. Recorded here rather than only
+    # in `present_frame!`, because a compute-only queue never presents and would
+    # otherwise never be allowed to rewind at all.
+    arg_pool_in_use!(bq, batch.signal_value)
     bq.last_dispatch_info = "$saved_dispatch_count dispatches ($(saved_last_was_rt ? "RT" : "compute"))"
     dg = (bq.ctx::VkContext).diag
     Threads.atomic_add!(dg.total_dispatches, saved_dispatch_count)
@@ -1203,10 +1208,17 @@ function sweep_retired_batches!(bq::BatchQueue)
     # against wrong pointers: no validation error, no device fault, just a kernel
     # that never returns. `capture` pins the range at the end via
     # `reserve_arg_slabs!`, which is too late to help the capture itself.
+    # "Recorded dispatches" is the wrong question, and asking it is a GPU crash.
+    # An arg buffer is handed out *before* the dispatch that uses it is recorded,
+    # and a caller may take several before recording any — every draw in a frame
+    # packs its arguments and only then records the draw. `arg_alloc_count` is
+    # the handouts since the last submit, which is what "someone is still holding
+    # pool memory" actually means.
     capturing_here = bq.capturing !== nothing
     active = bq.active_batch
     active_has_commands = active !== nothing && active.dispatch_count > 0
-    if isempty(bq.in_flight) && !active_has_commands && !capturing_here
+    if isempty(bq.in_flight) && !active_has_commands && !capturing_here &&
+       bq.arg_alloc_count == 0
         reset_arg_buffer_pool!(bq)
         reset_indirect_buffer_pool!(bq)
     end
