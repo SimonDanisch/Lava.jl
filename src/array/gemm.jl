@@ -248,6 +248,67 @@ end
     return haskey(GEMM_STAGED_KERNELS, c) ? c : nothing
 end
 
+"""
+    GEMM_PAD_SLACK
+
+How much extra arithmetic buying the staged kernel is allowed to cost, as a
+fraction of the work the tile rounding would have done.
+
+Measured on Whisper's three GEMM shapes, three arms interleaved on one clock
+plateau (`tools/bench_gemm_padn.jl`), the staged kernel is **1.73x, 1.99x and
+1.94x** the register-blocked one — well above the 1.4x `GEMM_TILINGS`' own table
+suggests, because that table compares tilings and this compares kernels. Reaching
+it via padding costs a `padcols` pass over `B` and a destination wider than the
+caller's.
+
+**25% is nonetheless the bar, and deliberately conservative**, because those
+ratios were measured at `N = 1500` and the shapes this rule can *hurt* are the
+small ones, where a workgroup grid of a few tiles is launch-bound rather than
+throughput-bound and the staged kernel's advantage has not been measured at all.
+`N = 48` would pad to 64 and `N = 8` to 64 — 1.33x and 8x the work, for an
+unmeasured gain. Raising this bar means measuring small `N` first.
+
+Whisper's 1500 pads to 1536: 1.021.
+"""
+const GEMM_PAD_SLACK = 0.25
+
+"""
+    gemm_padn(M, N, K; tile = GEMM_TILE, slack = GEMM_PAD_SLACK) -> Int
+
+`N` rounded up to the width that lets a staged tiling take this shape, or to a
+plain multiple of `tile` when none can — or when getting there would cost more
+than `slack`.
+
+A caller that pads `N` itself (`mm_coopmat_plan` pads the token axis, an im2col
+matrix is built to size) has to choose *what* to pad to, and rounding to the
+16-wide cooperative-matrix tile is the wrong answer: `gemm_tiling` needs the
+whole 64- or 128-wide **block** to divide, so a 16-multiple that is not also a
+block multiple lands on the register-blocked kernel instead of the staged one.
+
+Whisper's encoder is the case that makes this concrete. Every one of its 160
+matmuls has 1500 tokens, `cld(1500, 16) * 16` is 1504, and 1504 is not a
+multiple of 64 or 128 — so all 160 missed the staged kernel by 32 columns.
+
+Asks the same predicates `gemm_tiling` does, so the tiling it pads for is one
+`gemm_tiling` will accept; a divergence between the two would pad to a width
+nothing uses. It picks the **narrowest** applicable block rather than the first,
+because the first is chosen for speed and the choice here is about waste — a
+64-wide block that pads `N = 200` to 256 beats a 128-wide one that pads it to
+256 only by tying, and beats it outright at `N = 72`.
+"""
+function gemm_padn(M::Int, N::Int, K::Int;
+                   tile::Int = GEMM_TILE, slack::Real = GEMM_PAD_SLACK)
+    base = cld(N, tile) * tile
+    best = 0
+    for c in GEMM_TILINGS
+        M % gemm_bm(c) == 0 && K % gemm_bk(c) == 0 && !gemm_aliasing(c, K) || continue
+        haskey(GEMM_STAGED_KERNELS, c) || continue
+        np = cld(N, gemm_bn(c)) * gemm_bn(c)
+        (best == 0 || np < best) && (best = np)
+    end
+    best != 0 && best <= base * (1 + slack) ? best : base
+end
+
 """Does this device implement the tile `mul!` wants?"""
 # The block kernel derives its subgroup index as `lane ÷ 32` and GEMM_WORKGROUP
 # is sized as "2 subgroups" on the same assumption, so the whole thing is only

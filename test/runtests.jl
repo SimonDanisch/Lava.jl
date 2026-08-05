@@ -159,6 +159,10 @@ end
         include(joinpath(@__DIR__, "test_gemm_staged.jl"))
     end
 
+    @testset "scalar GEMM accumulator width" begin
+        include(joinpath(@__DIR__, "test_gemm_fp16_accum.jl"))
+    end
+
     @testset "whole-struct copy alignment" begin
         include(joinpath(@__DIR__, "test_struct_copy_alignment.jl"))
     end

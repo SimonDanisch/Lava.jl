@@ -152,6 +152,59 @@ end
         @test Lava.staged_gemm_tiling(64, 64, 64, 2, 1; staged = true) === nothing  # batched: refused
         @test Lava.staged_gemm_tiling(48, 40, 64, 1, 1; staged = true) === nothing  # no block divides
     end
+
+    # `gemm_padn` decides what a caller that pads `N` should pad it *to*. Rounding
+    # to the 16-wide cooperative-matrix tile makes the instruction legal and the
+    # staged kernel inapplicable, which is a factor of several on a shape whose
+    # token count happens to land between two blocks.
+    @testset "padding N lands on the block, not on the tile" begin
+        # Whisper's encoder, the case that found this. 1500 tokens: cld(1500,16)*16
+        # is 1504, which no tiling's block divides; 1536 is 12 x 128.
+        for (M, K) in ((1280, 1280), (5120, 1280), (1280, 5120))
+            @test Lava.gemm_padn(M, 1500, K) == 1536
+            c = Lava.gemm_tiling(M, Lava.gemm_padn(M, 1500, K), K)
+            @test c !== nothing
+            @test haskey(Lava.GEMM_STAGED_KERNELS, c)
+            # The old rounding is what it must beat, and it is only 32 columns away.
+            @test Lava.gemm_tiling(M, cld(1500, 16) * 16, K) === nothing
+        end
+
+        # Already on a block: no padding at all, so a shape that was fast stays
+        # fast and pays nothing.
+        @test Lava.gemm_padn(1280, 1536, 1280) == 1536
+        @test Lava.gemm_padn(1280, 4096, 1280) == 4096
+
+        # The padded width is always a multiple of the block the chooser then
+        # picks — the two ask the same predicates in the same order, and a
+        # divergence would pad to a width nothing uses.
+        for M in (64, 96, 128, 192, 256, 576, 1280, 2304, 5120),
+            K in (32, 64, 288, 576, 1152, 1280, 2304, 5120),
+            N in (1, 7, 40, 100, 1500, 4095)
+            NP = Lava.gemm_padn(M, N, K)
+            @test NP >= N
+            c = Lava.gemm_tiling(M, NP, K)
+            c === nothing || @test NP % Lava.gemm_bn(c) == 0
+        end
+
+        # No tiling can take these `M`/`K` at all, so there is nothing to pad for
+        # and the tile rounding is what is left.
+        @test Lava.gemm_padn(48, 40, 64) == 48        # M = 48 divides no block
+        @test Lava.gemm_padn(64, 40, 48) == 48        # K = 48 is not a multiple of 32
+
+        # `slack` is the point of the rule, not a detail of it: a small `N` pads
+        # to more work than the faster kernel can pay back, so it must NOT be
+        # padded. N = 48 would go to 64 (1.33x) and N = 8 to 64 (8x).
+        @test Lava.gemm_padn(1280, 48, 1280) == 48
+        @test Lava.gemm_padn(1280, 8, 1280) == 16
+        # ...and the same shape with the bar removed does pad, so the assertions
+        # above are testing the bar rather than an unreachable branch.
+        @test Lava.gemm_padn(1280, 48, 1280; slack = 10) == 64
+        # Either side of the bar, measured against the tile rounding the padding
+        # replaces rather than against `N` itself:
+        @test Lava.gemm_padn(1280, 208, 1280) == 256   # 256/208 = 1.23, just inside
+        @test Lava.gemm_padn(1280, 72, 1280) == 80     # 128/80  = 1.60, refused
+        # Already on a 64-wide block: nothing to pay, nothing to refuse.
+        @test Lava.gemm_padn(1280, 192, 1280) == 192
 end
 
 @testset "the aliasing rule keeps the 96-row block off its bad stride" begin
