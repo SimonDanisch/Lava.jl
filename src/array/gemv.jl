@@ -427,3 +427,40 @@ gemv(A::LavaArray{Float32}, B::LavaArray{Float32,2}) =
 
 gemv(x::LavaArray{Float32}, Wt::Transpose{Float32,<:LavaArray{Float32,2}}; kw...) =
     gemv!(similar(x, Float32, size(Wt, 1)), x, Wt; kw...)
+
+"""
+    GEMV_PREGENERATED_LIMITS
+
+Workgroup-size limits to pre-generate GEMV kernels for, at Lava load.
+
+Both GEMV families are `@eval`-generated (see the two "Why this is
+`@eval`-generated" notes above), and **an `@eval` on the runtime path cannot be
+precompiled**: a downstream package whose `@compile_workload` reaches one dies
+with
+
+    Evaluation into the closed module `Lava` breaks incremental compilation
+
+so the workload silently skips and every first call in a fresh process pays the
+compile the Runner packages exist to remove. That is not hypothetical and it is
+not new — `FFT_PREGENERATED` exists for exactly this, found by `KokoroRunner`.
+The GEMV port reintroduced it, and `SAM2Runner` is where it showed up: its
+workload skipped with that message, so nothing SAM 2 runs was frozen.
+
+Generating at load moves the `@eval` to ordinary top-level code. The set is small
+and derived — the loop below asks `gemv_config` and `gemv_ncontig_config`
+themselves rather than restating their answers, so a change to either is followed
+automatically. `(1, 4096)` are the two sides of every branch those functions take.
+
+The limit is a *device* property and there is no device at load time, so the
+plausible values are enumerated instead. A device outside this list still works;
+it merely pays the old cost, which is the same failure mode as before and not a
+worse one.
+"""
+const GEMV_PREGENERATED_LIMITS = (64, 128, 256, 512, 1024)
+
+for L in GEMV_PREGENERATED_LIMITS
+    for K in (1, 4096), N in (1, 4096)
+        gemv_kcontig_kernel(gemv_config(K, N, L)...)
+    end
+    gemv_ncontig_kernel(gemv_ncontig_config(1, 1, L)...)
+end
