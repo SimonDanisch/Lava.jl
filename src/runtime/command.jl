@@ -1313,9 +1313,53 @@ function flush!(bq::BatchQueue, device::Vulkan.Device)
         # A TDR marks the device lost while this call is still waiting on a value
         # that will now never be signalled, so ask between quanta rather than
         # sitting in one unbounded wait.
+        #
+        # ASK THE DRIVER, don't just read the flag. `device_lost(ctx)` is only
+        # ever set by `mark_if_lost!` from some OTHER call's `VkResult`, and
+        # during this wait there is no other call — so on a dead device the flag
+        # stays false forever. Worse, the two things we could ask disagree:
+        # `vkWaitSemaphores` returns TIMEOUT (not an error) and
+        # `vkGetSemaphoreCounterValue` returns a perfectly good stale counter,
+        # while `vkQueueWaitIdle` and `vkGetFenceStatus` report DEVICE_LOST.
+        # Lava polled the two that lie, so a GPU fault presented as a 120 s stall
+        # and the error told the user to RAISE the timeout — the one action that
+        # cannot help. Measured on MatAnyone: queue dead, counter happily
+        # answering 355, `vkQueueWaitIdle` -> ERROR_DEVICE_LOST.
+        #
+        # `vkQueueWaitIdle` is the probe, and it has to be: MEASURED on this
+        # driver with the device already dead, only one of five reports it —
+        #
+        #     get_fence_status(as_fence)      silent
+        #     get_semaphore_counter_value     silent (returns a stale 355!)
+        #     empty queue_submit_2            silent
+        #     wait_semaphores(0 timeout)      silent
+        #     queue_wait_idle                 ERROR_DEVICE_LOST, 2.5 s
+        #
+        # Which calls surface a lost device is a per-driver fact, not a spec
+        # guarantee, so it is measured rather than reasoned about.
+        #
+        # It blocks, but only in a situation that is already abnormal — the first
+        # quantum has passed without the target being reached — and on a HEALTHY
+        # device blocking until the queue drains is exactly what `flush!` wants.
+        # So this costs nothing in the common case, where the wait succeeds on
+        # the first quantum and this line is never reached.
+        let st = Vulkan.queue_wait_idle(bq.queue)
+            iserror(st) && mark_if_lost!(bq, st)
+        end
         if device_lost(bq.ctx::VkContext)
-            throw(LavaError("vkWaitSemaphores", "device was lost while waiting for timeline $target",
-                            "Call Lava.vk_reset_device!() to reinitialize"))
+            throw(LavaError("vkWaitSemaphores",
+                            "device was lost while waiting for timeline $target " *
+                            "(counter stuck at $(query_timeline(bq)), " *
+                            "$(length(bq.in_flight)) batch(es) in flight)",
+                            "The GPU faulted — a dispatch wrote out of bounds or hung. " *
+                            "Raising `bq.flush_timeout_ns` cannot help; call " *
+                            "`Lava.vk_reset_device!()` to reinitialize. To find the " *
+                            "dispatch: `journalctl -k` for an NVIDIA Xid names the fault " *
+                            "class, and `LAVA_VALIDATION=1 LAVA_GPU_AV=1 " *
+                            "LAVA_GPU_AV_SAFE=1` instruments the shaders — but note " *
+                            "GPU-AV can itself crash on a workload that kills the " *
+                            "device (measured: it does on MatAnyone's step, Safe Mode " *
+                            "included), so narrow with `LAVA_GPU_AV_SHADERS=` first."))
         end
         if budget != UInt64(0) && waited >= budget
             throw(LavaError("vkWaitSemaphores",
