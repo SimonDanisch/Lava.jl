@@ -29,6 +29,16 @@ mutable struct RenderWindow
     # Current frame state
     current_image_idx::UInt32
     acquired::Bool
+    # The task that acquired the image still in flight, for the message in
+    # `acquire_next_image!`. Only ever read to report a bug.
+    acquirer::Union{Nothing, Task}
+    # The framebuffer size the current swapchain was built for. A resize is not
+    # reliably reported: OUT_OF_DATE is what the spec allows a driver to return,
+    # not what it must, and SUBOPTIMAL is a *success* code that never reaches an
+    # error branch. On Xwayland a shrunk window keeps presenting at the old size
+    # and the compositor scales it, which looks like blur and reads back at the
+    # wrong resolution. Comparing against this is what actually notices.
+    fb_size::Tuple{Int,Int}
     # Owning context — swapchain/surface are bound to a specific device.
     ctx::VkContext
 end
@@ -63,7 +73,8 @@ function RenderWindow(width::Integer, height::Integer;
         Vulkan.Semaphore[], Vulkan.Semaphore[], Vulkan.Fence[],
         1,  # current_frame
         Union{Nothing, CommandBatch}[],  # frame_batches
-        UInt32(0), false,
+        UInt32(0), false, nothing,
+        (Int(width), Int(height)),       # fb_size, corrected by create_swapchain!
         ctx,
     )
 
@@ -111,13 +122,14 @@ function create_swapchain!(win::RenderWindow; vsync::Bool=true)
     end
 
     # Determine extent
+    fbw, fbh = GLFW.GetFramebufferSize(win.handle)
+    win.fb_size = (Int(fbw), Int(fbh))      # what this swapchain is built for
     if caps.current_extent.width != typemax(UInt32)
         win.extent = caps.current_extent
     else
-        w, h = GLFW.GetFramebufferSize(win.handle)
         win.extent = Vulkan.Extent2D(
-            clamp(UInt32(w), caps.min_image_extent.width, caps.max_image_extent.width),
-            clamp(UInt32(h), caps.min_image_extent.height, caps.max_image_extent.height),
+            clamp(UInt32(fbw), caps.min_image_extent.width, caps.max_image_extent.width),
+            clamp(UInt32(fbh), caps.min_image_extent.height, caps.max_image_extent.height),
         )
     end
 
@@ -125,6 +137,16 @@ function create_swapchain!(win::RenderWindow; vsync::Bool=true)
     image_count = caps.min_image_count + 1
     if caps.max_image_count > 0
         image_count = min(image_count, caps.max_image_count)
+    end
+
+    # readback_window copies out of a swapchain image, which needs TRANSFER_SRC.
+    # Without it the copy and its layout transitions are spec violations that
+    # only show up once validation is on: RADV tolerates them and returns
+    # plausible pixels, so the readback looked correct for as long as nobody
+    # checked. Only request it when the surface actually supports it.
+    usage = Vulkan.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | Vulkan.IMAGE_USAGE_TRANSFER_DST_BIT
+    if (caps.supported_usage_flags & Vulkan.IMAGE_USAGE_TRANSFER_SRC_BIT) != Vulkan.ImageUsageFlag(0)
+        usage |= Vulkan.IMAGE_USAGE_TRANSFER_SRC_BIT
     end
 
     old_swapchain = win.swapchain
@@ -138,7 +160,7 @@ function create_swapchain!(win::RenderWindow; vsync::Bool=true)
         dev, win.surface,
         image_count, chosen_format.format, chosen_format.color_space,
         win.extent, UInt32(1),
-        Vulkan.IMAGE_USAGE_COLOR_ATTACHMENT_BIT | Vulkan.IMAGE_USAGE_TRANSFER_DST_BIT,
+        usage,
         Vulkan.SHARING_MODE_EXCLUSIVE, UInt32[],
         caps.current_transform,
         Vulkan.COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
@@ -148,6 +170,28 @@ function create_swapchain!(win::RenderWindow; vsync::Bool=true)
 
     win.swapchain = swapchain
     win.images = unwrap(Vulkan.get_swapchain_images_khr(dev, swapchain))
+
+    # Destroy what the old swapchain owned, now that the new one exists.
+    # Reassigning the fields would leave these to finalizers, which run whenever
+    # the GC gets to them, so a window resized a few times accumulates whole
+    # swapchains' worth of images. Passing `old_swapchain` retires it; retiring
+    # is not destroying.
+    #
+    # The wait is not optional. `vkDestroySwapchainKHR` requires every use of a
+    # presentable image acquired from it to have completed, and an image view
+    # must not be destroyed while a pending command references it — and this
+    # function is reached from `acquire_next_image!` mid-render, with frames in
+    # flight. Without it a resize is a use-after-free that surfaces as a GPUVM
+    # fault several frames later, nowhere near the resize.
+    if old_swapchain !== nothing
+        Vulkan.device_wait_idle(dev)
+    end
+    for v in win.views
+        finalize(v)
+    end
+    if old_swapchain !== nothing
+        finalize(old_swapchain)
+    end
 
     # Create image views
     win.views = Vulkan.ImageView[]
@@ -184,16 +228,80 @@ function create_swapchain!(win::RenderWindow; vsync::Bool=true)
 end
 
 """
+    checkopen(win)
+
+A closed window has a destroyed GLFW handle and no swapchain, and asking it
+anything dereferences that handle inside the driver: a segfault with a native
+stack, not an error anyone can act on. Every entry point that touches the handle
+checks first.
+
+This is the handle, not `isopen`: a window whose close button has been clicked is
+still a perfectly good window to draw to, and the loop condition is what decides
+to stop.
+"""
+checkopen(win::RenderWindow) =
+    win.handle.handle == C_NULL &&
+        error("this window has been closed; nothing can be drawn to it or read from it")
+
+"""
+    sync_swapchain!(win) -> Bool
+
+Rebuild the swapchain if the window no longer matches it, and say whether it did.
+
+A resize is not reliably reported: `OUT_OF_DATE` is what a driver *may* return and
+`SUBOPTIMAL` is a success code that never reaches an error branch. On Xwayland
+neither arrives — the window changes size and the swapchain keeps presenting at
+the old one, which the compositor scales. Comparing the framebuffer size against
+what the swapchain was built for is what notices.
+
+Separate from `acquire_next_image!` so a caller that has to know the size *before*
+it starts recording — a graph, whose other attachments have to cover the render
+area — can bring the swapchain up to date first and bail out without a half
+recorded frame. Zero is a minimised window and has no swapchain to build.
+"""
+function sync_swapchain!(win::RenderWindow)
+    checkopen(win)
+    fbw, fbh = GLFW.GetFramebufferSize(win.handle)
+    (fbw, fbh) == win.fb_size && return false
+    (fbw > 0 && fbh > 0) || return false
+    resize!(win)
+    return true
+end
+
+"""
     acquire_next_image!(win::RenderWindow) -> UInt32
 
 Acquire the next swapchain image. Returns the image index.
 Must be called before recording rendering commands.
 """
 function acquire_next_image!(win::RenderWindow)
+    checkopen(win)
     ctx = win.ctx
     dev = ctx.device
-    fi = win.current_frame
 
+    sync_swapchain!(win)
+
+    # The fence below is signalled by the submit `present!` makes, so waiting on
+    # it while an image is still acquired waits for a submit the caller has not
+    # recorded yet. That wait is a `vkWaitForFences` — a blocking foreign call,
+    # so the task holding the unpresented frame can never be scheduled again, GC
+    # cannot run, and the process is left unkillable with no stack to look at.
+    #
+    # How a frame gets left open: recording is not atomic against the Julia
+    # scheduler. Anything that compiles a kernel mid-frame yields (the launch
+    # plan is keyed on the world counter, so one method definition anywhere in
+    # the session is enough), and a second task that renders in that window then
+    # arrives here between the acquire and the present.
+    if win.acquired
+        who = win.acquirer === current_task() ?
+              "the same task that is asking for another one" :
+              "another task ($(win.acquirer)) that has not presented it yet"
+        error("acquire_next_image!: this window already holds an image, acquired by " *
+              who * ". A window is rendered by one task: pass it around, or hand it " *
+              "over once the frame that owns it has been presented.")
+    end
+
+    fi = win.current_frame
     wait_for_fences!(ctx.default_bq, [win.in_flight[fi]])
     unwrap(Vulkan.reset_fences(dev, [win.in_flight[fi]]))
 
@@ -226,6 +334,7 @@ function acquire_next_image!(win::RenderWindow)
 
     win.current_image_idx = idx
     win.acquired = true
+    win.acquirer = current_task()
     return idx
 end
 
@@ -236,6 +345,7 @@ Present the rendered frame to the screen.
 Must be called after recording and submitting rendering commands.
 """
 function present!(win::RenderWindow)
+    checkopen(win)
     win.acquired || error("Cannot present: no image acquired (call acquire_next_image! first)")
     ctx = win.ctx
     fi = win.current_frame
@@ -253,6 +363,7 @@ function present!(win::RenderWindow)
         code = unwrap_error(result).code
         if code == Vulkan.ERROR_OUT_OF_DATE_KHR || code == Vulkan.SUBOPTIMAL_KHR
             win.acquired = false
+            win.acquirer = nothing
             resize!(win)                 # rebuild the swapchain; caller draws the next frame
             return nothing
         end
@@ -260,6 +371,7 @@ function present!(win::RenderWindow)
     end
 
     win.acquired = false
+    win.acquirer = nothing
     # Advance to next frame-in-flight slot
     win.current_frame = mod1(fi + 1, length(win.in_flight))
 end
@@ -270,6 +382,7 @@ end
 Handle window resize by recreating the swapchain.
 """
 function Base.resize!(win::RenderWindow)
+    checkopen(win)
     ctx = win.ctx
     Vulkan.device_wait_idle(ctx.device)
     # Reclaim in-flight frame batches before recreating swapchain — push back to
@@ -313,6 +426,32 @@ function Base.close(win::RenderWindow)
             win.frame_batches[i] = nothing
         end
     end
+    # Destroy the Vulkan objects here rather than leaving them to finalizers.
+    # Julia does not run finalizers at exit, so the surface outlives the
+    # instance and the validation layer reports it as leaked on every process
+    # teardown (VUID-vkDestroyInstance-instance-00629). Child before parent:
+    # views, then swapchain, then surface.
+    for v in win.views
+        finalize(v)
+    end
+    empty!(win.views)
+    empty!(win.images)                  # owned by the swapchain, not destroyed
+    for s in win.image_available; finalize(s); end
+    for s in win.render_finished; finalize(s); end
+    for f in win.in_flight; finalize(f); end
+    empty!(win.image_available); empty!(win.render_finished); empty!(win.in_flight)
+    if win.swapchain !== nothing
+        finalize(win.swapchain)
+        win.swapchain = nothing
+    end
+    # Explicitly, not `finalize`. The surface is wrapped by hand around the
+    # pointer GLFW returns, so it never went through Vulkan.jl's `init_handle!`:
+    # its `destructor` field is `UndefInitializer()` and it shares the instance's
+    # refcounter. Nothing would ever have destroyed it, which is why every run
+    # ended with one leaked object. No finalizer is registered, so there is no
+    # double-free to guard against.
+    Vulkan.destroy_surface_khr(ctx.instance, win.surface)
+
     GLFW.DestroyWindow(win.handle)
     win.handle = GLFW.Window(C_NULL)
 end
