@@ -1523,6 +1523,21 @@ function get_staging(bq::BatchQueue, nbytes::Integer)
         bq.staging = nothing
     end
 
+    managed = host_buffer(bq, nbytes)
+    bq.staging = managed
+    return (managed.buffer, managed.memory, managed.mapped_ptr, managed.size)
+end
+
+"""
+    host_buffer(bq, nbytes) -> VkManagedBuffer
+
+A host-visible, permanently mapped buffer the GPU can copy out of.
+
+The GPU cannot read a Julia `Vector`, so every host-to-device transfer starts
+with a memcpy into one of these. Who owns it, how it is sliced and when a slice
+may be reused are all questions for the caller; this only allocates one.
+"""
+function host_buffer(bq::BatchQueue, nbytes::Integer)
     ctx = bq.ctx::VkContext
     dev = bq.device
     alloc_size = max(65536, nextpow(2, nbytes))
@@ -1557,8 +1572,7 @@ function get_staging(bq::BatchQueue, nbytes::Integer)
         push!(p.live_buffers, managed)
         Threads.atomic_add!(p.live_bytes, managed.size)
     end
-    bq.staging = managed
-    return (vkbuf, memory, mapped_ptr, Int(alloc_size))
+    managed
 end
 
 """
