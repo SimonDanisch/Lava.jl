@@ -9,7 +9,8 @@
 """
     create_graphics_pipeline(vertex_spirv, fragment_spirv;
         blend=Opaque(), cull=CullBack(), topology=TriangleList(), depth=DepthLess(),
-        color_format=Vulkan.FORMAT_B8G8R8A8_SRGB, push_constant_size=8,
+        color_format=Vulkan.FORMAT_B8G8R8A8_SRGB,
+        depth_format=Vulkan.FORMAT_UNDEFINED, push_constant_size=8,
         geometry_spirv=nothing, geometry_config=nothing,
         tess_ctrl_spirv=nothing, tess_eval_spirv=nothing, tess_config=nothing,
         descriptor_set_layout=nothing) -> CompiledGraphicsPipeline
@@ -24,8 +25,8 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
                                     cull::CullFace=CullBack(),
                                     topology::Topology=TriangleList(),
                                     depth::DepthMode=DepthLess(),
-                                    color_format::Vulkan.Format=Vulkan.FORMAT_B8G8R8A8_SRGB,
-                                    depth_format::Vulkan.Format=Vulkan.FORMAT_D32_SFLOAT,
+                                    color_format=Vulkan.FORMAT_B8G8R8A8_SRGB,
+                                    depth_format::Vulkan.Format=Vulkan.FORMAT_UNDEFINED,
                                     push_constant_size::Integer=8,
                                     geometry_spirv::Union{Nothing, Vector{UInt8}}=nothing,
                                     tess_ctrl_spirv::Union{Nothing, Vector{UInt8}}=nothing,
@@ -100,9 +101,23 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
     multisample = Vulkan.PipelineMultisampleStateCreateInfo(
         Vulkan.SAMPLE_COUNT_1_BIT, false, 1.0f0, false, false)
 
-    # Depth/stencil
-    has_depth = !(depth isa DepthOff)
+    # Depth/stencil.
+    #
+    # Whether the pipeline declares a depth attachment is a property of the RENDER
+    # TARGET, not of the depth mode: with dynamic rendering the format baked in here
+    # must equal the format of the view bound at `vkCmdBeginRendering`, and NULL
+    # there means UNDEFINED here (VUID-vkCmdDraw-pDepthAttachment-06181). Deriving
+    # it from `depth isa DepthOff` instead got both mismatches wrong — a DepthOff
+    # draw into a framebuffer that has depth, and a DepthLess draw into a window
+    # that has none — because neither combination is about the test being on.
+    has_depth = depth_format != Vulkan.FORMAT_UNDEFINED
     depth_enable, depth_compare = vk_depth(depth)
+    if depth_enable && !has_depth
+        throw(ArgumentError(
+            "$(typeof(depth)) needs a depth attachment, and this render target has none. " *
+            "Pass `depth_format` for the target's depth view, or build the pipeline with " *
+            "`depth = DepthOff()`."))
+    end
     depth_stencil = Vulkan.PipelineDepthStencilStateCreateInfo(
         depth_enable, depth_enable,
         depth_compare,
@@ -115,11 +130,14 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
         0.0f0, 1.0f0,
     )
 
-    # Color blend
+    # Color blend, one attachment state per colour target: with several targets
+    # Vulkan requires the counts to match, and every target blends the same way
+    # because blending is pipeline state and the pipeline is one.
+    color_formats = colorformats(color_format)
     blend_attachment = vk_blend(blend)
     color_blend = Vulkan.PipelineColorBlendStateCreateInfo(
         false, Vulkan.LOGIC_OP_COPY,
-        [blend_attachment],
+        [blend_attachment for _ in color_formats],
         (0.0f0, 0.0f0, 0.0f0, 0.0f0),
     )
 
@@ -153,8 +171,8 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
     # Dynamic rendering info (Vulkan 1.3+)
     rendering_info = Vulkan.PipelineRenderingCreateInfo(
         UInt32(0),           # view mask
-        [color_format],      # color attachment formats
-        has_depth ? depth_format : Vulkan.FORMAT_UNDEFINED,
+        color_formats,       # color attachment formats
+        depth_format,
         Vulkan.FORMAT_UNDEFINED,  # stencil format
     )
 
@@ -189,9 +207,16 @@ function create_graphics_pipeline(vertex_spirv::Vector{UInt8},
         UInt32(push_constant_size),
         descriptor_set_layout,
         all_stage_flags,
-        color_format, has_depth,
+        color_formats, has_depth,
     )
 end
+
+"""
+One colour attachment or several, normalised. A single format is the common case
+and stays spellable as itself rather than as a one-element vector.
+"""
+colorformats(f::Vulkan.Format) = [f]
+colorformats(f::AbstractVector{Vulkan.Format}) = collect(f)
 
 function create_gfx_shader_module(dev::Vulkan.Device, spirv_bytes::Vector{UInt8})
     @assert length(spirv_bytes) % 4 == 0 "SPIR-V binary must be 4-byte aligned"
@@ -290,6 +315,8 @@ function vk_draw!(bq::BatchQueue,
                    instances::Integer=1,
                    depth_view::Union{Nothing, Vulkan.ImageView}=nothing,
                    depth_image::Union{Nothing, Vulkan.Image}=nothing,
+                   depth_clear::Union{Nothing, Float32}=1.0f0,
+                   depth_store_op::Vulkan.AttachmentStoreOp=Vulkan.ATTACHMENT_STORE_OP_STORE,
                    clear_color::Union{Nothing, NTuple{4, Float32}}=nothing,
                    indices_buffer::Union{Nothing, Vulkan.Buffer}=nothing,
                    index_count::Integer=0,
@@ -307,9 +334,21 @@ function vk_draw!(bq::BatchQueue,
     ) do batch
         cmd = batch.cmd_buf
 
-        # Transition color image to COLOR_ATTACHMENT_OPTIMAL
+        # Transition color image to COLOR_ATTACHMENT_OPTIMAL.
+        #
+        # `clear_color = nothing` is a LOAD, so the previous contents have to
+        # survive: the old layout is what the last pass left the image in, and the
+        # destination has to allow the read the load op performs. From UNDEFINED
+        # the driver is free to throw those contents away, which is the whole
+        # point of drawing without a clear. Synchronization validation reports the
+        # missing halves as a WRITE_AFTER_WRITE on the transition and a
+        # READ_AFTER_WRITE at vkCmdBeginRendering; `vk_begin_pass!` has always got
+        # this right and this path did not.
+        loads_color = clear_color === nothing
         transition_image!(cmd, color_image,
-            Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            loads_color ? Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL :
+                          Vulkan.IMAGE_LAYOUT_UNDEFINED,
+            Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             # srcStage is COLOR_ATTACHMENT_OUTPUT, not TOP_OF_PIPE. On a swapchain
             # image the submit waits on the semaphore `vkAcquireNextImageKHR`
             # signals, at COLOR_ATTACHMENT_OUTPUT — and a barrier whose srcStage is
@@ -320,21 +359,36 @@ function vk_draw!(bq::BatchQueue,
             # on screen it is bands of stale pixels that vanish under any full sync.
             Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
             Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            Vulkan.AccessFlag(0), Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+            Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            loads_color ? Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                          Vulkan.ACCESS_COLOR_ATTACHMENT_READ_BIT :
+                          Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
 
-        # Transition depth image to DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        # Transition depth image to DEPTH_STENCIL_ATTACHMENT_OPTIMAL.
+        #
+        # `depth_clear = nothing` means this draw builds on the depth the last one
+        # left, so the transition comes from DEPTH_STENCIL_ATTACHMENT_OPTIMAL and
+        # waits on that write. From UNDEFINED it would be free to throw the depth
+        # away, which is exactly what a second draw testing against the first needs
+        # to keep.
         if depth_image !== nothing
+            loads = depth_clear === nothing
+            # The source side names the previous depth write whichever way the load
+            # op goes: a layout transition is itself a write, so discarding one
+            # still has to be ordered after the store op of the pass before it.
             depth_barrier = Vulkan.ImageMemoryBarrier(
-                Vulkan.AccessFlag(0),
+                Vulkan.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                 Vulkan.ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | Vulkan.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                loads ? Vulkan.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL :
+                        Vulkan.IMAGE_LAYOUT_UNDEFINED,
+                Vulkan.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                 Vulkan.QUEUE_FAMILY_IGNORED, Vulkan.QUEUE_FAMILY_IGNORED,
                 depth_image,
                 Vulkan.ImageSubresourceRange(Vulkan.IMAGE_ASPECT_DEPTH_BIT,
                     UInt32(0), UInt32(1), UInt32(0), UInt32(1)),
             )
             Vulkan.cmd_pipeline_barrier(cmd, [], [], [depth_barrier];
-                src_stage_mask=Vulkan.PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                src_stage_mask=Vulkan.PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                 dst_stage_mask=Vulkan.PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT)
         end
 
@@ -360,13 +414,15 @@ function vk_draw!(bq::BatchQueue,
         # Depth attachment (optional)
         depth_attachment = C_NULL
         if depth_view !== nothing
-            depth_clear = Vulkan.ClearValue(Vulkan.ClearDepthStencilValue(1.0f0, UInt32(0)))
+            depth_clear_val = Vulkan.ClearValue(Vulkan.ClearDepthStencilValue(
+                depth_clear === nothing ? 1.0f0 : depth_clear, UInt32(0)))
             depth_attachment = Vulkan.RenderingAttachmentInfo(
                 Vulkan.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                 Vulkan.IMAGE_LAYOUT_UNDEFINED,
-                Vulkan.ATTACHMENT_LOAD_OP_CLEAR,
-                Vulkan.ATTACHMENT_STORE_OP_DONT_CARE,
-                depth_clear;
+                depth_clear === nothing ? Vulkan.ATTACHMENT_LOAD_OP_LOAD :
+                                          Vulkan.ATTACHMENT_LOAD_OP_CLEAR,
+                depth_store_op,
+                depth_clear_val;
                 image_view=depth_view,
                 resolve_mode=Vulkan.RESOLVE_MODE_NONE,
             )
@@ -448,68 +504,150 @@ end
 # Separates begin/draw/end for rendering multiple plots in a single pass.
 
 """
-    vk_begin_pass!(color_view, color_image, extent; clear_color, depth_view)
+    vk_begin_pass!(color_view(s), color_image(s), extent; clear_color, depth_view)
 
 Begin a dynamic rendering pass. Call `vk_draw_in_pass!` for each draw,
 then `vk_end_pass!` to finish.
+
+One colour attachment or several: pass vectors of views and images, and
+`clear_color` and `load_op` either once for all of them or once each. The
+fragment shader writes location `i` to attachment `i`.
+
+The depth attachment takes the same three-way answer as the colour one:
+`depth_clear` gives a value to clear to, `depth_clear = nothing` loads what is
+there, and `depth_load_op` states it outright, which is the only way to reach
+DONT_CARE.
 """
+vk_begin_pass!(bq::BatchQueue, color_view::Vulkan.ImageView, color_image::Vulkan.Image,
+               extent::Vulkan.Extent2D; kw...) =
+    vk_begin_pass!(bq, [color_view], [color_image], extent; kw...)
+
+"""One value for every attachment, or one value each. Anything else is a mistake
+worth naming rather than a silent recycle."""
+function perattachment(x, n::Integer, what::String)
+    x isa AbstractVector || return [x for _ in 1:n]
+    length(x) == n && return x
+    error("$what has $(length(x)) entries but the pass has $n colour attachments")
+end
+
 function vk_begin_pass!(bq::BatchQueue,
-                         color_view::Vulkan.ImageView,
-                         color_image::Vulkan.Image,
+                         color_views::AbstractVector{<:Vulkan.ImageView},
+                         color_images::AbstractVector{<:Vulkan.Image},
                          extent::Vulkan.Extent2D;
-                         clear_color::Union{Nothing, NTuple{4, Float32}}=(0f0, 0f0, 0f0, 1f0),
-                         depth_view::Union{Nothing, Vulkan.ImageView}=nothing)
+                         clear_color=(0f0, 0f0, 0f0, 1f0),
+                         depth_view::Union{Nothing, Vulkan.ImageView}=nothing,
+                         depth_image::Union{Nothing, Vulkan.Image}=nothing,
+                         depth_clear::Union{Nothing, Float32}=1.0f0,
+                         depth_load_op::Union{Nothing, Vulkan.AttachmentLoadOp}=nothing,
+                         depth_store_op::Vulkan.AttachmentStoreOp=Vulkan.ATTACHMENT_STORE_OP_STORE,
+                         transition::Bool=true,
+                         load_op=nothing)
     batch = ensure_active_batch!(bq)
     cmd = batch.cmd_buf
+    n = length(color_views)
+    n == length(color_images) ||
+        error("$n colour views but $(length(color_images)) colour images")
+    clears = perattachment(clear_color, n, "clear_color")
+    ops = perattachment(load_op, n, "load_op")
 
-    if clear_color !== nothing
-        # Clear mode: discard old content, start fresh
-        transition_image!(cmd, color_image,
-            Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            # srcStage is COLOR_ATTACHMENT_OUTPUT, not TOP_OF_PIPE. On a swapchain
-            # image the submit waits on the semaphore `vkAcquireNextImageKHR`
-            # signals, at COLOR_ATTACHMENT_OUTPUT — and a barrier whose srcStage is
-            # TOP_OF_PIPE creates NO execution dependency with that wait, so this
-            # transition (and the writes behind it) can run while the presentation
-            # engine still owns the image. Synchronization validation reports it as
-            # "WRITE_AFTER_READ hazard … previously accessed by vkAcquireNextImageKHR";
-            # on screen it is bands of stale pixels that vanish under any full sync.
-            Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            Vulkan.AccessFlag(0), Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+    color_attachments = map(1:n) do i
+        clear, given = clears[i], ops[i]
+        # Resolved once, so it means the same thing on every path. An explicit
+        # `load_op` is the only way to reach DONT_CARE: inferring it from
+        # `clear_color === nothing` can only ever pick CLEAR or LOAD, so a pass that
+        # overwrites every pixel had to pay for a load whose result it discards.
+        op = given !== nothing ? given :
+             clear !== nothing ? Vulkan.ATTACHMENT_LOAD_OP_CLEAR :
+                                 Vulkan.ATTACHMENT_LOAD_OP_LOAD
 
-        clear_val = Vulkan.ClearValue(Vulkan.ClearColorValue(clear_color))
-        load_op = Vulkan.ATTACHMENT_LOAD_OP_CLEAR
-    else
-        # Load mode: preserve existing content (for drawing on top of previous pass)
-        transition_image!(cmd, color_image,
-            Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT, Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT | Vulkan.ACCESS_COLOR_ATTACHMENT_READ_BIT)
+        # `transition=false` hands the layout transition to the caller. A caller that
+        # derives barriers from declared usage has to own this one too, because the
+        # transition below assumes it is the only writer of that image's layout and
+        # would double up with, or contradict, a derived barrier.
+        if !transition
+            clear_val = clear !== nothing ?
+                Vulkan.ClearValue(Vulkan.ClearColorValue(clear)) :
+                Vulkan.ClearValue(Vulkan.ClearColorValue((0f0, 0f0, 0f0, 0f0)))
+        elseif clear !== nothing
+            # Clear mode: discard old content, start fresh
+            transition_image!(cmd, color_images[i],
+                Vulkan.IMAGE_LAYOUT_UNDEFINED, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                # srcStage is COLOR_ATTACHMENT_OUTPUT, not TOP_OF_PIPE. On a swapchain
+                # image the submit waits on the semaphore `vkAcquireNextImageKHR`
+                # signals, at COLOR_ATTACHMENT_OUTPUT — and a barrier whose srcStage is
+                # TOP_OF_PIPE creates NO execution dependency with that wait, so this
+                # transition (and the writes behind it) can run while the presentation
+                # engine still owns the image. Synchronization validation reports it as
+                # "WRITE_AFTER_READ hazard … previously accessed by vkAcquireNextImageKHR";
+                # on screen it is bands of stale pixels that vanish under any full sync.
+                Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT, Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
 
-        clear_val = Vulkan.ClearValue(Vulkan.ClearColorValue((0f0, 0f0, 0f0, 0f0)))
-        load_op = Vulkan.ATTACHMENT_LOAD_OP_LOAD
+            clear_val = Vulkan.ClearValue(Vulkan.ClearColorValue(clear))
+        else
+            # Load mode: preserve existing content (for drawing on top of previous pass)
+            transition_image!(cmd, color_images[i],
+                Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, Vulkan.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT, Vulkan.ACCESS_COLOR_ATTACHMENT_WRITE_BIT | Vulkan.ACCESS_COLOR_ATTACHMENT_READ_BIT)
+
+            clear_val = Vulkan.ClearValue(Vulkan.ClearColorValue((0f0, 0f0, 0f0, 0f0)))
+        end
+
+        Vulkan.RenderingAttachmentInfo(
+            Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            Vulkan.IMAGE_LAYOUT_UNDEFINED,
+            op,
+            Vulkan.ATTACHMENT_STORE_OP_STORE,
+            clear_val;
+            image_view=color_views[i],
+            resolve_mode=Vulkan.RESOLVE_MODE_NONE,
+        )
     end
 
-    color_attachment = Vulkan.RenderingAttachmentInfo(
-        Vulkan.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        Vulkan.IMAGE_LAYOUT_UNDEFINED,
-        load_op,
-        Vulkan.ATTACHMENT_STORE_OP_STORE,
-        clear_val;
-        image_view=color_view,
-        resolve_mode=Vulkan.RESOLVE_MODE_NONE,
-    )
+    # Typed even when empty: a depth-only pass has no colour attachments, and
+    # `map` over an empty range does not always infer an element type the Vulkan
+    # constructor will take.
+    color_attachments = convert(Vector{Vulkan.RenderingAttachmentInfo}, color_attachments)
 
     depth_attachment = C_NULL
     if depth_view !== nothing
-        depth_clear = Vulkan.ClearValue(Vulkan.ClearDepthStencilValue(1.0f0, UInt32(0)))
+        dop = depth_load_op !== nothing ? depth_load_op :
+              depth_clear !== nothing ? Vulkan.ATTACHMENT_LOAD_OP_CLEAR :
+                                        Vulkan.ATTACHMENT_LOAD_OP_LOAD
+        # Same rule as the colour attachment: a discarding op does not need the old
+        # contents, so it transitions from UNDEFINED; a LOAD does, so it has to come
+        # from the layout the previous pass left the image in. `transition = false`
+        # hands both to the caller.
+        if transition && depth_image !== nothing
+            old = dop === Vulkan.ATTACHMENT_LOAD_OP_LOAD ?
+                  Vulkan.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL :
+                  Vulkan.IMAGE_LAYOUT_UNDEFINED
+            depth_barrier = Vulkan.ImageMemoryBarrier(
+                # Ordered after the previous depth write either way: the transition
+                # is a write itself, so a discarding one is a hazard too.
+                Vulkan.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                Vulkan.ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                    Vulkan.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                old, Vulkan.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                Vulkan.QUEUE_FAMILY_IGNORED, Vulkan.QUEUE_FAMILY_IGNORED,
+                depth_image,
+                Vulkan.ImageSubresourceRange(Vulkan.IMAGE_ASPECT_DEPTH_BIT,
+                    UInt32(0), UInt32(1), UInt32(0), UInt32(1)),
+            )
+            Vulkan.cmd_pipeline_barrier(cmd, [], [], [depth_barrier];
+                src_stage_mask=Vulkan.PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                dst_stage_mask=Vulkan.PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT)
+        end
+        depth_clear_val = Vulkan.ClearValue(Vulkan.ClearDepthStencilValue(
+            depth_clear === nothing ? 1.0f0 : depth_clear, UInt32(0)))
         depth_attachment = Vulkan.RenderingAttachmentInfo(
             Vulkan.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
             Vulkan.IMAGE_LAYOUT_UNDEFINED,
-            Vulkan.ATTACHMENT_LOAD_OP_CLEAR,
-            Vulkan.ATTACHMENT_STORE_OP_DONT_CARE,
-            depth_clear;
+            dop,
+            depth_store_op,
+            depth_clear_val;
             image_view=depth_view,
             resolve_mode=Vulkan.RESOLVE_MODE_NONE,
         )
@@ -519,7 +657,7 @@ function vk_begin_pass!(bq::BatchQueue,
     rendering_info = Vulkan.RenderingInfo(
         render_area,
         UInt32(1), UInt32(0),
-        [color_attachment];
+        color_attachments;
         depth_attachment=depth_attachment,
     )
     Vulkan.cmd_begin_rendering(cmd, rendering_info)
@@ -536,9 +674,16 @@ function vk_draw_in_pass!(bq::BatchQueue,
                            pipeline::CompiledGraphicsPipeline,
                            vertex_count::Integer;
                            push_data::Vector{UInt8}=UInt8[],
+                           # The push constant is one buffer device address. Taking
+                           # it as a value costs nothing; taking it as an eight-byte
+                           # `Vector` costs an allocation per draw per frame.
+                           push_bda::UInt64=UInt64(0),
                            instances::Integer=1,
                            viewport::Union{Nothing, Vulkan.Viewport}=nothing,
-                           scissor::Union{Nothing, Vulkan.Rect2D}=nothing)
+                           scissor::Union{Nothing, Vulkan.Rect2D}=nothing,
+                           # A caller that owns the pipeline for longer than the
+                           # frame does not need it pinned into every batch.
+                           pin::Bool=true)
     batch = bq.active_batch
     batch === nothing && error("vk_draw_in_pass! called without an active rendering pass")
     cmd = batch.cmd_buf
@@ -553,8 +698,16 @@ function vk_draw_in_pass!(bq::BatchQueue,
         Vulkan.cmd_set_scissor(cmd, [scissor])
     end
 
-    # Push constants
-    if !isempty(push_data)
+    # Push constants. The BDA path takes the address by value; the vector path is
+    # for callers written before it existed.
+    if push_bda != UInt64(0)
+        bda = Ref(push_bda)
+        GC.@preserve bda begin
+            Vulkan.cmd_push_constants(cmd, pipeline.pipeline_layout,
+                pipeline.push_stage_flags, UInt32(0), UInt32(8),
+                Ptr{Nothing}(Base.unsafe_convert(Ptr{UInt64}, bda)))
+        end
+    elseif !isempty(push_data)
         GC.@preserve push_data begin
             Vulkan.cmd_push_constants(cmd, pipeline.pipeline_layout,
                 pipeline.push_stage_flags, UInt32(0), UInt32(length(push_data)),
@@ -566,7 +719,86 @@ function vk_draw_in_pass!(bq::BatchQueue,
     batch.dispatch_count += 1
     batch.last_was_rt = false
     # Pin pipeline to batch — prevents GC from destroying it while command buffer references it
-    pin!(batch, pipeline)
+    pin && pin!(batch, pipeline)
+end
+
+"""
+    DrawIndirectCommand(vertices, instances, firstvertex, firstinstance)
+
+A draw the GPU wrote, laid out as `VkDrawIndirectCommand`: same four `UInt32`
+fields in the same order, so a buffer of these is one.
+
+    @kernel function finish!(cmds, counter)
+        @inbounds cmds[1] = DrawIndirectCommand(counter[1] * UInt32(36),
+                                                UInt32(1), UInt32(0), UInt32(0))
+    end
+
+`firstinstance` other than zero needs the `drawIndirectFirstInstance` feature; it
+is here because the struct is the Vulkan one, not because everything can use it.
+"""
+struct DrawIndirectCommand
+    vertices::UInt32
+    instances::UInt32
+    firstvertex::UInt32
+    firstinstance::UInt32
+end
+
+"""
+    indirect_buffer(n = 1) -> LavaArray{DrawIndirectCommand,1}
+
+Room for `n` draw commands, allocated so a draw may read them.
+
+`BUFFER_USAGE_INDIRECT_BUFFER_BIT` is not in the flags an ordinary allocation
+gets, and a buffer without it is a validation error at the draw rather than at
+the allocation, which is a long way from the mistake.
+"""
+indirect_buffer(n::Integer=1) =
+    LavaArray{DrawIndirectCommand,1}(undef, (Int(n),);
+        extra_usage=UInt32(Vulkan.BUFFER_USAGE_INDIRECT_BUFFER_BIT))
+
+"""
+    vk_draw_indirect_in_pass!(bq, pipeline, commands; first, count, push_bda, pin)
+
+Record a draw whose counts are in device memory, inside an active rendering pass.
+
+`commands` is a `LavaArray` of `DrawIndirectCommand`, and `first` is which of
+them to start at. Nothing here reads them: that is the point, because the numbers
+are written by a compute pass in the same frame and reading them on the host
+would mean waiting for it.
+
+The array has to have been allocated with `BUFFER_USAGE_INDIRECT_BUFFER_BIT`,
+which `indirect_buffer` does.
+"""
+function vk_draw_indirect_in_pass!(bq::BatchQueue,
+                                   pipeline::CompiledGraphicsPipeline,
+                                   commands::LavaArray{DrawIndirectCommand,1};
+                                   first::Integer=1,
+                                   count::Integer=1,
+                                   push_bda::UInt64=UInt64(0),
+                                   pin::Bool=true)
+    batch = bq.active_batch
+    batch === nothing && error("vk_draw_indirect_in_pass! called without an active rendering pass")
+    cmd = batch.cmd_buf
+
+    Vulkan.cmd_bind_pipeline(cmd, Vulkan.PIPELINE_BIND_POINT_GRAPHICS, pipeline.pipeline)
+
+    if push_bda != UInt64(0)
+        bda = Ref(push_bda)
+        GC.@preserve bda begin
+            Vulkan.cmd_push_constants(cmd, pipeline.pipeline_layout,
+                pipeline.push_stage_flags, UInt32(0), UInt32(8),
+                Ptr{Nothing}(Base.unsafe_convert(Ptr{UInt64}, bda)))
+        end
+    end
+
+    managed = commands.buf[]
+    offset = managed.pool_offset + commands.offset +
+             (first - 1) * sizeof(DrawIndirectCommand)
+    Vulkan.cmd_draw_indirect(cmd, managed.buffer, UInt64(offset),
+                             UInt32(count), UInt32(sizeof(DrawIndirectCommand)))
+    batch.dispatch_count += 1
+    batch.last_was_rt = false
+    pin && pin!(batch, pipeline)
 end
 
 """
@@ -601,6 +833,24 @@ function vk_draw_indexed_in_pass!(bq::BatchQueue,
     batch.dispatch_count += 1
     batch.last_was_rt = false
     pin!(batch, pipeline)
+end
+
+"""
+    vk_set_viewport!(bq, viewport, scissor)
+
+Set viewport and scissor once, for every draw that follows in the pass.
+
+They are dynamic pipeline state and every draw in a pass shares them, so setting
+them per draw records two extra commands and allocates two vectors per draw per
+frame — at a hundred plots, a third of the frame's garbage for a value that does
+not change.
+"""
+function vk_set_viewport!(bq::BatchQueue, viewport::Vulkan.Viewport, scissor::Vulkan.Rect2D)
+    batch = bq.active_batch
+    batch === nothing && error("vk_set_viewport! called without an active rendering pass")
+    Vulkan.cmd_set_viewport(batch.cmd_buf, [viewport])
+    Vulkan.cmd_set_scissor(batch.cmd_buf, [scissor])
+    nothing
 end
 
 """

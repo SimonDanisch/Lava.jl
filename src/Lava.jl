@@ -23,9 +23,11 @@ export enable_gpu_av, disable_gpu_av, verify_gpu_av, activate_all_debugging
 export GraphicsPipeline, Rasterizer, TrianglePipeline, LinePipeline
 export RenderWindow, LavaFramebuffer, WindowTarget, OffscreenTarget
 export CompiledGraphicsPipeline, LavaGfxShader
-export draw!, blit!, present_frame!, acquire_next_image!, readback_framebuffer, readback_window
+export draw!, blit!, present_frame!, acquire_next_image!, sync_swapchain!,
+       readback_framebuffer, readback_window
 export copy_framebuffer!
-export vk_begin_pass!, vk_draw_in_pass!, vk_draw_indexed_in_pass!, vk_end_pass!
+export vk_begin_pass!, vk_draw_in_pass!, vk_draw_indexed_in_pass!, vk_set_viewport!, vk_end_pass!
+export vk_draw_indirect_in_pass!, DrawIndirectCommand, indirect_buffer
 export pack_gfx_args, ensure_compiled!, transition_image!
 export LavaTexture2D, LavaTexture1D, LavaSampler, SampledTexture, LavaTexture
 export TextureBindings, bind_textures

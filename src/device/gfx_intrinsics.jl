@@ -508,8 +508,30 @@ end
     return :(NamedTuple{$keys_expr}($vals_expr))
 end
 
-"""Emit fragment output: Vec4f → location 0, NamedTuple with :color → location 0."""
+"""
+Emit fragment output: `Vec4f` → location 0, NamedTuple with `:color` → location 0,
+a tuple → one location each in order, which is how a fragment writes several
+render targets.
+
+A tuple rather than a NamedTuple for the several-target case because attachments
+are positional everywhere else — `location = 0` is the first colour attachment of
+the pass, not a name the shader chooses.
+"""
 @inline emit_fragment_output(color::Vec4f) = gfx_output(0, color)
+
+# A fragment shader that returns `nothing` writes no attachment, which is what a
+# depth-only pass wants: the depth test and the depth write are the whole of it,
+# and a colour output would have nowhere to go.
+@inline emit_fragment_output(::Nothing) = nothing
+
+@generated function emit_fragment_output(colors::T) where {T<:Tuple}
+    # Literal locations, so each reaches the emitter as the constant it needs.
+    stores = [:(gfx_output($(i - 1), colors[$i])) for i in 1:fieldcount(T)]
+    quote
+        $(stores...)
+        nothing
+    end
+end
 @generated function emit_fragment_output(result::NT) where NT <: NamedTuple
     if hasfield(NT, :color)
         return :(gfx_output(0, result.color))

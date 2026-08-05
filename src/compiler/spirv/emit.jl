@@ -7177,6 +7177,14 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
     elseif startswith(name, "llvm.assume")
         # assume — skip
         return
+    elseif startswith(name, "llvm.experimental.noalias.scope.decl")
+        # Declares an alias scope for !alias.scope/!noalias metadata and emits no
+        # code. The inliner leaves one behind whenever it inlines a function with
+        # noalias arguments, which is what a fragment shader returning a tuple of
+        # attachments does, so it reaches here on ordinary code rather than on
+        # anything exotic. SPIR-V has no consumer for the metadata; dropping the
+        # declaration loses nothing.
+        return
     elseif startswith(name, "llvm.memset.")
         emit_memset!(state, inst)
         return

@@ -52,24 +52,38 @@ LinePipeline(; vertex, fragment, kw...) = GraphicsPipeline(; vertex, fragment, t
 
 # The graphics shader cache is a `VkContext` field; a reset makes a new one.
 
+"""
+Everything that changes the created `VkPipeline` but is not the shader pair.
+
+Blend, cull, topology and depth mode are singletons, so `typeof(pipeline)` carries
+them exactly; `varyings` and the geometry/tessellation configs are values, so they
+are hashed as values. Leaving state out of the key made two pipelines that differ
+only in, say, blend mode or depth mode share one compiled pipeline — whichever was
+compiled first won, and the second draw silently rendered with the wrong state.
+"""
+pipeline_state_key(p::GraphicsPipeline) = (typeof(p), p.varyings, p.geometry, p.tess_control)
+
 """Return (vert_shader::LavaGfxShader, compiled::CompiledGraphicsPipeline)."""
 function ensure_compiled_with_shader!(pipeline::GraphicsPipeline,
                               vert_fn, frag_fn, tt_vertex, tt_fragment;
                               color_format=Vulkan.FORMAT_B8G8R8A8_SRGB,
+                              depth_format=Vulkan.FORMAT_UNDEFINED,
                               descriptor_set_layout=nothing)
     vert = get_or_compile_gfx(vert_fn, tt_vertex, :vertex)
     compiled = ensure_compiled!(pipeline, vert_fn, frag_fn, tt_vertex, tt_fragment;
-        color_format, descriptor_set_layout)
+        color_format, depth_format, descriptor_set_layout)
     return vert, compiled
 end
 
 function ensure_compiled!(pipeline::GraphicsPipeline, vert_fn, frag_fn, tt_vertex, tt_fragment;
                               color_format=Vulkan.FORMAT_B8G8R8A8_SRGB,
+                              depth_format=Vulkan.FORMAT_UNDEFINED,
                               descriptor_set_layout=nothing,
                               ctx::VkContext = vk_context())
-    # Cache key includes type tuples — different arg types get different compiled pipelines
-    cache_key = hash((vert_fn, frag_fn, tt_vertex, tt_fragment, color_format,
-                       descriptor_set_layout !== nothing))
+    # Cache key includes type tuples — different arg types get different compiled
+    # pipelines — and the pipeline state, which is the rest of what is baked in.
+    cache_key = hash((vert_fn, frag_fn, tt_vertex, tt_fragment, color_format, depth_format,
+                       pipeline_state_key(pipeline), descriptor_set_layout !== nothing))
     cached = get(ctx.caches.gfx_pipelines, cache_key, nothing)
     cached !== nothing && return cached::CompiledGraphicsPipeline
 
@@ -107,7 +121,7 @@ function ensure_compiled!(pipeline::GraphicsPipeline, vert_fn, frag_fn, tt_verte
     compiled = create_graphics_pipeline(vert.spirv_bytes, frag.spirv_bytes;
         blend=pipeline.blend, cull=pipeline.cull,
         topology=pipeline.topology, depth=pipeline.depth,
-        color_format=color_format,
+        color_format=color_format, depth_format=depth_format,
         push_constant_size=max(vert.push_info.push_size, frag.push_info.push_size),
         geometry_spirv=geom_spirv,
         tess_ctrl_spirv=tc_spirv, tess_eval_spirv=te_spirv,
@@ -181,9 +195,10 @@ function draw!(bq::BatchQueue, pipeline::GraphicsPipeline, target::WindowTarget,
 
     vert_fn, vert_tt, frag_fn, frag_tt = resolve_shader_pair(pipeline, vert_tt, frag_tt)
 
+    # A window target has no depth attachment, so the pipeline must not declare one.
     vert_shader, compiled = ensure_compiled_with_shader!(pipeline,
         vert_fn, frag_fn, vert_tt, frag_tt;
-        color_format=win.format)
+        color_format=win.format, depth_format=Vulkan.FORMAT_UNDEFINED)
 
     view = win.views[win.current_image_idx + 1]
     image = win.images[win.current_image_idx + 1]
@@ -197,6 +212,7 @@ end
 function draw!(bq::BatchQueue, pipeline::GraphicsPipeline, target::OffscreenTarget, vertex_count::Integer;
                args=(), frag_args=(), instances::Integer=1,
                clear_color::Union{Nothing, NTuple{4, Float32}}=(0.0f0, 0.0f0, 0.0f0, 1.0f0),
+               depth_clear::Union{Nothing, Float32}=1.0f0,
                descriptor_set_layout=nothing,
                descriptor_set=nothing)
     fb = target.fb
@@ -210,7 +226,9 @@ function draw!(bq::BatchQueue, pipeline::GraphicsPipeline, target::OffscreenTarg
 
     vert_shader, compiled = ensure_compiled_with_shader!(pipeline,
         vert_fn, frag_fn, vert_tt, frag_tt;
-        color_format=fb.color_format, descriptor_set_layout)
+        color_format=fb.color_format,
+        depth_format=fb.depth_view === nothing ? Vulkan.FORMAT_UNDEFINED : fb.depth_format,
+        descriptor_set_layout)
 
     push_data = isempty(args) ? UInt8[] : pack_gfx_args(bq, args, vert_shader.push_info)
 
@@ -220,7 +238,32 @@ function draw!(bq::BatchQueue, pipeline::GraphicsPipeline, target::OffscreenTarg
         push_data, instances,
         depth_view=fb.depth_view,
         depth_image=fb.depth_image,
+        depth_clear,
         clear_color, descriptor_set)
+end
+
+"""
+    pack_gfx_args_bda(bq, args, push_info) -> UInt64
+
+Pack a draw's arguments and return the buffer device address to push, rather than
+an eight-byte `Vector` holding it.
+
+The push constant is one BDA and always has been; wrapping it in a heap array
+allocated 48 bytes of header plus the payload *per draw per frame*, which at a
+hundred plots is most of a frame's garbage. `pack_gfx_args` still returns the
+vector for callers written against it.
+"""
+function pack_gfx_args_bda(bq::BatchQueue, args, push_info::PushConstantInfo)
+    (push_info.push_size == 0 || isempty(args)) && return UInt64(0)
+    batch = ensure_active_batch!(bq)
+    adaptor = LavaAdaptor(batch)
+    converted = map(a -> Adapt.adapt(adaptor, a), args)
+    byval_sizes = push_info.byval_llvm_sizes
+    total_size = push_info.arg_buffer_size + compute_inline_extra_from_byval(byval_sizes)
+    arg_buf = get_arg_buffer(bq, total_size)
+    pack_args_direct!(bq, arg_buf.mapped_ptr, arg_buf.address, push_info.arg_offsets,
+                      push_info.arg_buffer_size, byval_sizes, converted)
+    return arg_buf.address
 end
 
 function pack_gfx_args(bq::BatchQueue, args, push_info::PushConstantInfo)
@@ -237,7 +280,7 @@ function pack_gfx_args(bq::BatchQueue, args, push_info::PushConstantInfo)
 
     # Use the same arg buffer packing as compute: inline byval structs into
     # the arg buffer with self-referencing BDA pointers.
-    offsets = [p.first for p in push_info.arg_layout]
+    offsets = push_info.arg_offsets      # precomputed: this ran per draw per frame
     byval_sizes = push_info.byval_llvm_sizes
 
     inline_extra = compute_inline_extra_from_byval(byval_sizes)
@@ -302,11 +345,42 @@ end
 # Likewise the blit pipeline — see `DeviceCaches.blit`.
 
 """
+What shape a blit source has.
+
+A matrix is `(height, width)` — `img[row, col]`, which is what everything that
+calls an array an image means by it, and what `KernelAbstractions.allocate(be, T,
+h, w)` gives. A vector is that matrix flattened, so the row index varies fastest
+and pixel `(x, y)` is at `x * height + y + 1`.
+
+A `(width, height)` matrix is the transposition, and it is what
+`copy_image_to_buffer!` produces: an image copy packs rows, so its column index
+varies fastest. Reading one and blitting it with the same index is a picture that
+is sheared rather than wrong-looking, so the matrix case says so here. The vector
+case cannot tell the two apart and only checks there are enough pixels.
+"""
+function checkblitsize(a::LavaArray{<:Any,2}, w::Integer, h::Integer)
+    size(a) == (h, w) && return nothing
+    # Only the transposition is an error. A size that merely disagrees is what a
+    # resize looks like between the swapchain following the window and the caller
+    # reallocating, and one frame of the wrong size there is not worth a throw.
+    size(a) == (w, h) && throw(DimensionMismatch(
+        "blit source is $(size(a)) for a $(w)x$(h) target, which is the transpose of " *
+        "the $(h)x$(w) it wants. A source is a (height, width) matrix; an image read " *
+        "back with `copy_image_to_buffer!` packs rows and so comes out the other way."))
+    length(a) >= w * h || throw(DimensionMismatch(
+        "blit source holds $(length(a)) pixels and a $(w)x$(h) target needs $(w * h)"))
+    nothing
+end
+checkblitsize(a::LavaArray{<:Any,1}, w::Integer, h::Integer) =
+    length(a) >= w * h ? nothing : throw(DimensionMismatch(
+        "blit source holds $(length(a)) pixels and a $(w)x$(h) target needs $(w * h)"))
+
+"""
     blit!(bq, target::RenderTarget, source::LavaArray; clear=true)
 
 Display a GPU array on screen using a fullscreen blit.
 The source array should contain RGBA Float32 pixels (or any 4-component type).
-The buffer is read in Julia column-major order by the fragment shader.
+Its layout is `(height, width)` — see `checkblitsize`.
 """
 function blit!(bq::BatchQueue, target::RenderTarget, source::LavaArray;
                clear::Bool=true)
@@ -327,6 +401,7 @@ function blit!(bq::BatchQueue, target::RenderTarget, source::LavaArray;
     else
         error("blit! only supports WindowTarget and OffscreenTarget")
     end
+    checkblitsize(source, w, h)
 
     # Create or reuse blit pipeline. `bq.ctx`, not `vk_context()`: this pipeline
     # is a device-owned handle and the queue we are recording on names its device.
