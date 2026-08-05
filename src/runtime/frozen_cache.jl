@@ -138,19 +138,40 @@ time. `:module => nothing` turns the abbreviation off.
 typestring(@nospecialize(T)) = sprint(show, T; context = :module => nothing)
 
 """
+The layout of what an entry *is*, folded into every key.
+
+A frozen entry is one serialized `LavaGPUKernel`, and the only type nested in one
+is `PushConstantInfo` — so these two describe the format completely. `Serialization`
+reconstructs a struct field by field against the *current* definition, so a field
+added to either one makes every entry ever written unreadable. It is caught
+(`cache_io_error`) and each kernel recompiles, which is correct but silent enough
+to look like the cache simply stopped helping.
+
+Deriving it beats a hand-set number because the person who adds the field is not
+the person who remembers the cache exists: `PushConstantInfo` gained `arg_offsets`
+on 2026-08-04 and poisoned 456 JuliaVision entries and 58 RT entries at once, in a
+repo where every consumer would have had to bump its own version string.
+
+Hashed from the printed form, not the types: `hash` of a type is object identity
+and differs between sessions.
+"""
+const FROZEN_LAYOUT = hash(string(fieldnames(LavaGPUKernel), fieldtypes(LavaGPUKernel),
+                                  fieldnames(PushConstantInfo), fieldtypes(PushConstantInfo)))
+
+"""
     frozen_key(f, tt, workgroup_size) -> String
 
 `<module>_<kernel>_<signature digest>_v<version>`.
 
-The digest is over `typestring(tt)` and the workgroup size — a *string*, because
-`hash` of a type is object identity and changes between sessions, while its
-printed form does not. It is a filename, not a change detector: two different
-signatures must not collide, but a changed *body* under the same signature is
-explicitly not detected. That is what the version is for.
+The digest is over `typestring(tt)`, the workgroup size and `FROZEN_LAYOUT` — a
+*string*, because `hash` of a type is object identity and changes between
+sessions, while its printed form does not. It is a filename, not a change
+detector: two different signatures must not collide, but a changed *body* under
+the same signature is explicitly not detected. That is what the version is for.
 """
 function frozen_key(@nospecialize(f), @nospecialize(tt), workgroup_size)
     F = typeof(f)
-    h = hash(typestring(tt), hash(typestring(F), hash(workgroup_size)))
+    h = hash(typestring(tt), hash(typestring(F), hash(workgroup_size, FROZEN_LAYOUT)))
     sanitize(s) = replace(s, r"[^A-Za-z0-9_]" => "_")
     mod = sanitize(string(parentmodule(F)))
     fn = sanitize(string(nameof(F)))
