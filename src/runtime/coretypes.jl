@@ -276,7 +276,16 @@ mutable struct Diagnostics
     presubmit_scan::Bool
     presubmit_scan_throws::Bool
     pack_arg_assert_live::Bool
-    slab_dump_target::Any
+    # `UInt64`, NOT `Any`. `submit!` gates the slab scan on
+    # `slab_dump_target != UInt64(0)`, and the global this replaced was a
+    # `Ref{UInt64}(0)`, so that guard read `0 != 0` — false, block skipped. Typed
+    # `Any` and defaulted to `nothing`, the same guard reads
+    # `nothing != UInt64(0)` — TRUE — and every submit scanned the whole used arg
+    # slab with uncached host-visible reads. Silent, because `target` was
+    # `nothing` so nothing ever matched and `hits` stayed empty; it only showed up
+    # as ~41 us of host CPU per dispatch at submit (SAM 2 decode 7.1 -> 25 ms).
+    # A field that is compared against a number has to hold one.
+    slab_dump_target::UInt64
     # ── dispatch / batch
     batch_timing::Bool
     dispatch_logging::Bool
@@ -316,7 +325,7 @@ mutable struct Diagnostics
     total_dispatches::Threads.Atomic{Int}
 end
 
-Diagnostics() = Diagnostics(false, false, false, false, false, false, false, nothing,
+Diagnostics() = Diagnostics(false, false, false, false, false, false, false, UInt64(0),
                             false, false, nothing, false,
                             false, true, nothing, 0, 0, nothing,
                             NamedTuple[], NamedTuple[], NamedTuple[], NamedTuple[],

@@ -103,4 +103,42 @@ using Test, Lava
         # exist and why `verify_gpu_av` exists on top of them.
         ctx.debug.gpu_av || @test !ctx.gpu_assisted
     end
+
+    @testset "an off switch is off in the form its guard tests" begin
+        # `slab_dump_target` was typed `Any` and defaulted to `nothing`. Its guard
+        # in `submit!` reads
+        #
+        #     ctx.diag.slab_dump_target != UInt64(0)
+        #
+        # and `nothing != UInt64(0)` is TRUE, so the debug scan of the argument
+        # slab ran on EVERY submit — a loop over `arg_slab_offset ÷ 8` words of
+        # host-visible memory, growing with every dispatch recorded. It cost ~41 µs
+        # of host CPU per dispatch (SAM 2 decode 7.1 -> 25 ms, encode 103 -> 131)
+        # and said nothing, because `target` was `nothing` so no word ever matched
+        # and the hit list stayed empty. The global it replaced was a
+        # `Ref{UInt64}(0)`, where the same guard read `0 != 0`.
+        #
+        # So: assert the GUARD, not the value. `=== nothing` would have passed
+        # throughout, and `isnothing(...) == false` would too — only evaluating
+        # what the code actually branches on catches a field whose type drifted.
+        d = Lava.Diagnostics()
+        @test d.slab_dump_target isa UInt64
+        @test !(d.slab_dump_target != UInt64(0))
+
+        # The other `Any`-typed diagnostic. It is compared with `=== nothing`
+        # (`gpuarrays.jl`'s `probe_broadcast!`), so `nothing` is the right default
+        # here — the pair is the point: what a field may hold depends on how its
+        # guard asks.
+        @test d.broadcast_probe === nothing
+
+        # Every remaining switch is a Bool, and off means `false`. A Bool cannot
+        # develop this defect, which is why they are listed rather than trusted.
+        for f in (:alloc_debug, :free_debug, :freed_bda_scan, :destroy_freed_bdas_throws,
+                  :presubmit_scan, :presubmit_scan_throws, :pack_arg_assert_live,
+                  :batch_timing, :dispatch_logging, :dispatch_timing, :frozen_log_misses)
+            v = getfield(d, f)
+            @test v isa Bool
+            @test !v
+        end
+    end
 end
