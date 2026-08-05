@@ -55,6 +55,26 @@ it while developing kernels; leave it alone otherwise.
 """
 const FROZEN_VERSION = Ref("")
 
+"""
+    cache_io_error(ex) -> Bool
+
+Whether `ex` is a failure of the cache MEDIUM rather than of this library.
+
+A cache entry that is missing, truncated, or written by an older version is a
+recompile — never a failed session. Everything else is a bug here, and a bare
+`catch` that turns a `MethodError` in the deserializer into "cache miss" is how
+a cache silently stops working: every launch pays a recompile, every run is
+correct, and nothing ever says why.
+"""
+# No `Serialization.SerializationError` — the stdlib defines no such type, and
+# naming it made this function throw on its first call. `deserialize` on a
+# damaged or version-skewed entry surfaces as one of these instead: truncation is
+# `EOFError`, a type that no longer exists is `UndefVarError`, a changed field
+# layout is `TypeError` or `MethodError`.
+cache_io_error(ex) = ex isa Union{SystemError, Base.IOError, EOFError,
+                                  ArgumentError, UndefVarError, TypeError,
+                                  MethodError}
+
 """When true, kernels compiled the slow way are written to the frozen cache."""
 const FROZEN_RECORDING = Ref(false)
 
@@ -118,21 +138,45 @@ time. `:module => nothing` turns the abbreviation off.
 typestring(@nospecialize(T)) = sprint(show, T; context = :module => nothing)
 
 """
+The layout of what an entry *is*, folded into every key.
+
+A frozen entry is one serialized `LavaGPUKernel`, and the only type nested in one
+is `PushConstantInfo` — so these two describe the format completely. `Serialization`
+reconstructs a struct field by field against the *current* definition, so a field
+added to either one makes every entry ever written unreadable. It is caught
+(`cache_io_error`) and each kernel recompiles, which is correct but silent enough
+to look like the cache simply stopped helping.
+
+Deriving it beats a hand-set number because the person who adds the field is not
+the person who remembers the cache exists: `PushConstantInfo` gained `arg_offsets`
+on 2026-08-04 and poisoned 456 JuliaVision entries and 58 RT entries at once, in a
+repo where every consumer would have had to bump its own version string.
+
+Hashed from the printed form, not the types: `hash` of a type is object identity
+and differs between sessions.
+"""
+const FROZEN_LAYOUT = hash(string(fieldnames(LavaGPUKernel), fieldtypes(LavaGPUKernel),
+                                  fieldnames(PushConstantInfo), fieldtypes(PushConstantInfo)))
+
+"""
     frozen_key(f, tt, workgroup_size) -> String
 
 `<module>_<kernel>_<signature digest>_v<version>`.
 
-The digest is over `typestring(tt)` and the workgroup size — a *string*, because
-`hash` of a type is object identity and changes between sessions, while its
-printed form does not.
+The digest is over `typestring(tt)`, the workgroup size and `FROZEN_LAYOUT` — a
+*string*, because `hash` of a type is object identity and changes between
+sessions, while its printed form does not.
 
 **It also covers the build id of the module defining the kernel, and of `Lava`.**
-Without that the key describes a signature and not a body, so editing a kernel
-without bumping the version leaves the OLD SPIR-V reachable — and the symptom is
-not a wrong number, it is `device was lost ... a dispatch wrote out of bounds`,
-reported from whatever submit is in flight and nowhere near the edit. That cost
-an hour to diagnose once and then recurred immediately: nine hundred entries
-frozen during a bisecting session went stale the moment the code was restored.
+The two additions are orthogonal and both are needed: `FROZEN_LAYOUT` invalidates
+when the *stored record's* shape changes, this when the *kernel body* may have.
+Without the second the key describes a signature and not a body, so editing a
+kernel without bumping the version leaves the OLD SPIR-V reachable — and the
+symptom is not a wrong number, it is `device was lost ... a dispatch wrote out of
+bounds`, reported from whatever submit is in flight and nowhere near the edit.
+That cost an hour to diagnose once and then recurred immediately: nine hundred
+entries frozen during a bisecting session went stale the moment the code was
+restored.
 
 `Base.module_build_id` changes exactly when a module is recompiled, which is
 exactly when its kernels may have changed, so this is the invalidation signal
@@ -143,8 +187,9 @@ The cost is a re-freeze after any recompilation of `Lava` or the defining
 package. In development that is precisely what is wanted; for an installed
 package the id comes from the `.ji` and is stable across processes.
 
-`KERNELS_VERSION` remains for the deliberate, cross-package generation bump —
-this only removes the failure mode where a bump was *forgotten*.
+So a changed body under an unchanged signature **is** now detected — this
+docstring used to say the opposite, and `KERNELS_VERSION` remains only for the
+deliberate, cross-package generation bump rather than as the sole guard.
 """
 function frozen_key(@nospecialize(f), @nospecialize(tt), workgroup_size)
     F = typeof(f)
@@ -152,7 +197,8 @@ function frozen_key(@nospecialize(f), @nospecialize(tt), workgroup_size)
     # SPIR-V for it is produced. A change in either invalidates the entry.
     bids = hash(Base.module_build_id(parentmodule(F)),
                 hash(Base.module_build_id(@__MODULE__)))
-    h = hash(typestring(tt), hash(typestring(F), hash(workgroup_size, bids)))
+    h = hash(typestring(tt), hash(typestring(F),
+             hash(workgroup_size, hash(FROZEN_LAYOUT, bids))))
     sanitize(s) = replace(s, r"[^A-Za-z0-9_]" => "_")
     mod = sanitize(string(parentmodule(F)))
     fn = sanitize(string(nameof(F)))
@@ -187,7 +233,8 @@ function frozen_pipeline_cache(ctx::VkContext, key::AbstractString)
     bytes = try
         read(path)
     catch ex
-        @debug "Lava: frozen pipeline blob unreadable" path exception = ex
+        cache_io_error(ex) || rethrow()
+        @warn "Lava: frozen pipeline blob unreadable; the driver will recompile its ISA" path exception = ex maxlog = 1
         return nothing
     end
     pipeline_cache_compatible(bytes, ctx.physical_device) || return nothing
@@ -200,7 +247,7 @@ function frozen_pipeline_cache(ctx::VkContext, key::AbstractString)
     catch ex
         # Passed the header check and still refused: keep the session, drop the
         # blob so the next run does not retry it.
-        @warn "Lava: frozen pipeline blob rejected; rebuilding from SPIR-V" path exception = ex
+        @warn "Lava: frozen pipeline blob rejected; rebuilding from SPIR-V" path exception = ex maxlog = 1
         rm(path; force = true)
         return nothing
     end
@@ -221,7 +268,8 @@ function frozen_store_bin(ctx::VkContext, key::AbstractString, pcache)
             Libc.free(ptr)
         end
     catch ex
-        @debug "Lava: frozen pipeline blob store failed" key exception = ex
+        cache_io_error(ex) || rethrow()
+        @warn "Lava: frozen pipeline blob store failed; level-2 cache will stay cold" key exception = ex maxlog = 1
     end
     return nothing
 end
@@ -246,8 +294,9 @@ function frozen_load(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workgr
     compiled = try
         open(Serialization.deserialize, path)::LavaGPUKernel
     catch ex
-        # A damaged entry costs a recompile, never the session.
-        @debug "Lava: frozen cache entry unreadable" path exception = ex
+        # A damaged entry costs a recompile, never the session — but it says so.
+        cache_io_error(ex) || rethrow()
+        @warn "Lava: frozen cache entry unreadable; recompiling this kernel" path exception = ex maxlog = 1
         return nothing
     end
     # Level 2: hand the pipeline this kernel's own driver blob when there is a
@@ -290,7 +339,8 @@ function frozen_store(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workg
         frozen_logging(ctx) &&
             println("frozen STORE: ", basename(path)[1:end-6], " || ", typestring(tt))
     catch ex
-        @debug "Lava: frozen cache store failed" path exception = ex
+        cache_io_error(ex) || rethrow()
+        @warn "Lava: frozen cache store failed; this kernel will recompile next session" path exception = ex maxlog = 1
     end
     return nothing
 end
@@ -447,7 +497,8 @@ function frozen_rt_load(@nospecialize(f), @nospecialize(tt), stage::Symbol,
     shader = try
         open(Serialization.deserialize, path)::LavaRTShader
     catch ex
-        @debug "Lava: frozen RT entry unreadable" path exception = ex
+        cache_io_error(ex) || rethrow()
+        @warn "Lava: frozen RT entry unreadable; recompiling this stage" path exception = ex maxlog = 1
         return nothing
     end
     FROZEN_RT_MEM[memkey] = shader
@@ -479,7 +530,8 @@ function frozen_rt_store(@nospecialize(f), @nospecialize(tt), stage::Symbol,
         frozen_logging() &&
             println("frozen RT STORE: ", basename(path)[1:end-6], " || ", typestring(tt))
     catch ex
-        @debug "Lava: frozen RT store failed" path exception = ex
+        cache_io_error(ex) || rethrow()
+        @warn "Lava: frozen RT store failed; this stage will recompile next session" path exception = ex maxlog = 1
     end
     return nothing
 end

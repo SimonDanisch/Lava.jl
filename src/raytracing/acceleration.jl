@@ -114,8 +114,11 @@ function destroy_now!(as::Union{LavaBLAS, LavaTLAS})
         for (_, (pool, _)) in as.desc_sets
             try
                 pool.destructor()
-            catch
-                safe_fin_log("Lava LavaTLAS destroy_now!: descriptor pool destructor failed\n")
+            catch ex
+                # A destructor may not throw, but it can name the fault: the
+                # message was fixed text, so a driver error and a bug in this
+                # file printed identically.
+                safe_fin_log("Lava LavaTLAS destroy_now!: descriptor pool destructor failed: " * sprint(showerror, ex) * "\n")
             end
         end
         empty!(as.desc_sets)

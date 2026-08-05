@@ -167,8 +167,13 @@ end
     # ── Depth test ──
 
     @testset "depth test" begin
-        # Draw two fullscreen triangles: first at z=0.3 (blue), second at z=0.7 (red).
+        # Draw two fullscreen triangles: first at z=0.7 (red), second at z=0.3 (blue).
         # With depth < test, closer (z=0.3) blue should win.
+        #
+        # `depth_clear = nothing` on the second draw is what makes this a test of
+        # the depth test. Clearing depth per draw — which is what the attachment
+        # did unconditionally — leaves every fragment passing against 1.0, so the
+        # later draw always won and the assertion held whatever the z values were.
         function depth_vert(color::Vec4f, z_val::Float32)
             vid = Lava.vertex_index() - Int32(1)
             x = Float32(Int32(vid & Int32(1)) * 4 - 1)
@@ -194,10 +199,10 @@ end
         draw!(bq, pip, target, 3;
             args=(Vec4f(1f0, 0f0, 0f0, 1f0), 0.7f0),
             clear_color=(0f0, 0f0, 0f0, 1f0))
-        # Draw close blue at z=0.3 (no clear — load previous)
+        # Draw close blue at z=0.3 (no clear — load previous colour and depth)
         draw!(bq, pip, target, 3;
             args=(Vec4f(0f0, 0f0, 1f0, 1f0), 0.3f0),
-            clear_color=nothing)
+            clear_color=nothing, depth_clear=nothing)
         Lava.vk_flush!(Lava.vk_context())
 
         pixels = readback_framebuffer(fb)
@@ -205,6 +210,109 @@ end
         p = pixels[4, 4]
         @test p[3] ≈ 1f0 atol=0.05  # blue channel
         @test p[1] ≈ 0f0 atol=0.05  # red channel
+
+        # The other order is the half that a per-draw depth clear could not fail:
+        # near first, far second, and the far one must be rejected.
+        fb2 = LavaFramebuffer(8, 8; depth=true,
+            color_format=Vulkan.FORMAT_R32G32B32A32_SFLOAT)
+        t2 = OffscreenTarget(fb2)
+        draw!(bq, pip, t2, 3;
+            args=(Vec4f(0f0, 0f0, 1f0, 1f0), 0.3f0),
+            clear_color=(0f0, 0f0, 0f0, 1f0))
+        draw!(bq, pip, t2, 3;
+            args=(Vec4f(1f0, 0f0, 0f0, 1f0), 0.7f0),
+            clear_color=nothing, depth_clear=nothing)
+        Lava.vk_flush!(Lava.vk_context())
+
+        q = readback_framebuffer(fb2)[4, 4]
+        @test q[3] ≈ 1f0 atol=0.05  # still blue: the far draw failed the test
+        @test q[1] ≈ 0f0 atol=0.05
+    end
+
+    # ── Pipeline state vs. the compiled-pipeline cache ──
+
+    # One shader pair, two blend modes. The pipeline cache keyed only on the
+    # shaders, their argument types and the colour format, so the second pipeline
+    # got whatever state the first was compiled with: an Additive draw rendered
+    # opaque, or the reverse, depending on which ran first. Every other testset
+    # here defines its own shader functions, which is why nothing caught it.
+    function state_vert()
+        vid = Lava.vertex_index() - Int32(1)
+        x = Float32(Int32(vid & Int32(1)) * 4 - 1)
+        y = Float32(Int32((vid >> Int32(1)) & Int32(1)) * 4 - 1)
+        Lava.set_position!(Vec4f(x, y, 0.5f0, 1.0f0))
+        return nothing
+    end
+    function state_frag()
+        Lava.gfx_output(0, Vec4f(0.25f0, 0f0, 0f0, 1f0))
+        return nothing
+    end
+
+    @testset "pipeline state is part of the cache key" begin
+        opaque = GraphicsPipeline(; vertex=state_vert, fragment=state_frag,
+            blend=Opaque(), cull=NoCull(), depth=DepthOff())
+        additive = GraphicsPipeline(; vertex=state_vert, fragment=state_frag,
+            blend=Additive(), cull=NoCull(), depth=DepthOff())
+
+        ctx = Lava.vk_context()
+        bq = ctx.default_bq
+        # Opaque first, so a shared cache entry would hand the additive draws
+        # opaque blending.
+        @test draw_and_readback(opaque, 3)[4, 4][1] ≈ 0.25f0 atol=0.01
+
+        fb = LavaFramebuffer(8, 8; depth=false,
+            color_format=Vulkan.FORMAT_R32G32B32A32_SFLOAT)
+        target = OffscreenTarget(fb)
+        draw!(bq, additive, target, 3; clear_color=(0f0, 0f0, 0f0, 1f0))
+        draw!(bq, additive, target, 3; clear_color=nothing)
+        Lava.vk_flush!(ctx)
+        @test readback_framebuffer(fb)[4, 4][1] ≈ 0.5f0 atol=0.01
+    end
+
+    # ── Depth attachment vs. depth mode ──
+
+    # The pipeline's depth attachment format is a property of the render target:
+    # dynamic rendering requires it to equal the format of the bound depth view,
+    # and UNDEFINED when none is bound. Deriving it from the depth mode instead
+    # made both mismatched combinations produce an invalid pipeline.
+    @testset "depth testing needs a depth attachment" begin
+        pip = GraphicsPipeline(; vertex=state_vert, fragment=state_frag,
+            blend=Opaque(), cull=NoCull(), depth=DepthLess())
+        @test_throws ArgumentError draw_and_readback(pip, 3; depth=false)
+    end
+
+    @testset "DepthOff into a target that has depth" begin
+        # Legal, and not the same as having no attachment: the pass still binds
+        # depth, so the pipeline has to declare its format. Nothing is tested or
+        # written, so the later draw wins whatever its z is.
+        function zvert(color::Vec4f, z_val::Float32)
+            vid = Lava.vertex_index() - Int32(1)
+            x = Float32(Int32(vid & Int32(1)) * 4 - 1)
+            y = Float32(Int32((vid >> Int32(1)) & Int32(1)) * 4 - 1)
+            Lava.set_position!(Vec4f(x, y, z_val, 1.0f0))
+            Lava.gfx_output(0, color)
+            return nothing
+        end
+        function zfrag()
+            Lava.gfx_output(0, Lava.gfx_input(Vec4f, 0))
+            return nothing
+        end
+        pip = GraphicsPipeline(; vertex=zvert, fragment=zfrag,
+            blend=Opaque(), cull=NoCull(), depth=DepthOff())
+
+        fb = LavaFramebuffer(8, 8; depth=true,
+            color_format=Vulkan.FORMAT_R32G32B32A32_SFLOAT)
+        target = OffscreenTarget(fb)
+        ctx = Lava.vk_context()
+        bq = ctx.default_bq
+        draw!(bq, pip, target, 3; args=(Vec4f(0f0, 0f0, 1f0, 1f0), 0.3f0),
+            clear_color=(0f0, 0f0, 0f0, 1f0))          # near blue
+        draw!(bq, pip, target, 3; args=(Vec4f(1f0, 0f0, 0f0, 1f0), 0.7f0),
+            clear_color=nothing)                        # far red, drawn later
+        Lava.vk_flush!(ctx)
+        p = readback_framebuffer(fb)[4, 4]
+        @test p[1] ≈ 1f0 atol=0.05                      # red: no depth test ran
+        @test p[3] ≈ 0f0 atol=0.05
     end
 
     # ── Multiple outputs / instances ──
@@ -237,5 +345,51 @@ end
         has_green = any(p -> p[2] > 0.5f0, pixels)
         @test has_red
         @test has_green
+    end
+
+    @testset "a fragment shader writing several attachments compiles" begin
+        # A fragment shader that returns a tuple gets its varyings unpacked by
+        # FragmentWrapper, and inlining that leaves an
+        # llvm.experimental.noalias.scope.decl behind — a metadata declaration
+        # that emits no code and that the SPIR-V emitter used to reject as an
+        # unsupported intrinsic. Found by a deferred renderer whose g-buffer pass
+        # writes albedo and normals from one fragment.
+        gbuf_vertex() = (position = Vec4f(0, 0, 0.5, 1),
+                         albedo = Vec4f(1, 0, 0, 1), normal = Vec3f(0, 1, 0))
+        gbuf_fragment(inputs) = (inputs.albedo,
+                                 Vec4f(0.5f0 * inputs.normal[1] + 0.5f0,
+                                       0.5f0 * inputs.normal[2] + 0.5f0,
+                                       0.5f0 * inputs.normal[3] + 0.5f0, 1f0))
+        pipe = Rasterizer(vertex=gbuf_vertex, fragment=gbuf_fragment,
+            varyings=(albedo=Vec4f, normal=Vec3f), topology=TriangleList(),
+            blend=Opaque(), cull=NoCull(), depth=DepthOff())
+        vfn, vtt, ffn, ftt = Lava.resolve_shader_pair(pipe, Tuple{}, Tuple{})
+        _, compiled = Lava.ensure_compiled_with_shader!(pipe, vfn, ffn, vtt, ftt;
+            color_format=Vulkan.Format[Vulkan.FORMAT_R8G8B8A8_UNORM,
+                                       Vulkan.FORMAT_R8G8B8A8_UNORM],
+            depth_format=Vulkan.FORMAT_UNDEFINED)
+        @test compiled isa CompiledGraphicsPipeline
+    end
+
+    @testset "a blit source is a (height, width) matrix" begin
+        # `copy_image_to_buffer!` packs rows and the blit shader reads a matrix
+        # whose row index varies fastest, so the two are transposes of each
+        # other. Reading an image out and blitting it back with the same index
+        # shears the picture rather than breaking it, which is how it survived in
+        # two benches; a matrix source now says so instead.
+        w, h = 32, 16
+        fb = LavaFramebuffer(w, h; depth=false,
+            color_format=Vulkan.FORMAT_R32G32B32A32_SFLOAT)
+        bq = Lava.vk_context().default_bq
+        right = LavaArray(reshape([Vec4f(0, 1, 0, 1) for _ in 1:(w * h)], h, w))
+        wrong = LavaArray(reshape([Vec4f(0, 1, 0, 1) for _ in 1:(w * h)], w, h))
+        @test_throws DimensionMismatch blit!(bq, OffscreenTarget(fb), wrong)
+        @test_throws DimensionMismatch blit!(bq, OffscreenTarget(fb),
+                                            LavaArray([Vec4f(0, 0, 0, 1) for _ in 1:(w * h - 1)]))
+
+        blit!(bq, OffscreenTarget(fb), right)
+        Lava.vk_flush!(Lava.vk_context())
+        px = readback_framebuffer(fb)
+        @test all(p -> p[2] > 0.9f0, px)
     end
 end

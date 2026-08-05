@@ -320,24 +320,30 @@ fully populated and only the `next` chain is dropped, with no return code to
 check, because `vkGetPhysicalDeviceProperties2` returns void.
 """
 function query_shader_cores(phys_dev)
+    smcount, warps = 0, 0
     if has_extension(phys_dev, "VK_NV_shader_sm_builtins")
-        try
-            p = Vulkan.get_physical_device_properties_2(
-                    phys_dev, Vulkan.PhysicalDeviceShaderSMBuiltinsPropertiesNV).next
-            return Int(p.shader_sm_count), Int(p.shader_warps_per_sm)
-        catch err
-            @debug "VK_NV_shader_sm_builtins query failed; SM count unknown" err
-        end
+        # No try: the extension was just confirmed present by `has_extension`,
+        # so a failure here is a bug in the query, not an absent capability.
+        # Swallowing it produced `sm_count = 0`, which every caller reads as "the
+        # device does not report it" — a wrong answer dressed as a fact.
+        p = Vulkan.get_physical_device_properties_2(
+                phys_dev, Vulkan.PhysicalDeviceShaderSMBuiltinsPropertiesNV).next
+        smcount, warps = Int(p.shader_sm_count), Int(p.shader_warps_per_sm)
     elseif has_extension(phys_dev, "VK_AMD_shader_core_properties2")
-        try
-            p = Vulkan.get_physical_device_properties_2(
-                    phys_dev, Vulkan.PhysicalDeviceShaderCoreProperties2AMD).next
-            return Int(p.active_compute_unit_count), 0
-        catch err
-            @debug "VK_AMD_shader_core_properties2 query failed; CU count unknown" err
-        end
+        # Same reasoning as the NV branch above: advertised means queryable.
+        p = Vulkan.get_physical_device_properties_2(
+                phys_dev, Vulkan.PhysicalDeviceShaderCoreProperties2AMD).next
+        smcount = Int(p.active_compute_unit_count)
     end
-    return 0, 0
+    # MERGE NOTE (2026-08-05): `sd/nvidia` restructured this as
+    # `query_device_compute(phys_dev, phys_props) -> DeviceCompute`, which
+    # `DeviceCaps` has since absorbed (see its docstring: "three things became
+    # this one"). Git matched the two bodies as one hunk and spliced theirs into
+    # this shell, leaving `return 0, 0` below the assignments — a function that
+    # always reported "no SM count", which is exactly the wrong-answer-dressed-
+    # as-a-fact their comment above warns about, reintroduced by the merge that
+    # removed it. Their bodies are the improvement and are kept.
+    return smcount, warps
 end
 
 
@@ -1110,6 +1116,19 @@ function VkContext(; select = pick_physical_device, debug::DebugConfig = DebugCo
                 Vulkan.PhysicalDeviceVulkan12Features).next
         (buffer = q.shader_buffer_int_64_atomics, shared = q.shader_shared_int_64_atomics)
     end
+    # Subgroup ops on anything other than 32-bit types. `subgroup_shuffle` and the
+    # rest are bound for Int64/UInt64/Float64 (test_subgroup_shuffle.jl's
+    # "every element type round-trips"), and SPIR-V group operations on 8-, 16- or
+    # 64-bit types REQUIRE this feature: VUID-RuntimeSpirv-None-06275. Hardcoded
+    # false, so those shuffles were undefined — GPU-assisted validation reports
+    # "OpGroupNonUniformShuffle is using a 64-bit int scalar but
+    # shaderSubgroupExtendedTypes was not enabled". Asked, not assumed, for the
+    # same reason as the atomics above.
+    has_subgroup_extended = let
+        q = Vulkan.get_physical_device_features_2(phys_dev,
+                Vulkan.PhysicalDeviceVulkan12Features).next
+        q.shader_subgroup_extended_types
+    end
     has_pipeline_exec_props = has_extension(phys_dev, "VK_KHR_pipeline_executable_properties")
     # VK_EXT_memory_budget — lets us read VkPhysicalDeviceMemoryBudgetPropertiesEXT
     # for real heap utilisation, used in OOM error reporting.
@@ -1246,7 +1265,7 @@ function VkContext(; select = pick_physical_device, debug::DebugConfig = DebugCo
         true,   # scalar_block_layout  ← BDA struct layout
         false,  # imageless_framebuffer
         false,  # uniform_buffer_standard_layout
-        false,  # shader_subgroup_extended_types
+        has_subgroup_extended,  # shader_subgroup_extended_types ← 64-bit subgroup shuffles
         false,  # separate_depth_stencil_layouts
         false,  # host_query_reset
         true,   # timeline_semaphore  ← REQUIRED for explicit-queue cross-queue sync
@@ -1530,7 +1549,11 @@ function VkContext(; select = pick_physical_device, debug::DebugConfig = DebugCo
                                        scope=UInt32(p.scope)))
             end
         catch err
-            @debug "cooperative-matrix property query failed; treating as unsupported" err
+            # "Treating as unsupported" on ANY error is how a real fault becomes a
+            # silently slower path. Only an actual absence of the feature is
+            # tolerated; anything else is this library's bug and must surface.
+            err isa Vulkan.VulkanError || rethrow()
+            @warn "cooperative-matrix property query failed; treating as unsupported" exception = err
         end
     end
 

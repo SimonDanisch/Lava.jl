@@ -97,7 +97,15 @@ finalizer.  `msg` must be a `String` that already contains any trailing
 newline; no interpolation at call time (that would trigger dispatch /
 world-age / allocation).  Prefer short fixed strings built by the caller.
 """
-@inline safe_fin_log(msg::String) = ccall(:jl_safe_printf, Cvoid, (Cstring,), msg)
+# `msg` goes through a "%s" FORMAT, not as the format string itself.
+# `jl_safe_printf(const char *fmt, ...)` interprets its first argument as a
+# printf format, so a message containing `%` — a path, a driver string, an
+# exception text like "100% of heap" — was undefined behaviour: `%s` would read
+# a nonexistent vararg off the stack, inside a finalizer, where there is no way
+# to recover. Passing the string as an ARGUMENT makes any content safe, and
+# costs nothing.
+@inline safe_fin_log(msg::String) =
+    ccall(:jl_safe_printf, Cvoid, (Cstring, Cstring), "%s", msg)
 
 """
     @vk_checked site_str vk_call

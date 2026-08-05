@@ -77,7 +77,8 @@ function load_pipeline_cache_data(path::String, phys_device)
     bytes = try
         read(path)
     catch ex
-        @debug "Lava: pipeline cache read failed" path exception=ex
+        ex isa Union{SystemError, Base.IOError, EOFError} || rethrow()
+        @warn "Lava: pipeline cache read failed; the driver will recompile from SPIR-V" path exception=ex
         return UInt8[]
     end
     if !pipeline_cache_compatible(bytes, phys_device)
@@ -112,9 +113,13 @@ function create_lava_pipeline_cache(device::Vulkan.Device, path::String, phys_de
         end
     catch ex
         @warn "Lava: pipeline cache create from disk failed; starting empty" path exception=ex
+        # `force=true` already tolerates a missing file, so the only failures
+        # left are real (permissions, a directory in the way) and worth saying.
         try
             rm(path; force=true)
-        catch
+        catch rmex
+            rmex isa Union{SystemError, Base.IOError} || rethrow()
+            @warn "Lava: could not delete the unusable pipeline cache; it will fail again next session" path exception=rmex
         end
         return _create_empty()
     end
@@ -149,7 +154,8 @@ function save_pipeline_cache!(ctx)
             Libc.free(ptr)
         end
     catch ex
-        @debug "Lava: pipeline cache save failed" exception=ex
+        ex isa Union{SystemError, Base.IOError} || rethrow()
+        @warn "Lava: pipeline cache save failed; next session recompiles ISA from SPIR-V" exception=ex
     end
     return nothing
 end
@@ -168,8 +174,13 @@ function _register_pipeline_cache_atexit!()
             ctx = VK_CONTEXT_REF[]
             ctx === nothing && return
             save_pipeline_cache!(ctx)
-        catch
-            # Best-effort: never propagate from atexit.
+        catch ex
+            # Never propagate from atexit — Julia is shutting down and a throw
+            # here replaces the exit code. But SAY so: a pipeline cache that has
+            # silently failed to save every session looks exactly like one that
+            # is working.
+            safe_fin_log("Lava: pipeline cache save at exit failed: " *
+                         sprint(showerror, ex) * "\n")
         end
     end
 end

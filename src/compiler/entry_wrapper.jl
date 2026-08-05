@@ -28,7 +28,15 @@ struct PushConstantInfo
     arg_buffer_size::Int        # Total size of argument data
     arg_layout::Vector{Pair{Int,Int}}  # (offset, size) per argument
     byval_llvm_sizes::Vector{Int}  # LLVM alloc size per arg (>0 only for byval struct args)
+    # Just the offsets from `arg_layout`, because that is what packing wants and
+    # rebuilding it there allocated a vector per draw per frame for a value fixed
+    # at compile time.
+    arg_offsets::Vector{Int}
 end
+
+PushConstantInfo(name, push_size, arg_buffer_size, arg_layout, byval_sizes) =
+    PushConstantInfo(name, push_size, arg_buffer_size, arg_layout, byval_sizes,
+                     [first(p) for p in arg_layout])
 
 """
     wrap_entry_for_vulkan!(mod, entry; workgroup_size) -> PushConstantInfo

@@ -163,6 +163,12 @@ end
         include(joinpath(@__DIR__, "test_gemm_fp16_accum.jl"))
     end
 
+    # The scalar half of the same port: `mul!`'s fp32 path, which had no tiling
+    # at all and ran at 0.448 TFLOP/s where this reaches 4.301.
+    @testset "staged scalar GEMM" begin
+        include(joinpath(@__DIR__, "test_gemm_staged_scalar.jl"))
+    end
+
     @testset "whole-struct copy alignment" begin
         include(joinpath(@__DIR__, "test_struct_copy_alignment.jl"))
     end
@@ -207,6 +213,36 @@ end
     # `DebugConfig(validation = true)`.
     @testset "no OpBitcast on a logical pointer" begin
         include(joinpath(@__DIR__, "test_logical_pointer_bitcast.jl"))
+    end
+
+    # Only meaningful on a device whose subgroup width is not fixed — on wave32
+    # hardware "requested" and "default" are the same number and nothing is proved.
+    @testset "pinned subgroup width" begin
+        include(joinpath(@__DIR__, "test_subgroup_size_pinning.jl"))
+    end
+
+    # Both halves of the coopmat 32-lane pin: that it is not needed here, and
+    # that the refusal fires when it would be. The second half is unreachable on
+    # any device present, so it drives the capability cache instead.
+    @testset "coopmat 32-lane pin" begin
+        include(joinpath(@__DIR__, "test_coopmat_subgroup_pin.jl"))
+    end
+
+    # A handled allocation failure must absorb its own validation messages, or it
+    # aborts whatever unrelated code calls check_validation_errors! next.
+    @testset "tolerated alloc failure" begin
+        include(joinpath(@__DIR__, "test_tolerated_alloc_failure.jl"))
+    end
+
+    # The frozen path is the one the runners ship, and the profiler could not see
+    # it: 0 kernels reported against 45 live dispatches.
+    @testset "frozen kernels are visible to the profiler" begin
+        include(joinpath(@__DIR__, "test_frozen_kernels_visible.jl"))
+    end
+
+    # `vk_context` had methods for three of AnyLavaArray's six wrappers.
+    @testset "vk_context through array wrappers" begin
+        include(joinpath(@__DIR__, "test_vk_context_wrappers.jl"))
     end
 
     # The buffer-lifetime case behind the intermittent flush hang. Asserted on

@@ -97,9 +97,18 @@ caps(a::LavaArray) = caps(vk_context(a))
 # `dest`, which the broadcast machinery may hand it as a `SubArray` or a
 # `ReshapedArray` — walking to the parent is the whole answer, and it is the same
 # `AnyLavaArray` nest `_copyto!` already understands.
+#
+# One method per member of `AnyLavaArray` (gpuarrays.jl:91), and they have to stay
+# in step: that Union lists six wrappers and this list had three, so
+# `probe_broadcast!` — which does `vk_context(dest).diag.broadcast_probe` — threw
+# a MethodError for `Adjoint`/`Transpose`. GPUArrays' own broadcasting suite
+# caught it, 12 errors in "Adjoint and Transpose", because a transposed device
+# array is an ordinary thing to broadcast over.
 vk_context(a::SubArray) = vk_context(parent(a))
 vk_context(a::Base.ReshapedArray) = vk_context(parent(a))
 vk_context(a::Base.PermutedDimsArray) = vk_context(parent(a))
+vk_context(a::LinearAlgebra.Transpose) = vk_context(parent(a))
+vk_context(a::LinearAlgebra.Adjoint) = vk_context(parent(a))
 
 # Property access resolves a `nothing`-pinned queue through the live
 # `vk_context()` so a module-level `const BACKEND = LavaBackend()` keeps

@@ -343,7 +343,11 @@ function lava_disk_cache_load(source::Core.MethodInstance, workgroup_size)
     try
         entry = open(Serialization.deserialize, path)
     catch ex
-        @warn "Lava: disk cache load failed" path exception=(ex, catch_backtrace())
+        # Narrowed like the frozen cache's readers: a truncated or
+        # version-mismatched entry is a recompile, anything else is a bug here
+        # and must not be absorbed by a cache miss.
+        cache_io_error(ex) || rethrow()
+        @warn "Lava: disk cache load failed" path exception=(ex, catch_backtrace()) maxlog = 1
         return nothing
     end
     if string(entry.spec_types) == string(source.specTypes) && entry.workgroup_size == workgroup_size
@@ -376,7 +380,11 @@ function lava_disk_cache_store(source::Core.MethodInstance, workgroup_size, kern
         close(io)
         mv(tmppath, path; force=true)
     catch ex
-        @debug "Lava: disk cache store failed" path exception=ex
+        # A cache is an optimisation, so a failed WRITE may not take the session
+        # down — but it must be visible, or a permanently unwritable cache looks
+        # exactly like a working one. IO faults only; anything else is a bug here.
+        ex isa Union{SystemError, IOError, ArgumentError} || rethrow()
+        @warn "Lava: disk cache store failed; kernels will recompile next session" path exception = ex maxlog = 1
     end
 end
 
@@ -423,7 +431,7 @@ function link_kernel(ctx::VkContext, compiled::LavaGPUKernel; pipeline_cache=not
                                     push_constant_size=compiled.push_info.push_size,
                                     needs_tlas_descriptor=compiled.enable_ray_query,
                                     pipeline_cache)
-    offsets = Int[p.first for p in compiled.push_info.arg_layout]
+    offsets = compiled.push_info.arg_offsets
     byval_sizes = compiled.push_info.byval_llvm_sizes
     return LavaLinkedKernel(compiled, pipeline, offsets, byval_sizes)
 end
@@ -479,13 +487,14 @@ end
 # path and the device-wide cache is used as before.
 @inline function (l::LavaLinker)(::GPUCompiler.CompilerJob, compiled::LavaGPUKernel)
     if FROZEN_RECORDING[] && !isempty(FROZEN_VERSION[])
-        pc = try
-            Vulkan.PipelineCache(l.ctx.device,
-                                 Vulkan.PipelineCacheCreateInfo(Ptr{Cvoid}(C_NULL);
-                                                                initial_data_size=UInt64(0)))
-        catch
-            nothing
-        end
+        # No try. Creating an EMPTY pipeline cache cannot fail for any reason
+        # this code can handle: it takes no input to be malformed. The bare
+        # `catch nothing` here meant a failure produced `pc = nothing`, which
+        # `frozen_store` reads as "no ISA to snapshot" — so the frozen cache
+        # would silently degrade to level 1 forever, invisibly.
+        pc = Vulkan.PipelineCache(l.ctx.device,
+                                  Vulkan.PipelineCacheCreateInfo(Ptr{Cvoid}(C_NULL);
+                                                                 initial_data_size=UInt64(0)))
         l.ctx.caches.frozen_last_pcache = pc
         return link_kernel(l.ctx, compiled; pipeline_cache=pc)
     end
@@ -638,16 +647,35 @@ Rewinding at end-of-frame did exactly that: geometry corruption over a static
 scene, intermittent, hidden by any full sync, and invisible to validation —
 overwriting your own host-mapped memory is perfectly legal.
 """
-arg_pool_in_use!(bq::BatchQueue, signal_value::Integer) =
-    (bq.arg_pool_frontier = UInt64(signal_value); nothing)
+function arg_pool_in_use!(bq::BatchQueue, signal_value::Integer)
+    bq.arg_pool_frontier = UInt64(signal_value)
+    # Everything handed out so far now belongs to a submitted batch, and the
+    # frontier covers it. The recording that starts next holds nothing yet, which
+    # is what `arg_alloc_count` means from here on.
+    bq.arg_alloc_count = 0
+    nothing
+end
 
 """
 Rewind the arg pool if — and only if — the GPU has finished with everything
-allocated from it. Cheap: one non-blocking timeline query, and only when there is
-a frontier to clear.
+allocated from it *and* the recording in progress holds none of it. Cheap: one
+non-blocking timeline query, and only when there is a frontier to clear.
+
+The second condition is not redundant, and leaving it out is a GPU crash. The
+timeline can cross the frontier *while a frame is being recorded*: draws 1..k have
+already had their arg buffer addresses baked into push constants, the GPU then
+finishes the previous frame, and the next `get_arg_buffer` rewinds to offset zero
+and hands the same bytes to draw k+1. The earlier draws are left reading whatever
+the later ones wrote — a null buffer device address, and a GPUVM fault at 0x0.
+
+It needs many draws in one frame for a reclaim to land mid-recording, and frames
+in flight for the timeline to move during it, which is why it appeared the day the
+per-frame flush went away and only with a hundred plots. `arg_alloc_count` is the
+count since the last submit, so it is exactly "this recording holds handouts".
 """
 function reclaim_arg_buffer_pool!(bq::BatchQueue)
     bq.arg_pool_frontier == UInt64(0) && return false
+    bq.arg_alloc_count == 0 || return false
     query_timeline(bq) >= bq.arg_pool_frontier || return false
     reset_arg_buffer_pool!(bq)
     bq.arg_pool_frontier = UInt64(0)

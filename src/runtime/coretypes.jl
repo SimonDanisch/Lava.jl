@@ -240,8 +240,9 @@ struct CompiledGraphicsPipeline
     push_constant_size::UInt32
     descriptor_set_layout::Union{Nothing, Vulkan.DescriptorSetLayout}
     push_stage_flags::Vulkan.ShaderStageFlag
-    # Pipeline state (for debug/inspection)
-    color_format::Vulkan.Format
+    # Pipeline state (for debug/inspection). Plural: with dynamic rendering a
+    # pipeline is built for a whole set of colour attachment formats.
+    color_formats::Vector{Vulkan.Format}
     has_depth::Bool
 end
 

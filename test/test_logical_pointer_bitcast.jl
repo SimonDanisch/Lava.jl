@@ -36,6 +36,30 @@
 using Test, Lava, KernelAbstractions
 const KA = KernelAbstractions
 
+"""
+Count `OpBitcast` instructions whose RESULT type is a pointer, per dumped module.
+
+Walks the binary rather than disassembler text so it does not need `spirv-dis`,
+and keys on the result type having been declared by `OpTypePointer` rather than
+on any name, so a renamed type cannot make it stop noticing.
+"""
+function lpb_ptr_bitcasts(dir)
+    findings = Tuple{String,Int}[]
+    for f in filter(f -> endswith(f, ".spv"), readdir(dir; join = true))
+        words = reinterpret(UInt32, read(f))
+        ptr_types = Set{UInt32}(); bad = 0; i = 6
+        while i <= length(words)
+            wc = words[i] >> 16; op = words[i] & 0xFFFF
+            wc == 0 && break
+            op == 32  && push!(ptr_types, words[i+1])            # OpTypePointer
+            op == 124 && words[i+1] in ptr_types && (bad += 1)    # OpBitcast -> pointer
+            i += Int(wc)
+        end
+        bad > 0 && push!(findings, (basename(f), bad))
+    end
+    findings
+end
+
 @testset "no OpBitcast on a logical pointer" begin
     M = 128
 
@@ -87,6 +111,54 @@ const KA = KernelAbstractions
             end
             @test bad == 0
         end
+    finally
+        prev === nothing ? delete!(ENV, "LAVA_SPIRV_DUMP_DIR") : (ENV["LAVA_SPIRV_DUMP_DIR"] = prev)
+        rm(dumpdir; recursive = true, force = true)
+    end
+end
+
+# ── The second family: width mismatches on load and store ────────────────────
+#
+# The `OpSelect` case above was an ADDRESSING mismatch — array-of-T versus T at
+# one address — which `OpAccessChain` expresses, so drilling fixed it. These are
+# WIDTH mismatches: a 32-bit value through a pointer whose pointee is 64-bit.
+# Logical addressing cannot name a differently-typed pointer to the same address
+# at all, so the reconciliation has to happen on the VALUE side, and it does:
+# `emit_reconciled_scalar_load!` for loads, and the equal/narrow/wide split in
+# `emit_store!` for stores.
+#
+# The reproducer is an ordinary sliced `setindex!` over GPUArrays' element types.
+# The `Complex` types are REQUIRED — the eight real types alone are all clean,
+# which is why nothing hand-written found this. Before the fix it emitted two
+# invalid `gpu_getindex_kernel` modules while every one of the twelve types still
+# produced the CORRECT answer, so a value assertion alone asserts nothing here;
+# the module has to be inspected.
+@testset "no pointer OpBitcast from a width-mismatched load or store" begin
+    types = (Int16, Int32, Int64, Float16, Float32, Float64,
+             ComplexF16, ComplexF32, ComplexF64,
+             Complex{Int16}, Complex{Int32}, Complex{Int64})
+
+    dumpdir = mktempdir()
+    prev = get(ENV, "LAVA_SPIRV_DUMP_DIR", nothing)
+    ENV["LAVA_SPIRV_DUMP_DIR"] = dumpdir
+    try
+        for T in types
+            xc = zeros(T, (2, 3, 4))
+            yc = rand(T, (2, 3))
+            x = Lava.LavaArray(copy(xc))
+            y = Lava.LavaArray(copy(yc))
+
+            x[:, :, 2] = y                 # the store path
+            xc[:, :, 2] = yc
+            @test Array(x) == xc
+
+            z = x[:, :, 2]                 # the load path, same packed slots
+            @test Array(z) == yc
+        end
+
+        spvs = filter(f -> endswith(f, ".spv"), readdir(dumpdir))
+        @test !isempty(spvs)               # a dump we never wrote would assert nothing
+        @test isempty(lpb_ptr_bitcasts(dumpdir))
     finally
         prev === nothing ? delete!(ENV, "LAVA_SPIRV_DUMP_DIR") : (ENV["LAVA_SPIRV_DUMP_DIR"] = prev)
         rm(dumpdir; recursive = true, force = true)

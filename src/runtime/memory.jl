@@ -524,7 +524,22 @@ function try_vk_alloc(bq::BatchQueue, nbytes::Integer;
         if e isa Vulkan.VulkanError &&
            (e.code == Vulkan.ERROR_OUT_OF_DEVICE_MEMORY ||
             e.code == Vulkan.ERROR_OUT_OF_HOST_MEMORY)
-            empty!((bq.ctx::VkContext).validation.messages)
+            # DRAIN, then empty. The validation callback writes into a ring
+            # (`ctx.validation`, per device since 49f3f17) and only
+            # `drain_validation_messages!` moves entries out of it into
+            # `.messages`. Emptying the drained list alone leaves this failure's
+            # own messages sitting in the ring, where the next
+            # `check_validation_errors!` picks them up and blames its own caller.
+            #
+            # Observed exactly that way: test_source_mapping.jl:699 asks for 40 GB
+            # deliberately, and the error surfaced 40 lines later at :739 as a
+            # `LavaError during vk_flush!` on a FOUR-ELEMENT upload. An oversized
+            # allocation is the intended, handled outcome here, so its messages
+            # belong to it.
+            let c = bq.ctx::VkContext
+                drain_validation_messages!(c)
+                empty!(c.validation.messages)
+            end
             return AllocFailure(e.code, op, Int(nbytes), mem_type_idx_local)
         end
         # DEVICE_LOST during alloc is a hard fault — mark + propagate so the
@@ -791,8 +806,11 @@ function destroy_buffer!(buf::VkManagedBuffer)
     try
         buf.buffer.destructor()
         buf.memory.destructor()
-    catch
-        safe_fin_log("Lava destroy_buffer!: Vulkan destructor failed\n")
+    catch ex
+        # A destructor may not throw, but it can name the fault: this printed
+        # fixed text, so a driver error and a bug in this file read identically.
+        safe_fin_log("Lava destroy_buffer!: Vulkan destructor failed: " *
+                     sprint(showerror, ex) * "\n")
     end
     buf.address = BDA_POISON
     Threads.atomic_sub!(pool(ctx).live_bytes, buf.size)
@@ -1012,8 +1030,11 @@ function destroy_pool!(ctx::VkContext)
         try
             block.buffer.destructor()
             block.memory.destructor()
-        catch
-            safe_fin_log("Lava pool reset: destructor failed (ok during vk_reset_device!)\n")
+        catch ex
+            # A destructor may not throw, but it can name the fault: this printed
+            # fixed text, so a driver error and a bug in this file read alike.
+            safe_fin_log("Lava pool reset: destructor failed (ok during vk_reset_device!): " *
+                         sprint(showerror, ex) * "\n")
         end
     end
     empty!(ctx.caches.pool.blocks)
@@ -1440,10 +1461,11 @@ function reclaim_empty_pool_blocks!(bq::BatchQueue)
             try
                 block.buffer.destructor()
                 block.memory.destructor()
-            catch
+            catch ex
                 # Match destroy_buffer!: don't propagate from destructors,
-                # but log loudly so driver misbehaviour is visible.
-                safe_fin_log("Lava reclaim_empty_pool_blocks!: Vulkan destructor failed\n")
+                # but log loudly AND name the fault.
+                safe_fin_log("Lava reclaim_empty_pool_blocks!: Vulkan destructor failed: " *
+                             sprint(showerror, ex) * "\n")
             end
         end
     end
@@ -1501,6 +1523,21 @@ function get_staging(bq::BatchQueue, nbytes::Integer)
         bq.staging = nothing
     end
 
+    managed = host_buffer(bq, nbytes)
+    bq.staging = managed
+    return (managed.buffer, managed.memory, managed.mapped_ptr, managed.size)
+end
+
+"""
+    host_buffer(bq, nbytes) -> VkManagedBuffer
+
+A host-visible, permanently mapped buffer the GPU can copy out of.
+
+The GPU cannot read a Julia `Vector`, so every host-to-device transfer starts
+with a memcpy into one of these. Who owns it, how it is sliced and when a slice
+may be reused are all questions for the caller; this only allocates one.
+"""
+function host_buffer(bq::BatchQueue, nbytes::Integer)
     ctx = bq.ctx::VkContext
     dev = bq.device
     alloc_size = max(65536, nextpow(2, nbytes))
@@ -1535,8 +1572,7 @@ function get_staging(bq::BatchQueue, nbytes::Integer)
         push!(p.live_buffers, managed)
         Threads.atomic_add!(p.live_bytes, managed.size)
     end
-    bq.staging = managed
-    return (vkbuf, memory, mapped_ptr, Int(alloc_size))
+    managed
 end
 
 """

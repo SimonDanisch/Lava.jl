@@ -270,7 +270,7 @@ function compile_rt_pipeline(ctx::VkContext, pipeline::RayTracingPipeline, rayge
         push_constant_size=8)
 
     # Cache arg layout offsets and byval sizes for zero-alloc packing
-    offsets = Int[p.first for p in raygen_compiled.push_info.arg_layout]
+    offsets = raygen_compiled.push_info.arg_offsets
     byval_sizes = raygen_compiled.push_info.byval_llvm_sizes
 
     return (vk_pipeline, raygen_compiled, offsets, byval_sizes)

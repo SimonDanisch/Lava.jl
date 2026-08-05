@@ -1,9 +1,20 @@
 # `mul!` for LavaArray.
 #
 # How a matrix multiply is performed on this device is Lava's business, not its
-# caller's. `mul!` picks between the cooperative-matrix kernel and a scalar one
-# from the operand types and the device's reported capabilities; nothing above
-# this layer needs to know that tensor cores exist.
+# caller's. `mul!` picks from the operand types and the device's reported
+# capabilities; nothing above this layer needs to know that tensor cores exist.
+# There are three kernels, in descending order of preference:
+#
+#   * `coopmat_gemm!`, staged cooperative matrices. fp16 operands into an fp32
+#     destination on extents that land on the 16-wide tile.
+#   * `scalar_gemm_staged_kernel!`, staged and register-blocked but with ordinary
+#     `muladd`. The fp32 path, and the fp16 path wherever the tile does not fit
+#     or the device has no cooperative matrices at all.
+#   * `strided_gemm_kernel!`, one invocation per output element. What is left for
+#     fp64 and complex, and for products too small or too ragged to tile.
+#
+# The first two are ports of the two `#ifdef COOPMAT` branches of the same
+# shader, llama.cpp's `mul_mm.comp`, vendored at `reference/mul_mm/`.
 #
 # Measured on an RTX 4000 Ada, 2048³, fp16 in / fp32 accumulate:
 #   scalar kernel                            ~0.7 TFLOP/s
@@ -899,37 +910,60 @@ for (ci, cfg) in enumerate(GEMM_TILINGS)
     end
 end
 
-# The scalar kernel takes each operand as a *dense base array plus strides*
-# rather than as the wrapper the caller had. A transposed operand is then just a
-# pair of swapped strides — no copy, no second kernel, and no wrapper type inside
-# the kernel at all. That last part matters: `@Const` runs `Adapt.adapt_structure`
-# on the device, and rebuilding a wrapper there drags its constructor's error
-# paths in with it (see the PermutedDimsArray quirk).
+"""
+    gemmaccum(T) -> Type
+
+What a GEMM reduces in, given its destination type. `Float16` widens to `Float32`
+and everything else keeps its own type.
+
+This is `DNNKernels`' `accum` under a local name, and it exists because the
+per-element kernel used to reduce in `eltype(C)`: an fp16 destination summed the
+whole K loop in fp16. Measured on MatAnyone, 29 of its 132 `matmul!` calls land
+there with K between 256 and 769, which costs 12x to 20x the error of reducing in
+fp32 and storing once — in a model verified to 2.8e-4.
+
+The obvious alternative was to stop those calls declining the cooperative-matrix
+path at all: 27 of the 29 decline only because an operand is a
+`PermutedDimsArray`. Materialising it to qualify measured **slower** (0.876x and
+0.978x on MatAnyone over two rounds), because 18 of the 27 have `N = 16` and the
+copy costs more than the tensor cores return. Hence widening here instead.
+"""
+@inline gemmaccum(::Type{Float16}) = Float32
+@inline gemmaccum(::Type{T}) where {T} = T
+
+# The per-element kernel. No longer the general fp32 path: `staged_gemm_ok`
+# routes anything Float32 and big enough to tile to `scalar_gemm_staged_kernel!`
+# below, which is 9.6x faster at 2048^3. What is left here is what that one
+# cannot take, and each case is a real one rather than a leftover:
+#
+#   * fp64 and complex, whose accumulators do not fit the staged kernel's
+#     Float32 shared blocks;
+#   * products too small to fill the device with `BM x BN` tiles, where this
+#     kernel's much larger grid genuinely wins;
+#   * products so far off the tile grid that a staged launch would compute
+#     mostly-discarded output, a vector destination being the extreme.
+#
+# It takes each operand as a *dense base array plus strides* rather than as the
+# wrapper the caller had. A transposed operand is then just a pair of swapped
+# strides — no copy, no second kernel, and no wrapper type inside the kernel at
+# all. That last part matters: `@Const` runs `Adapt.adapt_structure` on the
+# device, and rebuilding a wrapper there drags its constructor's error paths in
+# with it (see the PermutedDimsArray quirk). The staged kernel takes its operands
+# the same way for the same reason.
 #
 # `K` is passed rather than read from `axes(A, 2)` for the same reason — the host
 # knows the extent, so the kernel need not query anything.
 
-"""
-    gemmaccumtype(T) -> Type
+# `gemmaccum` above is the accumulator width this kernel uses; it was found twice,
+# independently, from opposite ends. The table there is the arithmetic; the other
+# half of the evidence is the model: Whisper's `fc2` at K = 5120 measured 4.83e-2
+# against an fp64 reference where the fixed path reads 2.13e-4 — 234x, and
+# `sqrt(K) * eps(Float16) / 2` predicts 3.49e-2, which is what makes it a
+# diagnosis rather than a correlation. It reaches the scalar kernel at all
+# because `mm_coopmat_plan` declines whenever an operand arrives wrapped, which
+# in a RAW exported graph is every `addmm` — `Model` rewrites those away, so this
+# is the path `verifygraph` runs and not the one inference does.
 
-Element type a scalar GEMM accumulates in, given the promoted type of its
-operands and destination.
-
-`Float16` accumulates in `Float32`, and everything else in itself. A dot product
-of length `K` in a `p`-bit format carries a relative error of roughly
-`sqrt(K) * eps(T) / 2`; at `K = 5120` in `Float16` that is 3.5e-2, and it was
-measured at 4.8e-2 — a **234x** larger error than the same kernel writing a
-`Float32` destination and rounding afterwards (2.1e-4). Whisper's `fc2` is
-exactly that shape.
-
-This is what the other two implementations of this operation already do — Lava's
-cooperative-matrix path accumulates `Float32` for half operands, and DNNKernels'
-`mm2` widens through its own `accum` — so the scalar path taking `eltype(C)` was
-the odd one out. It matters because `mm_coopmat_applicable` declines whenever an
-operand arrives wrapped, which in a raw exported graph is every `addmm`.
-"""
-gemmaccumtype(::Type{Float16}) = Float32
-gemmaccumtype(::Type{T}) where {T} = T
 
 @kernel cpu=false function strided_gemm_kernel!(C, @Const(A), @Const(B), ::Val{K},
                                       co, cr, cc, ao, ar, ac, bo, br, bc,
@@ -943,10 +977,59 @@ gemmaccumtype(::Type{T}) where {T} = T
     i = (Int32(lin) - Int32(1)) % Int32(M) + Int32(1)
     j = (Int32(lin) - Int32(1)) ÷ Int32(M) + Int32(1)
     @inbounds begin
-        Tc = eltype(C)
-        # NOT `eltype(C)`: see `gemmaccumtype`. A half destination must not drag
-        # the accumulator down with it.
-        T = gemmaccumtype(promote_type(Tc, eltype(A), eltype(B)))
+        # ── KNOWN PRECISION ISSUE, not fixed here ────────────────────────────
+        #
+        # This accumulates in the DESTINATION type. With an fp16 destination the
+        # whole K-length reduction runs in fp16, which is reachable and not rare:
+        # `mul!`'s cooperative-matrix gate requires an fp32 destination and so
+        # does `staged_gemm_ok`, so every fp16-into-fp16 product lands right
+        # here. `DNNKernels`' `mm_coopmat_plan` docstring notes that under
+        # autocast every `addmm` in those models writes fp16.
+        #
+        # `DNNKernels`' own `mm2` gets this right (`T = accum(eltype(A))`, i.e.
+        # fp32 for fp16 operands) and three planning documents cite it as the
+        # scalar kernel that does — but `mm2` has no callers at all, and this is
+        # what actually runs.
+        #
+        # Audited across both packages: this is the ONLY reduction that types its
+        # accumulator from the destination. `attn_scores`, `attn_apply`,
+        # `memreadout_body` and `mm3` all widen with `accum(eltype(...))`, and the
+        # staged kernel below is gated to an fp32 destination so it cannot hit
+        # this. So it is one isolated gap in a convention the rest of the stack
+        # follows, not a pattern.
+        #
+        # How much it costs. Compare against the right baseline: the alternative
+        # is not an fp32 result, it is `mm3`'s fp32 ACCUMULATION rounded to an
+        # fp16 store, so fp16 output rounding (~3e-4, eps(Float16)/2) is a floor
+        # neither path beats. Both reductions run over identical fp16 operands
+        # against a Float64 reference; this is arithmetic, so it was measured on
+        # the host and holds wherever it runs.
+        #
+        #        K   fp32 accum -> fp16   fp16 accum      ratio
+        #       16            2.972e-04    9.429e-04       3.2x
+        #       32            3.182e-04    1.377e-03       4.3x
+        #      512            2.395e-04    4.189e-03      17.5x
+        #     5120            2.419e-04    1.415e-02      58.5x
+        #
+        # So the damage is a function of K and is modest at the short reductions:
+        # at K = 16-32 both sit inside fp16's own precision. It becomes serious
+        # at long ones, 1.4% of the largest element at Whisper's K = 5120.
+        #
+        # (Measuring against an fp32 destination instead shows ~10^4x, which is
+        # true and irrelevant: no reachable call has one, because a product with
+        # an fp32 destination takes the cooperative-matrix or staged path.)
+        #
+        # What bounds the exposure is how often an fp16 product actually gets
+        # here: `mm_coopmat_plan` declines only when `size(A,1)` or `size(A,2)`
+        # misses the 16-wide tile, and transformer dims (384, 768, 1536) do not,
+        # so most autocast matmuls take the cooperative-matrix path and never see
+        # this. Quantify that before assuming the models are affected.
+        #
+        # FIXED: the accumulator is now `gemmaccum(eltype(C))`, so an fp16
+        # destination reduces in fp32 and converts once on store. The paragraphs
+        # above are kept because they are the measurement that justified it and
+        # the reason not to "simplify" it back.
+        T = gemmaccum(eltype(C))
         acc = zero(T)
         ai = ao + (i - 1) * ar
         bj = bo + (j - 1) * bc
@@ -969,11 +1052,237 @@ gemmaccumtype(::Type{T}) where {T} = T
             k += 1
         end
         ci = co + (i - 1) * cr + (j - 1) * cc
-        # The scaling stays in the accumulator's precision too, and only the
-        # single store rounds — a `β * C[ci]` term evaluated in half would give
-        # back a chunk of what the wide accumulator just bought.
-        C[ci] = Tc(iszero(β) ? acc * T(α) : muladd(acc, T(α), T(C[ci]) * T(β)))
+        # `α`/`β` arrive in the destination's type; widen them so the epilogue
+        # stays in the accumulator's precision, and convert once at the store.
+        C[ci] = eltype(C)(iszero(β) ? acc * T(α) :
+                          muladd(acc, T(α), T(C[ci]) * T(β)))
     end
+    end
+end
+
+# ── the staged scalar GEMM ───────────────────────────────────────────────────
+#
+# `strided_gemm_kernel!` above declares no `@localmem` at all: one invocation per
+# output element, K walked in global memory, two global loads per `muladd`. At
+# 2048^3 on a Radeon 8060S that is **0.448 TFLOP/s** against 14.6 for the fp16
+# cooperative-matrix path, and it gets *worse* with size (0.531 at 1024^3), which
+# is what a kernel whose working set outgrows cache does.
+#
+# There is no fp32 shortcut to reach for instead. The driver reports 14
+# cooperative-matrix shapes and `FLOAT32` is in none of them as an A or B type,
+# only as an accumulator, which matches AMD's documented RDNA3 WMMA input set of
+# f16/bf16/iu8/iu4. Splitting fp32 into fp16 terms (the 3xTF32 approach) needs
+# three terms and so ~6 products, i.e. ~2.4 TFLOP/s from a 14.6 path, which is
+# *below* what this kernel does. A tiled scalar GEMM is the answer, not a
+# workaround for a missing one.
+#
+# Ported from the `#else` (non-`COOPMAT`) branch of `mul_mm.comp`, vendored at
+# `reference/mul_mm/` with its provenance. That is the same shader Lava's
+# cooperative-matrix GEMM came from, and the two branches share their staging, so
+# this is the other half of a port rather than a new kernel. Measured here:
+#
+#              Lava naive   this   fp16 coopmat
+#     1024^3        0.533   3.067         9.654       (5.8x)
+#     2048^3        0.447   5.432        14.577      (12.1x, 37% of the fp16 path)
+#
+# fp16 is 37% away and not reachable from here: there is no fp32 cooperative
+# matrix on this hardware to close it with, only a wider vector kernel.
+#
+# Two deviations from the reference, stated rather than silent:
+#
+#   * LAYOUT. ggml holds A row-major over (m, k); a `LavaArray` is column-major,
+#     and this kernel takes arbitrary `gemmstrides` besides. The *shared* layout
+#     is the reference's (`bufa[m * SHF + k]`); what changes is which index runs
+#     fastest in the staging loop, chosen so consecutive lanes still walk
+#     consecutive global addresses in the common unit-row-stride case.
+#   * NO V2 ACCUMULATOR PACKING. The reference keeps `sums` as `ACC_TYPEV2`,
+#     indexing `.x`/`.y` for two adjacent output rows through a flattened
+#     `sums_idx`. That is a GLSL vector-type artifact — its shared loads and
+#     `dot_product` are vector-typed and a flat array is the only way to index a
+#     register block there. Here each accumulator is named by its four `@nexprs`
+#     indices: same arithmetic, same register count, same store order.
+#
+# `WARP` is a tiling parameter, NOT a subgroup requirement: this branch uses no
+# subgroup operation, only an index decomposition, so the value need not match
+# the device's subgroup width and no capability query gates it.
+const SGEMM_BM, SGEMM_BN, SGEMM_BK = 64, 64, 32   # BK=32/BK_STEP=4 is the reference's F32 pair
+const SGEMM_WM, SGEMM_WN = 32, 32
+# ── the one place this departs from the reference's shipped numbers ──────────
+#
+# `mul_mm.comp` ships `WMITER = 2, TM = 4, TN = 2`; this is `2, 2, 2`. That is not
+# a divergence from the algorithm, it is a different point in the parameter space
+# the reference itself exposes: these are `layout (constant_id = ...)` spec
+# constants precisely because llama.cpp tunes them per device, and its defaults
+# are tuned for hardware that is not this one.
+#
+# Swept at 2048^3 on a Radeon 8060S, two runs, every config numerically verified
+# and constrained to satisfy the reference's own identities:
+#
+#     WMITER/TM/TN   BM x BN   acc  LDS(KB)   run1    run2
+#          2/4/2      64x64     16     17.0   4.687   4.557   <- reference default
+#          1/4/4      64x64     16     17.0   4.335   4.266
+#          2/2/2      64x64     16     17.0   5.041   5.060   <- this
+#          2/4/2     128x64     32     25.5   4.806   4.525
+#          2/4/2     64x128     32     25.5   4.948   4.956
+#          2/4/2    128x128     64     34.0   4.622   4.339
+#          4/4/2    128x128     64     34.0   4.057   4.255
+#          2/4/2  64x64 BK=64   16     33.0   3.971   3.907
+#
+# ~9% at a 0.4% spread, and there is a mechanism rather than just a number: at
+# `WMITER = WNITER = 2, TM = TN = 2` an invocation reads `WMITER*TM = 4` A-values
+# and `WNITER*TN = 4` B-values per k-step for 16 `fma`s, where 2/4/2 reads 8 and 2
+# for the same 16. Two FMAs per shared load against 1.6, with the same register
+# block and the same shared footprint. Widening the block further (128x128, 64
+# accumulators) loses, which is the spilling the file's opening note describes.
+const SGEMM_WMITER, SGEMM_TM, SGEMM_TN = 2, 2, 2
+const SGEMM_WARP = 64
+const SGEMM_BKSTEP = 4
+# `SHMEM_STRIDE` is `BK/2 + 1` V2s in the scalar branch and `BK/2 + 4` in the
+# cooperative-matrix one, so `GEMM_PAD = 4` is emphatically NOT the value here.
+const SGEMM_SHF = SGEMM_BK + 2
+const SGEMM_NUMWARPS = (SGEMM_BM ÷ SGEMM_WM) * (SGEMM_BN ÷ SGEMM_WN)
+const SGEMM_WG = SGEMM_NUMWARPS * SGEMM_WARP
+const SGEMM_WNITER = (SGEMM_WM * SGEMM_WN) ÷
+                     (SGEMM_WARP * SGEMM_TM * SGEMM_TN * SGEMM_WMITER)
+const SGEMM_WSUBM = SGEMM_WM ÷ SGEMM_WMITER
+const SGEMM_WSUBN = SGEMM_WN ÷ SGEMM_WNITER
+const SGEMM_AREPS = (SGEMM_BM * SGEMM_BK) ÷ SGEMM_WG
+const SGEMM_BREPS = (SGEMM_BK * SGEMM_BN) ÷ SGEMM_WG
+const SGEMM_NKSTEP = SGEMM_BK ÷ SGEMM_BKSTEP
+
+@eval begin
+    # `unsafe_indices=true` for the reason recorded above the coopmat staged
+    # kernel: the launch is an exact multiple of the workgroup and every index
+    # here comes from the group and local ids, so KA's `__validindex` guard is
+    # dead, and leaving it in kept the inner `muladd` under an `OpSelectionMerge`.
+    #
+    # Ragged extents are handled *inside* instead, exactly as the reference does:
+    # staging zero-fills out-of-range rows, columns and k, and the store is
+    # guarded. Zeros contribute nothing to the sum, so a partial block is exact
+    # rather than merely unread.
+    # `M` and `N` are `Val` alongside `K`, exactly as the cooperative-matrix
+    # staged kernel takes them. Not a style choice: with the extents as runtime
+    # arguments this measured 2.703 TFLOP/s at 2048^3 and 4.895 with them folded
+    # (both on the reference's tiling, before the sweep above chose 2/2/2),
+    # because every staging address and every bounds test is built from them. The
+    # cost is a SPIR-V module per (M, N, K, FAST), which is what the coopmat path
+    # already pays and what the frozen-kernel cache exists to absorb.
+    #
+    # It does mean a RECORDED FROZEN CACHE IS STALE once this kernel starts being
+    # selected: every product that used to compile one `strided_gemm_kernel!`
+    # variant per K now compiles one of these per shape instead. Re-record in a
+    # cold session and check `Lava.frozen_stats().misses == 0`, or first use will
+    # compile on the editor's hot path, which is the entire cost the freeze
+    # exists to remove.
+    # `FAST` is the reference's `is_aligned && is_in_bounds`, hoisted to a type
+    # parameter instead of a per-tile branch: true when the extents tile exactly
+    # and all three operands have unit row stride, so every bounds test and every
+    # stride multiply folds away. It is worth having rather than assuming the
+    # guards are cheap. At 2048^3, guarded-and-strided measured 2.988 TFLOP/s
+    # against 4.895 for the same kernel with none of it, so this branch is
+    # roughly the difference between a 6.8x and an 11x win over the kernel it
+    # replaces.
+    @kernel cpu=false unsafe_indices=true function scalar_gemm_staged_kernel!(
+            C, @Const(A), @Const(B), ::Val{M}, ::Val{N}, ::Val{K}, ::Val{FAST},
+            co, cr, cc_, ao, ar, ac, bo, br, bc, α, β, nblk_m) where {M,N,K,FAST}
+        bufa = @localmem Float32 ($SGEMM_BM * $SGEMM_SHF,)
+        bufb = @localmem Float32 ($SGEMM_BN * $SGEMM_SHF,)
+
+        tid = @index(Local, Linear) - 1
+        blk = @index(Group, Linear) - 1
+        ir = (blk % nblk_m) * $SGEMM_BM        # this workgroup's first row of C
+        ic = (blk ÷ nblk_m) * $SGEMM_BN        # ...and its first column
+
+        tiw    = tid % $SGEMM_WARP
+        warp_i = tid ÷ $SGEMM_WARP
+        tiwr   = tiw % ($SGEMM_WSUBM ÷ $SGEMM_TM)
+        tiwc   = tiw ÷ ($SGEMM_WSUBM ÷ $SGEMM_TM)
+        warp_r = warp_i % ($SGEMM_BM ÷ $SGEMM_WM)
+        warp_c = warp_i ÷ ($SGEMM_BM ÷ $SGEMM_WM)
+
+        Base.Cartesian.@nexprs $SGEMM_WNITER wsic -> Base.Cartesian.@nexprs $SGEMM_TN cn ->
+            Base.Cartesian.@nexprs $SGEMM_WMITER wsir -> Base.Cartesian.@nexprs $SGEMM_TM jj ->
+                s_wsic_cn_wsir_jj = zero(eltype(C))
+
+        for kb in 0:(cld(K, $SGEMM_BK) - 1)
+            k0 = kb * $SGEMM_BK
+            # A block: rows [ir, ir+BM) x cols [k0, k0+BK); `m` runs fastest, so
+            # consecutive lanes read consecutive addresses when `ar == 1`.
+            @inbounds for r in 0:($SGEMM_AREPS - 1)
+                idx = tid + r * $SGEMM_WG
+                m, kk = splitidx(idx, Val($SGEMM_BM))
+                i = ir + m; k = k0 + kk
+                bufa[1 + m * $SGEMM_SHF + kk] = if FAST
+                    Float32(A[ao + i + k * ac])
+                else
+                    (i < M) & (k < K) ? Float32(A[ao + i * ar + k * ac]) : 0.0f0
+                end
+            end
+            # B block: rows [k0, k0+BK) x cols [ic, ic+BN); `k` runs fastest.
+            @inbounds for r in 0:($SGEMM_BREPS - 1)
+                idx = tid + r * $SGEMM_WG
+                kk, n = splitidx(idx, Val($SGEMM_BK))
+                k = k0 + kk; j = ic + n
+                bufb[1 + n * $SGEMM_SHF + kk] = if FAST
+                    Float32(B[bo + k + j * bc])
+                else
+                    (k < K) & (j < N) ? Float32(B[bo + k * br + j * bc]) : 0.0f0
+                end
+            end
+            @synchronize
+
+            @inbounds Base.Cartesian.@nexprs $SGEMM_NKSTEP ii -> begin
+                kof = (ii - 1) * $SGEMM_BKSTEP
+                # cache_a[WMITER*TM], four k-values each: the reference's V4.
+                Base.Cartesian.@nexprs $SGEMM_WMITER wsir ->
+                    Base.Cartesian.@nexprs $SGEMM_TM jj -> begin
+                        ab_wsir_jj = 1 + (warp_r * $SGEMM_WM + (wsir - 1) * $SGEMM_WSUBM +
+                                          tiwr * $SGEMM_TM + (jj - 1)) * $SGEMM_SHF + kof
+                        a_wsir_jj_0 = bufa[ab_wsir_jj]
+                        a_wsir_jj_1 = bufa[ab_wsir_jj + 1]
+                        a_wsir_jj_2 = bufa[ab_wsir_jj + 2]
+                        a_wsir_jj_3 = bufa[ab_wsir_jj + 3]
+                    end
+                # One B vector live at a time, reloaded in the innermost loop.
+                # That is the reference's ordering and the register discipline the
+                # note above `GEMM_BK` records losing 64 registers to when the
+                # first port hoisted both operands instead.
+                Base.Cartesian.@nexprs $SGEMM_WNITER wsic ->
+                    Base.Cartesian.@nexprs $SGEMM_TN cn -> begin
+                        bb = 1 + (warp_c * $SGEMM_WN + (wsic - 1) * $SGEMM_WSUBN +
+                                  tiwc * $SGEMM_TN + (cn - 1)) * $SGEMM_SHF + kof
+                        b0 = bufb[bb]; b1 = bufb[bb + 1]
+                        b2 = bufb[bb + 2]; b3 = bufb[bb + 3]
+                        Base.Cartesian.@nexprs $SGEMM_WMITER wsir ->
+                            Base.Cartesian.@nexprs $SGEMM_TM jj ->
+                                # `dot_product()`: the reference's 4-deep fma chain.
+                                s_wsic_cn_wsir_jj =
+                                    muladd(a_wsir_jj_0, b0,
+                                    muladd(a_wsir_jj_1, b1,
+                                    muladd(a_wsir_jj_2, b2,
+                                    muladd(a_wsir_jj_3, b3, s_wsic_cn_wsir_jj))))
+                    end
+            end
+            @synchronize   # nothing may refill shared until every warp is done
+        end
+
+        @inbounds Base.Cartesian.@nexprs $SGEMM_WNITER wsic ->
+            Base.Cartesian.@nexprs $SGEMM_WMITER wsir -> begin
+                drw_wsic_wsir = ir + warp_r * $SGEMM_WM +
+                                (wsir - 1) * $SGEMM_WSUBM + tiwr * $SGEMM_TM
+                dcw_wsic_wsir = ic + warp_c * $SGEMM_WN +
+                                (wsic - 1) * $SGEMM_WSUBN + tiwc * $SGEMM_TN
+                Base.Cartesian.@nexprs $SGEMM_TN cn ->
+                    Base.Cartesian.@nexprs $SGEMM_TM jj -> begin
+                        i = drw_wsic_wsir + (jj - 1)
+                        j = dcw_wsic_wsir + (cn - 1)
+                        if FAST | ((i < M) & (j < N))
+                            ci = FAST ? co + i + j * cc_ : co + i * cr + j * cc_
+                            C[ci] = iszero(β) ? s_wsic_cn_wsir_jj * α :
+                                    muladd(s_wsic_cn_wsir_jj, α, C[ci] * β)
+                        end
+                    end
+            end
     end
 end
 
@@ -1039,9 +1348,10 @@ operands look like; `gemmstrides` unwraps them and only genuinely non-strided
 ones are copied.
 
 Uses cooperative matrices when the operands are dense fp16 into an fp32 result,
-the extents suit the tile, and the device implements it; otherwise the strided
-scalar kernel. That choice is an implementation detail — the result is the same
-either way.
+the extents suit the tile, and the device implements it. Failing that it uses the
+staged scalar GEMM, and failing *that* the per-element one; see `staged_gemm_ok`
+for which, and the header of this file for what the three are. That choice is an
+implementation detail: the result is the same either way, to fp32 reassociation.
 """
 function LinearAlgebra.mul!(C::LavaArray{T,2}, A::AbstractVecOrMat,
                             B::AbstractVecOrMat, α::Number, β::Number) where {T}
@@ -1263,6 +1573,92 @@ function LinearAlgebra.mul!(C::LavaArray{T,1}, A::AbstractVecOrMat,
     gemmlaunch!(C, A, B, M, 1, K, T(α), T(β))
 end
 
+# How many `BM x BN` tiles a product must cover before the staged kernel is worth
+# using. The quantity is the TILE COUNT, not the extents: one workgroup owns one
+# tile, so this is how many workgroups the launch has to fill the device with,
+# and a kernel that cannot fill it loses however good its inner loop is.
+#
+# Measured, both kernels in one session, TFLOP/s. Taken on the reference's
+# tiling, before the sweep above chose 2/2/2; the boundary was re-checked after
+# and 256 x 256 (exactly `SGEMM_MINTILES`) still wins, 1.27x.
+#
+#     shape                     tiles    naive   staged
+#     64 x 64 square                1    0.013    0.011
+#     192 x 192 square              9    0.169    0.161
+#     256 x 256 square             16    0.345    0.367
+#     64 x 1370   (attn*V plane)   22    0.548    0.893
+#     128 x 1370                   44    0.567    1.485
+#     192 x 1370                   66    0.587    2.270
+#     1370 x 1370 (Q*K' plane)    484    0.528    1.240
+#     2048 x 2048                1024    0.448    4.301
+#
+# Gating on `M` and `N` separately was tried first and is wrong: it sent the
+# 64 x 1370 plane to the per-element kernel on account of its 64 rows, and that
+# plane is the single largest operation in Depth Anything's forward pass. Sixteen
+# tiles is where the staged kernel stops losing. `test_gemm_staged_scalar.jl`
+# pins both sides so this cannot drift into "always staged" unmeasured.
+const SGEMM_MINTILES = 16
+
+# How much padded output a staged launch may compute for output it discards. A
+# tile is evaluated whole, so a product much narrower than `BN` (or shorter than
+# `BM`) pays the full tile for a sliver of it.
+#
+# Measured at K = 512, both kernels in one session, on shapes that clear
+# `SGEMM_MINTILES` so only the waste varies:
+#
+#     M     N   tiles  waste   naive  staged   ratio
+#    65  1370      44   2.02x  0.445   0.649   1.46x   staged
+#    66  1370      44   1.99x  0.379   0.531   1.40x   staged
+#    72  1370      44   1.83x  0.483   0.672   1.39x   staged
+#    96  1370      44   1.37x  0.673   0.622   0.92x   naive
+#   128  1370      44   1.03x  0.619   0.970   1.57x   staged
+#  2048    32      32   2.00x  0.408   0.434   1.06x   staged
+#  4096     8      64   8.00x  0.252   0.199   0.79x   naive
+#  2048     1      32  64.00x  0.025   0.015   0.61x   naive
+#
+# Read this honestly: in the 1x-2x band the result is NOT monotonic in waste (65
+# wins, 96 loses, 128 wins) and the naive column alone swings 40% across
+# near-identical shapes, so that band is measurement noise and the constant's
+# value there barely matters. What is unambiguous is the other end: at 8x and 64x
+# the per-element kernel wins by a margin far outside that noise.
+#
+# So this exists to exclude gross waste, and the boundary is somewhere in (2, 8].
+# Four is the midpoint consistent with every sample: nothing measured above 2x
+# lost except the 8x and 64x cases, and 2 was rejecting a 1.46x win. Do not read
+# more precision into it than that. Note also that K matters and is not in the
+# rule at all: the 64 x 1370 plane wins 1.63x at K = 1370 and ties at K = 512,
+# because a shorter reduction gives the staging less to amortise against.
+const SGEMM_MAXWASTE = 4
+
+"""
+Can this product use the staged kernel rather than the per-element one?
+
+Two independent requirements, and both are about correctness or waste rather
+than taste:
+
+  * **dtype.** The staged kernel's shared blocks are `Float32` and it accumulates
+    in `eltype(C)`, so it is exactly a `Float32` (or `Float16`-in) kernel. A
+    `Float64` or complex product would silently round through `Float32`, so those
+    keep the per-element kernel, which accumulates in `eltype(C)` throughout.
+  * **shape**, in two ways. One workgroup owns one `BM x BN` tile, so the tile
+    count is how many workgroups the launch has to fill the device with; below
+    `SGEMM_MINTILES` it cannot, and the per-element kernel's much larger grid
+    wins despite doing more work per output. But a tile is also computed *whole*
+    whether or not the product fills it, so a shape far off the tile grid pays
+    for output it discards. `mul!(::LavaArray{T,1}, ...)` arrives here as `N = 1`
+    and is the extreme: at `M = 2048` that is 32 tiles, enough to pass the count,
+    while computing a 64-wide column for one useful column. `SGEMM_MAXWASTE`
+    bounds the padded area against the real one.
+"""
+@inline function staged_gemm_ok(C, A, B, M, N)
+    eltype(C) === Float32 || return false
+    (eltype(A) === Float32 || eltype(A) === Float16) || return false
+    (eltype(B) === Float32 || eltype(B) === Float16) || return false
+    tm, tn = cld(M, SGEMM_BM), cld(N, SGEMM_BN)
+    tm * tn >= SGEMM_MINTILES || return false
+    return (tm * SGEMM_BM) * (tn * SGEMM_BN) <= SGEMM_MAXWASTE * M * N
+end
+
 function gemmlaunch!(C, A, B, M, N, K, α, β)
     a = gemmstrides(A)
     a === nothing && (a = gemmstrides(densify(A)))
@@ -1270,7 +1666,22 @@ function gemmlaunch!(C, A, B, M, N, K, α, β)
     b === nothing && (b = gemmstrides(densify(B)))
     c = gemmstrides(C)
     # See the note in `mul!` above: the backend comes from the destination.
-    strided_gemm_kernel!(KernelAbstractions.get_backend(c[1]))(c[1], a[1], b[1], Val(K),
+    backend = KernelAbstractions.get_backend(c[1])
+    if staged_gemm_ok(C, A, B, M, N)
+        nblk_m = cld(M, SGEMM_BM)
+        nblk_n = cld(N, SGEMM_BN)
+        # The reference's `is_aligned && is_in_bounds`, decided once on the host:
+        # exact tiling in all three extents and unit row stride on every operand.
+        fast = M % SGEMM_BM == 0 && N % SGEMM_BN == 0 && K % SGEMM_BK == 0 &&
+               a[3] == 1 && b[3] == 1 && c[3] == 1
+        scalar_gemm_staged_kernel!(backend, SGEMM_WG)(
+            c[1], a[1], b[1], Val(M), Val(N), Val(K), Val(fast),
+            c[2], c[3], c[4], a[2], a[3], a[4], b[2], b[3], b[4],
+            eltype(C)(α), eltype(C)(β), nblk_m;
+            ndrange = nblk_m * nblk_n * SGEMM_WG)
+        return C
+    end
+    strided_gemm_kernel!(backend)(c[1], a[1], b[1], Val(K),
                                         c[2], c[3], c[4],
                                         a[2], a[3], a[4],
                                         b[2], b[3], b[4],

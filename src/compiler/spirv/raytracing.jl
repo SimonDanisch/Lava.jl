@@ -522,11 +522,12 @@ end
 # the flag is unavailable we treat SER as unsupported and emit the implicit
 # OpTraceRayKHR fallback so the SPIR-V stays valid without the NV capability.
 function _ser_available_for_emit()
-    try
-        return vk_context().ser_available
-    catch
-        return false
-    end
+    # "No device initialised" is the documented case above, and it is the only
+    # one that may answer `false`: a context that EXISTS but errors on a field
+    # read is a bug, and treating it as "SER unsupported" would silently emit the
+    # slower fallback forever.
+    VK_CONTEXT_REF[] === nothing && return false
+    return (VK_CONTEXT_REF[]::VkContext).ser_available
 end
 
 """

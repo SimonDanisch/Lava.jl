@@ -74,9 +74,9 @@ end
     end
 end
 
-@testset "gemmaccumtype widens only the half type" begin
-    @test Lava.gemmaccumtype(Float16) === Float32
-    @test Lava.gemmaccumtype(Float32) === Float32
-    @test Lava.gemmaccumtype(Float64) === Float64
-    @test Lava.gemmaccumtype(Int32)   === Int32
+@testset "gemmaccum widens only the half type" begin
+    @test Lava.gemmaccum(Float16) === Float32
+    @test Lava.gemmaccum(Float32) === Float32
+    @test Lava.gemmaccum(Float64) === Float64
+    @test Lava.gemmaccum(Int32)   === Int32
 end

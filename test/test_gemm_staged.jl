@@ -205,6 +205,7 @@ end
         @test Lava.gemm_padn(1280, 72, 1280) == 80     # 128/80  = 1.60, refused
         # Already on a 64-wide block: nothing to pay, nothing to refuse.
         @test Lava.gemm_padn(1280, 192, 1280) == 192
+    end
 end
 
 @testset "the aliasing rule keeps the 96-row block off its bad stride" begin
