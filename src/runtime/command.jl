@@ -1461,16 +1461,30 @@ Called from `pack_args_direct!` at each buffer-typed leaf, and directly at
 dispatch entry points for objects not in the kernel arg tuple (pipelines,
 closures, RT AS handles, indirect buffers).
 """
-# `===` in an explicit loop, NOT `obj in batch.pinned`.
+# `===` in an explicit loop rather than `obj in batch.pinned`, and the reason is
+# NOT the one an earlier version of this comment gave. It claimed `pinned` was a
+# `Vector{Any}` whose `in` fell back to a generic `==`. It is an `IdSet{Any}`,
+# whose `in` is already identity-based and O(1) — verified directly:
+# `big1 in IdSet[big2]` is `false` for equal-content distinct arrays. The swap
+# fixed no correctness bug; there was none.
 #
-# `pinned` is a `Vector{Any}`, so `in` dispatches `isequal` -> the generic `==`
-# for every element, which recurses through struct fields and allocates. Pinning
-# is an IDENTITY question — "is this same object already kept alive by this
-# batch" — and the comment on `record_dispatch!` calls the container an IdSet for
-# exactly that reason. `===` answers it without a generic comparison.
+# What it did buy is 48.8 bytes per dispatch, measured — from boxing at this
+# call site, where `obj` is not inferred, rather than from `in` itself (both
+# forms allocate zero when the argument is concretely typed).
 #
-# Worth 48.8 bytes on every dispatch, measured; the pipeline is re-pinned once
-# per dispatch and hits the already-present branch almost every time.
+# THE TRADE IS SIZE-DEPENDENT, so it is written down. The scan is O(n) where the
+# hash is O(1); measured on this device:
+#
+#     |pinned|     IdSet `in`     === scan
+#            4       0.221 us      0.04 us
+#           64       0.21          0.10
+#          256       0.22          0.33     <- crossover
+#         4096       0.11          2.37
+#
+# A Whisper encode holds **129** entries in the open batch, i.e. essentially at
+# the crossover: this is break-even today, chosen for the bytes. It degrades
+# quadratically if batches grow, and `auto_submit_threshold` (64) is what sets
+# that. **Raise the threshold and this should go back to `in`.**
 @inline function pin!(batch::CommandBatch, obj)
     for x in batch.pinned
         x === obj && return nothing
@@ -1482,7 +1496,9 @@ end
 @inline function pin!(batch::CommandBatch, buf::VkManagedBuffer)
     bq = batch.bq::BatchQueue
     @assert buf.ctx === bq.ctx  "cross-ctx buffer use forbidden"
-    for x in batch.pinned            # identity, not `in` — see the method above
+    # Same trade as the method above, for the same reason: `in` on this `IdSet`
+    # is identity too, so this is about the boxing, not about correctness.
+    for x in batch.pinned
         x === buf && return nothing
     end
     push!(batch.pinned, buf)
