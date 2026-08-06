@@ -554,6 +554,34 @@ struct IterPlan{Ctx}
 end
 
 """
+One cached `IterPlan` plus the `(ndrange, workgroupsize)` it was built for.
+
+**Why an entry type instead of a `Dict` key.** The cache was
+`Dict{Any,IterPlan}` keyed on `(typeof(obj), ndrange, workgroupsize)`, so every
+dispatch hashed a HETEROGENEOUS tuple — a `DataType` beside an `Int` beside a
+`Nothing` — through dynamic `hash`/`isequal`. Measured against the alternatives:
+
+    Dict{Any,IterPlan}       (heterogeneous key)   7.9 ns
+    Dict{Any,IterPlan{Ctx}}  (concrete VALUES)     8.1 ns   <- values do not help
+    IdDict + linear scan     (pointer compare)     3.2 ns
+    concrete-field compare                         ~0 ns
+
+Making the *value* type concrete does nothing for lookup time; the key is the
+cost. `K` is a type parameter so the scan can test `q isa IterEntry{K}` — and `K`
+is known at the call site, because the caller has `ndrange` in hand — after which
+`q.key === k` is an `===` on a concrete isbits tuple rather than a hash.
+
+`plan` stays `Any` on purpose: it is boxed exactly once at build time, and the
+launch path types it with a single function barrier. A `Vector{IterEntry{K}}`
+would store entries INLINE and re-box on every read, which is the trap
+`DeviceCaches.launchplans` documents.
+"""
+struct IterEntry{K}
+    key::K
+    plan::Any
+end
+
+"""
     DeviceCaps
 
 What a kernel needs to know about the device it is about to run on, answered once
@@ -637,7 +665,24 @@ mutable struct DeviceCaches
     pipeline_order::Vector{UInt64}
     # `Dict{Any,…}` because GPUCompiler.cached_compilation derives the key itself.
     linked::Dict{Any,LavaLinkedKernel}
-    launchplans::IdDict{DataType,Vector{LaunchPlan}}
+    # `Vector{Any}`, NOT `Vector{LaunchPlan}` — and the difference is one heap
+    # allocation on EVERY dispatch, on the path that HITS this cache.
+    #
+    # `LaunchPlan` is an immutable struct with reference fields, so it is not
+    # `isbitstype`. Julia stores such structs INLINE in a typed `Vector`, which
+    # means pulling one out has to materialise it — a 64-byte box per read, even
+    # though the plan was already built and nothing is being constructed:
+    #
+    #     scan over Vector{Immut}  ->  64 bytes
+    #     scan over Vector{Any}    ->   0 bytes   (element is already a box;
+    #                                             reading hands back a pointer)
+    #
+    # A `Vector{Any}` holding one concrete type reads as sloppy, so: the
+    # alternative is making `LaunchPlan` mutable, which also measures 0 bytes but
+    # changes the type's semantics for every holder and failed a Lava test. This
+    # keeps the struct immutable and pays a `::LaunchPlan` typeassert on read,
+    # which is free. See `launch_plan`.
+    launchplans::IdDict{DataType,Vector{Any}}
     prepare_indirect::Union{Nothing,PrepareIndirect}
     pool::DevicePool
     # 0 means "not yet queried" — the device never reports 0.
@@ -675,7 +720,10 @@ mutable struct DeviceCaches
     # `maxComputeWorkGroupCount` therefore handed the second one the first one's
     # block grid. Same class as the caches above; it survived the first sweep
     # because that census matched `= Ref` and this is a `Dict`.
-    iterplans::Dict{Any,IterPlan}
+    # `IdDict` keyed by kernel TYPE (a pointer compare), holding `IterEntry`
+    # values scanned linearly — not a `Dict` on a heterogeneous tuple. See
+    # `IterEntry` for the measurements.
+    iterplans::IdDict{DataType,Vector{Any}}
     # Scratch buffers. These hold DEVICE MEMORY, so a process-wide one is the
     # defect the memory pool had: the second device is handed the first's buffer.
     # Both were already keyed by context, which is the surrogate a field replaces.
@@ -690,9 +738,9 @@ end
 # `DevicePool()` resolves at call time, long after `memory.jl` is loaded.
 DeviceCaches() = DeviceCaches(
     Dict{UInt64,LavaComputePipeline}(), UInt64[],
-    Dict{Any,LavaLinkedKernel}(), IdDict{DataType,Vector{LaunchPlan}}(),
+    Dict{Any,LavaLinkedKernel}(), IdDict{DataType,Vector{Any}}(),
     nothing, DevicePool(), 0, nothing, nothing, false,
     Dict{UInt64,CompiledGraphicsPipeline}(), Dict{UInt64,LavaGfxShader}(),
     nothing, nothing, 0, 1.0, Any[],
     Dict{Tuple{DataType,DataType,Any},Any}(), nothing,
-    Dict{Any,IterPlan}(), nothing, nothing, Any[])
+    IdDict{DataType,Vector{Any}}(), nothing, nothing, Any[])

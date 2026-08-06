@@ -387,10 +387,20 @@ end
 # to launch a given kernel shape decided the block grid for every device after.
 function get_or_build_iter_plan(obj::KA.Kernel{LavaBackend}, ndrange, workgroupsize,
                                 vkctx::VkContext)
-    key = (typeof(obj), ndrange, workgroupsize)
+    # `K` is known at THIS call site — the caller has `ndrange` in hand — so the
+    # scan below tests a concrete `IterEntry{K}` and compares an isbits tuple with
+    # `===`. No hash of a heterogeneous key, no dynamic `isequal`. See `IterEntry`.
+    k = (ndrange, workgroupsize)
+    K = typeof(k)
     cache = vkctx.caches.iterplans
-    plan = get(cache, key, nothing)
-    plan === nothing || return plan::IterPlan
+    v = get(cache, typeof(obj), nothing)
+    if v !== nothing
+        for q in v
+            if q isa IterEntry{K} && q.key === k
+                return q.plan
+            end
+        end
+    end
 
     ndr_canon, _ws, iterspace, _dyn = KA.launch_config(obj, ndrange, workgroupsize)
     ka_ctx  = KA.mkcontext(obj, ndr_canon, iterspace)
@@ -404,7 +414,7 @@ function get_or_build_iter_plan(obj::KA.Kernel{LavaBackend}, ndrange, workgroups
         ws_3d      = (nthreads, 1, 1)
         new_plan   = IterPlan(ka_ctx, block_dims, ws_3d, nblocks)
     end
-    cache[key] = new_plan
+    push!(get!(() -> Any[], cache, typeof(obj)), IterEntry{K}(k, new_plan))
     return new_plan
 end
 
@@ -600,6 +610,80 @@ function (obj::KA.Kernel{LavaBackend})(args...; ndrange=nothing, workgroupsize=n
     # static NDRange/WG-size and F type parameters. Cache the whole plan so the
     # second-and-later launch with the same shape is one Dict lookup.
     plan = get_or_build_iter_plan(obj, ndrange, workgroupsize, bq.ctx::VkContext)
+    # NOTE the `nblocks == 0` check lives inside the barrier, not here. Reading
+    # any field off `plan` at this point is a dynamic `getfield` on an abstract
+    # value, which boxes — the very cost the barrier exists to remove.
+    # FUNCTION BARRIER, and it is worth 176 bytes on every dispatch.
+    #
+    # `IterPlan{Ctx}` is parametric, so the `::IterPlan` the cache lookup can
+    # promise is a UnionAll, not a concrete type. Reading `plan.ka_ctx` /
+    # `.block_dims` / `.ws_3d` inline here is therefore a dynamic `getfield` that
+    # boxes its result — 32 bytes each, measured — and because `ka_ctx` then has
+    # no type, the `all_args` tuple downstream cannot be inferred either, for
+    # another 80.
+    #
+    # Handing `plan` to a separate function costs ONE dynamic dispatch and makes
+    # every use of it inside concrete. This is the standard cure for an
+    # unavoidably-abstract value on a hot path, and the alternative (threading
+    # `Ctx` through the caller) would infect the whole entry point with a type
+    # parameter that exists only to satisfy inference.
+    return launch_planned!(bq, obj, args, plan, tlas)
+end
+
+"""
+    Lava.compiled(kernel, ndrange; workgroupsize = nothing) -> LavaKernel
+
+A kernel with its iteration plan already resolved and **concretely typed**, so a
+launch is a static call with no cache lookup and no boxing.
+
+The plain path cannot get there. `IterPlan{Ctx}` is parametric, the per-device
+cache can only promise the `IterPlan` UnionAll, and every route out of an
+abstract container costs at least one dynamic dispatch — measured, on an
+otherwise-warm dispatch that builds nothing:
+
+    abstract cache, fields read inline   96 bytes
+    abstract cache + function barrier    16 bytes     <- the plain path today
+    plan held in a concrete field         0 bytes     <- this
+
+`Ctx` is a pure function of the kernel TYPE (verified: identical for ndrange 16,
+1000, 1024 and 4096) and is `isbits`, so resolving it once at construction is
+sound — the plan's *values* depend on `ndrange`, its *type* never does. That is
+what makes holding it legitimate rather than a cache that can go stale on shape.
+
+`P` is a type parameter so a caller that stores a `LavaKernel` in a concretely
+typed field gets `lk.plan` for free. Storing one in a `::LavaKernel` field (the
+UnionAll) throws that away and lands back on the dynamic path — parameterise the
+holder, e.g. `struct MyOp{KK}; kern::KK; end`.
+"""
+struct LavaKernel{K,P,Q}
+    inner::K
+    plan::P
+    # The queue, RESOLVED. `LavaBackend` stores `dispatch_bq::Union{BatchQueue,
+    # Nothing}` and has no `bq` field, so `backend.bq` goes through an accessor
+    # that does not infer concretely — and leaving it abstract made this whole
+    # idea BACKFIRE: the call below stayed dynamic, and a dynamic call has to box
+    # its arguments, so a concrete `IterPlan{Ctx}` (a large isbits struct) got
+    # copied into a fresh box on every launch. Measured 144 B/dispatch, i.e.
+    # THREE TIMES the abstract-plan barrier it was meant to beat. Typing the plan
+    # is worthless unless the call it feeds is static.
+    bq::Q
+end
+
+function compiled(obj::KA.Kernel{LavaBackend}, ndrange; workgroupsize = nothing)
+    bq = obj.backend.bq
+    plan = get_or_build_iter_plan(obj, ndrange, workgroupsize, bq.ctx::VkContext)
+    # `P` and `Q` come from the runtime types here, once, off the hot path.
+    return LavaKernel(obj, plan, bq)
+end
+
+"""Launch a [`compiled`](@ref) kernel: no lookup, no barrier, static dispatch."""
+function (lk::LavaKernel)(args...)
+    tlas = find_tlas_in_args(args)
+    return launch_planned!(lk.bq, lk.inner, args, lk.plan, tlas)
+end
+
+@noinline function launch_planned!(bq::BatchQueue, obj::KA.Kernel{LavaBackend},
+                                   args::Tuple, plan::IterPlan, tlas)
     plan.nblocks == 0 && return nothing
     ka_ctx     = plan.ka_ctx
     block_dims = plan.block_dims
@@ -715,11 +799,21 @@ Internal launch function for KA kernels. Compiles and dispatches the GPU functio
                              wg::NTuple{3,Int}, ray_query::Bool)
     key = typeof(all_args)
     world = Base.get_world_counter()
-    # `bq.ctx` — the queue has always carried its context; see `vk_context`.
-    cache = launch_plan_cache(bq.ctx)
+    # `bq.ctx::VkContext`, and the assert is the whole point: `BatchQueue.ctx` is
+    # declared `::Any` (it must be — `VkContext` owns the queue, so one direction
+    # of the cycle is untyped). Without the assert `ctx.caches.launchplans` infers
+    # as `Any`, which makes the `get` below a dynamic dispatch and the loop over
+    # `v` a fully dynamic iteration — measured at **464 bytes per dispatch**, on a
+    # warm cache that builds nothing. Every other `bq.ctx` in this file already
+    # carries the assert; this one did not.
+    cache = launch_plan_cache(bq.ctx::VkContext)
     v = get(cache, key, nothing)
     if v !== nothing
-        for p in v
+        for q in v
+            # `q::LaunchPlan` on an element of a `Vector{Any}` is a pointer
+            # check, not a copy. Iterating a `Vector{LaunchPlan}` instead boxes
+            # 64 bytes here on every dispatch — see `DeviceCaches.launchplans`.
+            p = q::LaunchPlan
             (p.world === world && p.wg === wg && p.ray_query === ray_query) && return p
         end
     end
@@ -738,8 +832,8 @@ end
     p = LaunchPlan(compiled, pipeline, offsets, byval_sizes, base,
                    base + compute_inline_extra_from_byval(byval_sizes),
                    world, wg, ray_query)
-    v = get!(() -> LaunchPlan[], launch_plan_cache(bq.ctx), key)
-    filter!(q -> q.world === world, v)   # entries from a superseded world are dead
+    v = get!(() -> Any[], launch_plan_cache(bq.ctx), key)
+    filter!(q -> (q::LaunchPlan).world === world, v)  # superseded worlds are dead
     push!(v, p)
     p
 end

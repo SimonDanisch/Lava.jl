@@ -496,6 +496,7 @@ end
 
         @testset "debug configuration" begin
             include(joinpath(@__DIR__, "test_debug_config.jl"))
+            include(joinpath(@__DIR__, "test_dispatch_allocation.jl"))
         end
 
         @testset "batched 1D FFT" begin

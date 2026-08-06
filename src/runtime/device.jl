@@ -82,7 +82,7 @@ and batch state. Multiple `BatchQueue`s can record and submit independently
 
 Create with `BatchQueue(device, queue, queue_family_index)`.
 """
-mutable struct BatchQueue
+mutable struct BatchQueue{C}
     device::Vulkan.Device
     queue::Vulkan.Queue
     family_index::UInt32
@@ -144,11 +144,26 @@ mutable struct BatchQueue
     # that grows as needed via get_staging!. Reused across transfers.
     # Loose type — VkManagedBuffer is declared later in memory.jl.
     staging::Union{Nothing, Any}
-    # Back-reference to owning VkContext. Set post-construction by
-    # the VkContext constructor / allocate_batch_queue!. `nothing` only during the brief
-    # window of default_bq construction before VkContext exists.
-    # Loose type — VkContext is declared below.
-    ctx::Any
+    # Back-reference to owning VkContext.
+    #
+    # `::C`, a TYPE PARAMETER, not `::Any`. `VkContext` is declared ~280 lines
+    # below this struct, so the field cannot name it directly — that ordering is
+    # the only reason it was ever untyped. A parameter closes the cycle without
+    # needing the name: `VkContext` holds a `BatchQueue{VkContext}`, exactly the
+    # shape `struct Node; next::Vector{Node}; end` already uses.
+    #
+    # Untyped, `bq.ctx.caches.<anything>` inferred as `Any`, which made the
+    # launch-plan lookup a dynamic dispatch and its loop a dynamic ITERATION:
+    # **464 bytes of allocation on every dispatch**, on a warm cache that builds
+    # nothing. The workaround was `bq.ctx::VkContext` written at eight separate
+    # call sites, and the ninth (the plan lookup) simply forgot it. A parameter
+    # makes it structural — there is no site left that can forget.
+    #
+    # The previous comment claimed this could be `nothing` "during the brief
+    # window of default_bq construction". It cannot: `VkContext`'s inner
+    # constructor is two-phase via `new()` precisely so a live `ctx` exists
+    # before `BatchQueue(...)` is called, and every call site passes one.
+    ctx::C
     # Single-writer invariant: only this thread may record into or submit
     # from this BatchQueue.  Captured at construction from `Threads.threadid()`.
     # Every dispatch-recording / sweep / slab-alloc entry point asserts that
@@ -371,7 +386,9 @@ mutable struct VkContext
     # non-nothing after the inner constructor returns (BatchQueue is built
     # using `new()`-based two-phase init to break the chicken-and-egg with
     # BatchQueue.ctx).
-    default_bq::BatchQueue
+    # `BatchQueue{VkContext}`, not the UnionAll — otherwise `ctx.default_bq` is
+    # abstract and the parameter above buys nothing at this end of the cycle.
+    default_bq::BatchQueue{VkContext}
     # Secondary compute queue (async RT) — same family, separate queue object
     compute_queue::Vulkan.Queue
     # Ray tracing (nothing if not available)

@@ -1169,8 +1169,15 @@ function submit!(bq::BatchQueue)
     # in `present_frame!`, because a compute-only queue never presents and would
     # otherwise never be allowed to rewind at all.
     arg_pool_in_use!(bq, batch.signal_value)
-    bq.last_dispatch_info = "$saved_dispatch_count dispatches ($(saved_last_was_rt ? "RT" : "compute"))"
     dg = (bq.ctx::VkContext).diag
+    # GATED. This built a fresh `String` on EVERY submit — 7.9 bytes per dispatch
+    # amortised — for a field only ever read by `maybe_write_dispatch_start_
+    # timestamp!` (which returns -1 immediately unless `dispatch_timing`) and by
+    # the hwtlas debug strings (gated on `dispatch_logging`). Same shape as the
+    # slab-scan bug: a diagnostic doing real work while switched off.
+    if dg.dispatch_logging || dg.dispatch_timing
+        bq.last_dispatch_info = "$saved_dispatch_count dispatches ($(saved_last_was_rt ? "RT" : "compute"))"
+    end
     Threads.atomic_add!(dg.total_dispatches, saved_dispatch_count)
     if dg.dispatch_logging
         append!(dg.dispatch_log, batch.dispatch_log)
@@ -1454,8 +1461,20 @@ Called from `pack_args_direct!` at each buffer-typed leaf, and directly at
 dispatch entry points for objects not in the kernel arg tuple (pipelines,
 closures, RT AS handles, indirect buffers).
 """
+# `===` in an explicit loop, NOT `obj in batch.pinned`.
+#
+# `pinned` is a `Vector{Any}`, so `in` dispatches `isequal` -> the generic `==`
+# for every element, which recurses through struct fields and allocates. Pinning
+# is an IDENTITY question — "is this same object already kept alive by this
+# batch" — and the comment on `record_dispatch!` calls the container an IdSet for
+# exactly that reason. `===` answers it without a generic comparison.
+#
+# Worth 48.8 bytes on every dispatch, measured; the pipeline is re-pinned once
+# per dispatch and hits the already-present branch almost every time.
 @inline function pin!(batch::CommandBatch, obj)
-    obj in batch.pinned && return nothing
+    for x in batch.pinned
+        x === obj && return nothing
+    end
     push!(batch.pinned, obj)
     return nothing
 end
@@ -1463,7 +1482,9 @@ end
 @inline function pin!(batch::CommandBatch, buf::VkManagedBuffer)
     bq = batch.bq::BatchQueue
     @assert buf.ctx === bq.ctx  "cross-ctx buffer use forbidden"
-    buf in batch.pinned && return nothing
+    for x in batch.pinned            # identity, not `in` — see the method above
+        x === buf && return nothing
+    end
     push!(batch.pinned, buf)
     return nothing
 end

@@ -43,7 +43,15 @@ end
     # The inner constructor takes a raw primary queue and builds default_bq
     # itself; there's no way to get a VkContext with default_bq unset after
     # the constructor returns.
-    @test fieldtype(Lava.VkContext, :default_bq) === Lava.BatchQueue
+    #
+    # `<:`, not `===`. The assertion is that the field admits no `nothing` — it
+    # was written as identity against the bare `BatchQueue`, which also pinned
+    # the field to the UnionAll and broke when `BatchQueue` gained its `{C}`
+    # parameter. `BatchQueue{VkContext}` satisfies the intent MORE strongly (it
+    # is concrete), so test the property, not one spelling of it.
+    T = fieldtype(Lava.VkContext, :default_bq)
+    @test T <: Lava.BatchQueue
+    @test !(Nothing <: T)
 end
 
 end  # @testset
