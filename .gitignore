@@ -1,1 +1,4 @@
 Manifest.toml
+
+# --track-allocation=user output; never source
+*.mem
