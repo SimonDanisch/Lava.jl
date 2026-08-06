@@ -513,6 +513,35 @@ function concurrent_dispatch_group(f::F) where F
     end
 end
 
+"""
+    exclusive_dispatch_group(f)
+
+Run `f()` with the automatic inter-dispatch barrier back on, whatever group is
+open around it.
+
+For a caller that has derived the dependencies between *units of work* but not
+inside them. A render graph knows what each pass reads and writes and emits the
+barrier between passes itself, which is the whole reason it opens a
+`concurrent_dispatch_group`; it knows nothing about the launches within one pass
+when that pass is an opaque body. Suppressing barriers there is not an
+optimisation, it is a race — an operator whose second kernel reads what its first
+wrote is ordinary, and a two-pass reduction or a split-K matmul is exactly that.
+
+So the group is lifted for the body, and the caller sets `bq.next_skip_barrier`
+if the *first* launch in it is the one it already emitted a barrier for.
+"""
+function exclusive_dispatch_group(f::F) where F
+    prev_active  = CONCURRENT_GROUP_ACTIVE[]
+    prev_started = CONCURRENT_GROUP_STARTED[]
+    CONCURRENT_GROUP_ACTIVE[] = false
+    try
+        f()
+    finally
+        CONCURRENT_GROUP_ACTIVE[]  = prev_active
+        CONCURRENT_GROUP_STARTED[] = prev_started
+    end
+end
+
 # ── Deferred indirect dispatch group ──
 #
 # An indirect dispatch's args read depends on its own prepare-indirect

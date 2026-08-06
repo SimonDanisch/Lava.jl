@@ -24,7 +24,7 @@ public dense, lavaroot, lavabacked
 public fft, fft!, rfft, rfft!, fftany!, fftmixed!, stft, hannwindow,
        fftplan, fftplan_mixed, fftgroup
 export set_dispatch_logging!, get_dispatch_log
-export concurrent_dispatch_group, concurrent_indirect_group
+export concurrent_dispatch_group, concurrent_indirect_group, exclusive_dispatch_group
 export verify_gpu_av
 
 # Graphics exports
