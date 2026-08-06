@@ -1,0 +1,248 @@
+        - # GPUCompiler target definition for Lava.jl
+        - #
+        - # Uses GPUCompiler.SPIRVCompilerTarget with backend=:llvm to get the
+        - # spirv64-unknown-unknown-unknown triple. We only use GPUCompiler for
+        - # LLVM IR generation (compile(:llvm, ...)), never for SPIR-V codegen —
+        - # that's handled by our custom emitter.
+        - 
+        - # ── Compiler parameters ──
+        - 
+        - struct LavaCompilerParams <: GPUCompiler.AbstractCompilerParams
+        -     workgroup_size::NTuple{3,Int}
+        -     enable_ray_query::Bool
+        - end
+        - LavaCompilerParams() = LavaCompilerParams((64, 1, 1), false)
+        - LavaCompilerParams(workgroup_size::NTuple{3,Int}) = LavaCompilerParams(workgroup_size, false)
+        - 
+        - const LavaCompilerConfig = GPUCompiler.CompilerConfig{GPUCompiler.SPIRVCompilerTarget, LavaCompilerParams}
+        - const LavaCompilerJob = GPUCompiler.CompilerJob{GPUCompiler.SPIRVCompilerTarget, LavaCompilerParams}
+        - 
+        - # ── Device runtime stubs ──
+        - #
+        - # GPUCompiler's lower_throw! pass converts `throw(...)` into calls to these
+        - # runtime functions. On GPU we can't throw, so they're no-ops. The pass then
+        - # inserts `llvm.trap` + `unreachable` after these calls, which our LLVM passes
+        - # (rm_trap!, replace_unreachable!) clean up before SPIR-V emission.
+        - 
+        - module LavaRuntime
+        -     signal_exception() = return
+        -     report_exception(ex) = return
+        -     report_oom(sz) = return
+        -     report_exception_name(ex) = return
+        -     report_exception_frame(idx, func, file, line) = return
+        - 
+        -     # GPUCompiler's runtime expects malloc/free for dynamic allocation.
+        -     # On GPU these are no-ops that return null — dynamic allocation is not
+        -     # supported in Vulkan compute shaders. The compiler should eliminate
+        -     # these via dead code elimination in practice.
+        -     malloc(sz) = reinterpret(Ptr{Nothing}, UInt(0))
+        -     free(ptr) = return
+        - end
+        - 
+        - # ── Method table for device overrides ──
+        - #
+        - # @lava_device_override puts methods on this table, which GPUCompiler uses
+        - # instead of the regular method table during compilation. This lets us
+        - # replace CPU functions with GPU-safe versions (e.g., intrinsics, math).
+        - 
+        - Base.Experimental.@MethodTable lava_method_table
+        - 
+        - macro lava_device_override(ex)
+        -     esc(quote
+        -         Base.Experimental.@overlay($lava_method_table, $ex)
+        -     end)
+        - end
+        - 
+        - # ── GPUCompiler hooks ──
+        - 
+        - GPUCompiler.runtime_module(::LavaCompilerJob) = LavaRuntime
+        - 
+        - GPUCompiler.method_table(::LavaCompilerJob) = lava_method_table
+        - 
+        - # Vulkan doesn't use GPUCompiler's kernel state mechanism
+        - GPUCompiler.kernel_state_type(::LavaCompilerJob) = Nothing
+        - 
+        - # ── Disable loop unswitching ──
+        - #
+        - # GPUCompiler's optimizer runs `SimpleLoopUnswitchPass` (twice, at opt_level≥2).
+        - # When a loop contains a branch on a loop-invariant condition, unswitching
+        - # duplicates the loop into two bodies dispatched on that condition. After our
+        - # StructurizeCFG pipeline this becomes two sequential guarded loops joined by
+        - # `Flow` selection-merge blocks. That SPIR-V is valid and semantically correct
+        - # (spirv-val passes, and it matches the LLVM IR), but **NVIDIA's shader compiler
+        - # miscompiles it** — a comparison inside one of the unswitched loop bodies
+        - # silently returns the wrong result. This corrupted, with no error, anything
+        - # with a loop-invariant branch in a loop: e.g. every `Base.isless`-based merge
+        - # sort binary search (AcceleratedKernels.sort!), where the loop-invariant
+        - # operand's NaN check is the branch that gets unswitched.
+        - #
+        - # Unswitching is a pure optimization (never required for correctness) and brings
+        - # little benefit on a GPU — a branch on a uniform/loop-invariant condition is
+        - # cheap and doesn't diverge, while the duplicated loop body just enlarges the
+        - # shader. So we drop ONLY `SimpleLoopUnswitchPass` and keep every other loop
+        - # optimization (LICM, rotation, indvar simplify, unroll, …). This is the general
+        - # root-cause fix for the whole "loop-invariant branch miscompiles on NVIDIA"
+        - # class; pinned by `test_loop_unswitch_miscompile.jl`.
+        - #
+        - # This mirrors GPUCompiler's own `buildLoopOptimizerPipeline` verbatim except for
+        - # the two omitted `SimpleLoopUnswitchPass` lines. Passes live in LLVM.jl; the
+        - # `instcombine_pass`/`*Callbacks`/`BasicSimplifyCFGOptions` helpers are
+        - # GPUCompiler-internal. Dispatching on our own `LavaCompilerJob` makes this a
+        - # normal (precompile-safe) method extension, not piracy. If GPUCompiler's
+        - # pipeline changes upstream, re-sync this body (the regression test will catch a
+        - # silent unswitch reintroduction).
+        - function GPUCompiler.buildLoopOptimizerPipeline(fpm, job::LavaCompilerJob, opt_level)
+        -     # All pass/helper symbols are qualified `GPUCompiler.` — that's the namespace
+        -     # the original pipeline uses them from (some, e.g. LowerSIMDLoopPass /
+        -     # JuliaLICMPass, live in LLVM.Interop and are not bare `LLVM` bindings).
+        0     GPUCompiler.add!(fpm, GPUCompiler.NewPMLoopPassManager(; use_memory_ssa=true)) do lpm
+        0         GPUCompiler.add!(lpm, GPUCompiler.LowerSIMDLoopPass())
+        0         if opt_level >= 2
+        0             GPUCompiler.add!(lpm, GPUCompiler.LoopInstSimplifyPass())
+        0             GPUCompiler.add!(lpm, GPUCompiler.LoopSimplifyCFGPass())
+        0             GPUCompiler.add!(lpm, GPUCompiler.LICMPass(; allowspeculation=false))
+        0             GPUCompiler.add!(lpm, GPUCompiler.JuliaLICMPass())
+        0             GPUCompiler.add!(lpm, GPUCompiler.LoopRotatePass())
+        0             GPUCompiler.add!(lpm, GPUCompiler.LICMPass())
+        0             GPUCompiler.add!(lpm, GPUCompiler.JuliaLICMPass())
+        -             # SimpleLoopUnswitchPass intentionally omitted — see comment above.
+        -         end
+        -         if LLVM.version() >= v"17"
+        0             GPUCompiler.add!(lpm, GPUCompiler.LateLoopOptimizationsCallbacks(; opt_level))
+        -         end
+        -     end
+        0     if opt_level >= 2
+        0         GPUCompiler.add!(fpm, GPUCompiler.IRCEPass())
+        -     end
+        0     GPUCompiler.add!(fpm, GPUCompiler.SimplifyCFGPass(; GPUCompiler.BasicSimplifyCFGOptions...))
+        0     GPUCompiler.add!(fpm, GPUCompiler.instcombine_pass(job))
+        0     GPUCompiler.add!(fpm, GPUCompiler.NewPMLoopPassManager()) do lpm
+        0         if opt_level >= 2
+        0             GPUCompiler.add!(lpm, GPUCompiler.LoopIdiomRecognizePass())
+        0             GPUCompiler.add!(lpm, GPUCompiler.IndVarSimplifyPass())
+        -             # SimpleLoopUnswitchPass intentionally omitted — see comment above.
+        0             GPUCompiler.add!(lpm, GPUCompiler.LoopDeletionPass())
+        0             GPUCompiler.add!(lpm, GPUCompiler.LoopFullUnrollPass())
+        -         end
+        -         if LLVM.version() >= v"17"
+        0             GPUCompiler.add!(lpm, GPUCompiler.LoopOptimizerEndCallbacks(; opt_level))
+        -         end
+        -     end
+        - end
+        - 
+        - # Allow SPIR-V intrinsic function calls to pass IR validation.
+        - # llvm.spv.* intrinsics are used by the LLVM SPIR-V backend.
+        - # OpenCL-mangled names (_Z*) are registered dynamically by our intrinsics
+        - # module when @builtin_ccall is used.
+        - const KNOWN_INTRINSICS = String[]
+        - 
+        - function GPUCompiler.isintrinsic(::LavaCompilerJob, fn::String)
+        -     # LLVM SPIR-V intrinsics (used by the SPIR-V backend for workgroup/subgroup ops)
+        0     startswith(fn, "llvm.spv.") && return true
+        -     # Custom _lava_glsl_* externals → SPIR-V emitter maps to GLSL.std.450
+        0     startswith(fn, "_lava_glsl_") && return true
+        -     # RT intrinsics → SPIR-V emitter maps to OpTraceRayKHR, payload load/store
+        0     startswith(fn, "_lava_rt_") && return true
+        -     # @lava_printf externals → SPIR-V emitter maps to NonSemantic.DebugPrintf
+        0     startswith(fn, "_lava_debug_printf_") && return true
+        -     # OpenCL C++ mangled builtins (thread indices, barriers, math)
+        0     fn in KNOWN_INTRINSICS && return true
+        0     return false
+        - end
+        - 
+        - # Override check_invocation to allow types with zero-sized non-isbits fields.
+        - # Julia's broadcast wraps functions in RefValue{typeof(f)} which is not isbits
+        - # but has sizeof == 0 and gets elided by LLVM. GPUCompiler's default check
+        - # rejects these, but they're safe to pass to GPU since they carry no data.
+        - function GPUCompiler.check_invocation(job::LavaCompilerJob)
+        0     sig = job.source.specTypes
+        0     for (arg_i, dt) in enumerate(sig.parameters)
+        0         GPUCompiler.isghosttype(dt) && continue
+        0         Core.Compiler.isconstType(dt) && continue
+        0         fieldcount(dt) == 0 && continue
+        0         if !isbitstype(dt) && !is_gpu_compatible(dt)
+        0             throw(GPUCompiler.KernelError(job, "passing non-bitstype argument",
+        -                 """Argument $arg_i to your kernel function is of type $dt, which is not a bitstype:
+        -                    $(GPUCompiler.explain_nonisbits(dt))
+        - 
+        -                    Only bitstypes can be used in GPU kernels."""))
+        -         end
+        0     end
+        0     return
+        - end
+        - 
+        - # Check if a non-isbits type is still GPU-compatible by verifying all
+        - # non-isbits fields are zero-sized (will be elided by LLVM).
+        - #
+        - # `Base.allocatedinline(t)` is the predicate that captures both:
+        - #   - non-concrete/UnionAll types (`Vector`, `Tuple`, `Tuple{Vararg{Int}}`)
+        - #   - concrete-but-flexible-size builtins (`Memory{T}`, `Symbol`, `String`),
+        - #     which are heap-referenced and would trip `sizeof` if we called it.
+        - # Anything not allocated inline carries a heap reference and is therefore
+        - # not GPU-compatible.  Once `allocatedinline` is true, `sizeof` is safe.
+        - function is_gpu_compatible(@nospecialize(dt::Type))
+        0     isbitstype(dt) && return true
+        0     Base.allocatedinline(dt) || return false
+        0     sizeof(dt) == 0 && return true
+        0     for i in 1:fieldcount(dt)
+        0         ft = fieldtype(dt, i)
+        0         isbitstype(ft) && continue
+        0         Base.allocatedinline(ft) || return false
+        0         sizeof(ft) == 0 && continue
+        0         is_gpu_compatible(ft) || return false
+        0     end
+        0     return true
+        - end
+        - 
+        - # ── Compiler configuration cache ──
+        - 
+        - const COMPILER_CONFIGS = Dict{UInt, LavaCompilerConfig}()
+        - 
+        - """
+        -     lava_compiler_config(; workgroup_size=(64,1,1)) -> LavaCompilerConfig
+        - 
+        - Get or create a cached compiler configuration. The configuration sets up
+        - GPUCompiler's SPIRVCompilerTarget with:
+        - - backend=:llvm for the spirv64 triple (required for LLVM IR generation)
+        - - validate=false (we validate SPIR-V ourselves after our custom emitter)
+        - - supports_fp64=true (AMD RX 7900 XTX supports Float64)
+        - - always_inline=true (SPIR-V requires all functions inlined for compute)
+        - - kernel=true (entry point is a kernel, not a regular function)
+        - """
+        - function lava_compiler_config(; workgroup_size::NTuple{3,Int} = (64, 1, 1),
+        -                                enable_ray_query::Bool = false,
+        -                                kwargs...)
+        0     h = hash((workgroup_size, enable_ray_query, kwargs))
+        0     config = get(COMPILER_CONFIGS, h, nothing)
+        0     if config !== nothing
+        0         return config
+        -     end
+        0     config = lava_full_compiler_config(; workgroup_size, enable_ray_query, kwargs...)
+        0     COMPILER_CONFIGS[h] = config
+        0     return config
+        - end
+        - 
+        0 @noinline function lava_full_compiler_config(;
+        -         kernel = true,
+        -         name = nothing,
+        -         # GPUCompiler's `always_inline=true` raises Julia's inline_cost_threshold
+        -         # to MAX_INLINE_COST, which forces every callee into the entry function
+        -         # at Julia IR level — overriding even `@noinline`. That was needed when
+        -         # Lava's SPIR-V emitter could only handle single-OpFunction kernels, but
+        -         # now that Lava's force_inline_all! supports multi-OpFunction output
+        -         # (force_inline_all=false default), we want Julia/GPUCompiler to respect
+        -         # `@noinline` so callees like `trace_shadow_transmittance` (which has a
+        -         # self-contained ray-query lifecycle) can survive as a separate
+        -         # OpFunction and keep their state out of the caller's register frame.
+        -         always_inline = false,
+        -         workgroup_size::NTuple{3,Int} = (64, 1, 1),
+        -         enable_ray_query::Bool = false,
+        -         kwargs...)
+        0     target = GPUCompiler.SPIRVCompilerTarget(;
+        -         backend = :llvm,       # gives spirv64-unknown-unknown-unknown triple
+        -         validate = false,      # we validate after our custom SPIR-V emitter
+        -         supports_fp64 = true,  # AMD RX 7900 XTX supports Float64
+        -     )
+        0     params = LavaCompilerParams(workgroup_size, enable_ray_query)
+        0     GPUCompiler.CompilerConfig(target, params; kernel, name, always_inline)
+        - end
