@@ -53,6 +53,12 @@ mutable struct CommandBatch
     pinned_refs::Vector{Any}
     dispatch_log::Vector{String}
     sealed_cmd_bufs::Vector{Vulkan.CommandBuffer}  # Completed CB segments awaiting submit
+    # Segments already handed to the queue, still being read by the GPU. They
+    # leave `sealed_cmd_bufs` at submit — a batch outlives a single frame, and a
+    # sealed segment left in that list would be submitted again by the next
+    # present — but they cannot go back to `free_cmd_bufs` there either, because
+    # only `reclaim_batch!` knows the fence has passed. So they wait here.
+    submitted_cmd_bufs::Vector{Vulkan.CommandBuffer}
 
     # Timeline value this batch will signal on its queue's `timeline_sem`.
     # Assigned at record time so `sync_access!` can store it into `buf.last_write`.
@@ -211,6 +217,7 @@ function init_batch(cb::Vulkan.CommandBuffer)
     sizehint!(pinned, 128)
     waits = Tuple{Vulkan.Semaphore, UInt64, Vulkan.PipelineStageFlag2}[]
     return CommandBatch(cb, false, 0, 0, false, pinned, Any[], String[],
+        Vulkan.CommandBuffer[],
         Vulkan.CommandBuffer[],
         UInt64(0),                       # signal_value (assigned at record time)
         waits,

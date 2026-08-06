@@ -485,8 +485,27 @@ function present_frame!(bq::BatchQueue, win::RenderWindow)
         Vulkan.SemaphoreSubmitInfo(win.render_finished[win.current_image_idx + 1], UInt64(0), UInt32(0);
             stage_mask=Vulkan.PIPELINE_STAGE_2_ALL_COMMANDS_BIT),
     ]
-    cb_info = Vulkan.CommandBufferSubmitInfo(cmd, UInt32(0))
-    submit_info = Vulkan.SubmitInfo2(wait_infos, [cb_info], signal_infos)
+    # Sealed segments first, then the one still being recorded — the same order
+    # `submit!` uses, and for the same reason: `maybe_split_cb!` ends the current
+    # CB mid-frame and starts a fresh one, so everything recorded before the split
+    # lives in `sealed_cmd_bufs`. Submitting only `batch.cmd_buf` here dropped it,
+    # silently: no validation error, because nothing is invalid about commands
+    # that are simply never handed to the queue. What it looked like was a frame
+    # that did nothing, once every `cb_split_threshold` dispatches — and for a
+    # graph whose first pass clears a counter that a later pass accumulates into,
+    # a lost clear means the counter never restarts and the consumer indexes off
+    # the end of its buffer.
+    cb_infos = [Vulkan.CommandBufferSubmitInfo(cb, UInt32(0)) for cb in batch.sealed_cmd_bufs]
+    push!(cb_infos, Vulkan.CommandBufferSubmitInfo(cmd, UInt32(0)))
+    # Moved out of `sealed_cmd_bufs`, or the next frame submits them again: this
+    # batch is reused across frames and `reclaim_batch!` is what normally empties
+    # that list, which does not happen between two presents. Re-submitting a
+    # sealed segment executes it twice — harmless for a clear, wrong for anything
+    # that accumulates. They cannot go straight back to `free_cmd_bufs` either;
+    # the GPU is still reading them until the fence. `reclaim_batch!` drains this.
+    append!(batch.submitted_cmd_bufs, batch.sealed_cmd_bufs)
+    empty!(batch.sealed_cmd_bufs)
+    submit_info = Vulkan.SubmitInfo2(wait_infos, cb_infos, signal_infos)
     queue_submit_2!(bq, [submit_info]; fence=win.in_flight[fi])
 
     # Store batch in window's per-frame slot — it will be reclaimed in

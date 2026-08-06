@@ -293,6 +293,13 @@ function ensure_active_batch!(bq::BatchQueue)
             # Fresh open on reused batch — assign the timeline value it will
             # signal, so record_buffer_access! can write it into buf.last_write.
             batch.signal_value = bq.next_timeline + 1
+            # `vkBeginCommandBuffer` has just reset this command buffer, so the
+            # segment starts empty and its dispatch count starts with it.
+            # (Hygiene, not a fix: zeroing it here does not change the periodic
+            # dropped frame — measured, bursts unchanged at every 600 frames for
+            # a 20-dispatch graph. Whatever `cb_split_threshold` is doing to that
+            # is not this counter surviving a reopen.)
+            batch.segment_dispatches = 0
         end
         return batch
     end
@@ -368,6 +375,11 @@ function reclaim_batch!(bq::BatchQueue, batch::CommandBatch)
     empty!(batch.dispatch_log)
     append!(bq.free_cmd_bufs, batch.sealed_cmd_bufs)
     empty!(batch.sealed_cmd_bufs)
+    # Segments `present_frame!` already submitted: the fence has passed by the
+    # time a batch is reclaimed, so the GPU is done reading them and they can go
+    # back to the pool with the rest.
+    append!(bq.free_cmd_bufs, batch.submitted_cmd_bufs)
+    empty!(batch.submitted_cmd_bufs)
     push!(bq.free_batches, batch)
     # Note: pool reset + deferred-free drain are done in `sweep_retired_batches!`
     # AFTER the batch is actually removed from `bq.in_flight` (reclaim_batch! is

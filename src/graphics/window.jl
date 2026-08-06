@@ -317,6 +317,13 @@ function acquire_next_image!(win::RenderWindow)
         old_batch.last_was_rt = false
         empty!(old_batch.pinned)
         empty!(old_batch.wait_semaphores)
+        # The command-buffer segments `present_frame!` sealed and submitted for
+        # this frame. The fence above says the GPU is done with them, and this is
+        # the only place a presented batch is reclaimed — `reclaim_batch!` runs
+        # for `submit!`'s batches, not these — so without this they are never
+        # returned and every split allocates a fresh one for good.
+        append!((old_batch.bq::BatchQueue).free_cmd_bufs, old_batch.submitted_cmd_bufs)
+        empty!(old_batch.submitted_cmd_bufs)
         push!((old_batch.bq::BatchQueue).free_batches, old_batch)
         win.frame_batches[fi] = nothing
     end
