@@ -1,0 +1,41 @@
+// Source of truth for the SPV_NV_tensor_addressing / coopmat2 tensor opcodes in
+// `src/compiler/spirv/module.jl`. It is not run — it is COMPILED, and its binary
+// is read for the numbers, the same way the reduce/per-element opcodes above them
+// were obtained. `test_tensor_opcodes.jl` re-derives them from this file and
+// compares, so a mistyped constant fails a test instead of producing a module the
+// driver rejects three layers away.
+//
+// It also records a fact that is easy to get wrong and that no amount of reading
+// the coopmat2 spec alone reveals: this needs TWO extensions. The layout and view
+// types and everything that builds them are `SPV_NV_tensor_addressing`
+// (capability `TensorAddressingNV`); only `OpCooperativeMatrixLoadTensorNV` is
+// `SPV_NV_cooperative_matrix2` (capability `CooperativeMatrixTensorAddressingNV`).
+//
+// Build (what the test does):
+//   glslang -V --target-env vulkan1.3 -S comp tensor_addressing_opcodes.comp -o /tmp/x.spv
+//
+// The shape mirrors llama.cpp's `mul_mm_cm2.comp`, which is the port target: a
+// layout is created, given its dimensions, sliced to the block this workgroup
+// owns, and handed straight to the matrix load — no shared-memory staging at all.
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_NV_cooperative_matrix2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 32) in;
+layout(binding = 0) buffer A { float16_t a[]; };
+layout(binding = 1) buffer O { float o[]; };
+
+void main() {
+    // OpCreateTensorLayoutNV / OpTypeTensorLayoutNV
+    tensorLayoutNV<2> tl = createTensorLayoutNV(2);
+    // OpTensorLayoutSetDimensionNV
+    tl = setTensorLayoutDimensionNV(tl, 64, 64);
+    // OpCreateTensorViewNV / OpTypeTensorViewNV — the transpose, as a view
+    tensorViewNV<2, false, 1, 0> tv = createTensorViewNV(2, false, 1, 0);
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> m;
+    // OpTensorLayoutSliceNV feeding OpCooperativeMatrixLoadTensorNV
+    coopMatLoadTensorNV(m, a, 0, sliceTensorLayoutNV(tl, 0, 16, 0, 16));
+    o[0] = float(m[0]);
+}

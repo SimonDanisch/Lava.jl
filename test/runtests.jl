@@ -106,6 +106,10 @@ end
     # ── Tier 1b: Compiler IR passes (no GPU) ──
     @testset "Tier 1b: Compiler IR passes" begin
         include(joinpath(@__DIR__, "test_replace_unreachable.jl"))
+        # `Op`/`Cap` are hand-maintained tables; a wrong constant surfaces as a
+        # module the driver rejects, far from the typo. Re-derives them from
+        # glslang. No GPU, skips when glslang is absent.
+        include(joinpath(@__DIR__, "test_tensor_opcodes.jl"))
     end
 
     # ── Tier 3a: Workgroup barrier-skip fix (GPU; catches lavapipe deadlock) ──

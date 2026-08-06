@@ -226,6 +226,31 @@ module Op
     # `coopMatReduceNV`, not from a remembered table.
     const OpCooperativeMatrixReduceNV                     = UInt16(5366)
     const OpCooperativeMatrixPerElementOpNV               = UInt16(5369)
+    # Tensor addressing — the operand-staging half of coopmat2, and it is TWO
+    # extensions, not one. The layout/view types and everything that builds them
+    # come from `SPV_NV_tensor_addressing` (capability `TensorAddressingNV`);
+    # only the load itself is `SPV_NV_cooperative_matrix2` (capability
+    # `CooperativeMatrixTensorAddressingNV`). Requiring just the latter produces a
+    # module the driver rejects.
+    #
+    #   %l  = OpCreateTensorLayoutNV                       (no operands)
+    #   %l' = OpTensorLayoutSetDimensionNV %l %d0 %d1 …
+    #   %s  = OpTensorLayoutSliceNV %l' %off0 %sz0 %off1 %sz1 …
+    #   %v  = OpCreateTensorViewNV                         (no operands)
+    #   %m  = OpCooperativeMatrixLoadTensorNV %ptr %object %s <operands-mask>
+    #
+    # Numbers read out of a SPIR-V binary that glslang produced for
+    # `test/glsl/tensor_addressing_opcodes.comp`, matched to the disassembly by
+    # result id — same method as the two above, not a remembered table.
+    # `test/test_tensor_opcodes.jl` re-derives them from that shader and fails if
+    # any constant here disagrees.
+    const OpTypeTensorLayoutNV                            = UInt16(5370)
+    const OpTypeTensorViewNV                              = UInt16(5371)
+    const OpCreateTensorLayoutNV                          = UInt16(5372)
+    const OpTensorLayoutSetDimensionNV                    = UInt16(5373)
+    const OpTensorLayoutSliceNV                           = UInt16(5375)
+    const OpCreateTensorViewNV                            = UInt16(5377)
+    const OpCooperativeMatrixLoadTensorNV                 = UInt16(5367)
     # VK_KHR_ray_query opcodes (SPV_KHR_ray_query)
     const OpTypeRayQueryKHR                               = UInt16(4472)
     const OpRayQueryInitializeKHR                         = UInt16(4473)
@@ -325,6 +350,13 @@ module Cap
     # `CoopMat2Caps` in runtime/device.jl. NVIDIA-only.
     const CooperativeMatrixReductionsNV            = UInt32(5430)
     const CooperativeMatrixPerElementOperationsNV  = UInt32(5432)
+    # Tensor addressing needs BOTH of these, from two different extensions:
+    # `TensorAddressingNV` (SPV_NV_tensor_addressing) for the layout/view types
+    # and their builders, `CooperativeMatrixTensorAddressingNV`
+    # (SPV_NV_cooperative_matrix2) for `OpCooperativeMatrixLoadTensorNV` itself.
+    # Read off a glslang-produced binary, same as the opcodes.
+    const CooperativeMatrixTensorAddressingNV      = UInt32(5433)
+    const TensorAddressingNV                       = UInt32(5439)
     const RayQueryKHR                   = UInt32(4472)
     const CooperativeMatrixKHR          = UInt32(6022)
     # SER (SPV_NV_shader_invocation_reorder).  Value per the SPIR-V unified1
