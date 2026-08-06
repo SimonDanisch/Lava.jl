@@ -77,6 +77,51 @@ end
     Lava.copyto!(pointer(out), 1, TB, acc)
 end
 
+# ── Does the slice cost AMORTISE? The arms above do one muladd per load, the
+# lowest intensity a GEMM can have. A 64x64 tile issues 16 muladds per pair of
+# slices, so the prediction from the numbers above (slice/load ~= 2.24) is that
+# the slice falls to 2.24/(16+2.24) ~= 12% of the loop. Predicted is not
+# measured, so: same loop, 16 muladds per slice.
+const MULS = 16
+
+@kernel cpu = false function tensor_amortised_bench!(out, @Const(src))
+    acc = Lava.coopmat_zero(AMb{Float32,TB,TB,Lava.Accumulator})
+    b = Lava.coopmat_zero(AMb{Float16,TB,TB,Lava.MatrixB})
+    base = Lava.tensor_setdim(
+               Lava.tensor_layout(Val(2), Val(Lava.TENSOR_CLAMP_CONSTANT)),
+               (Int32(EXT), Int32(EXT)))
+    za = Lava.coopmat_zero(AMb{Float16,TB,TB,Lava.MatrixA})
+    for r in 0:((REPS ÷ MULS) - 1)
+        o = Int32((r % (EXT ÷ TB)) * TB)
+        l = Lava.tensor_slice(base, (Int32(0), o), (Int32(TB), Int32(TB)))
+        a = Lava.tensor_load(za, UInt64(pointer(src)), l)
+        for _ in 1:MULS
+            acc = Lava.coopmat_muladd(a, b, acc)
+        end
+    end
+    Lava.copyto!(pointer(out), 1, TB, acc)
+end
+
+# The control for it: identical muladd count, slice hoisted. The ratio of these
+# two is the real per-block slice overhead at GEMM intensity.
+@kernel cpu = false function tensor_amortised_fixed!(out, @Const(src))
+    acc = Lava.coopmat_zero(AMb{Float32,TB,TB,Lava.Accumulator})
+    b = Lava.coopmat_zero(AMb{Float16,TB,TB,Lava.MatrixB})
+    l = Lava.tensor_slice(
+            Lava.tensor_setdim(
+                Lava.tensor_layout(Val(2), Val(Lava.TENSOR_CLAMP_CONSTANT)),
+                (Int32(EXT), Int32(EXT))),
+            (Int32(0), Int32(0)), (Int32(TB), Int32(TB)))
+    za = Lava.coopmat_zero(AMb{Float16,TB,TB,Lava.MatrixA})
+    for _ in 0:((REPS ÷ MULS) - 1)
+        a = Lava.tensor_load(za, UInt64(pointer(src)), l)
+        for _ in 1:MULS
+            acc = Lava.coopmat_muladd(a, b, acc)
+        end
+    end
+    Lava.copyto!(pointer(out), 1, TB, acc)
+end
+
 ctx = Lava.vk_context()
 if !ctx.coopmat2.tensor_addressing
     @info "no coopmat2 tensor addressing on this device"
@@ -90,7 +135,9 @@ else
     arms = ("strided varying" => () -> strided_load_bench!(back, (Int(WG),))(out, src; ndrange = (Int(WG),)),
             "strided fixed"   => () -> strided_fixed_bench!(back, (Int(WG),))(out, src; ndrange = (Int(WG),)),
             "tensor varying"  => () -> tensor_load_bench!(back, (Int(WG),))(out, src; ndrange = (Int(WG),)),
-            "tensor fixed"    => () -> tensor_fixed_bench!(back, (Int(WG),))(out, src; ndrange = (Int(WG),)))
+            "tensor fixed"    => () -> tensor_fixed_bench!(back, (Int(WG),))(out, src; ndrange = (Int(WG),)),
+            "amort varying"   => () -> tensor_amortised_bench!(back, (Int(WG),))(out, src; ndrange = (Int(WG),)),
+            "amort fixed"     => () -> tensor_amortised_fixed!(back, (Int(WG),))(out, src; ndrange = (Int(WG),)))
     run(f) = (f(); KA.synchronize(back))
     for (_, f) in arms; run(f); end       # compile every arm before timing any
 
@@ -113,6 +160,10 @@ else
             res["tensor varying"][1] / res["tensor fixed"][1])
     @printf("cost of re-offsetting    strided varying/fixed = %.3fx\n",
             res["strided varying"][1] / res["strided fixed"][1])
+    sl = res["tensor varying"][1] / res["tensor fixed"][1] - 1     # slice/load
+    @printf("\nat %d muladds per slice  measured %.3fx overhead, predicted %.3fx\n",
+            MULS, res["amort varying"][1] / res["amort fixed"][1],
+            1 + sl / MULS)
     println("\nThe fixed arms isolate the LOAD; the varying/fixed ratios price the")
     println("address arithmetic each path needs per k-block. A single overall ratio")
     println("blames whichever half you already suspected.")
