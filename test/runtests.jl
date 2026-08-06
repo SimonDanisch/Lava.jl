@@ -9,6 +9,49 @@
 using Test
 using Lava
 
+# ── Preflight: is this the environment the suite needs? ──────────────────────
+#
+# This suite is written against the VideoEdit umbrella project, not against
+# Lava's own. Two things follow from that and neither announces itself:
+#
+#   * `test_gemm_staged.jl` imports **DNNKernels**, which is downstream of Lava
+#     and therefore can never be one of its dependencies. Under `Pkg.test("Lava")`
+#     it is simply absent.
+#   * Lava's `[sources]` pins Raycore but NOT Vulkan, so `Pkg.test` resolves a
+#     registry Vulkan while the umbrella project uses the vendored `dev/Vulkan`.
+#     A different compiler stack emits different SPIR-V: the coopmat kernels in
+#     `test_shared_index_division.jl` come out with an `OpPhi` whose result type
+#     is `%uint` and whose incoming value is a cooperative matrix, and spirv-val
+#     rejects them. **Nine "SPIR-V validation failed" errors that are not bugs.**
+#
+# Every package below is one a test file does `using` on. When one is missing the
+# file throws at `include` time and Test reports it as an *error in that testset*,
+# which reads exactly like a broken kernel. That cost a full debugging pass on
+# 2026-08-06: 33 such errors, every one of them a missing package, and the pass
+# count was 11178 where a correct environment gives 23687 — less than half the
+# suite was running and nothing said so.
+#
+# Warn rather than abort: most of the suite does run without these, and a partial
+# run is worth having. The point is that it says which parts are not running.
+let required = ["Adapt", "Atomix", "ColorTypes", "DNNKernels", "FileIO",
+                "GPUArrays", "GPUArraysCore", "GPUCompiler", "GeometryBasics",
+                "JLD2", "KernelAbstractions", "LLVM", "Raycore",
+                "SPIRV_LLVM_Backend_jll", "StaticArrays", "StructArrays", "Vulkan"]
+    missing_pkgs = filter(p -> Base.find_package(p) === nothing, required)
+    if !isempty(missing_pkgs)
+        @warn """
+        $(length(missing_pkgs)) package(s) the tests import are not reachable from the active
+        project. Every testset that needs one will report an ERROR that looks like a
+        code failure and is not. Run from the umbrella project instead:
+
+            julia --project=<VideoEdit root> dev/Lava/test/runtests.jl
+
+        `Pkg.test("Lava")` is NOT equivalent — it resolves its own environment,
+        without DNNKernels and with a different Vulkan than the vendored one.
+        """ missing_pkgs
+    end
+end
+
 # Load test utilities once — individual files guard with @isdefined(SPIRVTestUtils)
 include(joinpath(@__DIR__, "spirv_test_utils.jl"))
 import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count, check_regex, normalize_spirv, compare_golden, compile_and_disasm, spirv_opt_roundtrip, check_vendor_safety, compile_with_llc
@@ -17,9 +60,13 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
 # A ~3-minute subset for local CI iteration (`act`, smoke-checking workflow
 # changes, fast loop after touching the emitter).  Triggered by either:
 #
-#     julia> Pkg.test("Lava"; test_args=["fast"])
-#     $  LAVA_FAST=1 julia --project -e 'using Pkg; Pkg.test()'
-#     $  julia --project test/runtests.jl fast
+#     $  julia --project=<VideoEdit root> dev/Lava/test/runtests.jl fast
+#     $  LAVA_FAST=1 julia --project=<VideoEdit root> dev/Lava/test/runtests.jl
+#
+# The `Pkg.test("Lava"; test_args=["fast"])` spelling used to be listed first here
+# and is wrong for this repo — see the preflight above for what it silently
+# changes. It is the reason nine SPIR-V validation "failures" were once chased as
+# emitter bugs.
 #
 # Includes the categories that have historically caught regressions:
 #   Tier 1 SPIR-V emission, Tier 3 GPU execution, Tier 3c atomics & dispatch,
