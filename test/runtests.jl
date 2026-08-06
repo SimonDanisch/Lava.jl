@@ -118,6 +118,11 @@ end
     # orientation.
     @testset "Tier 3a3: coopmat2 tensor load" begin
         include(joinpath(@__DIR__, "test_tensor_load.jl"))
+        # And what a PRODUCT of two tensor-loaded operands computes, which the
+        # load test cannot say: the load returns the transpose of its block, so
+        # the product is `P' * Q'`. A GEMM cannot be routed through this until
+        # that is pinned, and all four candidate orientations look sane.
+        include(joinpath(@__DIR__, "test_tensor_gemm.jl"))
     end
 
     # ── Tier 3a: Workgroup barrier-skip fix (GPU; catches lavapipe deadlock) ──
