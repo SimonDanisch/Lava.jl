@@ -62,6 +62,17 @@ function parse_coopmat_name(fn_name::AbstractString)
     (op, dtype, M, N, use, rowmajor)
 end
 
+"""Size in bytes of the dtype suffix used in the intrinsic name — the alignment
+a `PhysicalStorageBuffer` access has to declare."""
+function coopmat_component_bytes(dtype::AbstractString)
+    dtype == "f16" && return 2
+    dtype == "f32" && return 4
+    dtype == "f64" && return 8
+    (dtype == "i8" || dtype == "u8") && return 1
+    (dtype == "i32" || dtype == "u32") && return 4
+    error("unsupported cooperative-matrix component type: $dtype")
+end
+
 """Component type id for the dtype suffix used in the intrinsic name."""
 function coopmat_component_type!(state::SPIRVEmitterState, dtype::AbstractString)
     mod = state.mod
@@ -307,6 +318,126 @@ function coopmat_spill_once!(state::SPIRVEmitterState, var_id::UInt32, m_id::UIn
     get(state.coopmat_var_contents, var_id, nothing) === m_id && return nothing
     encode_instruction!(state.mod.functions, Op.OpStore, var_id, m_id)
     state.coopmat_var_contents[var_id] = m_id
+    return nothing
+end
+
+"""
+    parse_tensor_name(fn_name) -> (op, dim, clamp, rest) | nothing
+
+Invert the tensor-addressing intrinsic names, which are
+`_lava_tensor_<op>_<dim>_<clamp>[_<rest>]`. `dim` and `clamp` ride in the name
+for the same reason the matrix shape does: they are operands of the TYPE, built
+from constants, and no constant can be a runtime value.
+"""
+function parse_tensor_name(fn_name::AbstractString)
+    startswith(fn_name, "_lava_tensor_") || return nothing
+    parts = split(fn_name, '_')
+    # ["", "lava", "tensor", op, dim, clamp, rest...]
+    length(parts) >= 6 || return nothing
+    op = parts[4]
+    dim = tryparse(Int, parts[5]);   dim === nothing && return nothing
+    cl  = tryparse(UInt32, parts[6]); cl === nothing && return nothing
+    (op, dim, cl, parts[7:end])
+end
+
+"""
+    emit_tensor_call!(state, inst, fn_name) -> nothing
+
+Lower one `_lava_tensor_*` call — the `SPV_NV_tensor_addressing` half of the
+coopmat2 staging path. Dispatched from `emit_call!`.
+
+A layout is an SSA value exactly as a cooperative matrix is, so the handle's
+LLVM value maps straight to the SPIR-V result id and needs no variable or slot.
+Every operand other than the type parameters is a runtime `<id>`: the dimensions
+and the slice offsets are ordinary i32 values, which is the entire point — the
+block a workgroup owns is computed, not baked.
+"""
+function emit_tensor_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
+                           fn_name::AbstractString)
+    parsed = parse_tensor_name(fn_name)
+    parsed === nothing && error("not a tensor-addressing intrinsic: $fn_name")
+    op, dim, clamp, rest = parsed
+
+    mod = state.mod
+    args = LLVM.operands(inst)          # trailing operand is the callee
+    nargs = length(args) - 1
+    layout_ty = emit_tensor_layout_type!(state, dim, clamp)
+    require_capability!(mod, Cap.TensorAddressingNV)
+    require_extension!(mod, "SPV_NV_tensor_addressing")
+
+    if op == "create"
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpCreateTensorLayoutNV, layout_ty, id)
+        state.value_map[inst] = id
+
+    elseif op == "setdim"
+        # %layout followed by one <id> per dimension.
+        nargs == dim + 1 ||
+            error("tensor setdim for dim $dim takes $(dim + 1) arguments, got $nargs")
+        ids = UInt32[get_value_id!(state, args[k]) for k in 1:nargs]
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpTensorLayoutSetDimensionNV,
+                            layout_ty, id, ids...)
+        state.value_map[inst] = id
+
+    elseif op == "slice"
+        # %layout then OFFSET/SIZE PAIRS, one pair per dimension — not all the
+        # offsets followed by all the sizes, which is the natural mis-reading.
+        nargs == 2dim + 1 ||
+            error("tensor slice for dim $dim takes $(2dim + 1) arguments, got $nargs")
+        ids = UInt32[get_value_id!(state, args[k]) for k in 1:nargs]
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpTensorLayoutSliceNV,
+                            layout_ty, id, ids...)
+        state.value_map[inst] = id
+
+    elseif op == "load"
+        # `_lava_tensor_load_<dim>_<clamp>_<dtype>_<M>x<N>_<use>`
+        #   (i64 address, i32 object-handle, i32 layout-handle) -> i32 matrix
+        length(rest) == 3 || error("malformed tensor load name: $fn_name")
+        dtype = rest[1]
+        dims = split(rest[2], 'x'); length(dims) == 2 || error("bad shape in $fn_name")
+        M = parse(Int, dims[1]); N = parse(Int, dims[2])
+        # The use rides as the same "a"/"b"/"acc" suffix `parse_coopmat_name`
+        # decodes, not as a number.
+        use = rest[3] == "a" ? CoopMatUse.MatrixA :
+              rest[3] == "b" ? CoopMatUse.MatrixB : CoopMatUse.MatrixAccumulator
+        nargs == 3 || error("tensor load takes 3 arguments, got $nargs")
+
+        mat_ty = emit_coopmat_type!(state, dtype, M, N, use)
+        comp_ty = coopmat_component_type!(state, dtype)
+        ptr_id = coopmat_base_pointer!(state, args[1], comp_ty)
+        obj_id = get_value_id!(state, args[2])
+        layout_id = get_value_id!(state, args[3])
+
+        # The load is the coopmat2 half, so it needs THAT capability as well as
+        # the tensor-addressing one declared above — two extensions, one
+        # instruction sequence.
+        require_capability!(mod, Cap.CooperativeMatrixTensorAddressingNV)
+        require_extension!(mod, "SPV_NV_cooperative_matrix2")
+
+        id = fresh_id!(mod)
+        # MemoryOperands must be `Aligned` with a literal alignment, NOT `None`.
+        # glslang's reference emits `None None` — but its shader loads from a
+        # descriptor binding, and ours is a `PhysicalStorageBuffer` address, where
+        # VUID-StandaloneSpirv-PhysicalStorageBuffer64-04708 requires the
+        # alignment. spirv-val says so precisely; copying the reference verbatim
+        # would have produced a module that only fails on the buffer-device-address
+        # path this actually uses.
+        # And `TensorAddressingOperands` is then NOT optional: with the alignment
+        # present the decoder expects the trailing word, and omitting it aborts
+        # with "expected more operands after 8 words" rather than anything about
+        # tensors. Order is MemoryOperands, its literal, then the tensor mask.
+        align = coopmat_component_bytes(dtype)
+        encode_instruction!(mod.functions, Op.OpCooperativeMatrixLoadTensorNV,
+                            mat_ty, id, ptr_id, obj_id, layout_id,
+                            MemOp.Aligned, UInt32(align), UInt32(0))
+        state.value_map[inst] = id
+        state.coopmat_value_types[inst] = mat_ty
+
+    else
+        error("unsupported tensor-addressing op `$op` in $fn_name")
+    end
     return nothing
 end
 

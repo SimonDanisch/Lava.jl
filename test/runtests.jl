@@ -112,6 +112,14 @@ end
         include(joinpath(@__DIR__, "test_tensor_opcodes.jl"))
     end
 
+    # ── Tier 3a3: tensor addressing actually loads (GPU) ──
+    # Compiling and validating is not enough here: the instruction validated
+    # twice while still wrong. This runs it and checks the values and the
+    # orientation.
+    @testset "Tier 3a3: coopmat2 tensor load" begin
+        include(joinpath(@__DIR__, "test_tensor_load.jl"))
+    end
+
     # ── Tier 3a: Workgroup barrier-skip fix (GPU; catches lavapipe deadlock) ──
     @testset "Tier 3a: Barrier skip fix" begin
         include(joinpath(@__DIR__, "test_barrier_skip.jl"))

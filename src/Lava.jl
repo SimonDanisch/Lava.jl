@@ -172,6 +172,7 @@ include("device/atomics.jl")  # needs LavaDeviceArray from lavaarray.jl
 include("device/subgroup.jl") # subgroup / group-non-uniform intrinsics
 include("device/acceleratedmatrix.jl")     # AcceleratedMatrix: the user-facing type
 include("device/coopmat_intrinsics.jl")    # its llvmcall stubs
+include("device/tensor_intrinsics.jl")     # SPV_NV_tensor_addressing layouts
 include("array/pin_leaves.jl") # @generated walker that pins LavaArray leaves per batch
 
 # ---- Launch API (depends on LavaArray / LavaDeviceArray) ----

@@ -6828,6 +6828,14 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return emit_coopmat_call!(state, inst, fn_name)
         end
 
+        # Tensor addressing (SPV_NV_tensor_addressing) → the layout builders that
+        # feed OpCooperativeMatrixLoadTensorNV. Checked BEFORE the `_lava_coopmat_`
+        # prefix would be a bug: the names are disjoint, but the load intrinsic
+        # belongs to this family even though it produces a matrix.
+        if startswith(fn_name, "_lava_tensor_")
+            return emit_tensor_call!(state, inst, fn_name)
+        end
+
         # A parameter pinned against dead-argument elimination: the call exists
         # only so LLVM keeps the argument. See `coopmat_keepparam`.
         if startswith(fn_name, "_lava_keepparam_")
