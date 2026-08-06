@@ -123,6 +123,11 @@ end
         # the product is `P' * Q'`. A GEMM cannot be routed through this until
         # that is pinned, and all four candidate orientations look sane.
         include(joinpath(@__DIR__, "test_tensor_gemm.jl"))
+        # And the claim the port rests on: a clamping layout bounds-checks the
+        # load, so an extent that divides nothing is legal and out-of-range reads
+        # come back as exact zeros. That is what retires `gemm_padn`,
+        # `GEMM_BLOCK`, `padtile`/`crsextent` and `gemm_divides`.
+        include(joinpath(@__DIR__, "test_tensor_clamp.jl"))
     end
 
     # ── Tier 3a: Workgroup barrier-skip fix (GPU; catches lavapipe deadlock) ──
