@@ -28,12 +28,24 @@ layout(binding = 0) buffer A { float16_t a[]; };
 layout(binding = 1) buffer O { float o[]; };
 
 void main() {
-    // OpCreateTensorLayoutNV / OpTypeTensorLayoutNV
+    // OpCreateTensorLayoutNV / OpTypeTensorLayoutNV, default (Undefined) clamp
     tensorLayoutNV<2> tl = createTensorLayoutNV(2);
     // OpTensorLayoutSetDimensionNV
     tl = setTensorLayoutDimensionNV(tl, 64, 64);
-    // OpCreateTensorViewNV / OpTypeTensorViewNV — the transpose, as a view
-    tensorViewNV<2, false, 1, 0> tv = createTensorViewNV(2, false, 1, 0);
+
+    // The clamp modes, so their VALUES are pinned by the differential and not
+    // just their opcode. `Constant` is the one the GEMM needs: under it the
+    // driver bounds-checks the load, which is what makes an unpadded extent
+    // legal. Their enum order is not guessable — it is read from here.
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV>    lC = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeClampToEdgeNV> lE = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeClampToEdgeNV);
+
+    // OpCreateTensorViewNV / OpTypeTensorViewNV — the transpose, as a view.
+    // Both HasDimensions values, because they produce DISTINCT types and so
+    // exercise OpConstantTrue as well as OpConstantFalse.
+    tensorViewNV<2, false, 1, 0> tvF = createTensorViewNV(2, false, 1, 0);
+    tensorViewNV<2, true,  1, 0> tvT = createTensorViewNV(2, true,  1, 0);
+
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> m;
     // OpTensorLayoutSliceNV feeding OpCooperativeMatrixLoadTensorNV
     coopMatLoadTensorNV(m, a, 0, sliceTensorLayoutNV(tl, 0, 16, 0, 16));

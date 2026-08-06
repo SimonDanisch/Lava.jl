@@ -202,6 +202,13 @@ module Op
     const OpReportIntersectionKHR   = UInt16(5334)
     const OpTypeAccelerationStructureKHR = UInt16(5341)
     const OpConstantNull            = UInt16(46)
+    # Bool constants are their own opcodes, not `OpConstant` with a 0/1 operand.
+    # Needed by `OpTypeTensorViewNV`, whose `HasDimensions` parameter is a Bool
+    # constant <id>. Observed, not assumed: a shader declaring both a
+    # `tensorViewNV<2, true, …>` and a `<2, false, …>` emits 41 and 42 — and two
+    # DISTINCT view types, which is why `HasDimensions` is part of the type key.
+    const OpConstantTrue            = UInt16(41)
+    const OpConstantFalse           = UInt16(42)
     # Image/sampler instructions
     const OpTypeImage               = UInt16(25)
     const OpTypeSampler             = UInt16(26)
@@ -235,9 +242,22 @@ module Op
     #
     #   %l  = OpCreateTensorLayoutNV                       (no operands)
     #   %l' = OpTensorLayoutSetDimensionNV %l %d0 %d1 …
-    #   %s  = OpTensorLayoutSliceNV %l' %off0 %sz0 %off1 %sz1 …
+    #   %s  = OpTensorLayoutSliceNV %l' %off0 %sz0 %off1 %sz1 …   (offset/size PAIRS)
     #   %v  = OpCreateTensorViewNV                         (no operands)
-    #   %m  = OpCooperativeMatrixLoadTensorNV %ptr %object %s <operands-mask>
+    #   %m  = OpCooperativeMatrixLoadTensorNV %ptr %object %s <memop> <tensorop>
+    #
+    # Three things the operand list does not advertise, all read off the binary:
+    #
+    #  * the TYPES take constant <id>s, not literals. `OpTypeTensorLayoutNV` is
+    #    `%Dim %ClampMode` and `OpTypeTensorViewNV` is
+    #    `%Dim %HasDimensions %p0 %p1 …`, every one of them an `OpConstant`.
+    #  * `%object` on the load is **the matrix's existing value**, not a
+    #    destination pointer — glslang emits an `OpLoad` of the target matrix and
+    #    passes it in. It is what out-of-range elements keep, which is the whole
+    #    point under a clamping layout; pass an `OpUndef` only where every element
+    #    is known in range.
+    #  * `%ptr` is an ordinary pointer (glslang emits `OpAccessChain`), so the
+    #    GLSL element offset is folded into the pointer rather than passed on.
     #
     # Numbers read out of a SPIR-V binary that glslang produced for
     # `test/glsl/tensor_addressing_opcodes.comp`, matched to the disassembly by
@@ -851,6 +871,25 @@ function emit_type_bool!(mod::SPIRVModule)
     get!(mod.type_cache, key) do
         id = fresh_id!(mod)
         encode_instruction!(mod.types_constants, Op.OpTypeBool, id)
+        id
+    end
+end
+
+"""
+    emit_constant_bool!(mod, value) -> UInt32
+
+`OpConstantTrue`/`OpConstantFalse`, deduplicated. A Bool constant is a distinct
+opcode with no operand rather than an `OpConstant` carrying 0 or 1, so it cannot
+go through `emit_constant_u32!`.
+"""
+function emit_constant_bool!(mod::SPIRVModule, value::Bool)
+    type_id = emit_type_bool!(mod)
+    key = (:constbool, type_id, value)
+    get!(mod.constant_cache, key) do
+        id = fresh_id!(mod)
+        encode_instruction!(mod.types_constants,
+                            value ? Op.OpConstantTrue : Op.OpConstantFalse,
+                            type_id, id)
         id
     end
 end

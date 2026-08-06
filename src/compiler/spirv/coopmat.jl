@@ -26,6 +26,18 @@ end
 
 const COOPMAT_SCOPE_SUBGROUP = UInt32(3)
 
+# `OpTypeTensorLayoutNV`'s clamp mode. Values observed, not remembered: a shader
+# declaring one layout per `gl_CooperativeMatrixClampMode*NV` emits
+# `TypeTensorLayoutNV %dim %0`, `%1` and `%2` in that order.
+#
+# `TENSOR_CLAMP_CONSTANT` is the one that matters for the GEMM. Under it the
+# driver bounds-checks the load itself and substitutes a constant out of range,
+# which is what makes an unpadded extent legal — i.e. what would retire
+# `gemm_padn`, the `GEMM_BLOCK` pad on M and `padtile`/`crsextent` on K.
+const TENSOR_CLAMP_UNDEFINED    = UInt32(0)
+const TENSOR_CLAMP_CONSTANT     = UInt32(1)
+const TENSOR_CLAMP_TO_EDGE      = UInt32(2)
+
 """
     parse_coopmat_name(fn_name) -> (op, T, M, N, use) | nothing
 
@@ -91,6 +103,71 @@ function emit_coopmat_type!(state::SPIRVEmitterState, dtype::AbstractString,
     encode_instruction!(mod.types_constants, Op.OpTypeCooperativeMatrixKHR, id,
                         comp_ty, scope_id, rows_id, cols_id, use_id)
     state.coopmat_type_ids[key] = id
+    return id
+end
+
+"""
+    emit_tensor_layout_type!(state, dim, clampmode) -> UInt32
+
+`OpTypeTensorLayoutNV`, deduplicated per module.
+
+`dim` and `clampmode` are **constant <id>s, not literals** — the same shape as
+`OpTypeCooperativeMatrixKHR`'s rows/columns, and not what the operand list
+suggests. Read off a glslang binary; see `test/glsl/tensor_addressing_opcodes.comp`.
+
+The capability is `TensorAddressingNV` from `SPV_NV_tensor_addressing`, a
+DIFFERENT extension from the coopmat2 one that supplies the load. Declaring only
+`CooperativeMatrixTensorAddressingNV` yields a module the driver rejects.
+"""
+function emit_tensor_layout_type!(state::SPIRVEmitterState, dim::Integer,
+                                  clampmode::UInt32 = TENSOR_CLAMP_UNDEFINED)
+    key = (Int(dim), clampmode)
+    cached = get(state.tensor_layout_type_ids, key, nothing)
+    cached === nothing || return cached
+
+    mod = state.mod
+    require_capability!(mod, Cap.TensorAddressingNV)
+    require_extension!(mod, "SPV_NV_tensor_addressing")
+
+    dim_id = emit_constant_u32!(mod, UInt32(dim))
+    clamp_id = emit_constant_u32!(mod, clampmode)
+    id = fresh_id!(mod)
+    encode_instruction!(mod.types_constants, Op.OpTypeTensorLayoutNV, id, dim_id, clamp_id)
+    state.tensor_layout_type_ids[key] = id
+    return id
+end
+
+"""
+    emit_tensor_view_type!(state, dim, hasdims, perm) -> UInt32
+
+`OpTypeTensorViewNV`, deduplicated per module. `perm` is the dimension
+permutation — `(1, 0)` is the transpose that `mul_mm_cm2.comp` uses for its B
+operand, and it is what replaces staging a transposed copy.
+
+Operands are `%Dim %HasDimensions %p0 %p1 …`, all constant <id>s; `HasDimensions`
+is a Bool constant, so it is `OpConstantTrue`/`OpConstantFalse` rather than an
+integer.
+"""
+function emit_tensor_view_type!(state::SPIRVEmitterState, dim::Integer,
+                                hasdims::Bool, perm::AbstractVector{<:Integer})
+    length(perm) == dim ||
+        error("tensor view permutation has $(length(perm)) entries for dim $dim")
+    permu = UInt32[UInt32(p) for p in perm]
+    key = (Int(dim), hasdims, permu)
+    cached = get(state.tensor_view_type_ids, key, nothing)
+    cached === nothing || return cached
+
+    mod = state.mod
+    require_capability!(mod, Cap.TensorAddressingNV)
+    require_extension!(mod, "SPV_NV_tensor_addressing")
+
+    dim_id = emit_constant_u32!(mod, UInt32(dim))
+    has_id = emit_constant_bool!(mod, hasdims)
+    perm_ids = UInt32[emit_constant_u32!(mod, p) for p in permu]
+    id = fresh_id!(mod)
+    encode_instruction!(mod.types_constants, Op.OpTypeTensorViewNV, id,
+                        dim_id, has_id, perm_ids...)
+    state.tensor_view_type_ids[key] = id
     return id
 end
 

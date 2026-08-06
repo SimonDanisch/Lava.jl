@@ -87,6 +87,13 @@ mutable struct SPIRVEmitterState
     # ── Cooperative matrix (SPV_KHR_cooperative_matrix) ──
     # Cached OpTypeCooperativeMatrixKHR ids, keyed (dtype, rows, cols, use).
     coopmat_type_ids::Dict{Tuple{String, Int, Int, UInt32}, UInt32}
+    # ── Tensor addressing (SPV_NV_tensor_addressing) ──
+    # `OpTypeTensorLayoutNV` keyed (dim, clamp mode) and `OpTypeTensorViewNV`
+    # keyed (dim, has-dimensions, permutation). Both take their parameters as
+    # constant <id>s rather than literals, so the types are structural and
+    # dedupe exactly like the cooperative-matrix ones.
+    tensor_layout_type_ids::Dict{Tuple{Int, UInt32}, UInt32}
+    tensor_view_type_ids::Dict{Tuple{Int, Bool, Vector{UInt32}}, UInt32}
     # LLVM values that actually hold a cooperative matrix. The front end carries
     # them as an i32 handle, so their LLVM type says nothing useful; anything
     # that derives a SPIR-V type from the LLVM type (phis above all) has to
@@ -206,6 +213,8 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         nothing, nothing,  # SER: rt_hit_object_type_id, rt_hit_object_var_id
         false,
         Dict{Tuple{String, Int, Int, UInt32}, UInt32}(),  # coopmat types
+        Dict{Tuple{Int, UInt32}, UInt32}(),               # tensor layout types
+        Dict{Tuple{Int, Bool, Vector{UInt32}}, UInt32}(), # tensor view types
         Dict{LLVM.Value, UInt32}(),                       # coopmat-typed values
         Dict{UInt32, UInt32}(),                           # coopmat component vars
         Dict{UInt32, UInt32}(),                           # coopmat var contents
