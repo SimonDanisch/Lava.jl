@@ -26,6 +26,12 @@ using Test, Lava, KernelAbstractions
 using LinearAlgebra
 using Random
 const KA = KernelAbstractions
+# `mul!` explicitly, and by name. This file has no `using` of its own — it is
+# `include`d into whatever `runtests.jl` has in scope — and both LinearAlgebra and
+# LLVM put a `mul!` there, so the bare name resolves to neither and the whole
+# testset errors out before a single assertion runs. It reported as a failing GEMM
+# for as long as that was true.
+using LinearAlgebra: mul!
 
 relrms(got, want) = sqrt(sum(abs2, Float64.(got) .- want) / sum(abs2, want))
 
