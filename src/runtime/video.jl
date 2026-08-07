@@ -126,6 +126,23 @@ import Vulkan
 const Vk = Vulkan
 const C = Vk.VkCore
 
+"""
+    vkchk(result, what) -> result
+
+Throw on a failing `VkResult` instead of carrying on.
+
+Every `ccall` in this file returned an `Int32` that was thrown away. A decode
+whose session, submit or memory binding failed then looks *exactly* like one that
+worked and produced black: no exception, no validation message (a call that
+returns an error is not a usage error, so the layers say nothing), and frames of
+the right shape full of zeros. That is the failure this module has actually had —
+every video at 854x480 and above decoded to zeros with nothing reported anywhere.
+"""
+@inline function vkchk(r::Int32, what::AbstractString)
+    r == Int32(0) && return r
+    error("video decode: $what returned VkResult $r")
+end
+
 # ---------- bitstream ----------
 mutable struct BR; d::Vector{UInt8}; p::Int; end
 rb1(b)=(byte=b.d[(b.p>>3)+1]; v=(byte>>(7-(b.p&7)))&0x01; b.p+=1; Int(v))
@@ -313,9 +330,9 @@ function decode_capability_flags(ctx)
                      UInt64(0), UInt64(0), e0, e0, e0, UInt32(0), UInt32(0),
                      C.VkExtensionProperties(ntuple(_ -> Cchar(0), 256), UInt32(0))))
             GC.@preserve cp begin
-                ccall(Vk.function_pointer(ctx.instance, "vkGetPhysicalDeviceVideoCapabilitiesKHR"),
+                vkchk(ccall(Vk.function_pointer(ctx.instance, "vkGetPhysicalDeviceVideoCapabilitiesKHR"),
                       Int32, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
-                      ctx.physical_device.vks, pc(pr), pc(cp))
+                      ctx.physical_device.vks, pc(pr), pc(cp)), "vkGetPhysicalDeviceVideoCapabilitiesKHR")
             end
             return dc[].flags
         end
@@ -345,9 +362,9 @@ function video_capabilities(ctx)
              UInt64(0), UInt64(0), e0, e0, e0, UInt32(0), UInt32(0),
              C.VkExtensionProperties(ntuple(_ -> Cchar(0), 256), UInt32(0))))
     GC.@preserve hp pr pl hc dc cp begin
-        ccall(Vk.function_pointer(ctx.instance, "vkGetPhysicalDeviceVideoCapabilitiesKHR"),
+        vkchk(ccall(Vk.function_pointer(ctx.instance, "vkGetPhysicalDeviceVideoCapabilitiesKHR"),
               Int32, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
-              ctx.physical_device.vks, pc(pr), pc(cp))
+              ctx.physical_device.vks, pc(pr), pc(cp)), "vkGetPhysicalDeviceVideoCapabilitiesKHR")
     end
     c = cp[]
     return (minBitstreamBufferOffsetAlignment = Int(c.minBitstreamBufferOffsetAlignment),
@@ -417,7 +434,11 @@ mutable struct H264Decoder <: VideoDecoder
     dpb::Vector{Tuple{Int,Int,Int}}         # (slot, framenum, poc)
     freeslots::Vector{Int}
     prevmsb::Int; prevlsb::Int; maxpoclsb::Int; gop::Int
-    decoded::Int                            # AUs decoded ever (display index for poct≠0)
+    # `pic_order_cnt_type = 2` carries no POC in the slice header: it is derived
+    # from `frame_num`, so the wrap has to be tracked (8.2.1.3, prevFrameNum /
+    # prevFrameNumOffset).
+    prevfn::Int; prevfnoff::Int
+    decoded::Int                            # AUs decoded ever
     isfirst::Bool
     pending::Vector{Tuple{Int,Int,Any,Any}} # decoded, not yet display-safe: (gop, poc, Y, UV)
     open::Bool
@@ -484,16 +505,16 @@ function decodemore!(dec::VideoDecoder, maxframes::Integer; holdback::Integer = 
             ensurebitbuf!(dec, sum(ausize(dec.aus[i]) for i in sub))
             bi = Ref(C.VkCommandBufferBeginInfo(C.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, C_NULL,
                                                 UInt32(C.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT), Ptr{Cvoid}(C_NULL)))
-            GC.@preserve bi ccall(dfp(w,"vkBeginCommandBuffer"),Int32,(C.VkCommandBuffer,Ptr{Cvoid}),CB,pc(bi))
+            GC.@preserve bi vkchk(ccall(dfp(w,"vkBeginCommandBuffer"),Int32,(C.VkCommandBuffer,Ptr{Cvoid}),CB,pc(bi)), "vkBeginCommandBuffer")
             base = 0
             for (j, i) in enumerate(sub)
                 base += decodeau!(dec, dec.aus[i], base, j)
             end
-            ccall(dfp(w,"vkEndCommandBuffer"),Int32,(C.VkCommandBuffer,),CB)
+            vkchk(ccall(dfp(w,"vkEndCommandBuffer"),Int32,(C.VkCommandBuffer,),CB), "vkEndCommandBuffer")
             cbref = Ref(CB)
             si = Ref(C.VkSubmitInfo(C.VK_STRUCTURE_TYPE_SUBMIT_INFO,C_NULL,UInt32(0),Ptr{C.VkSemaphore}(C_NULL),Ptr{UInt32}(C_NULL),UInt32(1),Base.unsafe_convert(Ptr{C.VkCommandBuffer},cbref),UInt32(0),Ptr{C.VkSemaphore}(C_NULL)))
-            GC.@preserve si cbref ccall(dfp(w,"vkQueueSubmit"),Int32,(Ptr{Cvoid},UInt32,Ptr{Cvoid},Ptr{Cvoid}),w.q.vks,UInt32(1),Base.unsafe_convert(Ptr{Cvoid},si),C_NULL)
-            ccall(dfp(w,"vkQueueWaitIdle"),Int32,(Ptr{Cvoid},),w.q.vks)
+            GC.@preserve si cbref vkchk(ccall(dfp(w,"vkQueueSubmit"),Int32,(Ptr{Cvoid},UInt32,Ptr{Cvoid},Ptr{Cvoid}),w.q.vks,UInt32(1),Base.unsafe_convert(Ptr{Cvoid},si),C_NULL), "vkQueueSubmit")
+            vkchk(ccall(dfp(w,"vkQueueWaitIdle"),Int32,(Ptr{Cvoid},),w.q.vks), "vkQueueWaitIdle")
             # Blocks until the copies complete (flush! waits on the timeline), so the
             # decode targets are free for the next sub-chunk.
             drain_copies!(dec)
@@ -544,11 +565,11 @@ function ensurebitbuf!(dec::VideoDecoder, need::Integer)
     dec.bbuf === nothing || ccall(dfp(w,"vkDestroyBuffer"),Cvoid,(Ptr{Cvoid},C.VkBuffer,Ptr{Cvoid}),dev.vks,dec.bbuf,C_NULL)
     hp,pr,pl = decodeprofile(dec); push!(dec.PIN, hp, pr, pl)
     ci=Ref(C.VkBufferCreateInfo(C.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,Ptr{Cvoid}(rp(pl)),UInt32(0),sz,UInt32(C.VK_BUFFER_USAGE_VIDEO_DECODE_SRC_BIT_KHR),C.VK_SHARING_MODE_EXCLUSIVE,UInt32(0),Ptr{UInt32}(C_NULL)))
-    rb=Ref{C.VkBuffer}(); GC.@preserve ci pl ccall(dfp(w,"vkCreateBuffer"),Int32,(Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid}),dev.vks,pc(ci),C_NULL,rp(rb)); bf=rb[]
+    rb=Ref{C.VkBuffer}(); GC.@preserve ci pl vkchk(ccall(dfp(w,"vkCreateBuffer"),Int32,(Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid}),dev.vks,pc(ci),C_NULL,rp(rb)), "vkCreateBuffer"); bf=rb[]
     mr=Ref(C.VkMemoryRequirements(UInt64(0),UInt64(0),UInt32(0))); ccall(dfp(w,"vkGetBufferMemoryRequirements"),Cvoid,(Ptr{Cvoid},C.VkBuffer,Ptr{Cvoid}),dev.vks,bf,rp(mr))
     m=Vk.unwrap(Vk.allocate_memory(dev,mr[].size,memtype(w,mr[].memoryTypeBits,UInt32(C.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)|UInt32(C.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)))); push!(dec.PIN, m)
-    ccall(dfp(w,"vkBindBufferMemory"),Int32,(Ptr{Cvoid},C.VkBuffer,C.VkDeviceMemory,UInt64),dev.vks,bf,m.vks,UInt64(0))
-    pmap=Ref{Ptr{Cvoid}}(); ccall(dfp(w,"vkMapMemory"),Int32,(Ptr{Cvoid},C.VkDeviceMemory,UInt64,UInt64,UInt32,Ptr{Cvoid}),dev.vks,m.vks,UInt64(0),sz,UInt32(0),Base.unsafe_convert(Ptr{Ptr{Cvoid}},pmap))
+    vkchk(ccall(dfp(w,"vkBindBufferMemory"),Int32,(Ptr{Cvoid},C.VkBuffer,C.VkDeviceMemory,UInt64),dev.vks,bf,m.vks,UInt64(0)), "vkBindBufferMemory")
+    pmap=Ref{Ptr{Cvoid}}(); vkchk(ccall(dfp(w,"vkMapMemory"),Int32,(Ptr{Cvoid},C.VkDeviceMemory,UInt64,UInt64,UInt32,Ptr{Cvoid}),dev.vks,m.vks,UInt64(0),sz,UInt32(0),Base.unsafe_convert(Ptr{Ptr{Cvoid}},pmap)), "vkMapMemory")
     dec.bbuf=bf; dec.bmem=m; dec.bmap=Ptr{UInt8}(pmap[]); dec.bufsz=sz
     return nothing
 end
@@ -557,7 +578,7 @@ function Base.close(dec::VideoDecoder)
     dec.open || return nothing
     dec.open = false
     w = dec.w; dev = dec.dev
-    ccall(dfp(w,"vkQueueWaitIdle"),Int32,(Ptr{Cvoid},),w.q.vks)
+    vkchk(ccall(dfp(w,"vkQueueWaitIdle"),Int32,(Ptr{Cvoid},),w.q.vks), "vkQueueWaitIdle")
     dec.PARAMS === nothing || ccall(dfp(w,"vkDestroyVideoSessionParametersKHR"),Cvoid,(Ptr{Cvoid},C.VkVideoSessionParametersKHR,Ptr{Cvoid}),dev.vks,dec.PARAMS,C_NULL)
     dec.SESSION === nothing || ccall(dfp(w,"vkDestroyVideoSessionKHR"),Cvoid,(Ptr{Cvoid},C.VkVideoSessionKHR,Ptr{Cvoid}),dev.vks,dec.SESSION,C_NULL)
     dec.bbuf === nothing || ccall(dfp(w,"vkDestroyBuffer"),Cvoid,(Ptr{Cvoid},C.VkBuffer,Ptr{Cvoid}),dev.vks,dec.bbuf,C_NULL)
@@ -600,7 +621,7 @@ function H264Decoder(ctx, paramnals::AbstractVector{UInt8}; chroma::Bool=false)
     let hc=Ref(C.VkVideoDecodeH264CapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_CAPABILITIES_KHR,C_NULL,C.StdVideoH264LevelIdc(0),C.VkOffset2D(0,0))),
         dc=Ref(C.VkVideoDecodeCapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR,Ptr{Cvoid}(rp(hc)),UInt32(0))),
         e0=C.VkExtent2D(0,0), cp=Ref(C.VkVideoCapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR,Ptr{Cvoid}(rp(dc)),UInt32(0),UInt64(0),UInt64(0),e0,e0,e0,UInt32(0),UInt32(0),C.VkExtensionProperties(ntuple(_->Cchar(0),256),UInt32(0))))
-        GC.@preserve hc dc cp PIN ccall(Vk.function_pointer(ctx.instance,"vkGetPhysicalDeviceVideoCapabilitiesKHR"),Int32,(Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid}),ctx.physical_device.vks,Ptr{Cvoid}(pProf),pc(cp))
+        GC.@preserve hc dc cp PIN vkchk(ccall(Vk.function_pointer(ctx.instance,"vkGetPhysicalDeviceVideoCapabilitiesKHR"),Int32,(Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid}),ctx.physical_device.vks,Ptr{Cvoid}(pProf),pc(cp)), "vkGetPhysicalDeviceVideoCapabilitiesKHR")
         rHdr[]=cp[].stdHeaderVersion
         # The bitstream buffer's offset AND range must each be a multiple of the
         # profile's alignment. Hardcoding 256 happened to satisfy devices asking for
@@ -633,24 +654,24 @@ function H264Decoder(ctx, paramnals::AbstractVector{UInt8}; chroma::Bool=false)
     end
     maxslots=UInt32(sps.maxref+2)
     sci=pin(Ref(C.VkVideoSessionCreateInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_SESSION_CREATE_INFO_KHR,C_NULL,w.qf,UInt32(0),pProf,fmt,C.VkExtent2D(CW,CH),fmt,maxslots,UInt32(sps.maxref),rp(rHdr))))
-    rSess=Ref{C.VkVideoSessionKHR}(); GC.@preserve PIN ccall(dfp(w,"vkCreateVideoSessionKHR"),Int32,(Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid}),dev.vks,pc(sci),C_NULL,rp(rSess)); SESSION=rSess[]
+    rSess=Ref{C.VkVideoSessionKHR}(); GC.@preserve PIN vkchk(ccall(dfp(w,"vkCreateVideoSessionKHR"),Int32,(Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid}),dev.vks,pc(sci),C_NULL,rp(rSess)), "vkCreateVideoSessionKHR"); SESSION=rSess[]
     # bind session memory
-    let mc=Ref(UInt32(0)); ccall(dfp(w,"vkGetVideoSessionMemoryRequirementsKHR"),Int32,(Ptr{Cvoid},C.VkVideoSessionKHR,Ptr{UInt32},Ptr{Cvoid}),dev.vks,SESSION,mc,C_NULL)
+    let mc=Ref(UInt32(0)); vkchk(ccall(dfp(w,"vkGetVideoSessionMemoryRequirementsKHR"),Int32,(Ptr{Cvoid},C.VkVideoSessionKHR,Ptr{UInt32},Ptr{Cvoid}),dev.vks,SESSION,mc,C_NULL), "vkGetVideoSessionMemoryRequirementsKHR")
         mreqs=[C.VkVideoSessionMemoryRequirementsKHR(C.VK_STRUCTURE_TYPE_VIDEO_SESSION_MEMORY_REQUIREMENTS_KHR,C_NULL,UInt32(0),C.VkMemoryRequirements(UInt64(0),UInt64(0),UInt32(0))) for _ in 1:Int(mc[])]
-        GC.@preserve mreqs ccall(dfp(w,"vkGetVideoSessionMemoryRequirementsKHR"),Int32,(Ptr{Cvoid},C.VkVideoSessionKHR,Ptr{UInt32},Ptr{Cvoid}),dev.vks,SESSION,mc,pointer(mreqs))
+        GC.@preserve mreqs vkchk(ccall(dfp(w,"vkGetVideoSessionMemoryRequirementsKHR"),Int32,(Ptr{Cvoid},C.VkVideoSessionKHR,Ptr{UInt32},Ptr{Cvoid}),dev.vks,SESSION,mc,pointer(mreqs)), "vkGetVideoSessionMemoryRequirementsKHR")
         binds=C.VkBindVideoSessionMemoryInfoKHR[]
         for mr in mreqs
             m=Vk.unwrap(Vk.allocate_memory(dev,mr.memoryRequirements.size,memtype(w,mr.memoryRequirements.memoryTypeBits,C.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))); pin(m)
             push!(binds,C.VkBindVideoSessionMemoryInfoKHR(C.VK_STRUCTURE_TYPE_BIND_VIDEO_SESSION_MEMORY_INFO_KHR,C_NULL,mr.memoryBindIndex,m.vks,UInt64(0),mr.memoryRequirements.size))
         end
-        GC.@preserve binds PIN ccall(dfp(w,"vkBindVideoSessionMemoryKHR"),Int32,(Ptr{Cvoid},C.VkVideoSessionKHR,UInt32,Ptr{Cvoid}),dev.vks,SESSION,UInt32(length(binds)),pointer(binds))
+        GC.@preserve binds PIN vkchk(ccall(dfp(w,"vkBindVideoSessionMemoryKHR"),Int32,(Ptr{Cvoid},C.VkVideoSessionKHR,UInt32,Ptr{Cvoid}),dev.vks,SESSION,UInt32(length(binds)),pointer(binds)), "vkBindVideoSessionMemoryKHR")
     end
     # session params (SPS+PPS)
     rSPSs=pin(Ref(std_sps(sps))); rPPSs=pin(Ref(std_pps(pps)))
     add=pin(Ref(C.VkVideoDecodeH264SessionParametersAddInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_SESSION_PARAMETERS_ADD_INFO_KHR,C_NULL,UInt32(1),rp(rSPSs),UInt32(1),rp(rPPSs))))
     h264c=pin(Ref(C.VkVideoDecodeH264SessionParametersCreateInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_SESSION_PARAMETERS_CREATE_INFO_KHR,C_NULL,UInt32(1),UInt32(1),rp(add))))
     pci=pin(Ref(C.VkVideoSessionParametersCreateInfoKHR(C.VK_STRUCTURE_TYPE_VIDEO_SESSION_PARAMETERS_CREATE_INFO_KHR,Ptr{Cvoid}(rp(h264c)),UInt32(0),C_NULL,SESSION)))
-    rParams=Ref{C.VkVideoSessionParametersKHR}(); GC.@preserve PIN ccall(dfp(w,"vkCreateVideoSessionParametersKHR"),Int32,(Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid}),dev.vks,pc(pci),C_NULL,rp(rParams)); PARAMS=rParams[]
+    rParams=Ref{C.VkVideoSessionParametersKHR}(); GC.@preserve PIN vkchk(ccall(dfp(w,"vkCreateVideoSessionParametersKHR"),Int32,(Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid}),dev.vks,pc(pci),C_NULL,rp(rParams)), "vkCreateVideoSessionParametersKHR"); PARAMS=rParams[]
     # DPB image pool — real Vulkan.Image handles wrapped as VideoImages. The
     # decode commands (raw FFI) take the raw `.vks` handles; the output copy uses
     # the high-level VideoImage path. High-level handles are refcounted, so the
@@ -714,7 +735,9 @@ function H264Decoder(ctx, paramnals::AbstractVector{UInt8}; chroma::Bool=false)
                        Int(CW), Int(CH), Int(DW), Int(DH),
                        Vector{Vector{Vector{UInt8}}}(), 1,
                        Tuple{Int,Int,Int}[], collect(1:nslots),
-                       0, 0, 1 << (sps.log2poc + 4), 0, 0, true,
+                       0, 0, 1 << (sps.log2poc + 4), 0,
+                       0, 0,                                    # prevfn, prevfnoff
+                       0, true,
                        Tuple{Int,Int,Any,Any}[], true)
 end
 
@@ -753,16 +776,42 @@ function decodeau!(dec::H264Decoder, au, bufbase::Integer, slot::Integer=1)
         if sh.idr
             for (slot,_,_) in dpb; push!(freeslots,slot); end; empty!(dpb)
             dec.prevmsb=0; dec.prevlsb=0; dec.gop+=1
+            dec.prevfn=0; dec.prevfnoff=0
         end
-        # POC (type 0)
         if sps.poct==0
+            # 8.2.1.1
             if sh.idr; pmsb=0
             elseif sh.poclsb<dec.prevlsb && (dec.prevlsb-sh.poclsb)>=maxpoclsb÷2; pmsb=dec.prevmsb+maxpoclsb
             elseif sh.poclsb>dec.prevlsb && (sh.poclsb-dec.prevlsb)>maxpoclsb÷2; pmsb=dec.prevmsb-maxpoclsb
             else; pmsb=dec.prevmsb; end
             poc=pmsb+sh.poclsb
             if sh.nrid!=0; dec.prevmsb=pmsb; dec.prevlsb=sh.poclsb; end
-        else; poc=dec.decoded; end
+        elseif sps.poct==2
+            # 8.2.1.3. There is no POC in the slice header at all here: it is
+            # `2*(FrameNumOffset + frame_num)`, one less for a non-reference
+            # picture, and FrameNumOffset absorbs the frame_num wrap.
+            #
+            # This used to be `poc = dec.decoded`, a count of access units decoded
+            # ever. That is not a picture order count and is not even in the same
+            # units — a reference picture's POC advances by TWO — so the hardware
+            # was handed a dense 0,1,2,… as `PicOrderCnt` for every picture and
+            # every reference slot. x264 selects `pic_order_cnt_type = 2` whenever
+            # it emits no B-frames, which is precisely what `-bf 0` asks for and
+            # what VideoEditor's own mezzanine encodes with, so the editor's GPU
+            # preview decoded solid black for every clip it ever transcoded while
+            # the 128x96 B-pyramid fixture (type 0) stayed bit-exact.
+            maxfn = 1 << (sps.log2fn + 4)
+            fnoff = sh.idr ? 0 :
+                    (dec.prevfn > sh.fnum ? dec.prevfnoff + maxfn : dec.prevfnoff)
+            poc = sh.idr ? 0 :
+                  sh.nrid == 0 ? 2 * (fnoff + sh.fnum) - 1 : 2 * (fnoff + sh.fnum)
+            dec.prevfn = sh.fnum; dec.prevfnoff = fnoff
+        else
+            # Type 1 needs the SPS's offset_for_* cycle, which `parse_sps` reads
+            # past without keeping. Refuse rather than invent a number: that is
+            # the mistake type 2 was.
+            error("decode_h264: pic_order_cnt_type $(sps.poct) is not implemented")
+        end
         isref = sh.nrid!=0
         outslot=popfirst!(freeslots)
         outvimg,outviewhl=imgs[outslot]     # DPB slot — the setup reference picture
@@ -779,7 +828,15 @@ function decodeau!(dec::H264Decoder, au, bufbase::Integer, slot::Integer=1)
         off=0; sliceoffs=UInt32[]
         for sl in au
             push!(sliceoffs,UInt32(off))
-            unsafe_copyto!(bmap+bufbase+off, pointer(vcat(UInt8[0,0,1],sl)), length(sl)+3); off+=length(sl)+3
+            # The start code and the slice, staged through a temporary that has to
+            # be KEPT ALIVE across the copy. `pointer(vcat(...))` hands the address
+            # of an array nothing references any more: the compiler is free to
+            # treat it as dead the instant `pointer` returns, and a large slice is
+            # exactly when the collector is most likely to take it. Small frames
+            # survived, real ones did not.
+            stage = vcat(UInt8[0,0,1], sl)
+            GC.@preserve stage unsafe_copyto!(bmap+bufbase+off, pointer(stage), length(sl)+3)
+            off+=length(sl)+3
         end
         # reference slots (active DPB)
         refpr=Ref{C.VkVideoPictureResourceInfoKHR}[]; refri=Ref{C.StdVideoDecodeH264ReferenceInfo}[]; refds=Ref{C.VkVideoDecodeH264DpbSlotInfoKHR}[]

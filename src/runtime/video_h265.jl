@@ -9,8 +9,16 @@
 #
 # Scope: Main profile, 8-bit 4:2:0, frame pictures, closed GOPs (feeds start
 # at an IRAP that does not depend on earlier pictures — IDR, or CRA when the
-# feed drops its leading RASL pictures). Scaling lists / long-term references
-# / tiles-with-explicit-spacing error out rather than mis-decode.
+# feed drops its leading RASL pictures). Scaling lists and long-term references
+# error out rather than mis-decode.
+#
+# Tiles are handled, uniform spacing or not. They were on that refusal list, and
+# the refusal was not the safe half of the trade it looked like: the parse gave
+# up *after* `uniform_spacing_flag` and before the explicit widths, so anything
+# that swallowed the error carried on with a bit reader pointing into the middle
+# of the tile geometry, and every PPS field past it — deblocking, parallel merge
+# level — was read from the wrong bits. A phone recording three columns of
+# 24/24/12 CTBs across 1920 decoded to a flat green frame.
 
 # ---------- H.265 bitstream parsing ----------
 h265naltype(nal) = Int((nal[1] >> 1) & 0x3f)
@@ -162,9 +170,26 @@ function parse_pps_h265(nal)
     slqp = rb1(b); wp = rb1(b); wbp = rb1(b); tqbypass = rb1(b)
     tiles = rb1(b); entsync = rb1(b)
     ntilec = ntiler = 0; uniform = 1
+    colw = UInt16[]; rowh = UInt16[]
     if tiles == 1
         ntilec = ue(b); ntiler = ue(b); uniform = rb1(b)
-        uniform == 0 && error("decode_h265: non-uniform tile spacing not handled")
+        if uniform == 0
+            # 7.3.2.3.1: the explicit geometry sits between `uniform_spacing_flag`
+            # and `loop_filter_across_tiles_enabled_flag`. Skipping it does not
+            # merely lose the tile widths — it leaves the reader misaligned for
+            # the whole rest of the PPS, so the deblocking parameters and
+            # `log2_parallel_merge_level` are read out of the wrong bits and the
+            # `StdVideoH265PictureParameterSet` handed to the driver is nonsense.
+            # A phone's HEVC does this routinely: three columns of 24/24/12 CTBs
+            # across 1920 is what surfaced it.
+            colw = UInt16[ue(b) for _ in 1:ntilec]
+            rowh = UInt16[ue(b) for _ in 1:ntiler]
+        end
+        # The Std struct carries 19 columns and 21 rows, which is what the
+        # profiles allow; a stream past that would silently lose its last tiles.
+        (ntilec <= 19 && ntiler <= 21) || error(
+            "decode_h265: $(ntilec + 1)x$(ntiler + 1) tiles exceeds the " *
+            "19x21 the Vulkan video parameter set can carry")
         rb1(b)                                    # loop_filter_across_tiles
     end
     lfslices = rb1(b)
@@ -177,7 +202,7 @@ function parse_pps_h265(nal)
     listmod = rb1(b); log2pml = ue(b); shext = rb1(b)
     (; pps_id, sps_id, depslice, outflag, extrabits, signhide, cabacinit,
        nl0, nl1, initqp, cintra, tskip, cuqp, cuqpdepth, cbqp, crqp, slqp,
-       wp, wbp, tqbypass, tiles, entsync, ntilec, ntiler, uniform, lfslices,
+       wp, wbp, tqbypass, tiles, entsync, ntilec, ntiler, uniform, colw, rowh, lfslices,
        dbctl, dbovr, dbdis, beta, tc, listmod, log2pml, shext)
 end
 
@@ -291,7 +316,10 @@ function std_pps265(pps, sps)
         ntuple(_ -> Int8(0), 6), ntuple(_ -> Int8(0), 6),
         UInt8(0), UInt8(0), Int8(0), Int8(0), Int8(0), UInt8(0), UInt8(0), UInt8(0),
         UInt8(pps.ntilec), UInt8(pps.ntiler), UInt8(0), UInt8(0),
-        ntuple(_ -> UInt16(0), 19), ntuple(_ -> UInt16(0), 21), UInt32(0),
+        # Zero under uniform spacing, where the driver derives the geometry from
+        # the picture size and the tile counts; the explicit widths otherwise.
+        ntuple(i -> i <= length(pps.colw) ? pps.colw[i] : UInt16(0), 19),
+        ntuple(i -> i <= length(pps.rowh) ? pps.rowh[i] : UInt16(0), 21), UInt32(0),
         Ptr{C.StdVideoH265ScalingLists}(C_NULL),
         Ptr{C.StdVideoH265PredictorPaletteEntries}(C_NULL))
 end
@@ -327,6 +355,21 @@ mutable struct H265Decoder <: VideoDecoder
     PIN::Vector{Any}
     imgs::Vector{Any}
     nslots::Int
+    # The four fields the shared core in video.jl reads off a `VideoDecoder`.
+    # H.264 grew them with `DPB_AND_OUTPUT_DISTINCT` and the core was changed to
+    # read them; H.265 was not, so `feed!` and `decodemore!` died on a
+    # `FieldError` the moment either touched one. A shared core means the state
+    # it reads is part of the contract, not of one implementor.
+    #
+    # The first three are the COINCIDE defaults, which is what this decoder does:
+    # it copies out of the DPB slot in the same command buffer, so there are no
+    # separate decode targets and nothing is deferred. `mkoutimg === nothing` is
+    # what tells the core that. DISTINCT is not implemented for H.265; a device
+    # that only offers it would need this filled in the way video.jl does.
+    outimgs::Vector{Any}
+    mkoutimg::Any
+    copyq::Vector{Any}
+    bsalign::Int
     bbuf::Any; bmem::Any; bmap::Ptr{UInt8}; bufsz::UInt64
     cbh::Any; CB::Any
     CW::Int; CH::Int; DW::Int; DH::Int
@@ -361,11 +404,36 @@ function H265Decoder(ctx, paramnals::AbstractVector{UInt8}; chroma::Bool = false
     PIN = Any[]; pin(x) = (push!(PIN, x); x)
     hp, pr, pl = video_profile_h265(w); pin(hp); pin(pr); pin(pl); pProf = rp(pr)
     rHdr = pin(Ref(C.VkExtensionProperties(ntuple(_ -> Cchar(0), 256), UInt32(0))))
+    BSALIGN = 1
     let hc = Ref(C.VkVideoDecodeH265CapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_CAPABILITIES_KHR, C_NULL, C.StdVideoH265LevelIdc(0))),
         dc = Ref(C.VkVideoDecodeCapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR, Ptr{Cvoid}(rp(hc)), UInt32(0))),
         e0 = C.VkExtent2D(0, 0), cp = Ref(C.VkVideoCapabilitiesKHR(C.VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR, Ptr{Cvoid}(rp(dc)), UInt32(0), UInt64(0), UInt64(0), e0, e0, e0, UInt32(0), UInt32(0), C.VkExtensionProperties(ntuple(_ -> Cchar(0), 256), UInt32(0))))
         GC.@preserve hc dc cp PIN ccall(Vk.function_pointer(ctx.instance, "vkGetPhysicalDeviceVideoCapabilitiesKHR"), Int32, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}), ctx.physical_device.vks, Ptr{Cvoid}(pProf), pc(cp))
         rHdr[] = cp[].stdHeaderVersion
+        BSALIGN = Int(max(cp[].minBitstreamBufferOffsetAlignment,
+                          cp[].minBitstreamBufferSizeAlignment, 1))
+        # `dc` was filled in and thrown away here, exactly as it once was on the
+        # H.264 side. Its flags say whether one image may serve as both DPB and
+        # decode target (DPB_AND_OUTPUT_COINCIDE, 0x1) or whether the two must be
+        # separate images (DPB_AND_OUTPUT_DISTINCT, 0x2). This decoder copies the
+        # frame straight out of its DPB slot, which is only legal under COINCIDE.
+        #
+        # On a DISTINCT-only device that copy reads an image the driver never
+        # meant as a copy source, and RADV does not reject it — it **segfaults
+        # inside `vkCmdCopyImageToBuffer`**, taking the process with it. AMD
+        # Radeon 8060S reports 0x2, so every H.265 file killed the editor on this
+        # card whatever its contents; the tiled phone recording that surfaced it
+        # was a red herring twice over.
+        #
+        # Refusing here is what lets a caller fall back: `H265Decoder` is built
+        # before any frame is fed, so this throws with nothing recorded and
+        # nothing submitted.
+        COINCIDE = (dc[].flags & 0x1) != 0
+        COINCIDE || error("decode_h265: this device offers only " *
+            "DPB_AND_OUTPUT_DISTINCT (flags=0x$(string(dc[].flags; base = 16))), and " *
+            "the H.265 decoder copies out of its DPB slot, which needs " *
+            "DPB_AND_OUTPUT_COINCIDE. H.264 implements DISTINCT (see video.jl); " *
+            "H.265 does not yet. Decode this stream on the CPU, or transcode it.")
     end
     maxrefs = max(sps.dpbsize, 1)
     maxslots = UInt32(maxrefs + 2)
@@ -415,6 +483,7 @@ function H265Decoder(ctx, paramnals::AbstractVector{UInt8}; chroma::Bool = false
         Vk.CommandBufferAllocateInfo(Vk.unwrap(Vk.create_command_pool(dev, w.qf; flags = Vk.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)),
             Vk.COMMAND_BUFFER_LEVEL_PRIMARY, 1)))); pin(cbh)
     return H265Decoder(w, dev, sps, pps, chroma, SESSION, PARAMS, PIN, imgs, nslots,
+                       Any[], nothing, Any[], BSALIGN,
                        nothing, nothing, Ptr{UInt8}(0), UInt64(0), cbh, cbh.vks,
                        Int(CW), Int(CH), Int(DW), Int(DH),
                        Vector{Vector{Vector{UInt8}}}(), 1,
@@ -439,7 +508,16 @@ function feed!(dec::H265Decoder, annexb::AbstractVector{UInt8})
     return dec
 end
 
-function decodeau!(dec::H265Decoder, au, bufbase::Integer)
+# The fourth argument is the shared core's index into `dec.outimgs`, which only
+# DISTINCT fills. Accepted and ignored here so the H.264 and H.265 `decodeau!` are
+# the same call — `decodemore!` passes four to both, and a three-argument method
+# here is a `MethodError` from inside the decode loop.
+#
+# NOT named `outslot`: that is this function's own DPB slot, taken from
+# `freeslots` below and used for the reference-slot index and the DPB entry. A
+# parameter of that name is live from the first line to that assignment, which is
+# a decode into whatever slot the core's loop counter happened to name.
+function decodeau!(dec::H265Decoder, au, bufbase::Integer, ::Integer = 1)
     Lava = parentmodule(@__MODULE__)
     w = dec.w; sps = dec.sps; pps = dec.pps
     SESSION = dec.SESSION; PARAMS = dec.PARAMS; PIN = dec.PIN; imgs = dec.imgs
@@ -489,7 +567,10 @@ function decodeau!(dec::H265Decoder, au, bufbase::Integer)
     off = 0; sliceoffs = UInt32[]
     for sl in au
         push!(sliceoffs, UInt32(off))
-        unsafe_copyto!(bmap + bufbase + off, pointer(vcat(UInt8[0, 0, 1], sl)), length(sl) + 3); off += length(sl) + 3
+        # Kept alive across the copy — see the note on the same staging in video.jl.
+        stage = vcat(UInt8[0, 0, 1], sl)
+        GC.@preserve stage unsafe_copyto!(bmap + bufbase + off, pointer(stage), length(sl) + 3)
+        off += length(sl) + 3
     end
     # reference slots in DPB order; the Std picture info lists RPS entries as
     # positions into this array
