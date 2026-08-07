@@ -107,49 +107,69 @@ end
 # cost nothing" ablation prices the instruction AND silently deletes the memory
 # traffic; it bounds the win, it does not predict it.
 #
-# WHAT IS LEFT, in the order the numbers point at:
-#   * no reuse across subgroups. Each loads its own tiles from global where the
-#     staged kernel stages once into LDS for 8 warps. The earlier staging
-#     benchmark said dropping LDS wins at 16x16 granularity with 4 subgroups;
-#     this kernel is where that stops being true, and it is worth re-measuring
-#     rather than assuming either way.
-#   * arithmetic intensity is 8 muladds / 6 loads = 1.33. Going 2x2 -> 4x2 moved
-#     it 1.0 -> 1.33 and bought 12%, so this axis is real but shallow.
-#   * coopmat2 FLEXIBLE DIMENSIONS, unused here. Every tile is the KHR 16x16, so
-#     a 64x64 block costs 16 tiles and 6 slices; llama.cpp's `mul_mm_cm2.comp`
-#     uses larger cooperative matrices and issues far fewer of both. This is the
-#     largest untried lever and it is what task #44 was originally about.
+# ── WHY IT IS SLOWER. Five explanations were tested; the first four FAILED a
+# predictive test and only the fifth survived a negative control.
 #
-# ── WHY IT IS SLOWER. Diagnosed, not guessed — three hypotheses killed with
-# numbers before the fourth was accepted.
+#   register pressure   2x2 uses 72 regs, staged 124     FAILED (mine lower)
+#   occupancy           2x2 gets 7 wg/SM, staged 2       FAILED (mine higher)
+#   instruction count   2x2 296 insts, staged 575        FAILED (mine simpler)
+#   global traffic      predicted 4x4 at 0.50x           FAILED (measured 1.53x SLOWER)
+#   ADDRESSING REGISTERS  ~20 per live slice, measured   SURVIVED its control
 #
-#   register pressure   mine 72 regs, staged 124        RULED OUT (mine lower)
-#   occupancy           mine 7 wg/SM, staged 2          RULED OUT (mine higher)
-#   instruction count   mine 296 insts, staged 575      RULED OUT (mine simpler)
-#   GLOBAL TRAFFIC      mine 2.67x staged, per output   MATCHES the 2.25x time
+# The traffic explanation is the one an earlier revision of this file asserted as
+# the answer. It is wrong and this is the retraction. Traffic per output falls
+# monotonically across the variants while time does not:
 #
-# Registers and occupancy came from `VK_KHR_pipeline_executable_properties` via
-# `Lava.enable_pipeline_executable_properties!()` before device creation; the
-# workgroup sizes (128 vs 256) identify the two pipelines. Occupancy is
-# 65536 regs/SM ÷ (threads × regs): 7 workgroups for mine, 2 for staged.
+#     kernel                 ms     TF/s   traffic/out   regs   wg/SM
+#     staged (256 thr)    0.132     38.1        0.0234    124     2.1
+#     tensor 2x2          0.369     13.6        0.0625     72     7.1
+#     tensor 4x2          0.310     16.3        0.0469    255     2.0
+#     tensor 4x4          0.790      6.4        0.0312    255     1.0
 #
-# The traffic figure is global elements read per output element per unit of K:
+# 0.0625 -> 0.0469 -> 0.0312 against 0.369 -> 0.310 -> 0.790. A quantity that
+# decreases while the time it supposedly explains goes up is not the cause.
 #
-#     staged  (bm*bk + bk*bn) / (bm*bn) / bk  with 64x128x32  =  0.0234
-#     mine    4 subgroups * 4 tiles * 256 / 64^2 / 16         =  0.0625
+# WHAT IS ACTUALLY GOING ON: a live tensor slice is enormously expensive in
+# registers, so the tile cannot grow to where the reuse would be.
 #
-# Each of my subgroups loads its own A and B tiles from global. The staged kernel
-# stages A(64x32) and B(32x128) into LDS ONCE and eight warps read them from
-# there. That is the whole gap.
+#     hoisted slices  1     2     4     6     8      (1 accumulator, 32 threads)
+#     registers      81    80   133   168   255      -> ~20 per live slice
 #
-# THIS OVERTURNS THE SCOPE OF `bench_tensor_staging.jl`, which measured "dropping
-# the staging wins ~1.8x" and is not wrong so much as narrow: four subgroups
-# sharing ONE 16x16 block is a reuse factor of 4 on one operand with an
-# L1-resident working set. A real GEMM tile has reuse 8-16 and a working set that
-# does not fit. **A micro-benchmark measures its own regime.**
+# and the NEGATIVE CONTROL that makes this an attribution rather than a
+# correlation — same number of loads per iteration, but all through ONE slice
+# with the offset in the pointer, so only "loads in flight" varies:
+#
+#     loads/iter      1     2     4     6     8
+#     registers      81    82    84    85    87      -> ~0.75 per load
+#
+# Slices cost 27x what loads cost. For scale, an entire 16x16 fp16 coopmat
+# operand is 4 registers per lane; one slice descriptor costs five of them. The
+# fixed layout machinery is a further ~60-80 registers before any tile exists.
+#
+# That is a squeeze with no way through at 16x16:
+#   * beating the staged kernel needs operand reuse, which needs a big tile
+#   * a big tile out of KHR 16x16 tiles needs many live slices
+#   * ~20 registers each saturates the 255-register cap at 6-8 slices, which is
+#     reached BEFORE the tile is large enough to supply the reuse
+#   * recomputing slices in the loop instead costs 168 regs but 1.197x the time
+#     (measured), so neither side of the trade wins
+#   * 4x2 at 8 subgroups is 1.157x SLOWER than at 4 (measured): at 255 regs,
+#     256 threads gets 1 workgroup/SM
 #
 # So tensor addressing and LDS staging are NOT alternatives. The tensor load is a
-# better way to MOVE a tile; the reuse still has to come from somewhere — either
-# shared memory, or a tile large enough that one subgroup's own registers supply
-# it. The latter is what coopmat2 FLEXIBLE DIMENSIONS buys, and that is now
-# motivated by this measurement rather than by analogy to llama.cpp.
+# better way to MOVE a tile (measured 0.993x of a plain coopmat load, i.e. free);
+# the reuse still has to come from somewhere — shared memory, or a tile big
+# enough that one subgroup's registers supply it.
+#
+# THIS ALSO NARROWS `bench_tensor_staging.jl`, which measured "dropping the
+# staging wins ~1.8x": four subgroups sharing ONE 16x16 block is a reuse factor
+# of 4 with an L1-resident working set. A real GEMM tile has reuse 8-16 and does
+# not fit. A micro-benchmark measures its own regime.
+#
+# THE PREDICTION THIS MAKES, and the reason #44 is now the next step on evidence
+# rather than on analogy to llama.cpp: coopmat2 FLEXIBLE DIMENSIONS lets one
+# cooperative matrix cover 64x16, so the same tile area needs ONE slice where
+# this kernel needs four. If ~20 registers per slice is really the binding
+# constraint, that quarters the addressing cost at constant tile size and is the
+# only lever measured here that moves it. `bench_tensor_registers.jl` holds the
+# two sweeps above so the claim can be re-checked when that lands.
