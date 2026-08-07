@@ -283,6 +283,18 @@ module Op
     const OpTensorLayoutSliceNV                           = UInt16(5375)
     const OpCreateTensorViewNV                            = UInt16(5377)
     const OpCooperativeMatrixLoadTensorNV                 = UInt16(5367)
+    # The STORE, which is what makes a ragged OUTPUT legal — the clamping layout
+    # bounds-checks writes exactly as it bounds-checks reads, so an edge tile
+    # writes only its in-range elements instead of running off the end. Read off
+    # a glslang binary for `coopMatStoreTensorNV`, not guessed from the load:
+    #
+    #   OpCooperativeMatrixStoreTensorNV %ptr %object %layout <memop> <tensorop>
+    #
+    # NO result type and NO result id — it is a store — so it is the load's
+    # operand list minus its first two words. `%object` here IS the matrix being
+    # written, the same operand position that on the load carries the value
+    # out-of-range elements keep.
+    const OpCooperativeMatrixStoreTensorNV                = UInt16(5368)
     # VK_KHR_ray_query opcodes (SPV_KHR_ray_query)
     const OpTypeRayQueryKHR                               = UInt16(4472)
     const OpRayQueryInitializeKHR                         = UInt16(4473)

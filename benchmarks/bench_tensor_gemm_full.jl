@@ -1,5 +1,16 @@
 # A real tiled GEMM through tensor addressing, raced against the staged kernel.
 #
+# ⚠ READ `bench_tensor_gemm_ragged.jl` FIRST. Everything below races this kernel
+# against the tuned staged GEMM on 16-DIVISIBLE shapes, where it loses 2.3x, and
+# then spends five explanations failing to account for the gap. That race was the
+# wrong one. The staged coopmat path is GATED on divisibility (`gemm.jl:1379`),
+# so the shapes this kernel is FOR — the ragged ones — cannot take it and fall to
+# a scalar kernel at 5.86 TF/s. Against that, the same kernel is 1.7-2.6x FASTER,
+# measured. A kernel is only slow relative to what would otherwise run.
+#
+# Keep this file for the five negative results, which are still true and still
+# worth not repeating. Do not take its headline as the verdict on the port.
+#
 # Everything it needs was measured first, so none of this is guesswork:
 #   * layout dims go in REVERSED for a column-major array (last dim is fastest)
 #   * slice offsets are in the same order as `setdim`'s dims
@@ -114,7 +125,10 @@ end
 #   occupancy           2x2 gets 7 wg/SM, staged 2       FAILED (mine higher)
 #   instruction count   2x2 296 insts, staged 575        FAILED (mine simpler)
 #   global traffic      predicted 4x4 at 0.50x           FAILED (measured 1.53x SLOWER)
-#   ADDRESSING REGISTERS  ~20 per live slice, measured   SURVIVED its control
+#   addressing regs     predicted fewer slices = faster  FAILED (measured 1.18x SLOWER)
+#
+# ALL FIVE FAILED. There is no demonstrated cause. Read the rest of this section
+# as a record of what was ruled out, not as a diagnosis.
 #
 # The traffic explanation is the one an earlier revision of this file asserted as
 # the answer. It is wrong and this is the retraction. Traffic per output falls
@@ -166,10 +180,28 @@ end
 # of 4 with an L1-resident working set. A real GEMM tile has reuse 8-16 and does
 # not fit. A micro-benchmark measures its own regime.
 #
-# THE PREDICTION THIS MAKES, and the reason #44 is now the next step on evidence
-# rather than on analogy to llama.cpp: coopmat2 FLEXIBLE DIMENSIONS lets one
-# cooperative matrix cover 64x16, so the same tile area needs ONE slice where
-# this kernel needs four. If ~20 registers per slice is really the binding
-# constraint, that quarters the addressing cost at constant tile size and is the
-# only lever measured here that moves it. `bench_tensor_registers.jl` holds the
-# two sweeps above so the claim can be re-checked when that lands.
+# THE PREDICTION THIS MADE, AND HOW IT DIED. coopmat2 FLEXIBLE DIMENSIONS lets
+# one cooperative matrix cover 64x16, so the same tile area needs ONE slice where
+# this kernel needs four. If ~20 registers per slice were the binding constraint,
+# that quarters the addressing cost at constant tile size. Both arms were built
+# (flexible dimensions work — 1.1e-6 against CPU; see test_coopmat_flexible_dims.jl):
+#
+#   at the real tile, 64x16 b-tiles vs four 16x16     0.990x, registers still 255
+#   below the cap, EQUAL tile area (32 in N, 16 in M):
+#       3 slices (2x 16x16)   111 regs   0.613 ms   8.22 TF/s
+#       2 slices (1x 32x16)    96 regs   0.721 ms   6.98 TF/s   <- 1.176x SLOWER
+#
+# Fewer slices, fewer registers, HIGHER occupancy, and slower. The first arm is
+# inconclusive on mechanism (both pegged at the 255 cap, so a saving cannot show)
+# but conclusive on outcome. The second is clean: below the cap the register
+# saving is real — 15 per slice, matching the sweep — and it does not buy time.
+#
+# So ~20 registers per live slice is a TRUE measured property of tensor slices
+# and NOT the reason this GEMM is slow. That distinction is the whole lesson
+# here, and it is the same mistake twice in one sitting: traffic was real too.
+# A quantity can be genuine, controlled, and reproducible, and still not be on
+# the critical path — measuring it carefully does not make it causal. The test
+# that separates the two is always the same: change it on purpose and predict.
+#
+# `bench_tensor_registers.jl` holds the register sweeps, which stand on their own
+# as a fact about slices. Nothing here explains the 2.3x.

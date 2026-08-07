@@ -438,6 +438,43 @@ function emit_tensor_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         state.value_map[inst] = id
         state.coopmat_value_types[inst] = mat_ty
 
+    elseif op == "store"
+        # `_lava_tensor_store_<dim>_<clamp>_<dtype>_<M>x<N>_<use>`
+        #   (i64 address, i32 matrix-handle, i32 layout-handle) -> nothing
+        #
+        # The mirror of the load, and the half that makes a ragged OUTPUT legal:
+        # under a clamping layout the store writes only the elements the layout's
+        # dimensions admit, so an edge tile stops at the extent instead of running
+        # past it. That is what lets a GEMM skip `gemm_padn`/`GEMM_BLOCK` on the
+        # DESTINATION as well as the operands.
+        length(rest) == 3 || error("malformed tensor store name: $fn_name")
+        dtype = rest[1]
+        dims = split(rest[2], 'x'); length(dims) == 2 || error("bad shape in $fn_name")
+        M = parse(Int, dims[1]); N = parse(Int, dims[2])
+        use = rest[3] == "a" ? CoopMatUse.MatrixA :
+              rest[3] == "b" ? CoopMatUse.MatrixB : CoopMatUse.MatrixAccumulator
+        nargs == 3 || error("tensor store takes 3 arguments, got $nargs")
+
+        emit_coopmat_type!(state, dtype, M, N, use)   # declares caps/extension
+        comp_ty = coopmat_component_type!(state, dtype)
+        ptr_id = coopmat_base_pointer!(state, args[1], comp_ty)
+        mat_id = get_value_id!(state, args[2])
+        layout_id = get_value_id!(state, args[3])
+
+        require_capability!(mod, Cap.CooperativeMatrixTensorAddressingNV)
+        require_extension!(mod, "SPV_NV_cooperative_matrix2")
+
+        # Same two operand rules as the load, for the same reasons: `Aligned` with
+        # a literal rather than `None`, because ours is a `PhysicalStorageBuffer`
+        # address (VUID-…-04708) where glslang's reference uses a descriptor
+        # binding and emits `None`; and `TensorAddressingOperands` is then
+        # mandatory, not optional. No result type, no result id.
+        align = coopmat_component_bytes(dtype)
+        encode_instruction!(mod.functions, Op.OpCooperativeMatrixStoreTensorNV,
+                            ptr_id, mat_id, layout_id,
+                            MemOp.Aligned, UInt32(align), UInt32(0))
+        # A store produces no value, so nothing is recorded in `value_map`.
+
     else
         error("unsupported tensor-addressing op `$op` in $fn_name")
     end

@@ -128,6 +128,19 @@ end
         # come back as exact zeros. That is what retires `gemm_padn`,
         # `GEMM_BLOCK`, `padtile`/`crsextent` and `gemm_divides`.
         include(joinpath(@__DIR__, "test_tensor_clamp.jl"))
+        # And that a shape the device does NOT report is usable at all: every
+        # KHR shape here has M == 16, so 64x16 exercises coopmat2's flexible
+        # dimensions. A hard-coded shape list in `KNOWN_INTRINSICS` used to
+        # reject it before the emitter — which handles it correctly — ever saw
+        # it, so this guards a gate, not an instruction.
+        include(joinpath(@__DIR__, "test_coopmat_flexible_dims.jl"))
+        # The clamp test above covers READS. This is the other half: a clamping
+        # layout must bounds-check the STORE too, or a tensor GEMM can consume
+        # unpadded operands and still not write an unpadded result. Asserts
+        # two-sided — in-range elements land, and nothing outside the extent
+        # moves — because a store that trampled its neighbours would pass a
+        # one-sided "the right values are there" check.
+        include(joinpath(@__DIR__, "test_tensor_store.jl"))
     end
 
     # ── Tier 3a: Workgroup barrier-skip fix (GPU; catches lavapipe deadlock) ──

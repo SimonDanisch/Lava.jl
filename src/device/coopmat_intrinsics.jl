@@ -611,19 +611,17 @@ Check `vk_context().coopmat2.reductions` before compiling a kernel that uses thi
     end
 end
 
-# The emitter matches on the prefix, so individual names need no registration;
-# this keeps GPUCompiler's unknown-intrinsic check happy for the common shapes.
-# `(8, 8)` is not a shape any kernel here ships: it is what **lavapipe** offers,
-# and having it registered is what lets a cooperative-matrix reproducer run on a
-# second, independent compiler stack. See `test_shared_index_division.jl`.
-for T in (Float16, Float32), U in (MatrixA, MatrixB, Accumulator),
-    (M, N) in ((16, 16), (16, 8), (8, 8)),
-    op in ("load", "store", "zero", "muladd", "loadw", "loadw2", "storew", "convert",
-           "length", "getcomp", "setcomp", "perelem", "mul", "add",
-           # one name per reduce mask, since the mask is a literal operand
-           "reduce1", "reduce2", "reduce3", "reduce4")
-    push!(KNOWN_INTRINSICS, coopmat_intrinsic_name(op, T, M, N, U))
-    op in ("load", "loadw", "loadw2", "store", "storew") &&
-        push!(KNOWN_INTRINSICS, coopmat_intrinsic_name(op, T, M, N, U; rowmajor = true))
-end
+# No shape enumeration here. `GPUCompiler.isintrinsic` accepts the whole
+# `_lava_coopmat_` prefix, because the shape rides in the name and the emitter
+# parses it back out — enumerating shapes made the GATE decide which shapes
+# exist, and coopmat2 FLEXIBLE DIMENSIONS allows any M/N within the device's
+# max-dimension limit. A 64x16 matrix (legal here: `flexible_dimensions` is
+# enabled at device creation, and no device-reported KHR shape has M != 16) was
+# rejected before reaching an emitter that handles it correctly — measured
+# 1.1e-6 against CPU once the gate was lifted.
+#
+# Shapes the device cannot actually run still fail, just later and more
+# precisely: the emitter errors on a malformed name, and the driver rejects a
+# shape outside its limits. `coopmat_shape(ctx, T, M, N, K)` is the host-side
+# query for deciding whether to take this path at all.
 

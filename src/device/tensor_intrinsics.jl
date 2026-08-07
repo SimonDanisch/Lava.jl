@@ -37,19 +37,12 @@ end
 tensor_intrinsic_name(op::AbstractString, dim::Integer, clamp::UInt32) =
     "_lava_tensor_$(op)_$(dim)_$(clamp)"
 
-# Every name has to be registered, or GPUCompiler's IR validation rejects the
-# call as "unsupported call to an unknown function" long before Lava's emitter
-# ever sees it — `GPUCompiler.isintrinsic(::LavaCompilerJob, …)` whitelists a few
-# prefixes and consults `KNOWN_INTRINSICS` for everything else. The coopmat
-# intrinsics enumerate their shapes the same way; there is no prefix rule.
-#
-# Ranks 1-4 and all three clamp modes is the whole reachable set: rank comes from
-# the operand's dimensionality (2 for a GEMM, 4 for a convolution's im2col view)
-# and the mode from `TENSOR_CLAMP_*`.
-for dim in 1:4, clamp in (TENSOR_CLAMP_UNDEFINED, TENSOR_CLAMP_CONSTANT, TENSOR_CLAMP_TO_EDGE),
-    op in ("create", "setdim", "slice")
-    push!(KNOWN_INTRINSICS, tensor_intrinsic_name(op, dim, clamp))
-end
+# An unregistered name is rejected as "unsupported call to an unknown function"
+# by GPUCompiler's IR validation, long before Lava's emitter sees it.
+# `GPUCompiler.isintrinsic(::LavaCompilerJob, …)` now whitelists the whole
+# `_lava_tensor_` prefix, so nothing here needs enumerating — which is what lets
+# rank and clamp mode vary freely instead of only in the combinations someone
+# remembered to list.
 
 """Name of the tensor LOAD, which additionally carries the matrix shape.
 
@@ -60,11 +53,9 @@ tensor_load_name(dim::Integer, clamp::UInt32, ::Type{T}, M, N,
                  ::Type{U}) where {T,U<:MatrixUse} =
     "_lava_tensor_load_$(dim)_$(clamp)_$(COOPMAT_DTYPE_SUFFIX[T])_$(M)x$(N)_$(COOPMAT_USE_SUFFIX[U])"
 
-for dim in 1:4, clamp in (TENSOR_CLAMP_UNDEFINED, TENSOR_CLAMP_CONSTANT, TENSOR_CLAMP_TO_EDGE),
-    T in (Float16, Float32), U in (MatrixA, MatrixB, Accumulator),
-    (M, N) in ((16, 16), (16, 8), (8, 8))
-    push!(KNOWN_INTRINSICS, tensor_load_name(dim, clamp, T, M, N, U))
-end
+# Not enumerated: `isintrinsic` accepts the `_lava_tensor_` prefix, so the load
+# works at any cooperative-matrix shape the device supports — including the
+# flexible dimensions a fixed (16,16)/(16,8)/(8,8) list silently excluded.
 
 """
     tensor_layout(Val(DIM), Val(CLAMP)) -> TensorLayout
@@ -182,5 +173,44 @@ matrix when every element is in range.
         h = Base.llvmcall(($ir, "entry"), Int32, Tuple{UInt64,Int32,Int32},
                           addr, a.handle, l.handle)
         AcceleratedMatrix{$T,$M,$N,$U}(h)
+    end
+end
+
+"""Name of the tensor STORE. Same shape as `tensor_load_name`; see it for why
+`U` goes through `COOPMAT_USE_SUFFIX` rather than being interpolated."""
+tensor_store_name(dim::Integer, clamp::UInt32, ::Type{T}, M, N,
+                  ::Type{U}) where {T,U<:MatrixUse} =
+    "_lava_tensor_store_$(dim)_$(clamp)_$(COOPMAT_DTYPE_SUFFIX[T])_$(M)x$(N)_$(COOPMAT_USE_SUFFIX[U])"
+
+"""
+    tensor_store(a::AcceleratedMatrix, addr::UInt64, layout) -> nothing
+
+`OpCooperativeMatrixStoreTensorNV` — write a matrix straight to memory through
+`layout`, the mirror of [`tensor_load`](@ref).
+
+**This is the half that makes a ragged OUTPUT legal.** A clamping layout
+bounds-checks writes the same way it bounds-checks reads, so a tile straddling
+the edge of an `M x N` destination writes only the elements inside it. Without
+it a tensor-addressed GEMM can consume unpadded operands but still cannot
+produce an unpadded result — the loads clamp and the store runs off the end.
+
+Unlike the load, `a` here IS the value being written: there is no `%object`
+distinction to make, because nothing is left over to keep.
+"""
+@generated function tensor_store(a::AcceleratedMatrix{T,M,N,U}, addr::UInt64,
+                                 l::TensorLayout{DIM,CLAMP}) where {T,M,N,U,DIM,CLAMP}
+    fname = tensor_store_name(DIM, UInt32(CLAMP), T, M, N, U)
+    ir = """
+        declare void @$fname(i64, i32, i32) #0
+        define void @entry(i64 %p, i32 %m, i32 %l) #0 {
+            call void @$fname(i64 %p, i32 %m, i32 %l)
+            ret void
+        }
+        attributes #0 = { alwaysinline convergent }
+    """
+    quote
+        Base.llvmcall(($ir, "entry"), Nothing, Tuple{UInt64,Int32,Int32},
+                      addr, a.handle, l.handle)
+        nothing
     end
 end
