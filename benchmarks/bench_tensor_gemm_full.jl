@@ -119,3 +119,37 @@ end
 #     a 64x64 block costs 16 tiles and 6 slices; llama.cpp's `mul_mm_cm2.comp`
 #     uses larger cooperative matrices and issues far fewer of both. This is the
 #     largest untried lever and it is what task #44 was originally about.
+#
+# ── WHY IT IS SLOWER. Diagnosed, not guessed — three hypotheses killed with
+# numbers before the fourth was accepted.
+#
+#   register pressure   mine 72 regs, staged 124        RULED OUT (mine lower)
+#   occupancy           mine 7 wg/SM, staged 2          RULED OUT (mine higher)
+#   instruction count   mine 296 insts, staged 575      RULED OUT (mine simpler)
+#   GLOBAL TRAFFIC      mine 2.67x staged, per output   MATCHES the 2.25x time
+#
+# Registers and occupancy came from `VK_KHR_pipeline_executable_properties` via
+# `Lava.enable_pipeline_executable_properties!()` before device creation; the
+# workgroup sizes (128 vs 256) identify the two pipelines. Occupancy is
+# 65536 regs/SM ÷ (threads × regs): 7 workgroups for mine, 2 for staged.
+#
+# The traffic figure is global elements read per output element per unit of K:
+#
+#     staged  (bm*bk + bk*bn) / (bm*bn) / bk  with 64x128x32  =  0.0234
+#     mine    4 subgroups * 4 tiles * 256 / 64^2 / 16         =  0.0625
+#
+# Each of my subgroups loads its own A and B tiles from global. The staged kernel
+# stages A(64x32) and B(32x128) into LDS ONCE and eight warps read them from
+# there. That is the whole gap.
+#
+# THIS OVERTURNS THE SCOPE OF `bench_tensor_staging.jl`, which measured "dropping
+# the staging wins ~1.8x" and is not wrong so much as narrow: four subgroups
+# sharing ONE 16x16 block is a reuse factor of 4 on one operand with an
+# L1-resident working set. A real GEMM tile has reuse 8-16 and a working set that
+# does not fit. **A micro-benchmark measures its own regime.**
+#
+# So tensor addressing and LDS staging are NOT alternatives. The tensor load is a
+# better way to MOVE a tile; the reuse still has to come from somewhere — either
+# shared memory, or a tile large enough that one subgroup's own registers supply
+# it. The latter is what coopmat2 FLEXIBLE DIMENSIONS buys, and that is now
+# motivated by this measurement rather than by analogy to llama.cpp.
