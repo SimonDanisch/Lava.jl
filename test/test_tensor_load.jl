@@ -36,6 +36,16 @@ const TL_M = 16          # matrix tile
     Lava.copyto!(pointer(out), 1, TL_M, m)
 end
 
+@kernel cpu = false function tensorphi_kernel!(out, @Const(src), flag::Int32)
+    base = Lava.tensor_setdim(
+               Lava.tensor_layout(Val(2), Val(Lava.TENSOR_CLAMP_CONSTANT)),
+               (Int32(TL_N), Int32(TL_N)))
+    l = flag == 1 ? Lava.tensor_slice(base, (Int32(0), Int32(0)),      (Int32(TL_M), Int32(TL_M))) :
+                    Lava.tensor_slice(base, (Int32(0), Int32(TL_M)),   (Int32(TL_M), Int32(TL_M)))
+    z = Lava.coopmat_zero(AMt{Float32,TL_M,TL_M,Lava.Accumulator})
+    Lava.copyto!(pointer(out), 1, TL_M, Lava.tensor_load(z, UInt64(pointer(src)), l))
+end
+
 @testset "OpCooperativeMatrixLoadTensorNV loads what the layout describes" begin
     ctx = Lava.vk_context()
     if !ctx.coopmat2.tensor_addressing
@@ -70,5 +80,41 @@ end
         @test o == permutedims(blk)
         @test o != blk                      # and they are genuinely different
         @test o[1, 2] == s[2, 1]            # spelled out on one element
+    end
+end
+
+# A tensor layout is an opaque handle carried as an `i32`, exactly like a
+# cooperative matrix, so anything deriving a SPIR-V type from the LLVM type gets
+# `%uint`. A RUNTIME branch selecting between two layouts is the shape that
+# exposes it — a GEMM picking a layout per branch would — and before
+# `state.tensor_value_types` existed this failed validation with
+#
+#     OpPhi's result type '%uint' does not match incoming value type
+#
+# Two separate fixes were needed and the second is the interesting one. Typing
+# the phi result is not sufficient: the kernel body sits under the ndrange guard,
+# so the guard edge carries a plain `i32 0` and the phi is still ill-typed. The
+# cooperative-matrix path substitutes `OpConstantNull` there; a layout has NO
+# null value ("OpConstantNull Result Type cannot have a null value") and needs
+# `OpUndef` instead, which is correct because the edge is only taken where the
+# value is dead.
+@testset "a phi over tensor layouts is typed, not %uint" begin
+    ctx = Lava.vk_context()
+    if !ctx.coopmat2.tensor_addressing
+        @info "device has no coopmat2 tensor addressing — skipping"
+    else
+        back = LavaBackend()
+        WG = Lava.device_subgroup_size(ctx)
+        src = KA.allocate(back, Float32, TL_N, TL_N)
+        s = Float32.(reshape(1:(TL_N * TL_N), TL_N, TL_N))
+        copyto!(src, s)
+        out = KA.allocate(back, Float32, TL_M, TL_M)
+        for f in Int32.((1, 2))
+            fill!(out, NaN32)
+            tensorphi_kernel!(back, (Int(WG),))(out, src, f; ndrange = (Int(WG),))
+            KA.synchronize(back)
+            o = Array(out); off = f == 1 ? 0 : TL_M
+            @test all(o[i, j] == s[off + j, i] for i in 1:TL_M, j in 1:TL_M)
+        end
     end
 end

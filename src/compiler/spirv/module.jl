@@ -202,6 +202,18 @@ module Op
     const OpReportIntersectionKHR   = UInt16(5334)
     const OpTypeAccelerationStructureKHR = UInt16(5341)
     const OpConstantNull            = UInt16(46)
+    # `OpUndef` where `OpConstantNull` is illegal. An opaque handle type such as
+    # `OpTypeTensorLayoutNV` has no null value — spirv-val says so directly,
+    # "OpConstantNull Result Type cannot have a null value" — so a phi edge on
+    # which a layout is dead needs an undef rather than a null.
+    #
+    # **1, not 52.** 52 is `OpSpecConstantOp`, and using it produced "End of
+    # input reached while decoding OpSpecConstantOp: expected more operands"
+    # — a decoder error nowhere near the mistake. Read out of a module that
+    # `spirv-as` assembled from text containing an `OpUndef`, which is the same
+    # method the tensor opcodes above use and the reason they were right first
+    # time. This one was guessed and was not.
+    const OpUndef                   = UInt16(1)
     # Bool constants are their own opcodes, not `OpConstant` with a 0/1 operand.
     # Needed by `OpTypeTensorViewNV`, whose `HasDimensions` parameter is a Bool
     # constant <id>. Observed, not assumed: a shader declaring both a

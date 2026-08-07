@@ -94,6 +94,13 @@ mutable struct SPIRVEmitterState
     # dedupe exactly like the cooperative-matrix ones.
     tensor_layout_type_ids::Dict{Tuple{Int, UInt32}, UInt32}
     tensor_view_type_ids::Dict{Tuple{Int, Bool, Vector{UInt32}}, UInt32}
+    # LLVM values holding a tensor LAYOUT, for the same reason
+    # `coopmat_value_types` exists: the front end carries one as an i32 handle, so
+    # anything deriving a SPIR-V type from the LLVM type gets `%uint`. A phi over
+    # two layouts — `cond ? sliceA : sliceB`, which a GEMM selecting a layout per
+    # branch would produce — then fails validation with "OpPhi's result type
+    # '%uint' does not match incoming value type".
+    tensor_value_types::Dict{LLVM.Value, UInt32}
     # LLVM values that actually hold a cooperative matrix. The front end carries
     # them as an i32 handle, so their LLVM type says nothing useful; anything
     # that derives a SPIR-V type from the LLVM type (phis above all) has to
@@ -215,6 +222,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{Tuple{String, Int, Int, UInt32}, UInt32}(),  # coopmat types
         Dict{Tuple{Int, UInt32}, UInt32}(),               # tensor layout types
         Dict{Tuple{Int, Bool, Vector{UInt32}}, UInt32}(), # tensor view types
+        Dict{LLVM.Value, UInt32}(),                       # tensor-layout-typed values
         Dict{LLVM.Value, UInt32}(),                       # coopmat-typed values
         Dict{UInt32, UInt32}(),                           # coopmat component vars
         Dict{UInt32, UInt32}(),                           # coopmat var contents
@@ -6392,12 +6400,21 @@ function defer_phi!(state::SPIRVEmitterState, inst::LLVM.PHIInst, block_label_id
     end
 
     # A phi over cooperative matrices carries the matrix type, not the i32 the
-    # handle happens to have in LLVM.
+    # handle happens to have in LLVM. Tensor layouts are handles in exactly the
+    # same sense and need the same treatment — `cond ? sliceA : sliceB` otherwise
+    # emits `OpPhi %uint` over two `OpTypeTensorLayoutNV` values and spirv-val
+    # rejects the module.
     for (val, _) in incoming
         cm = get(state.coopmat_value_types, val, nothing)
         if cm !== nothing
             result_ty = cm
             state.coopmat_value_types[inst] = cm
+            break
+        end
+        tl = get(state.tensor_value_types, val, nothing)
+        if tl !== nothing
+            result_ty = tl
+            state.tensor_value_types[inst] = tl
             break
         end
     end
@@ -6410,6 +6427,13 @@ the emitter itself created, so it needs no bookkeeping beyond what
 `emit_coopmat_type!` already keeps."""
 is_coopmat_type_id(state::SPIRVEmitterState, id::UInt32) =
     any(==(id), values(state.coopmat_type_ids))
+
+"""Whether `id` names an `OpTypeTensorLayoutNV`. Same role as
+`is_coopmat_type_id`: a layout is an opaque handle carried as an `i32`, so a phi
+edge where it is dead can arrive as a plain `i32 0` and needs the same
+`OpConstantNull` substitution."""
+is_tensor_layout_type_id(state::SPIRVEmitterState, id::UInt32) =
+    any(==(id), values(state.tensor_layout_type_ids))
 
 """
 Resolve all deferred PHI nodes by inserting them right after their block's OpLabel.
@@ -6480,6 +6504,24 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
                         encode_instruction!(state.type_ctx.mod.types_constants, UInt16(46), type_id, uid)  # OpConstantNull
                         uid
                     end
+                end
+            elseif val isa LLVM.Constant && is_tensor_layout_type_id(state, type_id) &&
+                   get(state.tensor_value_types, val, nothing) !== type_id
+                # Exactly the cooperative-matrix case below, for tensor layouts:
+                # `cond ? sliceA : sliceB` inside a kernel whose body sits under
+                # the ndrange guard gives the phi an `i32 0` on the guard edge.
+                #
+                # `OpUndef`, NOT `OpConstantNull` — a layout is an opaque handle
+                # type with no null value, and spirv-val rejects the constant
+                # outright ("OpConstantNull Result Type cannot have a null
+                # value"). The edge is only taken where the value is unused, so
+                # undef is exactly right.
+                key = (:undef, type_id)
+                get!(state.type_ctx.mod.constant_cache, key) do
+                    uid = fresh_id!(state.type_ctx.mod)
+                    encode_instruction!(state.type_ctx.mod.types_constants,
+                                        Op.OpUndef, type_id, uid)
+                    uid
                 end
             elseif val isa LLVM.Constant && is_coopmat_type_id(state, type_id) &&
                    get(state.coopmat_value_types, val, nothing) !== type_id

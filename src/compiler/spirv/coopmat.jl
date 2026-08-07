@@ -369,6 +369,7 @@ function emit_tensor_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         id = fresh_id!(mod)
         encode_instruction!(mod.functions, Op.OpCreateTensorLayoutNV, layout_ty, id)
         state.value_map[inst] = id
+        state.tensor_value_types[inst] = layout_ty
 
     elseif op == "setdim"
         # %layout followed by one <id> per dimension.
@@ -379,6 +380,7 @@ function emit_tensor_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         encode_instruction!(mod.functions, Op.OpTensorLayoutSetDimensionNV,
                             layout_ty, id, ids...)
         state.value_map[inst] = id
+        state.tensor_value_types[inst] = layout_ty
 
     elseif op == "slice"
         # %layout then OFFSET/SIZE PAIRS, one pair per dimension — not all the
@@ -390,6 +392,7 @@ function emit_tensor_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         encode_instruction!(mod.functions, Op.OpTensorLayoutSliceNV,
                             layout_ty, id, ids...)
         state.value_map[inst] = id
+        state.tensor_value_types[inst] = layout_ty
 
     elseif op == "load"
         # `_lava_tensor_load_<dim>_<clamp>_<dtype>_<M>x<N>_<use>`
