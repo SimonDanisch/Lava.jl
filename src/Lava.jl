@@ -339,6 +339,12 @@ function __init__()
     # precompilation serialised its wreckage into the pkgimage and poisoned every
     # later session. They are `ctx.diag` fields now, built fresh with the context,
     # so there is nothing that can survive into the image to clear.
+    # A context is per process and can never be inherited from an image: its
+    # handles belong to a device this process has not opened. Precompilation
+    # runs workloads that build one, so this is not hypothetical — see the
+    # workload at the bottom of this file for the segfault it caused.
+    VK_CONTEXT_REF[] = nothing
+
     init_pipeline_thread!()
 
     # Mark device as lost during shutdown so GC finalizers don't call into
@@ -350,5 +356,23 @@ function __init__()
         VK_CONTEXT_REF[] = nothing
     end
 end
+
+# ── why there is no workload here ─────────────────────────────────────────────
+#
+# `@snoop_inference` on a cold SAM 2 call says **69.4% of first-call inference is
+# Lava's own methods** — 4333 instances, against 0.6% for SAM2Runner, which owns
+# the only workload. That reads like an argument for a workload in this package.
+# It was tried, and it bought nothing: 31.07 s cold against 30.70 s without.
+#
+# The reason is worth keeping. Those instances are Lava *methods* specialised on
+# *DNNKernels* types — `Broadcasted{…, typeof(DNNKernels.safetrunc), …}`,
+# one closure type per fused expression a graph produces. Generic broadcasts
+# written here cannot produce those types, so nothing here can infer them.
+# **Owning the method is not the same as being able to precompile it**, and a
+# profile grouped by owning module invites exactly that confusion.
+#
+# So the workload belongs where the argument types originate: the kernel library
+# and the model runners. What this package can usefully precompile is whatever a
+# *bare* Lava user reaches, which nobody has measured a need for.
 
 end # module Lava
