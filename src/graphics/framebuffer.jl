@@ -128,6 +128,44 @@ responsible for that and for transitioning the second from `UNDEFINED`.
 bind_image!(ctx::VkContext, image::Vulkan.Image, memory::Vulkan.DeviceMemory, offset::Integer) =
     unwrap(Vulkan.bind_image_memory(ctx.device, image, memory, UInt64(offset)))
 
+"""
+    unbound_buffer(ctx, bytes, usage) -> Buffer
+
+A `VkBuffer` with no memory behind it yet, for binding into an allocation
+somebody else owns.
+
+Every other buffer path here allocates memory per buffer and binds at offset 0,
+which is right when the buffer owns its bytes and useless when a suballocator
+does. This is the half that lets a caller place buffers the way `bind_image!`
+already lets it place images.
+"""
+unbound_buffer(ctx::VkContext, bytes::Integer, usage::Vulkan.BufferUsageFlag) =
+    Vulkan.Buffer(ctx.device, UInt64(max(bytes, 1)), usage,
+                  Vulkan.SHARING_MODE_EXCLUSIVE, UInt32[])
+
+"""Memory requirements of `buf`, shaped like [`image_requirements`](@ref)."""
+function buffer_requirements(ctx::VkContext, buf::Vulkan.Buffer)
+    r = Vulkan.get_buffer_memory_requirements(ctx.device, buf)
+    (size = Int(r.size), alignment = Int(r.alignment), type_bits = r.memory_type_bits)
+end
+
+"""
+    bind_buffer!(ctx, buffer, memory, offset)
+
+Bind a buffer to a byte offset in an existing allocation — [`bind_image!`](@ref)
+for buffers, and subject to the same rule: two resources may share bytes only if
+their contents never have to survive each other, and the caller owns that.
+
+It did not exist because nothing needed it: every `bind_buffer_memory` call in
+this package passes 0, since each buffer allocated its own memory. A suballocator
+above Lava has nowhere to put a buffer without it, which is how one ended up
+suballocating a `LavaArray` instead — i.e. stacked on top of Lava's own pool
+rather than on the device.
+"""
+bind_buffer!(ctx::VkContext, buf::Vulkan.Buffer, memory::Vulkan.DeviceMemory, offset::Integer) =
+    throw_if_error(ctx, "vkBindBufferMemory",
+                   Vulkan.bind_buffer_memory(ctx.device, buf, memory, UInt64(offset)))
+
 """Allocate device-local memory for an image and bind it."""
 function alloc_image_memory(ctx::VkContext, image::Vulkan.Image)
     req = image_requirements(ctx, image)
