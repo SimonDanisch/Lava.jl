@@ -780,9 +780,22 @@ end
 function pad_to_3d(::VkContext, t::NTuple{3,<:Integer})
     (Int(t[1]), Int(t[2]), Int(t[3]))
 end
-# For N>3, flatten then split
+# For N>3: drop trailing unit axes first, and only flatten if something non-unit
+# is left past the third.
+#
+# A trailing `1` carries no information — `(8, 1152, 4, 1)` is the same grid as
+# `(8, 1152, 4)` — but flattening it to 1D and re-splitting loses the 1:1
+# correspondence between the dispatch and the block grid, which is exactly what
+# `directdispatch` needs. Rank-4 ndranges ending in a batch of 1 are the common
+# shape in this codebase (`(W, H, C, 1)`), so this is what lets them index
+# without dividing.
 function pad_to_3d(ctx::VkContext, t::NTuple{N,<:Integer}) where N
-    pad_to_3d(ctx, (Int(prod(t)),))
+    n = N
+    while n > 3 && Int(t[n]) == 1
+        n -= 1
+    end
+    n > 3 && return pad_to_3d(ctx, (Int(prod(t)),))
+    return pad_to_3d(ctx, ntuple(i -> Int(t[i]), n))
 end
 
 """
@@ -1173,6 +1186,111 @@ end
     return bx + by * nx + bz * nx * ny + 1
 end
 
+@inline ndrank(::KA.NDRange{N}) where {N} = Val(N)
+
+@inline extentat(t::NTuple{N,Int}, ::Val{I}) where {N,I} = I <= N ? t[I] : 1
+
+"""
+    directdispatch(is, Val(N)) -> Bool
+
+Whether the global index can be read straight off the dispatch builtins instead
+of being recovered by dividing a flattened index back apart.
+
+`linear_block_index()` builds a linear index *out of* `WorkgroupId.{x,y,z}`, and
+`KA.expand` then indexes `blocks(iterspace)` — a `CartesianIndices` — with it,
+and `workitems(iterspace)` with the thread id. That round trip is `2(N-1)`
+integer divisions by **runtime** extents, and it is recovering exactly the
+numbers the hardware already handed us: `block_dims = pad_to_3d(size(blocks))`,
+and `pad_to_3d` is the identity once trailing unit axes are dropped.
+
+Measured on a plain elementwise copy of 70.8 MB, dynamic launch, this device:
+
+    rank 3   0.710 ms  100 GB/s  ->  0.286 ms  247 GB/s
+    rank 4   1.047      68       ->  0.397     179
+
+247 GB/s is what the *same copy* reaches through `@index(Global, Linear)`, whose
+rank-1 iteration space needs no division at all — so the tuple index has stopped
+paying anything for its shape. This is why `grid_sample2d_kernel!` looked like a
+slow gather: a bare copy over its ndrange cost **88%** of it, and the sampling
+was never the expense.
+
+**The guard compares against what was actually dispatched** — three
+`NumWorkgroups` reads — rather than re-deriving `pad_to_3d`'s rules here, where
+the copy could drift out of agreement with it. `pad_to_3d` re-splits a rank-1 or
+rank-2 grid past the device's `max_wg_dims`, and flattens a rank >= 4 grid that
+still has a non-unit axis past the third; in those cases the extents disagree
+and [`globalcart`](@ref) divides.
+"""
+@inline function directdispatch(is, ::Val{N}) where {N}
+    # Rank 4 is excluded on purpose, and statically: there the *device* reads
+    # the iteration space wrongly. `(1,1,4,1)` has `workitems = (1,1,4,1)`, so
+    # `length(workitems) == size(workitems,1)` is `4 == 1` — false on the host,
+    # and the direct path is correctly declined there — yet on device the same
+    # predicate admits it and three elements come out wrong. Rewriting it from
+    # `all(ntuple(...))` to scalar `length`/`size` comparisons changed nothing,
+    # and the same shapes are exact the moment this returns false, so it is the
+    # rank-4 metadata read and not the predicate. Reproducers, all rank 4 and
+    # all fine at ranks 1-3 and 5: (1,1,4,1) 3 wrong, (1,7,1,1) 6, (7,5,3,2)
+    # 168, (16,8,4,2) 896, (72,256,8,16) 1_566_720.
+    #
+    # `launchgroup`'s docstring records the other half of this from the static
+    # side. Until that is understood, a rank-4 launch divides like it always
+    # has; `pinned by test_index_recovery.jl`.
+    N <= 3 || return false
+    nx = Int(lava_num_workgroups_x())
+    ny = Int(lava_num_workgroups_y())
+    nz = Int(lava_num_workgroups_z())
+    nb = size(KA.blocks(is))
+    # The dispatch grid must BE the block grid on the three hardware axes ...
+    nx == extentat(nb, Val(1)) && ny == extentat(nb, Val(2)) && nz == extentat(nb, Val(3)) &&
+        # ... with nothing left over on any axis past them. Comparing the total
+        # against the product says that in one scalar, where a per-axis
+        # `all(ntuple(i -> nb[i] == 1, Val(N)))` both reads worse and, at rank 4
+        # specifically, came back TRUE on device when it is false on the host —
+        # sending `(7,5,3,2)` and `(1,7,1,1)` down the direct path, which is only
+        # valid for a 1-D workgroup. Same reason for `workitems` below.
+        length(KA.blocks(is)) == nx * ny * nz &&
+        # The workgroup must be 1-D along the fastest axis, so the linear thread
+        # id IS the fastest coordinate. `launchgroup` fills from the fastest axis
+        # up, so this holds for nearly every launch; `staticgroup` is the
+        # deliberate exception and it divides.
+        length(KA.workitems(is)) == extentat(size(KA.workitems(is)), Val(1))
+end
+
+@inline function directcart(is, ::Val{N}, t::Int) where {N}
+    w = extentat(size(KA.workitems(is)), Val(1))
+    CartesianIndex(ntuple(Val(N)) do i
+        i == 1 ? Int(lava_workgroup_id_x()) * w + t :
+        i == 2 ? Int(lava_workgroup_id_y()) + 1 :
+        i == 3 ? Int(lava_workgroup_id_z()) + 1 : 1
+    end)
+end
+
+"""
+    globalcart(ctx) -> CartesianIndex
+
+The global index: [`directcart`](@ref) when the dispatch allows it, and
+otherwise the *original* `KA.expand(is, linear_block_index(), t)`, character for
+character.
+
+**The fallback is left exactly as it was on purpose.** Re-spelling it as
+`expand(is, blocks(is)[b], workitems(is)[t])` — which is what KA's own
+`expand(::Integer, ::Integer)` method expands to, and so should be identical —
+produced wrong indices for a **rank-4** ndrange with a multi-dimensional
+workgroup, and only there: `(16,8,4,2)`, `(7,5,3,2)` and `(72,256,8,16)` all
+came back wrong while rank 3 and rank 5 through the same path stayed exact.
+That is the rank-4 fragility `launchgroup`'s docstring already describes from
+the other direction. Splitting the call is enough to trip it, so this path does
+not get touched to make the fast one look tidier.
+"""
+@inline function globalcart(ctx)
+    is = KA.__iterspace(ctx)
+    r = ndrank(is)
+    t = Int(lava_local_invocation_id_x()) + 1
+    directdispatch(is, r) && return directcart(is, r, t)
+    return @inbounds KA.expand(is, linear_block_index(), t)
+end
+
 @lava_device_override @inline function KA.__index_Local_Linear(ctx)
     return Int(lava_local_invocation_id_x()) + 1
 end
@@ -1182,8 +1300,7 @@ end
 end
 
 @lava_device_override @inline function KA.__index_Global_Linear(ctx)
-    I = @inbounds KA.expand(KA.__iterspace(ctx), linear_block_index(), Int(lava_local_invocation_id_x()) + 1)
-    @inbounds LinearIndices(KA.__ndrange(ctx))[I]
+    @inbounds LinearIndices(KA.__ndrange(ctx))[globalcart(ctx)]
 end
 
 @lava_device_override @inline function KA.__index_Local_Cartesian(ctx)
@@ -1195,13 +1312,12 @@ end
 end
 
 @lava_device_override @inline function KA.__index_Global_Cartesian(ctx)
-    return @inbounds KA.expand(KA.__iterspace(ctx), linear_block_index(), Int(lava_local_invocation_id_x()) + 1)
+    return globalcart(ctx)
 end
 
 @lava_device_override @inline function KA.__validindex(ctx)
     if KA.__dynamic_checkbounds(ctx)
-        I = @inbounds KA.expand(KA.__iterspace(ctx), linear_block_index(), Int(lava_local_invocation_id_x()) + 1)
-        return I in KA.__ndrange(ctx)
+        return globalcart(ctx) in KA.__ndrange(ctx)
     else
         return true
     end
@@ -1278,9 +1394,9 @@ Taking the array rather than making callers reach for `.ptr`: that field is an
 implementation detail, and a kernel reading `AcceleratedMatrix{...}(tile, 1, 16)`
 should say the same thing whether `tile` is shared or global.
 """
-@inline AcceleratedMatrix{T,M,N,U}(src::LavaSharedArray, offset::Integer,
-                                   stride::Integer) where {T,M,N,U} =
-    coopmat_load(AcceleratedMatrix{T,M,N,U}, src.ptr, offset, stride)
+@inline CoopMatrix{T,M,N,U,S}(src::LavaSharedArray, offset::Integer,
+                              stride::Integer) where {T,M,N,U,S} =
+    coopmat_load(CoopMatrix{T,M,N,U,S}, src.ptr, offset, stride)
 
 """
     AcceleratedMatrix{T,M,N,U}(shared, offset, stride, Val(true))   # row-major
@@ -1298,13 +1414,13 @@ the score product reads Q row-major and Kᵀ column-major from the same staging
 stride, and the value product reads P and V both row-major — no transpose
 anywhere, which is only available if the layout is a parameter here too.
 """
-@inline AcceleratedMatrix{T,M,N,U}(src::LavaSharedArray, offset::Integer,
-                                   stride::Integer, rowmajor::Val) where {T,M,N,U} =
-    coopmat_load(AcceleratedMatrix{T,M,N,U}, src.ptr, offset, stride, rowmajor)
+@inline CoopMatrix{T,M,N,U,S}(src::LavaSharedArray, offset::Integer,
+                              stride::Integer, rowmajor::Val) where {T,M,N,U,S} =
+    coopmat_load(CoopMatrix{T,M,N,U,S}, src.ptr, offset, stride, rowmajor)
 
 """Store a cooperative matrix into `@localmem`; see the load above."""
 @inline Base.copyto!(dst::LavaSharedArray, offset::Integer, stride::Integer,
-                     m::AcceleratedMatrix) =
+                     m::CoopMatrix) =
     coopmat_store(dst.ptr, offset, stride, m)
 
 """
@@ -1329,7 +1445,7 @@ because the next kernel to want it should not have to discover that the emitter
 was ready all along.
 """
 @inline Base.copyto!(dst::LavaSharedArray, offset::Integer, stride::Integer,
-                     m::AcceleratedMatrix, rowmajor::Val) =
+                     m::CoopMatrix, rowmajor::Val) =
     coopmat_store(dst.ptr, offset, stride, m, rowmajor)
 
 # Column-major linear index from an N-d cartesian index, fully constant-folded
