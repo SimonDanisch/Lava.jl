@@ -712,17 +712,26 @@ end
 # `vec2` shared layout, bit-identical results, interleaved, both arms at one
 # clock:
 #
-#     2 scalar loads -> one vec2 store      0.0242 ms/launch   693 GB/s
-#     one 128-bit load -> four vec2 stores  0.0377             445 GB/s   0.64x
+#     working set   2 scalar loads   one 128-bit load
+#     16.8 MB        628 GB/s          418 GB/s       0.67x   <- INSIDE 48 MB L2
+#    134.2 MB        278               279            1.00x   <- BEYOND it
 #
-# **693 GB/s is the card's ceiling** — a plain `copyto!` of a 9.4 MB tensor
-# measures 632 — so the global side of staging is at BANDWIDTH, not instruction
-# count, and there is nothing for a wider load to buy. What it costs instead is
-# the store pattern: a lane owning 8 consecutive elements writes `vec2` at
-# indices `4p .. 4p+3`, so store *i* across a warp strides 4 vectors = 16 bytes
-# and hits a 4-way bank conflict, exactly the mechanism the paragraph above
-# describes for the scalar array. Widening the shared element moved the conflict,
-# it did not remove it.
+# **The answer depends on residency, and the first version of this note missed
+# that.** It quoted 693 GB/s as "the card's ceiling" from a 16.8 MB working set,
+# which fits entirely in this card's 48 MB L2 — that is L2 bandwidth, not DRAM,
+# and the real GEMM streams its weights from memory. Re-run beyond L2 the two are
+# **identical at ~278 GB/s**: both are DRAM-bound and the load width is irrelevant.
+#
+# So there is no win in either regime, but for two different reasons. Streaming,
+# memory is the limit whatever the instruction count. L2-resident, the wide load
+# is 33% WORSE, and that is the store pattern: a lane owning 8 consecutive
+# elements writes `vec2` at indices `4p .. 4p+3`, so store *i* across a warp
+# strides 4 vectors = 16 bytes and takes a 4-way bank conflict — the same
+# mechanism the paragraph above describes for the scalar array. Widening the
+# shared element moved that conflict, it did not remove it.
+#
+# 278 GB/s against this card's ~360 GB/s spec is the streaming number worth
+# remembering; 693 was an artefact of a benchmark that fit in cache.
 #
 # So the staging deficit the ablation measures is NOT the loads. It is the shared
 # stores, the two barriers and the cooperative-matrix loads out of `sA`/`sB` —
