@@ -40,6 +40,19 @@ void main() {
     tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV>    lC = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
     tensorLayoutNV<2, gl_CooperativeMatrixClampModeClampToEdgeNV> lE = createTensorLayoutNV(2, gl_CooperativeMatrixClampModeClampToEdgeNV);
 
+    // OpTensorLayoutSetStrideNV — the distance in ELEMENTS between successive
+    // indices of each dimension. Absent from this shader until 2026-08-11, so
+    // its opcode was the one constant here that nothing re-derived.
+    tl = setTensorLayoutStrideNV(tl, 1, 64);
+
+    // OpTensorLayoutSetClampValueNV — what a Constant-clamped load substitutes
+    // out of range. The default is zero; setting it to one is what lets a row
+    // SUM fall out of a matrix product's padding columns instead of costing a
+    // separate reduction. The operand is a `uint` in GLSL whatever the matrix's
+    // component type, so how it maps to an fp16 element is not visible here —
+    // `mwe_tensor_clampvalue.jl` settles that on the device.
+    lC = setTensorLayoutClampValueNV(lC, 1);
+
     // OpCreateTensorViewNV / OpTypeTensorViewNV — the transpose, as a view.
     // Both HasDimensions values, because they produce DISTINCT types and so
     // exercise OpConstantTrue as well as OpConstantFalse.
