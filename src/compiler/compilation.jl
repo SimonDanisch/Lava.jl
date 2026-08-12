@@ -1908,7 +1908,7 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
         end
     end
 
-    collect_perelement_callbacks!(state, llvm_mod)
+    collect_inline_callbacks!(state, llvm_mod)
 
     # Emit global variables (if any — needed for builtin inputs, etc.)
     interface_ids = emit_globals!(state, llvm_mod)

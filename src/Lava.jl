@@ -1,7 +1,7 @@
 module Lava
 
 export LavaArray, LavaBackend, LavaDeviceArray, alloc_index_buffer
-export AcceleratedMatrix, MatrixA, MatrixB, Accumulator, CoopMat, Scalar
+export AcceleratedMatrix, WorkgroupMatrix, MatrixA, MatrixB, Accumulator, CoopMat, Scalar
 export matriximpl
 export BatchQueue
 # Freezing kernels: `@setup_workload` is PrecompileTools', re-exported so a
@@ -18,7 +18,7 @@ export ExternalImage, memoryfd
 # is wanted. `caps` is the one to reach for: a kernel deciding a tiling wants
 # several of these and they must all describe the same device.
 public caps, DeviceCaps, shader_core_count, shader_warps_per_sm, max_shared_memory,
-       workgroup_limit, device_subgroup_size
+       workgroup_limit, device_subgroup_size, wggranularity
 public gemv, gemv!, gemv_config
 public dense, lavaroot, lavabacked
 public fft, fft!, rfft, rfft!, fftany!, fftmixed!, stft, hannwindow,
@@ -191,6 +191,7 @@ include("runtime/pipeline_cache.jl")
 include("array/ka_backend.jl")
 include("array/gpuarrays.jl")
 include("array/gemm.jl")       # mul! for LavaArray — needs AnyLavaArray from gpuarrays.jl
+include("array/gemm_cm2.jl")   # the coopmat2 form of the same product, unrouted
 include("array/mapreduce.jl")
 include("array/fft.jl")     # batched 1D FFT — ported from dev/VkFFT
 include("array/gemv.jl")    # batch-1 GEMV — ported from llama.cpp mul_mat_vec.comp

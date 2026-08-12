@@ -649,7 +649,67 @@ function caps(ctx::VkContext = vk_context())
         COOPMAT_SUBGROUP,
         Int(limits.max_compute_shared_memory_size),
         Int(limits.max_compute_work_group_invocations),
-        cores, warps)
+        cores, warps,
+        workgroup_matrix_granularity(ctx))
+end
+
+"""
+    wggranularity(dev, nt) -> (M, N, K) | nothing
+
+The `(M, N, K)` multiples a workgroup-scope fp16 x fp16 -> fp32 matrix must be at
+a workgroup of `nt` invocations, from `dev.wggran`. `nothing` means this device
+runs no workgroup-scope matrix at that workgroup size.
+
+Here rather than in each kernel library: the table is the device's, so the lookup
+into it is too. Two callers had written the same loop with different argument
+orders — `DNNKernels`' flash chooser and this file's GEMM one — which is the
+shape that drifts.
+"""
+function wggranularity(dev, nt::Integer)
+    for (n, m, nn, k) in dev.wggran
+        n == nt && return (m, nn, k)
+    end
+    return nothing
+end
+
+"""
+    workgroup_matrix_granularity(ctx) -> Vector{(invocations, M, N, K)}
+
+The shapes a **workgroup-scope** fp16 x fp16 -> fp32 cooperative matrix may have
+on this device, one row per workgroup size, sorted by size.
+
+Empty means no workgroup-scope matrices — which is every device that is not
+NVIDIA with `VK_NV_cooperative_matrix2`, and is why this doubles as the
+capability test: a kernel cannot ask "may I?" without also being handed "at what
+shapes?", and those two drifting apart is how a kernel ends up asking for a tile
+the device refuses at pipeline creation.
+
+The pairing is the part that is not guessable. `M`, `N` and `K` are multiples,
+not sizes, and they COARSEN as the workgroup grows — on an RTX 4000 Ada,
+16/16/16 at 32 and 64 invocations, 32/16/16 at 128, 32/32/16 at 256. So a
+head dimension of 72 pads to 80 at 128 invocations and to 96 at 256, and the
+padding is 33% of both products in the second case. Measured: every tiling was
+faster at 128 than at 256 for exactly that reason.
+
+fp16 x fp16 -> fp32 only, because that is what every kernel here multiplies.
+Widen it when something needs bf16 or int8; the query returns those rows too.
+"""
+function workgroup_matrix_granularity(ctx::VkContext = vk_context())
+    rows = NTuple{4,Int}[]
+    ctx.coopmat2.workgroup_scope || return rows
+    props = unwrap(Vulkan.get_physical_device_cooperative_matrix_flexible_dimensions_properties_nv(
+                       ctx.physical_device))
+    for p in props
+        p.scope == Vulkan.SCOPE_WORKGROUP_KHR || continue
+        p.a_type == Vulkan.COMPONENT_TYPE_FLOAT16_KHR || continue
+        p.b_type == Vulkan.COMPONENT_TYPE_FLOAT16_KHR || continue
+        p.c_type == Vulkan.COMPONENT_TYPE_FLOAT32_KHR || continue
+        p.result_type == Vulkan.COMPONENT_TYPE_FLOAT32_KHR || continue
+        push!(rows, (Int(p.workgroup_invocations), Int(p.m_granularity),
+                     Int(p.n_granularity), Int(p.k_granularity)))
+    end
+    sort!(rows; by = first)
+    return rows
 end
 
 """

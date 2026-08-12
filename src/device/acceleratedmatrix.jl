@@ -32,6 +32,39 @@ struct MatrixB <: MatrixUse end
 struct Accumulator <: MatrixUse end
 
 """
+Whose registers hold the value: one subgroup's, or the whole workgroup's.
+
+Part of the type for the same reason `MatrixUse` is — SPIR-V fixes it when the
+type is created, and it decides how many components each invocation holds.
+"""
+abstract type MatrixScope end
+struct SubgroupScope <: MatrixScope end
+struct WorkgroupScope <: MatrixScope end
+
+"""
+    CoopMatrix{T,M,N,Use,Scope}
+
+An `M×N` matrix of `T` held in matrix hardware. Spell it as one of the two
+aliases rather than directly:
+
+    AcceleratedMatrix{T,M,N,Use}   # = CoopMatrix{...,SubgroupScope}, the portable one
+    WorkgroupMatrix{T,M,N,Use}     # = CoopMatrix{...,WorkgroupScope}, NVIDIA-only
+
+`AcceleratedMatrix` is the default because subgroup scope is `VK_KHR_cooperative_matrix`,
+which AMD's RDNA3 WMMA path also has. Workgroup scope comes from
+`VK_NV_cooperative_matrix2` (`vk_context().coopmat2.workgroup_scope`), so a kernel
+using it has to be selected against a device query — which is why it has to be
+written out rather than reached by default.
+
+Every operation requires its operands to agree on scope. Mixing them is then a
+method error at the call site instead of a module the driver rejects.
+"""
+struct CoopMatrix{T,M,N,Use<:MatrixUse,Scope<:MatrixScope}
+    # SSA anchor, not element storage — see the note above.
+    handle::Int32
+end
+
+"""
     AcceleratedMatrix{T,M,N,Use}
 
 An `M×N` matrix of `T` held in subgroup-scope matrix hardware.
@@ -52,15 +85,38 @@ cooperative matrices.
 Device-only: the value is spread across a subgroup's lanes and cannot be
 allocated host-side or outlive the invocation, like `@private`/`@localmem`.
 """
-struct AcceleratedMatrix{T,M,N,Use<:MatrixUse}
-    # SSA anchor, not element storage — see the note above.
-    handle::Int32
-end
+const AcceleratedMatrix{T,M,N,U} = CoopMatrix{T,M,N,U,SubgroupScope}
 
-Base.size(::AcceleratedMatrix{T,M,N}) where {T,M,N} = (M, N)
+"""
+    WorkgroupMatrix{T,M,N,Use}
 
-matrixuse(::Type{<:AcceleratedMatrix{T,M,N,U}}) where {T,M,N,U} = U
-matrixuse(m::AcceleratedMatrix) = matrixuse(typeof(m))
+An `M×N` matrix of `T` spread across **every invocation of the workgroup**, not
+one subgroup — `Scope = Workgroup` on `OpTypeCooperativeMatrixKHR`, which
+`VK_NV_cooperative_matrix2` is what enables.
+
+The reason it exists is register pressure. A `32 x 64` fp32 accumulator is 64
+components per lane at subgroup scope and 8 at workgroup scope with 256
+invocations, and the subgroup-scope flash kernel is gated by a step at 128
+registers. It is also what lets a kernel drop its shared-memory staging
+entirely: one matrix per operand, no per-subgroup tiling to write.
+
+**The workgroup size is part of the contract.** The legal `(M, N, K)` granularity
+depends on how many invocations the workgroup has — this device wants 256 for
+`M=32, N=32, K=16` and reports the whole table through
+`get_physical_device_cooperative_matrix_flexible_dimensions_properties_nv`. Launch
+with a different size and the driver rejects the pipeline. Uses must also be
+workgroup-uniform: every invocation reaches every operation, or the result is
+undefined.
+"""
+const WorkgroupMatrix{T,M,N,U} = CoopMatrix{T,M,N,U,WorkgroupScope}
+
+Base.size(::CoopMatrix{T,M,N}) where {T,M,N} = (M, N)
+
+matrixuse(::Type{<:CoopMatrix{T,M,N,U}}) where {T,M,N,U} = U
+matrixuse(m::CoopMatrix) = matrixuse(typeof(m))
+
+matrixscope(::Type{<:CoopMatrix{T,M,N,U,S}}) where {T,M,N,U,S} = S
+matrixscope(m::CoopMatrix) = matrixscope(typeof(m))
 
 """
     coopmat_shape(ctx, T, M, N, K) -> Bool
@@ -119,8 +175,8 @@ end
 Load an `M×N` tile from `src` starting at `offset`, `stride` elements between
 consecutive columns. Lowers to `OpCooperativeMatrixLoadKHR`.
 """
-@inline AcceleratedMatrix{T,M,N,U}(src, offset::Integer, stride::Integer) where {T,M,N,U} =
-    coopmat_load(AcceleratedMatrix{T,M,N,U}, src, offset, stride)
+@inline CoopMatrix{T,M,N,U,S}(src, offset::Integer, stride::Integer) where {T,M,N,U,S} =
+    coopmat_load(CoopMatrix{T,M,N,U,S}, src, offset, stride)
 
 """
     AcceleratedMatrix{T,M,N,U}(src, offset, stride, Val(true))   # row-major
@@ -133,9 +189,9 @@ identically and then reads A `RowMajor` and B `ColumnMajor`, because A is
 available, one of the two has to be transposed while staging — an extra pass over
 shared memory, or a second copy of the block.
 """
-@inline AcceleratedMatrix{T,M,N,U}(src, offset::Integer, stride::Integer,
-                                   rowmajor::Val) where {T,M,N,U} =
-    coopmat_load(AcceleratedMatrix{T,M,N,U}, src, offset, stride, rowmajor)
+@inline CoopMatrix{T,M,N,U,S}(src, offset::Integer, stride::Integer,
+                              rowmajor::Val) where {T,M,N,U,S} =
+    coopmat_load(CoopMatrix{T,M,N,U,S}, src, offset, stride, rowmajor)
 
 # The `@localmem` forms of these live in `array/ka_backend.jl`, beside
 # `LavaSharedArray` — this file is included before that type exists.
@@ -145,7 +201,7 @@ shared memory, or a second copy of the block.
 
 Store the tile back. Lowers to `OpCooperativeMatrixStoreKHR`.
 """
-@inline Base.copyto!(dst, offset::Integer, stride::Integer, m::AcceleratedMatrix) =
+@inline Base.copyto!(dst, offset::Integer, stride::Integer, m::CoopMatrix) =
     coopmat_store(dst, offset, stride, m)
 
 """
@@ -158,18 +214,21 @@ fp16, and without this the only way across is a store to an fp32 scratch and a
 second kernel that reads all of it back — `mm_epilogue_kernel!`, which is 23% of
 matmul time and a whole extra pass over `M x N`.
 
-Shape, scope and use must match; only the component type changes.
+Shape, scope and use must match; only the component type changes. (The wider
+conversion that also changes the USE is `coopmat_convert`, which `convert` does
+not reach: `Base.convert` between two types differing in a type parameter that
+means "operand position" is not something to arrive at implicitly.)
 """
-@inline Base.convert(::Type{AcceleratedMatrix{T,M,N,U}},
-                     m::AcceleratedMatrix{S,M,N,U}) where {T,S,M,N,U} =
-    coopmat_convert(AcceleratedMatrix{T,M,N,U}, m)
-@inline Base.convert(::Type{AcceleratedMatrix{T,M,N,U}},
-                     m::AcceleratedMatrix{T,M,N,U}) where {T,M,N,U} = m
+@inline Base.convert(::Type{CoopMatrix{T,M,N,U,SC}},
+                     m::CoopMatrix{S,M,N,U,SC}) where {T,S,M,N,U,SC} =
+    coopmat_convert(CoopMatrix{T,M,N,U,SC}, m)
+@inline Base.convert(::Type{CoopMatrix{T,M,N,U,SC}},
+                     m::CoopMatrix{T,M,N,U,SC}) where {T,M,N,U,SC} = m
 
-@inline Base.zero(::Type{AcceleratedMatrix{T,M,N,U}}) where {T,M,N,U} =
-    coopmat_zero(AcceleratedMatrix{T,M,N,U})
-@inline Base.zero(::AcceleratedMatrix{T,M,N,U}) where {T,M,N,U} =
-    zero(AcceleratedMatrix{T,M,N,U})
+@inline Base.zero(::Type{CoopMatrix{T,M,N,U,S}}) where {T,M,N,U,S} =
+    coopmat_zero(CoopMatrix{T,M,N,U,S})
+@inline Base.zero(::CoopMatrix{T,M,N,U,S}) where {T,M,N,U,S} =
+    zero(CoopMatrix{T,M,N,U,S})
 
 """
     muladd(a, b, c)
@@ -178,11 +237,11 @@ Shape, scope and use must match; only the component type changes.
 `OpCooperativeMatrixMulAddKHR` — this is the instruction that reaches the
 tensor cores.
 """
-@inline Base.muladd(a::AcceleratedMatrix{TA,M,K,MatrixA},
-                    b::AcceleratedMatrix{TB,K,N,MatrixB},
-                    c::AcceleratedMatrix{TC,M,N,Accumulator}) where {TA,TB,TC,M,N,K} =
+@inline Base.muladd(a::CoopMatrix{TA,M,K,MatrixA,S},
+                    b::CoopMatrix{TB,K,N,MatrixB,S},
+                    c::CoopMatrix{TC,M,N,Accumulator,S}) where {TA,TB,TC,M,N,K,S} =
     coopmat_muladd(a, b, c)
 
-@inline Base.:*(a::AcceleratedMatrix{TA,M,K,MatrixA},
-                b::AcceleratedMatrix{TB,K,N,MatrixB}) where {TA,TB,M,N,K} =
-    muladd(a, b, zero(AcceleratedMatrix{promote_type(TA, TB),M,N,Accumulator}))
+@inline Base.:*(a::CoopMatrix{TA,M,K,MatrixA,S},
+                b::CoopMatrix{TB,K,N,MatrixB,S}) where {TA,TB,M,N,K,S} =
+    muladd(a, b, zero(CoopMatrix{promote_type(TA, TB),M,N,Accumulator,S}))

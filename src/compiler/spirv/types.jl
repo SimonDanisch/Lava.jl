@@ -870,6 +870,14 @@ function wg_compute_type_size(ty::LLVM.LLVMType)
         return total
     elseif ty isa LLVM.ArrayType
         return UInt32(length(ty)) * wg_compute_type_size(eltype(ty))
+    elseif ty isa LLVM.VectorType
+        # A vector is its components, packed. Absent this branch it fell through
+        # to the 4 below, which is right for `<2 x half>` BY ACCIDENT and wrong
+        # for everything else — `<4 x half>` got ArrayStride 4 for an 8-byte
+        # element and `spirv-val` rejected the module ("array with stride 4 not
+        # satisfying alignment to 8"). The staged GEMM's `vec2` staging is the
+        # only thing that had ever used this path.
+        return UInt32(length(ty)) * wg_compute_type_size(eltype(ty))
     elseif ty isa LLVM.PointerType
         return UInt32(8)
     else
@@ -894,6 +902,13 @@ function wg_compute_type_alignment(ty::LLVM.LLVMType)
         return max_align
     elseif ty isa LLVM.ArrayType
         return wg_compute_type_alignment(eltype(ty))
+    elseif ty isa LLVM.VectorType
+        # Vulkan's rule, not the packed size: a 2-component vector aligns to 2x
+        # its component and a 3- or 4-component one to 4x. `<2 x half>` therefore
+        # keeps the 4 it was getting from the fallthrough, so nothing that worked
+        # before moves; `<4 x half>` gets the 8 the validator demands.
+        n = length(ty)
+        return (n == 2 ? 2 : 4) * wg_compute_type_alignment(eltype(ty))
     elseif ty isa LLVM.PointerType
         return 8
     else

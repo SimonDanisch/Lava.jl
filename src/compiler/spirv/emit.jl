@@ -85,8 +85,8 @@ mutable struct SPIRVEmitterState
     # Suppresses the redundant OpReturn from the trailing `ret void`.
     rt_block_terminated::Bool
     # ── Cooperative matrix (SPV_KHR_cooperative_matrix) ──
-    # Cached OpTypeCooperativeMatrixKHR ids, keyed (dtype, rows, cols, use).
-    coopmat_type_ids::Dict{Tuple{String, Int, Int, UInt32}, UInt32}
+    # Cached OpTypeCooperativeMatrixKHR ids, keyed (dtype, rows, cols, use, scope).
+    coopmat_type_ids::Dict{Tuple{String, Int, Int, UInt32, UInt32}, UInt32}
     # ── Tensor addressing (SPV_NV_tensor_addressing) ──
     # `OpTypeTensorLayoutNV` keyed (dim, clamp mode) and `OpTypeTensorViewNV`
     # keyed (dim, has-dimensions, permutation). Both take their parameters as
@@ -124,7 +124,7 @@ mutable struct SPIRVEmitterState
     # block, since a branch can arrive with the variable holding anything.
     coopmat_var_contents::Dict{UInt32, UInt32}
     # LLVM functions that are the callback of an `OpCooperativeMatrixPerElementOpNV`.
-    # Filled by `collect_perelement_callbacks!` before any function is emitted,
+    # Filled by `collect_inline_callbacks!` before any function is emitted,
     # because the callback is emitted *before* the entry function that names it.
     #
     # They exist as separate functions only so the instruction has something to
@@ -134,7 +134,7 @@ mutable struct SPIRVEmitterState
     # surviving as a function. Left as `DontInline` the driver honours it and pays
     # a real call per element; on SAM 2's global attention that was 5.525 ms
     # against the portable path's 4.938, i.e. the feature reading as a 12% loss.
-    perelement_callbacks::Set{LLVM.Function}
+    inline_callbacks::Set{LLVM.Function}
     # ── Ray-query state (compute kernels with enable_ray_query=true) ──
     # Cached OpTypeRayQueryKHR id, allocated lazily.
     ray_query_type_id::Union{Nothing, UInt32}
@@ -219,7 +219,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         nothing,
         nothing, nothing,  # SER: rt_hit_object_type_id, rt_hit_object_var_id
         false,
-        Dict{Tuple{String, Int, Int, UInt32}, UInt32}(),  # coopmat types
+        Dict{Tuple{String, Int, Int, UInt32, UInt32}, UInt32}(),  # coopmat types
         Dict{Tuple{Int, UInt32}, UInt32}(),               # tensor layout types
         Dict{Tuple{Int, Bool, Vector{UInt32}}, UInt32}(), # tensor view types
         Dict{LLVM.Value, UInt32}(),                       # tensor-layout-typed values
@@ -647,11 +647,11 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
     # A per-element callback is the exception and gets `Inline` instead: it is
     # `@noinline` in Julia only so it survives as a function for
     # `OpCooperativeMatrixPerElementOpNV` to name, and the driver is supposed to
-    # inline it into its own element loop. See `perelement_callbacks`.
+    # inline it into its own element loop. See `inline_callbacks`.
     noinline_kind = LLVM.API.LLVMGetEnumAttributeKindForName("noinline", 8)
     has_noinline = any(a -> a isa LLVM.EnumAttribute && LLVM.kind(a) == noinline_kind,
                         collect(LLVM.function_attributes(fn)))
-    fc = fn in state.perelement_callbacks ? FuncControl.Inline :
+    fc = fn in state.inline_callbacks ? FuncControl.Inline :
          (is_entry || !has_noinline) ? FuncControl.None : FuncControl.DontInline
     encode_instruction!(state.mod.functions, Op.OpFunction, ret_spirv, func_id, fc, func_type_id)
 

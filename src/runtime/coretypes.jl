@@ -621,7 +621,27 @@ struct DeviceCaps
     workgrouplimit::Int    # maxComputeWorkGroupInvocations: threads per workgroup
     cores::Int             # SMs / active CUs; 0 when the device will not say
     warps::Int             # max resident subgroups per SM; 0 = ditto
+    # Workgroup-scope cooperative matrices, and the SHAPES they may have.
+    #
+    # One row per workgroup size: `(invocations, M, N, K)`, the multiples a
+    # matrix's extents must be at that size for fp16 x fp16 -> fp32. Empty when
+    # the device has no workgroup-scope matrices at all, so `isempty` is the
+    # capability test and the table is the tiling rule — a kernel cannot ask
+    # "may I?" without also being handed "what shapes?", which is the pair that
+    # went wrong when a granularity was assumed rather than queried.
+    #
+    # It is a rule about the LAUNCH, not just the type: the same matrix shape is
+    # legal at 128 invocations and illegal at 256.
+    wggran::Vector{NTuple{4,Int}}
 end
+
+# Eight positional arguments still construct one — every caller that predates
+# `wggran` (`flashcm_tiling`'s docstring, `DNNKernels`' CPU fallback, the wave64
+# device in `test_flash.jl`) means "no workgroup-scope matrices".
+DeviceCaps(coopmat, tile, subgroup, coopmatsubgroup, sharedbudget,
+           workgrouplimit, cores, warps) =
+    DeviceCaps(coopmat, tile, subgroup, coopmatsubgroup, sharedbudget,
+               workgrouplimit, cores, warps, NTuple{4,Int}[])
 
 """
     DeviceCaps(c::DeviceCaps; kw...) -> DeviceCaps
@@ -633,9 +653,10 @@ switched off — without that device being present.
 DeviceCaps(c::DeviceCaps;
            coopmat = c.coopmat, tile = c.tile, subgroup = c.subgroup,
            coopmatsubgroup = c.coopmatsubgroup, sharedbudget = c.sharedbudget,
-           workgrouplimit = c.workgrouplimit, cores = c.cores, warps = c.warps) =
+           workgrouplimit = c.workgrouplimit, cores = c.cores, warps = c.warps,
+           wggran = c.wggran) =
     DeviceCaps(coopmat, tile, subgroup, coopmatsubgroup, sharedbudget,
-               workgrouplimit, cores, warps)
+               workgrouplimit, cores, warps, wggran)
 
 """
     DeviceCaches

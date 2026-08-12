@@ -64,6 +64,11 @@ module Op
     const OpUConvert                = UInt16(113)
     const OpSConvert                = UInt16(114)
     const OpFConvert                = UInt16(115)
+    # Use-CHANGING cooperative-matrix conversion (`SPV_NV_cooperative_matrix2`).
+    # `OpFConvert` is only legal between matrix types agreeing on scope, rows,
+    # cols AND use; turning an fp32 Accumulator into an fp16 MatrixA — which is
+    # what `flash_attn_cm2.comp` does twice, for `Qf16` and `P_A` — is this one.
+    const OpCooperativeMatrixConvertNV = UInt16(5293)
     const OpBitcast                 = UInt16(124)
     const OpSNegate                 = UInt16(126)
     const OpFNegate                 = UInt16(127)
@@ -280,9 +285,28 @@ module Op
     const OpTypeTensorViewNV                              = UInt16(5371)
     const OpCreateTensorLayoutNV                          = UInt16(5372)
     const OpTensorLayoutSetDimensionNV                    = UInt16(5373)
+    # The STRIDE between successive indices of each dimension, in elements. Without
+    # it a layout describes a PACKED tensor, and attention's operands are not: `q`,
+    # `k` and `v` arrive as a permuted view of one packed `(E, L, H, B)` block, so
+    # the extent alone does not say where the next row is. `mul_mm_cm2.comp` and
+    # `flash_attn_cm2.comp` both set it on every layout they build.
+    const OpTensorLayoutSetStrideNV                       = UInt16(5374)
     const OpTensorLayoutSliceNV                           = UInt16(5375)
+    # What a `TENSOR_CLAMP_CONSTANT` load substitutes OUT OF RANGE. The default
+    # is zero, and zero is not always the useful identity: filling `V`'s padding
+    # columns with ONE makes a row sum fall out of the `P x V` product's padding
+    # columns, which is a per-key-block row reduction removed rather than made
+    # cheaper. The operand is a single 32-bit <id> whatever the component type.
+    const OpTensorLayoutSetClampValueNV                   = UInt16(5376)
     const OpCreateTensorViewNV                            = UInt16(5377)
     const OpCooperativeMatrixLoadTensorNV                 = UInt16(5367)
+    # `TensorAddressingOperands` — the mask that trails a tensor load. Read off
+    # `/usr/include/glslang/SPIRV/spirv.hpp11` (`TensorAddressingOperandsMask`)
+    # rather than guessed: a wrong bit here does not fail to compile, it loads
+    # the wrong elements and still returns finite numbers.
+    const TENSOR_ADDR_NONE                                = UInt32(0x0)
+    const TENSOR_ADDR_TENSORVIEW                          = UInt32(0x1)
+    const TENSOR_ADDR_DECODEFUNC                          = UInt32(0x2)
     # The STORE, which is what makes a ragged OUTPUT legal — the clamping layout
     # bounds-checks writes exactly as it bounds-checks reads, so an edge tile
     # writes only its in-range elements instead of running off the end. Read off
@@ -393,6 +417,9 @@ module Cap
     # each has its own VkPhysicalDeviceCooperativeMatrix2FeaturesNV bit; see
     # `CoopMat2Caps` in runtime/device.jl. NVIDIA-only.
     const CooperativeMatrixReductionsNV            = UInt32(5430)
+    # Value from /usr/include/glslang/SPIRV/spirv.hpp11, not inferred from the
+    # neighbouring 5430 — adjacency is a coincidence, not a rule.
+    const CooperativeMatrixConversionsNV           = UInt32(5431)
     const CooperativeMatrixPerElementOperationsNV  = UInt32(5432)
     # Tensor addressing needs BOTH of these, from two different extensions:
     # `TensorAddressingNV` (SPV_NV_tensor_addressing) for the layout/view types

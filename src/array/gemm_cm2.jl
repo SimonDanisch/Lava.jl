@@ -167,9 +167,17 @@ loads and one `coopmat_muladd` over matrices that span all `NT` invocations.
     baseA = base(K, N)
     baseB = base(M, K)
 
-    @inline loadA(k) = tensor_load(coopmat_zero(WM{Float16,BN,BK,MatrixA}),
+    # `coopmat_undef`, not `coopmat_zero`: under a CONSTANT clamp mode the
+    # out-of-range elements come from the layout's clamp value, so the
+    # destination is never read and a zeroed fragment is a value the allocator
+    # holds until the load overwrites it. GLSL declares `coopmat mat_a;` and
+    # assigns nothing, which is what this matches. With `TENSOR_CLAMP_UNDEFINED`
+    # the destination DOES survive out of range, so the zero has to stay.
+    @inline dest(::Type{MT}) where {MT} =
+        CM === TENSOR_CLAMP_CONSTANT ? coopmat_undef(MT) : coopmat_zero(MT)
+    @inline loadA(k) = tensor_load(dest(WM{Float16,BN,BK,MatrixA}),
                                    UInt64(pointer(B)), slice(baseA, n0, k, BN, BK))
-    @inline loadB(k) = tensor_load(coopmat_zero(WM{Float16,BK,BM,MatrixB}),
+    @inline loadB(k) = tensor_load(dest(WM{Float16,BK,BM,MatrixB}),
                                    UInt64(pointer(A)), slice(baseB, k, m0, BK, BM))
 
     acc = coopmat_zero(WM{Float32,BN,BM,Accumulator})

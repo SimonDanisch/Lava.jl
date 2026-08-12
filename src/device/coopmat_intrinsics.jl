@@ -20,32 +20,44 @@ const COOPMAT_DTYPE_SUFFIX = Dict(
 
 const COOPMAT_USE_SUFFIX = Dict(MatrixA => "a", MatrixB => "b", Accumulator => "acc")
 
+# Subgroup scope adds NOTHING to the name. It is the default and by far the
+# common case, so every name a kernel emitted before workgroup scope existed is
+# unchanged — which keeps the frozen SPIR-V cache keys, the emitter tests and the
+# disassembly in the notes all still matching.
+const COOPMAT_SCOPE_SUFFIX = Dict(SubgroupScope => "", WorkgroupScope => "_wg")
+
 const COOPMAT_IR_TYPE = Dict(
     Float16 => "half", Float32 => "float", Float64 => "double",
     Int8 => "i8", UInt8 => "i8", Int32 => "i32", UInt32 => "i32",
 )
 
 """
-    coopmat_intrinsic_name(op, T, M, N, Use) -> String
+    coopmat_intrinsic_name(op, T, M, N, Use, Scope) -> String
 
-`_lava_coopmat_<op>_<dtype>_<M>x<N>_<use>`. The emitter parses this back out;
-keep the two in step.
+`_lava_coopmat_<op>_<dtype>_<M>x<N>_<use>[_wg][_row]`. The emitter parses this
+back out; keep the two in step.
+
+The two optional trailing flags are order-independent to the parser but written
+scope-then-layout here, and a subgroup-scope name carries no scope flag at all —
+see `COOPMAT_SCOPE_SUFFIX`.
 """
 function coopmat_intrinsic_name(op::String, ::Type{T}, M::Integer, N::Integer,
-                                ::Type{U}; rowmajor::Bool = false) where {T,U<:MatrixUse}
+                                ::Type{U}, ::Type{S} = SubgroupScope;
+                                rowmajor::Bool = false) where {T,U<:MatrixUse,S<:MatrixScope}
     haskey(COOPMAT_DTYPE_SUFFIX, T) ||
         throw(ArgumentError("no cooperative-matrix component type for $T"))
-    base = "_lava_coopmat_$(op)_$(COOPMAT_DTYPE_SUFFIX[T])_$(M)x$(N)_$(COOPMAT_USE_SUFFIX[U])"
+    base = "_lava_coopmat_$(op)_$(COOPMAT_DTYPE_SUFFIX[T])_$(M)x$(N)_$(COOPMAT_USE_SUFFIX[U])" *
+           COOPMAT_SCOPE_SUFFIX[S]
     return rowmajor ? base * "_row" : base
 end
 
 # Each distinct (op, T, M, N, Use) needs its own LLVM declaration, so the stubs
 # are generated on demand from the type parameters rather than enumerated.
 
-@generated function coopmat_load(::Type{AcceleratedMatrix{T,M,N,U}}, ptr::Ptr{S},
+@generated function coopmat_load(::Type{CoopMatrix{T,M,N,U,SC}}, ptr::Ptr{S},
                                  offset::Integer, stride::Integer,
-                                 ::Val{RM} = Val(false)) where {T,M,N,U,S,RM}
-    fname = coopmat_intrinsic_name("load", T, M, N, U; rowmajor = RM)
+                                 ::Val{RM} = Val(false)) where {T,M,N,U,SC,S,RM}
+    fname = coopmat_intrinsic_name("load", T, M, N, U, SC; rowmajor = RM)
     ir = """
         declare i32 @$fname(i64, i32) #0
         define i32 @entry(i64 %p, i32 %s) #0 {
@@ -58,7 +70,7 @@ end
         base = reinterpret(UInt64, ptr) + UInt64((offset - 1) * sizeof($S))
         h = Base.llvmcall(($ir, "entry"), Int32, Tuple{UInt64,UInt32},
                           base, UInt32(stride))
-        AcceleratedMatrix{$T,$M,$N,$U}(h)
+        CoopMatrix{$T,$M,$N,$U,$SC}(h)
     end
 end
 
@@ -102,20 +114,40 @@ always sees the same shape and always emits exactly one `OpAccessChain`.
 # A comment, not a docstring: this sits between the docstring below and the
 # function it documents, and two adjacent string literals make `@doc` try to
 # document the second one.
-coopmat_vec2(::Type{NTuple{2,VecElement{T}}}, ::Type{T}) where {T} = true
-coopmat_vec2(::Type, ::Type) = false
+#
+# Generalised from a 2-only predicate on 2026-08-12. The width is whatever the
+# `@localmem` element is, and SPIR-V vectors are 2, 3 or 4 components — so 4-wide
+# (64-bit) shared accesses are reachable and 8-wide are not. That matters: the
+# staged GEMM's scalar -> vec2 step is worth **+45% to +54%** per shape on this
+# card, measured against cuBLAS beside it, so the width is on the critical path
+# and the next notch is worth having.
+#
+# (A separate, earlier experiment that widened only the GLOBAL load while leaving
+# `@localmem` as `Float16` lost monotonically — 2-wide 0.80-0.92x, 4-wide
+# 0.69-0.81x — because each lane then wrote V scalar stores strided by V across
+# the warp, a V-way bank conflict. That result says nothing about widening BOTH
+# sides, which is what this is. See the note in `array/gemm.jl`.)
+coopmat_vecwidth(::Type{NTuple{N,VecElement{T}}}, ::Type{T}) where {N,T} = N
+coopmat_vecwidth(::Type, ::Type) = 0
 
-@generated function coopmat_load(::Type{AcceleratedMatrix{T,M,N,U}},
+"""Whether a `@localmem` element type may back a cooperative matrix of `T`:
+either `T` itself, or a SPIR-V-legal vector of it."""
+coopmat_sharedok(::Type{S}, ::Type{T}) where {S,T} =
+    S === T || coopmat_vecwidth(S, T) in (2, 3, 4)
+
+@generated function coopmat_load(::Type{CoopMatrix{T,M,N,U,SC}},
                                  ptr::Core.LLVMPtr{S,3},
                                  offset::Integer, stride::Integer,
-                                 ::Val{RM} = Val(false)) where {T,M,N,U,S,RM}
-    S === T || coopmat_vec2(S, T) ||
+                                 ::Val{RM} = Val(false)) where {T,M,N,U,SC,S,RM}
+    coopmat_sharedok(S, T) ||
         throw(ArgumentError("coopmat_load: a Workgroup array of $S cannot back a \
-                             cooperative matrix of $T; use $T or NTuple{2,VecElement{$T}}"))
-    # `loadw2` when the shared array is a vector of `T`: same instruction, but the
-    # emitter has to build a pointer to the *vector* rather than to `T`.
-    fname = coopmat_intrinsic_name(S === T ? "loadw" : "loadw2", T, M, N, U;
-                                   rowmajor = RM)
+                             cooperative matrix of $T; use $T or \
+                             NTuple{2|3|4,VecElement{$T}}"))
+    # `loadw<W>` when the shared array is a W-wide vector of `T`: same
+    # instruction, but the emitter has to build a pointer to the *vector* rather
+    # than to `T`, and `Stride` is then counted in vectors.
+    fname = coopmat_intrinsic_name(S === T ? "loadw" : "loadw$(coopmat_vecwidth(S, T))",
+                                   T, M, N, U, SC; rowmajor = RM)
     ir = """
         declare i32 @$fname(ptr addrspace(3), i32, i32) #0
         define i32 @entry(ptr addrspace(3) %p, i32 %o, i32 %s) #0 {
@@ -128,15 +160,15 @@ coopmat_vec2(::Type, ::Type) = false
         h = Base.llvmcall(($ir, "entry"), Int32,
                           Tuple{Core.LLVMPtr{$S,3},UInt32,UInt32},
                           ptr, UInt32(offset - 1), UInt32(stride))
-        AcceleratedMatrix{$T,$M,$N,$U}(h)
+        CoopMatrix{$T,$M,$N,$U,$SC}(h)
     end
 end
 
 @generated function coopmat_store(ptr::Core.LLVMPtr{S,3}, offset::Integer,
                                   stride::Integer,
-                                  m::AcceleratedMatrix{T,M,N,U},
-                                  ::Val{RM} = Val(false)) where {S,T,M,N,U,RM}
-    fname = coopmat_intrinsic_name("storew", T, M, N, U; rowmajor = RM)
+                                  m::CoopMatrix{T,M,N,U,SC},
+                                  ::Val{RM} = Val(false)) where {S,T,M,N,U,SC,RM}
+    fname = coopmat_intrinsic_name("storew", T, M, N, U, SC; rowmajor = RM)
     ir = """
         declare void @$fname(ptr addrspace(3), i32, i32, i32) #0
         define void @entry(ptr addrspace(3) %p, i32 %o, i32 %s, i32 %h) #0 {
@@ -154,8 +186,8 @@ end
 end
 
 @generated function coopmat_store(ptr::Ptr{S}, offset::Integer, stride::Integer,
-                                  m::AcceleratedMatrix{T,M,N,U}) where {S,T,M,N,U}
-    fname = coopmat_intrinsic_name("store", T, M, N, U)
+                                  m::CoopMatrix{T,M,N,U,SC}) where {S,T,M,N,U,SC}
+    fname = coopmat_intrinsic_name("store", T, M, N, U, SC)
     ir = """
         declare void @$fname(i64, i32, i32) #0
         define void @entry(i64 %p, i32 %s, i32 %h) #0 {
@@ -172,9 +204,21 @@ end
     end
 end
 
-@generated function coopmat_convert(::Type{AcceleratedMatrix{T,M,N,U}},
-                                    m::AcceleratedMatrix{S,M,N,U}) where {T,S,M,N,U}
-    fname = coopmat_intrinsic_name("convert", T, M, N, U)
+"""
+    coopmat_convert(::Type{CoopMatrix{T,M,N,U,S}}, m) -> CoopMatrix
+
+Convert a cooperative matrix's component type, and optionally its **use**.
+
+The use may differ from the source's: an fp32 `Accumulator` becoming an fp16
+`MatrixA` is what feeds the second product of a flash-attention kernel, and
+`flash_attn_cm2.comp` does exactly that twice (`Qf16` and `P_A`). The emitter
+picks the instruction — `OpFConvert` when the uses agree, and
+`OpCooperativeMatrixConvertNV` when they do not, since `OpFConvert` is only legal
+between matrix types agreeing on scope, rows, columns AND use.
+"""
+@generated function coopmat_convert(::Type{CoopMatrix{T,M,N,U,SC}},
+                                    m::CoopMatrix{S,M,N,V,SC}) where {T,S,M,N,U,V,SC}
+    fname = coopmat_intrinsic_name("convert", T, M, N, U, SC)
     ir = """
         declare i32 @$fname(i32) #0
         define i32 @entry(i32 %h) #0 {
@@ -185,12 +229,30 @@ end
     """
     quote
         h = Base.llvmcall(($ir, "entry"), Int32, Tuple{Int32}, m.handle)
-        AcceleratedMatrix{$T,$M,$N,$U}(h)
+        CoopMatrix{$T,$M,$N,$U,$SC}(h)
     end
 end
 
-@generated function coopmat_zero(::Type{AcceleratedMatrix{T,M,N,U}}) where {T,M,N,U}
-    fname = coopmat_intrinsic_name("zero", T, M, N, U)
+"""
+    coopmat_undef(::Type{CoopMatrix{T,M,N,U,SC}}) -> CoopMatrix
+
+An **uninitialised** matrix (`OpUndef`), for a destination whose prior contents
+cannot be observed.
+
+[`tensor_load`](@ref) takes its destination as an argument because glslang emits
+an `OpLoad` of the target, and under a CONSTANT clamp mode the out-of-range
+elements come from the layout's clamp value rather than from that target — so
+nothing about the destination is readable afterwards. Passing
+[`coopmat_zero`](@ref) there is a real value the allocator must hold until the
+load overwrites it; GLSL declares `coopmat mat_a;` and assigns nothing.
+
+**Only where the clamp mode makes the destination unobservable.** With
+`TENSOR_CLAMP_UNDEFINED` an out-of-range element keeps whatever was in the
+destination, and `OpUndef` there is genuine garbage in the output rather than
+the zero the caller expected.
+"""
+@generated function coopmat_undef(::Type{CoopMatrix{T,M,N,U,SC}}) where {T,M,N,U,SC}
+    fname = coopmat_intrinsic_name("undef", T, M, N, U, SC)
     ir = """
         declare i32 @$fname() #0
         define i32 @entry() #0 {
@@ -201,15 +263,34 @@ end
     """
     quote
         h = Base.llvmcall(($ir, "entry"), Int32, Tuple{})
-        AcceleratedMatrix{$T,$M,$N,$U}(h)
+        CoopMatrix{$T,$M,$N,$U,$SC}(h)
+    end
+end
+
+@generated function coopmat_zero(::Type{CoopMatrix{T,M,N,U,SC}}) where {T,M,N,U,SC}
+    fname = coopmat_intrinsic_name("zero", T, M, N, U, SC)
+    ir = """
+        declare i32 @$fname() #0
+        define i32 @entry() #0 {
+            %r = call i32 @$fname()
+            ret i32 %r
+        }
+        attributes #0 = { alwaysinline convergent }
+    """
+    quote
+        h = Base.llvmcall(($ir, "entry"), Int32, Tuple{})
+        CoopMatrix{$T,$M,$N,$U,$SC}(h)
     end
 end
 
 # The accumulator's shape and type name the instruction; A and B follow from it.
-@generated function coopmat_muladd(a::AcceleratedMatrix{TA,M,K,MatrixA},
-                                   b::AcceleratedMatrix{TB,K,N,MatrixB},
-                                   c::AcceleratedMatrix{TC,M,N,Accumulator}) where {TA,TB,TC,M,N,K}
-    fname = coopmat_intrinsic_name("muladd", TC, M, N, Accumulator)
+# All three share one `S`, so a subgroup-scope operand cannot reach a
+# workgroup-scope product: that is a method error here rather than a module the
+# driver rejects.
+@generated function coopmat_muladd(a::CoopMatrix{TA,M,K,MatrixA,S},
+                                   b::CoopMatrix{TB,K,N,MatrixB,S},
+                                   c::CoopMatrix{TC,M,N,Accumulator,S}) where {TA,TB,TC,M,N,K,S}
+    fname = coopmat_intrinsic_name("muladd", TC, M, N, Accumulator, S)
     ir = """
         declare i32 @$fname(i32, i32, i32) #0
         define i32 @entry(i32 %a, i32 %b, i32 %c) #0 {
@@ -221,12 +302,12 @@ end
     quote
         h = Base.llvmcall(($ir, "entry"), Int32, Tuple{Int32,Int32,Int32},
                           a.handle, b.handle, c.handle)
-        AcceleratedMatrix{$TC,$M,$N,Accumulator}(h)
+        CoopMatrix{$TC,$M,$N,Accumulator,$S}(h)
     end
 end
 
 """
-    coopmat_length(::Type{AcceleratedMatrix{T,M,N,U}}) -> Int32
+    coopmat_length(::Type{CoopMatrix{T,M,N,U,S}}) -> Int32
 
 Components of the matrix **this invocation** holds — `OpCooperativeMatrixLengthKHR`.
 
@@ -236,8 +317,8 @@ static. It is what makes an elementwise epilogue expressible at all: a GEMM that
 wants `gelu` on its accumulator has to reach the components, and the only portable
 way to say "all of mine" is to walk `0:length-1`.
 """
-@generated function coopmat_length(::Type{AcceleratedMatrix{T,M,N,U}}) where {T,M,N,U}
-    fname = coopmat_intrinsic_name("length", T, M, N, U)
+@generated function coopmat_length(::Type{CoopMatrix{T,M,N,U,SC}}) where {T,M,N,U,SC}
+    fname = coopmat_intrinsic_name("length", T, M, N, U, SC)
     ir = """
         declare i32 @$fname() #0
         define i32 @entry() #0 {
@@ -261,8 +342,8 @@ SPIR-V has no extract-from-cooperative-matrix instruction. The access is
 what GLSL's `mat[i]` lowers to as well; the emitter keeps one such variable per
 matrix type and writes `m` into it before reading. See `coopmat.jl`.
 """
-@generated function coopmat_getcomp(m::AcceleratedMatrix{T,M,N,U}, i::Int32) where {T,M,N,U}
-    fname = coopmat_intrinsic_name("getcomp", T, M, N, U)
+@generated function coopmat_getcomp(m::CoopMatrix{T,M,N,U,SC}, i::Int32) where {T,M,N,U,SC}
+    fname = coopmat_intrinsic_name("getcomp", T, M, N, U, SC)
     irty = COOPMAT_IR_TYPE[T]
     ir = """
         declare $irty @$fname(i32, i32) #0
@@ -286,9 +367,9 @@ Functional, because a cooperative matrix is an SSA value in SPIR-V and in the IR
 alike: the emitter stores `m` into its `Function` variable, writes the component
 through an `OpAccessChain`, and loads the whole matrix back as the result.
 """
-@generated function coopmat_setcomp(m::AcceleratedMatrix{T,M,N,U}, i::Int32,
-                                    v::T) where {T,M,N,U}
-    fname = coopmat_intrinsic_name("setcomp", T, M, N, U)
+@generated function coopmat_setcomp(m::CoopMatrix{T,M,N,U,SC}, i::Int32,
+                                    v::T) where {T,M,N,U,SC}
+    fname = coopmat_intrinsic_name("setcomp", T, M, N, U, SC)
     irty = COOPMAT_IR_TYPE[T]
     ir = """
         declare i32 @$fname(i32, i32, $irty) #0
@@ -301,7 +382,7 @@ through an `OpAccessChain`, and loads the whole matrix back as the result.
     quote
         h = Base.llvmcall(($ir, "entry"), Int32, Tuple{Int32,Int32,$T},
                           m.handle, i, v)
-        AcceleratedMatrix{$T,$M,$N,$U}(h)
+        CoopMatrix{$T,$M,$N,$U,$SC}(h)
     end
 end
 
@@ -321,9 +402,9 @@ constructor.
 Portable: this is the KHR extension, not `VK_NV_cooperative_matrix2`, so it is
 also what AMD's RDNA3 WMMA path gets.
 """
-@generated function coopmat_mul(a::AcceleratedMatrix{T,M,N,U},
-                                b::AcceleratedMatrix{T,M,N,U}) where {T,M,N,U}
-    fname = coopmat_intrinsic_name("mul", T, M, N, U)
+@generated function coopmat_mul(a::CoopMatrix{T,M,N,U,SC},
+                                b::CoopMatrix{T,M,N,U,SC}) where {T,M,N,U,SC}
+    fname = coopmat_intrinsic_name("mul", T, M, N, U, SC)
     ir = """
         declare i32 @$fname(i32, i32) #0
         define i32 @entry(i32 %a, i32 %b) #0 {
@@ -334,12 +415,12 @@ also what AMD's RDNA3 WMMA path gets.
     """
     quote
         h = Base.llvmcall(($ir, "entry"), Int32, Tuple{Int32,Int32}, a.handle, b.handle)
-        AcceleratedMatrix{$T,$M,$N,$U}(h)
+        CoopMatrix{$T,$M,$N,$U,$SC}(h)
     end
 end
 
 """
-    coopmat_add(a, b) -> AcceleratedMatrix
+    coopmat_add(a, b) -> CoopMatrix
 
 Component-wise sum — plain `OpFAdd`, which `SPV_KHR_cooperative_matrix` defines
 to act component-wise exactly as `OpFMul` does.
@@ -352,9 +433,9 @@ same vector, the residual at its real leading dimension. See `accinit`.
 
 Same portability as `coopmat_mul`: KHR, not `VK_NV_cooperative_matrix2`.
 """
-@generated function coopmat_add(a::AcceleratedMatrix{T,M,N,U},
-                                b::AcceleratedMatrix{T,M,N,U}) where {T,M,N,U}
-    fname = coopmat_intrinsic_name("add", T, M, N, U)
+@generated function coopmat_add(a::CoopMatrix{T,M,N,U,SC},
+                                b::CoopMatrix{T,M,N,U,SC}) where {T,M,N,U,SC}
+    fname = coopmat_intrinsic_name("add", T, M, N, U, SC)
     ir = """
         declare i32 @$fname(i32, i32) #0
         define i32 @entry(i32 %a, i32 %b) #0 {
@@ -365,7 +446,7 @@ Same portability as `coopmat_mul`: KHR, not `VK_NV_cooperative_matrix2`.
     """
     quote
         h = Base.llvmcall(($ir, "entry"), Int32, Tuple{Int32,Int32}, a.handle, b.handle)
-        AcceleratedMatrix{$T,$M,$N,$U}(h)
+        CoopMatrix{$T,$M,$N,$U,$SC}(h)
     end
 end
 
@@ -444,7 +525,14 @@ parameter at all and the thunk's LLVM signature is exactly
     coopmat_keepparam(col)
     coopmat_keepparam(e)
     ntuple(i -> coopmat_keepparam(extras[i]), Val(NE))
-    f(row, col, e, extras...)
+    # The barrier is on the RESULT, and it is what lets a callback that ignores
+    # its element work at all. `@noinline` stops inlining, not interprocedural
+    # constant propagation: a callback returning a literal — `(r, c, e) -> -3f38`,
+    # which is how a flash kernel's running maximum is initialised — lets Julia
+    # replace the *use* of this call with that constant, the marker then reaches
+    # the emitter as a constant rather than a call, and the error says the
+    # callback "did not survive as a call". Which is true and unhelpful.
+    Base.compilerbarrier(:const, f(row, col, e, extras...))
 end
 
 """
@@ -491,9 +579,9 @@ still the right answer.
 
 The `f(...)` call below is a marker, not the work — see `coopmat_perelement_marker`.
 """
-@generated function coopmat_perelement(f::F, m::AcceleratedMatrix{T,M,N,U},
-                                       extras::Vararg{Any,NE}) where {F,T,M,N,U,NE}
-    fname = coopmat_intrinsic_name("perelem", T, M, N, U)
+@generated function coopmat_perelement(f::F, m::CoopMatrix{T,M,N,U,SC},
+                                       extras::Vararg{Any,NE}) where {F,T,M,N,U,SC,NE}
+    fname = coopmat_intrinsic_name("perelem", T, M, N, U, SC)
     irty = COOPMAT_IR_TYPE[T]
     ir = """
         declare i32 @$fname(i32, $irty) #0
@@ -522,7 +610,57 @@ The `f(...)` call below is a marker, not the work — see `coopmat_perelement_ma
                   Base.compilerbarrier(:const, zero($T)),
                   extras...)
         h = Base.llvmcall(($ir, "entry"), Int32, Tuple{Int32,$T}, m.handle, probe)
-        AcceleratedMatrix{$T,$M,$N,$U}(h)
+        CoopMatrix{$T,$M,$N,$U,$SC}(h)
+    end
+end
+
+"""
+    coopmat_perelement(f, m, o::CoopMatrix) -> CoopMatrix
+
+`m` with `f(row, col, m_element, o_element)` applied to every element — the
+per-element op with a **matrix** as its extra operand.
+
+`OpCooperativeMatrixPerElementOpNV` allows a cooperative matrix in the operand
+list, and the callback is then handed that matrix's CORRESPONDING ELEMENT rather
+than the matrix. `flash_attn_cm2.comp` uses it twice — `coopMatPerElementNV(M,
+rowmax, Max, Mold)` is the elementwise maximum of two matrices in ONE pass.
+
+Without it the same result takes three: negate, relu, add. That is not
+bookkeeping — an ablation of the flash kernel puts **70% of its time in the
+softmax's per-element passes**, for one eightieth of the arithmetic, so the pass
+count is the thing that costs.
+
+`o` must have the same shape and scope as `m`; the instruction reads them
+element-for-element.
+
+**Why this is a separate method and not another `extras` entry.** The extras of
+the scalar form ride on the marker call, where they are real values; here the
+instruction needs the matrix's `<id>` while the CALLBACK must be compiled against
+an element. So the matrix goes through the `llvmcall` — where the emitter can
+resolve its handle to the matrix id — and the marker gets a dummy element of the
+right type. One kernel may use both forms; they are different LLVM symbols.
+"""
+@generated function coopmat_perelement(f::F, m::CoopMatrix{T,M,N,U,SC},
+                                       o::CoopMatrix{T,M,N,U2,SC}) where {F,T,M,N,U,U2,SC}
+    fname = coopmat_intrinsic_name("perelemm", T, M, N, U, SC)
+    irty = COOPMAT_IR_TYPE[T]
+    ir = """
+        declare i32 @$fname(i32, $irty, i32) #0
+        define i32 @entry(i32 %m, $irty %p, i32 %o) #0 {
+            %r = call i32 @$fname(i32 %m, $irty %p, i32 %o)
+            ret i32 %r
+        }
+        attributes #0 = { alwaysinline convergent }
+    """
+    quote
+        probe = coopmat_perelement_thunk(f,
+                  Base.compilerbarrier(:const, UInt32(0)),
+                  Base.compilerbarrier(:const, UInt32(0)),
+                  Base.compilerbarrier(:const, zero($T)),
+                  Base.compilerbarrier(:const, zero($T)))
+        h = Base.llvmcall(($ir, "entry"), Int32, Tuple{Int32,$T,Int32},
+                          m.handle, probe, o.handle)
+        CoopMatrix{$T,$M,$N,$U,$SC}(h)
     end
 end
 
@@ -553,7 +691,8 @@ dead-argument elimination and emit a module the validator rejects.
 @noinline function coopmat_reduce_thunk(f::F, x::T, y::T) where {F,T}
     coopmat_keepparam(x)
     coopmat_keepparam(y)
-    f(x, y)
+    # Result barrier for the same reason as `coopmat_perelement_thunk`'s.
+    Base.compilerbarrier(:const, f(x, y))
 end
 
 """
@@ -585,10 +724,10 @@ no operand slot for it. Do not mark it `@noinline` — the thunk already is, and
 
 Check `vk_context().coopmat2.reductions` before compiling a kernel that uses this.
 """
-@generated function coopmat_reduce(f::F, ::Type{AcceleratedMatrix{T,M,N,U}},
-                                   m::AcceleratedMatrix{S,MM,NN,UU},
-                                   ::Val{MASK}) where {F,T,M,N,U,S,MM,NN,UU,MASK}
-    fname = coopmat_intrinsic_name("reduce$(UInt32(MASK))", T, M, N, U)
+@generated function coopmat_reduce(f::F, ::Type{CoopMatrix{T,M,N,U,SC}},
+                                   m::CoopMatrix{S,MM,NN,UU,SC},
+                                   ::Val{MASK}) where {F,T,M,N,U,SC,S,MM,NN,UU,MASK}
+    fname = coopmat_intrinsic_name("reduce$(UInt32(MASK))", T, M, N, U, SC)
     irty = COOPMAT_IR_TYPE[T]
     ir = """
         declare i32 @$fname(i32, $irty) #0
@@ -607,7 +746,7 @@ Check `vk_context().coopmat2.reductions` before compiling a kernel that uses thi
                   Base.compilerbarrier(:const, zero($T)),
                   Base.compilerbarrier(:const, zero($T)))
         h = Base.llvmcall(($ir, "entry"), Int32, Tuple{Int32,$T}, m.handle, probe)
-        AcceleratedMatrix{$T,$M,$N,$U}(h)
+        CoopMatrix{$T,$M,$N,$U,$SC}(h)
     end
 end
 
