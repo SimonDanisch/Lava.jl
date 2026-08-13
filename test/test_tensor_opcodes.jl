@@ -58,6 +58,8 @@ end
                             ("OpTypeTensorViewNV", Lava.Op.OpTypeTensorViewNV),
                             ("OpCreateTensorLayoutNV", Lava.Op.OpCreateTensorLayoutNV),
                             ("OpTensorLayoutSetDimensionNV", Lava.Op.OpTensorLayoutSetDimensionNV),
+                            ("OpTensorLayoutSetStrideNV", Lava.Op.OpTensorLayoutSetStrideNV),
+                            ("OpTensorLayoutSetClampValueNV", Lava.Op.OpTensorLayoutSetClampValueNV),
                             ("OpTensorLayoutSliceNV", Lava.Op.OpTensorLayoutSliceNV),
                             ("OpCreateTensorViewNV", Lava.Op.OpCreateTensorViewNV),
                             ("OpCooperativeMatrixLoadTensorNV", Lava.Op.OpCooperativeMatrixLoadTensorNV))

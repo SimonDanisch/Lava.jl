@@ -330,3 +330,39 @@ end
         @test Lava.gemm_fits32(typemax(Int32) - 1, 1, 1)
     end
 end
+
+@testset "the double-buffered kernel is bit-identical to the single-buffered one" begin
+    # It is off by default (it measures no faster — see `GEMM_STAGED_DB_KERNELS`),
+    # so nothing else in the suite reaches it and it would rot silently. What has
+    # to hold is EQUALITY, not closeness: the two differ only in which staging
+    # buffer a k-block lands in, so any difference at all is an indexing bug.
+    #
+    # The K values are chosen for the pipeline's edges: one block (the prologue
+    # does everything and the loop's re-stage is pure overhead), two blocks, and
+    # an ODD block count, where the last tile is read out of buffer 1.
+    back = LavaBackend()
+    for (M, N, K) in ((192, 256, 32), (192, 256, 64), (192, 256, 96),
+                      (576, 512, 576), (96, 128, 32))
+        for c in Lava.GEMM_TILINGS
+            (Lava.gemm_divides(c, M, N, K) && !Lava.gemm_aliasing(c, K)) || continue
+            haskey(Lava.GEMM_STAGED_DB_KERNELS, c) || continue
+            a = Float16.(0.05f0 .* randn(Float32, M, K))
+            b = Float16.(0.05f0 .* randn(Float32, K, N))
+            A = KA.allocate(back, Float16, M, K); copyto!(A, a)
+            B = KA.allocate(back, Float16, K, N); copyto!(B, b)
+            C = KA.allocate(back, Float16, M, N)
+
+            fill!(C, Float16(NaN))
+            Lava.coopmat_gemm!(C, A, B, M, N, K; tiling = c, doublebuf = false)
+            KA.synchronize(back); one_ = copy(Array(C))
+
+            fill!(C, Float16(NaN))
+            Lava.coopmat_gemm!(C, A, B, M, N, K; tiling = c, doublebuf = true)
+            KA.synchronize(back); two = copy(Array(C))
+
+            @test two == one_
+            @test any(!iszero, one_)          # and it computed something
+            A = B = C = nothing; GC.gc()
+        end
+    end
+end
