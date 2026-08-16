@@ -145,6 +145,17 @@ function GPUCompiler.isintrinsic(::LavaCompilerJob, fn::String)
     startswith(fn, "_lava_rt_") && return true
     # @lava_printf externals → SPIR-V emitter maps to NonSemantic.DebugPrintf
     startswith(fn, "_lava_debug_printf_") && return true
+    # Cooperative-matrix and tensor-addressing intrinsics carry their shape in
+    # the NAME (`_lava_coopmat_<op>_<dtype>_<M>x<N>_<use>`), which the emitter
+    # parses back out. Enumerating the shapes here instead — as this did — makes
+    # the gate, not the hardware, decide which shapes exist: coopmat2 FLEXIBLE
+    # DIMENSIONS allows any M/N the device's max-dimension limit permits, and a
+    # 64x16 matrix was rejected before reaching the emitter that would have
+    # handled it fine. A prefix rule defers the decision to the emitter, which
+    # errors precisely ("bad shape in …", "not a cooperative-matrix intrinsic",
+    # "unsupported tensor-addressing op") rather than silently accepting.
+    startswith(fn, "_lava_coopmat_") && return true
+    startswith(fn, "_lava_tensor_") && return true
     # OpenCL C++ mangled builtins (thread indices, barriers, math)
     fn in KNOWN_INTRINSICS && return true
     return false

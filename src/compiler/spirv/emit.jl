@@ -85,8 +85,22 @@ mutable struct SPIRVEmitterState
     # Suppresses the redundant OpReturn from the trailing `ret void`.
     rt_block_terminated::Bool
     # ── Cooperative matrix (SPV_KHR_cooperative_matrix) ──
-    # Cached OpTypeCooperativeMatrixKHR ids, keyed (dtype, rows, cols, use).
-    coopmat_type_ids::Dict{Tuple{String, Int, Int, UInt32}, UInt32}
+    # Cached OpTypeCooperativeMatrixKHR ids, keyed (dtype, rows, cols, use, scope).
+    coopmat_type_ids::Dict{Tuple{String, Int, Int, UInt32, UInt32}, UInt32}
+    # ── Tensor addressing (SPV_NV_tensor_addressing) ──
+    # `OpTypeTensorLayoutNV` keyed (dim, clamp mode) and `OpTypeTensorViewNV`
+    # keyed (dim, has-dimensions, permutation). Both take their parameters as
+    # constant <id>s rather than literals, so the types are structural and
+    # dedupe exactly like the cooperative-matrix ones.
+    tensor_layout_type_ids::Dict{Tuple{Int, UInt32}, UInt32}
+    tensor_view_type_ids::Dict{Tuple{Int, Bool, Vector{UInt32}}, UInt32}
+    # LLVM values holding a tensor LAYOUT, for the same reason
+    # `coopmat_value_types` exists: the front end carries one as an i32 handle, so
+    # anything deriving a SPIR-V type from the LLVM type gets `%uint`. A phi over
+    # two layouts — `cond ? sliceA : sliceB`, which a GEMM selecting a layout per
+    # branch would produce — then fails validation with "OpPhi's result type
+    # '%uint' does not match incoming value type".
+    tensor_value_types::Dict{LLVM.Value, UInt32}
     # LLVM values that actually hold a cooperative matrix. The front end carries
     # them as an i32 handle, so their LLVM type says nothing useful; anything
     # that derives a SPIR-V type from the LLVM type (phis above all) has to
@@ -110,7 +124,7 @@ mutable struct SPIRVEmitterState
     # block, since a branch can arrive with the variable holding anything.
     coopmat_var_contents::Dict{UInt32, UInt32}
     # LLVM functions that are the callback of an `OpCooperativeMatrixPerElementOpNV`.
-    # Filled by `collect_perelement_callbacks!` before any function is emitted,
+    # Filled by `collect_inline_callbacks!` before any function is emitted,
     # because the callback is emitted *before* the entry function that names it.
     #
     # They exist as separate functions only so the instruction has something to
@@ -120,7 +134,7 @@ mutable struct SPIRVEmitterState
     # surviving as a function. Left as `DontInline` the driver honours it and pays
     # a real call per element; on SAM 2's global attention that was 5.525 ms
     # against the portable path's 4.938, i.e. the feature reading as a 12% loss.
-    perelement_callbacks::Set{LLVM.Function}
+    inline_callbacks::Set{LLVM.Function}
     # ── Ray-query state (compute kernels with enable_ray_query=true) ──
     # Cached OpTypeRayQueryKHR id, allocated lazily.
     ray_query_type_id::Union{Nothing, UInt32}
@@ -205,7 +219,10 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         nothing,
         nothing, nothing,  # SER: rt_hit_object_type_id, rt_hit_object_var_id
         false,
-        Dict{Tuple{String, Int, Int, UInt32}, UInt32}(),  # coopmat types
+        Dict{Tuple{String, Int, Int, UInt32, UInt32}, UInt32}(),  # coopmat types
+        Dict{Tuple{Int, UInt32}, UInt32}(),               # tensor layout types
+        Dict{Tuple{Int, Bool, Vector{UInt32}}, UInt32}(), # tensor view types
+        Dict{LLVM.Value, UInt32}(),                       # tensor-layout-typed values
         Dict{LLVM.Value, UInt32}(),                       # coopmat-typed values
         Dict{UInt32, UInt32}(),                           # coopmat component vars
         Dict{UInt32, UInt32}(),                           # coopmat var contents
@@ -630,11 +647,11 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
     # A per-element callback is the exception and gets `Inline` instead: it is
     # `@noinline` in Julia only so it survives as a function for
     # `OpCooperativeMatrixPerElementOpNV` to name, and the driver is supposed to
-    # inline it into its own element loop. See `perelement_callbacks`.
+    # inline it into its own element loop. See `inline_callbacks`.
     noinline_kind = LLVM.API.LLVMGetEnumAttributeKindForName("noinline", 8)
     has_noinline = any(a -> a isa LLVM.EnumAttribute && LLVM.kind(a) == noinline_kind,
                         collect(LLVM.function_attributes(fn)))
-    fc = fn in state.perelement_callbacks ? FuncControl.Inline :
+    fc = fn in state.inline_callbacks ? FuncControl.Inline :
          (is_entry || !has_noinline) ? FuncControl.None : FuncControl.DontInline
     encode_instruction!(state.mod.functions, Op.OpFunction, ret_spirv, func_id, fc, func_type_id)
 
@@ -6383,12 +6400,21 @@ function defer_phi!(state::SPIRVEmitterState, inst::LLVM.PHIInst, block_label_id
     end
 
     # A phi over cooperative matrices carries the matrix type, not the i32 the
-    # handle happens to have in LLVM.
+    # handle happens to have in LLVM. Tensor layouts are handles in exactly the
+    # same sense and need the same treatment — `cond ? sliceA : sliceB` otherwise
+    # emits `OpPhi %uint` over two `OpTypeTensorLayoutNV` values and spirv-val
+    # rejects the module.
     for (val, _) in incoming
         cm = get(state.coopmat_value_types, val, nothing)
         if cm !== nothing
             result_ty = cm
             state.coopmat_value_types[inst] = cm
+            break
+        end
+        tl = get(state.tensor_value_types, val, nothing)
+        if tl !== nothing
+            result_ty = tl
+            state.tensor_value_types[inst] = tl
             break
         end
     end
@@ -6401,6 +6427,13 @@ the emitter itself created, so it needs no bookkeeping beyond what
 `emit_coopmat_type!` already keeps."""
 is_coopmat_type_id(state::SPIRVEmitterState, id::UInt32) =
     any(==(id), values(state.coopmat_type_ids))
+
+"""Whether `id` names an `OpTypeTensorLayoutNV`. Same role as
+`is_coopmat_type_id`: a layout is an opaque handle carried as an `i32`, so a phi
+edge where it is dead can arrive as a plain `i32 0` and needs the same
+`OpConstantNull` substitution."""
+is_tensor_layout_type_id(state::SPIRVEmitterState, id::UInt32) =
+    any(==(id), values(state.tensor_layout_type_ids))
 
 """
 Resolve all deferred PHI nodes by inserting them right after their block's OpLabel.
@@ -6471,6 +6504,24 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
                         encode_instruction!(state.type_ctx.mod.types_constants, UInt16(46), type_id, uid)  # OpConstantNull
                         uid
                     end
+                end
+            elseif val isa LLVM.Constant && is_tensor_layout_type_id(state, type_id) &&
+                   get(state.tensor_value_types, val, nothing) !== type_id
+                # Exactly the cooperative-matrix case below, for tensor layouts:
+                # `cond ? sliceA : sliceB` inside a kernel whose body sits under
+                # the ndrange guard gives the phi an `i32 0` on the guard edge.
+                #
+                # `OpUndef`, NOT `OpConstantNull` — a layout is an opaque handle
+                # type with no null value, and spirv-val rejects the constant
+                # outright ("OpConstantNull Result Type cannot have a null
+                # value"). The edge is only taken where the value is unused, so
+                # undef is exactly right.
+                key = (:undef, type_id)
+                get!(state.type_ctx.mod.constant_cache, key) do
+                    uid = fresh_id!(state.type_ctx.mod)
+                    encode_instruction!(state.type_ctx.mod.types_constants,
+                                        Op.OpUndef, type_id, uid)
+                    uid
                 end
             elseif val isa LLVM.Constant && is_coopmat_type_id(state, type_id) &&
                    get(state.coopmat_value_types, val, nothing) !== type_id
@@ -6817,6 +6868,14 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
         # Cooperative matrix → OpCooperativeMatrix{Load,Store,MulAdd}KHR
         if startswith(fn_name, "_lava_coopmat_")
             return emit_coopmat_call!(state, inst, fn_name)
+        end
+
+        # Tensor addressing (SPV_NV_tensor_addressing) → the layout builders that
+        # feed OpCooperativeMatrixLoadTensorNV. Checked BEFORE the `_lava_coopmat_`
+        # prefix would be a bug: the names are disjoint, but the load intrinsic
+        # belongs to this family even though it produces a matrix.
+        if startswith(fn_name, "_lava_tensor_")
+            return emit_tensor_call!(state, inst, fn_name)
         end
 
         # A parameter pinned against dead-argument elimination: the call exists

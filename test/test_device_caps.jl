@@ -115,4 +115,48 @@ import KernelAbstractions as KA
         @test Lava.caps(ctx) === c                        # the device is untouched
         @test Lava.DeviceCaps(c) == c                     # no keywords = no change
     end
+
+    @testset "the shape table is the driver's, and tile is one entry of it" begin
+        # `tile` used to be the module constant `GEMM_TILE`, with a comment
+        # calling it "the cooperative-matrix tile this device implements" — a
+        # device fact that no device had answered for. It is now read from the
+        # table the driver reports, which Lava had queried all along and thrown
+        # away down to a single boolean.
+        @test !isempty(c.shapes)
+        @test all(s -> s.scope isa Lava.SubgroupScope, c.shapes)
+
+        sq = Lava.bestshape(c, Float16, Float32)
+        @test sq !== nothing
+        @test sq.M == sq.N == sq.K          # `bestshape` prefers square
+        @test c.tile == sq.M                # …and `tile` IS that entry
+
+        # Every entry must really be one the device reports, in both directions:
+        # a table built from a mistaken component-type mapping would still be
+        # self-consistent, so it is checked against the raw query.
+        @test length(c.shapes) ==
+              count(s -> Lava.juliacomponenttype(s.ab_type) !== nothing &&
+                         Lava.juliacomponenttype(s.c_type) !== nothing,
+                    ctx.coopmat_shapes)
+        @test Lava.supports(c, sq)
+    end
+
+    @testset "a device with no matrix hardware reports no shapes" begin
+        # The gate is in the accessor, NOT in the copy constructor: a copy has to
+        # change exactly the field it names, so `shapes` and `tile` stay put and
+        # it is `bestshape`/`supports` that answer as the device claims to be.
+        off = Lava.DeviceCaps(c; coopmat = false)
+        @test off.shapes == c.shapes                     # the copy contract holds
+        @test off.tile == c.tile
+        @test Lava.bestshape(off, Float16, Float32) === nothing
+        @test !Lava.supports(off, Lava.bestshape(c, Float16, Float32))
+    end
+
+    @testset "a shape the device does not have is refused" begin
+        # The point of carrying types rather than extents alone. This card lists
+        # 16x16x16 for four different type pairs, so an extent-only match would
+        # say yes for a pair it cannot execute.
+        @test Lava.bestshape(c, Float64, Float64) === nothing
+        @test !Lava.supports(c, Lava.MatrixShape(Float32, Float32, c.tile, c.tile,
+                                                 c.tile, Lava.SubgroupScope()))
+    end
 end

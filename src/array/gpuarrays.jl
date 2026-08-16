@@ -591,25 +591,37 @@ end
 
 # ── copyto! variants for CPU↔GPU transfers ──
 
+# ── No staging copy in either direction ──
+#
+# Both of these used to allocate a `Vector{UInt8}` the size of the transfer and
+# `unsafe_copyto!` every byte into it, purely to hand `upload!`/`download!` the
+# `Vector{UInt8}` their signatures ask for. That is a second full copy of every
+# byte that crosses the bus, and on Kokoro it was **3.6 MB of host allocation per
+# utterance** (measured, `--track-allocation`).
+#
+# `copy_buffer!` underneath them takes a raw pointer and a byte count — `upload!`
+# is only a wrapper — and `download_typed!` already called it directly with a
+# user array's pointer. So do these. `GC.@preserve` keeps the host array alive
+# across the call, which is exactly what the wrapper was doing for its temporary.
 function Base.copyto!(dest::LavaArray{T}, doffs::Integer,
                       src::Array{T}, soffs::Integer, n::Integer) where T
     n == 0 && return dest
-    bytes = Vector{UInt8}(undef, n * sizeof(T))
-    unsafe_copyto!(Ptr{UInt8}(pointer(bytes)), Ptr{UInt8}(pointer(src, soffs)), n * sizeof(T))
-    # upload! records into the active batch and flushes; sync_access! takes care
-    # of any prior cross-queue writer to `dest.buf[]` via timeline semaphore.
-    upload!(dest.buf[], bytes; offset=dest.offset + (Int(doffs) - 1) * sizeof(T))
+    # Records into the active batch and flushes; `sync_access!` takes care of any
+    # prior cross-queue writer to `dest.buf[]` via timeline semaphore.
+    GC.@preserve src copy_buffer!(:upload, dest.buf[],
+                                  Ptr{UInt8}(pointer(src, soffs)), n * sizeof(T);
+                                  offset = dest.offset + (Int(doffs) - 1) * sizeof(T))
     return dest
 end
 
 function Base.copyto!(dest::Array{T}, doffs::Integer,
                       src::LavaArray{T}, soffs::Integer, n::Integer) where T
     n == 0 && return dest
-    # download! records a copy into the active batch of whichever queue last
-    # wrote `src.buf[]` and flushes — sync_access! inserts any cross-queue wait.
-    bytes = Vector{UInt8}(undef, n * sizeof(T))
-    download!(bytes, src.buf[]; offset=src.offset + (Int(soffs) - 1) * sizeof(T))
-    unsafe_copyto!(Ptr{UInt8}(pointer(dest, doffs)), Ptr{UInt8}(pointer(bytes)), n * sizeof(T))
+    # Records a copy into the active batch of whichever queue last wrote
+    # `src.buf[]` and flushes — `sync_access!` inserts any cross-queue wait.
+    GC.@preserve dest copy_buffer!(:download, src.buf[],
+                                   Ptr{UInt8}(pointer(dest, doffs)), n * sizeof(T);
+                                   offset = src.offset + (Int(soffs) - 1) * sizeof(T))
     return dest
 end
 

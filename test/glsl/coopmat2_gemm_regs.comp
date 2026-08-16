@@ -1,0 +1,84 @@
+// Register-allocation differential for the coopmat2 GEMM.
+//
+// `gemm_cm2.jl` concludes that tensor-addressed loads cost 1.5-4x the registers
+// of equivalent staged code, and everything downstream of that ("shared staging
+// is how this device keeps addressing state out of the register file", "BK = 64
+// is unusable here", "coopmat2 cannot win on this driver") rests on it. The
+// evidence is that `128x128/32` needs ~90 registers by hand and the driver
+// allocates 196, and `BK = 64` saturates at 255.
+//
+// That was measured on modules from LAVA's SPIR-V emitter only. glslang and our
+// emitter produce different modules for the same algorithm, so the blow-up could
+// be ours. This shader is the same algorithm at llama.cpp's `m_warptile`
+// (BM=128, BN=128, BK=64, 256 invocations — `ggml-vulkan.cpp`, gated by
+// `if (device->coopmat2)`), built by glslangValidator, so the driver's register
+// count can be read for BOTH and compared.
+//
+// Fragments are declared INSIDE the k-loop body, one A and one B live at a time,
+// which is what the reference does and what our first port got wrong.
+//
+// Build:
+//   glslangValidator -V --target-env vulkan1.3 -S comp coopmat2_gemm_regs.comp -o /tmp/x.spv
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_NV_cooperative_matrix2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 256) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer Half {
+    float16_t v[];
+};
+
+// One push constant, the way every Lava kernel is dispatched.
+layout(push_constant) uniform PC {
+    uint64_t pa;
+    uint64_t pb;
+    uint64_t pc;
+    uint M;
+    uint N;
+    uint K;
+} p;
+
+const uint BM = 128;
+const uint BN = 128;
+const uint BK = 64;
+
+void main() {
+    uint ir = gl_WorkGroupID.x;
+    uint ic = gl_WorkGroupID.y;
+
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> tlA =
+        createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> tlB =
+        createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    tlA = setTensorLayoutDimensionNV(tlA, p.M, p.K);
+    tlB = setTensorLayoutDimensionNV(tlB, p.K, p.N);
+
+    coopmat<float, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator> sum =
+        coopmat<float, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint block_k = 0; block_k < p.K; block_k += BK) {
+        coopmat<float16_t, gl_ScopeWorkgroup, BM, BK, gl_MatrixUseA> mat_a;
+        coopmat<float16_t, gl_ScopeWorkgroup, BK, BN, gl_MatrixUseB> mat_b;
+
+        coopMatLoadTensorNV(mat_a, Half(p.pa).v, 0,
+                            sliceTensorLayoutNV(tlA, ir * BM, BM, block_k, BK));
+        coopMatLoadTensorNV(mat_b, Half(p.pb).v, 0,
+                            sliceTensorLayoutNV(tlB, block_k, BK, ic * BN, BN));
+
+        sum = coopMatMulAdd(mat_a, mat_b, sum);
+    }
+
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> tlC =
+        createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    tlC = setTensorLayoutDimensionNV(tlC, p.M, p.N);
+
+    coopmat<float16_t, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator> out16 =
+        coopmat<float16_t, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator>(sum);
+    coopMatStoreTensorNV(out16, Half(p.pc).v, 0,
+                         sliceTensorLayoutNV(tlC, ir * BM, BM, ic * BN, BN));
+}

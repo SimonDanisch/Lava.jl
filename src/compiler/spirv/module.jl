@@ -64,6 +64,11 @@ module Op
     const OpUConvert                = UInt16(113)
     const OpSConvert                = UInt16(114)
     const OpFConvert                = UInt16(115)
+    # Use-CHANGING cooperative-matrix conversion (`SPV_NV_cooperative_matrix2`).
+    # `OpFConvert` is only legal between matrix types agreeing on scope, rows,
+    # cols AND use; turning an fp32 Accumulator into an fp16 MatrixA — which is
+    # what `flash_attn_cm2.comp` does twice, for `Qf16` and `P_A` — is this one.
+    const OpCooperativeMatrixConvertNV = UInt16(5293)
     const OpBitcast                 = UInt16(124)
     const OpSNegate                 = UInt16(126)
     const OpFNegate                 = UInt16(127)
@@ -202,6 +207,25 @@ module Op
     const OpReportIntersectionKHR   = UInt16(5334)
     const OpTypeAccelerationStructureKHR = UInt16(5341)
     const OpConstantNull            = UInt16(46)
+    # `OpUndef` where `OpConstantNull` is illegal. An opaque handle type such as
+    # `OpTypeTensorLayoutNV` has no null value — spirv-val says so directly,
+    # "OpConstantNull Result Type cannot have a null value" — so a phi edge on
+    # which a layout is dead needs an undef rather than a null.
+    #
+    # **1, not 52.** 52 is `OpSpecConstantOp`, and using it produced "End of
+    # input reached while decoding OpSpecConstantOp: expected more operands"
+    # — a decoder error nowhere near the mistake. Read out of a module that
+    # `spirv-as` assembled from text containing an `OpUndef`, which is the same
+    # method the tensor opcodes above use and the reason they were right first
+    # time. This one was guessed and was not.
+    const OpUndef                   = UInt16(1)
+    # Bool constants are their own opcodes, not `OpConstant` with a 0/1 operand.
+    # Needed by `OpTypeTensorViewNV`, whose `HasDimensions` parameter is a Bool
+    # constant <id>. Observed, not assumed: a shader declaring both a
+    # `tensorViewNV<2, true, …>` and a `<2, false, …>` emits 41 and 42 — and two
+    # DISTINCT view types, which is why `HasDimensions` is part of the type key.
+    const OpConstantTrue            = UInt16(41)
+    const OpConstantFalse           = UInt16(42)
     # Image/sampler instructions
     const OpTypeImage               = UInt16(25)
     const OpTypeSampler             = UInt16(26)
@@ -226,6 +250,75 @@ module Op
     # `coopMatReduceNV`, not from a remembered table.
     const OpCooperativeMatrixReduceNV                     = UInt16(5366)
     const OpCooperativeMatrixPerElementOpNV               = UInt16(5369)
+    # Tensor addressing — the operand-staging half of coopmat2, and it is TWO
+    # extensions, not one. The layout/view types and everything that builds them
+    # come from `SPV_NV_tensor_addressing` (capability `TensorAddressingNV`);
+    # only the load itself is `SPV_NV_cooperative_matrix2` (capability
+    # `CooperativeMatrixTensorAddressingNV`). Requiring just the latter produces a
+    # module the driver rejects.
+    #
+    #   %l  = OpCreateTensorLayoutNV                       (no operands)
+    #   %l' = OpTensorLayoutSetDimensionNV %l %d0 %d1 …
+    #   %s  = OpTensorLayoutSliceNV %l' %off0 %sz0 %off1 %sz1 …   (offset/size PAIRS)
+    #   %v  = OpCreateTensorViewNV                         (no operands)
+    #   %m  = OpCooperativeMatrixLoadTensorNV %ptr %object %s <memop> <tensorop>
+    #
+    # Three things the operand list does not advertise, all read off the binary:
+    #
+    #  * the TYPES take constant <id>s, not literals. `OpTypeTensorLayoutNV` is
+    #    `%Dim %ClampMode` and `OpTypeTensorViewNV` is
+    #    `%Dim %HasDimensions %p0 %p1 …`, every one of them an `OpConstant`.
+    #  * `%object` on the load is **the matrix's existing value**, not a
+    #    destination pointer — glslang emits an `OpLoad` of the target matrix and
+    #    passes it in. It is what out-of-range elements keep, which is the whole
+    #    point under a clamping layout; pass an `OpUndef` only where every element
+    #    is known in range.
+    #  * `%ptr` is an ordinary pointer (glslang emits `OpAccessChain`), so the
+    #    GLSL element offset is folded into the pointer rather than passed on.
+    #
+    # Numbers read out of a SPIR-V binary that glslang produced for
+    # `test/glsl/tensor_addressing_opcodes.comp`, matched to the disassembly by
+    # result id — same method as the two above, not a remembered table.
+    # `test/test_tensor_opcodes.jl` re-derives them from that shader and fails if
+    # any constant here disagrees.
+    const OpTypeTensorLayoutNV                            = UInt16(5370)
+    const OpTypeTensorViewNV                              = UInt16(5371)
+    const OpCreateTensorLayoutNV                          = UInt16(5372)
+    const OpTensorLayoutSetDimensionNV                    = UInt16(5373)
+    # The STRIDE between successive indices of each dimension, in elements. Without
+    # it a layout describes a PACKED tensor, and attention's operands are not: `q`,
+    # `k` and `v` arrive as a permuted view of one packed `(E, L, H, B)` block, so
+    # the extent alone does not say where the next row is. `mul_mm_cm2.comp` and
+    # `flash_attn_cm2.comp` both set it on every layout they build.
+    const OpTensorLayoutSetStrideNV                       = UInt16(5374)
+    const OpTensorLayoutSliceNV                           = UInt16(5375)
+    # What a `TENSOR_CLAMP_CONSTANT` load substitutes OUT OF RANGE. The default
+    # is zero, and zero is not always the useful identity: filling `V`'s padding
+    # columns with ONE makes a row sum fall out of the `P x V` product's padding
+    # columns, which is a per-key-block row reduction removed rather than made
+    # cheaper. The operand is a single 32-bit <id> whatever the component type.
+    const OpTensorLayoutSetClampValueNV                   = UInt16(5376)
+    const OpCreateTensorViewNV                            = UInt16(5377)
+    const OpCooperativeMatrixLoadTensorNV                 = UInt16(5367)
+    # `TensorAddressingOperands` — the mask that trails a tensor load. Read off
+    # `/usr/include/glslang/SPIRV/spirv.hpp11` (`TensorAddressingOperandsMask`)
+    # rather than guessed: a wrong bit here does not fail to compile, it loads
+    # the wrong elements and still returns finite numbers.
+    const TENSOR_ADDR_NONE                                = UInt32(0x0)
+    const TENSOR_ADDR_TENSORVIEW                          = UInt32(0x1)
+    const TENSOR_ADDR_DECODEFUNC                          = UInt32(0x2)
+    # The STORE, which is what makes a ragged OUTPUT legal — the clamping layout
+    # bounds-checks writes exactly as it bounds-checks reads, so an edge tile
+    # writes only its in-range elements instead of running off the end. Read off
+    # a glslang binary for `coopMatStoreTensorNV`, not guessed from the load:
+    #
+    #   OpCooperativeMatrixStoreTensorNV %ptr %object %layout <memop> <tensorop>
+    #
+    # NO result type and NO result id — it is a store — so it is the load's
+    # operand list minus its first two words. `%object` here IS the matrix being
+    # written, the same operand position that on the load carries the value
+    # out-of-range elements keep.
+    const OpCooperativeMatrixStoreTensorNV                = UInt16(5368)
     # VK_KHR_ray_query opcodes (SPV_KHR_ray_query)
     const OpTypeRayQueryKHR                               = UInt16(4472)
     const OpRayQueryInitializeKHR                         = UInt16(4473)
@@ -324,7 +417,17 @@ module Cap
     # each has its own VkPhysicalDeviceCooperativeMatrix2FeaturesNV bit; see
     # `CoopMat2Caps` in runtime/device.jl. NVIDIA-only.
     const CooperativeMatrixReductionsNV            = UInt32(5430)
+    # Value from /usr/include/glslang/SPIRV/spirv.hpp11, not inferred from the
+    # neighbouring 5430 — adjacency is a coincidence, not a rule.
+    const CooperativeMatrixConversionsNV           = UInt32(5431)
     const CooperativeMatrixPerElementOperationsNV  = UInt32(5432)
+    # Tensor addressing needs BOTH of these, from two different extensions:
+    # `TensorAddressingNV` (SPV_NV_tensor_addressing) for the layout/view types
+    # and their builders, `CooperativeMatrixTensorAddressingNV`
+    # (SPV_NV_cooperative_matrix2) for `OpCooperativeMatrixLoadTensorNV` itself.
+    # Read off a glslang-produced binary, same as the opcodes.
+    const CooperativeMatrixTensorAddressingNV      = UInt32(5433)
+    const TensorAddressingNV                       = UInt32(5439)
     const RayQueryKHR                   = UInt32(4472)
     const CooperativeMatrixKHR          = UInt32(6022)
     # SER (SPV_NV_shader_invocation_reorder).  Value per the SPIR-V unified1
@@ -819,6 +922,25 @@ function emit_type_bool!(mod::SPIRVModule)
     get!(mod.type_cache, key) do
         id = fresh_id!(mod)
         encode_instruction!(mod.types_constants, Op.OpTypeBool, id)
+        id
+    end
+end
+
+"""
+    emit_constant_bool!(mod, value) -> UInt32
+
+`OpConstantTrue`/`OpConstantFalse`, deduplicated. A Bool constant is a distinct
+opcode with no operand rather than an `OpConstant` carrying 0 or 1, so it cannot
+go through `emit_constant_u32!`.
+"""
+function emit_constant_bool!(mod::SPIRVModule, value::Bool)
+    type_id = emit_type_bool!(mod)
+    key = (:constbool, type_id, value)
+    get!(mod.constant_cache, key) do
+        id = fresh_id!(mod)
+        encode_instruction!(mod.types_constants,
+                            value ? Op.OpConstantTrue : Op.OpConstantFalse,
+                            type_id, id)
         id
     end
 end

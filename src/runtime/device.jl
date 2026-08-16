@@ -53,6 +53,12 @@ mutable struct CommandBatch
     pinned_refs::Vector{Any}
     dispatch_log::Vector{String}
     sealed_cmd_bufs::Vector{Vulkan.CommandBuffer}  # Completed CB segments awaiting submit
+    # Segments already handed to the queue, still being read by the GPU. They
+    # leave `sealed_cmd_bufs` at submit — a batch outlives a single frame, and a
+    # sealed segment left in that list would be submitted again by the next
+    # present — but they cannot go back to `free_cmd_bufs` there either, because
+    # only `reclaim_batch!` knows the fence has passed. So they wait here.
+    submitted_cmd_bufs::Vector{Vulkan.CommandBuffer}
 
     # Timeline value this batch will signal on its queue's `timeline_sem`.
     # Assigned at record time so `sync_access!` can store it into `buf.last_write`.
@@ -76,7 +82,7 @@ and batch state. Multiple `BatchQueue`s can record and submit independently
 
 Create with `BatchQueue(device, queue, queue_family_index)`.
 """
-mutable struct BatchQueue
+mutable struct BatchQueue{C}
     device::Vulkan.Device
     queue::Vulkan.Queue
     family_index::UInt32
@@ -138,11 +144,26 @@ mutable struct BatchQueue
     # that grows as needed via get_staging!. Reused across transfers.
     # Loose type — VkManagedBuffer is declared later in memory.jl.
     staging::Union{Nothing, Any}
-    # Back-reference to owning VkContext. Set post-construction by
-    # the VkContext constructor / allocate_batch_queue!. `nothing` only during the brief
-    # window of default_bq construction before VkContext exists.
-    # Loose type — VkContext is declared below.
-    ctx::Any
+    # Back-reference to owning VkContext.
+    #
+    # `::C`, a TYPE PARAMETER, not `::Any`. `VkContext` is declared ~280 lines
+    # below this struct, so the field cannot name it directly — that ordering is
+    # the only reason it was ever untyped. A parameter closes the cycle without
+    # needing the name: `VkContext` holds a `BatchQueue{VkContext}`, exactly the
+    # shape `struct Node; next::Vector{Node}; end` already uses.
+    #
+    # Untyped, `bq.ctx.caches.<anything>` inferred as `Any`, which made the
+    # launch-plan lookup a dynamic dispatch and its loop a dynamic ITERATION:
+    # **464 bytes of allocation on every dispatch**, on a warm cache that builds
+    # nothing. The workaround was `bq.ctx::VkContext` written at eight separate
+    # call sites, and the ninth (the plan lookup) simply forgot it. A parameter
+    # makes it structural — there is no site left that can forget.
+    #
+    # The previous comment claimed this could be `nothing` "during the brief
+    # window of default_bq construction". It cannot: `VkContext`'s inner
+    # constructor is two-phase via `new()` precisely so a live `ctx` exists
+    # before `BatchQueue(...)` is called, and every call site passes one.
+    ctx::C
     # Single-writer invariant: only this thread may record into or submit
     # from this BatchQueue.  Captured at construction from `Threads.threadid()`.
     # Every dispatch-recording / sweep / slab-alloc entry point asserts that
@@ -211,6 +232,7 @@ function init_batch(cb::Vulkan.CommandBuffer)
     sizehint!(pinned, 128)
     waits = Tuple{Vulkan.Semaphore, UInt64, Vulkan.PipelineStageFlag2}[]
     return CommandBatch(cb, false, 0, 0, false, pinned, Any[], String[],
+        Vulkan.CommandBuffer[],
         Vulkan.CommandBuffer[],
         UInt64(0),                       # signal_value (assigned at record time)
         waits,
@@ -364,7 +386,9 @@ mutable struct VkContext
     # non-nothing after the inner constructor returns (BatchQueue is built
     # using `new()`-based two-phase init to break the chicken-and-egg with
     # BatchQueue.ctx).
-    default_bq::BatchQueue
+    # `BatchQueue{VkContext}`, not the UnionAll — otherwise `ctx.default_bq` is
+    # abstract and the parameter above buys nothing at this end of the cycle.
+    default_bq::BatchQueue{VkContext}
     # Secondary compute queue (async RT) — same family, separate queue object
     compute_queue::Vulkan.Queue
     # Ray tracing (nothing if not available)
@@ -618,14 +642,82 @@ function caps(ctx::VkContext = vk_context())
     c === nothing || return c
     limits = Vulkan.get_physical_device_properties(ctx.physical_device).limits
     cores, warps = query_shader_cores(ctx.physical_device)
+    # The driver's own table, not a constant. `tile` was `GEMM_TILE = 16` — a
+    # comment reading "the cooperative-matrix tile this device implements" on a
+    # module-level binding, which is a device fact that no device answered for.
+    # On a card reporting anything but 16 the kernels strided by 16 and read
+    # another fragment's registers, and nothing would have crashed.
+    shapes = matrixshapes(ctx)
+    square = bestshape(shapes, Float16, Float32)
     ctx.caches.caps = DeviceCaps(
         coopmat_gemm_available(ctx),
-        GEMM_TILE,
+        square === nothing ? 0 : square.M,
         device_subgroup_size(ctx),
         COOPMAT_SUBGROUP,
         Int(limits.max_compute_shared_memory_size),
         Int(limits.max_compute_work_group_invocations),
-        cores, warps)
+        cores, warps,
+        workgroup_matrix_granularity(ctx),
+        shapes)
+end
+
+"""
+    wggranularity(dev, nt) -> (M, N, K) | nothing
+
+The `(M, N, K)` multiples a workgroup-scope fp16 x fp16 -> fp32 matrix must be at
+a workgroup of `nt` invocations, from `dev.wggran`. `nothing` means this device
+runs no workgroup-scope matrix at that workgroup size.
+
+Here rather than in each kernel library: the table is the device's, so the lookup
+into it is too. Two callers had written the same loop with different argument
+orders — `DNNKernels`' flash chooser and this file's GEMM one — which is the
+shape that drifts.
+"""
+function wggranularity(dev, nt::Integer)
+    for (n, m, nn, k) in dev.wggran
+        n == nt && return (m, nn, k)
+    end
+    return nothing
+end
+
+"""
+    workgroup_matrix_granularity(ctx) -> Vector{(invocations, M, N, K)}
+
+The shapes a **workgroup-scope** fp16 x fp16 -> fp32 cooperative matrix may have
+on this device, one row per workgroup size, sorted by size.
+
+Empty means no workgroup-scope matrices — which is every device that is not
+NVIDIA with `VK_NV_cooperative_matrix2`, and is why this doubles as the
+capability test: a kernel cannot ask "may I?" without also being handed "at what
+shapes?", and those two drifting apart is how a kernel ends up asking for a tile
+the device refuses at pipeline creation.
+
+The pairing is the part that is not guessable. `M`, `N` and `K` are multiples,
+not sizes, and they COARSEN as the workgroup grows — on an RTX 4000 Ada,
+16/16/16 at 32 and 64 invocations, 32/16/16 at 128, 32/32/16 at 256. So a
+head dimension of 72 pads to 80 at 128 invocations and to 96 at 256, and the
+padding is 33% of both products in the second case. Measured: every tiling was
+faster at 128 than at 256 for exactly that reason.
+
+fp16 x fp16 -> fp32 only, because that is what every kernel here multiplies.
+Widen it when something needs bf16 or int8; the query returns those rows too.
+"""
+function workgroup_matrix_granularity(ctx::VkContext = vk_context())
+    rows = NTuple{4,Int}[]
+    ctx.coopmat2.workgroup_scope || return rows
+    props = unwrap(Vulkan.get_physical_device_cooperative_matrix_flexible_dimensions_properties_nv(
+                       ctx.physical_device))
+    for p in props
+        p.scope == Vulkan.SCOPE_WORKGROUP_KHR || continue
+        p.a_type == Vulkan.COMPONENT_TYPE_FLOAT16_KHR || continue
+        p.b_type == Vulkan.COMPONENT_TYPE_FLOAT16_KHR || continue
+        p.c_type == Vulkan.COMPONENT_TYPE_FLOAT32_KHR || continue
+        p.result_type == Vulkan.COMPONENT_TYPE_FLOAT32_KHR || continue
+        push!(rows, (Int(p.workgroup_invocations), Int(p.m_granularity),
+                     Int(p.n_granularity), Int(p.k_granularity)))
+    end
+    sort!(rows; by = first)
+    return rows
 end
 
 """

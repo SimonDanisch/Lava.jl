@@ -115,6 +115,47 @@ is not written: of SAM 2's 98 residual adds the 51 that are structurally
 foldable turned out to be the *cheap* half, so the measurement did not justify
 the surgery. The instruction is portable and tested either way.
 
+**New 2026-08-11: scope is a type parameter.** `CoopMatrix{T,M,N,Use,Scope}` with
+two aliases — `AcceleratedMatrix` (subgroup, the portable KHR one, and what every
+existing kernel spells) and `WorkgroupMatrix` (`Scope = Workgroup`, which
+`VK_NV_cooperative_matrix2` enables). One matrix then spans all `NT` invocations
+instead of one subgroup: a `32 x 96` fp32 accumulator is 12 components a lane at
+256 invocations against 96 at subgroup scope. Every operation requires its
+operands to agree on scope, so mixing them is a method error at the call site
+rather than a module the driver rejects.
+
+The SPIR-V difference is **one constant** — `Scope = 2` instead of `3` on
+`OpTypeCooperativeMatrixKHR` — and nothing else: same capabilities, same
+extensions, same instructions, verified against glslang in
+`test/glsl/workgroup_scope_coopmat.comp`.
+
+**What the GEMM measurement then said about tensor addressing itself**, since it
+is the strongest evidence this file has on the subject: a tensor-addressed load
+costs **1.5x to 4x the registers** of the equivalent `@localmem`-staged code, in
+all four kernel structures tried (workgroup scope at five tilings, subgroup scope
+with a 4x4 register block, with and without unrolling). The driver targets 128
+registers and caps at 255, so that is decisive — `src/array/gemm_cm2.jl` has the
+table. Attention still wins with it because there the gain is structural rather
+than arithmetic. Two more things worth carrying: an **unclamped** layout is 2.8x
+SLOWER here than a clamping one — the inverse of `mul_mm_cm2.comp`'s own fast
+path — and batching several loads before their products extends live ranges the
+scheduler cannot shorten.
+
+Two tensor-addressing gaps closed alongside it, both wanted by the GEMM:
+`tensor_setstride` (`OpTensorLayoutSetStrideNV`, 5374 — without it a layout
+describes a PACKED tensor, and every attention operand is a permuted view of one
+block) and a **viewed store**, `tensor_store(m, addr, layout, view)`, which is
+how `mul_mm_cm2.comp` writes an `N x M` destination from an `M x N` accumulator
+without a staging pass. Each has an MWE that keeps the un-viewed / un-strided
+form beside it as a negative control, because a packed test array passes either
+way and proves nothing. What is NOT free is the shape: legal
+`(M, N, K)` multiples depend on the workgroup size, and the device reports the
+table through
+`get_physical_device_cooperative_matrix_flexible_dimensions_properties_nv`
+(RTX 4000 Ada, fp16 x fp16 -> fp32: 16/16/16 at 32 and 64 invocations, 32/16/16
+at 128, 32/32/16 at 256). Launch a shape off that table and pipeline creation
+fails.
+
 Extents registered: `16x16`, `16x8`, and `8x8`. Nothing ships `8x8` — it is what
 **lavapipe** offers, and having it lets a cooperative-matrix reproducer run on a
 second, independent consumer. That is what settled `test_shared_index_division.jl`.

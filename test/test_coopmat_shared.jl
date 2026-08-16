@@ -177,6 +177,65 @@ end
     end
 end
 
+# The same, 4-wide. It is a separate test because it exercises a DIFFERENT bug:
+# `wg_compute_type_size`/`wg_compute_type_alignment` had no `VectorType` branch
+# at all and fell through to a constant 4. That is right for `<2 x half>` by
+# coincidence, so the vec2 test above passed while a 4-wide `@localmem` got
+# `ArrayStride 4` for an 8-byte element and `spirv-val` refused the module
+# ("array with stride 4 not satisfying alignment to 8"). A `<2 x float>` staging
+# buffer would have hit it too and nothing in the tree had one.
+const CMV4 = NTuple{4,VecElement{Float16}}
+
+@kernel cpu=false unsafe_indices=true function coopmat_vec4_tile!(out, @Const(A))
+    sh = @localmem CMV4 (4 * 16,)      # a 16x16 fp16 tile = 4 vec4 per column
+    t = @index(Local, Linear) - 1
+    @inbounds begin
+        if t < 64
+            i4 = t % 4; j = t ÷ 4
+            sh[1 + i4 + j * 4] = (VecElement(A[1 + 4i4 + j * 16]),
+                                  VecElement(A[2 + 4i4 + j * 16]),
+                                  VecElement(A[3 + 4i4 + j * 16]),
+                                  VecElement(A[4 + 4i4 + j * 16]))
+        end
+        @synchronize
+        if t < 32
+            # stride counted in vec4, hence 4 rather than 16
+            a = AcceleratedMatrix{Float16,16,16,MatrixA}(sh, 1, 4)
+            copyto!(pointer(out), 1, 16, a)
+        end
+    end
+end
+
+@testset "cooperative matrix from a vec4-typed @localmem" begin
+    backend = LavaBackend()
+    if !Lava.coopmat_gemm_available()
+        @info "skipping: no cooperative-matrix support on this device"
+    else
+        h = Float16.(reshape(1:256, 16, 16))
+        A = LavaArray(vec(h))
+        out = LavaArray(fill(Float16(-1), 256))
+        coopmat_vec4_tile!(backend, 128)(out, A; ndrange = 128)
+        KernelAbstractions.synchronize(backend)
+        @test reshape(Array(out), 16, 16) == h
+    end
+end
+
+@testset "workgroup layout sizes and alignments for vectors" begin
+    # The rule the fix encodes, checked without a GPU: packed size, and Vulkan's
+    # 2x/4x alignment. A vector was previously reported as 4 bytes whatever it
+    # was, which is why only the 2-wide fp16 case worked.
+    LLVM.@dispose ctx = LLVM.Context() begin
+        h = LLVM.HalfType(); f = LLVM.FloatType()
+        for (ty, sz, al) in ((LLVM.VectorType(h, 2),  4,  4),
+                             (LLVM.VectorType(h, 4),  8,  8),
+                             (LLVM.VectorType(f, 2),  8,  8),
+                             (LLVM.VectorType(f, 4), 16, 16))
+            @test Lava.wg_compute_type_size(ty) == sz
+            @test Lava.wg_compute_type_alignment(ty) == al
+        end
+    end
+end
+
 # The layout operand on a *store* into `@localmem`, which the load has taken
 # since the staged GEMM needed it and the store did not.
 #

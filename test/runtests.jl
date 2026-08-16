@@ -106,6 +106,50 @@ end
     # ── Tier 1b: Compiler IR passes (no GPU) ──
     @testset "Tier 1b: Compiler IR passes" begin
         include(joinpath(@__DIR__, "test_replace_unreachable.jl"))
+        # `Op`/`Cap` are hand-maintained tables; a wrong constant surfaces as a
+        # module the driver rejects, far from the typo. Re-derives them from
+        # glslang. No GPU, skips when glslang is absent.
+        include(joinpath(@__DIR__, "test_tensor_opcodes.jl"))
+    end
+
+    # ── Tier 3a3: tensor addressing actually loads (GPU) ──
+    # Compiling and validating is not enough here: the instruction validated
+    # twice while still wrong. This runs it and checks the values and the
+    # orientation.
+    @testset "Tier 3a3: coopmat2 tensor load" begin
+        include(joinpath(@__DIR__, "test_tensor_load.jl"))
+        # What the load substitutes OUT of range, which is a value the caller
+        # chooses and not always zero — `attn_flash_cm2!` gets a whole row
+        # reduction deleted by asking for one.
+        include(joinpath(@__DIR__, "test_tensor_clampvalue.jl"))
+        # And what a PRODUCT of two tensor-loaded operands computes, which the
+        # load test cannot say: the load returns the transpose of its block, so
+        # the product is `P' * Q'`. A GEMM cannot be routed through this until
+        # that is pinned, and all four candidate orientations look sane.
+        include(joinpath(@__DIR__, "test_tensor_gemm.jl"))
+        # And the claim the port rests on: a clamping layout bounds-checks the
+        # load, so an extent that divides nothing is legal and out-of-range reads
+        # come back as exact zeros. That is what retires `gemm_padn`,
+        # `GEMM_BLOCK`, `padtile`/`crsextent` and `gemm_divides`.
+        include(joinpath(@__DIR__, "test_tensor_clamp.jl"))
+        # And that a shape the device does NOT report is usable at all: every
+        # KHR shape here has M == 16, so 64x16 exercises coopmat2's flexible
+        # dimensions. A hard-coded shape list in `KNOWN_INTRINSICS` used to
+        # reject it before the emitter — which handles it correctly — ever saw
+        # it, so this guards a gate, not an instruction.
+        include(joinpath(@__DIR__, "test_coopmat_flexible_dims.jl"))
+        # The clamp test above covers READS. This is the other half: a clamping
+        # layout must bounds-check the STORE too, or a tensor GEMM can consume
+        # unpadded operands and still not write an unpadded result. Asserts
+        # two-sided — in-range elements land, and nothing outside the extent
+        # moves — because a store that trampled its neighbours would pass a
+        # one-sided "the right values are there" check.
+        include(joinpath(@__DIR__, "test_tensor_store.jl"))
+        # Workgroup scope, and the two kernels built on it. The GEMM is not
+        # routed to yet — `coopmat_gemm!` still runs the staged kernel — so this
+        # is the only thing keeping it honest while it waits to be measured.
+        include(joinpath(@__DIR__, "test_workgroup_scope.jl"))
+        include(joinpath(@__DIR__, "test_gemm_cm2.jl"))
     end
 
     # ── Tier 3a: Workgroup barrier-skip fix (GPU; catches lavapipe deadlock) ──
@@ -496,6 +540,7 @@ end
 
         @testset "debug configuration" begin
             include(joinpath(@__DIR__, "test_debug_config.jl"))
+            include(joinpath(@__DIR__, "test_dispatch_allocation.jl"))
         end
 
         @testset "batched 1D FFT" begin

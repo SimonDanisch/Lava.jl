@@ -27,7 +27,17 @@
 # remaining global loads against. 4×4 is a real optimum — 4×8 and 8×4 fall to
 # ~3 TFLOP/s and 8×8 to ~1.75, which is register spilling.
 
-const GEMM_TILE = 16       # the cooperative-matrix tile this device implements
+# The tile these kernels are WRITTEN FOR, not the one a device reports — that is
+# `caps(ctx).tile`, read from the driver's table. It stays a constant because it
+# is baked in more deeply than a parameter could reach: the `@nexprs` unroll
+# counts are literals derived from it (a 16x16 fp32 accumulator is 8 components
+# per lane at subgroup 32, hence `@nexprs 8`), and `@nexprs` cannot take a count
+# that comes from a `Val`.
+#
+# Nothing silently misreads a device that disagrees: `coopmat_gemm_available`
+# asks for exactly `Float16 16x16x16`, so a card without that shape reports
+# `coopmat = false` and every cooperative-matrix plan declines.
+const GEMM_TILE = 16
 const GEMM_BLOCK = 4       # register block: 4×4 accumulators per subgroup
 const GEMM_WORKGROUP = 64  # 2 subgroups; 32 loses latency hiding, 256 spills
 const GEMM_MAXBLOCK = 4    # largest register block `@nexprs` is unrolled for
@@ -168,6 +178,111 @@ const GEMM_TILINGS = GemmTiling[
 ]
 
 """
+## The tiling family is EXHAUSTED — four more were built and measured (2026-08-12)
+
+`tools/gemm_tiling_sweep.jl` forces every legal tiling at every one of SAM 2's
+six `addmm` shapes with **cuBLAS measured beside it in the same process**, which
+is the comparison this table never had: its own numbers were against a
+`CUBLAS_TFLOPS = 44.6` constant that understates cuBLAS by 40% (the real figure
+is 62.7 share-weighted — `gemm_vs_cublas.jl`).
+
+Best per shape, TFLOP/s and percent of cuBLAS at that shape:
+
+    shape                  best tiling      ours   cuBLAS   ratio
+    2304 x 4096 x  576     128x128/8w      42.69    66.41    64%   (96x128: 42.12)
+     576 x 4096 x 2304      64x128/8w      42.91    64.96    66%
+    1728 x 4096 x  576      96x128/8w      42.30    62.29    68%
+     576 x 4096 x  576      96x128/8w      36.44    46.71    78%
+     288 x 16384 x 1152     96x128/8w      40.18    52.03    77%
+    1152 x 16384 x  288    128x128/8w      33.54    53.52    63%   (96x128: 33.37)
+
+The four candidates and their verdicts, all measured, none kept:
+
+    96 x 256, 16 warps    LOSES everywhere (-8% to -13% against 96x128)
+    192 x 128, 16 warps   LOSES everywhere (-5% to -8%)
+    128 x 128,  8 warps   wins 1.4% on one shape and 0.5% on another, and needs
+                          48640 B of shared — at Vulkan's 48 KB floor
+    96 x 128, BK = 64     LOSES badly, -41% to -55%; 98 registers, so it is the
+                          staging cost per k-step and not pressure
+     64 x 128,  4 warps   LOSES badly, 24.6 TF/s against 41.6 (-41%)
+    128 x  64,  4 warps   LOSES badly, 26.7 TF/s (-36%)
+
+The last two close a gap in the first sweep, which had only ever widened the warp
+GRID or the tile AT 8 warps. Fewer warps with a bigger tile is the one
+combination the register budget allows — 128 threads doubles the registers a lane
+may hold before occupancy falls — and it is much worse. **Warps in flight are
+what this kernel wants**, at 8; both fewer and more lose.
+
+**A wider warp GRID loses and a wider warp TILE does not** — which inverts the
+rule this docstring carried. The "2x4 warp tile runs at 7.3" measurement above
+was a configuration that SPILLED 31 KB; a 4x2 tile at 8 warps does not spill
+(128 registers, `Local Memory Size` 16 like every other entry) and is the fastest
+tiling on the dominant shape. The rule was true of one config and written as if
+general.
+
+**So the ~64% deficit is not a tiling choice**, and the chooser already lands on
+the best tiling or within 1.4% of it at every shape. Do not re-run the tiling
+sweep; it is in `gemm_tiling_sweep.jl` and it is done.
+
+## WHERE THE DEFICIT ACTUALLY IS: the staging, and only the staging
+
+`tools/gemm_ablate.jl` runs the kernel with the staging removed after the first
+k-block — same muladds, same barriers, a wrong answer on purpose. Registers are
+unchanged (128) in both arms, so this is not an occupancy artefact:
+
+    shape                   full   no staging   cuBLAS   staging share
+    2304 x 4096 x  576     42.91        62.93    67.48        32%
+     576 x 4096 x 2304     42.27        75.14    65.14        44%
+    1728 x 4096 x  576     42.76        60.26    62.74        29%
+     288 x 16384 x 1152    41.01        71.62    52.55        43%
+
+**Our arithmetic is already at 93-136% of cuBLAS's whole kernel.** The entire
+deficit is what it costs us to get the tiles into shared memory — and cuBLAS
+hides that cost with asynchronous global-to-shared copies, which SPIR-V does not
+expose.
+
+And it is **instruction-bound, not latency-bound**, which is what makes the two
+earlier negative results cohere: double buffering (hiding latency) bought
+nothing, while scalar -> `vec2` (halving the instruction count) bought +45%.
+
+`vec4` should therefore have won and did not, at ANY padding — so bank conflicts
+on the shared store are not the explanation either:
+
+    96x128/8w, 2304 x 4096 x 576      vec2     vec4
+    PAD =  4                         32.81    30.62
+    PAD =  8  (shipped)              41.52    41.05
+    PAD = 16                         38.74    36.21
+    PAD = 24                         43.03    40.34
+
+**`PAD` had never been swept, and 24 beats 8 on EVERY shape in the
+microbenchmark — and buys NOTHING in the model.** Per shape, interleaved, cuBLAS
+beside it:
+
+    shape                  PAD=8    PAD=24
+    2304 x 4096 x  576     41.53     43.65   +5.1%
+    1728 x 4096 x  576     41.79     43.38   +3.8%
+     576 x 4096 x  576     36.12     39.03   +8.1%
+     288 x 16384 x 1152    39.65     41.10   +3.7%
+    1152 x 16384 x  288    33.21     33.92   +2.1%
+
+Never a regression, on the tiling that serves 56.5% of the encoder's GEMM
+arithmetic — so it was shipped, and SAM 2's encode came back **74.50 ms against
+74.13/74.37 before it**, i.e. nothing, or slightly worse. Reverted.
+
+**That gap is the finding, and it applies to every GEMM number in this file.**
+The microbenchmark runs one GEMM eight times over the same operands, so both arms
+work out of a warm L2; the model streams different weights through every one of
+its 195 calls. A change that helps the L2-resident regime need not help the
+streaming one. The RATIOS here are still sound — both arms are measured the same
+way — but **a microbenchmark win does not become a model win until the model
+says so**, and the only number that decides a ship is `bench_sam2.jl`.
+
+The `64 x 128` twin was mixed even in the microbenchmark (+0.3% to +1.6% on four
+shapes, -2.0% on the fifth) and was never taken.
+"""
+const GEMM_TILING_SWEEP_DONE = true
+
+"""
     GEMM_TILING[]
 
 Force one tiling instead of letting `gemm_tiling` choose, or `nothing` for the
@@ -229,6 +344,17 @@ tiling in favour of one that was measured, so its failure mode is a missed win.
 # agree, so it gets a name. `vec2` and `narrow_ok` are read at exactly one call
 # site each and are written as literals there instead.
 const GEMM_STAGED_DEFAULT = true
+
+"""Whether the double-buffered staging kernel is the default.
+
+**Off until it is measured.** It is a new kernel family with the same answer and
+a different barrier structure, so shipping it before an interleaved A/B would be
+exactly the mistake this file's history is full of."""
+const GEMM_DOUBLEBUF_DEFAULT = false
+
+"""Whether 4-wide (64-bit) staging is the default. **Off until measured** — same
+rule as `GEMM_DOUBLEBUF_DEFAULT`, and the same reason."""
+const GEMM_VEC4_DEFAULT = false
 
 @inline function gemm_tiling(M::Int, N::Int, K::Int; forced = nothing)
     # A forced tiling still has to divide the shape. Skipping that check makes a
@@ -582,12 +708,44 @@ end
 #     vector pointee whose component type matches the matrix and counts `Stride`
 #     in those vectors.
 #
-# What remains is the integration, and it is mechanical: declare `sA`/`sB` as
-# vec2 arrays, halve `LDA`/`LDB` and the coopmat strides, and have each lane
-# store one packed pair instead of two halves — `AREPS`/`BREPS` halve with it.
-# A is packed along `m` and B along `k`, which is the contiguous axis on each, so
-# both stay coalesced on the global side and neither needs a transpose. The
-# `test_gemm_staged.jl` K-sweep is what should catch it if the index maths slips.
+# That integration LANDED — `GEMM_STAGED_V2_KERNELS` below is it, and it is worth
+# 1.09x. So the paragraph above is history, and the obvious next step it implies
+# — now that the shared array IS vec2, go back and widen the GLOBAL load the way
+# `mul_mm.comp` does — has been measured and **does not work here.**
+#
+# ## The wide global load, re-measured against the vec2 shared array (2026-08-12)
+#
+# `mul_mm.comp` uses `LOAD_VEC = 8` for fp16 (`vulkan-shaders-gen.cpp:449`): ONE
+# 128-bit global load decomposed into FOUR `vec2` shared stores, which is an
+# ASYMMETRIC widening our `GEMM_STAGED_V4_KERNELS` never tested — those widen the
+# shared array to `f16vec4` as well. Staging a 128x32 tile through an identical
+# `vec2` shared layout, bit-identical results, interleaved, both arms at one
+# clock:
+#
+#     working set   2 scalar loads   one 128-bit load
+#     16.8 MB        628 GB/s          418 GB/s       0.67x   <- INSIDE 48 MB L2
+#    134.2 MB        278               279            1.00x   <- BEYOND it
+#
+# **The answer depends on residency, and the first version of this note missed
+# that.** It quoted 693 GB/s as "the card's ceiling" from a 16.8 MB working set,
+# which fits entirely in this card's 48 MB L2 — that is L2 bandwidth, not DRAM,
+# and the real GEMM streams its weights from memory. Re-run beyond L2 the two are
+# **identical at ~278 GB/s**: both are DRAM-bound and the load width is irrelevant.
+#
+# So there is no win in either regime, but for two different reasons. Streaming,
+# memory is the limit whatever the instruction count. L2-resident, the wide load
+# is 33% WORSE, and that is the store pattern: a lane owning 8 consecutive
+# elements writes `vec2` at indices `4p .. 4p+3`, so store *i* across a warp
+# strides 4 vectors = 16 bytes and takes a 4-way bank conflict — the same
+# mechanism the paragraph above describes for the scalar array. Widening the
+# shared element moved that conflict, it did not remove it.
+#
+# 278 GB/s against this card's ~360 GB/s spec is the streaming number worth
+# remembering; 693 was an artefact of a benchmark that fit in cache.
+#
+# So the staging deficit the ablation measures is NOT the loads. It is the shared
+# stores, the two barriers and the cooperative-matrix loads out of `sA`/`sB` —
+# and `mul_mm.comp` has no answer for those that we have not already ported.
 
 const GEMM_STAGED_KERNELS = Dict{GemmTiling,Any}()
 
@@ -657,8 +815,122 @@ duplication is a correctness requirement and not only a measurement convenience.
 """
 const GEMM_STAGED_V2N_KERNELS = Dict{GemmTiling,Any}()
 
-"A 2-wide fp16 vector, i.e. `f16vec2`; see `Lava.coopmat_vec2`."
+"""
+Double-buffered twins of `GEMM_STAGED_V2N_KERNELS`, keyed the same way.
+
+Two alternating staging buffers, so the second `@synchronize` per k-block — the
+one that exists only to stop the next block's staging from overwriting a tile
+still being read — is gone, and the staging of block `k+1` overlaps the
+arithmetic of block `k`. Costs 2x the shared memory (33792 B at 96x128, against a
+48 KB floor) and no occupancy, since 128 registers x 256 threads already binds at
+two workgroups per SM.
+
+Selected by `coopmat_gemm!`'s `doublebuf` keyword. Both families are generated
+because the only measurement worth having is the two interleaved in one session
+on one set of buffers, and because a device with less shared memory needs the
+single-buffer one.
+
+## MEASURED, and it does not pay (2026-08-12, `gemm_doublebuf_ab.jl`)
+
+Bit-identical to the single-buffer kernel on 40 tiling/shape combinations first
+(`db_check`), including `K` of one block and an odd block count, so this is one
+structural difference and nothing else. Interleaved, cuBLAS beside it:
+
+    shape                   1buf     2buf    delta
+    2304 x 4096 x  576     42.95    42.69    +0.6%
+     576 x 4096 x 2304     42.96    43.06    -0.2%
+    1728 x 4096 x  576     43.17    42.58    +1.4%
+     576 x 4096 x  576     36.77    36.77    -0.0%
+     288 x 16384 x 1152    41.91    30.01   +39.7%
+    1152 x 16384 x  288    34.58    33.33    +3.8%
+    share-weighted         42.1     41.2
+
+**The second barrier is not the bottleneck.** On every shape where the register
+count did not move, removing it bought between -0.2% and +1.4% — nothing. That
+is the result, and it is worth more than the kernel: it rules out the one
+structural difference from `mul_mm.comp` that was visible from the source.
+
+The 39.7% outlier is a separate, self-inflicted thing and its mechanism is
+measured: registers go **128 -> 161** there, so occupancy halves from two
+workgroups per SM to one. The four phase offsets (`rda`/`rdb`/`wra`/`wrb`) live
+across the whole loop. Unrolling the k-loop by two would make the phase a
+compile-time constant in each half and cost no registers at all — that is the
+fix, and it is not worth making while the best case on the other five shapes is
+-0.2%.
+
+Kept, default off (`GEMM_DOUBLEBUF_DEFAULT`), because it is tested and correct
+and any future attempt at this should start from working code rather than
+rebuild it.
+"""
+const GEMM_STAGED_DB_KERNELS = Dict{GemmTiling,Any}()
+
+"""
+4-wide-staging twins of `GEMM_STAGED_V2N_KERNELS`: 64-bit shared accesses.
+
+The staging width turned out to be the load-bearing thing in this kernel —
+scalar to `vec2` is **+45% to +54%** per shape against cuBLAS measured beside it,
+not the +9% recorded when `vec2` landed. SPIR-V vectors stop at four components,
+so this is the last notch available without changing how the tile is addressed.
+
+Generated only for tilings where every width divides exactly (`LDA`, `LDB`, `BM`
+and `BK` by 4, and the staging by `4 * WG`); nothing rounds, because a staging
+loop that does not cover the tile loses k-terms silently. Selected by
+`coopmat_gemm!`'s `vec4` keyword.
+
+## MEASURED, and the trend does not continue (2026-08-12)
+
+Bit-identical to the `vec2` kernel on 40 tiling/shape combinations before timing.
+Interleaved, cuBLAS beside it, TFLOP/s:
+
+    shape                   vec2     vec4    delta
+    2304 x 4096 x  576     42.53    40.65    -4.4%
+     576 x 4096 x 2304     42.60    40.92    -4.0%
+    1728 x 4096 x  576     42.66    40.82    -4.3%
+     576 x 4096 x  576     37.29    36.03    -3.4%
+     288 x 16384 x 1152    40.52    40.48    -0.1%
+    1152 x 16384 x  288    34.52    34.26    -0.8%
+
+**`vec2` is the sweet spot.** Scalar to `vec2` is +45% to +54%; `vec2` to `vec4`
+is -4%. Whatever the first step bought, it was not simply "wider is better", or
+the second would have continued it. Shared memory and register counts are
+unchanged between the two, so it is not residency.
+
+Kept, default off, because the Lava-side generalisation it forced is a real fix
+(see below) and any future attempt should not have to rebuild the kernel.
+
+**It found a latent bug worth more than the kernel.** `wg_compute_type_size` and
+`wg_compute_type_alignment` had no `VectorType` branch at all — both fell through
+to a constant 4. That is correct for `<2 x half>` BY COINCIDENCE, which is why
+`vec2` staging worked and nothing noticed; `<4 x half>` got `ArrayStride 4` for
+an 8-byte element and `spirv-val` rejected the module. A `<2 x float>` staging
+buffer would have hit it too, and nothing in the tree had one.
+`test_coopmat_shared.jl` now checks both the 4-wide tile and the size/alignment
+rule directly.
+"""
+const GEMM_STAGED_V4_KERNELS = Dict{GemmTiling,Any}()
+
+"""
+Ablation twins: `:all` is the kernel, `:nostage` stages only the first k-block
+and runs every later block's arithmetic on that stale tile.
+
+**They compute wrong answers on purpose.** The gap between them is what the
+staging loads cost, with the muladds and the barriers held fixed — the only
+instrument that says which half of the k-loop the ~36% deficit to cuBLAS lives
+in, now that tiling, double buffering and staging width are all measured and
+closed. Driven by `tools/gemm_ablate.jl`, never by a shipped path.
+"""
+const GEMM_STAGED_ABL_KERNELS = Dict{GemmTiling,Any}()
+
+"A 2-wide fp16 vector, i.e. `f16vec2`; see `Lava.coopmat_vecwidth`."
 const GemmV2 = NTuple{2,VecElement{Float16}}
+
+"""A 4-wide fp16 vector, i.e. `f16vec4` — 64-bit shared accesses.
+
+The staging width is **on the critical path**: scalar -> vec2 is worth +45% to
++54% per shape against cuBLAS measured beside it, far more than the +9% this file
+used to record for it. SPIR-V vectors stop at 4 components, so this is the last
+notch available by this route."""
+const GemmV4 = NTuple{4,VecElement{Float16}}
 
 for (ci, cfg) in enumerate(GEMM_TILINGS)
     STM, STN, WM, WN, BK, PAD = cfg
@@ -907,6 +1179,289 @@ for (ci, cfg) in enumerate(GEMM_TILINGS)
             end
             GEMM_STAGED_V2N_KERNELS[$cfg] = $kv2n
         end
+
+        # ── Double-buffered twin of the narrow vec2 kernel ──────────────────
+        #
+        # The single-buffer loop issues TWO barriers per k-block: one so the
+        # staged tile is visible before the cooperative-matrix loads, and one so
+        # the next block's staging cannot overwrite a tile still being read.
+        # Only the first is about data the kernel needs; the second exists purely
+        # because there is one buffer. Two alternating buffers remove it, and the
+        # staging of block k+1 then overlaps the arithmetic of block k instead of
+        # waiting behind it — which is what `mul_mm.comp` does and this did not.
+        #
+        # Costs 2x the shared memory: 33792 B at 96x128, against a 48 KB Vulkan
+        # floor, and occupancy is unchanged because 128 registers x 256 threads
+        # already binds at two workgroups per SM.
+        kdb = Symbol("coopmat_gemm_staged_kernel_", ci, "_db!")
+        @eval begin
+            @kernel cpu=false unsafe_indices=true function $kdb(
+                                              C, @Const(A), @Const(B), bias, epi,
+                                              ::Val{M}, ::Val{N}, ::Val{K}) where {M,N,K}
+                sA = @localmem GemmV2 (2 * $LDA2 * $BK,)
+                sB = @localmem GemmV2 (2 * $LDB2 * $BN,)
+
+                tid = Int32(@index(Local, Linear) - 1)
+                blk = Int32(@index(Group, Linear) - 1)
+                nblk_m = Int32(M ÷ $BM)
+                tm = (blk % nblk_m) * Int32($BM)
+                tn = (blk ÷ nblk_m) * Int32($BN)
+
+                s = tid ÷ Int32(32)
+                sm = (s % Int32($WM)) * Int32($STM)
+                sn = (s ÷ Int32($WM)) * Int32($STN)
+
+                bp = bias === nothing ? bias : pointer(bias)
+                Base.Cartesian.@nexprs $STN nt -> Base.Cartesian.@nexprs $STM mt ->
+                    c_mt_nt = accinit(bias, bp, 1 + tm + (sm + mt - 1) * GEMM_TILE)
+
+                nkb = Int32(K ÷ $BK)
+
+                # Prologue: block 0 into buffer 0, so the loop always has a tile
+                # to compute on and only ever stages the NEXT one.
+                @inbounds for r in Int32(0):Int32($AREPS2 - 1)
+                    idx = tid + r * Int32($WG)
+                    p, kk = splitidx(idx, Val($BM2))
+                    g = Int32(1) + (tm + Int32(2) * Int32(p)) + Int32(kk) * Int32(M)
+                    sA[1 + Int(p) + Int(kk) * $LDA2] =
+                        (VecElement(A[g]), VecElement(A[g + Int32(1)]))
+                end
+                @inbounds for r in Int32(0):Int32($BREPS2 - 1)
+                    idx = tid + r * Int32($WG)
+                    q, j = splitidx(idx, Val($BK2))
+                    g = Int32(1) + Int32(2) * Int32(q) + (tn + Int32(j)) * Int32(K)
+                    sB[1 + Int(q) + Int(j) * $LDB2] =
+                        (VecElement(B[g]), VecElement(B[g + Int32(1)]))
+                end
+                @synchronize
+
+                for kb in Int32(0):(nkb - Int32(1))
+                    rda = (kb & Int32(1)) * Int32($LDA2 * $BK)
+                    rdb = (kb & Int32(1)) * Int32($LDB2 * $BN)
+                    wra = (Int32(1) - (kb & Int32(1))) * Int32($LDA2 * $BK)
+                    wrb = (Int32(1) - (kb & Int32(1))) * Int32($LDB2 * $BN)
+                    # `min` and not a branch. A conditional around the staging
+                    # would be uniform and legal, but the k-loop's structurizing
+                    # is what once left the `muladd` under an `OpSelectionMerge`
+                    # at a measured 3x cost, so the last iteration re-stages the
+                    # final block into the buffer nothing will read instead.
+                    k0 = min(kb + Int32(1), nkb - Int32(1)) * Int32($BK)
+
+                    @inbounds for r in Int32(0):Int32($AREPS2 - 1)
+                        idx = tid + r * Int32($WG)
+                        p, kk = splitidx(idx, Val($BM2))
+                        g = Int32(1) + (tm + Int32(2) * Int32(p)) +
+                            (k0 + Int32(kk)) * Int32(M)
+                        sA[1 + Int(wra) + Int(p) + Int(kk) * $LDA2] =
+                            (VecElement(A[g]), VecElement(A[g + Int32(1)]))
+                    end
+                    @inbounds for r in Int32(0):Int32($BREPS2 - 1)
+                        idx = tid + r * Int32($WG)
+                        q, j = splitidx(idx, Val($BK2))
+                        g = Int32(1) + (k0 + Int32(2) * Int32(q)) +
+                            (tn + Int32(j)) * Int32(K)
+                        sB[1 + Int(wrb) + Int(q) + Int(j) * $LDB2] =
+                            (VecElement(B[g]), VecElement(B[g + Int32(1)]))
+                    end
+
+                    Base.Cartesian.@nexprs $NKT u -> begin
+                        kt = (u - 1) * GEMM_TILE
+                        Base.Cartesian.@nexprs $STM mt -> begin
+                            a = AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixA}(
+                                    sA, 1 + Int(rda) + (sm + mt - 1) * ($(GEMM_TILE ÷ 2)) +
+                                        kt * $LDA2, $LDA2)
+                            Base.Cartesian.@nexprs $STN nt -> begin
+                                b = AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixB}(
+                                        sB, 1 + Int(rdb) + (kt ÷ 2) +
+                                            (sn + nt - 1) * GEMM_TILE * $LDB2, $LDB2)
+                                c_mt_nt = muladd(a, b, c_mt_nt)
+                            end
+                        end
+                    end
+                    # ONE barrier: it both publishes the tile just staged and
+                    # retires the reads of the tile just consumed.
+                    @synchronize
+                end
+
+                Base.Cartesian.@nexprs $STN nt -> Base.Cartesian.@nexprs $STM mt ->
+                    accstore!(C,
+                              1 + Int(tm + (sm + mt - 1) * Int32(GEMM_TILE)) +
+                                  (tn + (sn + nt - 1) * GEMM_TILE) * M,
+                              M, c_mt_nt, epi)
+            end
+            GEMM_STAGED_DB_KERNELS[$cfg] = $kdb
+        end
+    end
+
+    # ── 4-wide staging: 64-bit shared accesses ─────────────────────────────
+    #
+    # The same widening that took scalar to `vec2`, one notch further. It is
+    # generated only where every width divides exactly; nothing rounds, because a
+    # staging loop that does not cover the tile loses k-terms silently rather
+    # than failing (see `splitidx`).
+    if LDA % 4 == 0 && LDB % 4 == 0 && BM % 4 == 0 && BK % 4 == 0 &&
+       (BM * BK) % (4 * WG) == 0 && (BK * BN) % (4 * WG) == 0
+        LDA4, LDB4 = LDA ÷ 4, LDB ÷ 4
+        AREPS4, BREPS4 = (BM * BK) ÷ 4 ÷ WG, (BK * BN) ÷ 4 ÷ WG
+        BM4, BK4 = BM ÷ 4, BK ÷ 4
+        kv4 = Symbol("coopmat_gemm_staged_kernel_", ci, "_v4!")
+        @eval begin
+            @kernel cpu=false unsafe_indices=true function $kv4(
+                                              C, @Const(A), @Const(B), bias, epi,
+                                              ::Val{M}, ::Val{N}, ::Val{K}) where {M,N,K}
+                sA = @localmem GemmV4 ($LDA4 * $BK,)
+                sB = @localmem GemmV4 ($LDB4 * $BN,)
+
+                tid = Int32(@index(Local, Linear) - 1)
+                blk = Int32(@index(Group, Linear) - 1)
+                nblk_m = Int32(M ÷ $BM)
+                tm = (blk % nblk_m) * Int32($BM)
+                tn = (blk ÷ nblk_m) * Int32($BN)
+
+                s = tid ÷ Int32(32)
+                sm = (s % Int32($WM)) * Int32($STM)
+                sn = (s ÷ Int32($WM)) * Int32($STN)
+
+                bp = bias === nothing ? bias : pointer(bias)
+                Base.Cartesian.@nexprs $STN nt -> Base.Cartesian.@nexprs $STM mt ->
+                    c_mt_nt = accinit(bias, bp, 1 + tm + (sm + mt - 1) * GEMM_TILE)
+
+                for kb in Int32(0):Int32(K ÷ $BK - 1)
+                    k0 = kb * Int32($BK)
+                    # A: quads along `m`, the contiguous axis, so consecutive
+                    # lanes still read consecutive global addresses.
+                    @inbounds for r in Int32(0):Int32($AREPS4 - 1)
+                        idx = tid + r * Int32($WG)
+                        p, kk = splitidx(idx, Val($BM4))
+                        g = Int32(1) + (tm + Int32(4) * Int32(p)) +
+                            (k0 + Int32(kk)) * Int32(M)
+                        sA[1 + Int(p) + Int(kk) * $LDA4] =
+                            (VecElement(A[g]), VecElement(A[g + Int32(1)]),
+                             VecElement(A[g + Int32(2)]), VecElement(A[g + Int32(3)]))
+                    end
+                    # B: quads along `k`, contiguous here for the same reason.
+                    @inbounds for r in Int32(0):Int32($BREPS4 - 1)
+                        idx = tid + r * Int32($WG)
+                        q, j = splitidx(idx, Val($BK4))
+                        g = Int32(1) + (k0 + Int32(4) * Int32(q)) +
+                            (tn + Int32(j)) * Int32(K)
+                        sB[1 + Int(q) + Int(j) * $LDB4] =
+                            (VecElement(B[g]), VecElement(B[g + Int32(1)]),
+                             VecElement(B[g + Int32(2)]), VecElement(B[g + Int32(3)]))
+                    end
+                    @synchronize
+
+                    Base.Cartesian.@nexprs $NKT u -> begin
+                        kt = (u - 1) * GEMM_TILE
+                        Base.Cartesian.@nexprs $STM mt -> begin
+                            a = AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixA}(
+                                    sA, 1 + (sm + mt - 1) * ($(GEMM_TILE ÷ 4)) +
+                                        kt * $LDA4, $LDA4)
+                            Base.Cartesian.@nexprs $STN nt -> begin
+                                b = AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixB}(
+                                        sB, 1 + (kt ÷ 4) +
+                                            (sn + nt - 1) * GEMM_TILE * $LDB4, $LDB4)
+                                c_mt_nt = muladd(a, b, c_mt_nt)
+                            end
+                        end
+                    end
+                    @synchronize
+                end
+
+                Base.Cartesian.@nexprs $STN nt -> Base.Cartesian.@nexprs $STM mt ->
+                    accstore!(C,
+                              1 + Int(tm + (sm + mt - 1) * Int32(GEMM_TILE)) +
+                                  (tn + (sn + nt - 1) * GEMM_TILE) * M,
+                              M, c_mt_nt, epi)
+            end
+            GEMM_STAGED_V4_KERNELS[$cfg] = $kv4
+        end
+    end
+
+    # ── The ablation: staging or arithmetic? ───────────────────────────────
+    #
+    # Every external lever is measured and closed — tiling in both directions,
+    # double buffering, staging width — and the kernel still sits at ~64% of
+    # cuBLAS. This is the instrument that says which HALF of the k-loop the time
+    # is in, the same way `flash_cm2_ablate.jl` settled the flash kernel.
+    #
+    # It computes a WRONG answer on purpose: `:nostage` stages only the first
+    # k-block and then runs every remaining block's arithmetic on that stale
+    # tile. The muladds all still happen, the barriers all still happen, and the
+    # staging loads do not. `:all` minus `:nostage` is what the staging costs.
+    #
+    # The staging guard is around the STAGING, never around the `muladd` — a
+    # `muladd` under an `OpSelectionMerge` measured 3x here once and would make
+    # the ablation report its own artifact.
+    kabl = Symbol("coopmat_gemm_staged_kernel_", ci, "_abl!")
+    @eval begin
+        @kernel cpu=false unsafe_indices=true function $kabl(
+                                          C, @Const(A), @Const(B), bias, epi,
+                                          ::Val{M}, ::Val{N}, ::Val{K},
+                                          ::Val{ABL}) where {M,N,K,ABL}
+            sA = @localmem GemmV2 ($LDA2 * $BK,)
+            sB = @localmem GemmV2 ($LDB2 * $BN,)
+
+            tid = Int32(@index(Local, Linear) - 1)
+            blk = Int32(@index(Group, Linear) - 1)
+            nblk_m = Int32(M ÷ $BM)
+            tm = (blk % nblk_m) * Int32($BM)
+            tn = (blk ÷ nblk_m) * Int32($BN)
+
+            s = tid ÷ Int32(32)
+            sm = (s % Int32($WM)) * Int32($STM)
+            sn = (s ÷ Int32($WM)) * Int32($STN)
+
+            bp = bias === nothing ? bias : pointer(bias)
+            Base.Cartesian.@nexprs $STN nt -> Base.Cartesian.@nexprs $STM mt ->
+                c_mt_nt = accinit(bias, bp, 1 + tm + (sm + mt - 1) * GEMM_TILE)
+
+            for kb in Int32(0):Int32(K ÷ $BK - 1)
+                k0 = kb * Int32($BK)
+                if ABL !== :nostage || kb == Int32(0)
+                    @inbounds for r in Int32(0):Int32($AREPS2 - 1)
+                        idx = tid + r * Int32($WG)
+                        p, kk = splitidx(idx, Val($BM2))
+                        g = Int32(1) + (tm + Int32(2) * Int32(p)) +
+                            (k0 + Int32(kk)) * Int32(M)
+                        sA[1 + Int(p) + Int(kk) * $LDA2] =
+                            (VecElement(A[g]), VecElement(A[g + Int32(1)]))
+                    end
+                    @inbounds for r in Int32(0):Int32($BREPS2 - 1)
+                        idx = tid + r * Int32($WG)
+                        q, j = splitidx(idx, Val($BK2))
+                        g = Int32(1) + (k0 + Int32(2) * Int32(q)) +
+                            (tn + Int32(j)) * Int32(K)
+                        sB[1 + Int(q) + Int(j) * $LDB2] =
+                            (VecElement(B[g]), VecElement(B[g + Int32(1)]))
+                    end
+                end
+                @synchronize
+
+                Base.Cartesian.@nexprs $NKT u -> begin
+                    kt = (u - 1) * GEMM_TILE
+                    Base.Cartesian.@nexprs $STM mt -> begin
+                        a = AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixA}(
+                                sA, 1 + (sm + mt - 1) * ($(GEMM_TILE ÷ 2)) +
+                                    kt * $LDA2, $LDA2)
+                        Base.Cartesian.@nexprs $STN nt -> begin
+                            b = AcceleratedMatrix{Float16,GEMM_TILE,GEMM_TILE,MatrixB}(
+                                    sB, 1 + (kt ÷ 2) +
+                                        (sn + nt - 1) * GEMM_TILE * $LDB2, $LDB2)
+                            c_mt_nt = muladd(a, b, c_mt_nt)
+                        end
+                    end
+                end
+                @synchronize
+            end
+
+            Base.Cartesian.@nexprs $STN nt -> Base.Cartesian.@nexprs $STM mt ->
+                accstore!(C,
+                          1 + Int(tm + (sm + mt - 1) * Int32(GEMM_TILE)) +
+                              (tn + (sn + nt - 1) * GEMM_TILE) * M,
+                          M, c_mt_nt, epi)
+        end
+        GEMM_STAGED_ABL_KERNELS[$cfg] = $kabl
     end
 end
 
@@ -1502,6 +2057,8 @@ function coopmat_gemm!(C, A, B, M::Int, N::Int, K::Int;
                        staged::Bool = GEMM_STAGED_DEFAULT,
                        vec2::Bool   = true,
                        narrow_ok::Bool = true,
+                       doublebuf::Bool = GEMM_DOUBLEBUF_DEFAULT,
+                       vec4::Bool = GEMM_VEC4_DEFAULT,
                        tiling = nothing)
     # `KA.get_backend(C)`, NOT `LavaBackend()`. An unpinned backend resolves
     # its queue through `vk_context()`, so on a second device this dispatches on
@@ -1530,6 +2087,15 @@ function coopmat_gemm!(C, A, B, M::Int, N::Int, K::Int;
         narrow = narrow_ok && gemm_fits32(M, N, K)
         kern = if !vec2
             GEMM_STAGED_KERNELS[c]
+        elseif vec4 && haskey(GEMM_STAGED_V4_KERNELS, c)
+            GEMM_STAGED_V4_KERNELS[c]
+        elseif narrow && doublebuf
+            # The double-buffered kernel is a narrow-index one, so it needs both
+            # gates; falling back through the narrow kernel keeps a shape that
+            # only fails `doublebuf` on the next-best path rather than the worst.
+            get(GEMM_STAGED_DB_KERNELS, c,
+                get(GEMM_STAGED_V2N_KERNELS, c,
+                    get(GEMM_STAGED_V2_KERNELS, c, GEMM_STAGED_KERNELS[c])))
         elseif narrow
             get(GEMM_STAGED_V2N_KERNELS, c,
                 get(GEMM_STAGED_V2_KERNELS, c, GEMM_STAGED_KERNELS[c]))

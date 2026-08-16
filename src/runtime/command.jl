@@ -293,6 +293,13 @@ function ensure_active_batch!(bq::BatchQueue)
             # Fresh open on reused batch — assign the timeline value it will
             # signal, so record_buffer_access! can write it into buf.last_write.
             batch.signal_value = bq.next_timeline + 1
+            # `vkBeginCommandBuffer` has just reset this command buffer, so the
+            # segment starts empty and its dispatch count starts with it.
+            # (Hygiene, not a fix: zeroing it here does not change the periodic
+            # dropped frame — measured, bursts unchanged at every 600 frames for
+            # a 20-dispatch graph. Whatever `cb_split_threshold` is doing to that
+            # is not this counter surviving a reopen.)
+            batch.segment_dispatches = 0
         end
         return batch
     end
@@ -368,6 +375,11 @@ function reclaim_batch!(bq::BatchQueue, batch::CommandBatch)
     empty!(batch.dispatch_log)
     append!(bq.free_cmd_bufs, batch.sealed_cmd_bufs)
     empty!(batch.sealed_cmd_bufs)
+    # Segments `present_frame!` already submitted: the fence has passed by the
+    # time a batch is reclaimed, so the GPU is done reading them and they can go
+    # back to the pool with the rest.
+    append!(bq.free_cmd_bufs, batch.submitted_cmd_bufs)
+    empty!(batch.submitted_cmd_bufs)
     push!(bq.free_batches, batch)
     # Note: pool reset + deferred-free drain are done in `sweep_retired_batches!`
     # AFTER the batch is actually removed from `bq.in_flight` (reclaim_batch! is
@@ -493,6 +505,35 @@ function concurrent_dispatch_group(f::F) where F
     prev_started = CONCURRENT_GROUP_STARTED[]
     CONCURRENT_GROUP_ACTIVE[]  = true
     CONCURRENT_GROUP_STARTED[] = false
+    try
+        f()
+    finally
+        CONCURRENT_GROUP_ACTIVE[]  = prev_active
+        CONCURRENT_GROUP_STARTED[] = prev_started
+    end
+end
+
+"""
+    exclusive_dispatch_group(f)
+
+Run `f()` with the automatic inter-dispatch barrier back on, whatever group is
+open around it.
+
+For a caller that has derived the dependencies between *units of work* but not
+inside them. A render graph knows what each pass reads and writes and emits the
+barrier between passes itself, which is the whole reason it opens a
+`concurrent_dispatch_group`; it knows nothing about the launches within one pass
+when that pass is an opaque body. Suppressing barriers there is not an
+optimisation, it is a race — an operator whose second kernel reads what its first
+wrote is ordinary, and a two-pass reduction or a split-K matmul is exactly that.
+
+So the group is lifted for the body, and the caller sets `bq.next_skip_barrier`
+if the *first* launch in it is the one it already emitted a barrier for.
+"""
+function exclusive_dispatch_group(f::F) where F
+    prev_active  = CONCURRENT_GROUP_ACTIVE[]
+    prev_started = CONCURRENT_GROUP_STARTED[]
+    CONCURRENT_GROUP_ACTIVE[] = false
     try
         f()
     finally
@@ -1128,8 +1169,15 @@ function submit!(bq::BatchQueue)
     # in `present_frame!`, because a compute-only queue never presents and would
     # otherwise never be allowed to rewind at all.
     arg_pool_in_use!(bq, batch.signal_value)
-    bq.last_dispatch_info = "$saved_dispatch_count dispatches ($(saved_last_was_rt ? "RT" : "compute"))"
     dg = (bq.ctx::VkContext).diag
+    # GATED. This built a fresh `String` on EVERY submit — 7.9 bytes per dispatch
+    # amortised — for a field only ever read by `maybe_write_dispatch_start_
+    # timestamp!` (which returns -1 immediately unless `dispatch_timing`) and by
+    # the hwtlas debug strings (gated on `dispatch_logging`). Same shape as the
+    # slab-scan bug: a diagnostic doing real work while switched off.
+    if dg.dispatch_logging || dg.dispatch_timing
+        bq.last_dispatch_info = "$saved_dispatch_count dispatches ($(saved_last_was_rt ? "RT" : "compute"))"
+    end
     Threads.atomic_add!(dg.total_dispatches, saved_dispatch_count)
     if dg.dispatch_logging
         append!(dg.dispatch_log, batch.dispatch_log)
@@ -1413,8 +1461,34 @@ Called from `pack_args_direct!` at each buffer-typed leaf, and directly at
 dispatch entry points for objects not in the kernel arg tuple (pipelines,
 closures, RT AS handles, indirect buffers).
 """
+# `===` in an explicit loop rather than `obj in batch.pinned`, and the reason is
+# NOT the one an earlier version of this comment gave. It claimed `pinned` was a
+# `Vector{Any}` whose `in` fell back to a generic `==`. It is an `IdSet{Any}`,
+# whose `in` is already identity-based and O(1) — verified directly:
+# `big1 in IdSet[big2]` is `false` for equal-content distinct arrays. The swap
+# fixed no correctness bug; there was none.
+#
+# What it did buy is 48.8 bytes per dispatch, measured — from boxing at this
+# call site, where `obj` is not inferred, rather than from `in` itself (both
+# forms allocate zero when the argument is concretely typed).
+#
+# THE TRADE IS SIZE-DEPENDENT, so it is written down. The scan is O(n) where the
+# hash is O(1); measured on this device:
+#
+#     |pinned|     IdSet `in`     === scan
+#            4       0.221 us      0.04 us
+#           64       0.21          0.10
+#          256       0.22          0.33     <- crossover
+#         4096       0.11          2.37
+#
+# A Whisper encode holds **129** entries in the open batch, i.e. essentially at
+# the crossover: this is break-even today, chosen for the bytes. It degrades
+# quadratically if batches grow, and `auto_submit_threshold` (64) is what sets
+# that. **Raise the threshold and this should go back to `in`.**
 @inline function pin!(batch::CommandBatch, obj)
-    obj in batch.pinned && return nothing
+    for x in batch.pinned
+        x === obj && return nothing
+    end
     push!(batch.pinned, obj)
     return nothing
 end
@@ -1422,7 +1496,11 @@ end
 @inline function pin!(batch::CommandBatch, buf::VkManagedBuffer)
     bq = batch.bq::BatchQueue
     @assert buf.ctx === bq.ctx  "cross-ctx buffer use forbidden"
-    buf in batch.pinned && return nothing
+    # Same trade as the method above, for the same reason: `in` on this `IdSet`
+    # is identity too, so this is about the boxing, not about correctness.
+    for x in batch.pinned
+        x === buf && return nothing
+    end
     push!(batch.pinned, buf)
     return nothing
 end
