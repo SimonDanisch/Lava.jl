@@ -20,6 +20,7 @@
 # flaky on a loaded machine.
 
 using Test, Lava
+using GPUCompiler, LLVM
 
 @testset "compile-time overhead" begin
 
@@ -90,6 +91,53 @@ using Test, Lava
         # `entry_name` is the Vulkan entry point and cannot distinguish kernels;
         # that is exactly why `source_name` has to exist.
         @test kernel.entry_name == "main"
+    end
+
+    @testset "source-location lookup is memoised, and equivalent" begin
+        # `extract_source_location` runs once per emitted instruction and walks
+        # the whole `inlined_at` chain, so in inlined code its cost per
+        # instruction grew with the inline depth — which grows with the
+        # instruction count. That made the SPIR-V emitter QUADRATIC in function
+        # size (measured exponent 2.6 against IR bytes; see
+        # benchmarks/compile_baseline/FINDINGS.md).
+        #
+        # `diloc_outermost` is the same walk expressed recursively so each LINK
+        # can be memoised. Caching only the instruction's own DILocation is not
+        # enough and is the trap: every instruction has its own leaf node, so
+        # that memo never hits. The parents are shared, and caching those is
+        # what makes it linear.
+        #
+        # Two things have to hold, and only the second is about speed:
+        #   1. it returns exactly what the original loop returned, and
+        #   2. the cache actually gets populated.
+        mod_ir = nothing
+        locs_cached = Tuple{String, Int}[]
+        locs_legacy = Tuple{String, Int}[]
+        cache_size = 0
+
+        # Drive a real compile and compare both implementations on every
+        # instruction that carries debug info.
+        GPUCompiler.JuliaContext() do ctx
+            config = Lava.lava_compiler_config(; workgroup_size = (64, 1, 1))
+            source = GPUCompiler.methodinstance(typeof(overhead_probe), kernel_tt)
+            job = GPUCompiler.CompilerJob(source, config)
+            m, meta = GPUCompiler.compile(:llvm, job)
+            cache = Dict{LLVM.API.LLVMMetadataRef, Union{Nothing, Tuple{String, Int}}}()
+            for fn in LLVM.functions(m), bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+                dbg = Lava.instruction_diloc(inst)
+                dbg === nothing && continue
+                a = Lava.diloc_outermost(dbg, cache)
+                b = Lava.extract_source_location_legacy(dbg)
+                a === nothing || push!(locs_cached, a)
+                b === nothing || push!(locs_legacy, b)
+                @test a == b          # memoised result == original walk
+            end
+            cache_size = length(cache)
+        end
+
+        @test !isempty(locs_cached)   # the comparison actually ran on something
+        @test locs_cached == locs_legacy
+        @test cache_size > 0          # the memo was populated, not bypassed
     end
 
     @testset "lava_run reports exit status correctly" begin

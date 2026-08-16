@@ -129,6 +129,51 @@ compile 37570 → 6232, and codegen byte-for-byte unchanged** (§3).
 
 ---
 
+## 1b. The SPIR-V emitter was QUADRATIC in function size — fixed
+
+Found with `BenchCompileTime.quadratic_hunt()`, which fits each phase's time
+against IR size and reports the exponent. **A sampling profiler cannot find
+this**: `@profile` is SIGPROF-based and cannot interrupt a long call into
+libLLVM, so a 74 s compile produced a flat profile topping out at 24 samples out
+of ~14 800. Scaling measurement found it in one run.
+
+| phase | exponent before | after |
+|---|---:|---:|
+| `emitfn/block emission loop` | **2.61** | 0.68 |
+| `emit/emit_function!` (entry) | **2.59** | 0.74 |
+| `stage/emit_spirv_from_llvm` | **2.41** | 0.76 |
+
+Absolute, on the largest synthetic kernel (268 kB IR): emitter **0.113 s →
+0.010 s, 11×**. Every other Lava-owned phase was already ~1.0, including
+`run_structurize_cfg_pipeline!` at 0.68. `GPUCompiler.compile` remains ~2.7 and
+is not ours.
+
+### Cause
+
+`extract_source_location` runs once per emitted instruction and walked the whole
+`inlined_at` chain, calling `diloc_file` (→ `LLVM.scope` → `Metadata`
+construction, the top self-cost frame) on **every link**, while keeping only the
+outermost non-empty one. Cost per instruction is therefore O(inline depth) — and
+in inlined code the instruction count and the inline depth grow together. That
+is the quadratic.
+
+### The fix, and the trap in it
+
+Memoising on the instruction's own `DILocation` **does not work**, and measuring
+is the only reason that was caught: the exponent stayed at 2.4, because in
+inlined code every instruction has its own distinct leaf node, so the memo never
+hits. The chain's *parent* nodes are shared by every instruction inlined from the
+same call site.
+
+So the walk was re-expressed recursively (`diloc_outermost`) specifically so each
+LINK can be memoised, keyed on the metadata ref. That makes it O(1) amortised
+and the emitter linear.
+
+Equivalence is pinned rather than asserted: the original loop is retained as
+`extract_source_location_legacy` and `test/test_compile_overhead.jl` compares
+the two on every debug-carrying instruction of a real compile. SPIR-V is
+unchanged on all guard cases.
+
 ## 2. Axis B — how often that cost is paid at all. This is the real problem.
 
 Same GEMM, same source, same argument types:

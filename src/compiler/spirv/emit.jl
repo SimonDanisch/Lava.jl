@@ -198,6 +198,21 @@ mutable struct SPIRVEmitterState
     # for PSB pointers cannot be bridged with OpBitcast — we record the emitted pointee here
     # and pick the select result type from it rather than from the (possibly newer) PTM.
     value_emitted_pointee::Dict{LLVM.Value, LLVM.LLVMType}
+    # Memo for `extract_source_location`, keyed on the DILocation node.
+    #
+    # This is what stops the emitter being QUADRATIC in function size. Source
+    # locations are read once per emitted instruction, and resolving one walks
+    # the whole `inlined_at` chain — so cost per instruction is O(inline depth),
+    # and in inlined code the instruction count and the inline depth grow
+    # together. Measured on a scaling sweep: `emit_function!` had exponent 2.5
+    # against IR size, all of it inside the block-emission loop, with
+    # `diloc_file`'s `scope`/`Metadata` calls the top self-cost frame.
+    #
+    # Every instruction originating from one inlined source line shares one
+    # DILocation node, so memoising on it collapses thousands of identical chain
+    # walks into one each. Keyed by the metadata ref: two Julia objects can wrap
+    # the same underlying node.
+    source_loc_cache::Dict{LLVM.API.LLVMMetadataRef, Union{Nothing, Tuple{String, Int}}}
 end
 
 function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
@@ -238,6 +253,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{UInt32, LLVM.LLVMType}(),  # spirv_id_llvm_type
         Dict{UInt32, Tuple{UInt32, UInt32}}(),  # psb_access_chain
         Dict{LLVM.Value, LLVM.LLVMType}(),  # value_emitted_pointee
+        Dict{LLVM.API.LLVMMetadataRef, Union{Nothing, Tuple{String, Int}}}(),  # source_loc_cache
     )
 end
 
@@ -255,10 +271,94 @@ inlines everything and the leaf location is typically in Julia Base (e.g. pointe
 Returns `nothing` if no debug info is attached.
 """
 function extract_source_location(inst::LLVM.Instruction)
+    dbg = instruction_diloc(inst)
+    dbg === nothing && return nothing
+    return extract_source_location(dbg)
+end
+
+"""The `DILocation` attached to `inst`, or `nothing` when it carries no debug info."""
+function instruction_diloc(inst::LLVM.Instruction)
     md = LLVM.metadata(inst)
     haskey(md, LLVM.MD_dbg) || return nothing
     dbg = md[LLVM.MD_dbg]
     dbg isa LLVM.DILocation || return nothing
+    return dbg
+end
+
+"""
+    extract_source_location(state, inst) -> Union{Nothing, Tuple{String, Int}}
+
+Memoised on the instruction's `DILocation` — see `source_loc_cache`. Same result
+as the uncached method; this is the one the emitter must use on its hot path.
+"""
+function extract_source_location(state::SPIRVEmitterState, inst::LLVM.Instruction)
+    dbg = instruction_diloc(inst)
+    dbg === nothing && return nothing
+    return diloc_outermost(dbg, state.source_loc_cache)
+end
+
+extract_source_location(dbg::LLVM.DILocation) = diloc_outermost(dbg, nothing)
+
+"""
+    diloc_outermost(dbg, cache) -> Union{Nothing, Tuple{String, Int}}
+
+The outermost location in `dbg`'s inline chain that has a file — the user's
+kernel code rather than the inlined `Base` leaf.
+
+Recursive rather than a loop specifically so it can be memoised PER LINK, and
+that is the whole point. Caching only the instruction's own `DILocation` does
+nothing: in inlined code every instruction has its own leaf node, so the memo
+never hits (measured — the scaling exponent stayed at 2.4). The chain's *parent*
+nodes, on the other hand, are shared by every instruction inlined from the same
+call site, so caching each link makes the walk O(1) amortised and the emitter
+linear in function size.
+
+`cache === nothing` runs it uncached.
+"""
+function diloc_outermost(dbg::LLVM.DILocation, cache)
+    if cache !== nothing
+        hit = get(cache, dbg.ref, missing)
+        hit === missing || return hit
+    end
+    result = diloc_outermost_walk(dbg, cache)
+    cache === nothing || (cache[dbg.ref] = result)
+    return result
+end
+
+function diloc_outermost_walk(dbg::LLVM.DILocation, cache)
+    # Walking the inline chain: LLVM returns null at the end, and older LLVM.jl
+    # throws instead of returning `nothing`. That is the tolerated case;
+    # anything else is our bug.
+    parent = try
+        LLVM.inlined_at(dbg)
+    catch ex
+        ex isa Union{ArgumentError, MethodError, UndefRefError} || rethrow()
+        nothing
+    end
+    # An outer link wins over this one, exactly as the original loop's
+    # `best_file`/`best_line` overwrite did. A parent whose line is 0 ends the
+    # chain, so it and anything beyond it are not considered.
+    if parent isa LLVM.DILocation && LLVM.line(parent) != 0
+        outer = diloc_outermost(parent, cache)
+        outer === nothing || return outer
+    end
+    line = LLVM.line(dbg)
+    line == 0 && return nothing
+    file = diloc_file(dbg)
+    return isempty(file) ? nothing : (file, Int(line))
+end
+
+"""
+    extract_source_location_legacy(dbg) -> Union{Nothing, Tuple{String, Int}}
+
+The original iterative chain walk, kept ONLY as the equivalence oracle for
+`diloc_outermost` in `test/test_compile_overhead.jl` — nothing in `src/` calls
+it. `diloc_outermost` replaced it to make the walk memoisable per link (the
+emitter was quadratic in function size without that), and the rewrite is subtle
+enough that "produces the same answer as the loop it replaced" is worth pinning
+on real debug metadata rather than asserting by inspection.
+"""
+function extract_source_location_legacy(dbg::LLVM.DILocation)
     line = LLVM.line(dbg)
     line == 0 && return nothing
 
@@ -325,7 +425,7 @@ Record the source location of `inst` for SPIR-V result ID `spirv_id`.
 Called after every `fresh_id!` during instruction emission.
 """
 function record_source_location!(state::SPIRVEmitterState, spirv_id::UInt32, inst::LLVM.Instruction)
-    loc = extract_source_location(inst)
+    loc = extract_source_location(state, inst)
     loc === nothing && return
     state.mod.source_locations[spirv_id] = loc
 end
@@ -727,9 +827,12 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
     # Emit basic blocks in reverse post-order (dominators before dominated blocks).
     # After StructurizeCFG, LLVM block order may not respect dominance, causing
     # forward references in non-PHI instructions.
-    rpo_blocks = reverse_postorder(fn)
+    rpo_blocks = timed_phase("emitfn", "reverse_postorder") do
+        reverse_postorder(fn)
+    end
     entry_label_emitted = false
     entry_label_pos = 0
+    t_blocks = time()
     for bb in rpo_blocks
         if !entry_label_emitted
             entry_label_pos = length(state.mod.functions) + 1  # OpLabel will be emitted here
@@ -759,24 +862,31 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
                 # The entry block's OpLabel was emitted at `entry_label_pos`.
                 # OpLabel is 2 words. Insert preamble at entry_label_pos + 2.
                 insert_pos = entry_label_pos + 2
-                # Use a tail copy to avoid overlapping copyto! issues
-                tail_words = state.mod.functions[insert_pos:end]
-                n_preamble = length(preamble_words)
-                resize!(state.mod.functions, insert_pos - 1 + n_preamble + length(tail_words))
-                copyto!(state.mod.functions, insert_pos, preamble_words, 1, n_preamble)
-                copyto!(state.mod.functions, insert_pos + n_preamble, tail_words, 1, length(tail_words))
+                timed_phase("emitfn", "preamble insert (buffer copy)") do
+                    # Use a tail copy to avoid overlapping copyto! issues
+                    tail_words = state.mod.functions[insert_pos:end]
+                    n_preamble = length(preamble_words)
+                    resize!(state.mod.functions, insert_pos - 1 + n_preamble + length(tail_words))
+                    copyto!(state.mod.functions, insert_pos, preamble_words, 1, n_preamble)
+                    copyto!(state.mod.functions, insert_pos + n_preamble, tail_words, 1, length(tail_words))
+                end
             end
         end
         # Emit any trampolines targeting the NEXT block in RPO order.
         # Trampolines must appear before the blocks that reference them.
         emit_pending_trampolines!(state, bb, rpo_blocks)
     end
+    record_phase!("emitfn", "block emission loop", time() - t_blocks)
 
     # Emit any remaining trampolines not yet emitted
-    emit_remaining_trampolines!(state)
+    timed_phase("emitfn", "emit_remaining_trampolines!") do
+        emit_remaining_trampolines!(state)
+    end
 
     # Now resolve deferred PHIs — insert at correct block positions
-    resolve_deferred_phis!(state)
+    timed_phase("emitfn", "resolve_deferred_phis!") do
+        resolve_deferred_phis!(state)
+    end
 
     # OpFunctionEnd
     encode_instruction!(state.mod.functions, Op.OpFunctionEnd)
@@ -997,7 +1107,7 @@ function emit_instruction!(state::SPIRVEmitterState, inst::LLVM.Instruction)
     # decomposition). We map all of them to the same Julia source location.
     id_after = state.mod.next_id
     if id_after > id_before
-        loc = extract_source_location(inst)
+        loc = extract_source_location(state, inst)
         if loc !== nothing
             for id in id_before:(id_after - UInt32(1))
                 state.mod.source_locations[id] = loc

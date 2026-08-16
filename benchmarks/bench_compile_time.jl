@@ -167,7 +167,10 @@ function stage_timings(f)
     end
     stages = Dict(r.label => r.seconds for r in Lava.phase_table(; group = "stage"))
     subs = copy(Lava.phase_subprocesses())
-    return result, stages, subs
+    # Every group, not just "stage": the quadratic hunt needs the individual
+    # passes inside run_llvm_passes! and the emitter, which live in "pass"/"emit".
+    phases = Dict((r.group, r.label) => (r.seconds, r.calls) for r in Lava.phase_table())
+    return result, stages, subs, phases
 end
 
 """
@@ -203,9 +206,9 @@ function compile_one(TILE::Int, DEPTH::Int; workgroup_size = (64, 1, 1))
     # untimed compile with the dump switched on. Keeping the two apart is the
     # point: folding the dump into the timed compile would hide the very cost
     # that gating it removed.
-    local res, stages, subs
+    local res, stages, subs, phases
     t = @elapsed begin
-        res, stages, subs = stage_timings() do
+        res, stages, subs, phases = stage_timings() do
             Lava.lava_compile_gpu(probe_kernel, probe_tt(TILE, DEPTH); workgroup_size)
         end
     end
@@ -228,6 +231,7 @@ function compile_one(TILE::Int, DEPTH::Int; workgroup_size = (64, 1, 1))
             spirv_opt   = get_s("run_spirv_opt"),
             validate    = get_s("validate_spirv"),
             lava_owned  = lava_owned,
+            phases      = phases,
             subprocess_spawns = sum(st.calls for (t, st) in subs if !startswith(t, "write"); init = 0),
             subprocess_bytes  = sum(st.bytes for (_, st) in subs; init = 0))
 end
@@ -242,6 +246,20 @@ function depth_sweep(depths = (4, 8, 16, 32, 64, 128, 256); TILE::Int = 16)
     return [compile_one(TILE, d) for d in depths]
 end
 
+"""
+    quadratic_hunt(; depths = (16, 32, 64, 128, 256, 384, 512)) -> (rows, scaling)
+
+Sweep IR size and report how every compiler phase scales. Wider and denser than
+`depth_sweep` because a slope needs points; the large end is where a quadratic
+phase separates from a linear one.
+"""
+function quadratic_hunt(; depths = (16, 32, 64, 128, 256, 384, 512), TILE::Int = 16)
+    warmup!()
+    rows = [compile_one(TILE, d) for d in depths]
+    print_sweep(rows)
+    return (rows = rows, scaling = print_scaling(rows))
+end
+
 function print_sweep(rows)
     @printf("%-7s %9s %9s %9s %9s %9s %9s %9s %10s\n",
             "DEPTH", "IR kB", "SPIR-V", "total s", "gpucomp", "passes", "emit", "str(mod)", "lava-own")
@@ -252,6 +270,69 @@ function print_sweep(rows)
                 r.passes, r.emit, r.string_mod, r.lava_owned)
     end
     return nothing
+end
+
+# ── Quadratic hunt ───────────────────────────────────────────────────────────
+#
+# A sampling profiler cannot find this. `@profile` is SIGPROF-based and cannot
+# interrupt a long call into libLLVM, so every LLVM pass shows up as a handful
+# of samples regardless of how long it ran — measured here, a 74 s compile
+# produced a flat profile topping out at 24 samples. What DOES find it is
+# scaling: run the same source at several IR sizes and fit each phase's time
+# against size.
+#
+#   exponent ~1.0  linear, fine
+#   exponent ~1.5  superlinear, worth a look
+#   exponent ~2.0  quadratic — this is what we are hunting
+#
+# Fitted per phase LABEL (not per compile), so a pass that is fine on small IR
+# and explodes on large IR is separated from one that is merely slow.
+
+"""
+    phase_scaling(rows) -> Vector{NamedTuple}
+
+Least-squares slope of log(seconds) against log(IR bytes), per phase label.
+`rows` comes from a sweep that varies IR size for one source.
+"""
+function phase_scaling(rows)
+    # label => (log sizes, log times)
+    series = Dict{Tuple{String,String}, Tuple{Vector{Float64}, Vector{Float64}}}()
+    for r in rows
+        r.ir_bytes > 0 || continue
+        for ((g, l), (s, _n)) in r.phases
+            s > 1e-4 || continue          # below timer resolution: slope is noise
+            xs, ys = get!(series, (g, l), (Float64[], Float64[]))
+            push!(xs, log(r.ir_bytes))
+            push!(ys, log(s))
+        end
+    end
+    out = NamedTuple[]
+    for ((g, l), (xs, ys)) in series
+        length(xs) >= 4 || continue       # need enough points for a slope
+        x̄, ȳ = sum(xs) / length(xs), sum(ys) / length(ys)
+        sxx = sum((x - x̄)^2 for x in xs)
+        sxx > 0 || continue
+        slope = sum((xs[i] - x̄) * (ys[i] - ȳ) for i in eachindex(xs)) / sxx
+        push!(out, (group = g, label = l, exponent = slope,
+                    n = length(xs), t_max = exp(maximum(ys))))
+    end
+    sort!(out; by = r -> -r.exponent)
+    return out
+end
+
+function print_scaling(rows; min_exponent::Float64 = 0.0)
+    sc = phase_scaling(rows)
+    println()
+    println("── how each phase scales with IR size ", "─"^36)
+    @printf("%-52s %9s %7s %8s\n", "group/label", "exponent", "pts", "max s")
+    println("-"^80)
+    for r in sc
+        r.exponent >= min_exponent || continue
+        flag = r.exponent >= 1.8 ? "  <-- QUADRATIC" : (r.exponent >= 1.4 ? "  <-- superlinear" : "")
+        @printf("%-52s %9.2f %7d %8.3f%s\n",
+                string(r.group, "/", r.label), r.exponent, r.n, r.t_max, flag)
+    end
+    return sc
 end
 
 # ── The real large kernel: the staged GEMM, unmodified ───────────────────────

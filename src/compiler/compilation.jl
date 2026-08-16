@@ -834,6 +834,56 @@ end
 # ── RT Shader Compilation ──
 
 """
+One `lava_compile_rt_shader` invocation, recorded so it can be replayed.
+
+The argument tuple for a chit is built at trace time from the adapted launch
+arguments (`trace_rays_indirect!`), so there is no way to reconstruct it by
+hand — the only way to compile one chit in isolation was to render a whole
+scene, ~80 s per attempt. Capturing the job once turns that into an in-session
+call that can be repeated as often as a measurement needs.
+"""
+struct RTShaderJob
+    f::Any
+    tt::Type
+    stage::Symbol
+    payload_type::Symbol
+    push_constant_size::Int
+end
+
+function Base.show(io::IO, j::RTShaderJob)
+    print(io, "RTShaderJob(", j.stage, ", ", nameof(typeof(j.f)), ")")
+end
+
+"""
+Captured RT compile jobs. Recording is off unless `LAVA_CAPTURE_RT_JOBS=1`;
+see [`captured_rt_jobs`](@ref) and [`replay_rt_job`](@ref).
+"""
+const RT_JOB_CAPTURE = RTShaderJob[]
+
+"""
+    captured_rt_jobs() -> Vector{RTShaderJob}
+
+Every RT shader compile seen since the last [`clear_rt_job_capture!`](@ref),
+when `LAVA_CAPTURE_RT_JOBS=1` was set. Render a scene once to populate it, then
+replay individual shaders without rendering again.
+"""
+captured_rt_jobs() = RT_JOB_CAPTURE
+
+clear_rt_job_capture!() = (empty!(RT_JOB_CAPTURE); nothing)
+
+"""
+    replay_rt_job(job; validate=true) -> LavaRTShader
+
+Recompile a captured shader, from scratch. `frozen_rt_load` is disabled by
+default (`FROZEN_VERSION[] == ""`), so this genuinely re-runs the whole
+pipeline rather than returning a cached result.
+"""
+replay_rt_job(job::RTShaderJob; validate::Bool=true) =
+    lava_compile_rt_shader(job.f, job.tt; stage=job.stage,
+                           push_constant_size=job.push_constant_size,
+                           payload_type=job.payload_type, validate)
+
+"""
     LavaRTShader
 
 Compilation result for a ray tracing shader stage.
@@ -868,6 +918,12 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
                                  push_constant_size::Integer=8,
                                  payload_type::Symbol=:f32,
                                  validate::Bool=true)
+    # Before the frozen check, so a cache hit is still recorded — the capture is
+    # about learning WHICH shaders a scene compiles, not about timing them.
+    if get(ENV, "LAVA_CAPTURE_RT_JOBS", "") == "1"
+        push!(RT_JOB_CAPTURE, RTShaderJob(f, tt, stage, payload_type, Int(push_constant_size)))
+    end
+
     # Frozen SPIR-V, before any of the compiler runs.  Everything below —
     # GPUCompiler, the LLVM pass pipeline, structurize, the SPIR-V emitter — is
     # what an hw_accel=true scene pays in every session, and it dwarfs rendering
@@ -898,6 +954,12 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
         checkpoint("GPUCompiler.compile(:llvm)")
         entry_fn = meta.entry
         entry_name = LLVM.name(entry_fn)
+        # Tag this compile's phases with the shader they belong to. Without it
+        # every RT phase inherits whatever `lava_compile_gpu_from_job` set last,
+        # so a per-shader breakdown bills all five RT shaders to some unrelated
+        # compute kernel — which is exactly how a 5-line counter-reset kernel
+        # came out "costing" 21.6 s against its real 0.4 s.
+        phase_kernel!(entry_name)
 
         # BDA entry wrapper (same as compute — args via push constant buffer)
         push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
