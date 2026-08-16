@@ -174,6 +174,87 @@ Equivalence is pinned rather than asserted: the original loop is retained as
 the two on every debug-carrying instruction of a real compile. SPIR-V is
 unchanged on all guard cases.
 
+## 1c. Crown, and the CUDA comparison — read this before optimising anything
+
+The synthetic kernels above say Lava's own stages are cheap. Crown, the real
+workload, both confirms that and shows where the cost actually is.
+
+### Lava's compiler is not slow — it matches CUDA and renders 4.5x faster
+
+Same scene, same Julia source, `hw_accel=false` so both backends compile the
+identical compute kernels:
+
+| crown, SW path | Lava | CUDA.jl |
+|---|---:|---:|
+| compile (first call) | 146.2 s | 141.2 s |
+| frame, 4 spp | **961 ms** | 4283 ms |
+
+`GPUCompiler.compile(:llvm)` measured separately on identical source is within
+noise between the two (ratio 0.97–1.06 across a 5x IR range), and Lava's
+*backend-specific* work — LLVM passes, SPIR-V emitter, spirv-opt, spirv-val — is
+**5–12x FASTER** than CUDA's (NVPTX ISel + ptxas + nvlink). At DEPTH=480:
+Lava 0.027 s against CUDA 0.136 s.
+
+So there is nothing left to win in the compute path's own code. Whatever is slow
+is either GPUCompiler (shared with CUDA, not ours) or the HW-RT path.
+
+### It is the HW-RT path: 670 s vs 146 s for the same scene
+
+| crown | compile | frame |
+|---|---:|---:|
+| SW | 146.2 s | 961 ms @ 4 spp |
+| **HW-RT** | **670.1 s** | 2143 ms @ 16 spp |
+
+4.6x, and it is architectural rather than a defect. The SW path spreads shading
+over 54 smaller compute kernels; the HW path fuses routing + geometry + emitters
++ direct lighting + BSDF + RR into one monolithic chit and then compiles it once
+per concrete material type. Both choices were deliberate runtime wins (the
+inline-shadow fusion, the per-material queue split); crown is where the compile
+bill lands.
+
+### The 12 chits, and a measurement trap in reading them
+
+Crown's 50 named materials collapse to **12 concrete Julia types**, so the RT
+pipeline builds 12 chits at **~24.9 s each** — 298.6 s, 45% of the build.
+
+**`VPClosesthitTyped{T}` does not encode `T` in its mangled symbol.** All 12
+chits therefore share one kernel name, and any per-kernel view merges them. That
+is how "one shader costs 298 s" appeared in this investigation before the call
+counts were checked; it is twelve shaders. Phase totals are unaffected (they do
+not depend on attribution), per-kernel ones are.
+
+Cost scales with distinct material *types*, not scene size — adding a 13th type
+adds ~25 s. Of crown's 12, only ~5 are distinct material *classes*; the rest is
+constant-vs-texture parameter combinatorics (`Conductor` appears 3x) and wrapper
+types (4x `BumpMapped`, 2x `MixMaterial`). Removing that combinatorics is the
+open lever.
+
+### Where crown's HW 670 s goes
+
+| | s | share |
+|---|---:|---:|
+| the 12 chits combined | 298.6 | 45% |
+| uncaptured (driver SPIR-V→ISA, SBT build, the 2.1 s frame) | 137.5 | 21% |
+| `GPUCompiler.compile` | 107.2 | 16% |
+| `StructurizeCFG` (largest single Lava leaf) | 62.2 | 9% |
+| `validate_spirv` (subprocess) | 24.8 | 4% |
+
+Note the phase records NEST (`StructurizeCFG` ⊂ `run_structurize_cfg_pipeline!`
+⊂ `run_llvm_passes!`), so summing them double-counts. Use top-level stages only.
+
+### spirv-opt: 22 s on crown SW, for nothing measurable — but it is not the RT lever
+
+`SPIRV_OPT_ENABLED[] = false` on crown SW: compile 146.2 → 117.2 s, frame
+961 → 965 ms (noise), output bit-identical. **But `lava_compile_rt_shader` never
+calls `run_spirv_opt` at all** — only the compute path does — so this cannot
+help the 670 s HW case, and an apparent HW difference when toggling it was
+run-to-run variance (`GPUCompiler.compile` moved 107 → 143 s between two runs of
+the same code; this machine swings ~30% on crown-scale HW runs — take medians).
+
+Switching it off is gated on RADV: the `-O` pipeline's `--if-conversion` is
+documented in `run_spirv_opt` as fixing a class of RADV miscompile. Needs an AMD
+retest, not a vendor conditional.
+
 ## 2. Axis B — how often that cost is paid at all. This is the real problem.
 
 Same GEMM, same source, same argument types:
