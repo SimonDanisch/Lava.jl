@@ -84,3 +84,44 @@ from the Hikari side.
 Note this is NOT the same as the older AMD/RADV "HW RT volumetric trips
 DEVICE_LOST" note: this reproduces on NVIDIA RTX 4000 Ada, driver 595.80, with
 no device loss and no validation error.
+
+## SPIR-V evidence
+
+Both chit modules were dumped with `LAVA_SPIRV_DUMP_DIR` (note: RT shaders go
+through `dump_spirv_to_disk`, which reads that variable — `LAVA_DUMP_KERNELS`
+only captures the compute path) and disassembled.
+
+The Dielectric chit, broken vs working:
+
+| | broken (hoisted) | working (raw) |
+|---|---|---|
+| spirv-val (vulkan1.3) | passes | passes |
+| OpFunction   | 2    | 2    |
+| OpLabel      | 3883 | 4050 |
+| OpAtomicIAdd | 3    | 3    |
+| OpAtomicFAddEXT | 4 | 4    |
+| OpStore      | 582  | 582  |
+| OpRayQuery   | 9    | 9    |
+| function-scope OpVariable | 12 | 12 |
+
+So the module is valid, the three work-queue appends and the four film
+accumulations are all present, and the counts of stores, rayqueries and
+function-scope allocas are identical. The hoisted module is simply 167 basic
+blocks smaller, which is what hoisting is supposed to do. Nothing is missing —
+the appends must be executing with wrong values, which makes this a dataflow
+miscompile rather than a structural one.
+
+The one dataflow difference the bisection leaves standing: with hoisting, the
+BxDF carrier is built ONCE before the direct-lighting call and reused by BSDF
+sampling afterwards, so it must survive across the inline shadow trace's
+`OpRayQuery` loops. Without hoisting it is rebuilt after them. A value that
+lives across the rayquery traversal is the shape to suspect — the same region
+that produced the `emit_select!` PSB-pointer-mismatch bug when the shadow trace
+was first inlined.
+
+Against that: the const-field probe (step 5 above) never reads the carrier in
+the sampling path at all and still fails, so if the carrier is being clobbered,
+something else that is live across the same region is being clobbered with it.
+Resolving that needs the values themselves — on-kernel printf via
+`Lava.enable_debug_printf!()`, or a diagnostic write into `pixel_L` from the
+chit — not more static comparison.
