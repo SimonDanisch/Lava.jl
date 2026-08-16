@@ -206,6 +206,33 @@ lava_debug_dir() = get(ENV, "LAVA_DEBUG_DIR", tempdir())
 lava_debug_path(name::AbstractString) = joinpath(lava_debug_dir(), name)
 
 """
+    kernel_dump_dir() -> String
+
+Where `LAVA_DUMP_KERNELS=1` puts the per-compile `.ll` / `.spv` pair.
+`LAVA_DUMP_KERNELS_DIR` overrides the default `dev/tmp_kernels`.
+"""
+function kernel_dump_dir()
+    dir = get(ENV, "LAVA_DUMP_KERNELS_DIR", "")
+    isempty(dir) || return dir
+    return joinpath(@__DIR__, "..", "..", "..", "tmp_kernels")
+end
+
+"""
+    kernel_dump_wanted() -> Bool
+
+Whether anything downstream actually needs the post-pass IR string.
+
+This used to be unconditional, which cost a `string(mod)` plus two file writes
+on every single compile — measurable on small kernels and, per the RT path's own
+comment, seconds on a fat module. Enable with `LAVA_DUMP_KERNELS=1`, or
+implicitly by asking for one of the other debug artifacts that consumes the IR.
+"""
+kernel_dump_wanted() =
+    get(ENV, "LAVA_DUMP_KERNELS", "") == "1" ||
+    get(ENV, "LAVA_DEBUG_PASSES", "") == "1" ||
+    !isempty(get(ENV, "LAVA_SPIRV_DUMP_DIR", ""))
+
+"""
     dump_spirv_to_disk(spirv_bytes::Vector{UInt8}, post_pass_ir::AbstractString,
                        kernel_name::AbstractString;
                        entry_name::AbstractString="")
@@ -269,11 +296,26 @@ before trusting the result.
 """
 function lava_run(cmd::Base.AbstractCmd; timeout::Float64=180.0,
                   label::AbstractString="subprocess")
+    t_spawn = time()
     p = run(cmd; wait=false)
-    deadline = time() + timeout
+    deadline = t_spawn + timeout
+    # Escalating backoff, not a flat `sleep(0.005)`. On a small module these
+    # tools exit in ~1.3 ms, and a flat 5 ms poll rounded that to 6.4 ms —
+    # ~10 ms wasted per kernel across the spirv-opt and spirv-val spawns, which
+    # was the single largest Lava-owned cost for a small kernel. Spinning for
+    # the first few ms recovers all of it; backing off afterwards keeps a
+    # genuinely stuck child from pegging a core for the full timeout.
+    nap = 0.0
     while !process_exited(p) && time() < deadline
-        sleep(0.005)
+        if nap == 0.0
+            yield()
+            (time() - t_spawn) > 0.005 && (nap = 0.0005)
+        else
+            sleep(nap)
+            nap = min(nap * 2, 0.05)
+        end
     end
+    record_subprocess!(label, time() - t_spawn)
     if !process_exited(p)
         @warn "Lava: $label did not report exit within $(round(Int, timeout))s — killing"
         # The process may exit between the check and the signal, which is the
@@ -308,6 +350,7 @@ function run_spirv_opt(spirv_bytes::Vector{UInt8})
     out_path = tempname() * ".spv"
     try
         write(in_path, spirv_bytes)
+        record_subprocess!("write spirv-opt input", 0.0, length(spirv_bytes))
         p = lava_run(pipeline(`$spirv_opt --target-env=vulkan1.3 -O $in_path -o $out_path`;
                               stderr=devnull, stdout=devnull); label="spirv-opt")
         if process_exited(p) && p.exitcode == 0 && isfile(out_path)
@@ -350,12 +393,26 @@ struct LavaGPUKernel
     entry_name::String
     workgroup_size::NTuple{3,Int}
     push_info::PushConstantInfo
+    # Post-pass LLVM IR. EMPTY unless `kernel_dump_wanted()` — materialising it
+    # costs a `string(mod)` on every compile for something only a debugging
+    # session reads. Both caches have always stored `""` here too.
     ir::String
     enable_ray_query::Bool
+    # The mangled GPUCompiler entry symbol (e.g. `_Z15gpu_fcpd_scale_16Compiler…`).
+    # `entry_name` above is the Vulkan entry point and is always "main", so it
+    # cannot tell two kernels apart; this can, and the profiler needs that.
+    # Kept as its own field rather than recovered from `ir`, so that gating the
+    # IR does not blind the profiler — it is a few dozen bytes and, unlike the
+    # IR, it is session-portable, so the caches keep it.
+    source_name::String
 end
-# Backward-compat constructor for disk-cache deserialization (old entries lack the field).
+# Backward-compat constructors for cache deserialisation (older entries have
+# fewer fields). A stale entry that misses these raises MethodError/TypeError,
+# which `cache_io_error` classifies as "recompile", not as a failure.
 LavaGPUKernel(spirv_bytes, entry_name, workgroup_size, push_info, ir) =
-    LavaGPUKernel(spirv_bytes, entry_name, workgroup_size, push_info, ir, false)
+    LavaGPUKernel(spirv_bytes, entry_name, workgroup_size, push_info, ir, false, "")
+LavaGPUKernel(spirv_bytes, entry_name, workgroup_size, push_info, ir, enable_ray_query) =
+    LavaGPUKernel(spirv_bytes, entry_name, workgroup_size, push_info, ir, enable_ray_query, "")
 
 # ── Unified introspection result ──
 
@@ -665,51 +722,87 @@ function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob;
     GPUCompiler.JuliaContext() do ctx
         local mod, meta
         try
-            mod, meta = GPUCompiler.compile(:llvm, job)
+            mod, meta = timed_phase("stage", "GPUCompiler.compile(:llvm)") do
+                GPUCompiler.compile(:llvm, job)
+            end
         catch e
             wrap_gpu_compiler_error(e, job.source.def.sig, job.source.specTypes)
         end
         entry_fn = meta.entry
         entry_name = LLVM.name(entry_fn)
+        phase_kernel!(entry_name)
 
         # ── Stage 0: BDA entry wrapper ──
         # Must happen BEFORE passes — the wrapper becomes the new entry point
-        push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size)
+        push_info = timed_phase("stage", "wrap_entry_for_vulkan!") do
+            wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size)
+        end
         wrapper_name = push_info.wrapper_name
 
         # The wrapper function is now the entry point
         wrapper_fn = LLVM.functions(mod)[wrapper_name]
 
         # ── Stage 1: LLVM passes ──
-        run_llvm_passes!(mod, wrapper_fn; force_inline_all)
+        timed_phase("stage", "run_llvm_passes!") do
+            run_llvm_passes!(mod, wrapper_fn; force_inline_all)
+        end
 
-        # Save IR for debugging
-        ir = string(mod)
-        KERNEL_DEBUG_COUNTER[] += 1
-        _kidx = KERNEL_DEBUG_COUNTER[]
-        _dbg_dir = joinpath(@__DIR__, "..", "..", "..", "tmp_kernels")
-        mkpath(_dbg_dir)
-        write(joinpath(_dbg_dir, "kernel_$(_kidx)_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).ll"), ir)
+        # Materialising the post-pass IR is not free: `string(mod)` is
+        # proportional to module size and is "seconds by itself" on a fat module
+        # (the RT path says so in its own comment), and the two writes below put
+        # a `.ll` and a `.spv` on disk for EVERY kernel — `dev/tmp_kernels` had
+        # grown to 5675 files / 275 MB. None of it is read unless somebody is
+        # debugging a compile, so none of it runs unless asked.
+        #
+        # `ir` is only consumed by `dump_spirv_to_disk` below and by
+        # `kernel_source_name` in profiling.jl. Both the frozen cache and the
+        # disk cache already store `""` here, so a cached kernel has always had
+        # an empty `ir` — leaving it empty by default matches what the cached
+        # path has always done rather than degrading something that worked.
+        want_ir = kernel_dump_wanted()
+        ir = want_ir ? timed_phase("stage", "string(mod)") do
+            string(mod)
+        end : ""
+        if want_ir
+            timed_phase("stage", "write .ll") do
+                KERNEL_DEBUG_COUNTER[] += 1
+                _dbg_dir = kernel_dump_dir()
+                mkpath(_dbg_dir)
+                write(joinpath(_dbg_dir, "kernel_$(KERNEL_DEBUG_COUNTER[])_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).ll"), ir)
+                record_subprocess!("write tmp_kernels/.ll", 0.0, sizeof(ir))
+            end
+        end
 
         # ── Stage 2: Custom SPIR-V emission ──
-        spirv_bytes, source_map = emit_spirv_from_llvm(mod, wrapper_name, workgroup_size;
-                                                        enable_ray_query)
+        spirv_bytes, source_map = timed_phase("stage", "emit_spirv_from_llvm") do
+            emit_spirv_from_llvm(mod, wrapper_name, workgroup_size; enable_ray_query)
+        end
 
         # ── Stage 2.5: SPIR-V optimization (optional, helps NVIDIA) ──
         if SPIRV_OPT_ENABLED[]
-            spirv_bytes = run_spirv_opt(spirv_bytes)
+            spirv_bytes = timed_phase("stage", "run_spirv_opt") do
+                run_spirv_opt(spirv_bytes)
+            end
         end
 
-        # Save SPIR-V for debugging
-        write(joinpath(_dbg_dir, "kernel_$(_kidx)_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).spv"), spirv_bytes)
+        # Save SPIR-V for debugging (same gate as the .ll above)
+        if want_ir
+            timed_phase("stage", "write .spv") do
+                write(joinpath(kernel_dump_dir(), "kernel_$(KERNEL_DEBUG_COUNTER[])_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).spv"), spirv_bytes)
+                record_subprocess!("write tmp_kernels/.spv", 0.0, length(spirv_bytes))
+            end
+        end
         dump_spirv_to_disk(spirv_bytes, ir, wrapper_name; entry_name)
 
         # ── Stage 3: Validation ──
         if validate
-            validate_spirv(spirv_bytes, ir, source_map)
+            timed_phase("stage", "validate_spirv") do
+                validate_spirv(spirv_bytes, ir, source_map)
+            end
         end
 
-        return LavaGPUKernel(spirv_bytes, wrapper_name, workgroup_size, push_info, ir, enable_ray_query)
+        return LavaGPUKernel(spirv_bytes, wrapper_name, workgroup_size, push_info, ir,
+                             enable_ray_query, entry_name)
     end
 end
 
@@ -1867,8 +1960,11 @@ entry point setup, and serialization.
 function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
                                 workgroup_size::NTuple{3,Int};
                                 enable_ray_query::Bool=false)
+    emit_check = PhaseTimer("    [emit] "; group="emit")
+
     # Build pointee type map (opaque pointer → typed pointer recovery)
     ptm = build_pointee_type_map(llvm_mod)
+    emit_check("build_pointee_type_map")
 
     # Create SPIR-V module and type context
     spirv_mod = SPIRVModule()
@@ -1885,9 +1981,11 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
 
     # Build struct pointer member type map (resolves ptr members in structs)
     build_struct_ptr_member_types!(type_ctx, llvm_mod)
+    emit_check("build_struct_ptr_member_types!")
 
     # Pre-collect all types used in the module
     collect_module_types!(type_ctx, llvm_mod)
+    emit_check("collect_module_types!")
 
     # Create emitter state
     state = SPIRVEmitterState(spirv_mod, type_ctx)
@@ -1909,9 +2007,11 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
     end
 
     collect_inline_callbacks!(state, llvm_mod)
+    emit_check("collect_inline_callbacks!")
 
     # Emit global variables (if any — needed for builtin inputs, etc.)
     interface_ids = emit_globals!(state, llvm_mod)
+    emit_check("emit_globals!")
 
     # For ray-query compute kernels: emit the TLAS descriptor variable and
     # merge its id into the interface list for OpEntryPoint.
@@ -1934,11 +2034,13 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
                 error("Mutual recursion is not supported in SPIR-V multi-OpFunction emission: cycle through $names")
             end
         end
+        emit_check("collect_reachable_callees+SCC")
         for fn in reachable
             fn === entry_fn && continue
             isempty(LLVM.blocks(fn)) && continue
             emit_function!(state, fn; is_entry=false)
         end
+        emit_check("emit_function! (helpers)")
     end
 
     # Check if entry function has parameters
@@ -1948,11 +2050,13 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
     if n_params == 0
         # No parameters — emit directly as entry point
         func_id = emit_function!(state, entry_fn; is_entry=true)
+        emit_check("emit_function! (entry)")
     else
         # Entry functions in Vulkan SPIR-V cannot have parameters.
         # Create a parameterless wrapper that calls the kernel.
         # For now, pass undef values for parameters (real BDA wrapper comes later).
         func_id = emit_entry_wrapper!(state, entry_fn)
+        emit_check("emit_entry_wrapper!")
     end
 
     # Setup entry point and execution modes
@@ -1965,9 +2069,12 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
 
     # Add Block + MemberOffset decorations for PSB-pointed struct types
     decorate_psb_struct_layouts!(type_ctx, llvm_mod)
+    emit_check("decorate_psb_struct_layouts!")
 
     # Serialize to binary, return bytes + source map
-    return serialize(spirv_mod), spirv_mod.source_locations
+    bytes = serialize(spirv_mod)
+    emit_check("serialize")
+    return bytes, spirv_mod.source_locations
 end
 
 """
@@ -2493,6 +2600,7 @@ function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
 
     # Write SPIR-V binary so spirv-val can read it
     write(spv_path, spirv_bytes)
+    record_subprocess!("write lava_last.spv", 0.0, length(spirv_bytes))
 
     # Validate — capture stderr via temp file (spirv-val writes errors to stderr)
     val_err_file = tempname()

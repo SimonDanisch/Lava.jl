@@ -323,7 +323,7 @@ function frozen_store(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workg
     # SPIR-V and what it takes to build a pipeline from it, nothing else.
     entry = LavaGPUKernel(compiled.spirv_bytes, compiled.entry_name,
                           compiled.workgroup_size, compiled.push_info, "",
-                          compiled.enable_ray_query)
+                          compiled.enable_ray_query, compiled.source_name)
     try
         tmppath, io = mktemp(dir; cleanup = false)
         Serialization.serialize(io, entry)

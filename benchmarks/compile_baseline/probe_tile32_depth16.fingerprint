@@ -1,0 +1,231 @@
+%__spirv_BuiltInGlobalInvocationId = OpVariable %_ptr_Input_v3uint Input
+%__spirv_BuiltInLocalInvocationId = OpVariable %_ptr_Input_v3uint Input
+%_arr_float_uint_32 = OpTypeArray %float %uint_32
+%_ptr_Input_v3uint = OpTypePointer Input %v3uint
+%_ptr_PhysicalStorageBuffer__ptr_PhysicalStorageBuffer_float = OpTypePointer PhysicalStorageBuffer %_ptr_PhysicalStorageBuffer_float
+%_ptr_PhysicalStorageBuffer_float = OpTypePointer PhysicalStorageBuffer %float
+%_ptr_PhysicalStorageBuffer_ulong = OpTypePointer PhysicalStorageBuffer %ulong
+%_ptr_PushConstant__struct_14 = OpTypePointer PushConstant %_struct_14
+%_ptr_PushConstant_ulong = OpTypePointer PushConstant %ulong
+%_ptr_Workgroup__arr_float_uint_32 = OpTypePointer Workgroup %_arr_float_uint_32
+%_ptr_Workgroup__struct_19 = OpTypePointer Workgroup %_struct_19
+%_ptr_Workgroup_float = OpTypePointer Workgroup %float
+%_struct_14 = OpTypeStruct %ulong
+%_struct_19 = OpTypeStruct %_arr_float_uint_32
+%bool = OpTypeBool
+%false = OpConstantFalse %bool
+%float = OpTypeFloat 32
+%float_0 = OpConstant %float 0
+%float_0_5 = OpConstant %float 0.5
+%float_1_00010002 = OpConstant %float 1.00010002
+%float_1_00020003 = OpConstant %float 1.00020003
+%float_1_00030005 = OpConstant %float 1.00030005
+%float_1_00040007 = OpConstant %float 1.00040007
+%float_1_00050008 = OpConstant %float 1.00050008
+%float_1_0006001 = OpConstant %float 1.0006001
+%float_1_00070024 = OpConstant %float 1.00070024
+%float_1_00080037 = OpConstant %float 1.00080037
+%float_1_00090003 = OpConstant %float 1.00090003
+%float_1_00090051 = OpConstant %float 1.00090051
+%float_1_00100064 = OpConstant %float 1.00100064
+%float_1_00110078 = OpConstant %float 1.00110078
+%float_1_00120091 = OpConstant %float 1.00120091
+%float_1_00130105 = OpConstant %float 1.00130105
+%float_1_00140119 = OpConstant %float 1.00140119
+%float_1_00150132 = OpConstant %float 1.00150132
+%lava_shared_probe_tile = OpVariable %_ptr_Workgroup__struct_19 Workgroup %
+%main = OpFunction %void None %
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_1 = OpConstant %uint 1
+%uint_10 = OpConstant %uint 10
+%uint_11 = OpConstant %uint 11
+%uint_12 = OpConstant %uint 12
+%uint_13 = OpConstant %uint 13
+%uint_14 = OpConstant %uint 14
+%uint_15 = OpConstant %uint 15
+%uint_16 = OpConstant %uint 16
+%uint_2 = OpConstant %uint 2
+%uint_24840 = OpConstant %uint 24840
+%uint_3 = OpConstant %uint 3
+%uint_32 = OpConstant %uint 32
+%uint_4 = OpConstant %uint 4
+%uint_4294967295 = OpConstant %uint 4294967295
+%uint_5 = OpConstant %uint 5
+%uint_6 = OpConstant %uint 6
+%uint_7 = OpConstant %uint 7
+%uint_8 = OpConstant %uint 8
+%uint_9 = OpConstant %uint 9
+%ulong = OpTypeInt 64 0
+%ulong_0 = OpConstant %ulong 0
+%ulong_1 = OpConstant %ulong 1
+%ulong_16 = OpConstant %ulong 16
+%ulong_18446744073709551615 = OpConstant %ulong 18446744073709551615
+%ulong_24 = OpConstant %ulong 24
+%ulong_4 = OpConstant %ulong 4
+%ulong_8 = OpConstant %ulong 8
+%v3uint = OpTypeVector %uint 3
+%void = OpTypeVoid
+; Bound: 201
+; Generator: Khronos; 0
+; SPIR-V
+; Schema: 0
+; Version: 1.4
+OpAccessChain %_ptr_PushConstant_ulong % %uint_0
+OpAccessChain %_ptr_Workgroup__arr_float_uint_32 %lava_shared_probe_tile %uint_0
+OpAccessChain %_ptr_Workgroup__arr_float_uint_32 %lava_shared_probe_tile %uint_0
+OpAccessChain %_ptr_Workgroup__arr_float_uint_32 %lava_shared_probe_tile %uint_0
+OpAccessChain %_ptr_Workgroup_float %lava_shared_probe_tile %uint_0 %
+OpAccessChain %_ptr_Workgroup_float %lava_shared_probe_tile %uint_0 %
+OpBranch %
+OpBranchConditional % % %
+OpCapability Int64
+OpCapability PhysicalStorageBufferAddresses
+OpCapability Shader
+OpCapability VariablePointers
+OpCapability VulkanMemoryModel
+OpCapability WorkgroupMemoryExplicitLayoutKHR
+OpCompositeExtract %uint % 0
+OpCompositeExtract %uint % 0
+OpConstantNull %_struct_19
+OpControlBarrier %uint_2 %uint_2 %uint_24840
+OpConvertPtrToU %ulong %
+OpConvertSToF %float %
+OpConvertUToPtr %_ptr_PhysicalStorageBuffer__ptr_PhysicalStorageBuffer_float %
+OpConvertUToPtr %_ptr_PhysicalStorageBuffer__ptr_PhysicalStorageBuffer_float %
+OpConvertUToPtr %_ptr_PhysicalStorageBuffer__ptr_PhysicalStorageBuffer_float %
+OpConvertUToPtr %_ptr_PhysicalStorageBuffer_float %
+OpConvertUToPtr %_ptr_PhysicalStorageBuffer_float %
+OpConvertUToPtr %_ptr_PhysicalStorageBuffer_ulong %
+OpConvertUToPtr %_ptr_PhysicalStorageBuffer_ulong %
+OpConvertUToPtr %_ptr_PhysicalStorageBuffer_ulong %
+OpConvertUToPtr %_ptr_PhysicalStorageBuffer_ulong %
+OpDecorate %__spirv_BuiltInGlobalInvocationId BuiltIn GlobalInvocationId
+OpDecorate %__spirv_BuiltInLocalInvocationId BuiltIn LocalInvocationId
+OpDecorate %_arr_float_uint_32 ArrayStride 4
+OpDecorate %_ptr_PhysicalStorageBuffer_float ArrayStride 4
+OpDecorate %_struct_14 Block
+OpDecorate %_struct_19 Block
+OpEntryPoint GLCompute %main "main" %__spirv_BuiltInLocalInvocationId %__spirv_BuiltInGlobalInvocationId % %lava_shared_probe_tile
+OpExecutionMode %main LocalSize 64 1 1
+OpExtInst %float % Fma % % %
+OpExtInst %float % Fma % %float_1_00090003 %
+OpExtInstImport "GLSL.std.450"
+OpExtension "SPV_KHR_physical_storage_buffer"
+OpExtension "SPV_KHR_variable_pointers"
+OpExtension "SPV_KHR_vulkan_memory_model"
+OpExtension "SPV_KHR_workgroup_memory_explicit_layout"
+OpFAdd %float % %
+OpFAdd %float % %
+OpFMul %float % %
+OpFMul %float % %
+OpFMul %float % %float_0_5
+OpFMul %float % %float_1_00010002
+OpFMul %float % %float_1_00020003
+OpFMul %float % %float_1_00030005
+OpFMul %float % %float_1_00040007
+OpFMul %float % %float_1_00050008
+OpFMul %float % %float_1_0006001
+OpFMul %float % %float_1_00070024
+OpFMul %float % %float_1_00080037
+OpFMul %float % %float_1_00090051
+OpFMul %float % %float_1_00100064
+OpFMul %float % %float_1_00110078
+OpFMul %float % %float_1_00120091
+OpFMul %float % %float_1_00130105
+OpFMul %float % %float_1_00140119
+OpFMul %float % %float_1_00150132
+OpFunction %float DontInline %
+OpFunction %float DontInline %
+OpFunctionCall %float % % %
+OpFunctionCall %float % % % % %
+OpFunctionCall %float % % % % %
+OpFunctionCall %float % % % % %
+OpFunctionCall %float % % % % %
+OpFunctionCall %float % % % % %
+OpFunctionCall %float % % % % %
+OpFunctionCall %float % % % % %
+OpFunctionCall %float % % % % %
+OpFunctionCall %float % % % % %
+OpFunctionCall %float % % % % %
+OpFunctionCall %float % % % % %
+OpFunctionCall %float % % % % %
+OpFunctionCall %float % % % % %
+OpFunctionCall %float % % % % %
+OpFunctionCall %float % % % % %
+OpFunctionCall %float % % % % %
+OpFunctionEnd
+OpFunctionEnd
+OpFunctionEnd
+OpFunctionParameter %float
+OpFunctionParameter %float
+OpFunctionParameter %float
+OpFunctionParameter %float
+OpFunctionParameter %float
+OpFunctionParameter %uint
+OpIAdd %uint % %uint_1
+OpIAdd %uint % %uint_10
+OpIAdd %uint % %uint_11
+OpIAdd %uint % %uint_12
+OpIAdd %uint % %uint_13
+OpIAdd %uint % %uint_14
+OpIAdd %uint % %uint_15
+OpIAdd %uint % %uint_2
+OpIAdd %uint % %uint_3
+OpIAdd %uint % %uint_4
+OpIAdd %uint % %uint_4294967295
+OpIAdd %uint % %uint_5
+OpIAdd %uint % %uint_6
+OpIAdd %uint % %uint_7
+OpIAdd %uint % %uint_8
+OpIAdd %uint % %uint_9
+OpIAdd %ulong % %ulong_16
+OpIAdd %ulong % %ulong_18446744073709551615
+OpIAdd %ulong % %ulong_18446744073709551615
+OpIAdd %ulong % %ulong_24
+OpIAdd %ulong % %ulong_4
+OpIAdd %ulong % %ulong_8
+OpIEqual %bool % %uint_32
+OpLabel
+OpLabel
+OpLabel
+OpLabel
+OpLabel
+OpLoad %_ptr_PhysicalStorageBuffer_float % Aligned 8
+OpLoad %_ptr_PhysicalStorageBuffer_float % Aligned 8
+OpLoad %_ptr_PhysicalStorageBuffer_float % Aligned 8
+OpLoad %float % Aligned 4
+OpLoad %float % Aligned 4
+OpLoad %float % Aligned 4
+OpLoad %float % Aligned 4
+OpLoad %float % Aligned|NonPrivatePointer 4
+OpLoad %ulong %
+OpLoad %ulong % Aligned 8
+OpLoad %ulong % Aligned 8
+OpLoad %ulong % Aligned 8
+OpLoad %ulong % Aligned 8
+OpLoad %v3uint %__spirv_BuiltInGlobalInvocationId
+OpLoad %v3uint %__spirv_BuiltInLocalInvocationId
+OpLoopMerge % % None
+OpMemberDecorate %_struct_14 0 Offset 0
+OpMemberDecorate %_struct_19 0 Offset 0
+OpMemoryModel PhysicalStorageBuffer64 Vulkan
+OpPhi %float %float_0 % % %
+OpPhi %uint %uint_1 % % %
+OpPtrAccessChain %_ptr_PhysicalStorageBuffer_float % %
+OpPtrAccessChain %_ptr_PhysicalStorageBuffer_float % %
+OpPtrAccessChain %_ptr_PhysicalStorageBuffer_float % %
+OpReturn
+OpReturnValue %
+OpReturnValue %
+OpSConvert %ulong %
+OpStore % % Aligned 4
+OpStore % % Aligned|NonPrivatePointer 4
+OpTypeFunction %float %float %float
+OpTypeFunction %float %float %float %float %uint
+OpTypeFunction %void
+OpUConvert %uint %
+OpUConvert %uint %
+OpUConvert %ulong %
+OpUConvert %ulong %
+OpVariable %_ptr_PushConstant__struct_14 PushConstant

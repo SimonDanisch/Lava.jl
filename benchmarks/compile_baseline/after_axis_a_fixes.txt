@@ -1,0 +1,27 @@
+julia          = 1.12.6
+Lava           = 0.1.0
+GPUCompiler    = 2.1.1
+LLVM           = 9.12.0
+KernelAbstractions= 0.9.42
+GPUArrays      = 11.5.10
+device         = NVIDIA RTX 4000 Ada Generation
+
+# Axis A after the two fixed-overhead fixes (TILE=16).
+# Compare against depth_sweep.txt, recorded on the same machine before them.
+# IR kB and SPIR-V are IDENTICAL to the baseline in every row => codegen unchanged.
+#   fix 1: lava_run flat sleep(0.005) -> adaptive backoff
+#   fix 2: string(mod) + .ll/.spv writes gated behind LAVA_DUMP_KERNELS
+
+DEPTH       IR kB    SPIR-V   total s   gpucomp    passes      emit  str(mod)   lava-own
+----------------------------------------------------------------------------------------
+4            27.6      3124     0.016     0.009     0.001     0.001    0.0000      0.006
+8            29.4      3540     0.017     0.010     0.001     0.001    0.0000      0.006
+16           33.0      4356     0.019     0.012     0.001     0.001    0.0000      0.007
+32           40.4      6020     0.027     0.018     0.002     0.001    0.0000      0.008
+64           55.2      9348     0.050     0.036     0.002     0.006    0.0000      0.014
+128          84.9     16004     0.137     0.115     0.003     0.009    0.0000      0.022
+256         144.9     29316     0.425     0.381     0.006     0.026    0.0000      0.044
+
+lava-own, before -> after:  DEPTH=4  0.016 -> 0.006 s   (2.7x)
+                            DEPTH=256 0.063 -> 0.044 s  (1.4x)
+bytes written per compile (small kernel): 37570 -> 6232

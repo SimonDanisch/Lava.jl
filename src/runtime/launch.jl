@@ -371,7 +371,8 @@ function lava_disk_cache_store(source::Core.MethodInstance, workgroup_size, kern
         kernel = LavaGPUKernel(
             kernel.spirv_bytes, kernel.entry_name, kernel.workgroup_size,
             kernel.push_info, "",  # don't cache the LLVM IR string (large, session-specific)
-            kernel.enable_ray_query
+            kernel.enable_ray_query,
+            kernel.source_name     # …but DO keep it: small, portable, and the profiler needs it
         ),
     )
     try

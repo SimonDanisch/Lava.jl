@@ -112,11 +112,27 @@ Returns `""` rather than throwing when neither matches: a profiler must not be
 the thing that fails.
 """
 function kernel_source_name(compiled)
-    ir = compiled.ir
+    # `source_name` (the mangled entry symbol) first: it is always present on a
+    # freshly compiled kernel and survives both caches, whereas `ir` is empty
+    # unless `kernel_dump_wanted()`. The same two patterns match either input —
+    # the mangled symbol is exactly what these used to find inside the IR.
+    ir = compiled.source_name
+    isempty(ir) && (ir = compiled.ir)
     isempty(ir) && return ""
     m = match(r"_Z\d+([A-Za-z0-9_]+?)_?\d*CompilerMetadata", ir)
     m === nothing && (m = match(r"\bjulia_([A-Za-z0-9_]+)", ir))
-    m === nothing && return ""
+    if m === nothing
+        # A plain (non-KA) device function has no `CompilerMetadata` argument
+        # and, once `ir` is gated off, no `julia_` symbol to fall back on
+        # either — just the Itanium mangling `_Z<length><name><args…>`. Take
+        # exactly `<length>` characters so argument mangling is not swallowed.
+        mz = match(r"^_Z(\d+)(.+)$", ir)
+        mz === nothing && return ""
+        n = parse(Int, mz.captures[1])
+        rest = mz.captures[2]
+        length(rest) < n && return ""
+        return replace(rest[1:n], r"_\d+$" => "")
+    end
     # Trailing specialisation numbers differ between sessions; the name does not.
     return replace(m.captures[1], r"_\d+$" => "")
 end

@@ -484,6 +484,10 @@ end
     # ── Tier 3h: Disk Cache & Two-Tier Caching ──
     @testset "Tier 3h: Kernel Cache" begin
         include(joinpath(@__DIR__, "test_disk_cache.jl"))
+        # Fixed per-kernel compile overhead (ungated IR dump, subprocess poll
+        # quantisation). Lives here because it is about what a compile costs
+        # when the cache does NOT save you.
+        include(joinpath(@__DIR__, "test_compile_overhead.jl"))
     end
 
     # ── Tier 3g: Graphics Pipeline ──

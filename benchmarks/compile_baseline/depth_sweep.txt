@@ -1,0 +1,19 @@
+julia          = 1.12.6
+Lava           = 0.1.0
+GPUCompiler    = 2.1.1
+LLVM           = 9.12.0
+KernelAbstractions= 0.9.42
+GPUArrays      = 11.5.10
+device         = NVIDIA RTX 4000 Ada Generation
+
+# Axis A: per-kernel compile speed vs IR size (TILE=16)
+# gpucomp = GPUCompiler.compile(:llvm); lava-own = everything Lava controls
+DEPTH       IR kB    SPIR-V   total s   gpucomp    passes      emit  str(mod)   lava-own
+----------------------------------------------------------------------------------------
+4            27.6      3124     0.025     0.009     0.001     0.000    0.0003      0.016
+8            29.4      3540     0.024     0.010     0.001     0.000    0.0003      0.015
+16           33.0      4356     0.027     0.012     0.001     0.001    0.0003      0.015
+32           40.4      6020     0.034     0.018     0.002     0.001    0.0004      0.016
+64           55.2      9348     0.068     0.049     0.003     0.003    0.0006      0.019
+128          84.9     16004     0.137     0.102     0.003     0.017    0.0009      0.034
+256         144.9     29316     0.440     0.377     0.005     0.037    0.0016      0.063
