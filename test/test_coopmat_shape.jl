@@ -26,7 +26,7 @@ using Test, Lava
         # Every reported (extent, operand type) pair must be found...
         for s in shapes
             s.scope == Lava.VK_SCOPE_SUBGROUP || continue
-            T = findfirst(t -> Lava._vk_component_type(t) == s.ab_type,
+            T = findfirst(t -> Lava.vkcomponenttype(t) == s.ab_type,
                           (Float16, Float32, Float64,
                            Int8, Int16, Int32, Int64,
                            UInt8, UInt16, UInt32, UInt64))
@@ -40,7 +40,7 @@ using Test, Lava
         # however many shapes share its extents.
         reported = Set(s.ab_type for s in shapes)
         for ty in (Float16, Float32, Float64, Int8, UInt8)
-            Lava._vk_component_type(ty) in reported && continue
+            Lava.vkcomponenttype(ty) in reported && continue
             for s in shapes
                 @test !Lava.coopmat_shape(ctx, ty, s.M, s.N, s.K)
             end
@@ -51,6 +51,6 @@ using Test, Lava
 
         # A type with no VkComponentTypeKHR mapping is not a shape.
         @test !Lava.coopmat_shape(ctx, ComplexF32, 16, 16, 16)
-        @test Lava._vk_component_type(ComplexF32) === nothing
+        @test Lava.vkcomponenttype(ComplexF32) === nothing
     end
 end

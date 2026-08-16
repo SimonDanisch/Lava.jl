@@ -25,21 +25,16 @@
 # fixes it when the type is created, so it cannot be inferred afterwards -- the
 # same way `Adjoint` and `Transpose` are part of the type in Base.
 
-"""Which operand position a matrix occupies in `A*B + C`."""
-abstract type MatrixUse end
-struct MatrixA <: MatrixUse end
-struct MatrixB <: MatrixUse end
-struct Accumulator <: MatrixUse end
-
-"""
-Whose registers hold the value: one subgroup's, or the whole workgroup's.
-
-Part of the type for the same reason `MatrixUse` is — SPIR-V fixes it when the
-type is created, and it decides how many components each invocation holds.
-"""
-abstract type MatrixScope end
-struct SubgroupScope <: MatrixScope end
-struct WorkgroupScope <: MatrixScope end
+# `MatrixUse` (MatrixA/MatrixB/Accumulator) and `MatrixScope`
+# (SubgroupScope/WorkgroupScope) are defined in `KernelInterfaces` and imported
+# at the top of `Lava.jl`. They live there because Mantle has to name the same
+# concepts to record what a device supports, and Mantle cannot depend on Lava —
+# it weak-depends on it for `MantleLavaExt`, so an edge back would close a cycle.
+#
+# They are part of the type here for the reason they were when they lived in this
+# file: SPIR-V fixes both when the type is created, so neither can be inferred
+# afterwards, the same way `Adjoint` is part of a type in Base. `MatrixScope`
+# additionally decides how many components each invocation holds.
 
 """
     CoopMatrix{T,M,N,Use,Scope}
@@ -128,20 +123,50 @@ set of `(M, N, K, dtype)` combinations, so a kernel picks one of those or uses
 # VkComponentTypeKHR. Only the types a cooperative-matrix operand can currently
 # have in Lava; an unmapped type reports "no such shape" rather than matching one
 # by accident.
-_vk_component_type(::Type{Float16}) = UInt32(0)
-_vk_component_type(::Type{Float32}) = UInt32(1)
-_vk_component_type(::Type{Float64}) = UInt32(2)
-_vk_component_type(::Type{Int8})    = UInt32(3)
-_vk_component_type(::Type{Int16})   = UInt32(4)
-_vk_component_type(::Type{Int32})   = UInt32(5)
-_vk_component_type(::Type{Int64})   = UInt32(6)
-_vk_component_type(::Type{UInt8})   = UInt32(7)
-_vk_component_type(::Type{UInt16})  = UInt32(8)
-_vk_component_type(::Type{UInt32})  = UInt32(9)
-_vk_component_type(::Type{UInt64})  = UInt32(10)
-_vk_component_type(::Type) = nothing
+#
+# The table is written once, in one direction, and the inverse is derived from it
+# — two hand-written tables are two chances for one entry to disagree, and the
+# symptom would be a shape silently reported as a type it is not.
+const VK_COMPONENT_TYPES = (Float16, Float32, Float64, Int8, Int16, Int32, Int64,
+                            UInt8, UInt16, UInt32, UInt64)
+
+vkcomponenttype(::Type{T}) where {T} =
+    (i = findfirst(==(T), VK_COMPONENT_TYPES); i === nothing ? nothing : UInt32(i - 1))
+
+"The Julia type a `VkComponentTypeKHR` code names, or `nothing` if Lava has none."
+juliacomponenttype(code::Integer) =
+    (1 <= code + 1 <= length(VK_COMPONENT_TYPES)) ? VK_COMPONENT_TYPES[code+1] : nothing
 
 const VK_SCOPE_SUBGROUP = UInt32(3)
+const VK_SCOPE_WORKGROUP = UInt32(2)
+
+"""
+    matrixshapes(ctx) -> Vector{MatrixShape}
+
+The driver's cooperative-matrix table as [`MatrixShape`](@ref)s.
+
+Lava has always held this — `ctx.coopmat_shapes`, queried at device creation —
+and then thrown all but a boolean away: `caps` reported a single hardcoded tile.
+This is the same data in the vocabulary Mantle can also name, so a kernel picks
+its tile from what the device said rather than from a constant that happened to
+be right on the card it was written on.
+
+Entries whose component type Lava does not map are dropped rather than guessed.
+"""
+function matrixshapes(ctx::VkContext)
+    out = MatrixShape[]
+    ctx.coopmat_available || return out
+    for s in ctx.coopmat_shapes
+        ab = juliacomponenttype(s.ab_type)
+        acc = juliacomponenttype(s.c_type)
+        (ab === nothing || acc === nothing) && continue
+        scope = s.scope == VK_SCOPE_SUBGROUP  ? SubgroupScope()  :
+                s.scope == VK_SCOPE_WORKGROUP ? WorkgroupScope() : nothing
+        scope === nothing && continue
+        push!(out, MatrixShape(ab, acc, s.M, s.N, s.K, scope))
+    end
+    return out
+end
 
 # `T` is the A/B operand type, and it used to be accepted and then ignored: the
 # match was on M, N and K alone. A device can report the same extents for
@@ -157,7 +182,7 @@ const VK_SCOPE_SUBGROUP = UInt32(3)
 function coopmat_shape(ctx::VkContext, ::Type{T}, M::Integer, N::Integer,
                        K::Integer) where {T}
     ctx.coopmat_available || return false
-    want = _vk_component_type(T)
+    want = vkcomponenttype(T)
     want === nothing && return false
     any(s -> s.M == M && s.N == N && s.K == K &&
              s.ab_type == want && s.scope == VK_SCOPE_SUBGROUP,

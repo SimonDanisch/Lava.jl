@@ -642,15 +642,23 @@ function caps(ctx::VkContext = vk_context())
     c === nothing || return c
     limits = Vulkan.get_physical_device_properties(ctx.physical_device).limits
     cores, warps = query_shader_cores(ctx.physical_device)
+    # The driver's own table, not a constant. `tile` was `GEMM_TILE = 16` — a
+    # comment reading "the cooperative-matrix tile this device implements" on a
+    # module-level binding, which is a device fact that no device answered for.
+    # On a card reporting anything but 16 the kernels strided by 16 and read
+    # another fragment's registers, and nothing would have crashed.
+    shapes = matrixshapes(ctx)
+    square = bestshape(shapes, Float16, Float32)
     ctx.caches.caps = DeviceCaps(
         coopmat_gemm_available(ctx),
-        GEMM_TILE,
+        square === nothing ? 0 : square.M,
         device_subgroup_size(ctx),
         COOPMAT_SUBGROUP,
         Int(limits.max_compute_shared_memory_size),
         Int(limits.max_compute_work_group_invocations),
         cores, warps,
-        workgroup_matrix_granularity(ctx))
+        workgroup_matrix_granularity(ctx),
+        shapes)
 end
 
 """
