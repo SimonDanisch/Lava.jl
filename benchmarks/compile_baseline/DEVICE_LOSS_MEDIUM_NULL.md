@@ -101,6 +101,38 @@ which is deliberate — BDA_POISON, so a shader dereferencing it faults on null
 rather than on recycled memory. Worth knowing when reading the counts: the same
 slot cannot be counted twice across renders.
 
+## Poisoning the stale entries prevents the hang
+
+With the scan's own crash fixed (below), it runs to completion — and the run
+does not lose the device:
+
+| render | freed BDAs in live slabs | new this render |
+|---|---|---|
+| 1 | 4369 | — |
+| 2 | 8728 | +4359 |
+| 3 | 13087 | +4359 |
+| 4 | 17446 | +4359 |
+| 5 | 21805 | +4359 |
+| 6 | 26164 | +4359 |
+
+Two things in one table. The rate is EXACTLY constant — 4359 fresh stale slots
+per render — so this is a fixed set of buffers per render, not drift. And six
+renders survived, where the same workload without the scan loses the device on
+the third.
+
+The scan zeroes every hit (`unsafe_store!(p, UInt64(0), k+1)` — BDA_POISON), so
+it is not observing the stale references, it is neutralising them. That makes
+this causal rather than correlational: remove the stale addresses and the hang
+does not happen.
+
+**The confound, stated plainly.** The scan also makes each render 90x slower
+(42 s against 0.46 s), because it walks every slab on every free. A slower
+render shifts whatever window the collector and the recording overlap in, and
+that alone could hide the fault. So this is strong evidence, not proof. What
+would settle it: log the hits WITHOUT zeroing them and see whether the device
+still dies at the same rate. If it does, the poisoning is what mattered; if it
+does not, the slowdown is.
+
 ## A bug in the instrument
 
 The scan is not finalizer-safe. `memory.jl:829` reads `slab.buf[]`, and when

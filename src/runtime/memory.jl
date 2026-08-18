@@ -826,6 +826,13 @@ function scan_arg_slabs_for_bda!(buf::VkManagedBuffer)
     bq = ctx.default_bq
     for (kind, slabs) in ((:arg, bq.arg_slabs), (:indirect, bq.indirect_slabs))
         for (i, slab) in enumerate(slabs)
+            # A slab whose own DataRef has been released is not something to
+            # read: `getindex` throws "Attempt to use a freed reference", and
+            # this runs from `vk_free!`, which finalizers reach — so the throw
+            # is swallowed by Julia's finalizer machinery and the scan silently
+            # stops partway. `freed` is the predicate for it; there is nothing
+            # to scan in a slab whose storage is gone anyway.
+            slab.buf.freed && continue
             mb = slab.buf[]::VkManagedBuffer
             mb.mapped_ptr == Ptr{UInt8}(0) && continue
             n = mb.size ÷ 8
