@@ -24,7 +24,7 @@ UnsafeAtomics = "013be700-e6cd-48c3-b4a1-df204f14c38f"
 Vulkan = "9f14b124-c50e-4008-a7d4-969b3a6cd68a"
 
 [sources]
-Raycore = {url = "https://github.com/JuliaGeometry/Raycore.jl", rev = "master"}
+Raycore = {url = "https://github.com/JuliaGeometry/Raycore.jl", rev = "sd/with-texture"}
 
 [compat]
 # Lava depends on a few GPUCompiler internals (rm_trap! was one, now vendored;
