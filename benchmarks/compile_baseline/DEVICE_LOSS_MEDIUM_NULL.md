@@ -163,3 +163,34 @@ qualifier as the hits it reports.
 Worth pairing with `ctx.diag.free_debug`, whose log records for each free
 whether a batch was recording at the time — the two together should say whether
 the buffer was freed during a recording and then named by it.
+
+## A fast probe, and how to run a variant against it without ruining it
+
+The compile dominates: ~150 s for the first render, ~0.5 s for each one after.
+So one process amortises it and then rolls the dice N times —
+`/sim/tmp/bench/rate_fast.jl` with `HUNT_N=15`, driven by
+`/sim/tmp/bench/rate_trials.sh <label> <trials>`. Measured on that probe: one
+trial survived 15 renders, the next lost the device, so a trial of 15 is roughly
+a coin flip and a handful of trials per arm is enough to see a real difference.
+
+**The mistake to avoid, having made it.** A first attempt to measure
+defer-always against baseline produced nothing usable, because the baseline
+driver was still running when its source was patched and the variant driver was
+started alongside it. Two arms then shared a GPU and one of them changed
+compilation unit mid-run. Discarded.
+
+Rules that follow:
+
+* one arm at a time, and confirm the previous driver has EXITED (not just that
+  its log stopped growing — these runs are slow, and a quiet log is not a dead
+  process);
+* never edit `src/` while any trial is in flight, since each trial is a fresh
+  process that picks up whatever is on disk when it starts;
+* run the trials in the FOREGROUND. Background shells here are killed after
+  roughly eight minutes, which silently truncates an arm to however many trials
+  fit — and a truncated arm looks like a clean one.
+
+The variant itself is kept at `/sim/tmp/bench/apply_defer_always.py`: it makes
+`vk_free!` never destroy inline, on the theory that the four defer branches all
+read a point-in-time fact and then fall through to a destroy nothing serialises
+against a recording starting immediately after.
