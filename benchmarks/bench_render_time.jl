@@ -11,6 +11,7 @@
 using Lava
 using Hikari
 using Printf
+import KernelAbstractions as KA
 
 function main(scene_path::String, mode::String, spp::Int)
     hw = mode == "hw"
@@ -31,13 +32,27 @@ function main(scene_path::String, mode::String, spp::Int)
                                   hw_accel = hw,
                                   sensor = r.sensor)
     # `render!` draws ONE sample and accumulates, so these are per-sample times.
+    #
+    # The `KA.synchronize` is required for the timing to mean anything:
+    # `render!` records and submits, then returns without waiting, so timing it
+    # alone measures CPU-side command recording rather than the render. On
+    # killeroo that reads as 0.4 ms per sample for a 1026x1368 frame — off by
+    # two orders of magnitude.
+    #
     # First call compiles; the ones after it are the measurement.
-    first = @elapsed Hikari.render!(integrator, r.scene, r.film, r.camera)
+    backend_ka = KA.get_backend(r.film.framebuffer)
+    first = @elapsed begin
+        Hikari.render!(integrator, r.scene, r.film, r.camera)
+        KA.synchronize(backend_ka)
+    end
     println("first_seconds  = ", round(first, digits = 2), "   (includes shader compilation)")
 
     times = Float64[]
     for _ in 1:5
-        push!(times, @elapsed Hikari.render!(integrator, r.scene, r.film, r.camera))
+        push!(times, @elapsed begin
+            Hikari.render!(integrator, r.scene, r.film, r.camera)
+            KA.synchronize(backend_ka)
+        end)
     end
     sort!(times)
     @printf("sample_seconds = %s\n", join(round.(times, digits = 4), ", "))

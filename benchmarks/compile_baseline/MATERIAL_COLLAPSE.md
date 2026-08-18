@@ -131,10 +131,20 @@ Julia 1.12.6, GPUCompiler 2.1.1. Hikari `bf0ffcc` (before) against `b69b1ad`
 
 ### Compile
 
-`cold_seconds` is the first `render_pbrt` after the scene is built, i.e. almost
-entirely shader compilation. `first_seconds` is the same quantity measured by
-the other harness, which builds the scene itself first — two independent
-measurements of the same thing.
+`cold_seconds` is the first `render_pbrt` after the scene is built.
+`first_seconds` is the same quantity measured by the other harness, which
+builds the scene itself first.
+
+**These are not interchangeable, and the difference is not noise.**
+`render_pbrt` re-parses and REBUILDS the scene, so `cold_seconds` is
+`second_build + compile`. On crown the second build is ~20 s and the two
+metrics agree to within 10 % (232.9 vs 212.5 s on 2026-08-18). On
+`RayDemo/Materials/materials.pbrt` the build is ~394 s — the scene is 20
+spheres, each tessellated at `segments=512` into ~524 k triangles
+(`scene_builder.jl:925`), so ~10.5 M triangles get a BVH built twice — and
+`cold_seconds` reads 632.7 s against a true compile time of 238.6 s. Any
+cross-revision comparison on a sphere-heavy scene must use `first_seconds`;
+`cold_seconds` there is mostly measuring tessellation.
 
 | | before (12 types) | after (5 types) | change |
 |---|---|---|---|
