@@ -58,7 +58,7 @@ The trigger is *when* a collection happens, not that one happens:
 |---|---|---|
 | dropped | whenever the GC feels like it | **device lost on render 3** |
 | dropped | forced `GC.gc(true)` between renders | 6 / 6 survived |
-| held alive | never | 3 / 3 survived |
+| held alive | never | 6 / 6 survived |
 
 Forcing collection at a quiet point is safe. Letting it land wherever it likes
 is not. Which is precisely the window `vk_free!` already documents:
