@@ -138,13 +138,29 @@ builds the scene itself first.
 **These are not interchangeable, and the difference is not noise.**
 `render_pbrt` re-parses and REBUILDS the scene, so `cold_seconds` is
 `second_build + compile`. On crown the second build is ~20 s and the two
-metrics agree to within 10 % (232.9 vs 212.5 s on 2026-08-18). On
-`RayDemo/Materials/materials.pbrt` the build is ~394 s — the scene is 20
-spheres, each tessellated at `segments=512` into ~524 k triangles
-(`scene_builder.jl:925`), so ~10.5 M triangles get a BVH built twice — and
-`cold_seconds` reads 632.7 s against a true compile time of 238.6 s. Any
-cross-revision comparison on a sphere-heavy scene must use `first_seconds`;
-`cold_seconds` there is mostly measuring tessellation.
+metrics agree to within 10 % (232.9 vs 212.5 s on 2026-08-18).
+
+On `RayDemo/Materials/materials.pbrt` they disagreed by 394 s, and chasing that
+gap found a real bug rather than a measurement artefact. The scene is 20 spheres
+tessellated at `segments=512` (~524 k triangles each, ~10.5 M total), so the
+first guess was tessellation and BVH. Profiling said otherwise: `vkAllocateMemory`
+and `vkFreeMemory` at the top, reached through
+`push!(::MultiTypeSet, ::DiffuseAreaLight)`. Hikari registered one area light per
+emissive FACE, and every single-element push into a GPU-backed set resizes the
+slot — free, allocate, copy. Two emissive spheres meant 783 362 of those.
+
+| materials.pbrt build | before | after |
+|---|---|---|
+| cold (fresh process, incl. JIT) | 409.3 s | 69.8 s |
+| warm (second build in-process)  | 311.5 s |  8.6 s |
+
+Fixed by `Raycore.append!` (one resize + one `copyto!` per type) with the lights
+staged host-side — Raycore `e2e4a0d`, Hikari `626b419`. Tessellation cost what it
+always cost: 41 ms per sphere, 0.8 s for the scene.
+
+So the numbers below still stand, but any figure for materials measured before
+2026-08-19 is ~300 s of area-light registration plus the real cost. Prefer
+`first_seconds` regardless: it builds once, outside the timer.
 
 | | before (12 types) | after (5 types) | change |
 |---|---|---|---|
