@@ -633,15 +633,32 @@ struct DeviceCaps
     # It is a rule about the LAUNCH, not just the type: the same matrix shape is
     # legal at 128 invocations and illegal at 256.
     wggran::Vector{NTuple{4,Int}}
+    # Every SUBGROUP-scope shape the driver reports, in the vocabulary Mantle can
+    # also name. `tile` above is one entry of this table — the square fp16 -> fp32
+    # one — kept as a field because most callers want exactly that and nothing
+    # else. Anything wanting another type pair, or a non-square instruction, asks
+    # `bestshape` instead of assuming.
+    #
+    # Appended rather than inserted beside `tile`: `mantlecaps` copies this struct
+    # positionally, so a field added in the middle would misalign it silently.
+    shapes::Vector{MatrixShape}
 end
 
 # Eight positional arguments still construct one — every caller that predates
 # `wggran` (`flashcm_tiling`'s docstring, `DNNKernels`' CPU fallback, the wave64
 # device in `test_flash.jl`) means "no workgroup-scope matrices".
+#
+# Those callers say `coopmat = true, tile = 16` to mean "a device with a square
+# 16 fp16 -> fp32 instruction", so that is the shape table they get. Synthesising
+# it here rather than leaving it empty keeps `tile` and `shapes` from disagreeing
+# on a synthetic device — a disagreement that would only ever show up as a plan
+# declining for a reason the test did not ask about.
 DeviceCaps(coopmat, tile, subgroup, coopmatsubgroup, sharedbudget,
-           workgrouplimit, cores, warps) =
+           workgrouplimit, cores, warps, wggran = NTuple{4,Int}[]) =
     DeviceCaps(coopmat, tile, subgroup, coopmatsubgroup, sharedbudget,
-               workgrouplimit, cores, warps, NTuple{4,Int}[])
+               workgrouplimit, cores, warps, wggran,
+               coopmat ? [MatrixShape(Float16, Float32, tile, tile, tile, SubgroupScope())] :
+                         MatrixShape[])
 
 """
     DeviceCaps(c::DeviceCaps; kw...) -> DeviceCaps
@@ -654,9 +671,27 @@ DeviceCaps(c::DeviceCaps;
            coopmat = c.coopmat, tile = c.tile, subgroup = c.subgroup,
            coopmatsubgroup = c.coopmatsubgroup, sharedbudget = c.sharedbudget,
            workgrouplimit = c.workgrouplimit, cores = c.cores, warps = c.warps,
-           wggran = c.wggran) =
+           wggran = c.wggran, shapes = c.shapes) =
     DeviceCaps(coopmat, tile, subgroup, coopmatsubgroup, sharedbudget,
-               workgrouplimit, cores, warps, wggran)
+               workgrouplimit, cores, warps, wggran, shapes)
+
+"""
+    supports(c::DeviceCaps, s::MatrixShape) -> Bool
+    bestshape(c::DeviceCaps, ab, acc; scope) -> MatrixShape | nothing
+
+Ask this device's shape table, `coopmat` included.
+
+**The gate is here rather than in the copy constructor**, which was the first
+thing tried and is wrong: `DeviceCaps(c; coopmat = false)` must change exactly
+the field it names, and having `tile` and `shapes` quietly follow it means naming
+one field and moving three. `test_device_caps.jl` asserts that contract by name —
+"a modified copy leaves the device's own answer alone" — and it is the right
+contract. So a caps with `coopmat = false` may still carry a full table, and
+every accessor to it answers as the device it claims to be.
+"""
+supports(c::DeviceCaps, s::MatrixShape) = c.coopmat && supports(c.shapes, s)
+bestshape(c::DeviceCaps, ab, acc; scope::MatrixScope = SubgroupScope()) =
+    c.coopmat ? bestshape(c.shapes, ab, acc; scope) : nothing
 
 """
     DeviceCaches

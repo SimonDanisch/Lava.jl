@@ -12,6 +12,7 @@ GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
 GPUCompiler = "61eb1bfa-7361-4325-ad38-22787b887f55"
 GeometryBasics = "5c1252a2-5f33-56bf-86c9-59e7332b4326"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+KernelInterfaces = "ce25d451-9bb5-4870-a156-ce22182641de"
 LLVM = "929cbde3-209d-540e-8aea-75f648917ca0"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Raycore = "afc56b53-c9a9-482a-a956-d1d800e05559"
@@ -25,6 +26,9 @@ Vulkan = "9f14b124-c50e-4008-a7d4-969b3a6cd68a"
 
 [sources]
 Raycore = {url = "https://github.com/JuliaGeometry/Raycore.jl", rev = "sd/with-texture"}
+# In Mantle's repository, under `lib/`, but a package of its own — Lava depends
+# on it WITHOUT depending on Mantle, which is the whole reason it was split out.
+KernelInterfaces = {url = "https://github.com/SimonDanisch/Mantle.jl", rev = "sd/mantle-dev", subdir = "lib/KernelInterfaces"}
 
 [compat]
 # Lava depends on a few GPUCompiler internals (rm_trap! was one, now vendored;

@@ -27,7 +27,17 @@
 # remaining global loads against. 4×4 is a real optimum — 4×8 and 8×4 fall to
 # ~3 TFLOP/s and 8×8 to ~1.75, which is register spilling.
 
-const GEMM_TILE = 16       # the cooperative-matrix tile this device implements
+# The tile these kernels are WRITTEN FOR, not the one a device reports — that is
+# `caps(ctx).tile`, read from the driver's table. It stays a constant because it
+# is baked in more deeply than a parameter could reach: the `@nexprs` unroll
+# counts are literals derived from it (a 16x16 fp32 accumulator is 8 components
+# per lane at subgroup 32, hence `@nexprs 8`), and `@nexprs` cannot take a count
+# that comes from a `Val`.
+#
+# Nothing silently misreads a device that disagrees: `coopmat_gemm_available`
+# asks for exactly `Float16 16x16x16`, so a card without that shape reports
+# `coopmat = false` and every cooperative-matrix plan declines.
+const GEMM_TILE = 16
 const GEMM_BLOCK = 4       # register block: 4×4 accumulators per subgroup
 const GEMM_WORKGROUP = 64  # 2 subgroups; 32 loses latency hiding, 256 spills
 const GEMM_MAXBLOCK = 4    # largest register block `@nexprs` is unrolled for

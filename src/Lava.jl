@@ -107,6 +107,14 @@ using LinearAlgebra
 using StaticArrays
 using GeometryBasics
 import GLFW
+# The matrix vocabulary is shared with Mantle, which cannot depend on Lava.
+# Re-exported below so `Lava.MatrixA` keeps resolving for every existing caller.
+using KernelInterfaces
+using KernelInterfaces: MatrixUse, MatrixA, MatrixB, Accumulator,
+                        MatrixScope, SubgroupScope, WorkgroupScope, MatrixShape
+# `import`, not `using ... :` — `coretypes.jl` adds `DeviceCaps` methods to these
+# two, and extending a function from another module requires importing it by name.
+import KernelInterfaces: supports, bestshape
 
 # ---- Graphics types (pure Julia, no Vulkan dependency) ----
 include("graphics/types.jl")
