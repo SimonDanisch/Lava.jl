@@ -73,12 +73,50 @@ is not. Which is precisely the window `vk_free!` already documents:
 This is that recurrence, on a workload that reaches it in 80 s rather than
 needing 90 trials.
 
-## Next
+## The scan fires, in volume
 
-`ctx.diag.freed_bda_scan` is the instrument for exactly the question the comment
-poses: before destroying a buffer it scans live arg slabs for its address, which
-is a reference nothing pinned. `/sim/tmp/bench/bda_scan.jl` turns it on and runs
-the reproducer; a hit names the buffer and the slab.
+`ctx.diag.freed_bda_scan` answers the comment's question directly: before
+destroying a buffer it walks live arg slabs for its address, which is a
+reference nothing pinned. Run over the reproducer
+(`/sim/tmp/bench/bda_scan.jl`):
+
+| render | freed BDAs still present in a live arg slab |
+|---|---|
+| 1 | 4372 |
+| 2 | 8731 |
+| 3 | device lost |
+
+So the condition the comment predicted is not rare — it is thousands of slots
+per render, and it grows.
+
+**What this does NOT yet establish.** `scan_arg_slabs_for_bda!` walks every live
+slab and does not ask whether that slab is still IN FLIGHT. A retired slab
+holding a stale address is harmless; only one an unretired batch will submit is
+a use-after-free. Lava recycles slabs, so an unknown share of these 4372 are
+stale-but-retired. Qualifying the scan by in-flight status is what turns this
+count into a diagnosis, and is the next step.
+
+The scan also zeroes each hit it finds (`unsafe_store!(p, UInt64(0), k+1)`),
+which is deliberate — BDA_POISON, so a shader dereferencing it faults on null
+rather than on recycled memory. Worth knowing when reading the counts: the same
+slot cannot be counted twice across renders.
+
+## A bug in the instrument
+
+The scan is not finalizer-safe. `memory.jl:829` reads `slab.buf[]`, and when
+that slab's own `DataRef` has already been released the getindex throws inside
+`vk_free!`:
+
+```
+error in running finalizer: Core.ArgumentError("Attempt to use a freed reference.")
+  getindex at GPUArrays/src/host/abstractarray.jl:73
+  scan_arg_slabs_for_bda! at runtime/memory.jl:829
+  vk_free! at runtime/memory.jl:723
+```
+
+Diagnostic-only — the flag is off by default — but it means the scan cannot be
+left on for a long run, and the slab list it walks needs the same liveness
+qualifier as the hits it reports.
 
 Worth pairing with `ctx.diag.free_debug`, whose log records for each free
 whether a batch was recording at the time — the two together should say whether
