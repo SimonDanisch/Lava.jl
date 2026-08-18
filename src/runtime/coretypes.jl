@@ -272,6 +272,12 @@ mutable struct Diagnostics
     alloc_debug::Bool
     free_debug::Bool
     freed_bda_scan::Bool
+    # Whether the scan POISONS what it finds. On by default because a stale BDA
+    # left in a slab is a use-after-free waiting to be submitted, and zeroing it
+    # faults on null instead. Off makes the scan a pure observer — which is what
+    # separates "the poisoning prevented the hang" from "the scan slowed the
+    # render down enough to hide it".
+    freed_bda_scan_poisons::Bool
     destroy_freed_bdas_throws::Bool
     presubmit_scan::Bool
     presubmit_scan_throws::Bool
@@ -325,7 +331,7 @@ mutable struct Diagnostics
     total_dispatches::Threads.Atomic{Int}
 end
 
-Diagnostics() = Diagnostics(false, false, false, false, false, false, false, UInt64(0),
+Diagnostics() = Diagnostics(false, false, false, true, false, false, false, false, UInt64(0),
                             false, false, nothing, false,
                             false, true, nothing, 0, 0, nothing,
                             NamedTuple[], NamedTuple[], NamedTuple[], NamedTuple[],

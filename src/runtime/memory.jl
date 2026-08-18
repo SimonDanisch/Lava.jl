@@ -843,7 +843,12 @@ function scan_arg_slabs_for_bda!(buf::VkManagedBuffer)
                     push!(buf.ctx.diag.freed_bda_scan_log,
                           (slab=kind, idx=i, offset=k*8, freed_bda=target,
                            buf_size=buf.size))
-                    unsafe_store!(p, UInt64(0), k+1)
+                    # Poisoning is the point of finding it — a null BDA faults
+                    # cleanly where a recycled one corrupts. Skippable so the
+                    # scan can be a pure observer, which is how you tell whether
+                    # the poisoning is what stopped a fault or merely the
+                    # slowdown that came with it.
+                    ctx.diag.freed_bda_scan_poisons && unsafe_store!(p, UInt64(0), k+1)
                     hits += 1
                 end
             end

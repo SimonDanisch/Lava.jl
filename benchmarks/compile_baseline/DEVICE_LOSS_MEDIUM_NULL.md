@@ -101,7 +101,7 @@ which is deliberate — BDA_POISON, so a shader dereferencing it faults on null
 rather than on recycled memory. Worth knowing when reading the counts: the same
 slot cannot be counted twice across renders.
 
-## Poisoning the stale entries prevents the hang
+## The stale entries are real; poisoning them is NOT what prevents the hang
 
 With the scan's own crash fixed (below), it runs to completion — and the run
 does not lose the device:
@@ -121,17 +121,27 @@ renders survived, where the same workload without the scan loses the device on
 the third.
 
 The scan zeroes every hit (`unsafe_store!(p, UInt64(0), k+1)` — BDA_POISON), so
-it is not observing the stale references, it is neutralising them. That makes
-this causal rather than correlational: remove the stale addresses and the hang
-does not happen.
+the obvious reading is that it neutralises the stale references and that is why
+the run survives. **That reading is wrong**, and the test that settles it is one
+flag: `freed_bda_scan_poisons = false` makes the scan a pure observer.
 
-**The confound, stated plainly.** The scan also makes each render 90x slower
-(42 s against 0.46 s), because it walks every slab on every free. A slower
-render shifts whatever window the collector and the recording overlap in, and
-that alone could hide the fault. So this is strong evidence, not proof. What
-would settle it: log the hits WITHOUT zeroing them and see whether the device
-still dies at the same rate. If it does, the poisoning is what mattered; if it
-does not, the slowdown is.
+| poisoning | renders | outcome |
+|---|---|---|
+| on  | 6 | survived, 26164 hits |
+| off | 6 | survived, 26294 hits |
+
+Identical. Leaving every stale BDA in place survives just as well, so what
+prevented the fault was not the poisoning — it was the scan's cost. Each render
+takes 42 s under the scan against 0.46 s without it, 90x, because it walks every
+slab on every free. That shifts whatever window the collector and the recording
+overlap in, and the fault needs that window.
+
+So the stale entries are a real and precisely-rated finding, and they are NOT
+yet shown to cause this. Which fits everything else here: fast renders die, slow
+ones do not; uncontrolled collection dies, controlled collection does not. The
+fault is timing, and any instrument heavy enough to observe it changes the
+timing enough to hide it. That is the actual difficulty of this bug, and it is
+why the next step is not another scan.
 
 ## A bug in the instrument
 
