@@ -22,7 +22,7 @@ HUNT_N=4 HUNT_SPP=64 julia --project=. /sim/tmp/bench/skip_probe.jl
 ```
 
 ~80 s: render 1 pays shader compilation, renders 2-3 are ~2 s each, and the
-device goes somewhere in the first few. `/sim/tmp/bench/hunt_devlost.jl` is the
+device goes somewhere in the first few. ``benchmarks/device_loss/rate_fast.jl`` is the
 same thing at 256 spp.
 
 ## Rate
@@ -78,7 +78,7 @@ needing 90 trials.
 `ctx.diag.freed_bda_scan` answers the comment's question directly: before
 destroying a buffer it walks live arg slabs for its address, which is a
 reference nothing pinned. Run over the reproducer
-(`/sim/tmp/bench/bda_scan.jl`):
+(``benchmarks/device_loss/bda_scan.jl``):
 
 | render | freed BDAs still present in a live arg slab |
 |---|---|
@@ -168,8 +168,8 @@ the buffer was freed during a recording and then named by it.
 
 The compile dominates: ~150 s for the first render, ~0.5 s for each one after.
 So one process amortises it and then rolls the dice N times —
-`/sim/tmp/bench/rate_fast.jl` with `HUNT_N=15`, driven by
-`/sim/tmp/bench/rate_trials.sh <label> <trials>`. Measured on that probe: one
+``benchmarks/device_loss/rate_fast.jl`` with `HUNT_N=15`, driven by
+``benchmarks/device_loss/rate_trials.sh` <label> <trials>`. Measured on that probe: one
 trial survived 15 renders, the next lost the device, so a trial of 15 is roughly
 a coin flip and a handful of trials per arm is enough to see a real difference.
 
@@ -190,7 +190,7 @@ Rules that follow:
   roughly eight minutes, which silently truncates an arm to however many trials
   fit — and a truncated arm looks like a clean one.
 
-The variant itself is kept at `/sim/tmp/bench/apply_defer_always.py`: it makes
+The variant itself is kept at ``benchmarks/device_loss/apply_defer_always.py``: it makes
 `vk_free!` never destroy inline, on the theory that the four defer branches all
 read a point-in-time fact and then fall through to a destroy nothing serialises
 against a recording starting immediately after.
@@ -223,7 +223,7 @@ destruction at all (the pool handing a still-referenced block back out through
 `return_to_pool!` would look identical and is untouched by deferring), or the
 reference that matters is captured before any of this and survives the defer.
 
-Patch preserved at `/sim/tmp/bench/apply_defer_always.py`; the tree is reverted.
+Patch preserved at ``benchmarks/device_loss/apply_defer_always.py``; the tree is reverted.
 
 ## Also ruled out: the pool, and the concurrent dispatch groups
 
@@ -325,3 +325,26 @@ the night; trials three through six then lost the device four times running. At
 n = 2 the arm read 0/2 against a 5/6 baseline and looked decisive. It was noise.
 Six trials is the minimum that has meant anything on this bug, and even six only
 separates "no effect" from "large effect".
+
+## Everything here is runnable, from this checkout
+
+`benchmarks/device_loss/` holds the probes rather than a description of them —
+they were written in `/sim/tmp`, which is a RAM-backed tmpfs on the machine this
+was found on and would have taken the whole investigation with it.
+
+| script | what it is for |
+|---|---|
+| `rate_fast.jl` | the reproducer: one process, `HUNT_N` renders after the compile |
+| `rate_trials.sh` | `<label> <trials> [renders]` — counts lost devices over trials |
+| `gc_probe.jl` | `HUNT_MODE=gc\|keep\|drop`, the collection-timing arms |
+| `bda_scan.jl` | freed BDAs still live in arg slabs; `HUNT_POISON=false` to observe only |
+| `gpuav_hunt.jl` | GPU-AV, `HUNT_SHADERS=` comma-separated or empty for all |
+| `apply_defer_always.py` | variant: `vk_free!` never destroys inline |
+| `apply_no_concurrent.py` | variant: no concurrent dispatch groups |
+
+Env knobs shared by the Julia ones: `HUNT_N`, `HUNT_SPP`, and for `rate_fast.jl`
+also `HUNT_NOPOOL` and `HUNT_NOEARLYEXIT`.
+
+Run them one arm at a time, in the foreground, without editing `src/` while a
+trial is in flight — the reasons are three sections up, and each was learned by
+getting it wrong first.
