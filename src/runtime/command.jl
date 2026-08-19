@@ -157,6 +157,51 @@ mutable struct CapturedSequence
     cmd_bufs::Vector{Vulkan.CommandBuffer}
     pinned::Vector{Any}          # keeps every referenced GPU object alive
     submissions::Int             # submit! boundaries folded into one replay
+    # The argument memory this capture's dispatches point at, OWNED here.
+    #
+    # It used to come from the queue's shared bump allocator, with
+    # `reserve_arg_slabs!` pushing a high-water mark past it so a later recording
+    # could not overwrite the bytes a replay reads. That mark only ever went up:
+    # the slabs were never handed back, by `release!`, by dropping the sequence,
+    # or by a full GC. Capturing was a permanent ~4 MB, which is invisible when a
+    # model is baked once for the life of a process and a leak when a renderer
+    # rebuilds its plans on every scene edit.
+    #
+    # Owning them instead makes the lifetime ordinary: nothing else can allocate
+    # from these, so nothing can overwrite them, and when the sequence goes they
+    # go — promptly via [`release!`](@ref), or through the array finalizers if it
+    # is simply dropped.
+    slabs::Vector{Any}
+    slab_idx::Int
+    slab_offset::Int
+end
+CapturedSequence(bq, cmd_bufs, pinned, submissions) =
+    CapturedSequence(bq, cmd_bufs, pinned, submissions, Any[], 1, 0)
+
+"""
+    release!(seq::CapturedSequence)
+
+Give back everything a capture holds: its argument slabs, its pinned set and its
+command buffers. The sequence is empty afterwards and replaying it does nothing.
+
+Explicit because the caller knows when the recording is dead and the GC does not
+know it is holding device memory. Dropping the sequence works too — the slabs are
+ordinary arrays with ordinary finalizers — this just makes it prompt, and is what
+`Mantle.free!` on a baked plan calls.
+
+The device has to be past the last replay, which is the same precondition every
+other `free!` here carries.
+"""
+function release!(seq::CapturedSequence)
+    empty!(seq.cmd_bufs)
+    empty!(seq.pinned)
+    for s in seq.slabs
+        finalize(s)
+    end
+    empty!(seq.slabs)
+    seq.slab_idx = 1
+    seq.slab_offset = 0
+    return nothing
 end
 
 
@@ -209,10 +254,6 @@ function capture(f, bq::BatchQueue)
         bq.capturing = nothing
     end
     flush!(bq, bq.device)
-    # Everything the capture recorded lives in the arg slabs it filled; move the
-    # bump allocator past them so later recording cannot overwrite the bytes the
-    # replayed push constants point at.
-    reserve_arg_slabs!(bq)
     seq
 end
 
@@ -1254,8 +1295,10 @@ function sweep_retired_batches!(bq::BatchQueue)
     # records the next), so without this the second half of a capture overwrites
     # the argument records of the first, and the replay dispatches valid commands
     # against wrong pointers: no validation error, no device fault, just a kernel
-    # that never returns. `capture` pins the range at the end via
-    # `reserve_arg_slabs!`, which is too late to help the capture itself.
+    # that never returns. A capture's own slabs (see `CapturedSequence`) are
+    # never rewound at all, which is what actually protects it — this test still
+    # matters for the SHARED pool, which a capture's non-argument allocations and
+    # every ordinary recording keep using.
     # "Recorded dispatches" is the wrong question, and asking it is a GPU crash.
     # An arg buffer is handed out *before* the dispatch that uses it is recorded,
     # and a caller may take several before recording any — every draw in a frame

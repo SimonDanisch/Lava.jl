@@ -597,10 +597,19 @@ end
 
 function get_arg_buffer(bq::BatchQueue, nbytes::Integer)
     @assert Threads.threadid() == bq.owning_thread  "BatchQueue is single-writer; cross-thread arg-buf alloc forbidden"
+    aligned_size = (max(Int(nbytes), 16) + ARG_SLAB_ALIGN - 1) & ~(ARG_SLAB_ALIGN - 1)
+    # A capture allocates from its OWN slabs. The address is baked into the
+    # command buffer as a push constant, so a replay reads whatever those bytes
+    # hold at replay time — which means nothing else may ever be given them. That
+    # used to be arranged by pushing the shared pool's high-water mark past them
+    # for good; owning them says the same thing and can also be undone. See
+    # `CapturedSequence`.
+    let cap = bq.capturing
+        cap === nothing || return capture_arg_buffer!(cap, bq, aligned_size)
+    end
     # Rewind here rather than at end-of-frame: safe exactly when the GPU has
     # passed every batch that allocated from the pool (see `arg_pool_in_use!`).
     reclaim_arg_buffer_pool!(bq)
-    aligned_size = (max(Int(nbytes), 16) + ARG_SLAB_ALIGN - 1) & ~(ARG_SLAB_ALIGN - 1)
     ensure_arg_slab!(bq, aligned_size)
     slab = bq.arg_slabs[bq.arg_slab_idx]::LavaArray{UInt8,1}
     mb = slab.buf[]::VkManagedBuffer
@@ -614,26 +623,37 @@ function get_arg_buffer(bq::BatchQueue, nbytes::Integer)
     )
 end
 
-"""
-    reserve_arg_slabs!(bq)
-
-Move `bq`'s bump allocator past everything recorded so far and keep it there —
-`bq.reserved_arg_slabs` is the high-water mark `reset_arg_buffer_pool!` must not
-hand out again.
-
-A dispatch's arguments live in an arg slab and the slab address is baked into
-the command buffer as a push constant, so a replayed command buffer reads
-whatever those bytes hold at replay time. The bump allocator normally rewinds to
-slab 1 offset 0 once the queue drains, which would let the next recording
-overwrite exactly those bytes — the replay would then dispatch a live pipeline
-against another kernel's arguments. Capturing reserves the slabs it filled.
-"""
-function reserve_arg_slabs!(bq::BatchQueue)
-    bq.reserved_arg_slabs = max(bq.reserved_arg_slabs, bq.arg_slab_idx)
-    bq.arg_slab_idx = bq.reserved_arg_slabs + 1
-    bq.arg_slab_offset = 0
-    return
+"""Bump-allocate `aligned_size` bytes from a capture's own slabs, growing them
+as needed. No reclaim and no frontier: a capture's slabs are never rewound,
+which is the whole point of them being its own."""
+function capture_arg_buffer!(cap, bq::BatchQueue, aligned_size::Int)
+    while length(cap.slabs) < cap.slab_idx
+        push!(cap.slabs, LavaArray{UInt8,1}(undef, (max(ARG_SLAB_SIZE, aligned_size),);
+                                            bq = bq, unified = true))
+    end
+    slab = cap.slabs[cap.slab_idx]::LavaArray{UInt8,1}
+    if cap.slab_offset + aligned_size > slab.buf[].size
+        cap.slab_idx += 1
+        cap.slab_offset = 0
+        while length(cap.slabs) < cap.slab_idx
+            push!(cap.slabs, LavaArray{UInt8,1}(undef, (max(ARG_SLAB_SIZE, aligned_size),);
+                                                bq = bq, unified = true))
+        end
+        slab = cap.slabs[cap.slab_idx]::LavaArray{UInt8,1}
+    end
+    mb = slab.buf[]::VkManagedBuffer
+    offset = cap.slab_offset
+    cap.slab_offset = offset + aligned_size
+    return ArgBufferAlloc(mb.address + UInt64(offset), mb.mapped_ptr + offset, aligned_size)
 end
+
+# `reserve_arg_slabs!` used to live here: it pushed a high-water mark past the
+# slabs a capture had filled so `reset_arg_buffer_pool!` could not hand them out
+# again, because a replay reads whatever the baked push-constant address points
+# at. The mark only went up and nothing ever lowered it, so every capture cost
+# the pool a few megabytes for the life of the process. A capture owns its
+# argument slabs now, which says the same thing about who may write them and can
+# also be given back — see `CapturedSequence` and `release!`.
 
 """
     arg_pool_in_use!(bq, signal_value)
@@ -683,9 +703,12 @@ function reclaim_arg_buffer_pool!(bq::BatchQueue)
     return true
 end
 
-"""Reset arg buffer slab allocator for `bq` after its in_flight batches drained."""
+"""Reset arg buffer slab allocator for `bq` after its in_flight batches drained.
+
+All the way to the first slab: nothing is reserved here any more, because a
+capture allocates its arguments from slabs it owns rather than from this pool."""
 function reset_arg_buffer_pool!(bq::BatchQueue)
-    bq.arg_slab_idx = bq.reserved_arg_slabs + 1
+    bq.arg_slab_idx = 1
     bq.arg_slab_offset = 0
     bq.arg_alloc_count = 0
     bq.arg_pool_frontier = UInt64(0)

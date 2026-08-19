@@ -211,9 +211,6 @@ mutable struct BatchQueue{C}
     # `Any` because `CapturedSequence` is declared in `command.jl`; use sites
     # assert it, the same shape as `ctx`.
     capturing::Any
-    # The high-water mark of arg slabs a capture reserved on this queue, so a
-    # replay does not overwrite arguments a recorded pipeline still points at.
-    reserved_arg_slabs::Int
     # Highest timeline value signalled by a replay on this queue. `flush!` has to
     # wait on it: a replay puts no `CommandBatch` in `in_flight`, so the in-flight
     # scan alone would return before the GPU had run any of it. Was an
@@ -272,7 +269,7 @@ function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32, 
                     64, 3000, UInt64(120) * 1_000_000_000,  # auto-submit, CB split, flush timeout
                     :memory, false, false,                  # barrier mode / elision / one-shot skip
                     false, UInt64[], UInt64[],              # ranges_declared + elision tracker
-                    nothing, nothing, 0, UInt64(0),         # deferred indirect, capture, reserved slabs, watermark
+                    nothing, nothing, UInt64(0),            # deferred indirect, capture, replay watermark
                     "", "")                                 # last / prev dispatch info
     # Plug the back-reference into every pre-allocated batch so `batch.bq`
     # is non-nothing as soon as the bq is returned.  Future batches allocated
