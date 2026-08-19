@@ -194,3 +194,33 @@ The variant itself is kept at `/sim/tmp/bench/apply_defer_always.py`: it makes
 `vk_free!` never destroy inline, on the theory that the four defer branches all
 read a point-in-time fact and then fall through to a destroy nothing serialises
 against a recording starting immediately after.
+
+## Ruled out: deferring every free
+
+The hypothesis was that `vk_free!`'s four defer branches each read a
+point-in-time fact — pinned, in flight, batch recording, wrong thread — and then
+fall through to a `destroy_buffer!` that nothing serialises against a recording
+STARTING immediately afterwards. Removing the fall-through entirely closes that
+gap: hand every free to the owning thread's deferred list and let
+`drain_deferred_frees!` do it at a flush or submit boundary, where no recording
+is open by construction.
+
+Measured on the fast probe, one arm at a time, 15 renders per trial:
+
+| arm | lost | survived |
+|---|---|---|
+| baseline | 5 | 1 |
+| defer-always | 4 | 2 |
+
+No difference. So the inline destroy is not the window, and destruction TIMING
+is not what this is — deferring everything to a quiet boundary fails at the same
+rate as destroying immediately.
+
+That is worth as much as a fix would have been, because it is the hypothesis the
+existing comment points at and it would have cost a day. What it leaves: the
+corruption is not caused by WHEN the buffer is destroyed, so either it is not
+destruction at all (the pool handing a still-referenced block back out through
+`return_to_pool!` would look identical and is untouched by deferring), or the
+reference that matters is captured before any of this and survives the defer.
+
+Patch preserved at `/sim/tmp/bench/apply_defer_always.py`; the tree is reverted.
