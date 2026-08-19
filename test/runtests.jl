@@ -172,6 +172,11 @@ end
         include(joinpath(@__DIR__, "test_select_width_mismatch.jl"))
     end
 
+    # ── Tier 3a5: constant lookup table indexed at runtime (GPU) ──
+    @testset "Tier 3a5: constant table storage class" begin
+        include(joinpath(@__DIR__, "test_const_table_index.jl"))
+    end
+
     # ── Tier 3: GPU Execution ──
     @testset "Tier 3: GPU Execution" begin
         include(joinpath(@__DIR__, "test_handwritten_spirv.jl"))

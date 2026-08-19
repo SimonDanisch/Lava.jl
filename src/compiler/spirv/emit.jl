@@ -8134,10 +8134,25 @@ function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
             error("Could not compute ConstantExpr GEP result type: $val")
         end
 
-        # Determine storage class from the base pointer
+        # Determine the storage class from the base pointer.
+        #
+        # Address space 1 is Julia's for BOTH device pointers and constant
+        # globals, and only the first is `PhysicalStorageBuffer` — a constant
+        # lookup table is `Private`. `get_pointer_storage_class` is where that
+        # distinction lives, so ask it rather than mapping the address space and
+        # getting PSB for a table. The instruction GEP built on top of this
+        # expression already asks it, so reading the raw address space here gave
+        # ONE pointer chain two storage classes and a module `spirv-val` rejects:
+        #
+        #   The result pointer storage class and base pointer storage class in
+        #   OpAccessChain do not match.
+        #
+        # Address space 1 only. The value-level answer for address space 0
+        # differs from the type-level one — a global there traces to "not an
+        # alloca" and so reads as PSB — and nothing has asked for that change.
         base_ty = LLVM.value_type(base)
         as = base_ty isa LLVM.PointerType ? LLVM.addrspace(base_ty) : 0
-        sc = llvm_addrspace_to_storage_class(as)
+        sc = as == 1 ? get_pointer_storage_class(base) : llvm_addrspace_to_storage_class(as)
 
         # Use fresh workgroup types for addrspace(3) to avoid layout decoration conflicts
         result_pointee_spirv = if sc == SC.Workgroup
@@ -8167,6 +8182,28 @@ function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
             array_len = Int64(LLVM.length(source_ty))
             inner_idx = ops[3] isa LLVM.ConstantInt ? convert(Int64, ops[3]) : 0
             flat_offset = first_idx * array_len + inner_idx
+
+            # `OpPtrAccessChain` is not valid in `Private` or `Function`, and the
+            # pointer this expression names has nothing to point at anyway: the
+            # only way a non-zero first index reaches a constant table is Julia's
+            # 1-based fold, where LLVM writes `kern[i]` as a constant pointer one
+            # element BEFORE the table plus the dynamic index —
+            #
+            #   gep float, ptr (gep [5 x float], ptr @c, i64 -1, i64 4), i64 %i
+            #
+            # so `@c - 1` is never loaded from, only added to. Record the offset
+            # as an array-element origin and return the table itself; the GEP
+            # that consumes this folds the two into one `OpAccessChain @c (i-1)`,
+            # which is the instruction that was wanted all along. The fold is the
+            # same one chained array GEPs already use — see the
+            # `array_element_origin` branches in the GEP handler.
+            if sc == SC.Private || sc == SC.Function
+                offset_id = emit_constant_u32!(state.mod,
+                                               reinterpret(UInt32, Int32(flat_offset)))
+                state.array_element_origin[val] = (base_id, UInt32[], offset_id, source_ty)
+                set_pointee_type!(state.type_ctx.ptm, val, result_pointee; priority=4)
+                return base_id
+            end
 
             # Get pointer to element 0
             zero_id = emit_constant_u32!(state.mod, UInt32(0))
