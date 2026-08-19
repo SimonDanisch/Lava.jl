@@ -224,3 +224,51 @@ destruction at all (the pool handing a still-referenced block back out through
 reference that matters is captured before any of this and survives the defer.
 
 Patch preserved at `/sim/tmp/bench/apply_defer_always.py`; the tree is reverted.
+
+## Also ruled out: the pool, and the concurrent dispatch groups
+
+Same probe, same protocol, one arm at a time, 15 renders per trial:
+
+| arm | lost | survived |
+|---|---|---|
+| baseline | 5 | 1 |
+| defer every free | 4 | 2 |
+| `pool_disabled = true` | 4 | 0 |
+| no concurrent groups | 2 | 0 |
+
+**The pool.** `destroy_buffer!` on a pooled chunk calls `return_to_pool!` rather
+than destroying, so a still-referenced block handed back to the next
+`pool_alloc` would look exactly like this. One VkBuffer per allocation removes
+that path entirely, and the fault is unchanged.
+
+**The groups.** `concurrent_dispatch_group` elides the barriers between the
+dispatches inside it and `concurrent_indirect_group` fuses their prepares, so
+the GPU may run them overlapped — a plausible source of nondeterminism in a
+workload whose sampling is deterministic, and where two of the three races found
+in this codebase already lived. Making both wrappers pass-throughs, so every
+dispatch keeps its own barrier and every indirect records its own prepare
+inline, does not help either. (The toggle was verified live in the running
+process, not assumed.)
+
+## Where that leaves it, and the one thing the eliminations point at
+
+Six hypotheses are now dead: missing barrier, unbounded loop, stale BDAs,
+destroy timing, pool reuse, dispatch overlap. What remains has to explain how a
+workload that submits IDENTICAL work every run — the framebuffer sums are
+bit-identical, so this is not in question — fails one run in five.
+
+If the work is fixed and the outcome is not, the varying input is not the work:
+it is the ADDRESS LAYOUT. Allocation order and virtual addresses differ run to
+run, so an out-of-bounds access that usually lands in another live buffer, and
+is therefore invisible, occasionally lands in an unmapped page and takes the
+device.
+
+That reading also explains the pool result, which looked like noise: disabling
+the pool makes it 4/4 rather than 5/6, and one VkBuffer per allocation means
+MORE unmapped gaps between allocations for a stray access to find. Suballocation
+inside a big block hides exactly this.
+
+So the next instrument is GPU-assisted validation with bounds checking
+(`DebugConfig(gpu_av = true, gpu_av_shaders = [...])`), narrowed to the medium
+kernels — with the caveat already in `vk_free!`'s message that GPU-AV can itself
+crash on a workload that kills the device, so it wants narrowing first.
