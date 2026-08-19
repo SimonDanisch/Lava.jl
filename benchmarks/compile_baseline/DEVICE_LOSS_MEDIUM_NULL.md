@@ -307,8 +307,21 @@ class and settles hang-versus-fault immediately — it needs root, which this
 account does not have) or a reading of the lifetime layer deeper than
 elimination can reach.
 
-One measurement worth having first, because it is cheap and would narrow it a
-lot: does the fault survive `EARLY_EXIT_ENABLED[] = false`? That flag makes the
-bounce loop read a device counter and break, which is the one place per render
-where the host observes device state mid-render — and the only remaining source
-of run-to-run variation in an otherwise identical workload.
+### Eight: the early-exit readback
+
+`EARLY_EXIT_ENABLED` makes the bounce loop synchronise every
+`EXIT_CHECK_INTERVAL` rounds and read the ray queue's BAR counter — the one
+place per render where the host observes device state mid-render, and so the
+last remaining source of run-to-run variation in otherwise identical work.
+
+| arm | lost | survived |
+|---|---|---|
+| baseline | 5 | 1 |
+| `EARLY_EXIT_ENABLED[] = false` | 4 | 2 |
+
+Not it either. Recorded with a warning attached, because the first two trials of
+that arm both survived and were briefly written up as the strongest result of
+the night; trials three through six then lost the device four times running. At
+n = 2 the arm read 0/2 against a 5/6 baseline and looked decisive. It was noise.
+Six trials is the minimum that has meant anything on this bug, and even six only
+separates "no effect" from "large effect".
