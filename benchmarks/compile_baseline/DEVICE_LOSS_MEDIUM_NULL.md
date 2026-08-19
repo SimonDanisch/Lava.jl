@@ -272,3 +272,43 @@ So the next instrument is GPU-assisted validation with bounds checking
 (`DebugConfig(gpu_av = true, gpu_av_shaders = [...])`), narrowed to the medium
 kernels — with the caveat already in `vk_free!`'s message that GPU-AV can itself
 crash on a workload that kills the device, so it wants narrowing first.
+
+## And ruled out: an out-of-bounds access
+
+GPU-AV bounds-checks every device access and reports the offending shader
+whether or not that access would have faulted — so unlike sync validation or the
+BDA scan, a silent run here is evidence rather than an absence of luck.
+
+| instrumented | renders | real OOB reports |
+|---|---|---|
+| `gpu_vp_sample_medium_kernel!` | 6 | 0 |
+| trace+shade, shade-material, shadow-rays | 5 | 0 |
+| every shader | 4 | 0 |
+
+`verify_gpu_av()` returned true in each run, so the layer was genuinely
+instrumenting and not silently disabled. Read the logs with care: GPU-AV's own
+self-test writes one byte out of bounds at `0xdefe021a7f` on purpose, and that
+line appears in every clean run. It is the proof the layer fires, not a finding.
+
+So the address-layout reading in the previous section is weakened, not
+confirmed. It survives only in the form GPU-AV cannot see: a PSB pointer that
+stays within SOME live allocation and therefore never trips a bounds check,
+while still being the wrong allocation.
+
+## Seven dead ends, and what that is worth
+
+missing barrier · unbounded loop · stale BDAs · destroy timing · pool reuse ·
+dispatch overlap · out-of-bounds access
+
+Each was plausible, each is now measured rather than argued, and the protocol
+for each is in this file. The next person does not get to spend a day on any of
+them. What is left needs either the kernel log (an NVIDIA Xid names the fault
+class and settles hang-versus-fault immediately — it needs root, which this
+account does not have) or a reading of the lifetime layer deeper than
+elimination can reach.
+
+One measurement worth having first, because it is cheap and would narrow it a
+lot: does the fault survive `EARLY_EXIT_ENABLED[] = false`? That flag makes the
+bounce loop read a device counter and break, which is the one place per render
+where the host observes device state mid-render — and the only remaining source
+of run-to-run variation in an otherwise identical workload.
