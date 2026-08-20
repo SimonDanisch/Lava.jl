@@ -618,6 +618,19 @@ end
             include(joinpath(@__DIR__, "test_indirect_in_concurrent_group.jl"))
         end
         include(joinpath(@__DIR__, "test_crossqueue_sync.jl"))
+        # A recorded copy has to outlive the value that was copied FROM, even
+        # when nothing holds it. Its own file because no render test reaches it:
+        # only device→device from a temporary is affected.
+        @testset "copyto! from a dropped source" begin
+            include(joinpath(@__DIR__, "test_copyto_dropped_source.jl"))
+        end
+        # Who owns a queue from `allocate_batch_queue!`. A dropped one used to
+        # let its timeline semaphore be finalized while buffers still named it,
+        # and the buffer finalizer's `vkGetSemaphoreCounterValue` then segfaulted
+        # inside the driver.
+        @testset "batch queue lifetime" begin
+            include(joinpath(@__DIR__, "test_batch_queue_lifetime.jl"))
+        end
     end
 
     # ── Tier 3j: Phase-M alloc/free regression matrix ──────────────────

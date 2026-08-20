@@ -11,7 +11,7 @@ export CompilationResult, lava_compile, optimize_spirv
 # Debugging & diagnostics. `DebugConfig` is exported because it is the ONLY way
 # to switch validation on — see its docstring; there is no environment variable.
 export vk_reset_device!, dump_state, gpu_memory_usage, trim_gpu_pool!,
-       allocate_batch_queue!, DebugConfig
+       allocate_batch_queue!, release_batch_queue!, DebugConfig
 export ExternalImage, memoryfd
 # Device capability queries: API, but not exported — a kernel library reaches
 # them as `Lava.caps(backend)`, or the individual accessors where only one number
@@ -43,7 +43,8 @@ export TextureBindings, bind_textures
 export ShaderStage, VertexStage, FragmentStage, GeometryStage, TessControlStage, TessEvalStage
 export BlendMode, Opaque, AlphaBlend, Additive, Premultiplied
 export CullFace, NoCull, CullBack, CullFront
-export Topology, TriangleList, TriangleStrip, LineList, LineStrip, PointList, PatchList, LineListAdjacency
+export Topology, TriangleList, TriangleStrip, LineList, LineStrip, PointList, PatchList
+export LineListAdjacency, LineStripAdjacency
 export DepthMode, DepthLess, DepthLessEq, DepthGreater, DepthAlways, DepthOff
 export GeometryConfig, TessConfig
 export TessSpacing, EqualSpacing, FractionalEvenSpacing, FractionalOddSpacing

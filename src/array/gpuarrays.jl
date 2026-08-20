@@ -633,6 +633,34 @@ function Base.copyto!(dest::LavaArray{T}, doffs::Integer,
     dst_offset = dest.buf[].pool_offset + dest.offset + (Int(doffs) - 1) * sizeof(T)
     nbytes = n * sizeof(T)
     bq = (dest.buf[].ctx::VkContext).default_bq
+    # Pin the ARRAYS, not the `VkManagedBuffer`s that `cmd_copy_buffer!` sees.
+    #
+    # It pins what it is given, and it is given `src.buf[]` — so it can only
+    # reach `pin!(::VkManagedBuffer)`, which pushes the object into
+    # `batch.pinned` and makes it REACHABLE. Reachability is not what decides
+    # whether the memory is still ours: the `DataRef` refcount is, and the
+    # array's finalizer releases that. So for
+    #
+    #     copyto!(dst, Adapt.adapt(backend, host_array))
+    #
+    # — no reference to the source survives the call — the GC collects the
+    # source, its ref releases, the pooled block goes back, and the recorded
+    # `vkCmdCopyBuffer` names memory the pool has handed onward. `submit!`
+    # catches it as `sync_access!: buffer is not ALIVE`.
+    #
+    # `pin!(::LavaArray)` is the level that does both halves: it retains the
+    # `DataRef` into `batch.pinned_refs` and takes a buffer pin, and
+    # `release_pinned_refs!` drops both when the batch completes or its submit
+    # fails. Nothing new is needed — every kernel argument already gets exactly
+    # this lifetime through `LavaAdaptor`; only the copy path was pinning a
+    # level too low.
+    #
+    # `ensure_active_batch!` asserts the owning thread before it touches any
+    # state, so hoisting it here keeps the single-writer check ahead of the
+    # driver rather than moving it after.
+    batch = ensure_active_batch!(bq)
+    pin!(batch, src)
+    pin!(batch, dest)
     cmd_copy_buffer!(bq, src.buf[], dest.buf[], nbytes;
                      src_off=src_offset, dst_off=dst_offset)
     # No flush: this is device→device, so nothing on the host needs the result.

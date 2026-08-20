@@ -233,6 +233,7 @@ vk_topology(::LineStrip)     = Vulkan.PRIMITIVE_TOPOLOGY_LINE_STRIP
 vk_topology(::PointList)     = Vulkan.PRIMITIVE_TOPOLOGY_POINT_LIST
 vk_topology(::PatchList)              = Vulkan.PRIMITIVE_TOPOLOGY_PATCH_LIST
 vk_topology(::LineListAdjacency)      = Vulkan.PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY
+vk_topology(::LineStripAdjacency)     = Vulkan.PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY
 
 vk_cull(::NoCull)    = Vulkan.CULL_MODE_NONE
 vk_cull(::CullBack)  = Vulkan.CULL_MODE_BACK_BIT

@@ -232,28 +232,24 @@ function emit_gfx_execution_modes!(mod::SPIRVModule, func_id::UInt32,
     # Vertex stage has no execution modes
 end
 
-function geometry_input_vertex_count(t::Topology)
-    t isa PointList           ? 1 :
-    t isa LineList             ? 2 :
-    t isa LineListAdjacency    ? 4 :
-    t isa TriangleList         ? 3 :
-    error("Unsupported geometry input topology for vertex count: $t")
-end
+geometry_input_vertex_count(::PointList)          = 1
+geometry_input_vertex_count(::LineList)           = 2
+geometry_input_vertex_count(::TriangleList)       = 3
+geometry_input_vertex_count(::LineListAdjacency)  = 4
+geometry_input_vertex_count(::LineStripAdjacency) = 4
 
-function geometry_input_mode(t::Topology)
-    t isa PointList           ? ExecMode.InputPoints :
-    t isa LineList             ? ExecMode.InputLines :
-    t isa LineListAdjacency    ? ExecMode.InputLinesAdjacency :
-    t isa TriangleList         ? ExecMode.Triangles :
-    error("Unsupported geometry input topology: $t")
-end
+geometry_input_mode(::PointList)          = ExecMode.InputPoints
+geometry_input_mode(::LineList)           = ExecMode.InputLines
+geometry_input_mode(::TriangleList)       = ExecMode.Triangles
+# Both adjacency topologies present the geometry stage with the same four-vertex
+# primitive; list vs strip is purely how the index buffer is walked, so SPIR-V
+# has one execution mode for the pair.
+geometry_input_mode(::LineListAdjacency)  = ExecMode.InputLinesAdjacency
+geometry_input_mode(::LineStripAdjacency) = ExecMode.InputLinesAdjacency
 
-function geometry_output_mode(t::Topology)
-    t isa PointList       ? ExecMode.OutputPoints :
-    t isa LineStrip       ? ExecMode.OutputLineStrip :
-    t isa TriangleStrip   ? ExecMode.OutputTriangleStrip :
-    error("Unsupported geometry output topology: $t")
-end
+geometry_output_mode(::PointList)     = ExecMode.OutputPoints
+geometry_output_mode(::LineStrip)     = ExecMode.OutputLineStrip
+geometry_output_mode(::TriangleStrip) = ExecMode.OutputTriangleStrip
 
 function tess_domain_mode(d::TessDomain)
     d isa TessTriangles ? ExecMode.Triangles :

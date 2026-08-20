@@ -18,6 +18,16 @@ mutable struct RenderWindow
     images::Vector{Vulkan.Image}
     views::Vector{Vulkan.ImageView}
     format::Vulkan.Format
+    # What the caller asked for, as opposed to `format`, which is what the
+    # surface actually offered. Kept because `create_swapchain!` runs again on
+    # every resize and would otherwise fall back to the default preference.
+    #
+    # This is the choice of what a shader's output MEANS. `_SRGB` makes the
+    # hardware encode on write, so shaders write linear; `_UNORM` stores the
+    # value as-is, so shaders write display-referred. Either lands on screen
+    # correctly, because the presentation engine decodes sRGB in both cases —
+    # they differ only in which space the renderer works in.
+    preferred_format::Vulkan.Format
     extent::Vulkan.Extent2D
     # Per-frame-in-flight sync (rotating ring buffer)
     image_available::Vector{Vulkan.Semaphore}
@@ -44,13 +54,21 @@ mutable struct RenderWindow
 end
 
 """
-    RenderWindow(width, height; title="Lava", vsync=true)
+    RenderWindow(width, height; title="Lava", vsync=true, color_format=FORMAT_B8G8R8A8_SRGB)
 
 Create a new window with Vulkan surface and swapchain.
+
+`color_format` picks the swapchain format, which decides what a shader writing
+to this window is expected to produce: `_SRGB` takes linear values and encodes
+them in hardware, `_UNORM` takes display-referred values and stores them
+verbatim. Pass `_UNORM` when the pixels being presented have already been
+gamma-encoded, or they get encoded a second time. The surface may not offer the
+requested format, in which case its first advertised one is used.
 """
 function RenderWindow(width::Integer, height::Integer;
                       ctx::VkContext=vk_context(),
-                      title::String="Lava", vsync::Bool=true)
+                      title::String="Lava", vsync::Bool=true,
+                      color_format::Vulkan.Format=Vulkan.FORMAT_B8G8R8A8_SRGB)
 
     # Initialize GLFW (no OpenGL context — we use Vulkan)
     GLFW.Init()
@@ -68,7 +86,7 @@ function RenderWindow(width::Integer, height::Integer;
     win = RenderWindow(
         handle, surface, nothing,
         Vulkan.Image[], Vulkan.ImageView[],
-        Vulkan.FORMAT_B8G8R8A8_SRGB,
+        color_format, color_format,
         Vulkan.Extent2D(width, height),
         Vulkan.Semaphore[], Vulkan.Semaphore[], Vulkan.Fence[],
         1,  # current_frame
@@ -95,11 +113,13 @@ function create_swapchain!(win::RenderWindow; vsync::Bool=true)
     # Query surface capabilities
     caps = unwrap(Vulkan.get_physical_device_surface_capabilities_khr(phys, win.surface))
 
-    # Pick format (prefer B8G8R8A8_SRGB)
+    # Pick the format the window was asked for, falling back to whatever the
+    # surface lists first. Read from the window rather than a default, because
+    # a resize comes back through here and must not undo the caller's choice.
     formats = unwrap(Vulkan.get_physical_device_surface_formats_khr(phys; surface=win.surface))
     chosen_format = formats[1]
     for f in formats
-        if f.format == Vulkan.FORMAT_B8G8R8A8_SRGB &&
+        if f.format == win.preferred_format &&
            f.color_space == Vulkan.COLOR_SPACE_SRGB_NONLINEAR_KHR
             chosen_format = f
             break

@@ -36,7 +36,14 @@ struct LineList      <: Topology end
 struct LineStrip     <: Topology end
 struct PointList     <: Topology end
 struct PatchList          <: Topology end  # for tessellation
-struct LineListAdjacency  <: Topology end  # for geometry shader line processing
+# Both feed a geometry shader four vertices per primitive. They differ in how the
+# index buffer is walked: the LIST form consumes a disjoint group of 4 per
+# primitive, the STRIP form slides a 4-wide window one index at a time. An
+# adjacency index list built for a strip (Makie's polylines: `0 0 1 2 3 3`)
+# yields ⌊n/4⌋ primitives under the list form instead of n-3 — a polyline drawn
+# as scattered dashes.
+struct LineListAdjacency  <: Topology end
+struct LineStripAdjacency <: Topology end
 
 # ── Depth Test ──
 

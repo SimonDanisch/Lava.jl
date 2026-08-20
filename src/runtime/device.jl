@@ -222,6 +222,10 @@ mutable struct BatchQueue{C}
     # to another queue's kernel.
     last_dispatch_info::String
     prev_dispatch_info::String
+    # Which hardware queue of `family_index` this one drives, so
+    # `release_batch_queue!` can hand the slot back. -1 for the primary queue and
+    # for any queue that had to share it because the family ran out.
+    queue_index::Int
 end
 
 function init_batch(cb::Vulkan.CommandBuffer)
@@ -238,7 +242,7 @@ function init_batch(cb::Vulkan.CommandBuffer)
 end
 
 function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32, ctx;
-                    n_initial_batches::Int=2)
+                    n_initial_batches::Int=2, queue_index::Int=-1)
     cmd_pool = Vulkan.CommandPool(device, qf_idx;
         flags=Vulkan.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
     batches = CommandBatch[]
@@ -270,7 +274,8 @@ function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32, 
                     :memory, false, false,                  # barrier mode / elision / one-shot skip
                     false, UInt64[], UInt64[],              # ranges_declared + elision tracker
                     nothing, nothing, UInt64(0),            # deferred indirect, capture, replay watermark
-                    "", "")                                 # last / prev dispatch info
+                    "", "",                                 # last / prev dispatch info
+                    queue_index)
     # Plug the back-reference into every pre-allocated batch so `batch.bq`
     # is non-nothing as soon as the bq is returned.  Future batches allocated
     # lazily (alloc_cmd_buf → init_batch) must set .bq themselves.
@@ -398,6 +403,22 @@ mutable struct VkContext
     # Queue allocation: next available index + total requested from device
     next_queue_index::Int
     max_queue_count::Int
+    # Every queue `allocate_batch_queue!` has handed out and that nobody has
+    # released yet.
+    #
+    # OWNERSHIP, not bookkeeping. A `ManagedBuffer` records `last_write = (bq,
+    # value)` and its finalizer asks that queue's timeline semaphore whether the
+    # GPU is done. Without this list the queue is reachable only from the buffers
+    # that name it, so when a screen and its buffers become garbage together the
+    # semaphore's own finalizer can run FIRST — and then
+    # `vkGetSemaphoreCounterValue` is a use-after-free that segfaults inside the
+    # driver. Holding the queue here means it outlives every buffer allocated on
+    # it, the same argument `caches` makes further down: a field dies with its
+    # context, so nothing outlives the handles it describes.
+    extra_queues::Vector{BatchQueue{VkContext}}
+    # Hardware queue slots handed back by `release_batch_queue!`, reused before
+    # `next_queue_index` advances.
+    free_queue_indices::Vector{Int}
     # Async compute family (distinct from primary). RADV family 1: 4 queues,
     # compute+transfer. Used by the explicit-queue refactor for upload_bq.
     async_queue_family_index::Union{Nothing, UInt32}
@@ -575,6 +596,8 @@ mutable struct VkContext
         ctx.validation = validation
         ctx.next_queue_index = next_queue_index
         ctx.max_queue_count = max_queue_count
+        ctx.extra_queues = BatchQueue{VkContext}[]
+        ctx.free_queue_indices = Int[]
         ctx.async_queue_family_index = async_queue_family_index
         ctx.async_queue_count = async_queue_count
         ctx.device_lost = device_lost
@@ -1689,6 +1712,10 @@ end
 Create a new independent BatchQueue on a separate Vulkan queue (if available).
 Falls back to a separate command pool on the primary queue if all queues are taken.
 Used by Screen for isolated graphics rendering.
+
+The context holds the returned queue until [`release_batch_queue!`](@ref) gives
+it back. Call that when done — a caller that just drops the reference keeps the
+command pool, semaphore and slabs alive for the life of the device.
 """
 function allocate_batch_queue!()
     ctx = vk_context()
@@ -1696,15 +1723,54 @@ function allocate_batch_queue!()
 end
 
 function allocate_batch_queue!(ctx::VkContext)
-    idx = ctx.next_queue_index
+    idx = isempty(ctx.free_queue_indices) ? ctx.next_queue_index : pop!(ctx.free_queue_indices)
     if idx < ctx.max_queue_count
         queue = Vulkan.get_device_queue(ctx.device, ctx.queue_family_index, UInt32(idx))
-        ctx.next_queue_index += 1
+        idx == ctx.next_queue_index && (ctx.next_queue_index += 1)
     else
         # All hardware queues taken — reuse primary queue with separate command pool
         queue = ctx.default_bq.queue
+        idx = -1
     end
-    return BatchQueue(ctx.device, queue, ctx.queue_family_index, ctx)
+    bq = BatchQueue(ctx.device, queue, ctx.queue_family_index, ctx; queue_index = idx)
+    push!(ctx.extra_queues, bq)
+    return bq
+end
+
+"""
+    release_batch_queue!(bq::BatchQueue)
+
+Give a queue from [`allocate_batch_queue!`](@ref) back: drain it, destroy what it
+still holds, and make its hardware slot available again.
+
+Must be called from the queue's owning thread, and only once nothing will record
+on it again — `flush!` below waits for everything already submitted. Releasing
+the context's primary queue is an error; it is not one of the handed-out ones.
+
+Dropping a queue without this is what made the finalizer crash possible: the
+context keeps it alive (see `extra_queues`), so an unreleased queue is a leak of
+a command pool, a semaphore and its argument slabs rather than a dangling
+handle.
+"""
+function release_batch_queue!(bq::BatchQueue)
+    ctx = bq.ctx::VkContext
+    bq === ctx.default_bq &&
+        throw(LavaError("release_batch_queue!", "the context's primary queue cannot be released",
+                        "Only queues from `allocate_batch_queue!` can be given back."))
+    i = findfirst(q -> q === bq, ctx.extra_queues)
+    i === nothing && return nothing   # already released; releasing twice is a no-op
+
+    # Drain before letting go. On a lost device there is nothing to wait for and
+    # every call would fail, so the queue is dropped as-is.
+    if !device_lost(ctx)
+        flush!(bq, ctx.device)
+        drain_deferred_frees!(bq)
+        drain_deferred_as_frees!(bq)
+    end
+
+    deleteat!(ctx.extra_queues, i)
+    bq.queue_index >= 0 && push!(ctx.free_queue_indices, bq.queue_index)
+    return nothing
 end
 
 """Whether this is Mesa's software rasteriser, which every machine here has."""
