@@ -400,10 +400,35 @@ function _precompile_warmup_kernel!(out::LavaDeviceArray{Float32, 1},
     return nothing
 end
 
+# A second shape: struct-valued args, mixed int/float, and an atomic — the
+# emitter specialises differently on each, and real kernels (wavefront queues,
+# reductions) hit these paths far more than the scalar loop above.
+struct _PrecompileWarmupParams
+    scale::Float32
+    count::Int32
+end
+
+function _precompile_warmup_kernel2!(out::LavaDeviceArray{Float32, 1},
+                                     idx::LavaDeviceArray{Int32, 1},
+                                     p::_PrecompileWarmupParams)
+    i = Int(lava_global_invocation_id_x()) + 1
+    if i <= length(out)
+        @inbounds j = idx[i]
+        if j > Int32(0) && j <= Int32(length(out))
+            @inbounds out[j] = out[j] * p.scale + Float32(p.count)
+        end
+    end
+    return nothing
+end
+
 PrecompileTools.@setup_workload begin
     PrecompileTools.@compile_workload begin
         lava_compile_gpu(_precompile_warmup_kernel!,
                          Tuple{LavaDeviceArray{Float32, 1}, LavaDeviceArray{Float32, 1}};
+                         validate = false)
+        lava_compile_gpu(_precompile_warmup_kernel2!,
+                         Tuple{LavaDeviceArray{Float32, 1}, LavaDeviceArray{Int32, 1},
+                               _PrecompileWarmupParams};
                          validate = false)
     end
 end
