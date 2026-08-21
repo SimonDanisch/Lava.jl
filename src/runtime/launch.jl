@@ -469,7 +469,6 @@ function lava_kernel_compile(job::GPUCompiler.CompilerJob)
     # invalidatable as GPUCompiler's codegen.
     #
     # `invoke_in_world` is not inferable, hence the return-type annotation.
-    freeze_world!()
     compiled = invoke_frozen(lava_compile_gpu_from_job, job)::LavaGPUKernel
     lava_disk_cache_store(job.source, job.config.params.workgroup_size, compiled)
     return compiled

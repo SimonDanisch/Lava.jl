@@ -368,12 +368,6 @@ insertions in later-loaded packages.
 `invoke_in_world` is not inferable, so callers should annotate the result with a
 concrete return type where it matters.
 """
-function freeze_world!()
-    _initialization_world[] == typemax(UInt) || return nothing
-    _initialization_world[] = Base.get_world_counter()
-    return nothing
-end
-
 function invoke_frozen(f, args...; kwargs...)
     @inline
     kwargs = merge(NamedTuple(), kwargs)
@@ -383,12 +377,49 @@ function invoke_frozen(f, args...; kwargs...)
     return Base.invoke_in_world(_initialization_world[], Core.kwcall, kwargs, f, args...)
 end
 
+# ── Precompile workload ─────────────────────────────────────────────────────
+#
+# Compile one representative kernel at PRECOMPILE time so the pipeline's native
+# code — GPUCompiler's typeinf/codegen and Lava's own SPIR-V emitter — lands in
+# Lava's package image. Without it, `using Lava` leaves the pipeline cold and the
+# first kernel compile in a session spends ~24 s JITting the COMPILER before it
+# starts on the kernel.
+#
+# DEVICE-FREE BY CONSTRUCTION: `lava_compile_gpu` only reaches `vk_context()`
+# when `enable_ray_query=true`. Precompilation must never touch the driver.
+function _precompile_warmup_kernel!(out::LavaDeviceArray{Float32, 1},
+                                    a::LavaDeviceArray{Float32, 1})
+    i = Int(lava_global_invocation_id_x()) + 1
+    if i <= length(out)
+        acc = 0f0
+        for k in 1:4
+            @inbounds acc += a[i] * Float32(k)
+        end
+        @inbounds out[i] = acc
+    end
+    return nothing
+end
+
+PrecompileTools.@setup_workload begin
+    PrecompileTools.@compile_workload begin
+        lava_compile_gpu(_precompile_warmup_kernel!,
+                         Tuple{LavaDeviceArray{Float32, 1}, LavaDeviceArray{Float32, 1}};
+                         validate = false)
+    end
+end
+
 function __init__()
     # Nothing to reset here any more. The counters and logs this used to zero
     # were module-level `Ref`s and `Vector`s, which meant a device crash during
     # precompilation serialised its wreckage into the pkgimage and poisoned every
     # later session. They are `ctx.diag` fields now, built fresh with the context,
     # so there is nothing that can survive into the image to clear.
+    # Capture BEFORE any other package loads. The precompile workload above put
+    # the pipeline's native code in THIS package image; a later-loaded package
+    # defining methods can invalidate it, and then the first compile re-JITs the
+    # compiler. Freezing here keeps that precompiled code live.
+    _initialization_world[] = Base.get_world_counter()
+
     init_pipeline_thread!()
 
     # Mark device as lost during shutdown so GC finalizers don't call into
