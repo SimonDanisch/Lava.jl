@@ -344,6 +344,45 @@ function dump_state(; io::IO=stdout)
     return nothing
 end
 
+# ── Frozen world ────────────────────────────────────────────────────────────
+#
+# Same construction as CUDACore (`CUDACore/src/initialization.jl`) and cuTile
+# (`cuTile.jl:invoke_frozen`). The compilation pipeline — GPUCompiler's
+# typeinf/codegen AND Lava's own SPIR-V emitter — is precompiled into package
+# images, but a method defined by any later-loaded package can invalidate that
+# native code, so the first kernel compile in a session pays to re-JIT the
+# COMPILER before it even starts compiling the kernel. Running the pipeline in
+# the world captured at `__init__` keeps the precompiled code live.
+#
+# Defaults to `typemax(UInt)` so that during precompilation, before `__init__`
+# has run, `invoke_in_world` clamps to the current world and behaves normally.
+const _initialization_world = Ref{UInt}(typemax(UInt))
+
+"""
+    invoke_frozen(f, args...; kwargs...)
+
+Invoke `f(args...; kwargs...)` in the world captured at `__init__` time, so
+precompiled native code for the compilation pipeline stays usable across method
+insertions in later-loaded packages.
+
+`invoke_in_world` is not inferable, so callers should annotate the result with a
+concrete return type where it matters.
+"""
+function freeze_world!()
+    _initialization_world[] == typemax(UInt) || return nothing
+    _initialization_world[] = Base.get_world_counter()
+    return nothing
+end
+
+function invoke_frozen(f, args...; kwargs...)
+    @inline
+    kwargs = merge(NamedTuple(), kwargs)
+    if isempty(kwargs)
+        return Base.invoke_in_world(_initialization_world[], f, args...)
+    end
+    return Base.invoke_in_world(_initialization_world[], Core.kwcall, kwargs, f, args...)
+end
+
 function __init__()
     # Nothing to reset here any more. The counters and logs this used to zero
     # were module-level `Ref`s and `Vector`s, which meant a device crash during
