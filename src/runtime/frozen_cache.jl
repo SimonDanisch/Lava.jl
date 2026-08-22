@@ -98,6 +98,69 @@ function frozen_eligible(@nospecialize(f))
     return Base.PkgId(Base.moduleroot(parentmodule(typeof(f)))).uuid !== nothing
 end
 
+
+# ── Automatic bounding ──────────────────────────────────────────────────────
+#
+# `frozen_prune!` is documented as deliberately manual, and that was right while
+# the cache was opt-in. It is on by default now, so "grows forever" became the
+# DEFAULT behaviour: every source edit mints a new build id and therefore a fresh
+# set of entries, and nothing reclaims the old ones. Measured here mid-session:
+# 1541 entries / 1.6 GB, from one project.
+#
+# cuTile bounds its disk cache the same way (`DiskCache`: prune at a 90 % high
+# water mark down to 75 %). This is that, adapted to plain files: check ONCE per
+# session, on the first store, and only when over the cap. One readdir+stat pass
+# against a compile that costs seconds is free.
+#
+# Recency is the right proxy for usefulness: a live entry is re-read (and its
+# `.bin` rewritten) whenever it is hit, while an entry orphaned by an edit is
+# never touched again.
+const FROZEN_PRUNED = Ref(false)
+
+"""Byte budget for the frozen cache. `LAVA_FROZEN_MAX_BYTES` overrides; 0 disables."""
+frozen_max_bytes() = parse(Int, get(ENV, "LAVA_FROZEN_MAX_BYTES", string(2 * 1024^3)))
+
+"""
+    frozen_prune_once!(ctx)
+
+Bound the frozen cache to `frozen_max_bytes()`, at most once per session.
+
+Budgeted in BYTES, not entries: entries here average ~2 MB (SPIR-V plus the
+per-kernel pipeline blob) but RT stages are far larger than compute kernels, so
+an entry count is a poor proxy for disk. Measured: 817 entries occupying 1.6 GB.
+
+Deletes oldest-first down to 75 % of the budget, so it does not re-trigger every
+session — the same high/low water shape cuTile's `DiskCache` uses.
+"""
+function frozen_prune_once!(ctx::VkContext)
+    FROZEN_PRUNED[] && return nothing
+    FROZEN_PRUNED[] = true
+    dir = frozen_cache_dir()
+    isdir(dir) || return nothing
+    budget = frozen_max_bytes()
+    budget <= 0 && return nothing                    # explicit opt-out
+    entries = filter(f -> endswith(f, ".spirv"), readdir(dir))
+    isempty(entries) && return nothing
+    # Size of an entry is its .spirv plus the .bin beside it, if any.
+    entry_bytes(f) = filesize(joinpath(dir, f)) +
+                     filesize(joinpath(dir, replace(f, r"\.spirv$" => ".bin")))
+    total = sum(entry_bytes, entries)
+    total <= budget && return nothing
+    # Newest first; keep as many as fit in 75 % of the budget.
+    sort!(entries; by = f -> mtime(joinpath(dir, f)), rev = true)
+    target = (budget * 3) ÷ 4
+    acc = 0
+    keep = 0
+    for f in entries
+        acc += entry_bytes(f)
+        acc > target && break
+        keep += 1
+    end
+    removed = frozen_prune!(; keep, ctx)
+    @debug "Lava: pruned frozen kernel cache" bytes_before=total budget keep removed
+    return nothing
+end
+
 """When true, kernels compiled the slow way are written to the frozen cache."""
 const FROZEN_RECORDING = Ref(false)
 
@@ -340,6 +403,7 @@ function frozen_store(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workg
                       compiled::LavaGPUKernel)
     (FROZEN_RECORDING[] && !isempty(FROZEN_VERSION[])) || return nothing
     frozen_eligible(f) || return nothing
+    frozen_prune_once!(ctx)
     dir = frozen_cache_dir()
     mkpath(dir)
     key = frozen_key(f, tt, workgroup_size)
