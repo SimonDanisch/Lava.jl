@@ -555,9 +555,17 @@ const FROZEN_RT_MEM = Dict{Tuple{DataType, DataType, Symbol, Symbol, Int}, Any}(
 function frozen_rt_key(@nospecialize(f), @nospecialize(tt), stage::Symbol,
                        payload_type::Symbol, push_constant_size::Integer)
     F = typeof(f)
+    # Same build-id mix as `frozen_key`, and for the same reason: without it a
+    # changed shader body under an unchanged signature keeps its key and is
+    # served stale SPIR-V. This key used to hash only types, stage, payload and
+    # push-constant size, which was survivable while the cache was opt-in and is
+    # not now that it is on by default.
+    bids = hash(Base.module_build_id(parentmodule(F)),
+                hash(Base.module_build_id(@__MODULE__)))
     h = hash(typestring(tt),
              hash(typestring(F),
-                  hash(stage, hash(payload_type, hash(push_constant_size)))))
+                  hash(stage, hash(payload_type,
+                       hash(push_constant_size, hash(FROZEN_LAYOUT, bids))))))
     sanitize(s) = replace(s, r"[^A-Za-z0-9_]" => "_")
     mod = sanitize(string(parentmodule(F)))
     fn = sanitize(string(nameof(F)))
@@ -574,6 +582,7 @@ The frozen SPIR-V for an RT stage, without running the compiler.
 function frozen_rt_load(@nospecialize(f), @nospecialize(tt), stage::Symbol,
                         payload_type::Symbol, push_constant_size::Integer)
     isempty(FROZEN_VERSION[]) && return nothing
+    frozen_eligible(f) || return nothing
     memkey = (typeof(f), tt, stage, payload_type, Int(push_constant_size))
     hit = get(FROZEN_RT_MEM, memkey, nothing)
     hit === nothing || return hit
@@ -604,6 +613,7 @@ function frozen_rt_store(@nospecialize(f), @nospecialize(tt), stage::Symbol,
                          payload_type::Symbol, push_constant_size::Integer,
                          shader::LavaRTShader)
     (FROZEN_RECORDING[] && !isempty(FROZEN_VERSION[])) || return nothing
+    frozen_eligible(f) || return nothing
     dir = frozen_cache_dir()
     mkpath(dir)
     key = frozen_rt_key(f, tt, stage, payload_type, push_constant_size)
