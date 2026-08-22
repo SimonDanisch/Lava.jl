@@ -439,6 +439,19 @@ function __init__()
     # precompilation serialised its wreckage into the pkgimage and poisoned every
     # later session. They are `ctx.diag` fields now, built fresh with the context,
     # so there is nothing that can survive into the image to clear.
+    # Frozen kernel cache ON by default. The key already mixes in
+    # `Base.module_build_id` of both the kernel's defining module and Lava, so a
+    # changed kernel body produces a different key; `frozen_eligible` restricts
+    # it to package modules, whose build ids actually move (Main's does not --
+    # measured: an edited Main kernel was served stale SPIR-V).
+    #
+    # This is what makes a package's SECOND session cheap: Hikari's 45-kernel
+    # scene goes 31.5 s -> 20.1 s, and per frozen_cache.jl crown's hw_accel
+    # startup ~1063 s -> ~123 s. Recording costs nothing measurable (31.9 s vs
+    # 31.5 s), so both halves are on.
+    FROZEN_VERSION[] = "1"
+    FROZEN_RECORDING[] = true
+
     # Capture BEFORE any other package loads. The precompile workload above put
     # the pipeline's native code in THIS package image; a later-loaded package
     # defining methods can invalidate it, and then the first compile re-JITs the

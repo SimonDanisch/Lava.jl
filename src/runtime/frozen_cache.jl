@@ -75,6 +75,29 @@ cache_io_error(ex) = ex isa Union{SystemError, Base.IOError, EOFError,
                                   ArgumentError, UndefVarError, TypeError,
                                   MethodError}
 
+
+"""
+    frozen_eligible(f) -> Bool
+
+Is this kernel's defining module one whose build id actually MOVES when its
+source changes?
+
+`frozen_key` mixes in `Base.module_build_id(parentmodule(typeof(f)))`, and that
+is the whole reason a changed kernel body produces a different key. It only holds
+for modules loaded from a package image. `Main` — a script, `include`, or the
+REPL — keeps ONE build id for the entire session AND across sessions, so a
+redefined kernel there hits the previous entry and is served stale SPIR-V.
+
+Measured, not assumed: a Main-defined kernel edited from `2i` to `3i` came back
+with the old `2i` result, `build_id(Main)` byte-identical across both runs. That
+is why the cache cannot simply be switched on globally.
+
+Packages have a UUID and Main does not, which is exactly the distinction needed.
+"""
+function frozen_eligible(@nospecialize(f))
+    return Base.PkgId(Base.moduleroot(parentmodule(typeof(f)))).uuid !== nothing
+end
+
 """When true, kernels compiled the slow way are written to the frozen cache."""
 const FROZEN_RECORDING = Ref(false)
 
@@ -282,6 +305,7 @@ asking Julia to infer anything.
 """
 function frozen_load(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workgroup_size)
     isempty(FROZEN_VERSION[]) && return nothing
+    frozen_eligible(f) || return nothing
     memkey = (typeof(f), tt, workgroup_size)
     hit = get(ctx.caches.frozen_mem, memkey, nothing)
     hit === nothing || return hit
@@ -315,6 +339,7 @@ Write a compiled kernel under its frozen key. Only while recording.
 function frozen_store(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workgroup_size,
                       compiled::LavaGPUKernel)
     (FROZEN_RECORDING[] && !isempty(FROZEN_VERSION[])) || return nothing
+    frozen_eligible(f) || return nothing
     dir = frozen_cache_dir()
     mkpath(dir)
     key = frozen_key(f, tt, workgroup_size)
