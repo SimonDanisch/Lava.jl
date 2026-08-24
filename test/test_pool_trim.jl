@@ -48,6 +48,71 @@ const KA = KernelAbstractions
     @test all(Array(b) .== 2.0f0)
 end
 
+# The case the testset above cannot reach, and the one that mattered.
+#
+# It calls `KA.synchronize` before dropping its arrays, so every buffer's
+# timeline value has already signalled, `vk_free!` destroys each on the spot, and
+# the trim finds empty blocks. Drop them while a batch is still *recording* and
+# nothing is destroyed at all: `vk_free!` takes its `pins > 0` branch, sets
+# `free_requested` and returns, and the block keeps its `live_count` until the
+# flush inside `quiesce_before_reclaim!` releases the pin. (A buffer with
+# in-flight work takes a third branch onto `deferred_frees`, released by the
+# drain in the same call.)
+#
+# `trim_gpu_pool!` used to gate on `any(b -> b.live_count == 0, blocks)` *before*
+# that call — a precondition it establishes itself — so it returned `(0, 0)` and
+# kept everything. A graph evaluator is nothing but this shape, dispatches
+# recorded and not flushed until the output is read: TRELLIS.2's 30-block torso
+# left 190 blocks and 12 410 MiB resident with 0 blocks empty, and 12 750 MiB of
+# it was reclaimable. Nothing had leaked; the trim was refusing to look.
+#
+# 60 unsynchronised dispatches is the smallest thing that reproduces it, and the
+# assertion is on the state *before* the trim as well as the bytes after, so this
+# fails loudly if a future change makes the workload stop reproducing rather than
+# passing on a technicality.
+@testset "an explicit trim flushes before it decides there is nothing to do" begin
+    be = LavaBackend()
+    ctx = Lava.vk_context()
+    Lava.trim_gpu_pool!(ctx)                  # from a known floor
+
+    @kernel function grind!(a)
+        i = @index(Global)
+        x = a[i]
+        for _ in 1:2000
+            x = x * 1.0000001f0 + 1f-7
+        end
+        a[i] = x
+    end
+
+    let arrays = Lava.LavaArray[]
+        for _ in 1:60
+            a = KA.allocate(be, Float32, 4_000_000)          # 16 MB
+            fill!(a, 1.0f0)
+            grind!(be, 256)(a; ndrange = length(a))          # recorded, NOT synchronised
+            push!(arrays, a)
+        end
+        empty!(arrays)
+    end
+    GC.gc(true)
+
+    grown = Lava.gpu_live_bytes()
+    @test grown > 256 * 1024 * 1024
+    # The state the old gate mishandled — every block still counted as live even
+    # though every reference to its contents is gone.
+    @test !any(b -> b.live_count == 0, Lava.pool(ctx).blocks)
+
+    blocks, bytes = Lava.trim_gpu_pool!(ctx)
+    @test blocks > 0
+    @test bytes > 0
+    @test Lava.gpu_live_bytes() < grown ÷ 2
+
+    # And the allocator still works — blocks were returned, not corrupted.
+    b = KA.allocate(be, Float32, 1024)
+    fill!(b, 2.0f0)
+    KA.synchronize(be)
+    @test all(Array(b) .== 2.0f0)
+end
+
 @testset "trim is rate-limited" begin
     ctx = Lava.vk_context()
     Lava.pool(Lava.vk_context()).last_trim = time()            # just trimmed

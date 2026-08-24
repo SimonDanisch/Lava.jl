@@ -535,6 +535,12 @@ end
             include(joinpath(@__DIR__, "test_pool_trim.jl"))
         end
 
+        # Was never included, and had been throwing `UndefVarError` on the first
+        # line of every testset since the deferred-free list went per-BatchQueue.
+        @testset "rapid alloc/free" begin
+            include(joinpath(@__DIR__, "test_rapid_alloc_free.jl"))
+        end
+
         @testset "frozen RT cache" begin
             include(joinpath(@__DIR__, "test_frozen_rt_cache.jl"))
         end
