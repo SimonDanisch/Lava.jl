@@ -209,6 +209,35 @@ caller is about to do a heavy synchronous operation anyway.
 # five seconds; unbounded pool growth is the worse of the two, but not by so much
 # that it justifies a hitch per frame.
 
+"""
+    reclaimable(ctx) -> Bool
+
+Whether the *automatic* trim could return anything without flushing.
+
+Two things make a block empty. It may already be, or the release may be sitting
+on a `deferred_frees` list: a sub-allocation's finalizer moves the buffer
+ALIVE → DEFERRED, and the `live_count` it holds is not given back until
+`drain_deferred_frees!` runs inside `quiesce_before_reclaim!` — after the gate.
+So `any(b -> b.live_count == 0, blocks)` on its own is a precondition the trim
+establishes, and gating on it alone means declining to look.
+
+**This deliberately does not see the third case**, which is a buffer pinned by a
+batch that is still recording: `vk_free!` takes the `pins > 0` branch, sets
+`free_requested` and returns, and only the flush inside
+`quiesce_before_reclaim!` releases it. Detecting that would make the automatic
+path flush whenever a batch is open, which for a render loop is a stall every
+`trim_min_interval`. [`trim_gpu_pool!`](@ref) is the caller that wants it and
+pays for it explicitly.
+"""
+function reclaimable(ctx::VkContext)
+    p = pool(ctx)
+    any(b -> b.live_count == 0, p.blocks) && return true
+    bq = ctx.default_bq
+    return lock(bq.deferred_frees_lock) do
+        !isempty(bq.deferred_frees) || !isempty(bq.deferred_as_frees)
+    end
+end
+
 function maybe_trim_pool!(ctx::VkContext)
     p = pool(ctx)
     p.live_bytes[] < p.trim_threshold && return
@@ -217,12 +246,12 @@ function maybe_trim_pool!(ctx::VkContext)
     p.last_trim = now
 
     GC.gc(false)
-    if !any(b -> b.live_count == 0, p.blocks)
+    if !reclaimable(ctx)
         # Nothing reclaimable *yet*; the finalizers may simply not have run.
         now - p.last_full_gc < p.trim_full_gc_interval && return
         p.last_full_gc = now
         GC.gc(true)
-        any(b -> b.live_count == 0, p.blocks) || return
+        reclaimable(ctx) || return
     end
     bq = ctx.default_bq
     quiesce_before_reclaim!(bq)
@@ -242,12 +271,27 @@ batch of work and want the memory back" — and for measuring, where dead pool
 capacity otherwise counts as live and makes a VRAM figure depend on GC timing
 rather than on demand.
 
-Runs a full collection first: blocks become empty only when their
-sub-allocations' finalizers have run.
+Runs a full collection and then `quiesce_before_reclaim!` — a flush, a wait and a
+drain — **unconditionally**, because that is the request. It used to return early
+unless some block already read `live_count == 0`, and that gate is a precondition
+the flush and the drain establish: a buffer pinned by a recording batch, or one
+already moved onto a `deferred_frees` list, holds its count until then, and
+between them that is everything a graph evaluator allocates.
+
+The measurement, on a plain KA workload of 60 dispatches never synchronised:
+15 blocks, 964 MiB live, **0** blocks empty, so the old code returned `(0, 0)`
+and kept all of it. Flushing first made 15 of 15 empty and handed back 960 MiB,
+leaving 4 MiB. TRELLIS.2's 30-block torso was the same fault at scale — 190
+blocks and 12 410 MiB resident, of which 12 750 MiB was reclaimable — and it is
+why a second model in one session hit the allocator's failure path with the
+memory for it free.
+
+The automatic path keeps the cheap gate; see [`reclaimable`](@ref). This one is
+the explicit "I have finished and want the memory back", so it pays the stall.
 """
 function trim_gpu_pool!(ctx::VkContext = vk_context())
     GC.gc(true)
-    any(b -> b.live_count == 0, pool(ctx).blocks) || return (0, 0)
+    isempty(pool(ctx).blocks) && return (0, 0)
     bq = ctx.default_bq
     quiesce_before_reclaim!(bq)
     return reclaim_empty_pool_blocks!(bq)
