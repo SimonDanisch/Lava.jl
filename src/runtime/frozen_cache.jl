@@ -77,6 +77,24 @@ cache_io_error(ex) = ex isa Union{SystemError, Base.IOError, EOFError,
 
 
 """
+Modules WITHOUT a package identity that may use the frozen cache anyway.
+
+[`frozen_eligible`](@ref) refuses `Main` because its build id is constant across
+sessions, so an edited kernel is served stale SPIR-V — the measurement is over
+there. A test does not have that problem: it writes under a version string it
+mints fresh on every run and clears afterwards, so nothing it stores outlives it.
+Without this the store path is simply unreachable from a test file, since every
+kernel defined at the top level of one belongs to `Main` — which is how the
+frozen-cache tests came to assert `stores >= 2` against a constant 0.
+
+Names MODULES rather than being a boolean on purpose: opting one test file in
+must not opt in every script in the session.
+
+    push!(Lava.FROZEN_UNPACKAGED, @__MODULE__)
+"""
+const FROZEN_UNPACKAGED = Set{Module}()
+
+"""
     frozen_eligible(f) -> Bool
 
 Is this kernel's defining module one whose build id actually MOVES when its
@@ -93,9 +111,13 @@ with the old `2i` result, `build_id(Main)` byte-identical across both runs. That
 is why the cache cannot simply be switched on globally.
 
 Packages have a UUID and Main does not, which is exactly the distinction needed.
+
+See [`FROZEN_UNPACKAGED`](@ref) for the one deliberate way past this.
 """
 function frozen_eligible(@nospecialize(f))
-    return Base.PkgId(Base.moduleroot(parentmodule(typeof(f)))).uuid !== nothing
+    m = Base.moduleroot(parentmodule(typeof(f)))
+    m in FROZEN_UNPACKAGED && return true
+    return Base.PkgId(m).uuid !== nothing
 end
 
 

@@ -25,6 +25,16 @@ end
     back = LavaBackend()
     version = "test-" * string(hash(time()); base = 16)[1:8]
 
+    # THE STORE PATH IS UNREACHABLE FROM A TEST FILE WITHOUT THIS. `frozen_store`
+    # is handed the `gpu_`-prefixed function KA generates, and for a kernel
+    # written at the top level of this file that function belongs to `Main`,
+    # which `frozen_eligible` refuses — correctly, since Main's build id never
+    # moves. Every assertion below on `stores` or on files appearing was
+    # therefore comparing against a constant 0 from the moment the guard landed.
+    # Opting this module in is the sanctioned way past it; the version string is
+    # minted fresh above and cleared below, so nothing here can go stale.
+    push!(Lava.FROZEN_UNPACKAGED, @__MODULE__)
+
     a = KA.allocate(back, Float32, 256); fill!(a, 2.0f0)
     b = KA.allocate(back, Float32, 256); fill!(b, 3.0f0)
     out = KA.allocate(back, Float32, 256)
@@ -90,6 +100,30 @@ end
         Lava.FROZEN_VERSION[] = ""
     end
 
+    @testset "a module with no package identity is refused" begin
+        # The guard itself, asserted rather than assumed — this is what the opt-in
+        # at the top of the file is suspending, and it is the reason the cache can
+        # be on by default at all.
+        delete!(Lava.FROZEN_UNPACKAGED, @__MODULE__)
+        try
+            Lava.frozen_clear!(version = version)
+            Lava.frozen_reset_stats!()
+            Lava.with_frozen_recording(version) do
+                frozentest_scale!(back)(out, a, 3.0f0; ndrange = 256)
+                KA.synchronize(back)
+            end
+            @test Lava.frozen_stats().stores == 0        # refused, silently
+            @test isempty(filter(f -> endswith(f, "_v$(version).spirv"),
+                                 readdir(Lava.frozen_cache_dir())))
+            # …and the kernel still RAN. Declining to cache is not declining to work.
+            @test all(==(6.0f0), Array(out))
+        finally
+            push!(Lava.FROZEN_UNPACKAGED, @__MODULE__)
+            Lava.frozen_clear!(version = version)
+            Lava.FROZEN_VERSION[] = ""
+        end
+    end
+
     @testset "a bumped version invalidates, and nothing else does" begin
         # The version is part of the filename, so an entry written under one is
         # simply not found under another — the whole invalidation story.
@@ -130,6 +164,10 @@ end
         Lava.frozen_clear!(version = version)
         Lava.FROZEN_VERSION[] = ""
     end
+
+    # Hand the guard back. Leaving `Main` opted in would let any later test file's
+    # kernels reach the cache, which is the staleness this whole thing prevents.
+    delete!(Lava.FROZEN_UNPACKAGED, @__MODULE__)
 end
 
 @testset "pipeline cache header validation" begin
