@@ -685,7 +685,7 @@ function vk_free!(buf::VkManagedBuffer)
     if lw !== nothing
         bq = lw[1]::BatchQueue
         val = lw[2]::UInt64
-        if !device_lost(bq.ctx::VkContext)
+        if !device_lost(bq.ctx::VkContext) && !queue_released(bq)
             # query_timeline rethrows on healthy-device failure.  We are
             # inside a finalizer-reachable path: a throw here is logged by
             # Julia's finalizer machinery rather than propagating.

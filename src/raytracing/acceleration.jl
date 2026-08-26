@@ -24,7 +24,34 @@ mutable struct LavaBLAS
     # own `last_write` tracks in-flight usage, so their VkManagedBuffers
     # are also timeline-gated when the BLAS is finalized.
     preserves::Vector{LavaArray}
+
+    # ── Refit support (MODE_UPDATE_KHR), only populated when built with
+    # `allow_update=true`.
+    #
+    # Opt-in per BLAS and NOT the default, because ALLOW_UPDATE makes the driver
+    # build a lower-quality BVH: every static scene would pay traversal
+    # performance for a capability it never uses, which would move the pbrt and
+    # crown benchmark numbers. A deforming mesh promotes itself by rebuilding
+    # once with this set, then refits from then on.
+    allow_update::Bool
+    # Scratch for MODE_UPDATE_KHR, queried at build time. Smaller than build
+    # scratch; 0 means this BLAS is not refit-capable.
+    update_scratch_size::UInt64
+    # The geometry a refit re-issues. Vertices are rewritten in place, so the
+    # buffer and its device address survive and the driver's retained VAs stay
+    # valid. Topology cannot change: `MODE_UPDATE_KHR` keeps the tree and only
+    # refits bounds, so triangle count and index buffer are fixed at build.
+    vertex_arr::Union{Nothing, LavaArray{UInt8, 1}}
+    index_addr::UInt64
+    n_triangles::UInt32
+    max_vertex::UInt32
+    geo_flags::UInt32
 end
+
+# A BLAS with no refit support — what the AABB and pooled builders produce.
+LavaBLAS(accel, storage, address, preserves) =
+    LavaBLAS(accel, storage, address, preserves,
+             false, UInt64(0), nothing, UInt64(0), UInt32(0), UInt32(0), UInt32(0))
 
 """
     LavaTLAS
@@ -205,7 +232,7 @@ Build a bottom-level acceleration structure. Records into `ctx`'s command buffer
 Must be called inside `as_build()`.
 """
 function build_blas(ctx::ASBuildContext, vertices::Vector{NTuple{3,Float32}}, indices::Vector{UInt32};
-                    opaque::Bool=true)
+                    opaque::Bool=true, allow_update::Bool=false)
     bq = ctx.bq
     dev = as_device(ctx)
 
@@ -222,6 +249,9 @@ function build_blas(ctx::ASBuildContext, vertices::Vector{NTuple{3,Float32}}, in
     vstride = UInt64(sizeof(NTuple{3,Float32}))
     itype = UInt32(Vulkan.INDEX_TYPE_UINT32)
     build_flags = UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
+    if allow_update
+        build_flags |= UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)
+    end
     geo_flags = opaque ? UInt32(Vulkan.GEOMETRY_OPAQUE_BIT_KHR) : UInt32(0)
 
     geom = TrianglesGeometry(; vertex_format=vfmt, vertex_addr, vertex_stride=vstride,
@@ -260,8 +290,97 @@ function build_blas(ctx::ASBuildContext, vertices::Vector{NTuple{3,Float32}}, in
     if (ctx.bq.ctx::Lava.VkContext).diag.alloc_debug
         push!(Lava.ALLOC_DEBUG_LOG, (kind=:blas_as, addr=as_addr, size=0, pool=false))
     end
-    blas = LavaBLAS(accel, storage, as_addr, blas_preserves)
+    blas = LavaBLAS(accel, storage, as_addr, blas_preserves,
+                    allow_update,
+                    allow_update ? UInt64(sizes.update_scratch_size) : UInt64(0),
+                    allow_update ? vertex_arr : nothing,
+                    index_addr, n_triangles, max_vertex, geo_flags)
     finalizer(unsafe_free!, blas)
+    return blas
+end
+
+"""
+    refit_blas!(ctx::ASBuildContext, blas::LavaBLAS,
+                vertices::Vector{NTuple{3,Float32}})
+
+Update a BLAS in place via `MODE_UPDATE_KHR` after its vertices moved. Reuses
+the AS storage and the original vertex buffer, so the device addresses the
+driver retained stay valid.
+
+The BLAS must have been built with `allow_update=true`, and `vertices` must have
+the same length as at build time: `MODE_UPDATE_KHR` refits the existing tree and
+cannot change topology.
+
+Refitting keeps the tree the mesh was built with, so traversal quality decays as
+the geometry moves away from that pose. Callers animating a mesh should rebuild
+periodically rather than refit forever.
+
+Errors loudly on misuse.
+"""
+function refit_blas!(ctx::ASBuildContext, blas::LavaBLAS,
+                     vertices::Vector{NTuple{3,Float32}})
+    blas.allow_update || error(
+        "refit_blas!: BLAS was built with allow_update=false; cannot refit. " *
+        "Rebuild it via build_blas(...; allow_update=true).")
+    blas.update_scratch_size > 0 || error(
+        "refit_blas!: cached update_scratch_size is 0; the BLAS is not refit-capable.")
+    vertex_arr = blas.vertex_arr
+    vertex_arr === nothing && error(
+        "refit_blas!: no vertex buffer retained; the BLAS is not refit-capable.")
+    bytes = collect(reinterpret(UInt8, vertices))
+    length(bytes) == length(vertex_arr) || error(
+        "refit_blas!: vertex count changed ($(length(bytes)) bytes vs " *
+        "$(length(vertex_arr)) at build). MODE_UPDATE_KHR cannot change " *
+        "topology — rebuild the BLAS instead.")
+
+    bq = ctx.bq
+    dev = as_device(ctx)
+
+    # Rewrite in place. The address must not move: the driver may hold VAs into
+    # this buffer from the original build.
+    copyto!(vertex_arr, bytes)
+
+    build_flags = UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR) |
+                  UInt32(Vulkan.BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)
+
+    scratch_arr = LavaArray{UInt8,1}(undef, (max(Int(blas.update_scratch_size), 16),);
+                                      bq, extra_usage=AS_SCRATCH_USAGE, scratch=true)
+    scratch_addr = bda_address(scratch_arr)
+    push!(ctx.preserves, scratch_arr)
+
+    geom = TrianglesGeometry(;
+        vertex_format=UInt32(Vulkan.FORMAT_R32G32B32_SFLOAT),
+        vertex_addr=bda_address(vertex_arr),
+        vertex_stride=UInt64(sizeof(NTuple{3,Float32})),
+        max_vertex=blas.max_vertex,
+        index_type=UInt32(Vulkan.INDEX_TYPE_UINT32),
+        index_addr=blas.index_addr,
+        transform_addr=UInt64(0))
+
+    # Same barrier reasoning as refit_tlas!: the vertex rewrite above is a
+    # transfer write that the AS build has to see, and a previous build/refit of
+    # this same AS has to have finished.
+    cmd = as_cmd_buf(ctx)
+    pre_barrier = Vulkan.MemoryBarrier(
+        C_NULL,
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+        Vulkan.ACCESS_SHADER_WRITE_BIT |
+        Vulkan.ACCESS_TRANSFER_WRITE_BIT,
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+        Vulkan.ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+    )
+    Vulkan.cmd_pipeline_barrier(
+        cmd, [pre_barrier], [], [];
+        src_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                       Vulkan.PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                       Vulkan.PIPELINE_STAGE_TRANSFER_BIT,
+        dst_stage_mask=Vulkan.PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+    )
+
+    build_as_on_gpu(ctx, blas.accel, scratch_addr, geom;
+        as_type=UInt32(1), build_flags,
+        geo_flags=blas.geo_flags, primitive_count=blas.n_triangles,
+        mode=UInt32(1), src_as=blas.accel)   # MODE_UPDATE_KHR, in place
     return blas
 end
 
@@ -945,10 +1064,13 @@ function build_as_on_gpu(ctx::ASBuildContext, accel::Vulkan.AccelerationStructur
                          scratch_addr::UInt64, geom::GeometryType;
                          as_type::UInt32, build_flags::UInt32=UInt32(0),
                          primitive_count::UInt32=UInt32(0),
-                         geo_flags::UInt32=UInt32(0))
+                         geo_flags::UInt32=UInt32(0),
+                         mode::UInt32=UInt32(0),
+                         src_as::Union{Nothing, Vulkan.AccelerationStructureKHR}=nothing)
     geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
     pack_geometry!(geo_buf, 0, geom; geo_flags)
-    build_as_on_gpu_impl(ctx, accel, scratch_addr, geo_buf, as_type, build_flags, primitive_count)
+    build_as_on_gpu_impl(ctx, accel, scratch_addr, geo_buf, as_type, build_flags,
+                         primitive_count, mode, src_as)
 end
 
 # Legacy keyword-dispatch overload; used by the `:instances` path in build_tlas.
@@ -959,12 +1081,17 @@ function build_as_on_gpu(ctx::ASBuildContext, accel::Vulkan.AccelerationStructur
                          kwargs...)
     geo_buf = zeros(UInt8, C_SIZEOF_AS_GEOMETRY_KHR)
     pack_geometry!(geo_buf, 0; kwargs...)
-    build_as_on_gpu_impl(ctx, accel, scratch_addr, geo_buf, as_type, build_flags, primitive_count)
+    build_as_on_gpu_impl(ctx, accel, scratch_addr, geo_buf, as_type, build_flags,
+                         primitive_count, UInt32(0), nothing)
 end
 
+# `mode` is MODE_BUILD_KHR (0) or MODE_UPDATE_KHR (1); an update also needs
+# `src_as`, which is the same AS for an in-place refit.
 function build_as_on_gpu_impl(ctx::ASBuildContext, accel::Vulkan.AccelerationStructureKHR,
                                scratch_addr::UInt64, geo_buf::Vector{UInt8},
-                               as_type::UInt32, build_flags::UInt32, primitive_count::UInt32)
+                               as_type::UInt32, build_flags::UInt32, primitive_count::UInt32,
+                               mode::UInt32=UInt32(0),
+                               src_as::Union{Nothing, Vulkan.AccelerationStructureKHR}=nothing)
     cmd = as_cmd_buf(ctx)
 
     # packed by caller so typed and legacy dispatch paths share this body
@@ -995,7 +1122,8 @@ function build_as_on_gpu_impl(ctx::ASBuildContext, accel::Vulkan.AccelerationStr
         dst_ptr = accel.vks
 
         pack_build_geometry_info!(bgi_buf, 0;
-            as_type, build_flags, dst_as=dst_ptr,
+            as_type, mode, build_flags, dst_as=dst_ptr,
+            src_as=(src_as === nothing ? C_NULL : src_as.vks),
             geometry_count=UInt32(1),
             p_geometries=Ptr{Nothing}(geo_ptr),
             scratch_addr)

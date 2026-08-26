@@ -23,7 +23,12 @@ using Test, Lava
         Lava.frozen_clear!()
         Lava.frozen_reset_stats!()
 
-        f = sin                       # any function: the key is types, not code
+        # NOT `sin`, and not "any function": `frozen_eligible` requires the
+        # DEFINING module to have a UUID, and `Base` has none — so a `sin`-keyed
+        # store was silently refused and every assertion after it failed against
+        # an entry that was never written. The key is types, but eligibility is
+        # the function's module.
+        f = Lava._precompile_warmup_kernel!   # defined in Lava, so cacheable
         tt = Tuple{Float32}
         pinfo = Lava.PushConstantInfo("wrapper_main", 8, 16, [0 => 8, 8 => 8], Int[0, 0])
         shader = Lava.LavaRTShader(UInt8[0x03, 0x02, 0x23, 0x07], :raygen, pinfo,

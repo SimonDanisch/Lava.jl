@@ -50,18 +50,48 @@ end
         Lava.FROZEN_VERSION[] = ""
     end
 
+    # The gate that makes the round-trip test below look the way it does. A
+    # kernel is only cacheable if its defining module has a UUID, i.e. is a
+    # package. `Main` has none, and `build_id(Main)` does not move when a script
+    # is edited — measured: a Main kernel changed from `2i` to `3i` came back
+    # with the stale `2i` result. Not caching is the correct answer there.
+    #
+    # This assertion did not exist, which is how the change came to break the
+    # round-trip test instead of being documented by one: `frozentest_scale!` and
+    # `frozentest_add!` are defined at the top of THIS FILE, so `include`ing it
+    # puts them in `Main` and nothing about them can ever be stored.
+    @testset "only package-defined kernels are cacheable" begin
+        @test !Lava.frozen_eligible(frozentest_scale!)
+        @test parentmodule(typeof(frozentest_scale!)) === Main
+        @test Base.PkgId(Base.moduleroot(Main)).uuid === nothing
+
+        Lava.frozen_clear!(version = version)
+        Lava.frozen_reset_stats!()
+        Lava.with_frozen_recording(version) do
+            frozentest_scale!(back)(out, a, 4.0f0; ndrange = 256)
+            KA.synchronize(back)
+        end
+        @test Lava.frozen_stats().stores == 0            # gate held
+        dir = Lava.frozen_cache_dir()
+        @test isempty(filter(f -> occursin("frozentest_scale", f), readdir(dir)))
+        Lava.FROZEN_VERSION[] = ""
+    end
+
     @testset "record then replay: hits, no stores, same answer" begin
         Lava.frozen_clear!(version = version)
         Lava.frozen_reset_stats!()
 
-        # Record.
+        # A broadcast, NOT the `frozentest_*` kernels above: those live in `Main`
+        # and are refused by `frozen_eligible`, so recording them stored nothing
+        # and this testset asserted an outcome the gate forbids. The broadcast
+        # kernel is generated inside Lava, which has a UUID, so it exercises the
+        # path a real workload takes.
         Lava.with_frozen_recording(version) do
-            frozentest_scale!(back)(out, a, 4.0f0; ndrange = 256)
-            frozentest_add!(back)(out, a, b; ndrange = 256)
+            out .= a .* 4.0f0
             KA.synchronize(back)
         end
         rec = Lava.frozen_stats()
-        @test rec.stores >= 2                            # both kernels written
+        @test rec.stores >= 1                            # an eligible kernel was written
 
         # Replaying through a *launch* would prove nothing here: Lava caches the
         # launch plan per kernel type, so the second launch in one session never
@@ -75,7 +105,7 @@ end
         # one that can only pass if all of this works.
         dir = Lava.frozen_cache_dir()
         entries = filter(f -> endswith(f, "_v$(version).spirv"), readdir(dir))
-        @test length(entries) >= 2
+        @test length(entries) >= 1
         for name in entries
             k = open(Serialization.deserialize, joinpath(dir, name))
             @test k isa Lava.LavaGPUKernel
@@ -84,9 +114,9 @@ end
             @test reinterpret(UInt32, k.spirv_bytes)[1] == 0x07230203   # magic
             @test !isempty(k.entry_name)
         end
-        # Both kernels under test are there, each exactly once.
-        @test count(f -> occursin("frozentest_scale", f), entries) == 1
-        @test count(f -> occursin("frozentest_add", f), entries) == 1
+        # The entry is keyed to the module that DEFINES the kernel, which for a
+        # broadcast is Lava — that is what made it eligible in the first place.
+        @test any(f -> startswith(f, "Lava_"), entries)
         Lava.FROZEN_VERSION[] = ""
     end
 
@@ -113,18 +143,23 @@ end
 
     @testset "a damaged entry costs a recompile, not the session" begin
         Lava.frozen_clear!(version = version)
+        # A broadcast again, not `frozentest_scale!`: a Main-defined kernel is
+        # never written, so the `first(filter(...))` below had nothing to pick and
+        # this testset ERRORED rather than failed — which is why it read as an
+        # unrelated bug instead of the same eligibility gate.
         Lava.with_frozen_recording(version) do
-            frozentest_scale!(back)(out, a, 4.0f0; ndrange = 256)
+            out .= a .* 4.0f0
             KA.synchronize(back)
         end
         dir = Lava.frozen_cache_dir()
-        entry = first(filter(f -> endswith(f, "_v$(version).spirv") &&
-                                  occursin("frozentest_scale", f), readdir(dir)))
+        candidates = filter(f -> endswith(f, "_v$(version).spirv"), readdir(dir))
+        @test !isempty(candidates)                       # something to damage
+        entry = first(candidates)
         write(joinpath(dir, entry), rand(UInt8, 64))     # not a serialized kernel
         empty!(Lava.vk_context().caches.frozen_mem)
         Lava.use_frozen_kernels(version)
         fill!(out, 0.0f0)
-        frozentest_scale!(back)(out, a, 4.0f0; ndrange = 256)   # must not throw
+        out .= a .* 4.0f0                                # must not throw
         KA.synchronize(back)
         @test all(==(8.0f0), Array(out))                 # fell back and is correct
         Lava.frozen_clear!(version = version)

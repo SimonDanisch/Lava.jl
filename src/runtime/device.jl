@@ -1773,6 +1773,32 @@ function release_batch_queue!(bq::BatchQueue)
     return nothing
 end
 
+"""
+    queue_released(bq::BatchQueue) -> Bool
+
+Whether `bq` has been handed back by [`release_batch_queue!`](@ref).
+
+A released queue is not safe to QUERY. Its `timeline_sem` is a
+`Vulkan.Semaphore` whose own finalizer destroys it, and a buffer's `last_write`
+names the queue, so buffer and queue can become garbage in the same GC cycle —
+where Julia runs finalizers in UNSPECIFIED order. If the semaphore goes first,
+`vk_free!`'s `query_timeline` reads a dangling handle and segfaults inside
+`run_finalizers`, with no Julia frame naming the buffer. Holding a reference
+cannot fix an ordering problem; the query itself has to be safe.
+
+It is, and semantically rather than defensively: `release_batch_queue!` flushes
+and drains BEFORE letting go, so a released queue has no in-flight work and any
+buffer still naming it can be destroyed immediately instead of waited on.
+
+Membership in `ctx.extra_queues` is already the liveness record, so this needs no
+flag — `release_batch_queue!` removing the entry IS the transition.
+"""
+function queue_released(bq::BatchQueue)
+    ctx = bq.ctx::VkContext
+    bq === ctx.default_bq && return false      # the primary queue is never released
+    return findfirst(q -> q === bq, ctx.extra_queues) === nothing
+end
+
 """Whether this is Mesa's software rasteriser, which every machine here has."""
 islavapipe(dev) = occursin("llvmpipe",
     String(filter(!=('\0'), collect(Vulkan.get_physical_device_properties(dev).device_name))))

@@ -181,6 +181,9 @@ end
     @testset "Tier 3: GPU Execution" begin
         include(joinpath(@__DIR__, "test_handwritten_spirv.jl"))
         include(joinpath(@__DIR__, "test_handwritten_rt.jl"))
+        # After test_handwritten_rt.jl: it reuses those shaders to prove a refit
+        # moved the acceleration structure, not merely the vertex buffer.
+        include(joinpath(@__DIR__, "test_blas_refit.jl"))
         include(joinpath(@__DIR__, "test_rayquery_vs_cpu.jl"))
         include(joinpath(@__DIR__, "test_aabb_blas_overlap.jl"))
         include(joinpath(@__DIR__, "test_instance_masks.jl"))
