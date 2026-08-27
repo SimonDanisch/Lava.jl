@@ -492,6 +492,11 @@ module BuiltIn
     const GlobalInvocationId        = UInt32(28)
     const LocalInvocationIndex      = UInt32(29)
     const SubgroupSize              = UInt32(36)
+    # 37 is SubgroupMaxSize, deliberately absent: spirv-val rejects it under the
+    # Kernel (OpenCL) capability, so no Vulkan module may carry it. The value
+    # lives host-side in `subgroup_size_control(ctx).max`.
+    const NumSubgroups              = UInt32(38)
+    const SubgroupId                = UInt32(40)
     const SubgroupLocalInvocationId = UInt32(41)
     # Ray tracing built-ins
     const LaunchIdKHR               = UInt32(5319)

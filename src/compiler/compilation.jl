@@ -819,7 +819,17 @@ function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
                            enable_ray_query::Bool = false,
                            validate::Bool = true,
                            force_inline_all::Bool = false)
-    if enable_ray_query && !vk_context().ray_query_available
+    # `targetfeatures()`, not `vk_context().ray_query_available`. Same answer for
+    # the same reason — a module declaring RayQueryKHR on a device without it
+    # fails at pipeline creation, so it is refused here where the message can say
+    # why — but asked of a record the runtime pushed rather than by reaching into
+    # a `VkContext`, which is what kept the compiler tied to the Vulkan runtime.
+    #
+    # With no device bound the answer is `false` and this refuses, which is
+    # correct: `enable_ray_query = true` is a claim about hardware, and a caller
+    # compiling for hardware that is not there has to say so with
+    # `targetfeatures!` rather than have it assumed.
+    if enable_ray_query && !targetfeatures().ray_query
         error("lava_compile_gpu: enable_ray_query=true requested, but the " *
               "active Vulkan device does not support VK_KHR_ray_query. " *
               "Either run on a device that supports ray_query (e.g. RADV, " *
@@ -2431,15 +2441,19 @@ const SPIRV_BUILTIN_MAP = Dict{String, UInt32}(
     "__spirv_BuiltInNumWorkgroups"        => BuiltIn.NumWorkgroups,
     "__spirv_BuiltInWorkgroupSize"        => BuiltIn.WorkgroupSize,
     "__spirv_BuiltInLocalInvocationIndex" => BuiltIn.LocalInvocationIndex,
-    # Both need Cap.GroupNonUniform, added by `emit_builtin_global!` below.
+    # All need Cap.GroupNonUniform, added by `emit_builtin_global!` below.
     "__spirv_BuiltInSubgroupSize"              => BuiltIn.SubgroupSize,
     "__spirv_BuiltInSubgroupLocalInvocationId" => BuiltIn.SubgroupLocalInvocationId,
+    "__spirv_BuiltInNumSubgroups"              => BuiltIn.NumSubgroups,
+    "__spirv_BuiltInSubgroupId"                => BuiltIn.SubgroupId,
 )
 
 # Builtins that are not Vulkan 1.0 core and carry a capability requirement.
 const SPIRV_BUILTIN_CAPABILITY = Dict{String, UInt32}(
     "__spirv_BuiltInSubgroupSize"              => Cap.GroupNonUniform,
     "__spirv_BuiltInSubgroupLocalInvocationId" => Cap.GroupNonUniform,
+    "__spirv_BuiltInNumSubgroups"              => Cap.GroupNonUniform,
+    "__spirv_BuiltInSubgroupId"                => Cap.GroupNonUniform,
 )
 
 """
@@ -3006,3 +3020,57 @@ function lower_memset!(inst::LLVM.CallInst)
     end
 end
 
+# ── Naming a compiled kernel ────────────────────────────────────────────────
+#
+# Moved here from what is now `Mantle/src/vulkan/runtime/profiling.jl`: the
+# profiler displays this, but producing it is string work over what the
+# compiler emitted, and a compile-overhead test needs it with no device.
+
+"""
+    kernel_source_name(compiled) -> String
+
+The Julia kernel a compiled module came from, recovered from its LLVM IR.
+
+`entry_name` is the SPIR-V entry point, and Lava names every compute entry
+`main` — so a list of `KernelStats` was a list of identical `"main"`s and could
+not be attributed to anything. That is not cosmetic: it is what made
+`list_compiled_kernels` unusable for the question it exists to answer, and why a
+table joining GPU time to register counts had nothing to join *on*.
+
+NOT from the `define` line: by the time this IR exists the entry has already been
+renamed, so every module defines exactly one function and it is called `@main`.
+The original name survives further down, in the mangled symbol and in inlining
+labels — `_Z15gpu_fcpd_scale_16CompilerMetadataI...` and `julia_gpu_fcpd_scale`.
+
+`CompilerMetadata` is the anchor: KernelAbstractions gives every `@kernel` that
+as its first argument, so the name is exactly what precedes it in the mangled
+symbol. `julia_<name>` is the fallback for anything not shaped that way.
+
+Returns `""` rather than throwing when neither matches: a profiler must not be
+the thing that fails.
+"""
+function kernel_source_name(compiled)
+    # `source_name` (the mangled entry symbol) first: it is always present on a
+    # freshly compiled kernel and survives both caches, whereas `ir` is empty
+    # unless `kernel_dump_wanted()`. The same two patterns match either input —
+    # the mangled symbol is exactly what these used to find inside the IR.
+    ir = compiled.source_name
+    isempty(ir) && (ir = compiled.ir)
+    isempty(ir) && return ""
+    m = match(r"_Z\d+([A-Za-z0-9_]+?)_?\d*CompilerMetadata", ir)
+    m === nothing && (m = match(r"\bjulia_([A-Za-z0-9_]+)", ir))
+    if m === nothing
+        # A plain (non-KA) device function has no `CompilerMetadata` argument
+        # and, once `ir` is gated off, no `julia_` symbol to fall back on
+        # either — just the Itanium mangling `_Z<length><name><args…>`. Take
+        # exactly `<length>` characters so argument mangling is not swallowed.
+        mz = match(r"^_Z(\d+)(.+)$", ir)
+        mz === nothing && return ""
+        n = parse(Int, mz.captures[1])
+        rest = mz.captures[2]
+        length(rest) < n && return ""
+        return replace(rest[1:n], r"_\d+$" => "")
+    end
+    # Trailing specialisation numbers differ between sessions; the name does not.
+    return replace(m.captures[1], r"_\d+$" => "")
+end

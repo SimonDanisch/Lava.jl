@@ -2,33 +2,41 @@ name = "Lava"
 uuid = "3a680b1f-cb25-4bee-9cf7-bc880b76dc8c"
 version = "0.1.0"
 
+# A Julia→SPIR-V compiler, and nothing else.
+#
+# Six dependencies left on 2026-08-27 when the runtime moved to Mantle, and the
+# first of them is the point of the whole exercise: **Vulkan is no longer a
+# dependency of Lava.** Nor are GLFW (windows), GPUArraysCore (host array
+# machinery) or LinearAlgebra (`mul!` and friends) — all of which belong to the
+# runtime that now lives in `Mantle/src/vulkan/`.
+#
+# `Lava/test/test_compiler_runtime_split.jl` asserts the source side of this: no
+# file here names `Vulkan`, `VkContext` or `vk_context` in code. The 87 times the
+# word still appears are prose, plus `MemModel.Vulkan` — a SPIR-V memory-model
+# enum defined in this package.
+#
+# What remains is what a compiler needs: LLVM and GPUCompiler to get the IR,
+# SPIRV_Tools_jll to validate what comes out, and GPUArrays/Adapt/Atomix/
+# KernelAbstractions for the vocabulary a kernel is compiled against.
 [deps]
-AcceleratedKernels = "6a4ca0a5-0e36-4168-a932-d9be78d558f1"
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 Atomix = "a9b6321e-bd34-4604-b9c9-b65b8de01458"
-GLFW = "f7f18e0c-5ee9-5ccd-a5bf-e8befd85ed98"
 GPUArrays = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
-GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
 GPUCompiler = "61eb1bfa-7361-4325-ad38-22787b887f55"
 GeometryBasics = "5c1252a2-5f33-56bf-86c9-59e7332b4326"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
-KernelInterfaces = "ce25d451-9bb5-4870-a156-ce22182641de"
+KernelInterface = "4ee993da-d684-4d17-a7dd-4e58e78d92bf"
 LLVM = "929cbde3-209d-540e-8aea-75f648917ca0"
-LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 Raycore = "afc56b53-c9a9-482a-a956-d1d800e05559"
 SPIRV_LLVM_Backend_jll = "4376b9bf-cff8-51b6-bb48-39421dff0d0c"
-PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
-Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 SPIRV_Tools_jll = "6ac6d60f-d740-5983-97d7-a4482c0689f4"
+Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 UnsafeAtomics = "013be700-e6cd-48c3-b4a1-df204f14c38f"
-Vulkan = "9f14b124-c50e-4008-a7d4-969b3a6cd68a"
 
 [sources]
 Raycore = {url = "https://github.com/JuliaGeometry/Raycore.jl", rev = "sd/with-texture"}
-# In Mantle's repository, under `lib/`, but a package of its own — Lava depends
-# on it WITHOUT depending on Mantle, which is the whole reason it was split out.
-KernelInterfaces = {url = "https://github.com/SimonDanisch/Mantle.jl", rev = "sd/mantle-dev", subdir = "lib/KernelInterfaces"}
 
 [compat]
 # Lava depends on a few GPUCompiler internals (rm_trap! was one, now vendored;
@@ -43,6 +51,26 @@ KernelInterfaces = {url = "https://github.com/SimonDanisch/Mantle.jl", rev = "sd
 # one project — the reverse of what an earlier note here claimed.
 GPUCompiler = "1, 2"
 
+# The cross-backend device/host/launch contract every backend implements, and
+# what kernels are written against. It also carries the cooperative-matrix
+# vocabulary (`MatrixShape`, `SubgroupScope`, `bestshape`) and `DeviceCaps`,
+# which used to be a second package named `KernelInterfaces` — plural, UUID
+# ce25d451, living in Mantle's `lib/`. That package is gone; both halves are here
+# now, and Mantle names the same types rather than copying them.
+#
+# Deliberately NOT tied to KernelAbstractions 0.10: KernelInterface has zero
+# dependencies of its own and resolves alongside KA 0.9.42 unchanged. Nine
+# packages in this environment still pin KA to 0.9. CUDA takes the same route
+# in JuliaGPU/CUDA.jl#3246.
+#
+# It is NOT registered yet: it lives in `KernelAbstractions/lib/KernelInterface`,
+# and the matrix half is on a branch pending upstream. There is deliberately no
+# `[sources]` entry for it — a URL pointing at KA's `main` would resolve to a
+# `KernelInterface` without `MatrixShape` and fail at load with an
+# `UndefVarError` instead of failing at resolve, where the message is legible.
+# Until it is upstreamed, `dev` the local checkout.
+KernelInterface = "0.1"
+
 # Only the test suite touches this jll: test/spirv_test_utils.jl runs `llc` as a
 # reference oracle against our own emitter. Nothing in src/ uses it, so the
 # emitted SPIR-V is unaffected by the backend version. 22 is allowed so OpenCL
@@ -53,17 +81,19 @@ StaticArrays = "1.9.17"
 julia = "1.12"
 
 [extras]
-ColorTypes = "3da002f7-5984-5a60-b8a6-cbb66c0b333f"
-JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+# The compiler suite's own dependencies, and they are few because it needs no
+# device: `Test`, a logger for the capture tests, two array packages whose
+# layouts the emitter is checked against, and `llc` as a reference oracle for
+# what LLVM's own SPIR-V backend emits.
+#
+# ColorTypes, JLD2, Random, SparseArrays and Statistics left with the 128 test
+# files that moved to Mantle on 2026-08-27 — every one of them was there for a
+# GPU array test.
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
-Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
-Raycore = "afc56b53-c9a9-482a-a956-d1d800e05559"
 SPIRV_LLVM_Backend_jll = "4376b9bf-cff8-51b6-bb48-39421dff0d0c"
-SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
-Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 StructArrays = "09ab397b-f2b6-538f-b94a-2f83cf4a842a"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["ColorTypes", "JLD2", "Logging", "Random", "SPIRV_LLVM_Backend_jll", "SparseArrays", "StaticArrays", "Statistics", "StructArrays", "Test"]
+test = ["Logging", "SPIRV_LLVM_Backend_jll", "StaticArrays", "StructArrays", "Test"]

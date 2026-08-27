@@ -28,7 +28,7 @@ rt_probe_fn(x) = x
         # package UUID either. So the store was refused and both the `stores == 1`
         # and the round-trip assertion below compared against nothing at all.
         push!(Lava.FROZEN_UNPACKAGED, @__MODULE__)
-        Lava.frozen_clear!()
+        Lava.frozen_rt_clear!()
         Lava.frozen_reset_stats!()
 
         f = rt_probe_fn               # any function: the key is types, not code
@@ -61,7 +61,7 @@ rt_probe_fn(x) = x
         @test Lava.frozen_rt_load(f, tt, :miss, :f32, 8) === nothing
         @test Lava.frozen_rt_load(f, tt, :raygen, :u32, 8) === nothing
     finally
-        Lava.frozen_clear!()
+        Lava.frozen_rt_clear!()
         delete!(Lava.FROZEN_UNPACKAGED, @__MODULE__)   # hand the guard back
         Lava.FROZEN_VERSION[]   = old_version
         Lava.FROZEN_RECORDING[] = old_recording

@@ -80,6 +80,28 @@ end
     """, "entry"), UInt32, Tuple{})
 end
 
+# The rest of the subgroup set `KernelInterface` declares, minus SubgroupMaxSize:
+# spirv-val rejects that one under the Kernel (OpenCL) capability, so Vulkan
+# cannot have it device-side at all — `subgroup_size_control(ctx).max` is the
+# host-side answer. Both of these are compute builtins carrying
+# Cap.GroupNonUniform (see SPIRV_BUILTIN_CAPABILITY). Values are raw and 0-based
+# where the builtin is an index; KernelInterface's 1-based convention is applied
+# at its own boundary.
+for (jl_name, spirv_name) in ((:lava_num_subgroups, :__spirv_BuiltInNumSubgroups),
+                              (:lava_subgroup_id,   :__spirv_BuiltInSubgroupId))
+    ir = """
+        @$(spirv_name) = external addrspace(7) global i32
+        define i32 @entry() #0 {
+            %val = load i32, ptr addrspace(7) @$(spirv_name), align 4
+            ret i32 %val
+        }
+        attributes #0 = { alwaysinline }
+    """
+    @eval @inline function $jl_name()
+        Base.llvmcall(($ir, "entry"), UInt32, Tuple{})
+    end
+end
+
 @inline function lava_subgroup_local_id()
     Base.llvmcall(("""
         @__spirv_BuiltInSubgroupLocalInvocationId = external addrspace(7) global i32

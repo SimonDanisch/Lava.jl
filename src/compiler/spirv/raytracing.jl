@@ -87,16 +87,13 @@ function emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
     require_extension!(spirv_mod, "SPV_KHR_variable_pointers")
     require_extension!(spirv_mod, "SPV_KHR_ray_tracing")
     # SER capability — opt-in, declared only when the device supports it.
-    # Reading `ser_available` keeps the SPIR-V module valid on non-NVIDIA
-    # hardware (where the capability would be a validation error).  Check
-    # VK_CONTEXT_REF[] directly so emitter tests without a device don't
-    # trigger a lazy `VkContext()`.
-    if stage === :raygen
-        ctx = VK_CONTEXT_REF[]
-        if ctx !== nothing && ctx.ser_available
-            require_capability!(spirv_mod, Cap.ShaderInvocationReorderNV)
-            require_extension!(spirv_mod, "SPV_NV_shader_invocation_reorder")
-        end
+    # Declaring it on non-NVIDIA hardware is a validation error, not a slow path,
+    # so the module asks `targetfeatures()` rather than assuming. With no device
+    # bound the answer is `false`, which is the module that is valid everywhere —
+    # so an emitter test never has to construct a `VkContext` to compile.
+    if stage === :raygen && targetfeatures().ser
+        require_capability!(spirv_mod, Cap.ShaderInvocationReorderNV)
+        require_extension!(spirv_mod, "SPV_NV_shader_invocation_reorder")
     end
 
     # Build struct pointer member type map
@@ -517,18 +514,11 @@ end
 # SER (SPV_NV_shader_invocation_reorder) emission
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Read `vk_context().ser_available` defensively: the emitter runs in contexts
-# where vk_context may not be initialised (unit tests without a device).  When
-# the flag is unavailable we treat SER as unsupported and emit the implicit
-# OpTraceRayKHR fallback so the SPIR-V stays valid without the NV capability.
-function _ser_available_for_emit()
-    # "No device initialised" is the documented case above, and it is the only
-    # one that may answer `false`: a context that EXISTS but errors on a field
-    # read is a bug, and treating it as "SER unsupported" would silently emit the
-    # slower fallback forever.
-    VK_CONTEXT_REF[] === nothing && return false
-    return (VK_CONTEXT_REF[]::VkContext).ser_available
-end
+# `_ser_available_for_emit` is gone. It read `VK_CONTEXT_REF[]` and reached into
+# a `VkContext` for one boolean, which was the whole of the compiler's dependency
+# on the Vulkan runtime here. `targetfeatures().ser` is the same answer, with the
+# same "no device bound means emit the portable module" rule, from a record that
+# has no Vulkan in it. See `compiler/target_features.jl`.
 
 """
 Emit OpTypeHitObjectNV once per module.  Cached in `state.rt_hit_object_type_id`.
@@ -579,7 +569,7 @@ ops then become no-ops; together they reproduce the implicit-trace path
 the SER pattern emulates on hardware that does support reordering.
 """
 function emit_rt_hit_object_trace_ray!(state::SPIRVEmitterState, inst::LLVM.CallInst)
-    if !_ser_available_for_emit()
+    if !targetfeatures().ser
         return emit_rt_trace_ray!(state, inst)
     end
     mod = state.mod
@@ -647,7 +637,7 @@ already lowered to a full OpTraceRayKHR (which invoked the chit inline);
 nothing remains to reorder, so this is a no-op.
 """
 function emit_rt_reorder_thread!(state::SPIRVEmitterState, inst::LLVM.CallInst)
-    _ser_available_for_emit() || return
+    targetfeatures().ser || return
     mod = state.mod
     ho_var = get_or_create_hit_object_var!(state)
     # OpReorderThreadWithHitObjectNV %hit_object_var
@@ -666,7 +656,7 @@ inline by the fallback OpTraceRayKHR in `emit_rt_hit_object_trace_ray!`, so
 this is a no-op.
 """
 function emit_rt_hit_object_execute_shader!(state::SPIRVEmitterState, inst::LLVM.CallInst)
-    _ser_available_for_emit() || return
+    targetfeatures().ser || return
     mod = state.mod
     ho_var = get_or_create_hit_object_var!(state)
     payload_var = state.rt_payload_var_id
