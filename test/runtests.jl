@@ -634,6 +634,19 @@ end
         @testset "batch queue lifetime" begin
             include(joinpath(@__DIR__, "test_batch_queue_lifetime.jl"))
         end
+        # A `transpose(::LavaArray)` destination is not a `LavaArray` and used to
+        # miss every `mapreducedim!` method here. Its own file because the
+        # assertions have to read the destination's parent storage, which is the
+        # only place `adjoint`'s conjugation is visible.
+        @testset "mapreducedim! into transposed destinations" begin
+            include(joinpath(@__DIR__, "test_mapreduce_transposed.jl"))
+        end
+        # Lava's GEMM kernels need a numeric element type; anything else belongs
+        # to `GPUArrays.generic_matmatmul!`. Its own file because it defines a
+        # struct at top level to be the non-numeric element type.
+        @testset "mul! with a non-numeric element type" begin
+            include(joinpath(@__DIR__, "test_mul_nonnumeric_eltype.jl"))
+        end
     end
 
     # ── Tier 3j: Phase-M alloc/free regression matrix ──────────────────

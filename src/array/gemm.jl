@@ -1907,9 +1907,20 @@ the extents suit the tile, and the device implements it. Failing that it uses th
 staged scalar GEMM, and failing *that* the per-element one; see `staged_gemm_ok`
 for which, and the header of this file for what the three are. That choice is an
 implementation detail: the result is the same either way, to fp32 reassociation.
+
+The `T<:Number` bound is required, not decoration. These kernels accumulate
+in the destination's element type — `muladd(T(A[…]), T(B[…]), acc)` — and scale
+by `T(α)`, both of which assume `T` can be constructed from the operand and
+scalar types. An element type that is merely `+`- and `*`-able does not satisfy
+that: a matrix of a two-field struct entered as `mul!(C, A, B, true, false)` and
+threw `Duo{Float16}(true)`, and removing only the scalar conversion just moved
+the failure into the kernel at `T(B[…])`. Outside the bound,
+`LinearAlgebra.mul!` reaches `GPUArrays.generic_matmatmul!`, which multiplies
+with the types' own `*` and promotes the accumulator, which is the correct thing
+for those and is already a GPU kernel. Widening this signature takes that away.
 """
 function LinearAlgebra.mul!(C::LavaArray{T,2}, A::AbstractVecOrMat,
-                            B::AbstractVecOrMat, α::Number, β::Number) where {T}
+                            B::AbstractVecOrMat, α::Number, β::Number) where {T<:Number}
     M, K = size(A, 1), size(A, 2)
     N = size(B, 2)
     size(B, 1) == K && size(C) == (M, N) ||
@@ -2132,7 +2143,7 @@ end
 # A matrix-vector product is just the N == 1 case. `C` carries strides like the
 # operands do, so its rank never reaches the kernel and one kernel serves both.
 function LinearAlgebra.mul!(C::LavaArray{T,1}, A::AbstractVecOrMat,
-                            B::AbstractVector, α::Number, β::Number) where {T}
+                            B::AbstractVector, α::Number, β::Number) where {T<:Number}
     M, K = size(A, 1), size(A, 2)
     length(B) == K && length(C) == M ||
         throw(DimensionMismatch("mul!: $(size(C)) = $(size(A)) * $(size(B))"))
@@ -2268,12 +2279,18 @@ end
 # times the work. This mirrors its implementation rather than `invoke`-ing it,
 # because the signature to invoke through is unwieldy and would silently rot if
 # GPUArrays retyped it.
+#
+# The `T<:Number` bound has to match the general `mul!` above. These two are
+# disambiguated only by being narrower in the operand positions, so if the
+# general one is narrower in `C`'s element type and these are not, neither method
+# wins and every diagonal multiply raises an ambiguity instead of running.
+# `test_diagonal_mul.jl` is what catches that.
 function LinearAlgebra.mul!(C::LavaArray{T,2},
                             D::Diagonal{<:Any, <:AbstractGPUArray},
                             B::Union{AbstractGPUArray,
                                      Adjoint{S, <:AbstractGPUArray{S}},
                                      Transpose{S, <:AbstractGPUArray{S}}},
-                            α::Number, β::Number) where {T, S}
+                            α::Number, β::Number) where {T<:Number, S}
     dd = D.diag
     d = length(dd)
     m, n = size(B, 1), size(B, 2)
@@ -2300,7 +2317,7 @@ function LinearAlgebra.mul!(C::LavaArray{T,2},
                                      Adjoint{S, <:AbstractGPUArray{S}},
                                      Transpose{S, <:AbstractGPUArray{S}}},
                             D::Diagonal{<:Any, <:AbstractGPUArray},
-                            α::Number, β::Number) where {T, S}
+                            α::Number, β::Number) where {T<:Number, S}
     dd = D.diag
     d = length(dd)
     m, n = size(A, 1), size(A, 2)

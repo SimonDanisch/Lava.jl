@@ -113,16 +113,68 @@ function GPUArrays.mapreducedim!(f::F, op::OP, R::LavaArray{T},
     return R
 end
 
+# Transposed destinations.
+#
+# `Base.mapreducedim!` sends any GPU-array destination here, and `transpose(v)`
+# of a LavaArray is one — but it is not itself a `LavaArray`, so it fell past
+# both methods above into GPUArrays' generic `error("Not implemented")`. That
+# single gap was all 133 errors the GPUArrays conformance suite reported: it
+# reduces into `transpose(zeros(ET, ...))` and `adjoint(...)` for every eltype.
+#
+# The obvious repair — reduce into `parent(R)` — is wrong twice over. The parent
+# of a transposed vector has the reduction's axes swapped, and `Adjoint`
+# conjugates on access, so R's contents are `conj.(parent)` rather than the
+# parent itself. Measured on a 2x2 `Complex{Int64}` sum: unwrapping gives
+# `[3+3im, 7+7im]` where the answer is `[4-4im, 6-6im]`. A real-valued smoke
+# test cannot see either error.
+#
+# So go through a dense temporary in R's own logical shape and let the wrapper
+# do what it exists to do: `tmp .= R` reads through the transpose, `R .= tmp`
+# writes back through it and conjugates when R is an `Adjoint`. No branch on
+# which wrapper it is, and no assumption about the parent's strides — which is
+# what makes the matrix case (`transpose` of a 2x3, reduced into as a 3x2) come
+# out right as well.
+const LavaTransposed{T} = Union{Transpose{T, <:LavaArray{T}}, Adjoint{T, <:LavaArray{T}}}
+
+# `A` must be spelled exactly as GPUArrays spells it. `Base.AbstractArrayOrBroadcasted`
+# looks like the same type but unions in `Base.AbstractBroadcasted`, the abstract
+# supertype, where GPUArrays unions in the concrete `Broadcast.Broadcasted`. That
+# makes this method narrower in `R` and *wider* in `A` than the fallback it is
+# meant to beat, so neither is more specific and every call is an ambiguity error
+# rather than a dispatch to this method.
+function GPUArrays.mapreducedim!(f::F, op::OP, R::LavaTransposed{T},
+                                  A::Union{AbstractArray, Base.Broadcast.Broadcasted};
+                                  init=nothing) where {F, OP, T}
+    tmp = similar(parent(R), T, size(R))
+    # Seed with R's current contents: with `init === nothing` the reduction
+    # accumulates into the destination rather than overwriting it.
+    tmp .= R
+    GPUArrays.mapreducedim!(f, op, tmp, A; init)
+    R .= tmp
+    return R
+end
+
 function mapreducedim_ak!(f::F, op::OP, R::LavaArray{T}, A;
                             init=nothing) where {F, OP, T}
     n = length(A)
     n == 0 && return R
 
-    init_val = if init !== nothing
-        convert(T, init)
-    else
-        GPUArrays.neutral_element(op, T)
-    end
+    # What `init` means, which is not what it looks like. A supplied `init` says R
+    # is uninitialized scratch — `_mapreduce` allocates R with `similar` and then
+    # always passes one, which is why `sum`/`prod` work — so R's contents are
+    # garbage and must be overwritten. `init === nothing` is the opposite: it is
+    # `Base.mapreducedim!`'s own call, and there R's current contents ARE the
+    # accumulator seed. Reducing `[1 2; 3 4]` into `[10, 20]` gives `[13, 27]`.
+    #
+    # Both were treated as "overwrite with the neutral element", so every
+    # `mapreducedim!`/`reducedim!`/`sum!` into a non-empty destination silently
+    # dropped what was already there. The GPUArrays conformance suite cannot catch
+    # it: it only ever seeds with the neutral element itself (`zeros` for `+`,
+    # `ones` for `*`), and `op(neutral, x) == x` hides the difference.
+    #
+    # Snapshotting here keeps every branch below to the single job of overwriting R.
+    prior = init === nothing ? copy(R) : nothing
+    init_val = init === nothing ? GPUArrays.neutral_element(op, T) : convert(T, init)
 
     if length(R) == 1
         # Full reduction (dims=:)
@@ -133,16 +185,14 @@ function mapreducedim_ak!(f::F, op::OP, R::LavaArray{T}, A;
         # bandwidth; AK's tree-reduce is ~2× slower because of per-level
         # scalar readbacks. Any non-matching case falls through to AK.
         # `Base.add_sum` is `Base.sum`'s default op (=== +, but different fn object).
-        if T === Float32 && (op === (+) || op === Base.add_sum) && f === identity && A isa LavaArray{Float32}
-            result = vk_reduce_sum(A::LavaArray{Float32}) + init_val
-            R_host = Float32[result]
-            copyto!(R, 1, R_host, 1, 1)
-            return R
+        result = if T === Float32 && (op === (+) || op === Base.add_sum) && f === identity && A isa LavaArray{Float32}
+            vk_reduce_sum(A::LavaArray{Float32}) + init_val
+        else
+            # Fallback: AK.mapreduce to scalar
+            AK.mapreduce(f, op, A, KA.get_backend(A);
+                         init=init_val, neutral=init_val,
+                         block_size=64, switch_below=0)
         end
-        # Fallback: AK.mapreduce to scalar
-        result = AK.mapreduce(f, op, A, KA.get_backend(A);
-                              init=init_val, neutral=init_val,
-                              block_size=64, switch_below=0)
         # Write scalar result into R
         R_host = T[convert(T, result)]
         copyto!(R, 1, R_host, 1, 1)
@@ -170,18 +220,25 @@ function mapreducedim_ak!(f::F, op::OP, R::LavaArray{T}, A;
                          dims=rdim, temp=R_temp, block_size=64)
         elseif size(A_arr) == size(R)
             # No dimension reduced: R and A have same shape (e.g., dims=[]).
-            if init !== nothing
-                fill!(R, init_val)
-                R .= op.(R, f.(A_arr))
-            else
-                R .= f.(A_arr)
-            end
+            #
+            # Seeding via `fill!` rather than broadcasting `init_val` in
+            # directly: for `findmax`-style reductions the neutral element is a
+            # `Tuple{Float32,Int64}`, and broadcast treats a tuple as a container
+            # to iterate, not a scalar — `op.(init_val, ...)` fails
+            # `check_broadcast_shape` against a 2D destination. `fill!` takes it
+            # as the value it is.
+            fill!(R, init_val)
+            R .= op.(R, f.(A_arr))
         else
             # Multiple dims reduced or ndims mismatch — reduce sequentially
             # along each reduced dimension
             multi_dim_reduce!(f, op, R, A_arr, init_val)
         end
     end
+    # Fold R's pre-existing contents back in. Every branch above wrote the
+    # reduction seeded with the neutral element, so this is what turns it into an
+    # accumulation.
+    prior === nothing || (R .= op.(prior, R))
     return R
 end
 
