@@ -520,7 +520,16 @@ hashes by `(objectid(MethodInstance), world, cfg)` — type-based, so
 different closure instances of the same type share one compiled kernel,
 and world-age tracking means Revise edits invalidate correctly.
 """
-function get_compiled_kernel_and_pipeline(ctx::VkContext, @nospecialize(f), @nospecialize(tt),
+#
+# `@noinline` is load-bearing, not a code-size preference. `@nospecialize` on `f`
+# and `tt` widens this method's OWN signature, but inference will still infer a
+# specialised copy in order to inline it into a caller that is itself specialised
+# per kernel — which is every launch site. Measured on SAM 2's encoder: 1 002
+# specialisations of this function and of `frozen_load`/`frozen_store` beneath
+# it, one per kernel, for bodies that do not vary with the kernel. The barrier in
+# `build_launch_plan!` supplies the type-erased caller; this keeps the compiler
+# from undoing it.
+@noinline function get_compiled_kernel_and_pipeline(ctx::VkContext, @nospecialize(f), @nospecialize(tt),
                                           workgroup_size;
                                           enable_ray_query::Bool=false)
     # The frozen cache first, and deliberately before anything that needs a

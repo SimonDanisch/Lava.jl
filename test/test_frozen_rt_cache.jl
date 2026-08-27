@@ -15,20 +15,23 @@
 
 using Test, Lava
 
+"A function of this file's own, so the module opted in below is the one that owns it."
+rt_probe_fn(x) = x
+
 @testset "frozen RT cache round-trip" begin
     old_version, old_recording = Lava.FROZEN_VERSION[], Lava.FROZEN_RECORDING[]
     try
         Lava.FROZEN_VERSION[] = "rt_test_v1"
         Lava.FROZEN_RECORDING[] = true
+        # `frozen_rt_store` runs the same `frozen_eligible` guard the compute path
+        # does, and this used to pass `sin` — whose module is `Base`, which has no
+        # package UUID either. So the store was refused and both the `stores == 1`
+        # and the round-trip assertion below compared against nothing at all.
+        push!(Lava.FROZEN_UNPACKAGED, @__MODULE__)
         Lava.frozen_clear!()
         Lava.frozen_reset_stats!()
 
-        # NOT `sin`, and not "any function": `frozen_eligible` requires the
-        # DEFINING module to have a UUID, and `Base` has none — so a `sin`-keyed
-        # store was silently refused and every assertion after it failed against
-        # an entry that was never written. The key is types, but eligibility is
-        # the function's module.
-        f = Lava._precompile_warmup_kernel!   # defined in Lava, so cacheable
+        f = rt_probe_fn               # any function: the key is types, not code
         tt = Tuple{Float32}
         pinfo = Lava.PushConstantInfo("wrapper_main", 8, 16, [0 => 8, 8 => 8], Int[0, 0])
         shader = Lava.LavaRTShader(UInt8[0x03, 0x02, 0x23, 0x07], :raygen, pinfo,
@@ -59,6 +62,7 @@ using Test, Lava
         @test Lava.frozen_rt_load(f, tt, :raygen, :u32, 8) === nothing
     finally
         Lava.frozen_clear!()
+        delete!(Lava.FROZEN_UNPACKAGED, @__MODULE__)   # hand the guard back
         Lava.FROZEN_VERSION[]   = old_version
         Lava.FROZEN_RECORDING[] = old_recording
     end

@@ -4,6 +4,18 @@
 # - GC pressure from old arrays while new dispatches are recording
 # - Simulates the pattern that crashes RayMakie reference tests on APU
 
+#
+# **This file called `Lava.flush_deferred_frees!()` and read a global
+# `Lava.DEFERRED_FREES` until 2026-08-23.** Neither has existed since the
+# deferred-free list became per-BatchQueue, so every testset below threw
+# `UndefVarError` on its first line — and `runtests.jl` did not include the file,
+# so nothing said so. It is included now. A test nothing runs is not a test.
+#
+# The replacements are the per-BQ API: `quiesce_before_reclaim!` for the flush +
+# GC + drain that `flush_deferred_frees!` used to do (the drain on its own is not
+# safe with a batch open — see its docstring), and the two `deferred_*` lists
+# under the lock that guards them for the count.
+
 using Test, Lava, KernelAbstractions
 
 @kernel function fill_kernel!(dst, val)
@@ -11,8 +23,15 @@ using Test, Lava, KernelAbstractions
     @inbounds dst[i] = val
 end
 
+"""Pending deferred frees on `bq`, read under the lock the finalizers push with."""
+pendingfrees(bq) = lock(bq.deferred_frees_lock) do
+    length(bq.deferred_frees) + length(bq.deferred_as_frees)
+end
+
 @testset "Rapid allocation/free cycles" begin
     backend = Lava.LavaBackend()
+    bq = Lava.vk_context().default_bq
+    drainfrees!() = Lava.quiesce_before_reclaim!(bq)
 
     @testset "many small arrays created and discarded" begin
         # Simulate 50 "test iterations" each creating 10 arrays
@@ -32,7 +51,7 @@ end
             # Let arrays go out of scope — GC should handle cleanup
         end
         GC.gc(true)
-        Lava.flush_deferred_frees!()
+        drainfrees!()
         @test true  # Didn't crash
     end
 
@@ -46,7 +65,7 @@ end
         end
         Lava.vk_flush!(Lava.vk_context())
         GC.gc(true)
-        Lava.flush_deferred_frees!()
+        drainfrees!()
         @test true
     end
 
@@ -69,12 +88,12 @@ end
             # Flush every 5 iterations (like the reference test GC between test files)
             if iter % 5 == 0
                 Lava.vk_flush!(Lava.vk_context())
-                Lava.flush_deferred_frees!()
+                drainfrees!()
                 GC.gc(true)
             end
         end
         Lava.vk_flush!(Lava.vk_context())
-        Lava.flush_deferred_frees!()
+        drainfrees!()
         GC.gc(true)
         @test true
     end
@@ -108,13 +127,13 @@ end
             # shapes is UInt8, unsafe_free! it too
             Lava.unsafe_free!(shapes)
 
-            Lava.flush_deferred_frees!()
+            drainfrees!()
         end
         @test true
     end
 
     @testset "deferred free count stays bounded" begin
-        initial_deferred = length(Lava.DEFERRED_FREES)
+        initial_deferred = pendingfrees(bq)
 
         for iter in 1:100
             a = Lava.LavaArray(rand(Float32, 50))
@@ -124,9 +143,9 @@ end
 
         Lava.vk_flush!(Lava.vk_context())
         GC.gc(true)
-        Lava.flush_deferred_frees!()
+        drainfrees!()
 
-        final_deferred = length(Lava.DEFERRED_FREES)
+        final_deferred = pendingfrees(bq)
         @test final_deferred <= initial_deferred + 10  # Should be mostly cleaned up
     end
 
@@ -142,7 +161,7 @@ end
         GC.gc(true)
         # Next allocation should proactively flush any accumulated deferred frees
         b = Lava.LavaArray(rand(Float32, 10))
-        @test length(Lava.DEFERRED_FREES) == 0
+        @test pendingfrees(bq) == 0
         Lava.unsafe_free!(b)
     end
 
@@ -155,7 +174,7 @@ end
             Lava.vk_flush!(Lava.vk_context())
         end
         GC.gc(true)
-        Lava.flush_deferred_frees!()
+        drainfrees!()
         @test true
     end
 end

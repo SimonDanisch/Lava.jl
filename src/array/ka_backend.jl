@@ -833,12 +833,68 @@ Internal launch function for KA kernels. Compiles and dispatches the GPU functio
     build_launch_plan!(bq, f, all_args, wg, ray_query, key, world)
 end
 
+# ── The function barrier, and why this is two functions instead of one.
+#
+# `all_args` is a fully concrete tuple type — a different one for every kernel in
+# the program — so ANY method taking it is inferred once per kernel. That is
+# correct and unavoidable for the code that packs arguments, which genuinely
+# needs each type. It is pure waste for everything downstream of it, which needs
+# only `tt`.
+#
+# Measured on SAM 2's encoder, first call in a fresh process: 16 981
+# MethodInstances inferred, 11 729 of them owned by Lava, ~26 s of the ~36 s of
+# first-call latency. The launch path was ~1 000 of each of `build_launch_plan!`,
+# `get_compiled_kernel_and_pipeline`, `frozen_load` and `frozen_store` — one per
+# kernel, for four functions whose bodies do not depend on the kernel at all.
+# `@nospecialize` was already on `f` and `tt` and did not help: inference still
+# specialises a callee to inline it into a specialised caller, so the widening
+# has to be paired with a barrier the compiler will not cross.
+#
+# This is CUDA.jl's shape (`cudacall` keeps the argument-dependent part to a thin
+# shell over a type-erased worker). The split point is `tt`: everything above it
+# is per-kernel and tiny, everything below is per-kernel-invariant and large.
 @noinline function build_launch_plan!(bq::BatchQueue, @nospecialize(f), all_args::Tuple,
                                       wg::NTuple{3,Int}, ray_query::Bool,
                                       key::DataType, world::UInt64)
     # Excludes f — GPUCompiler prepends typeof(f). all_args are already
     # post-adapt (LavaDeviceArray, not Ptr{T}).
+    #
+    # Computed here, and only here, because `typeof(all_args)` cannot stand in for
+    # it: a type-valued argument erases to `DataType` in the tuple type, and
+    # `arg_sigtype` recovers the `Type{X}` GPUCompiler needs.
     tt = Tuple{map(arg_sigtype, Base.tail(all_args))...}
+    # `key` is boxed for the same reason `tt` is, and it is worth naming because
+    # it is easy to miss: `key::DataType` looks like an ordinary value parameter,
+    # but a *type-valued* argument enters the lattice as `Type{Tuple{…}}`, so
+    # Julia specialises on it exactly as it would on `tt`. Leaving it unboxed
+    # while boxing the other two took this from 1 238 specialisations to 909, not
+    # to 1.
+    build_launch_plan_tt!(bq, Ref{Any}(f), Ref{Any}(tt), Ref{Any}(key), wg, ray_query, world)
+end
+
+"""The half of `build_launch_plan!` that does not depend on the kernel's argument
+types — inferred once for the whole program rather than once per kernel.
+
+**The `Ref{Any}` boxes are the erasure, and `@nospecialize` is not a substitute.**
+Julia ignores `@nospecialize` for exactly the two kinds of argument this takes:
+specialising on a singleton function type is free, and a `Type{T}` argument is
+how dispatch is spelled, so both are always specialised on. Measured: with
+`@nospecialize` on both and `@noinline` on the method, this still had 1 238
+specialisations, one per kernel — the annotation had no effect at all. Boxed, the
+signature is `RefValue{Any}` twice and there is one.
+
+The cost is that `f` and `tt` come out as `Any` and every call below here is a
+dynamic dispatch. That is the right trade on this path and only on this path:
+`launch_plan` reaches it solely on a cache miss, i.e. once per kernel per world,
+and what follows is a SPIR-V compile. On the hit path nothing here runs."""
+@noinline function build_launch_plan_tt!(bq::BatchQueue, fbox::Base.RefValue{Any},
+                                         ttbox::Base.RefValue{Any},
+                                         keybox::Base.RefValue{Any},
+                                         wg::NTuple{3,Int}, ray_query::Bool,
+                                         world::UInt64)
+    f = fbox[]
+    tt = ttbox[]
+    key = keybox[]::DataType
     compiled, pipeline, offsets, byval_sizes = get_compiled_kernel_and_pipeline(
         bq.ctx::VkContext, f, tt, wg; enable_ray_query=ray_query)
     base = compiled.push_info.arg_buffer_size

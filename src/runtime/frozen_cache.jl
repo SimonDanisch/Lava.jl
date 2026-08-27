@@ -77,6 +77,24 @@ cache_io_error(ex) = ex isa Union{SystemError, Base.IOError, EOFError,
 
 
 """
+Modules WITHOUT a package identity that may use the frozen cache anyway.
+
+[`frozen_eligible`](@ref) refuses `Main` because its build id is constant across
+sessions, so an edited kernel is served stale SPIR-V — the measurement is over
+there. A test does not have that problem: it writes under a version string it
+mints fresh on every run and clears afterwards, so nothing it stores outlives it.
+Without this the store path is simply unreachable from a test file, since every
+kernel defined at the top level of one belongs to `Main` — which is how the
+frozen-cache tests came to assert `stores >= 2` against a constant 0.
+
+Names MODULES rather than being a boolean on purpose: opting one test file in
+must not opt in every script in the session.
+
+    push!(Lava.FROZEN_UNPACKAGED, @__MODULE__)
+"""
+const FROZEN_UNPACKAGED = Set{Module}()
+
+"""
     frozen_eligible(f) -> Bool
 
 Is this kernel's defining module one whose build id actually MOVES when its
@@ -93,9 +111,13 @@ with the old `2i` result, `build_id(Main)` byte-identical across both runs. That
 is why the cache cannot simply be switched on globally.
 
 Packages have a UUID and Main does not, which is exactly the distinction needed.
+
+See [`FROZEN_UNPACKAGED`](@ref) for the one deliberate way past this.
 """
 function frozen_eligible(@nospecialize(f))
-    return Base.PkgId(Base.moduleroot(parentmodule(typeof(f)))).uuid !== nothing
+    m = Base.moduleroot(parentmodule(typeof(f)))
+    m in FROZEN_UNPACKAGED && return true
+    return Base.PkgId(m).uuid !== nothing
 end
 
 
@@ -373,8 +395,13 @@ end
 
 The linked kernel for this signature, from memory or from disk, without ever
 asking Julia to infer anything.
+
+`@noinline` for the reason `get_compiled_kernel_and_pipeline` carries it: the
+`@nospecialize` alone does not stop inference from making a per-kernel copy of
+this to inline into a per-kernel caller, and on SAM 2's encoder that was 1 002
+copies of a dictionary lookup.
 """
-function frozen_load(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workgroup_size)
+@noinline function frozen_load(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workgroup_size)
     isempty(FROZEN_VERSION[]) && return nothing
     frozen_eligible(f) || return nothing
     memkey = (typeof(f), tt, workgroup_size)
@@ -406,8 +433,12 @@ end
     frozen_store(ctx, f, tt, workgroup_size, compiled)
 
 Write a compiled kernel under its frozen key. Only while recording.
+
+`@noinline` for the same reason as [`frozen_load`](@ref) — and this one is the
+starker case, since outside a recording its whole body is one early return that
+was being inferred a thousand times.
 """
-function frozen_store(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workgroup_size,
+@noinline function frozen_store(ctx::VkContext, @nospecialize(f), @nospecialize(tt), workgroup_size,
                       compiled::LavaGPUKernel)
     (FROZEN_RECORDING[] && !isempty(FROZEN_VERSION[])) || return nothing
     frozen_eligible(f) || return nothing
