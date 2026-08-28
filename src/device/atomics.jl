@@ -45,27 +45,31 @@ end
 end
 
 @lava_device_override function Base.getindex(r::LavaAtomicRef{T,N}, I::CartesianIndex{N}) where {T,N}
-    li = atomic_linear_index(r.dims, I)
+    li = linear_index(r.dims, I)
     PtrIndexableRef{T}(r.ptr, li)
 end
 
 # `Atomix.@atomic arr[i, j, ...]` expands to `referenceable(arr)[i, j, ...]`, so
 # we need a getindex that accepts N integer args (one per dim).
 @lava_device_override function Base.getindex(r::LavaAtomicRef{T,N}, I::Vararg{Integer,N}) where {T,N}
-    li = atomic_linear_index(r.dims, CartesianIndex(map(Int, I)))
+    li = linear_index(r.dims, CartesianIndex(map(Int, I)))
     PtrIndexableRef{T}(r.ptr, li)
 end
 
-# CartesianIndex to linear index for atomic refs (mirrors linear_index in ka_backend.jl)
-@inline function atomic_linear_index(dims::NTuple{N,Int}, I::CartesianIndex{N}) where N
-    li = I[1]
-    stride = 1
-    for d in 2:N
-        stride *= dims[d-1]
-        li += stride * (I[d] - 1)
-    end
-    return li
-end
+# `linear_index` is `device/devicearray.jl`'s, included just before this file.
+#
+# There was a second copy here, `atomic_linear_index`, written when the original
+# lived in `array/ka_backend.jl` and this file could not see it — and it was the
+# naive form:
+#
+#     li = I[1]; stride = 1
+#     for d in 2:N;  stride *= dims[d-1];  li += stride * (I[d] - 1);  end
+#
+# which is exactly the nested-product expansion `linear_index`'s Horner comment
+# says NVIDIA's shader compiler miscompiles when the result feeds a
+# PhysicalStorageBuffer offset. So the duplicate was not merely redundant: an
+# `Atomix.@atomic a[i, j, k]` on a 3-D array with computed indices had the same
+# dropped-`I[1]` exposure that `repeat(x; inner)` was fixed for.
 
 @lava_device_override function Base.getindex(r::PtrRef{T}, i::Integer) where T
     PtrIndexableRef{T}(r.ptr, Int(i))
@@ -551,7 +555,7 @@ end
     arr::LavaDeviceArray{T,N}, order::Symbol, op::OP, val, I::CartesianIndex{N}
 ) where {T, N, OP}
     v = convert(T, val)
-    li = atomic_linear_index(arr.dims, I)
+    li = linear_index(arr.dims, I)
     ref = Atomix.Internal.referenceable(arr)[li]
     return Atomix.modify!(ref, op, v, UnsafeAtomics.seq_cst)
 end
@@ -562,7 +566,7 @@ end
     arr::LavaDeviceArray{T,N}, order::Symbol, op::OP, val, I::Vararg{Integer,N}
 ) where {T, N, OP}
     v = convert(T, val)
-    li = atomic_linear_index(arr.dims, CartesianIndex(map(Int, I)))
+    li = linear_index(arr.dims, CartesianIndex(map(Int, I)))
     ref = Atomix.Internal.referenceable(arr)[li]
     return Atomix.modify!(ref, op, v, UnsafeAtomics.seq_cst)
 end
