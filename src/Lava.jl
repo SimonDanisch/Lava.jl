@@ -37,7 +37,15 @@ export @setup_workload
 # Cooperative matrices: the TYPE a kernel is compiled against, and the operand
 # positions. `MatrixUse`/`MatrixScope`/`MatrixShape`/`DeviceCaps` come from
 # `KernelInterface` and are re-exported so a kernel library needs one import.
-export AcceleratedMatrix, WorkgroupMatrix, MatrixA, MatrixB, Accumulator
+# `AcceleratedMatrix`, `WorkgroupMatrix` and `CoopMatrix` are NOT exported here.
+# They are `KernelInterface`'s, and Mantle — the user-facing, cross-platform API
+# — is what re-exports them. This package is a Julia→SPIR-V compiler: it
+# implements the nine `coopmat_*` operations on them and uses the type
+# internally, which needs no export.
+#
+# `MatrixA`/`MatrixB`/`Accumulator` stay: they are the operand-position tags a
+# shader author writes directly when instantiating a tile against this compiler.
+export MatrixA, MatrixB, Accumulator
 
 # Ray-tracing device intrinsics. The pipeline that dispatches them is Mantle's;
 # these are what a shader body calls.
@@ -52,11 +60,17 @@ export Ray
 # shader-stage intrinsics. Pure Julia — `graphics/types.jl` has no Vulkan in it,
 # which is why it stayed when the pipeline that consumes it left.
 export ShaderStage, VertexStage, FragmentStage, GeometryStage, TessControlStage, TessEvalStage
-export BlendMode, Opaque, AlphaBlend, Additive, Premultiplied
-export CullFace, NoCull, CullBack, CullFront
+# `BlendMode`, `CullFace`, `DepthMode` and `RenderTarget` are gone from here:
+# they are fixed-function pipeline state, this compiler never dispatched on any
+# of them, and they are Mantle's now.
+#
+# `Topology` stays exported, but it is re-exported rather than defined —
+# `KernelInterface` owns it, because the geometry stage's execution mode is
+# emitted from it HERE and a pipeline is created from it in every backend. A
+# name re-exported from a common source is exactly the case
+# `test_no_stale_exports.jl` allows, alongside `MatrixA` and `DeviceCaps`.
 export Topology, TriangleList, TriangleStrip, LineList, LineStrip, PointList, PatchList
 export LineListAdjacency, LineStripAdjacency
-export DepthMode, DepthLess, DepthLessEq, DepthGreater, DepthAlways, DepthOff
 export GeometryConfig, TessConfig
 export TessSpacing, EqualSpacing, FractionalEvenSpacing, FractionalOddSpacing
 export TessWinding, WindingCW, WindingCCW

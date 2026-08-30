@@ -12,47 +12,21 @@ struct GeometryStage    <: ShaderStage end
 struct TessControlStage <: ShaderStage end
 struct TessEvalStage    <: ShaderStage end
 
-# ── Blend Modes ──
-
-abstract type BlendMode end
-struct Opaque        <: BlendMode end   # no blending
-struct AlphaBlend    <: BlendMode end   # src.a * src + (1-src.a) * dst
-struct Additive      <: BlendMode end   # src + dst
-struct Premultiplied <: BlendMode end   # premultiplied alpha
-
-# ── Culling ──
-
-abstract type CullFace end
-struct NoCull    <: CullFace end
-struct CullBack  <: CullFace end
-struct CullFront <: CullFace end
-
-# ── Input Topology ──
-
-abstract type Topology end
-struct TriangleList  <: Topology end
-struct TriangleStrip <: Topology end
-struct LineList      <: Topology end
-struct LineStrip     <: Topology end
-struct PointList     <: Topology end
-struct PatchList          <: Topology end  # for tessellation
-# Both feed a geometry shader four vertices per primitive. They differ in how the
-# index buffer is walked: the LIST form consumes a disjoint group of 4 per
-# primitive, the STRIP form slides a 4-wide window one index at a time. An
-# adjacency index list built for a strip (Makie's polylines: `0 0 1 2 3 3`)
-# yields ⌊n/4⌋ primitives under the list form instead of n-3 — a polyline drawn
-# as scattered dashes.
-struct LineListAdjacency  <: Topology end
-struct LineStripAdjacency <: Topology end
-
-# ── Depth Test ──
-
-abstract type DepthMode end
-struct DepthLess     <: DepthMode end   # default: closer wins
-struct DepthLessEq   <: DepthMode end
-struct DepthGreater  <: DepthMode end
-struct DepthAlways   <: DepthMode end
-struct DepthOff      <: DepthMode end   # no depth test/write
+# ── Pipeline state: not here any more ──
+#
+# `BlendMode`, `CullFace` and `DepthMode` are Mantle's, in
+# `Mantle/src/graphics/state.jl`. They are fixed-function rasterizer state, and
+# this compiler never dispatched on any of them — the only use outside this file
+# was the `export` line.
+#
+# `Topology` IS dispatched on here, by `geometry_input_vertex_count` and
+# `geometry_input_mode` in `compiler/spirv/graphics.jl`, and a backend dispatches
+# on it too when it creates a pipeline. Two owners means neither, so it is
+# `KernelInterface`'s now, beside `MatrixShape` and `DeviceCaps` — a Metal
+# backend can name `TriangleList` without importing a SPIR-V compiler.
+using KernelInterface: Topology, TriangleList, TriangleStrip, LineList,
+                       LineStrip, PointList, PatchList, LineListAdjacency,
+                       LineStripAdjacency
 
 # ── Geometry Shader Config ──
 
@@ -97,5 +71,8 @@ function TessConfig(; vertices::Integer=3, spacing::TessSpacing=EqualSpacing(),
 end
 
 # ── Render Target ──
-
-abstract type RenderTarget end
+#
+# `RenderTarget` is Mantle's, in `graphics/state.jl`. It had no use anywhere in
+# this package — what a pipeline renders INTO is the runtime's concern, and the
+# concrete targets (a window's swapchain image, an offscreen framebuffer) are
+# each a backend's.

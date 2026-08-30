@@ -88,6 +88,20 @@ end
 # backend, which is a host handle — so it is in the host half, and this is the
 # one list both sides derive from.
 
+# `sub_group_reduce_add` is KI's name for the reduce-add, and Lava's
+# `subgroup_add` is the SPIR-V `OpGroupNonUniformFAdd`/`IAdd` behind it.
+#
+# Its own type list rather than a reuse of `KI_SHFL_TYPES`, even though the six
+# coincide today: the shuffle family and the reductions are separate SPIR-V
+# capabilities, and a backend can have one without the other — Metal's
+# `simd_sum` has no `Float64` at all. Tying them to one tuple would make that
+# divergence unrepresentable.
+const KI_REDUCE_ADD_TYPES = (Float32, Float64, Int32, UInt32, Int64, UInt64)
+
+for T in KI_REDUCE_ADD_TYPES
+    @eval @inline KI.sub_group_reduce_add(val::$T) = subgroup_add(val)
+end
+
 # ── Barriers ────────────────────────────────────────────────────────────────
 #
 # `@lava_device_override`, not a plain method, and the difference matters here in
