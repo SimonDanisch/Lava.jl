@@ -534,13 +534,19 @@ end
 # GPU update kernel + update_transform!/update_transforms!
 # ============================================================================
 
+# A refit rewrites the transform only. `custom_index_and_mask` is per instance:
+# the `instance_ids` overloads of `push!` write a different index into each
+# record, and that index is how a shader finds the instance's material, so the
+# kernel carries the word across from the record rather than restamping it from
+# the batch. The mask shares that word and is per-batch, but nothing changes it
+# after registration.
 KA.@kernel cpu=false function update_instance_records_kernel!(
         records,
         @Const(transforms),
         blas_address::UInt64,
-        cim::UInt32,
         sof::UInt32)
     i = @index(Global, Linear)
+    @inbounds cim = records[i].custom_index_and_mask
     @inbounds records[i] = LavaInstanceRecord(transforms[i], cim, sof, blas_address)
 end
 
@@ -597,12 +603,11 @@ Raycore.update_transform!(hwtlas::HWTLAS, handle::Raycore.TLASHandle, transform:
 
 function _apply_pending_update!(batch::InstanceBatch, transforms::LavaArray{Mat3x4f, 1})
     backend = KA.get_backend(batch.instance_buf)
-    cim = (batch.custom_index & 0x00FFFFFF) | (UInt32(batch.instance_mask) << 24)
     # Preserve the batch's SBT hit-group offset across refits (8-bit flags = 0).
     sof = batch.sbt_offset & 0x00FFFFFF
     update_instance_records_kernel!(backend)(
         batch.instance_buf, transforms,
-        batch.blas.address, cim, sof;
+        batch.blas.address, sof;
         ndrange = batch.n)
 end
 
