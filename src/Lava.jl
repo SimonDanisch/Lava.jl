@@ -96,10 +96,21 @@ public caps, DeviceCaps
 import Serialization
 import PrecompileTools
 using PrecompileTools: @setup_workload
-# NOT `using Vulkan`, and that is the headline of the 2026-08-27 split: a
-# compiler does not need a driver. GLFW, GPUArraysCore and LinearAlgebra left
-# with it — windows, host array machinery and `mul!` are the runtime's, and the
-# runtime is `Mantle/src/vulkan/` now.
+# `import`, and the ONLY line in this package that names Vulkan.
+#
+# The 2026-08-27 split moved the Vulkan RUNTIME out — GLFW, GPUArraysCore and
+# LinearAlgebra left with it, because windows, host array machinery and `mul!`
+# are the runtime's, and the runtime is `Mantle/src/vulkan/` now. It also dropped
+# the dependency, which was a step too far: `Mantle`'s backend is an extension
+# triggered on `["Lava", "Vulkan"]`, and Lava is the only one of that pair anyone
+# downstream names. Hikari, RayMakie and Mantle's own test suite all loaded Lava,
+# got no extension, and reported "no GPU backend is available" on a machine with
+# a working driver.
+#
+# So the driver is loaded and nothing here uses it: `test_compiler_runtime_split.jl`
+# still asserts, file by file, that no source names `VkContext`, `vk_context` or
+# `VK_CONTEXT_REF`, and that `Vulkan` itself appears in no file but this one.
+import Vulkan
 using GPUCompiler
 using Raycore: Ray
 using LLVM

@@ -7,6 +7,15 @@ runtime moved to `Mantle/src/vulkan/` and the line became the package boundary,
 so the assertion got simpler and stronger: not "no file on that side", but **no
 file**.
 
+**Types, not the dependency.** The 2026-08-27 change also dropped Vulkan from
+`[deps]`, and that part was undone on 2026-08-30: `Mantle`'s backend extension
+triggers on `["Lava", "Vulkan"]`, Lava is the only one of that pair anyone
+downstream names, and with the dependency gone the extension never loaded — so
+Hikari, RayMakie and Mantle's own suite each reported "no GPU backend is
+available" on a machine with a working driver. `Lava.jl` says `import Vulkan` and
+uses nothing from it; every other file, and every `VkContext` / `vk_context` /
+`VK_CONTEXT_REF` anywhere including that one, is still forbidden.
+
 What had to be untangled before the move was possible, each of which would put a
 `VkContext` back here if it came undone:
 
@@ -23,8 +32,9 @@ What had to be untangled before the move was possible, each of which would put a
     asymmetry was the split.
 
 Parsed, not grepped, so a `VkContext` named in a docstring does not count. Several
-are, deliberately, to say where something went; `Vulkan` itself still appears 87
-times in prose and once as `MemModel.Vulkan`, a SPIR-V enum this package defines.
+are, deliberately, to say where something went; `Vulkan` itself appears many times
+in prose, once as `MemModel.Vulkan` (a SPIR-V enum this package defines), and once
+as the `import` described above.
 
 The list of files is exhaustive and checked: a new file under `src/` that is not
 in it fails, because a compiler gaining a source file is worth one line of
@@ -55,8 +65,23 @@ const LAVA_SOURCES = [
     "device/sharedmemory.jl", "device/ndrange.jl",
 ]
 
-# `Vulkan` is the package; the other three are the runtime's entry points into it.
+# The runtime's entry points into the driver. Naming any of these is the failure
+# this file is about: it would mean compiler code reaching for a live device.
 const VULKAN_NAMES = Set([:Vulkan, :VkContext, :vk_context, :VK_CONTEXT_REF])
+
+# `Vulkan` — the PACKAGE — is allowed in exactly one file, and nowhere else.
+#
+# `Lava.jl` says `import Vulkan` and uses nothing from it. That is a dependency,
+# not code: `Mantle`'s backend extension triggers on `["Lava", "Vulkan"]`, and
+# with the dependency dropped (as it was between 2026-08-27 and 2026-08-30)
+# nothing downstream loaded the second half of that pair, so the extension never
+# fired and every consumer reported "no GPU backend is available" on a machine
+# with a working driver.
+#
+# The exemption is one name in one file on purpose. `VkContext`, `vk_context` and
+# `VK_CONTEXT_REF` are NOT exempt anywhere, including here — those are the ones
+# that would mean the runtime had leaked back in.
+const VULKAN_DEP_FILE = "Lava.jl"
 
 """Every identifier a file references, from its syntax — docstrings excluded for
 free, since a docstring is a string literal and not a symbol."""
@@ -106,18 +131,29 @@ end
     @test sort(found) == sort(LAVA_SOURCES)
 
     @testset "$f" for f in LAVA_SOURCES
-        hits = intersect(referenced_names(joinpath(src, f)), VULKAN_NAMES)
+        banned = f == VULKAN_DEP_FILE ? setdiff(VULKAN_NAMES, [:Vulkan]) : VULKAN_NAMES
+        hits = intersect(referenced_names(joinpath(src, f)), banned)
         # Named, not counted: a failure says which file reached and for what.
         @test (f, sort(collect(hits); by = string)) == (f, Symbol[])
     end
 
-    # And the dependency itself is gone, which is the fact the file names assert
-    # one at a time. `Vulkan` not being loadable from inside Lava is what makes
-    # the rest of it true rather than merely tidy.
-    @testset "Vulkan is not a dependency" begin
+    # The one exemption is one line, and this is what keeps it that way: a second
+    # `Vulkan` in `Lava.jl` — a `using Vulkan`, a `Vulkan.Device` — would pass the
+    # loop above and fail here.
+    @testset "the dependency is one import and nothing more" begin
         toml = read(joinpath(pkgdir(Lava), "Project.toml"), String)
         deps = split(split(toml, "[deps]")[2], "[")[1]
-        for pkg in ("Vulkan", "GLFW", "GPUArraysCore", "LinearAlgebra")
+        @test occursin(Regex("^Vulkan = ", "m"), deps)
+        body = read(joinpath(src, VULKAN_DEP_FILE), String)
+        # In CODE. The comment above the import explains the whole arrangement,
+        # so the word itself is expected in prose several times over.
+        code = [strip(l) for l in split(body, '\n')
+                if occursin(r"\bVulkan\b", l) && !startswith(strip(l), "#")]
+        @test code == ["import Vulkan"]
+
+        # The RUNTIME's dependencies are still gone, which is what the split was
+        # for. These left with `Mantle/src/vulkan/` and none of them came back.
+        for pkg in ("GLFW", "GPUArraysCore", "LinearAlgebra")
             @test !occursin(Regex("^$pkg = ", "m"), deps)
         end
         # The compiler's own dependencies are still there.
