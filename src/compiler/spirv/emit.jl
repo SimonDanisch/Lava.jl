@@ -4845,12 +4845,32 @@ end
 Infer what a loaded pointer value points to by examining its users.
 When a `load ptr` produces a pointer, look at how that pointer is used
 (GEPs with struct source type, loads, stores) to determine the pointee.
+
+When `ptm` is given, the PTM entry of the consuming load is preferred over
+use-based inference: it is the same entry `emit_load!` (via
+`map_pointer_type_for_value!`) will use for the load's result type, so the
+OpLoad result type matches the pointee type assigned to this pointer here.
+Pure use-based inference can disagree with the PTM because the two traverse
+in different orders — inference follows the use list (reverse creation order,
+so a byte-offset GEP feeding e.g. a float field load can win) while the PTM
+is built in instruction scan order (so a later direct `load i32` at offset 0
+overwrites the inferred entry at equal priority). The disagreement produces
+`OpLoad` result types that mismatch the pointer's declared pointee type.
 """
-function infer_inner_ptr_pointee(gep_or_load::LLVM.Instruction)
+function infer_inner_ptr_pointee(gep_or_load::LLVM.Instruction, ptm::Union{PointeeTypeMap,Nothing}=nothing)
     # Look at users of loads from this GEP/inttoptr
     for use in LLVM.uses(gep_or_load)
         user = LLVM.user(use)
         if user isa LLVM.LoadInst
+            # The PTM entry for this load is authoritative for the load's
+            # emitted result type (see docstring). Skip pointer-typed entries:
+            # those are handled (as before) by the recursive use tracing below.
+            if ptm !== nothing
+                pt = get_pointee_type(ptm, user)
+                if pt !== nothing && !(pt isa LLVM.PointerType)
+                    return pt
+                end
+            end
             # The load produces a ptr — look at how that ptr is used.
             # Two passes: prefer struct GEPs (non-byte-offset) over byte-offset GEPs,
             # since byte-offset GEPs access individual fields while struct GEPs give
@@ -5792,7 +5812,9 @@ function emit_inttoptr!(state::SPIRVEmitterState, inst::LLVM.IntToPtrInst)
         if pointee isa LLVM.PointerType
             # The inttoptr result points to a pointer. Find what THAT pointer points to
             # by looking at the users of the load that consumes this inttoptr.
-            inner_pointee = infer_inner_ptr_pointee(inst)
+            # Pass the PTM so the load's recorded pointee (what emit_load! will
+            # use for the OpLoad result type) wins over use-order-dependent inference.
+            inner_pointee = infer_inner_ptr_pointee(inst, state.type_ctx.ptm)
             if inner_pointee === nothing
                 inner_pointee = LLVM.IntType(8)  # fallback: ptr to i8
             end

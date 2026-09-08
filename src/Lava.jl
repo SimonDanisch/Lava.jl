@@ -75,8 +75,13 @@ export GeometryConfig, TessConfig
 export TessSpacing, EqualSpacing, FractionalEvenSpacing, FractionalOddSpacing
 export TessWinding, WindingCW, WindingCCW
 export TessDomain, TessTriangles, TessQuads, TessIsolines
-export vertex_index, instance_index
-export frag_coord, frag_coord_x, frag_coord_y, frag_coord_xy
+# The shader builtins — `vertex_index`, `instance_index` and the `frag_coord`
+# family — are defined here and deliberately NOT exported. Mantle declares and
+# exports the portable names (`Mantle.vertex_index`), and the Vulkan backend
+# binds them to these implementations with `@lava_device_override`, qualified
+# as `Lava.vertex_index`. Exported from both, `using Mantle, Lava` left the
+# bare name ambiguous and unbound, so every shader that wrote `vertex_index()`
+# in such a scope inferred `Any` and failed to compile.
 export dFdx, dFdy
 export front_facing
 export set_position!, set_point_size!
