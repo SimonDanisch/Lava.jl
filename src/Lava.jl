@@ -49,9 +49,9 @@ export MatrixA, MatrixB, Accumulator
 
 # Ray-tracing device intrinsics. The pipeline that dispatches them is Mantle's;
 # these are what a shader body calls.
-export lava_rt_ignore_intersection, lava_rt_terminate_ray
+# DELETED in phase 1.4: exports of the deleted intrinsics
 # SER (SPV_NV_shader_invocation_reorder)
-export lava_rt_hit_object_trace_ray, lava_rt_reorder_thread, lava_rt_hit_object_execute_shader
+# DELETED in phase 1.4: exports of the deleted intrinsics
 
 # Re-export Raycore.Ray so `using Lava` users get Ray without ambiguity
 export Ray
