@@ -147,15 +147,18 @@ function compile_and_disasm(@nospecialize(f), @nospecialize(tt);
                             config=nothing,
                             payload_type::Symbol=:f32,
                             enable_ray_query::Bool=false,
-                            validate::Bool=true)
+                            validate::Bool=true,
+                            # A compiler test that turns ray queries on is
+                            # compiling for hardware that has them.
+                            features::Lava.TargetFeatures=Lava.TargetFeatures(; ray_query = enable_ray_query))
     if stage == :compute
-        result = Lava.lava_compile_gpu(f, tt; workgroup_size, enable_ray_query, validate)
+        result = Lava.lava_compile_gpu(f, tt; workgroup_size, enable_ray_query, validate, features)
         bytes = result.spirv_bytes
     elseif stage in (:vertex, :fragment, :geometry, :tess_control, :tess_eval)
         result = Lava.lava_compile_gfx_shader(f, tt; stage, config, validate)
         bytes = result.spirv_bytes
     elseif stage in (:raygen, :closesthit, :miss, :anyhit, :intersection, :callable)
-        result = Lava.lava_compile_rt_shader(f, tt; stage, payload_type, validate)
+        result = Lava.lava_compile_rt_shader(f, tt; stage, payload_type, validate, features)
         bytes = result.spirv_bytes
     else
         error("Unknown stage: $stage")

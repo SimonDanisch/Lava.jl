@@ -37,8 +37,8 @@ rt_probe_fn(x) = x
         shader = Lava.LavaRTShader(UInt8[0x03, 0x02, 0x23, 0x07], :raygen, pinfo,
                                    "some llvm ir that must NOT be stored")
 
-        @test Lava.frozen_rt_load(f, tt, :raygen, :f32, 8) === nothing   # cold
-        Lava.frozen_rt_store(f, tt, :raygen, :f32, 8, shader)
+        @test Lava.frozen_rt_load(f, tt, :raygen, :f32, 8, Lava.TargetFeatures()) === nothing   # cold
+        Lava.frozen_rt_store(f, tt, :raygen, :f32, 8, Lava.TargetFeatures(), shader)
         @test Lava.frozen_stats().stores == 1
 
         # A fresh session has no memo, only the file. This is the path that
@@ -47,7 +47,7 @@ rt_probe_fn(x) = x
         # `MethodError: Cannot convert Tuple{DataType,DataType,Symbol,Symbol,Int64}`
         # at the first cache hit, so every replay failed to render.
         empty!(Lava.FROZEN_RT_MEM)
-        got = Lava.frozen_rt_load(f, tt, :raygen, :f32, 8)
+        got = Lava.frozen_rt_load(f, tt, :raygen, :f32, 8, Lava.TargetFeatures())
         @test got !== nothing
         @test got.spirv_bytes == shader.spirv_bytes
         @test got.stage === :raygen
@@ -55,11 +55,11 @@ rt_probe_fn(x) = x
         @test Lava.frozen_stats().misses == 0
 
         # Second load comes from the memo — must not throw, must be the same object.
-        @test Lava.frozen_rt_load(f, tt, :raygen, :f32, 8) === got
+        @test Lava.frozen_rt_load(f, tt, :raygen, :f32, 8, Lava.TargetFeatures()) === got
 
         # Stage and payload are part of the key: a different stage is a miss.
-        @test Lava.frozen_rt_load(f, tt, :miss, :f32, 8) === nothing
-        @test Lava.frozen_rt_load(f, tt, :raygen, :u32, 8) === nothing
+        @test Lava.frozen_rt_load(f, tt, :miss, :f32, 8, Lava.TargetFeatures()) === nothing
+        @test Lava.frozen_rt_load(f, tt, :raygen, :u32, 8, Lava.TargetFeatures()) === nothing
     finally
         Lava.frozen_rt_clear!()
         delete!(Lava.FROZEN_UNPACKAGED, @__MODULE__)   # hand the guard back

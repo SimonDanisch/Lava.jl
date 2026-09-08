@@ -561,8 +561,9 @@ end
 function lava_compile_rt_full(@nospecialize(f), @nospecialize(tt);
                                 stage::Symbol=:raygen,
                                 payload_type::Symbol=:f32,
-                                validate::Bool=true)
-    config = lava_compiler_config(; workgroup_size=(1, 1, 1))
+                                validate::Bool=true,
+                                features::TargetFeatures=TargetFeatures())
+    config = lava_compiler_config(; workgroup_size=(1, 1, 1), features)
     source = GPUCompiler.methodinstance(typeof(f), tt)
     job = GPUCompiler.CompilerJob(source, config)
 
@@ -588,7 +589,7 @@ function lava_compile_rt_full(@nospecialize(f), @nospecialize(tt);
         post_pass_ir = string(mod)
 
         spirv_bytes, source_map = emit_spirv_from_llvm_rt(mod, wrapper_name, stage;
-                                                payload_type=payload_type)
+                                                payload_type=payload_type, features)
 
         write(lava_debug_path("lava_last.spv"), spirv_bytes)
         write(lava_debug_path("lava_last.ll"), post_pass_ir)
@@ -719,6 +720,17 @@ function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob;
                                     validate::Bool = true,
                                     force_inline_all::Bool = false)
     workgroup_size = job.config.params.workgroup_size
+    features = job.config.params.features
+    # `enable_ray_query = true` is a claim about hardware. Refused here, where the
+    # message can say why, rather than by the driver at pipeline creation; and
+    # asked of the job's own record, so the answer is for the device this kernel
+    # is compiled for and not for whichever device happens to be the default.
+    if enable_ray_query && !features.ray_query
+        error("lava_compile_gpu: enable_ray_query=true requested, but the target " *
+              "Vulkan device does not support VK_KHR_ray_query. Either compile for " *
+              "a device that supports ray_query (e.g. RADV, lavapipe) or compile " *
+              "without enable_ray_query.")
+    end
     GPUCompiler.JuliaContext() do ctx
         local mod, meta
         try
@@ -818,24 +830,12 @@ function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
                            workgroup_size::NTuple{3,Int} = (64, 1, 1),
                            enable_ray_query::Bool = false,
                            validate::Bool = true,
-                           force_inline_all::Bool = false)
-    # `targetfeatures()`, not `vk_context().ray_query_available`. Same answer for
-    # the same reason — a module declaring RayQueryKHR on a device without it
-    # fails at pipeline creation, so it is refused here where the message can say
-    # why — but asked of a record the runtime pushed rather than by reaching into
-    # a `VkContext`, which is what kept the compiler tied to the Vulkan runtime.
-    #
-    # With no device bound the answer is `false` and this refuses, which is
-    # correct: `enable_ray_query = true` is a claim about hardware, and a caller
-    # compiling for hardware that is not there has to say so with
-    # `targetfeatures!` rather than have it assumed.
-    if enable_ray_query && !targetfeatures().ray_query
-        error("lava_compile_gpu: enable_ray_query=true requested, but the " *
-              "active Vulkan device does not support VK_KHR_ray_query. " *
-              "Either run on a device that supports ray_query (e.g. RADV, " *
-              "lavapipe) or call lava_compile_gpu without enable_ray_query.")
-    end
-    config = lava_compiler_config(; workgroup_size, enable_ray_query)
+                           force_inline_all::Bool = false,
+                           features::TargetFeatures = TargetFeatures())
+    # `features` is what the target device allows; `enable_ray_query` against a
+    # record without ray query is refused in `lava_compile_gpu_from_job`, where
+    # both paths meet.
+    config = lava_compiler_config(; workgroup_size, enable_ray_query, features)
     source = GPUCompiler.methodinstance(typeof(f), tt)
     job = GPUCompiler.CompilerJob(source, config)
     return lava_compile_gpu_from_job(job; enable_ray_query, validate, force_inline_all)
@@ -927,7 +927,8 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
                                  stage::Symbol=:raygen,
                                  push_constant_size::Integer=8,
                                  payload_type::Symbol=:f32,
-                                 validate::Bool=true)
+                                 validate::Bool=true,
+                                 features::TargetFeatures=TargetFeatures())
     # Before the frozen check, so a cache hit is still recorded — the capture is
     # about learning WHICH shaders a scene compiles, not about timing them.
     if get(ENV, "LAVA_CAPTURE_RT_JOBS", "") == "1"
@@ -940,7 +941,7 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
     # (crown: ~610 s of compile against ~7.8 s of frames).  `ctx.pipeline_cache`
     # does not help here; it caches the driver's SPIR-V → ISA step, which cannot
     # start until this function has produced the SPIR-V.
-    let hit = frozen_rt_load(f, tt, stage, payload_type, push_constant_size)
+    let hit = frozen_rt_load(f, tt, stage, payload_type, push_constant_size, features)
         hit === nothing || return hit
     end
 
@@ -949,7 +950,7 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
     # `enable_ray_query=true` to bring in the TLAS variable + the rayQuery
     # capability. The cost of enabling on RT shaders that don't actually use
     # ray query is one unused descriptor binding (the driver strips dead code).
-    config = lava_compiler_config(; workgroup_size=(1, 1, 1), enable_ray_query=true)
+    config = lava_compiler_config(; workgroup_size=(1, 1, 1), enable_ray_query=true, features)
     source = GPUCompiler.methodinstance(typeof(f), tt)
     job = GPUCompiler.CompilerJob(source, config)
 
@@ -993,7 +994,7 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
 
         # RT-specific SPIR-V emission
         spirv_bytes, source_map = emit_spirv_from_llvm_rt(mod, wrapper_name, stage;
-                                                payload_type=payload_type)
+                                                payload_type=payload_type, features)
         checkpoint("emit_spirv_from_llvm_rt")
 
         write(lava_debug_path("lava_last.spv"), spirv_bytes)
@@ -1005,7 +1006,7 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
         end
 
         shader = LavaRTShader(spirv_bytes, stage, push_info, ir)
-        frozen_rt_store(f, tt, stage, payload_type, push_constant_size, shader)
+        frozen_rt_store(f, tt, stage, payload_type, push_constant_size, features, shader)
         return shader
     end
 end

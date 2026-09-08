@@ -21,25 +21,17 @@ import .SPIRVTestUtils: check, check_not, compile_and_disasm
 end
 
 @testset "Ray Query - Phase A2 enable flag emits capability" begin
-    # Tell the emitter the device has ray query, so the guard in
-    # `lava_compile_gpu` does not fire.
-    #
-    # This used to reach for `vk_context()` and MUTATE `ctx.ray_query_available`
-    # on the live device — a test writing to a driver-probed field, restored in a
-    # `finally`. Since the emitter reads `targetfeatures()` instead, the same
-    # thing is a record swap, and this file no longer needs a device at all.
-    saved = Lava.targetfeatures()
-    Lava.targetfeatures!(Lava.TargetFeatures(; ser = saved.ser, ray_query = true))
+    # `compile_and_disasm` compiles for hardware that has ray query whenever
+    # `enable_ray_query` is on: the record travels with the compile job, so this
+    # file needs neither a device nor a global to swap.
     local d
-    try
+    let
         function noop_kernel(out)
             @inbounds out[1] = 1.0f0
             return nothing
         end
         d, _ = compile_and_disasm(noop_kernel, Tuple{Lava.LavaDeviceArray{Float32,1}};
                                   stage=:compute, enable_ray_query=true)
-    finally
-        Lava.targetfeatures!(saved)
     end
     check(d, "OpCapability RayQueryKHR")
     check(d, "OpCapability RayTracingKHR")
@@ -48,35 +40,29 @@ end
 end
 
 @testset "Ray Query - Phase A2 errors loudly without device support" begin
-    # Save and restore the record so this test does not poison later ones.
-    saved = Lava.targetfeatures()
-    Lava.targetfeatures!(Lava.TargetFeatures(; ser = saved.ser, ray_query = false))
-    try
+    # The job's own record says the target has no ray query; nothing global
+    # is touched, so nothing can poison a later test.
+    let
         function noop_kernel2(out)
             @inbounds out[1] = 1f0
             return nothing
         end
         @test_throws ErrorException compile_and_disasm(noop_kernel2,
             Tuple{Lava.LavaDeviceArray{Float32,1}};
-            stage=:compute, enable_ray_query=true)
-    finally
-        Lava.targetfeatures!(saved)
+            stage=:compute, enable_ray_query=true,
+            features=Lava.TargetFeatures(; ray_query = false))
     end
 end
 
 @testset "Ray Query - Phase A3 type and TLAS descriptor declared" begin
-    saved = Lava.targetfeatures()
-    Lava.targetfeatures!(Lava.TargetFeatures(; ser = saved.ser, ray_query = true))
     local d
-    try
+    let
         function noop_kernel3(out)
             @inbounds out[1] = 1.0f0
             return nothing
         end
         d, _ = compile_and_disasm(noop_kernel3, Tuple{Lava.LavaDeviceArray{Float32,1}};
                                   stage=:compute, enable_ray_query=true)
-    finally
-        Lava.targetfeatures!(saved)
     end
     check(d, "OpTypeAccelerationStructureKHR")
     check(d, "OpTypeRayQueryKHR")
@@ -85,10 +71,8 @@ end
 end
 
 @testset "Ray Query - Phase A4 OpRayQueryInitializeKHR" begin
-    saved = Lava.targetfeatures()
-    Lava.targetfeatures!(Lava.TargetFeatures(; ser = saved.ser, ray_query = true))
     local d
-    try
+    let
         function init_kernel(out)
             ray = Ray(o=Point3f(0, 0, 0), d=Vec3f(0, 0, 1), t_min=0f0, t_max=1f3)
             Lava.lava_ray_query_init(ray; mask=UInt32(0xFF))
@@ -97,17 +81,13 @@ end
         end
         d, _ = compile_and_disasm(init_kernel, Tuple{Lava.LavaDeviceArray{Float32,1}};
                                   stage=:compute, enable_ray_query=true)
-    finally
-        Lava.targetfeatures!(saved)
     end
     check(d, "OpRayQueryInitializeKHR")
 end
 
 @testset "Ray Query - Phase A5 control flow + getters" begin
-    saved = Lava.targetfeatures()
-    Lava.targetfeatures!(Lava.TargetFeatures(; ser = saved.ser, ray_query = true))
     local d
-    try
+    let
         function full_kernel(out)
             Lava.lava_ray_query_init(Ray(o=Point3f(0, 0, 0), d=Vec3f(0, 0, 1), t_min=0f0, t_max=1f3))
             while Lava.lava_ray_query_proceed()
@@ -130,8 +110,6 @@ end
         end
         d, _ = compile_and_disasm(full_kernel, Tuple{Lava.LavaDeviceArray{Float32,1}};
                                   stage=:compute, enable_ray_query=true)
-    finally
-        Lava.targetfeatures!(saved)
     end
     for op in ("OpRayQueryProceedKHR",
                "OpRayQueryConfirmIntersectionKHR",
@@ -146,10 +124,8 @@ end
 end
 
 @testset "Ray Query - Phase A5 terminate" begin
-    saved = Lava.targetfeatures()
-    Lava.targetfeatures!(Lava.TargetFeatures(; ser = saved.ser, ray_query = true))
     local d
-    try
+    let
         function term_kernel(out)
             Lava.lava_ray_query_init(Ray(o=Point3f(0, 0, 0), d=Vec3f(0, 0, 1), t_min=0f0, t_max=1f3))
             Lava.lava_ray_query_terminate()
@@ -158,17 +134,13 @@ end
         end
         d, _ = compile_and_disasm(term_kernel, Tuple{Lava.LavaDeviceArray{Float32,1}};
                                   stage=:compute, enable_ray_query=true)
-    finally
-        Lava.targetfeatures!(saved)
     end
     check(d, "OpRayQueryTerminateKHR")
 end
 
 @testset "Ray Query - Phase A6 OpVariable survives optimizer sink (init in conditional)" begin
-    saved = Lava.targetfeatures()
-    Lava.targetfeatures!(Lava.TargetFeatures(; ser = saved.ser, ray_query = true))
     local d
-    try
+    let
         function conditional_init_kernel(out)
             i = Lava.lava_global_invocation_id_x()
             if i > UInt32(0)  # always true at runtime, but optimizer may not know
@@ -187,8 +159,6 @@ end
         d, _ = compile_and_disasm(conditional_init_kernel,
                                    Tuple{Lava.LavaDeviceArray{Float32,1}};
                                    stage=:compute, enable_ray_query=true)
-    finally
-        Lava.targetfeatures!(saved)
     end
     # Validation is run inside compile_and_disasm: if the OpVariable was sunk
     # out of the entry block the validator throws before we get here.
@@ -199,4 +169,4 @@ end
 # The device PROBE — does this driver actually expose VK_KHR_ray_query — moved to
 # `Mantle/test/vulkan/test_rayquery_device_probe.jl`. It reads a `VkContext`
 # field, which is the one thing in this file that needed hardware; everything
-# above asks `targetfeatures()` and runs on a machine with no driver.
+# above passes the compile job its own record and runs on a machine with no driver.

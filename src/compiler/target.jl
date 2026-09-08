@@ -10,9 +10,15 @@
 struct LavaCompilerParams <: GPUCompiler.AbstractCompilerParams
     workgroup_size::NTuple{3,Int}
     enable_ray_query::Bool
+    # What the target device lets the module declare. In the params so it is part
+    # of the job GPUCompiler caches on and of every frozen key derived from it:
+    # two devices with different feature sets compile the same kernel twice, as
+    # they must.
+    features::TargetFeatures
 end
-LavaCompilerParams() = LavaCompilerParams((64, 1, 1), false)
-LavaCompilerParams(workgroup_size::NTuple{3,Int}) = LavaCompilerParams(workgroup_size, false)
+LavaCompilerParams() = LavaCompilerParams((64, 1, 1), false, TargetFeatures())
+LavaCompilerParams(workgroup_size::NTuple{3,Int}) =
+    LavaCompilerParams(workgroup_size, false, TargetFeatures())
 
 const LavaCompilerConfig = GPUCompiler.CompilerConfig{GPUCompiler.SPIRVCompilerTarget, LavaCompilerParams}
 const LavaCompilerJob = GPUCompiler.CompilerJob{GPUCompiler.SPIRVCompilerTarget, LavaCompilerParams}
@@ -222,13 +228,14 @@ GPUCompiler's SPIRVCompilerTarget with:
 """
 function lava_compiler_config(; workgroup_size::NTuple{3,Int} = (64, 1, 1),
                                enable_ray_query::Bool = false,
+                               features::TargetFeatures = TargetFeatures(),
                                kwargs...)
-    h = hash((workgroup_size, enable_ray_query, kwargs))
+    h = hash((workgroup_size, enable_ray_query, features, kwargs))
     config = get(COMPILER_CONFIGS, h, nothing)
     if config !== nothing
         return config
     end
-    config = lava_full_compiler_config(; workgroup_size, enable_ray_query, kwargs...)
+    config = lava_full_compiler_config(; workgroup_size, enable_ray_query, features, kwargs...)
     COMPILER_CONFIGS[h] = config
     return config
 end
@@ -248,12 +255,13 @@ end
         always_inline = false,
         workgroup_size::NTuple{3,Int} = (64, 1, 1),
         enable_ray_query::Bool = false,
+        features::TargetFeatures = TargetFeatures(),
         kwargs...)
     target = GPUCompiler.SPIRVCompilerTarget(;
         backend = :llvm,       # gives spirv64-unknown-unknown-unknown triple
         validate = false,      # we validate after our custom SPIR-V emitter
         supports_fp64 = true,  # AMD RX 7900 XTX supports Float64
     )
-    params = LavaCompilerParams(workgroup_size, enable_ray_query)
+    params = LavaCompilerParams(workgroup_size, enable_ray_query, features)
     GPUCompiler.CompilerConfig(target, params; kernel, name, always_inline)
 end

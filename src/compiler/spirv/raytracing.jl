@@ -68,7 +68,8 @@ Same skeleton as `emit_spirv_from_llvm` but:
 6. TLAS descriptor variable (for raygen — AccelerationStructureKHR)
 """
 function emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
-                                   stage::Symbol; payload_type::Symbol=:f32)
+                                   stage::Symbol; payload_type::Symbol=:f32,
+                                   features::TargetFeatures=TargetFeatures())
     stage_info = get(RT_STAGE_INFO, stage, nothing)
     stage_info === nothing && error("Unknown RT shader stage: $stage")
 
@@ -86,12 +87,12 @@ function emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
     require_capability!(spirv_mod, Cap.RayTracingKHR)
     require_extension!(spirv_mod, "SPV_KHR_variable_pointers")
     require_extension!(spirv_mod, "SPV_KHR_ray_tracing")
-    # SER capability — opt-in, declared only when the device supports it.
-    # Declaring it on non-NVIDIA hardware is a validation error, not a slow path,
-    # so the module asks `targetfeatures()` rather than assuming. With no device
-    # bound the answer is `false`, which is the module that is valid everywhere —
-    # so an emitter test never has to construct a `VkContext` to compile.
-    if stage === :raygen && targetfeatures().ser
+    # SER capability: declared only when the device this module is FOR supports
+    # it. Declaring it on non-NVIDIA hardware is a validation error, not a slow
+    # path, so the module asks the job's feature record rather than assuming. The
+    # record defaults to all-false, which is the module that is valid everywhere,
+    # so an emitter test never has to construct a device to compile.
+    if stage === :raygen && features.ser
         require_capability!(spirv_mod, Cap.ShaderInvocationReorderNV)
         require_extension!(spirv_mod, "SPV_NV_shader_invocation_reorder")
     end
@@ -103,6 +104,7 @@ function emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
     # Create emitter state
     state = SPIRVEmitterState(spirv_mod, type_ctx)
     state.data_layout = LLVM.datalayout(llvm_mod)
+    state.features = features
 
     # Find entry function
     entry_fn = LLVM.functions(llvm_mod)[entry_name]
@@ -516,9 +518,9 @@ end
 
 # `_ser_available_for_emit` is gone. It read `VK_CONTEXT_REF[]` and reached into
 # a `VkContext` for one boolean, which was the whole of the compiler's dependency
-# on the Vulkan runtime here. `targetfeatures().ser` is the same answer, with the
-# same "no device bound means emit the portable module" rule, from a record that
-# has no Vulkan in it. See `compiler/target_features.jl`.
+# on the Vulkan runtime here. `state.features.ser` is the same answer for the
+# device this module is compiled FOR, from the job's record, with the same "no
+# device means emit the portable module" default. See `compiler/target_features.jl`.
 
 """
 Emit OpTypeHitObjectNV once per module.  Cached in `state.rt_hit_object_type_id`.
@@ -569,7 +571,7 @@ ops then become no-ops; together they reproduce the implicit-trace path
 the SER pattern emulates on hardware that does support reordering.
 """
 function emit_rt_hit_object_trace_ray!(state::SPIRVEmitterState, inst::LLVM.CallInst)
-    if !targetfeatures().ser
+    if !state.features.ser
         return emit_rt_trace_ray!(state, inst)
     end
     mod = state.mod
@@ -637,7 +639,7 @@ already lowered to a full OpTraceRayKHR (which invoked the chit inline);
 nothing remains to reorder, so this is a no-op.
 """
 function emit_rt_reorder_thread!(state::SPIRVEmitterState, inst::LLVM.CallInst)
-    targetfeatures().ser || return
+    state.features.ser || return
     mod = state.mod
     ho_var = get_or_create_hit_object_var!(state)
     # OpReorderThreadWithHitObjectNV %hit_object_var
@@ -656,7 +658,7 @@ inline by the fallback OpTraceRayKHR in `emit_rt_hit_object_trace_ray!`, so
 this is a no-op.
 """
 function emit_rt_hit_object_execute_shader!(state::SPIRVEmitterState, inst::LLVM.CallInst)
-    targetfeatures().ser || return
+    state.features.ser || return
     mod = state.mod
     ho_var = get_or_create_hit_object_var!(state)
     payload_var = state.rt_payload_var_id

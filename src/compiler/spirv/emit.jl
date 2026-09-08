@@ -213,6 +213,10 @@ mutable struct SPIRVEmitterState
     # walks into one each. Keyed by the metadata ref: two Julia objects can wrap
     # the same underlying node.
     source_loc_cache::Dict{LLVM.API.LLVMMetadataRef, Union{Nothing, Tuple{String, Int}}}
+    # What the device this module is for lets it declare. Set by the RT emitter
+    # from the compile job's `LavaCompilerParams`; all-false until then, which is
+    # the module that is valid everywhere.
+    features::TargetFeatures
 end
 
 function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
@@ -254,6 +258,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{UInt32, Tuple{UInt32, UInt32}}(),  # psb_access_chain
         Dict{LLVM.Value, LLVM.LLVMType}(),  # value_emitted_pointee
         Dict{LLVM.API.LLVMMetadataRef, Union{Nothing, Tuple{String, Int}}}(),  # source_loc_cache
+        TargetFeatures(),  # features (set by the RT emitter from the job)
     )
 end
 

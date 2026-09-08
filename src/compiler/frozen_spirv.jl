@@ -179,8 +179,8 @@ comparable against a directory listing.
 """
 
 """
-Whether the bound device asked for miss logging. Pushed by `bind_context!`, the
-same way `targetfeatures()` is, and reset when the device is released.
+Whether the bound device asked for miss logging. Pushed by `bind_context!` and
+reset when the device is released.
 
 It used to be read off `ctx.diag.frozen_log_misses` through `VK_CONTEXT_REF[]`,
 which meant this file — the half the COMPILER consults before it compiles — named
@@ -243,7 +243,7 @@ const FROZEN_LAYOUT = hash(string(fieldnames(LavaGPUKernel), fieldtypes(LavaGPUK
                                   fieldnames(PushConstantInfo), fieldtypes(PushConstantInfo)))
 
 """
-    frozen_key(f, tt, workgroup_size) -> String
+    frozen_key(f, tt, workgroup_size, features) -> String
 
 `<module>_<kernel>_<signature digest>_v<version>`.
 
@@ -275,14 +275,17 @@ So a changed body under an unchanged signature **is** now detected — this
 docstring used to say the opposite, and `KERNELS_VERSION` remains only for the
 deliberate, cross-package generation bump rather than as the sole guard.
 """
-function frozen_key(@nospecialize(f), @nospecialize(tt), workgroup_size)
+function frozen_key(@nospecialize(f), @nospecialize(tt), workgroup_size,
+                    features::TargetFeatures)
     F = typeof(f)
     # `parentmodule(F)` is where the `@kernel` was written; `Lava` is where the
-    # SPIR-V for it is produced. A change in either invalidates the entry.
+    # SPIR-V for it is produced. A change in either invalidates the entry. The
+    # feature record is in the key because it is in the module: a kernel frozen
+    # for a device with ray queries is not the module a device without them runs.
     bids = hash(Base.module_build_id(parentmodule(F)),
                 hash(Base.module_build_id(@__MODULE__)))
     h = hash(typestring(tt), hash(typestring(F),
-             hash(workgroup_size, hash(FROZEN_LAYOUT, bids))))
+             hash(workgroup_size, hash(features, hash(FROZEN_LAYOUT, bids)))))
     sanitize(s) = replace(s, r"[^A-Za-z0-9_]" => "_")
     mod = sanitize(string(parentmodule(F)))
     fn = sanitize(string(nameof(F)))
@@ -327,7 +330,7 @@ frozen_reset_stats!() = (FROZEN_HITS[] = 0; FROZEN_STORES[] = 0; FROZEN_MISSES[]
 # compile-result memo, and sharing it across devices is correct rather than a
 # §8 defect. `frozen_mem` holds `LavaLinkedKernel`s, which own a pipeline; that
 # is why only that one moved onto the context.
-const FROZEN_RT_MEM = Dict{Tuple{DataType, DataType, Symbol, Symbol, Int}, Any}()
+const FROZEN_RT_MEM = Dict{Tuple{DataType, DataType, Symbol, Symbol, Int, TargetFeatures}, Any}()
 
 # ── Ray-tracing shaders ──
 #
@@ -345,7 +348,8 @@ const FROZEN_RT_MEM = Dict{Tuple{DataType, DataType, Symbol, Symbol, Int}, Any}(
 # function is compiled once per stage and payloads change the emitted module.
 
 function frozen_rt_key(@nospecialize(f), @nospecialize(tt), stage::Symbol,
-                       payload_type::Symbol, push_constant_size::Integer)
+                       payload_type::Symbol, push_constant_size::Integer,
+                       features::TargetFeatures)
     F = typeof(f)
     # Same build-id mix as `frozen_key`, and for the same reason: without it a
     # changed shader body under an unchanged signature keeps its key and is
@@ -357,7 +361,7 @@ function frozen_rt_key(@nospecialize(f), @nospecialize(tt), stage::Symbol,
     h = hash(typestring(tt),
              hash(typestring(F),
                   hash(stage, hash(payload_type,
-                       hash(push_constant_size, hash(FROZEN_LAYOUT, bids))))))
+                       hash(push_constant_size, hash(features, hash(FROZEN_LAYOUT, bids)))))))
     sanitize(s) = replace(s, r"[^A-Za-z0-9_]" => "_")
     mod = sanitize(string(parentmodule(F)))
     fn = sanitize(string(nameof(F)))
@@ -367,18 +371,19 @@ function frozen_rt_key(@nospecialize(f), @nospecialize(tt), stage::Symbol,
 end
 
 """
-    frozen_rt_load(f, tt, stage, payload_type, push_constant_size) -> LavaRTShader | nothing
+    frozen_rt_load(f, tt, stage, payload_type, push_constant_size, features) -> LavaRTShader | nothing
 
 The frozen SPIR-V for an RT stage, without running the compiler.
 """
 function frozen_rt_load(@nospecialize(f), @nospecialize(tt), stage::Symbol,
-                        payload_type::Symbol, push_constant_size::Integer)
+                        payload_type::Symbol, push_constant_size::Integer,
+                        features::TargetFeatures)
     isempty(FROZEN_VERSION[]) && return nothing
     frozen_eligible(f) || return nothing
-    memkey = (typeof(f), tt, stage, payload_type, Int(push_constant_size))
+    memkey = (typeof(f), tt, stage, payload_type, Int(push_constant_size), features)
     hit = get(FROZEN_RT_MEM, memkey, nothing)
     hit === nothing || return hit
-    key = frozen_rt_key(f, tt, stage, payload_type, push_constant_size)
+    key = frozen_rt_key(f, tt, stage, payload_type, push_constant_size, features)
     path = frozen_path(key)
     if !isfile(path)
         frozen_logging() && println("frozen RT MISS: ", key, " || ", typestring(tt))
@@ -397,18 +402,18 @@ function frozen_rt_load(@nospecialize(f), @nospecialize(tt), stage::Symbol,
 end
 
 """
-    frozen_rt_store(f, tt, stage, payload_type, push_constant_size, shader)
+    frozen_rt_store(f, tt, stage, payload_type, push_constant_size, features, shader)
 
 Write an RT stage's SPIR-V under its frozen key. Only while recording.
 """
 function frozen_rt_store(@nospecialize(f), @nospecialize(tt), stage::Symbol,
                          payload_type::Symbol, push_constant_size::Integer,
-                         shader::LavaRTShader)
+                         features::TargetFeatures, shader::LavaRTShader)
     (FROZEN_RECORDING[] && !isempty(FROZEN_VERSION[])) || return nothing
     frozen_eligible(f) || return nothing
     dir = frozen_cache_dir()
     mkpath(dir)
-    key = frozen_rt_key(f, tt, stage, payload_type, push_constant_size)
+    key = frozen_rt_key(f, tt, stage, payload_type, push_constant_size, features)
     path = frozen_path(key)
     # Drop the LLVM IR: session-specific, and by far the largest field.
     entry = LavaRTShader(shader.spirv_bytes, shader.stage, shader.push_info, "")
