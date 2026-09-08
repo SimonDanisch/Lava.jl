@@ -27,20 +27,11 @@ struct TessEvalStage    <: ShaderStage end
 using KernelInterface: Topology, TriangleList, TriangleStrip, LineList,
                        LineStrip, PointList, PatchList, LineListAdjacency,
                        LineStripAdjacency
-
-# ── Geometry Shader Config ──
-
-struct GeometryConfig
-    input_topology::Topology
-    output_topology::Topology
-    max_vertices::Int
-    invocations::Int
-end
-
-function GeometryConfig(; input::Topology=TriangleList(), output::Topology=TriangleStrip(),
-                          max_vertices::Integer=3, invocations::Integer=1)
-    GeometryConfig(input, output, max_vertices, invocations)
-end
+# `GeometryConfig` followed `Topology` there, and for the same reason: a compiler
+# reads every field of it to emit the stage's execution modes, and a portable
+# pipeline description has to be able to hold one without depending on a SPIR-V
+# compiler. It was defined below.
+using KernelInterface: GeometryConfig
 
 # ── Tessellation Config ──
 
