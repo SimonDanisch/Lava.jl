@@ -141,7 +141,7 @@ using GeometryBasics
 
     @testset "vertex shader cross-platform" begin
         function vert()
-            idx = Lava.vertex_index()
+            idx = KernelInterface.vertex_index()
             Lava.set_position!(GeometryBasics.Vec4f(Float32(idx), 0.0f0, 0.0f0, 1.0f0))
             return nothing
         end

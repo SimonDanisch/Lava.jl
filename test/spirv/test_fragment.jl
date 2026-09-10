@@ -30,8 +30,8 @@ using GeometryBasics
 
     @testset "frag coord builtin" begin
         function frag_coord_test()
-            x = Lava.frag_coord_x()
-            y = Lava.frag_coord_y()
+            x = KernelInterface.frag_coord_x()
+            y = KernelInterface.frag_coord_y()
             Lava.gfx_output(0, Vec4f(x / 800.0f0, y / 600.0f0, 0.0f0, 1.0f0))
             return nothing
         end

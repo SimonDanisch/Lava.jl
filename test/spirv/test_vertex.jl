@@ -12,7 +12,7 @@ using GeometryBasics
 
     @testset "passthrough vertex" begin
         function passthrough_vert()
-            idx = Lava.vertex_index()
+            idx = KernelInterface.vertex_index()
             # Simple triangle positions
             x = idx == Int32(1) ? -1.0f0 : (idx == Int32(2) ? 1.0f0 : 0.0f0)
             y = idx == Int32(1) ? -1.0f0 : (idx == Int32(2) ? -1.0f0 : 1.0f0)
@@ -38,8 +38,8 @@ using GeometryBasics
 
     @testset "instance index builtin" begin
         function instance_vert()
-            vidx = Lava.vertex_index()
-            iidx = Lava.instance_index()
+            vidx = KernelInterface.vertex_index()
+            iidx = KernelInterface.instance_index()
             Lava.set_position!(Vec4f(Float32(vidx), Float32(iidx), 0.0f0, 1.0f0))
             return nothing
         end
@@ -49,7 +49,7 @@ using GeometryBasics
 
     @testset "vertex output variables" begin
         function vert_output()
-            idx = Lava.vertex_index()
+            idx = KernelInterface.vertex_index()
             Lava.set_position!(Vec4f(0.0f0, 0.0f0, 0.0f0, 1.0f0))
             Lava.gfx_output(0, Vec4f(1.0f0, 0.0f0, 0.0f0, 1.0f0))
             return nothing
@@ -61,7 +61,7 @@ using GeometryBasics
 
     @testset "vertex with BDA args" begin
         function vert_bda(positions)
-            idx = Lava.vertex_index()
+            idx = KernelInterface.vertex_index()
             @inbounds pos = positions[idx]
             Lava.set_position!(Vec4f(pos[1], pos[2], pos[3], 1.0f0))
             return nothing
@@ -75,7 +75,7 @@ using GeometryBasics
 
     @testset "multiple output locations" begin
         function vert_multi_out()
-            idx = Lava.vertex_index()
+            idx = KernelInterface.vertex_index()
             Lava.set_position!(Vec4f(0.0f0, 0.0f0, 0.0f0, 1.0f0))
             Lava.gfx_output(0, Vec4f(1.0f0, 0.0f0, 0.0f0, 1.0f0))  # color
             Lava.gfx_output(1, Vec2f(0.5f0, 0.5f0))                 # uv

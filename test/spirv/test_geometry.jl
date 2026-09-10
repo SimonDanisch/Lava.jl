@@ -14,8 +14,8 @@ using GeometryBasics
         function passthrough_geom()
             # Just pass through a single vertex
             Lava.set_position!(Vec4f(0.0f0, 0.0f0, 0.0f0, 1.0f0))
-            Lava.emit_vertex!()
-            Lava.end_primitive!()
+            KernelInterface.emit_vertex!()
+            KernelInterface.end_primitive!()
             return nothing
         end
         config = Lava.GeometryConfig(;
@@ -50,8 +50,8 @@ using GeometryBasics
         function geom_invocation()
             inv = Lava.invocation_id()
             Lava.set_position!(Vec4f(Float32(inv), 0.0f0, 0.0f0, 1.0f0))
-            Lava.emit_vertex!()
-            Lava.end_primitive!()
+            KernelInterface.emit_vertex!()
+            KernelInterface.end_primitive!()
             return nothing
         end
         config = Lava.GeometryConfig(;

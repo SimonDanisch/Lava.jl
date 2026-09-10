@@ -1177,7 +1177,13 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # Verify IR after each custom pass to catch corruption early.
     # Only in debug mode — verify is cheap but adds up across 30+ passes.
     verify_passes = get(ENV, "LAVA_VERIFY_PASSES", "") == "1"
+    # `LAVA_DUMP_PASSES=<dir>` writes the module after every pass, which is how
+    # you find WHICH pass broke the IR rather than only that it is broken. Same
+    # shape as `LAVA_SPIRV_DUMP_DIR` above. It found `lower_memcpy!` typing a
+    # partial copy by its destination in one run.
     function verify_ir!(label)
+        dumpdir = get(ENV, "LAVA_DUMP_PASSES", "")
+        isempty(dumpdir) || write(joinpath(dumpdir, "after_$(label).ll"), string(mod))
         verify_passes || return
         try
             LLVM.verify(mod)
@@ -2875,6 +2881,7 @@ Lower LLVM intrinsics that SPIR-V cannot represent:
 """
 function lower_unsupported_intrinsics!(mod::LLVM.Module)
     to_erase = LLVM.Instruction[]
+    dl = LLVM.datalayout(mod)
 
     for fn in LLVM.functions(mod)
         for bb in LLVM.blocks(fn)
@@ -2885,7 +2892,7 @@ function lower_unsupported_intrinsics!(mod::LLVM.Module)
                 fname = LLVM.name(called)
 
                 if startswith(fname, "llvm.memcpy")
-                    lower_memcpy!(inst)
+                    lower_memcpy!(inst, dl)
                     push!(to_erase, inst)
                 elseif startswith(fname, "llvm.memset")
                     lower_memset!(inst)
@@ -2913,18 +2920,32 @@ end
 
 """
 Lower a single memcpy call to a typed load + store.
-If the destination is an alloca, use the alloca's type for the load/store
-so SPIR-V doesn't need to bitcast structs.
+If the destination is an alloca AND the copy covers the whole of it, use the
+alloca's type for the load/store so SPIR-V doesn't need to bitcast structs.
+
+The size check is the whole of it. A memcpy that fills only a PREFIX of its
+destination is ordinary — Julia builds a tuple field by field, so
+`(dev_array, vec)` is a 16-byte copy into a 32-byte alloca followed by a
+12-byte copy into the field after it — and typing that first copy by the
+DESTINATION read 32 bytes from a 16-byte source. The out-of-range half then
+reached the emitter as a load with no member to address: `OpLoad %uchar` on a
+struct pointer, which `spirv-val` rejects, or (with a pointer at offset 0) a
+type it cannot map at all. The byte-chunk path below already copies exactly
+`len` bytes, so a partial copy goes there.
 """
-function lower_memcpy!(inst::LLVM.CallInst)
+function lower_memcpy!(inst::LLVM.CallInst, dl::LLVM.DataLayout)
     ops = LLVM.operands(inst)
     dst = ops[1]
     src = ops[2]
+    len_val = ops[3]
 
-    # Try to find the alloca's element type for typed load/store
+    # The alloca's element type, but only when the copy is the whole object.
     copy_type = nothing
-    if dst isa LLVM.AllocaInst
-        copy_type = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(dst))
+    if dst isa LLVM.AllocaInst && len_val isa LLVM.ConstantInt
+        allocated = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(dst))
+        if convert(Int, len_val) == Int(compute_type_size(allocated, dl))
+            copy_type = allocated
+        end
     end
 
     LLVM.@dispose builder=LLVM.IRBuilder() begin
@@ -2939,7 +2960,6 @@ function lower_memcpy!(inst::LLVM.CallInst)
             # on NVIDIA when the destination is a PSB pointer into a non-8-byte-aligned
             # struct array, e.g. 12-byte or 52-byte structs where odd-indexed elements
             # are only 4-aligned).
-            len_val = ops[3]
             if !(len_val isa LLVM.ConstantInt)
                 error("Cannot lower memcpy with non-constant length: $inst")
             end

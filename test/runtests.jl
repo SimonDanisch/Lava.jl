@@ -20,6 +20,9 @@
 
 using Test
 using Lava
+# The portable shader vocabulary is KernelInterface's since phase 2.1 — the
+# stage tests name `KernelInterface.vertex_index`, not `Lava.vertex_index`.
+import KernelInterface
 
 # Loaded once; each test file guards with `@isdefined(SPIRVTestUtils)` so it also
 # runs standalone, which is how a file gets run while a feature is being added.

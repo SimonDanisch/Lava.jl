@@ -99,7 +99,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
 
     @testset "vertex shader" begin
         function vert()
-            idx = Lava.vertex_index()
+            idx = KernelInterface.vertex_index()
             Lava.set_position!(GeometryBasics.Vec4f(Float32(idx), 0.0f0, 0.0f0, 1.0f0))
             return nothing
         end
@@ -109,7 +109,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
 
     @testset "fragment shader" begin
         function frag()
-            xy = Lava.frag_coord_xy()
+            xy = KernelInterface.frag_coord_xy()
             Lava.gfx_output(0, GeometryBasics.Vec4f(xy[1], xy[2], 0.0f0, 1.0f0))
             return nothing
         end
