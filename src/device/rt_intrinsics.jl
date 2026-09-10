@@ -1,9 +1,434 @@
-# DELETED in phase 1.4: see Mantle/docs/mantle-owns-it.md
+# Device-side ray tracing intrinsics for Lava.jl
 #
-# The 28 `lava_rt_*` ray-tracing intrinsics. The vendor is in the NAME, which
-# CLAUDE.md forbids in a code path, and Hikari imported all thirteen of them by
-# name — the single reason a renderer that goes through Mantle for everything
-# else still had `import Lava` at the top of a file.
+# ── Two kinds of name, and the line between them ─────────────────────────────
 #
-# Phase 2.1 declares them in KernelInterface under vendor-free names
-# (`rt_trace_ray`, `rt_launch_id_x`, …) and this file comes back as overrides.
+# The `lava_rt_*` names below are this compiler's LOWERING LEAVES: each is one
+# `llvmcall` whose LLVM function name the SPIR-V emitter matches on. Nothing
+# outside this package should call one, which is why they keep the prefix — a
+# second unprefixed spelling of the same function would be exported by both
+# Lava and Mantle and leave the bare name ambiguous under `using Mantle, Lava`,
+# which is the bug the graphics builtins already had.
+#
+# What a SHADER BODY calls is `KernelInterface.rt_*`: vendor-free, declared in
+# one place, and overridden onto these at the bottom of this file. Hikari had
+# `import Lava` at the top of `rt-pipeline.jl` for these names alone, and when
+# Lava took its dependency on Vulkan back that one line stopped Hikari loading
+# on a machine with no driver. See `Mantle/docs/mantle-owns-it.md` phase 2.1.
+#
+# RT builtins via llvmcall, following the same pattern as compute builtins
+# in runtime/intrinsics.jl. Each builtin produces loads from addrspace(7)
+# globals with __spirv_BuiltIn* names. The SPIR-V emitter recognizes these
+# and creates Input variables with BuiltIn decorations.
+#
+# RT-specific intrinsics (lava_rt_trace_ray) use addrspace(8) globals
+# for payload and addrspace(9) for acceleration structure descriptors.
+# The RT emitter handles these specially.
+
+# ── RT 3D Builtins (uvec3) ──
+# Available in raygen shaders: LaunchIdKHR, LaunchSizeKHR
+# Available in hit/miss shaders: WorldRayOriginKHR, WorldRayDirectionKHR, etc.
+
+for (jl_name, spirv_name) in (
+    :lava_rt_launch_id       => :__spirv_BuiltInLaunchIdKHR,
+    :lava_rt_launch_size     => :__spirv_BuiltInLaunchSizeKHR,
+)
+    gvar = "@$spirv_name"
+    ir = """
+        $gvar = external addrspace(7) global <3 x i32>
+        define i32 @entry(i32 %dim) #0 {
+            %vec = load <3 x i32>, ptr addrspace(7) $gvar, align 16
+            %x = extractelement <3 x i32> %vec, i32 %dim
+            ret i32 %x
+        }
+        attributes #0 = { alwaysinline }
+    """
+    @eval @inline function $jl_name(dim::Integer=1)
+        Base.llvmcall(($ir, "entry"), UInt32, Tuple{UInt32}, UInt32(dim - 1))
+    end
+    x_name = Symbol(jl_name, :_x)
+    y_name = Symbol(jl_name, :_y)
+    z_name = Symbol(jl_name, :_z)
+    @eval @inline $x_name() = $jl_name(1)
+    @eval @inline $y_name() = $jl_name(2)
+    @eval @inline $z_name() = $jl_name(3)
+end
+
+# ── RT 3D Builtins (vec3 float) ──
+# Available in closest-hit/miss: WorldRayOriginKHR, WorldRayDirectionKHR,
+# ObjectRayOriginKHR, ObjectRayDirectionKHR
+
+for (jl_name, spirv_name) in (
+    :lava_rt_world_ray_origin    => :__spirv_BuiltInWorldRayOriginKHR,
+    :lava_rt_world_ray_direction => :__spirv_BuiltInWorldRayDirectionKHR,
+    :lava_rt_object_ray_origin   => :__spirv_BuiltInObjectRayOriginKHR,
+    :lava_rt_object_ray_direction => :__spirv_BuiltInObjectRayDirectionKHR,
+)
+    gvar = "@$spirv_name"
+    ir = """
+        $gvar = external addrspace(7) global <3 x float>
+        define float @entry(i32 %dim) #0 {
+            %vec = load <3 x float>, ptr addrspace(7) $gvar, align 16
+            %x = extractelement <3 x float> %vec, i32 %dim
+            ret float %x
+        }
+        attributes #0 = { alwaysinline }
+    """
+    @eval @inline function $jl_name(dim::Integer=1)
+        Base.llvmcall(($ir, "entry"), Float32, Tuple{UInt32}, UInt32(dim - 1))
+    end
+    x_name = Symbol(jl_name, :_x)
+    y_name = Symbol(jl_name, :_y)
+    z_name = Symbol(jl_name, :_z)
+    @eval @inline $x_name() = $jl_name(1)
+    @eval @inline $y_name() = $jl_name(2)
+    @eval @inline $z_name() = $jl_name(3)
+end
+
+# ── RT Scalar Builtins ──
+# RayTminKHR, RayTmaxKHR (float) — available in intersection/anyhit/closesthit/miss
+# HitKindKHR (uint) — available in anyhit/closesthit
+# InstanceCustomIndexKHR (uint) — available in intersection/anyhit/closesthit
+# PrimitiveId (uint) — available in intersection/anyhit/closesthit
+# InstanceId (uint) — available in intersection/anyhit/closesthit
+
+for (jl_name, spirv_name) in (
+    :lava_rt_ray_tmin  => :__spirv_BuiltInRayTminKHR,
+    :lava_rt_ray_tmax  => :__spirv_BuiltInRayTmaxKHR,
+)
+    gvar = "@$spirv_name"
+    ir = """
+        $gvar = external addrspace(7) global float
+        define float @entry() #0 {
+            %val = load float, ptr addrspace(7) $gvar, align 4
+            ret float %val
+        }
+        attributes #0 = { alwaysinline }
+    """
+    @eval @inline function $jl_name()
+        Base.llvmcall(($ir, "entry"), Float32, Tuple{})
+    end
+end
+
+for (jl_name, spirv_name) in (
+    :lava_rt_hit_kind             => :__spirv_BuiltInHitKindKHR,
+    :lava_rt_instance_custom_index => :__spirv_BuiltInInstanceCustomIndexKHR,
+    :lava_rt_primitive_id         => :__spirv_BuiltInPrimitiveId,
+    :lava_rt_instance_id          => :__spirv_BuiltInInstanceId,
+    :lava_rt_incoming_ray_flags   => :__spirv_BuiltInIncomingRayFlagsKHR,
+)
+    gvar = "@$spirv_name"
+    ir = """
+        $gvar = external addrspace(7) global i32
+        define i32 @entry() #0 {
+            %val = load i32, ptr addrspace(7) $gvar, align 4
+            ret i32 %val
+        }
+        attributes #0 = { alwaysinline }
+    """
+    @eval @inline function $jl_name()
+        Base.llvmcall(($ir, "entry"), UInt32, Tuple{})
+    end
+end
+
+# ── RT 4x3 Matrix Builtins ──
+# ObjectToWorldKHR, WorldToObjectKHR — mat4x3 (12 floats)
+# Available in intersection/anyhit/closesthit
+# We expose individual element access: lava_rt_object_to_world(row, col)
+
+for (jl_name, spirv_name) in (
+    :lava_rt_object_to_world => :__spirv_BuiltInObjectToWorldKHR,
+    :lava_rt_world_to_object => :__spirv_BuiltInWorldToObjectKHR,
+)
+    gvar = "@$spirv_name"
+    # SPIR-V mat4x3 = 4 columns of vec3 = [12 x float]
+    # Access as flat array: index = col * 3 + row
+    ir = """
+        $gvar = external addrspace(7) global [12 x float]
+        define float @entry(i32 %idx) #0 {
+            %ptr = getelementptr [12 x float], ptr addrspace(7) $gvar, i32 0, i32 %idx
+            %val = load float, ptr addrspace(7) %ptr, align 4
+            ret float %val
+        }
+        attributes #0 = { alwaysinline }
+    """
+    @eval @inline function $jl_name(row::Integer, col::Integer)
+        Base.llvmcall(($ir, "entry"), Float32, Tuple{UInt32}, UInt32((col - 1) * 3 + (row - 1)))
+    end
+end
+
+# ── OpTraceRayKHR Intrinsic ──
+# This is the main RT trace call. The emitter recognizes "lava_rt_trace_ray"
+# and emits OpTraceRayKHR.
+#
+# SPIR-V signature: OpTraceRayKHR %accel %ray_flags %cull_mask
+#   %sbt_offset %sbt_stride %miss_index
+#   %origin %tmin %direction %tmax %payload_idx
+#
+# The accel structure and payload are handled implicitly by the emitter
+# (they're global variables, not function parameters). What we pass here
+# are the ray parameters.
+#
+# The function is a no-op at LLVM level — the emitter replaces the call
+# with OpTraceRayKHR referencing the implicit TLAS and payload variables.
+
+@inline function lava_rt_trace_ray(
+    ray_flags::UInt32, cull_mask::UInt32,
+    sbt_offset::UInt32, sbt_stride::UInt32, miss_index::UInt32,
+    origin_x::Float32, origin_y::Float32, origin_z::Float32, tmin::Float32,
+    dir_x::Float32, dir_y::Float32, dir_z::Float32, tmax::Float32
+)
+    Base.llvmcall(("""
+        declare void @lava_rt_trace_ray(
+            i32, i32, i32, i32, i32,
+            float, float, float, float,
+            float, float, float, float) #0
+        define void @entry(
+            i32 %flags, i32 %mask, i32 %sbt_off, i32 %sbt_stride, i32 %miss_idx,
+            float %ox, float %oy, float %oz, float %tmin,
+            float %dx, float %dy, float %dz, float %tmax) #0 {
+            call void @lava_rt_trace_ray(
+                i32 %flags, i32 %mask, i32 %sbt_off, i32 %sbt_stride, i32 %miss_idx,
+                float %ox, float %oy, float %oz, float %tmin,
+                float %dx, float %dy, float %dz, float %tmax)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32, UInt32, UInt32, UInt32, UInt32,
+                                Float32, Float32, Float32, Float32,
+                                Float32, Float32, Float32, Float32},
+    ray_flags, cull_mask, sbt_offset, sbt_stride, miss_index,
+    origin_x, origin_y, origin_z, tmin,
+    dir_x, dir_y, dir_z, tmax)
+end
+
+# High-level trace_ray! wrapper
+@inline function lava_rt_trace_ray!(
+    ray_flags::UInt32, cull_mask::UInt32,
+    sbt_offset::UInt32, sbt_stride::UInt32, miss_index::UInt32,
+    origin_x::Float32, origin_y::Float32, origin_z::Float32, tmin::Float32,
+    dir_x::Float32, dir_y::Float32, dir_z::Float32, tmax::Float32
+)
+    lava_rt_trace_ray(
+        ray_flags, cull_mask, sbt_offset, sbt_stride, miss_index,
+        origin_x, origin_y, origin_z, tmin,
+        dir_x, dir_y, dir_z, tmax)
+end
+
+# ── Payload Load/Store Intrinsics ──
+# These read/write the ray payload global variable.
+# The emitter maps these to OpLoad/OpStore on the RayPayloadKHR or
+# IncomingRayPayloadKHR variable.
+
+@inline function lava_rt_payload_store_f32(val::Float32)
+    Base.llvmcall(("""
+        declare void @lava_rt_payload_store_f32(float) #0
+        define void @entry(float %val) #0 {
+            call void @lava_rt_payload_store_f32(float %val)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{Float32}, val)
+end
+
+@inline function lava_rt_payload_load_f32()
+    Base.llvmcall(("""
+        declare float @lava_rt_payload_load_f32() #0
+        define float @entry() #0 {
+            %val = call float @lava_rt_payload_load_f32()
+            ret float %val
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Float32, Tuple{})
+end
+
+# ── Indexed Payload Load/Store ──
+# For multi-field payloads (payload_type = :f32_N).
+# Store/load at a specific index in the payload array.
+
+@inline function lava_rt_payload_store_f32_at(val::Float32, idx::UInt32)
+    Base.llvmcall(("""
+        declare void @lava_rt_payload_store_f32_at(float, i32) #0
+        define void @entry(float %val, i32 %idx) #0 {
+            call void @lava_rt_payload_store_f32_at(float %val, i32 %idx)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{Float32, UInt32}, val, idx)
+end
+
+@inline function lava_rt_payload_load_f32_at(idx::UInt32)
+    Base.llvmcall(("""
+        declare float @lava_rt_payload_load_f32_at(i32) #0
+        define float @entry(i32 %idx) #0 {
+            %val = call float @lava_rt_payload_load_f32_at(i32 %idx)
+            ret float %val
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Float32, Tuple{UInt32}, idx)
+end
+
+# ── Hit Attribute (Barycentric) Load Intrinsic ──
+# In closesthit shaders, gl_HitAttributeEXT contains vec2 barycentrics (u, v).
+# w = 1 - u - v is the weight for vertex 0.
+
+@inline function lava_rt_hit_attrib_load_f32_at(idx::UInt32)
+    Base.llvmcall(("""
+        declare float @lava_rt_hit_attrib_load_f32_at(i32) #0
+        define float @entry(i32 %idx) #0 {
+            %val = call float @lava_rt_hit_attrib_load_f32_at(i32 %idx)
+            ret float %val
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Float32, Tuple{UInt32}, idx)
+end
+
+# Convenience wrappers
+@inline lava_rt_hit_bary_u() = lava_rt_hit_attrib_load_f32_at(UInt32(0))
+@inline lava_rt_hit_bary_v() = lava_rt_hit_attrib_load_f32_at(UInt32(1))
+
+# ── OpIgnoreIntersectionKHR / OpTerminateRayKHR Intrinsics ──
+# These are SPIR-V block terminators — valid only in any-hit shaders.
+# OpIgnoreIntersectionKHR: reject the current intersection, continue traversal.
+# OpTerminateRayKHR: accept the current hit and stop traversal immediately.
+
+@inline function lava_rt_ignore_intersection()
+    Base.llvmcall(("""
+        declare void @lava_rt_ignore_intersection() #0
+        define void @entry() #0 {
+            call void @lava_rt_ignore_intersection()
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{})
+end
+
+@inline function lava_rt_terminate_ray()
+    Base.llvmcall(("""
+        declare void @lava_rt_terminate_ray() #0
+        define void @entry() #0 {
+            call void @lava_rt_terminate_ray()
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{})
+end
+
+# ── SER (SPV_NV_shader_invocation_reorder) intrinsics ──
+#
+# These three calls replace the implicit `lava_rt_trace_ray` + automatic
+# closest-hit dispatch with the explicit pbrt-v4-OptiX HitObject pattern:
+#
+#   1. lava_rt_hit_object_trace_ray(...)  — same operands as trace_ray, but
+#      writes the result into the per-shader implicit HitObject variable
+#      INSTEAD of immediately invoking the closest-hit shader.
+#   2. lava_rt_reorder_thread()           — reorders the warp lanes so
+#      threads with similar hit info group together; later
+#      hitObjectExecuteShaderNV calls then dispatch coherent closest-hit
+#      shaders per warp.
+#   3. lava_rt_hit_object_execute_shader() — invokes the closest-hit (or
+#      miss) shader for the recorded HitObject, with the current payload.
+#
+# The implicit HitObject is owned by the emitter (`state.rt_hit_object_var_id`)
+# and lazily allocated as a Private-storage OpVariable in the raygen.  Only
+# valid inside the raygen.
+
+@inline function lava_rt_hit_object_trace_ray(
+    ray_flags::UInt32, cull_mask::UInt32,
+    sbt_offset::UInt32, sbt_stride::UInt32, miss_index::UInt32,
+    origin_x::Float32, origin_y::Float32, origin_z::Float32, tmin::Float32,
+    dir_x::Float32, dir_y::Float32, dir_z::Float32, tmax::Float32
+)
+    Base.llvmcall(("""
+        declare void @lava_rt_hit_object_trace_ray(
+            i32, i32, i32, i32, i32,
+            float, float, float, float,
+            float, float, float, float) #0
+        define void @entry(
+            i32 %flags, i32 %mask, i32 %sbt_off, i32 %sbt_stride, i32 %miss_idx,
+            float %ox, float %oy, float %oz, float %tmin,
+            float %dx, float %dy, float %dz, float %tmax) #0 {
+            call void @lava_rt_hit_object_trace_ray(
+                i32 %flags, i32 %mask, i32 %sbt_off, i32 %sbt_stride, i32 %miss_idx,
+                float %ox, float %oy, float %oz, float %tmin,
+                float %dx, float %dy, float %dz, float %tmax)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32, UInt32, UInt32, UInt32, UInt32,
+                                Float32, Float32, Float32, Float32,
+                                Float32, Float32, Float32, Float32},
+    ray_flags, cull_mask, sbt_offset, sbt_stride, miss_index,
+    origin_x, origin_y, origin_z, tmin,
+    dir_x, dir_y, dir_z, tmax)
+end
+
+@inline function lava_rt_reorder_thread()
+    Base.llvmcall(("""
+        declare void @lava_rt_reorder_thread() #0
+        define void @entry() #0 {
+            call void @lava_rt_reorder_thread()
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{})
+end
+
+@inline function lava_rt_hit_object_execute_shader()
+    Base.llvmcall(("""
+        declare void @lava_rt_hit_object_execute_shader() #0
+        define void @entry() #0 {
+            call void @lava_rt_hit_object_execute_shader()
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{})
+end
+
+# Register RT intrinsic names for GPUCompiler validation
+push!(KNOWN_INTRINSICS, "lava_rt_trace_ray")
+push!(KNOWN_INTRINSICS, "lava_rt_payload_store_f32")
+push!(KNOWN_INTRINSICS, "lava_rt_payload_load_f32")
+push!(KNOWN_INTRINSICS, "lava_rt_payload_store_f32_at")
+push!(KNOWN_INTRINSICS, "lava_rt_payload_load_f32_at")
+push!(KNOWN_INTRINSICS, "lava_rt_hit_attrib_load_f32_at")
+push!(KNOWN_INTRINSICS, "lava_rt_ignore_intersection")
+push!(KNOWN_INTRINSICS, "lava_rt_terminate_ray")
+push!(KNOWN_INTRINSICS, "lava_rt_hit_object_trace_ray")
+push!(KNOWN_INTRINSICS, "lava_rt_reorder_thread")
+push!(KNOWN_INTRINSICS, "lava_rt_hit_object_execute_shader")
+
+# ── The vocabulary, over the leaves ──────────────────────────────────────────
+#
+# One implementation each: the portable name a shader body writes, overridden
+# onto the `llvmcall` above it. A backend that cannot answer one of these says
+# so through `caps` rather than leaving a `MethodError` for a shader to find at
+# compile time; this backend answers all of them.
+#
+# `rt_trace_ray`, `rt_terminate_ray` and the payload pair are deliberately NOT
+# here: KernelInterface does not declare them, because the set there is what
+# CALLERS use and Hikari imported those four without ever calling one. The
+# raygen and closest-hit shaders in Mantle's Vulkan backend do call them, and
+# they call the `lava_rt_*` leaves directly — a backend's own shader may name
+# its own compiler.
+
+@lava_device_override @inline KernelInterface.rt_launch_id_x() = lava_rt_launch_id_x()
+@lava_device_override @inline KernelInterface.rt_primitive_id() = lava_rt_primitive_id()
+@lava_device_override @inline KernelInterface.rt_instance_id() = lava_rt_instance_id()
+@lava_device_override @inline KernelInterface.rt_instance_custom_index() =
+    lava_rt_instance_custom_index()
+@lava_device_override @inline KernelInterface.rt_ray_tmax() = lava_rt_ray_tmax()
+@lava_device_override @inline KernelInterface.rt_hit_bary_u() = lava_rt_hit_bary_u()
+@lava_device_override @inline KernelInterface.rt_hit_bary_v() = lava_rt_hit_bary_v()
+@lava_device_override @inline KernelInterface.rt_ignore_intersection() =
+    lava_rt_ignore_intersection()
+@lava_device_override @inline KernelInterface.rt_reorder_thread() = lava_rt_reorder_thread()
+@lava_device_override @inline KernelInterface.rt_hit_object_execute_shader() =
+    lava_rt_hit_object_execute_shader()
+
+@lava_device_override @inline KernelInterface.rt_hit_object_trace_ray(
+    ray_flags::UInt32, cull_mask::UInt32, sbt_offset::UInt32, sbt_stride::UInt32,
+    miss_index::UInt32, origin_x::Float32, origin_y::Float32, origin_z::Float32,
+    tmin::Float32, dir_x::Float32, dir_y::Float32, dir_z::Float32, tmax::Float32) =
+    lava_rt_hit_object_trace_ray(ray_flags, cull_mask, sbt_offset, sbt_stride, miss_index,
+                                 origin_x, origin_y, origin_z, tmin,
+                                 dir_x, dir_y, dir_z, tmax)

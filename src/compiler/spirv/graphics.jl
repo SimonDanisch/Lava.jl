@@ -138,7 +138,7 @@ function emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
 
     # Set geometry shader input vertex count from config
     if stage == :geometry && config !== nothing
-        gfx_io.geom_input_vertex_count = geometry_input_vertex_count(config.input_topology)
+        gfx_io.geom_input_vertex_count = KernelInterface.primitivevertices(config.input_topology)
     end
 
     # Find entry function
@@ -232,11 +232,10 @@ function emit_gfx_execution_modes!(mod::SPIRVModule, func_id::UInt32,
     # Vertex stage has no execution modes
 end
 
-geometry_input_vertex_count(::PointList)          = 1
-geometry_input_vertex_count(::LineList)           = 2
-geometry_input_vertex_count(::TriangleList)       = 3
-geometry_input_vertex_count(::LineListAdjacency)  = 4
-geometry_input_vertex_count(::LineStripAdjacency) = 4
+# `geometry_input_vertex_count` was here: five methods saying how many vertices
+# a primitive of each topology has. It is `KernelInterface.primitivevertices`
+# now, because Mantle's geometry-stage wrapper needs the same number to size the
+# arrayed inputs it reads, and two tables of one fact drift.
 
 geometry_input_mode(::PointList)          = ExecMode.InputPoints
 geometry_input_mode(::LineList)           = ExecMode.InputLines

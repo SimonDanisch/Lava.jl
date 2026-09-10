@@ -3,14 +3,15 @@
 # Pure Julia types — no Vulkan dependency, used for dispatch everywhere.
 # Pipeline state encoded in type parameters for zero-cost dispatch.
 
-# ── Shader Stage Types ──
-
-abstract type ShaderStage end
-struct VertexStage      <: ShaderStage end
-struct FragmentStage    <: ShaderStage end
-struct GeometryStage    <: ShaderStage end
-struct TessControlStage <: ShaderStage end
-struct TessEvalStage    <: ShaderStage end
+# ── Shader stage types: not here any more ──
+#
+# `ShaderStage` and its five tags were this compiler's spelling of "which stage
+# am I compiling", and nothing here dispatched on one — the compiler takes a
+# `stage::Symbol`. Mantle has a `ShaderStage` of its own, the supertype of
+# `VertexShader`/`FragmentShader`/`GeometryShader`, and that one IS dispatched
+# on. Two modules exporting one name that resolves to two different types leaves
+# the bare name unbound in any scope that loads both, which is the trap
+# `test_no_stale_exports.jl` exists for.
 
 # ── Pipeline state: not here any more ──
 #

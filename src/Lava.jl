@@ -59,7 +59,6 @@ export Ray
 # Graphics: the configuration types a pipeline is described with, and the
 # shader-stage intrinsics. Pure Julia — `graphics/types.jl` has no Vulkan in it,
 # which is why it stayed when the pipeline that consumes it left.
-export ShaderStage, VertexStage, FragmentStage, GeometryStage, TessControlStage, TessEvalStage
 # `BlendMode`, `CullFace`, `DepthMode` and `RenderTarget` are gone from here:
 # they are fixed-function pipeline state, this compiler never dispatched on any
 # of them, and they are Mantle's now.
@@ -75,21 +74,25 @@ export GeometryConfig, TessConfig
 export TessSpacing, EqualSpacing, FractionalEvenSpacing, FractionalOddSpacing
 export TessWinding, WindingCW, WindingCCW
 export TessDomain, TessTriangles, TessQuads, TessIsolines
-# The shader builtins — `vertex_index`, `instance_index` and the `frag_coord`
-# family — are defined here and deliberately NOT exported. Mantle declares and
-# exports the portable names (`Mantle.vertex_index`), and the Vulkan backend
-# binds them to these implementations with `@lava_device_override`, qualified
-# as `Lava.vertex_index`. Exported from both, `using Mantle, Lava` left the
-# bare name ambiguous and unbound, so every shader that wrote `vertex_index()`
-# in such a scope inferred `Any` and failed to compile.
-export dFdx, dFdy
+# The shader builtins a person WRITES — `vertex_index`, `instance_index`, the
+# `frag_coord` family, `dFdx`/`dFdy`, `set_point_size!`, `sample_texture_2d`,
+# `emit_vertex!`/`end_primitive!`/`primitive_id_in` — are KernelInterface's and
+# are not exported here. This package OVERRIDES them for its target
+# (`device/gfx_intrinsics.jl`); exporting them again is what left the bare name
+# ambiguous under `using Mantle, Lava`, so every shader that wrote
+# `vertex_index()` in such a scope inferred `Any` and failed to compile.
+#
+# What is exported is the lowering language nobody types by hand: stage I/O by
+# location, the geometry-stage arrayed inputs, the tessellation levels. The
+# Vulkan backend's stage wrappers are the only caller.
 export front_facing
-export set_position!, set_point_size!
+export set_position!
 export gfx_output, gfx_input, gfx_output_flat, gfx_input_flat
-export emit_vertex!, end_primitive!, invocation_id, primitive_id_in
+export invocation_id
 export geom_input, geom_input_position
 export tess_coord, tess_coord_uvw, set_tess_level_outer!, set_tess_level_inner!
-export sample_texture_2d, GfxTexture2D
+export GfxTexture2D
+export VertexWrapper, FragmentWrapper, GeometryWrapper
 
 # Device capability vocabulary, not exported — a kernel library reaches these as
 # `Lava.caps(backend)`. `caps` is the one to reach for: a kernel deciding a
@@ -136,6 +139,11 @@ using GeometryBasics
 # that a field inserted anywhere but the end would misalign it silently. Both
 # copies are deleted: there is one type, and Mantle's `caps(ctx::VkContext)` is
 # the method that fills it in.
+# The module itself, not only names from it: `device/gfx_intrinsics.jl` and
+# `device/rt_intrinsics.jl` write `@lava_device_override KernelInterface.<name>`,
+# which needs the module binding. A bare `using KernelInterface: a, b` brings in
+# the names and NOT the module.
+import KernelInterface
 using KernelInterface: MatrixUse, MatrixA, MatrixB, Accumulator,
                        MatrixScope, SubgroupScope, WorkgroupScope, MatrixShape,
                        DeviceCaps
