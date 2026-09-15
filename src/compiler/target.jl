@@ -65,6 +65,25 @@ GPUCompiler.runtime_module(::LavaCompilerJob) = LavaRuntime
 
 GPUCompiler.method_table(::LavaCompilerJob) = lava_method_table
 
+"""
+    kernelinterpreter(f, tt) -> AbstractInterpreter
+
+The interpreter `f(tt...)` will be inferred through when it is compiled, so that
+anything reasoning about a kernel ahead of time reasons about the DEVICE code.
+
+Without it, `code_typed` on a kernel is the host's: `LavaDeviceArray`'s indexing
+lives on `lava_method_table` and nowhere else, so plain inference walks into
+`error_if_canonical_getindex` and concludes the kernel does nothing at all.
+Mantle's dispatch-access analysis is the caller; it is exported for anyone else
+reading a kernel before it runs.
+"""
+function kernelinterpreter(@nospecialize(f), @nospecialize(tt);
+                           workgroup_size::NTuple{3,Int} = (64, 1, 1))
+    config = lava_compiler_config(; workgroup_size)
+    source = GPUCompiler.methodinstance(typeof(f), tt)
+    return GPUCompiler.get_interpreter(GPUCompiler.CompilerJob(source, config))
+end
+
 # Vulkan doesn't use GPUCompiler's kernel state mechanism
 GPUCompiler.kernel_state_type(::LavaCompilerJob) = Nothing
 
