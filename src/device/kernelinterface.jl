@@ -126,23 +126,24 @@ end
 
 # ── Workgroup memory ────────────────────────────────────────────────────────
 #
-# `KI.localmemory` is NOT implemented, and the reason is KI's signature rather
-# than anything about Vulkan.
+# One line, and it was blocked on KI's signature rather than on anything about
+# Vulkan. Lava's workgroup memory is an LLVM global in addrspace(3) NAMED
+# `lava_shared_$Id`, so the id is the only thing that makes two buffers two
+# buffers; `KI.localmemory(T, Val(Dims))` had no such parameter, and the only
+# key available was `(T, Dims)`. Two `localmemory(Float32, (16, 16))` calls in
+# one kernel would have been ONE buffer, with the second write landing silently
+# on the first tile, so this method was left missing rather than implemented
+# wrong.
 #
-# Lava's workgroup memory is an LLVM global in addrspace(3), created by
-# `lava_alloc_shared(::Val{Id}, ::Type{T}, ::Val{N})`, and the global is NAMED
-# `lava_shared_$Id`. `KA.SharedMemory(T, Val(Dims), Val(Id))` carries that `Id`
-# because `@localmem` mints one per call site; `KI.localmemory(T, Val(Dims))`
-# has no such parameter, so the only key available is `(T, Dims)`.
-#
-# Two `localmemory(Float32, (16, 16))` calls in one kernel would then be one
-# buffer. That is not an error anything can raise — the second write silently
-# lands on the first tile — so the method is left missing rather than
-# implemented wrong. A generated function cannot mint the id itself: its body is
-# cached per signature, and a counter inside it would not be pure.
-#
-# `KA.@localmem` is the working path on Lava and is unaffected. Closing this
-# needs the id in KI's signature, which is an upstream change.
+# `KI.localmemory` takes the id now (KernelInterface `device.jl`), which is
+# where it belongs: every backend keys its global on something, and the ones
+# that were already implemented were keying it on a constant. So this is the
+# same override `KA.SharedMemory` has had all along, spelled portably.
+@lava_device_override @inline function KI.localmemory(::Type{T}, ::Val{Dims},
+                                                      ::Val{Id}) where {T, Dims, Id}
+    N = prod(Dims)
+    LavaSharedArray{T, Dims}(lava_alloc_shared(Val(Id), T, Val(N)), N)
+end
 
 # ── Printing ────────────────────────────────────────────────────────────────
 #
