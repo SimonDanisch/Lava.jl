@@ -26,6 +26,7 @@ import KernelInterface
 
 # Loaded once; each test file guards with `@isdefined(SPIRVTestUtils)` so it also
 # runs standalone, which is how a file gets run while a feature is being added.
+include(joinpath(@__DIR__, "test_mul_high_override.jl"))
 include(joinpath(@__DIR__, "spirv_test_utils.jl"))
 import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count,
     check_regex, normalize_spirv, compare_golden, compile_and_disasm,

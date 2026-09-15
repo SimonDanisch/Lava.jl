@@ -1524,7 +1524,22 @@ function map_pointer_type_for_value!(ctx::SPIRVTypeContext, ptr_value::LLVM.Valu
                 pointee_llvm = LLVM.Int8Type()
             end
         else
-            error("Could not recover pointee type for pointer value: $(LLVM.name(ptr_value))")
+            # Name alone does not locate this: an argument called `ex` says
+            # nothing about WHICH function survived un-inlined with an opaque
+            # pointer parameter, and that function is the thing to fix. Report
+            # the enclosing function and the parameter position with it.
+            ctxinfo = if ptr_value isa LLVM.Argument
+                fn = LLVM.Function(LLVM.API.LLVMGetParamParent(ptr_value))
+                idx = findfirst(==(ptr_value), collect(LLVM.parameters(fn)))
+                "parameter $(idx === nothing ? "?" : idx) of `$(LLVM.name(fn))`"
+            elseif ptr_value isa LLVM.Instruction
+                "instruction in `$(LLVM.name(LLVM.parent(LLVM.parent(ptr_value))))`"
+            else
+                "$(typeof(ptr_value))"
+            end
+            error("Could not recover pointee type for pointer value: " *
+                  "$(LLVM.name(ptr_value))::$(string(LLVM.value_type(ptr_value))) " *
+                  "($ctxinfo)")
         end
     end
 

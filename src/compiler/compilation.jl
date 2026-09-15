@@ -1906,6 +1906,25 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
             delete!(attrs, LLVM.EnumAttribute("alwaysinline"))
         end
 
+        # Those prefixes are not merely "do not strip": Julia's throw/box/
+        # exception helpers have to be GONE by emission time, and skipping them
+        # in the loop above only preserves an `alwaysinline` that GPUCompiler
+        # did not necessarily put there. `gpu_report_exception(ex)` takes an
+        # opaque `ptr addrspace(1)` whose POINTEE type the PTM cannot recover,
+        # so if it survives as an OpFunction the emitter aborts on parameter 1.
+        # Same storage-class-comes-from-the-call-site problem as the
+        # pointer-return rule below, one argument position over. Mark them.
+        for fn in LLVM.functions(mod)
+            isempty(LLVM.blocks(fn)) && continue
+            fname = LLVM.name(fn)
+            startswith(fname, "llvm.") && continue
+            fn === entry_fn && continue
+            any(p -> occursin(p, fname), must_inline_prefixes) || continue
+            attrs = LLVM.function_attributes(fn)
+            delete!(attrs, LLVM.EnumAttribute("noinline"))
+            push!(attrs, LLVM.EnumAttribute("alwaysinline"))
+        end
+
         # Structural rule (runs AFTER the strip pass above so it isn't undone):
         # any function whose RETURN type is a pointer must be inlined into its
         # callers.  SPIR-V Logical addressing has no concept of a contextless

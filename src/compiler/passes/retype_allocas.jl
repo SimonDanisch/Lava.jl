@@ -364,7 +364,18 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
         #   addressing.
         for site in info.accesses
             LLVM.position!(builder, site.inst)
-            access_sz = Int(API.LLVMABISizeOfType(dl, site.access_type))
+            # `site.access_type` is a snapshot taken when the uses were walked.
+            # For a LOAD it cannot go stale — it is the instruction's own result
+            # type. For a STORE it is the type of the value OPERAND, and that
+            # operand can be replaced between collection and here (by an earlier
+            # site in this very loop, or by a prior pass). Trusting the snapshot
+            # then decomposes a 32-bit store as if it were 64-bit and emits
+            # `trunc i32 %v to i32` plus `lshr i32 %v, i64 32` — IR whose operand
+            # types disagree, which survives to the emitter as a same-width
+            # `OpUConvert` and is rejected by spirv-val. Re-read it.
+            access_ty = site.is_load ? site.access_type :
+                                       LLVM.value_type(LLVM.operands(site.inst)[1])
+            access_sz = Int(API.LLVMABISizeOfType(dl, access_ty))
             byte_offset_expr = build_byte_offset(site)
 
             if access_sz == sz
@@ -377,7 +388,7 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
                 @assert access_sz % sz == 0
                 n_parts = access_sz ÷ sz
                 t_bw = sz * 8   # bit width of T (only int handled for now)
-                @assert site.access_type isa LLVM.IntegerType
+                @assert access_ty isa LLVM.IntegerType
                 @assert T isa LLVM.IntegerType   # decomposition currently only for int → int
                 t_ty = T
 
@@ -394,7 +405,7 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
 
                 if site.is_load
                     # Load each T-sized chunk, zext + shift + or to assemble the wide value.
-                    wide_ty = site.access_type
+                    wide_ty = access_ty
                     parts = LLVM.Value[]
                     for g in geps
                         v = LLVM.load!(builder, t_ty, g)
@@ -413,7 +424,15 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
                 else
                     # Store: split the wide value into n_parts T-chunks, store each.
                     val = LLVM.operands(site.inst)[1]   # value being stored
-                    wide_ty = site.access_type
+                    wide_ty = access_ty
+                    # The shift constants and truncations below are built from
+                    # `wide_ty`; if the value is not actually that type the pass
+                    # emits `lshr i32 %v, i64 32` and `trunc i32 %v to i32`,
+                    # which is invalid IR that only surfaces much later as a
+                    # same-width OpUConvert out of the SPIR-V emitter.
+                    LLVM.value_type(val) == wide_ty || error(
+                        "retype_allocas: store value type $(string(LLVM.value_type(val))) " *
+                        "disagrees with access type $(string(wide_ty)) for $(string(site.inst))")
                     for i in 1:n_parts
                         chunk = if i == 1 && t_bw == LLVM.width(wide_ty)
                             val   # no truncation needed
