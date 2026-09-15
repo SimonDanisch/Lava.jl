@@ -1086,6 +1086,43 @@ function emit_constant_u64!(mod::SPIRVModule, value::UInt64)
     end
 end
 
+"""
+    emit_constant_uint!(mod, spirv_w, value) -> id
+
+An unsigned integer constant at an explicit SPIR-V width.
+
+`emit_constant_u32!` and `emit_constant_u64!` hardcode their width, which is
+fine for the operand of an index computation but not for anything paired with a
+value whose width the emitter did not choose. SPIR-V requires both operands of
+an integer comparison, and of a bitwise op, to have the same component width,
+and `spirv_int_width` keeps 8- and 16-bit integers at their own width instead of
+promoting to 32 -- so a `Bool` slot loads as `%uchar` and needs a `%uchar` zero.
+
+Cache keys match the two fixed-width helpers exactly, so a constant emitted
+through either path is shared rather than duplicated.
+"""
+function emit_constant_uint!(mod::SPIRVModule, spirv_w::UInt32, value::UInt64)
+    type_id = emit_type_int!(mod, spirv_w, UInt32(0))
+    if spirv_w >= UInt32(64)
+        lo = UInt32(value & 0xFFFFFFFF)
+        hi = UInt32((value >> 32) & 0xFFFFFFFF)
+        key = (:const, type_id, lo, hi)
+        return get!(mod.constant_cache, key) do
+            id = fresh_id!(mod)
+            encode_instruction!(mod.types_constants, Op.OpConstant, type_id, id, lo, hi)
+            id
+        end
+    else
+        word = UInt32(value)
+        key = (:const, type_id, word)
+        return get!(mod.constant_cache, key) do
+            id = fresh_id!(mod)
+            encode_instruction!(mod.types_constants, Op.OpConstant, type_id, id, word)
+            id
+        end
+    end
+end
+
 function emit_constant_null!(mod::SPIRVModule, type_id::UInt32)
     key = (:const_null, type_id)
     get!(mod.constant_cache, key) do

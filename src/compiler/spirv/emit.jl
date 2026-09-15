@@ -1358,14 +1358,14 @@ function emit_reconciled_scalar_load!(state::SPIRVEmitterState, ptr_id::UInt32,
     # i1 is OpTypeBool, not a 1-bit integer, so it cannot be reached by convert/bitcast.
     # `trunc iN to i1` keeps the low bit, which is `(x & 1) != 0`.
     if want_ty isa LLVM.IntegerType && LLVM.width(want_ty) == 1
-        one_id = spirv_int_width(slot_w) >= UInt32(64) ?
-                 emit_constant_u64!(state.mod, UInt64(1)) :
-                 emit_constant_u32!(state.mod, UInt32(1))
+        # Both constants must carry `slot_spirv`'s width, not a 32/64 guess: a
+        # `Bool` slot loads as `%uchar`, and `OpBitwiseAnd`/`OpINotEqual` against
+        # a `%uint` operand is rejected by spirv-val.
+        slot_sw = spirv_int_width(slot_w)
+        one_id = emit_constant_uint!(state.mod, slot_sw, UInt64(1))
         masked = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpBitwiseAnd, slot_spirv, masked, raw, one_id)
-        zero_id = spirv_int_width(slot_w) >= UInt32(64) ?
-                  emit_constant_u64!(state.mod, UInt64(0)) :
-                  emit_constant_u32!(state.mod, UInt32(0))
+        zero_id = emit_constant_uint!(state.mod, slot_sw, UInt64(0))
         bool_ty = emit_type_bool!(state.mod)
         res = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpINotEqual, bool_ty, res, masked, zero_id)
@@ -5876,18 +5876,13 @@ function infer_inner_ptr_pointee(inttoptr_inst::LLVM.Value)
 end
 
 function get_zero_constant!(state::SPIRVEmitterState, ty::LLVM.IntegerType)
-    w = LLVM.width(ty)
-    if w <= 32
-        return emit_constant_u32!(state.mod, UInt32(0))
-    else
-        type_id = map_type!(state.type_ctx, ty)
-        key = (:const, type_id, UInt64(0))
-        get!(state.mod.constant_cache, key) do
-            id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.types_constants, Op.OpConstant, type_id, id, UInt32(0), UInt32(0))
-            id
-        end
-    end
+    # The zero has to carry the same SPIR-V type as the value it is compared
+    # against. `spirv_int_width` keeps 8- and 16-bit integers at their own width
+    # instead of promoting them to 32, so `i8` maps to `%uchar` — and handing a
+    # `%uint 0` to an `OpINotEqual` whose other operand is an `OpLoad %uchar` is
+    # rejected by spirv-val with "Expected both operands to have the same
+    # component bit width". Map the type and match it, at every width.
+    return emit_constant_uint!(state.mod, spirv_int_width(LLVM.width(ty)), UInt64(0))
 end
 
 # ================================================================
@@ -7334,19 +7329,16 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
         return emit_glsl_ext_inst!(state, inst, glsl_num)
     end
 
-    # `llvm.copysign` should never reach the emitter: `Base.copysign` is
-    # overlay-overridden in `device/math.jl` with a bitwise sign-copy, and
-    # Base's only caller of `copysign_float` is that method. GLSL.std.450
-    # has no IEEE-correct copysign (FSign(0) == 0 breaks `FAbs·FSign`), so if
-    # something does slip through (new Base caller, LLVM canonicalization,
-    # direct `Core.Intrinsics.copysign_float`), fail loudly instead of
-    # emitting a silently-wrong result.
+    # `llvm.copysign` has no GLSL.std.450 equivalent: the obvious
+    # `FAbs(x) * FSign(y)` returns 0 for any zero `y`, because GLSL FSign(0) is
+    # 0, which silently breaks `safe_invdir` clamps and other IEEE-dependent
+    # ray-tracing code. `Base.copysign` is overlay-overridden in
+    # `device/math.jl` with the bitwise form, but an overlay only catches calls
+    # routed through that method -- LLVM canonicalisation and Base internals
+    # reach the intrinsic directly, and which of them do so changes between
+    # Julia versions. Emitting the same bit pattern here covers every path.
     if base_name == "llvm.copysign"
-        error("llvm.copysign reached SPIR-V emitter — this means some code " *
-              "path is bypassing the `Base.copysign` overlay in " *
-              "Lava/src/device/math.jl. GLSL.std.450 has no zero-preserving " *
-              "copysign. Add a Julia-level override for the caller, or " *
-              "implement copysign in the emitter via bitwise sign-copy.")
+        return emit_copysign!(state, inst)
     end
 
     # `llvm.minimum` / `llvm.maximum` (IEEE 754-2019 NaN-propagating) have no
@@ -7712,6 +7704,52 @@ function strip_intrinsic_suffix(name::String)
         return join(parts[1:end-1], '.')
     end
     return name
+end
+
+"""
+    emit_copysign!(state, inst)
+
+`llvm.copysign` as an IEEE bitwise sign-copy: the magnitude bits of `x` OR the
+sign bit of `y`. Exact for every input including zeros, infinities and NaNs,
+which is the property `FAbs * FSign` lacks.
+"""
+function emit_copysign!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    ops = LLVM.operands(inst)
+    n_args = length(ops) - 1        # last operand of a CallInst is the callee
+    n_args == 2 || error("llvm.copysign expects 2 arguments, got $n_args")
+
+    ty = LLVM.value_type(inst)
+    w = ty isa LLVM.LLVMHalf   ? 16 :
+        ty isa LLVM.LLVMFloat  ? 32 :
+        ty isa LLVM.LLVMDouble ? 64 :
+        error("llvm.copysign on unsupported type $(string(ty)) — " *
+              "scalar f16/f32/f64 only (a vector copysign would need a " *
+              "vector mask constant; no code path produces one yet)")
+
+    x_id = get_value_id!(state, ops[1])
+    y_id = get_value_id!(state, ops[2])
+
+    int_ty   = emit_type_int!(state.mod, UInt32(w), UInt32(0))
+    float_ty = map_type!(state.type_ctx, ty)
+    sign_mask = UInt64(1) << (w - 1)      # 0x8000 / 0x8000_0000 / 0x8000_…_0000
+    abs_mask  = sign_mask - UInt64(1)     # everything below it
+    sign_id = emit_constant_uint!(state.mod, UInt32(w), sign_mask)
+    abs_id  = emit_constant_uint!(state.mod, UInt32(w), abs_mask)
+
+    xb = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpBitcast, int_ty, xb, x_id)
+    yb = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpBitcast, int_ty, yb, y_id)
+    mag = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpBitwiseAnd, int_ty, mag, xb, abs_id)
+    sgn = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpBitwiseAnd, int_ty, sgn, yb, sign_id)
+    bits = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpBitwiseOr, int_ty, bits, mag, sgn)
+    result_id = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpBitcast, float_ty, result_id, bits)
+
+    state.value_map[inst] = result_id
 end
 
 function emit_glsl_ext_inst!(state::SPIRVEmitterState, inst::LLVM.CallInst, glsl_num::UInt32)
