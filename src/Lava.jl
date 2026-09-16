@@ -119,6 +119,20 @@ using PrecompileTools: @setup_workload
 # still asserts, file by file, that no source names `VkContext`, `vk_context` or
 # `VK_CONTEXT_REF`, and that `Vulkan` itself appears in no file but this one.
 import Vulkan
+
+# ── Everything below is gated on Vulkan having bindings to compile against ───
+#
+# A Julia→SPIR-V compiler for a driver that is not here can do nothing, and
+# `Mantle` — the only thing downstream that loads it — imports it only under
+# `@static if !Sys.isapple()`. Compiling it anyway is what made every Mac in
+# this tree pay for a Vulkan backend it never uses, and latterly what made it
+# FAIL: the body below is written against a `KernelInterface.NativeEmitter{Out,
+# Flats}` that this KernelAbstractions checkout does not have.
+#
+# The inner text is unchanged, so with a loader present this is the module it
+# always was.
+@static if Vulkan.HAS_LOADER
+
 using GPUCompiler
 using Raycore: Ray
 using LLVM
@@ -311,5 +325,7 @@ function __init__()
     # cannot call into a torn-down driver. A compiler has no device to lose, so
     # they moved with `runtime/device.jl` and run from Mantle's `__init__`.
 end
+
+end # @static if Vulkan.HAS_LOADER
 
 end # module Lava
