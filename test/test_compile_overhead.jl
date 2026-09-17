@@ -4,20 +4,19 @@
 # no codegen effect — and that are both easy to reintroduce because neither
 # announces itself. See benchmarks/compile_baseline/FINDINGS.md §1a.
 #
-#  1. `lava_compile_gpu_from_job` used to call `string(mod)` and write a `.ll`
-#     and a `.spv` on EVERY compile, ungated. `dev/tmp_kernels` had reached
-#     5675 files / 275 MB. On a fat module `string(mod)` alone is seconds (the
-#     RT path says so in its own comment).
+#  1. `lava_compile_gpu_from_job` calling `string(mod)` and writing a `.ll` and
+#     a `.spv` on EVERY compile, ungated, fills `dev/tmp_kernels` (5675 files /
+#     275 MB observed) and costs seconds per fat module for the `string(mod)`
+#     alone.
 #
-#  2. `lava_run` used to wait on `spirv-opt` / `spirv-val` with a flat
+#  2. `lava_run` waiting on `spirv-opt` / `spirv-val` with a flat
 #     `sleep(0.005)`. Those tools exit in ~1.3 ms on a small module, so the
-#     poll granularity — not the tool — was the cost: ~10 ms per kernel across
-#     the two spawns, which was the single largest Lava-owned cost for a small
-#     kernel.
+#     poll granularity — not the tool — is the cost: ~10 ms per kernel across
+#     the two spawns, the single largest Lava-owned cost for a small kernel.
 #
-# The timing assertions here are deliberately loose (they assert "not the old
-# quantisation", not a target number) so they pin the regression without going
-# flaky on a loaded machine.
+# The timing assertions here are deliberately loose (they assert "not the
+# sleep quantisation", not a target number) so they pin the regression without
+# going flaky on a loaded machine.
 
 using Test, Lava
 using GPUCompiler, LLVM

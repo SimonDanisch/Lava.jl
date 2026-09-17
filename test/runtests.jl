@@ -12,7 +12,7 @@
 #   Tier 2   Validation and structure: every builtin through `spirv-val`, the
 #            emitter's capability decisions, and the compiler's own frozen cache.
 #
-# There is no Tier 3. It was GPU execution, and it is Mantle's now.
+# There is no Tier 3: GPU execution is Mantle's.
 #
 # `compile_and_disasm` reaches `spirv-val` and `spirv-dis` through
 # `SPIRV_Tools_jll`, which are binaries rather than a driver — that is what makes
@@ -20,8 +20,8 @@
 
 using Test
 using Lava
-# The portable shader vocabulary is KernelInterface's since phase 2.1 — the
-# stage tests name `KernelInterface.vertex_index`, not `Lava.vertex_index`.
+# The portable shader vocabulary is KernelInterface's: the stage tests name
+# `KernelInterface.vertex_index`, not `Lava.vertex_index`.
 import KernelInterface
 
 # Loaded once; each test file guards with `@isdefined(SPIRVTestUtils)` so it also
@@ -66,8 +66,8 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         include(joinpath(@__DIR__, "test_builtin_validation.jl"))
     end
 
-    # What the emitter may declare, and who tells it. The compiler used to read
-    # `VK_CONTEXT_REF[]` for two booleans; it reads a record the runtime pushes,
+    # What the emitter may declare, and who tells it. Not a context ref read for
+    # two booleans: a record the runtime pushes,
     # which is the last thing that had to go before the move was possible.
     # Asserted on the emitted SPIR-V: flip the record, the capability changes.
     @testset "target features" begin

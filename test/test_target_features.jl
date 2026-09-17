@@ -3,8 +3,8 @@
 
 The emitter has to know two things about the hardware it is emitting for, because
 a capability declared on a device that lacks it is a **validation error**, not a
-slow path. The record used to be a process global the runtime pushed when it
-bound a device, which answered for the bound device rather than the one being
+slow path. As a process global pushed when the runtime bound a device, the
+record answers for the bound device rather than the one being
 compiled for. It is part of `LavaCompilerParams` now: a compile job carries it,
 the frozen keys mix it in, and there is no global to swap.
 

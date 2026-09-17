@@ -1,11 +1,8 @@
 """
 Lava names no Vulkan type. Asserted from the source, on every file.
 
-This file used to describe a LINE inside Lava — a compiler half that must not
-reach into a runtime half that was still in the same package. On 2026-08-27 the
-runtime moved to `Mantle/src/vulkan/` and the line became the package boundary,
-so the assertion got simpler and stronger: not "no file on that side", but **no
-file**.
+The runtime is `Mantle/src/vulkan/`, so the line is the package boundary and
+the assertion is not "no file on that side" but **no file**.
 
 **Types, not the dependency.** The 2026-08-27 change also dropped Vulkan from
 `[deps]`, and that part was undone on 2026-08-30: `Mantle`'s backend extension
@@ -241,8 +238,8 @@ end
         @test "OpFMul" in body
     end
 
-    # `device/atomics.jl` reaches `linear_index` across a file boundary now that
-    # its own copy is gone. If the include order ever puts it first, this is
+    # `device/atomics.jl` reaches `linear_index` across a file boundary rather
+    # than keeping a copy. If the include order ever puts it first, this is
     # where that shows up.
     @testset "atomics reach linear_index" begin
         function split_atomic(A)

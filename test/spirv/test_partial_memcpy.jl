@@ -39,7 +39,7 @@ using GeometryBasics
 # Through `VertexWrapper`, because THAT is what builds the tuple: it calls
 # `F.instance(args...)`, and a stage body written against the intrinsics
 # directly never materialises one. The same body compiled bare passes either
-# way, which is what made the first attempt at this test worthless.
+# way, which is what makes a test written that way worthless.
 function partial_copy_body(xs::Lava.LavaDeviceArray{Vec3f,1}, u::Vec3f)
     i = KernelInterface.vertex_index()
     v = xs[i]

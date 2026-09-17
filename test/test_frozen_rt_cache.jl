@@ -24,8 +24,8 @@ rt_probe_fn(x) = x
         Lava.FROZEN_VERSION[] = "rt_test_v1"
         Lava.FROZEN_RECORDING[] = true
         # `frozen_rt_store` runs the same `frozen_eligible` guard the compute path
-        # does, and this used to pass `sin` — whose module is `Base`, which has no
-        # package UUID either. So the store was refused and both the `stores == 1`
+        # does, so it must not be handed `sin` — whose module is `Base`, which
+        # has no package UUID either. The store is refused and both the `stores == 1`
         # and the round-trip assertion below compared against nothing at all.
         push!(Lava.FROZEN_UNPACKAGED, @__MODULE__)
         Lava.frozen_rt_clear!()

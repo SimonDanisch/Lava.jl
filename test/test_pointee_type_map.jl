@@ -14,8 +14,8 @@
 # plain i32).
 #
 # The fix: `infer_inner_ptr_pointee` takes the PTM and prefers the consuming
-# load's PTM entry, so the two can no longer disagree. This file pins both
-# halves: that the IR below really does produce the disagreement without the
+# load's PTM entry, so the two cannot disagree. This file pins both halves:
+# that the IR below really does produce the disagreement without the
 # PTM, and that with it the answer is the PTM's.
 
 using Test

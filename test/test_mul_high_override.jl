@@ -8,7 +8,7 @@
 # The overlay is attached by NAME, and the name is a Base internal that moves:
 # Julia <=1.12 spells it `Base.MultiplicativeInverses._mul_high`, Julia 1.13
 # renamed it to `Base.mul_hi` and moved it to int.jl, generalised to
-# `T<:Integer`. An overlay on a name Base no longer has is not an error — the
+# `T<:Integer`. An overlay on a name Base does not have is not an error: the
 # `@overlay` simply defines a method nobody calls, the compiler reaches the
 # widening original, and the failure surfaces far away as an i128 type the
 # backend cannot lower. So pin two things: that the name still resolves, and
