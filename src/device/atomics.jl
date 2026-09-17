@@ -58,18 +58,16 @@ end
 
 # `linear_index` is `device/devicearray.jl`'s, included just before this file.
 #
-# There was a second copy here, `atomic_linear_index`, written when the original
-# lived in `array/ka_backend.jl` and this file could not see it — and it was the
-# naive form:
+# No second copy here, and in particular not the naive form:
 #
 #     li = I[1]; stride = 1
 #     for d in 2:N;  stride *= dims[d-1];  li += stride * (I[d] - 1);  end
 #
 # which is exactly the nested-product expansion `linear_index`'s Horner comment
 # says NVIDIA's shader compiler miscompiles when the result feeds a
-# PhysicalStorageBuffer offset. So the duplicate was not merely redundant: an
-# `Atomix.@atomic a[i, j, k]` on a 3-D array with computed indices had the same
-# dropped-`I[1]` exposure that `repeat(x; inner)` was fixed for.
+# PhysicalStorageBuffer offset. An `Atomix.@atomic a[i, j, k]` on a 3-D array
+# with computed indices would have the same dropped-`I[1]` exposure that
+# `repeat(x; inner)` is fixed for.
 
 @lava_device_override function Base.getindex(r::PtrRef{T}, i::Integer) where T
     PtrIndexableRef{T}(r.ptr, Int(i))

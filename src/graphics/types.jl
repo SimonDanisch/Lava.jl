@@ -31,7 +31,7 @@ using KernelInterface: Topology, TriangleList, TriangleStrip, LineList,
 # `GeometryConfig` followed `Topology` there, and for the same reason: a compiler
 # reads every field of it to emit the stage's execution modes, and a portable
 # pipeline description has to be able to hold one without depending on a SPIR-V
-# compiler. It was defined below.
+# compiler.
 using KernelInterface: GeometryConfig
 
 # ── Tessellation Config ──

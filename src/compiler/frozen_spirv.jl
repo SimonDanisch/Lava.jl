@@ -1,10 +1,10 @@
 # The frozen cache, COMPILER half: what a kernel's identity is, where it is
 # written, and the ray-tracing entries.
 #
-# Nothing in this file names a `VkContext`. That is the point of the split — the
-# compiler consults the cache before it compiles, and used to reach into the
+# Nothing in this file names a `VkContext`. That is the point of the split: the
+# compiler consults the cache before it compiles, without reaching into the
 # Vulkan runtime to do it. The device half is `runtime/frozen_pipeline.jl`; see
-# its header for what stayed there and why.
+# its header for what lives there and why.
 #
 """
 Frozen kernel cache: SPIR-V on disk under a key that never changes by itself.
@@ -131,11 +131,11 @@ end
 
 # ── Automatic bounding ──────────────────────────────────────────────────────
 #
-# `frozen_prune!` is documented as deliberately manual, and that was right while
-# the cache was opt-in. It is on by default now, so "grows forever" became the
-# DEFAULT behaviour: every source edit mints a new build id and therefore a fresh
-# set of entries, and nothing reclaims the old ones. Measured here mid-session:
-# 1541 entries / 1.6 GB, from one project.
+# `frozen_prune!` is deliberately manual, which is survivable only for an
+# opt-in cache. On by default, "grows forever" is the DEFAULT behaviour: every
+# source edit mints a new build id and therefore a fresh set of entries, and
+# nothing reclaims the previous ones. Measured mid-session: 1541 entries /
+# 1.6 GB, from one project.
 #
 # cuTile bounds its disk cache the same way (`DiskCache`: prune at a 90 % high
 # water mark down to 75 %). This is that, adapted to plain files: check ONCE per
@@ -182,10 +182,9 @@ comparable against a directory listing.
 Whether the bound device asked for miss logging. Pushed by `bind_context!` and
 reset when the device is released.
 
-It used to be read off `ctx.diag.frozen_log_misses` through `VK_CONTEXT_REF[]`,
-which meant this file — the half the COMPILER consults before it compiles — named
-a `VkContext` for a log line. The flag is a boolean, so the runtime pushes the
-boolean.
+A boolean pushed by the runtime, not read off `ctx.diag.frozen_log_misses`
+through a context ref: this file is the half the COMPILER consults before it
+compiles, and it names no `VkContext` for a log line.
 """
 const FROZEN_LOG_MISSES = Ref(false)
 
@@ -271,9 +270,9 @@ The cost is a re-freeze after any recompilation of `Lava` or the defining
 package. In development that is precisely what is wanted; for an installed
 package the id comes from the `.ji` and is stable across processes.
 
-So a changed body under an unchanged signature **is** now detected — this
-docstring used to say the opposite, and `KERNELS_VERSION` remains only for the
-deliberate, cross-package generation bump rather than as the sole guard.
+So a changed body under an unchanged signature **is** detected, and
+`KERNELS_VERSION` is for the deliberate cross-package generation bump rather
+than the sole guard.
 """
 function frozen_key(@nospecialize(f), @nospecialize(tt), workgroup_size,
                     features::TargetFeatures)
@@ -353,9 +352,9 @@ function frozen_rt_key(@nospecialize(f), @nospecialize(tt), stage::Symbol,
     F = typeof(f)
     # Same build-id mix as `frozen_key`, and for the same reason: without it a
     # changed shader body under an unchanged signature keeps its key and is
-    # served stale SPIR-V. This key used to hash only types, stage, payload and
-    # push-constant size, which was survivable while the cache was opt-in and is
-    # not now that it is on by default.
+    # served stale SPIR-V. Hashing only types, stage, payload and
+    # push-constant size is survivable for an opt-in cache and not for one that
+    # is on by default.
     bids = hash(Base.module_build_id(parentmodule(F)),
                 hash(Base.module_build_id(@__MODULE__)))
     h = hash(typestring(tt),

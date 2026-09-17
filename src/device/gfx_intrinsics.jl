@@ -12,9 +12,8 @@
 # `sample_texture_2d`, `emit_vertex!`/`end_primitive!`/`primitive_id_in`. Those
 # are DECLARED there — one name, from one place, for a shader that must run on
 # either backend — and every definition below is an `@lava_device_override` on
-# the declaration rather than a Lava function of the same name. That is what
-# phase 2.1 of `Mantle/docs/mantle-owns-it.md` asked for, and it is why the
-# `Mantle.$f() = Lava.$f()` bridge in `MantleVulkanExt` is gone.
+# the declaration rather than a Lava function of the same name, so nothing needs
+# a `Mantle.f() = Lava.f()` bridge to reach them.
 #
 # **What the COMPILER lowers stage I/O through** is Lava's own and stays
 # unqualified: `set_position!`, `gfx_output`/`gfx_input` and their flat

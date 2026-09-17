@@ -344,8 +344,8 @@ reach one component. Done literally that is quadratic in the obvious usage: an
 epilogue or a rescale that touches all `n` components spills and reloads the
 entire matrix `n` times to change `n` values.
 
-**This is worth doing and it bought no measured time.** It was built to explain
-why holding SAM 2's attention `O` in accumulators loses, and it does not: the
+**Worth doing, and it buys no measured time.** It does not explain why holding
+SAM 2's attention `O` in accumulators loses: the
 flash kernel measured 4.955 ms before and 4.950 after, the GEMM's gelu epilogue
 is unchanged at 255 registers, and the real cause turned out to be occupancy
 (see `DNNKernels`' `FLASHCM_HELD`). NVIDIA's shader compiler evidently coalesces

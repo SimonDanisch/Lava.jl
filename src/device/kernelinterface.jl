@@ -6,9 +6,9 @@
 # kernels written against it compile on all of them — that is the whole point,
 # and it is why these names, not Lava's own, are what Lava uses internally.
 #
-# The cooperative-matrix vocabulary that used to be a second package called
-# `KernelInterfaces` — plural, UUID ce25d451 — is part of KI now; `Lava.jl`
-# imports those names at the top. `matrix_shapes` below is the backend hook it
+# The cooperative-matrix vocabulary is part of KI, not a second package of its
+# own; `Lava.jl` imports those names at the top. `matrix_shapes` below is the
+# backend hook it
 # gained in the move.
 #
 # ── Conventions this file reconciles ────────────────────────────────────────

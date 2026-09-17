@@ -222,8 +222,8 @@ end
 
 Whether anything downstream actually needs the post-pass IR string.
 
-This used to be unconditional, which cost a `string(mod)` plus two file writes
-on every single compile — measurable on small kernels and, per the RT path's own
+Asked, because dumping unconditionally costs a `string(mod)` plus two file
+writes on every compile — measurable on small kernels and, per the RT path's own
 comment, seconds on a fat module. Enable with `LAVA_DUMP_KERNELS=1`, or
 implicitly by asking for one of the other debug artifacts that consumes the IR.
 """
@@ -261,9 +261,9 @@ function dump_spirv_to_disk(spirv_bytes::Vector{UInt8},
     dir = get(ENV, "LAVA_SPIRV_DUMP_DIR", "")
     isempty(dir) && return nothing
     isdir(dir) || mkpath(dir)
-    # `spirv_content_hash`, not `hash` — the sampling hash collides for modules
-    # that differ in a few bytes, so two distinct dumps used to overwrite each
-    # other and a triage session would compare a file with itself.
+    # `spirv_content_hash`, not `hash`: the sampling hash collides for modules
+    # that differ in a few bytes, so two distinct dumps overwrite each other and
+    # a triage session compares a file with itself.
     h = string(spirv_content_hash(spirv_bytes); base=16, pad=16)
     sanitize(s) = replace(s, r"[^A-Za-z0-9_]" => "_")
     # Mangled GPUCompiler names can run to several hundred chars (every
@@ -536,8 +536,8 @@ function lava_compile_gfx_full(@nospecialize(f), @nospecialize(tt);
         wrapper_name = push_info.wrapper_name
         wrapper_fn = LLVM.functions(mod)[wrapper_name]
 
-        # GFX shader emission doesn't have the multi-OpFunction walker yet;
-        # keep the old single-OpFunction behavior for now.
+        # GFX shader emission has no multi-OpFunction walker, so this path
+        # collapses the module into one.
         run_llvm_passes!(mod, wrapper_fn; force_inline_all=true)
         post_pass_ir = string(mod)
 
@@ -583,8 +583,8 @@ function lava_compile_rt_full(@nospecialize(f), @nospecialize(tt);
         wrapper_name = push_info.wrapper_name
         wrapper_fn = LLVM.functions(mod)[wrapper_name]
 
-        # RT shader emission doesn't have the multi-OpFunction walker yet;
-        # keep the old single-OpFunction behavior for now.
+        # RT shader emission has no multi-OpFunction walker, so this path
+        # collapses the module into one.
         run_llvm_passes!(mod, wrapper_fn; force_inline_all=true)
         post_pass_ir = string(mod)
 
@@ -1064,8 +1064,8 @@ function lava_compile_gfx_shader(@nospecialize(f), @nospecialize(tt);
         wrapper_name = push_info.wrapper_name
         wrapper_fn = LLVM.functions(mod)[wrapper_name]
 
-        # LLVM passes (GFX emit doesn't have the multi-OpFunction walker yet;
-        # keep the old single-OpFunction behavior for now.)
+        # LLVM passes; GFX emit has no multi-OpFunction walker, so the module
+        # collapses into one.
         run_llvm_passes!(mod, wrapper_fn; force_inline_all=true)
 
         ir = string(mod)
@@ -1118,11 +1118,10 @@ unrolls for NVPTX and does not for SPIR-V, and that difference alone accounts
 for most of the flat ~2.5x deficit Lava shows on identical KernelAbstractions
 source.
 
-(An earlier note here claimed forcing the unroll made things *worse*, based on
-`LLVM.clopts("--unroll-count=8", "--unroll-allow-partial")` measuring
-4200 -> 2103 GFLOP/s. That was wrong: those are process-global LLVM options and
-they perturb every other compilation in the session. The source-level
-measurement above is the trustworthy one.)
+(`LLVM.clopts("--unroll-count=8", "--unroll-allow-partial")` measures
+4200 -> 2103 GFLOP/s, and that number means nothing: those options are
+process-global and perturb every other compilation in the session. The
+source-level measurement above is the trustworthy one.)
 
 Nothing in Lava's pipeline unrolls, and that shows up as a flat ~2.5x deficit
 against identical KernelAbstractions source on CUDA.jl — uniform across shapes,
@@ -1215,7 +1214,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # Default: respect Julia/GPUCompiler's inlining. Only Julia-marked
     # alwaysinline (throw/box wrappers) get inlined; other helpers survive
     # as their own functions and are emitted as separate OpFunctions.
-    # Pass `force_inline_all=true` for the old single-OpFunction behavior.
+    # Pass `force_inline_all=true` for single-OpFunction emission.
     checkpoint("pre_inline_cleanup")
     force_inline_all!(mod, entry_fn; force_inline_all)
     verify_ir!("force_inline")
@@ -1256,8 +1255,8 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     checkpoint("InstCombine+SROA+InstCombine")
 
     # ── Loop optimisation ──
-    # Nothing here used to unroll, and it showed up as a flat ~2.5x deficit
-    # against the same KernelAbstractions source on CUDA.jl — uniform across
+    # Without unrolling here there is a flat ~2.5x deficit against the same
+    # KernelAbstractions source on CUDA.jl — uniform across
     # shapes, which is the signature of a per-iteration cost rather than a tiling
     # problem. A dependent `muladd` chain with a compile-time trip count measured
     # 4.2 TFLOP/s here against 24.5 on CUDA (the card's fp32 peak is ~26.7): the
@@ -1570,8 +1569,8 @@ and Step 6's emission walker emits each as a separate SPIR-V OpFunction.
 
 Escape hatch (`force_inline_all=true`): the original blanket-inline behavior
 — mark every non-entry, non-declaration function `alwaysinline` and collapse
-the whole module into a single OpFunction. Kept so any regression can be
-A/B compared against the old path with a single flag flip.
+the whole module into a single OpFunction. Kept so any regression can be A/B
+compared against single-OpFunction emission with a single flag flip.
 """
 function outline_oversized!(mod::LLVM.Module; force_inline_all::Bool=false)
     # When force_inline_all is on we want everything in a single OpFunction
@@ -1594,8 +1593,8 @@ function outline_oversized!(mod::LLVM.Module; force_inline_all::Bool=false)
     get(ENV, "LAVA_OUTLINE_ENABLED", "0") == "1" || return nothing
 
     # AMDVLK chokes somewhere around 100-150 BBs in a single OpFunction. 50
-    # leaves comfortable margin and matches the threshold the spirv_bisect
-    # work used to characterize the chokepoint. Override via env var when
+    # leaves comfortable margin and matches the threshold spirv_bisect
+    # characterised the chokepoint at. Override via env var when
     # tuning for a specific kernel.
     threshold = parse(Int, get(ENV, "LAVA_OUTLINE_BB_THRESHOLD", "50"))
 
@@ -2006,7 +2005,7 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # entire ray-query lifecycle internally and exposes only ordinary scalar
     # / vector returns to its caller.
     #
-    # The case the old rule was guarding against — Julia hoisting a
+    # The case worth guarding against — Julia hoisting a
     # `while lava_ray_query_proceed() ... end` loop body into a separate
     # function — is detected: the hoisted helper has proceed/get calls but no
     # init, so it falls into the INCOMPLETE bucket and gets `alwaysinline`'d
@@ -2122,8 +2121,9 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
     # emit every reachable helper as its own OpFunction BEFORE the entry. The
     # function IDs were pre-allocated above so OpFunctionCall to forward
     # references is well-defined; emission order here is for source-map locality.
-    # Surviving helpers exist only when force_inline_all=false (the new default);
-    # under the old escape hatch only the entry survives and this loop is a no-op.
+    # Surviving helpers exist only when force_inline_all=false (the default);
+    # with `force_inline_all=true` only the entry survives and this loop is a
+    # no-op.
     let reachable = collect_reachable_callees(entry_fn),
         sccs = strongly_connected_components(reachable)
         for scc in sccs
@@ -3093,7 +3093,7 @@ function kernel_source_name(compiled)
     # `source_name` (the mangled entry symbol) first: it is always present on a
     # freshly compiled kernel and survives both caches, whereas `ir` is empty
     # unless `kernel_dump_wanted()`. The same two patterns match either input —
-    # the mangled symbol is exactly what these used to find inside the IR.
+    # the mangled symbol is exactly what these look for inside the IR.
     ir = compiled.source_name
     isempty(ir) && (ir = compiled.ir)
     isempty(ir) && return ""

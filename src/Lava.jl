@@ -28,10 +28,10 @@ export CompilationResult, lava_compile, optimize_spirv, LavaGfxShader
 # `test_no_stale_exports.jl`.
 
 # `@setup_workload` is PrecompileTools', re-exported. `@compile_workload` is NOT
-# here any more: the version-taking one freezes kernels into the on-disk cache,
-# which needs a device to compile them for, so it moved to Mantle with
-# `runtime/workload.jl`. Exporting a macro this package no longer defines is how
-# `CoopMat` and `Scalar` survived as dead names for months.
+# here: the version-taking one freezes kernels into the on-disk cache, which
+# needs a device to compile them for, so it is Mantle's, in
+# `runtime/workload.jl`. Exporting a macro this package does not define is how a
+# name stays dead and reachable.
 export @setup_workload
 
 # Cooperative matrices: the TYPE a kernel is compiled against, and the operand
@@ -49,9 +49,7 @@ export MatrixA, MatrixB, Accumulator
 
 # Ray-tracing device intrinsics. The pipeline that dispatches them is Mantle's;
 # these are what a shader body calls.
-# DELETED in phase 1.4: exports of the deleted intrinsics
 # SER (SPV_NV_shader_invocation_reorder)
-# DELETED in phase 1.4: exports of the deleted intrinsics
 
 # Re-export Raycore.Ray so `using Lava` users get Ray without ambiguity
 export Ray
@@ -59,9 +57,9 @@ export Ray
 # Graphics: the configuration types a pipeline is described with, and the
 # shader-stage intrinsics. Pure Julia — `graphics/types.jl` has no Vulkan in it,
 # which is why it stayed when the pipeline that consumes it left.
-# `BlendMode`, `CullFace`, `DepthMode` and `RenderTarget` are gone from here:
-# they are fixed-function pipeline state, this compiler never dispatched on any
-# of them, and they are Mantle's now.
+# `BlendMode`, `CullFace`, `DepthMode` and `RenderTarget` are NOT here: they are
+# fixed-function pipeline state, which this compiler never dispatches on, so
+# they are Mantle's.
 #
 # `Topology` stays exported, but it is re-exported rather than defined —
 # `KernelInterface` owns it, because the geometry stage's execution mode is
@@ -295,11 +293,10 @@ include("compiler/frozen_world.jl")
 
 
 function __init__()
-    # Nothing to reset here any more. The counters and logs this used to zero
-    # were module-level `Ref`s and `Vector`s, which meant a device crash during
-    # precompilation serialised its wreckage into the pkgimage and poisoned every
-    # later session. They are `ctx.diag` fields now, built fresh with the context,
-    # so there is nothing that can survive into the image to clear.
+    # No counters or logs to reset: module-level `Ref`s and `Vector`s let a
+    # device crash during precompilation serialise its wreckage into the
+    # pkgimage and poison every later session. They are `ctx.diag` fields, built
+    # fresh with the context, so nothing survives into the image.
     # Frozen kernel cache ON by default. The key already mixes in
     # `Base.module_build_id` of both the kernel's defining module and Lava, so a
     # changed kernel body produces a different key; `frozen_eligible` restricts

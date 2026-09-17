@@ -23,8 +23,8 @@ SPIR-V has no `trap` and no way to abort a compute kernel, so the trap calls
 GPUCompiler emits on error paths (via `lower_throw!`) must be stripped before
 the SPIR-V emitter runs.
 
-This was historically `GPUCompiler.rm_trap!`, an internal helper. It was
-removed for good in GPUCompiler 1.13.3 — deliberately unified into
+Ours rather than `GPUCompiler.rm_trap!`, which was removed in GPUCompiler
+1.13.3 — deliberately unified into
 `lower_unreachable_control_flow!`, which GPUCompiler now runs inside its
 SPIR-V `finish_ir!`. Lava uses its own emitter pipeline (it reads the LLVM
 module after passes; GPUCompiler's `finish_ir!` never runs here), so the

@@ -13,7 +13,7 @@
 # one place, and overridden onto these at the bottom of this file. Hikari had
 # `import Lava` at the top of `rt-pipeline.jl` for these names alone, and when
 # Lava took its dependency on Vulkan back that one line stopped Hikari loading
-# on a machine with no driver. See `Mantle/docs/mantle-owns-it.md` phase 2.1.
+# on a machine with no driver.
 #
 # RT builtins via llvmcall, following the same pattern as compute builtins
 # in runtime/intrinsics.jl. Each builtin produces loads from addrspace(7)

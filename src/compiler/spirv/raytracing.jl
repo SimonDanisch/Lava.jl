@@ -437,9 +437,9 @@ function payload_sc_for_state(state::SPIRVEmitterState)
     # `rt_payload_storage_class` was set when the payload OpVariable was
     # created in `emit_spirv_from_llvm_rt`, using `RT_STAGE_INFO[stage]`'s
     # `payload_sc` — `RayPayloadKHR` for raygen, `IncomingRayPayloadKHR`
-    # for closesthit / miss / anyhit / intersection. Previously this was
-    # inferred from `rt_tlas_var_id !== nothing` (only raygen had a TLAS),
-    # but chit/miss/anyhit now also emit the TLAS descriptor so they can
+    # for closesthit / miss / anyhit / intersection. Inferring it from
+    # `rt_tlas_var_id !== nothing` does not work: chit/miss/anyhit emit the TLAS
+    # descriptor too, so they can
     # fire inline ray queries — so the TLAS-as-proxy heuristic produced
     # the wrong storage class on chit/miss.
     state.rt_payload_storage_class
@@ -516,9 +516,9 @@ end
 # SER (SPV_NV_shader_invocation_reorder) emission
 # ─────────────────────────────────────────────────────────────────────────────
 
-# `_ser_available_for_emit` is gone. It read `VK_CONTEXT_REF[]` and reached into
-# a `VkContext` for one boolean, which was the whole of the compiler's dependency
-# on the Vulkan runtime here. `state.features.ser` is the same answer for the
+# SER availability comes from `state.features.ser` and never from a context ref:
+# reaching into a `VkContext` for one boolean is the compiler's whole dependency
+# on the Vulkan runtime here. It is the same answer for the
 # device this module is compiled FOR, from the job's record, with the same "no
 # device means emit the portable module" default. See `compiler/target_features.jl`.
 

@@ -2,9 +2,9 @@
 #
 # The emitter has to know a few things about the hardware it is emitting for,
 # because a capability declared on a device that lacks it is a validation error
-# rather than a slow path. It used to learn them from a process-global record the
-# runtime pushed when it bound a device, which answered for the BOUND device and
-# not for the one a kernel was being compiled for: a raygen compiled for a second
+# rather than a slow path. A process-global record pushed by the runtime when it
+# binds a device answers for the BOUND device and not for the one a kernel is
+# being compiled for: a raygen compiled for a second
 # device while an NVIDIA card was bound declared `ShaderInvocationReorderNV` on
 # hardware without it, and the frozen SPIR-V it produced was served to any device
 # afterwards, because the key knew nothing about features either.

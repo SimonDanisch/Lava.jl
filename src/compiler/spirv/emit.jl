@@ -70,9 +70,8 @@ mutable struct SPIRVEmitterState
     # Raygen: RayPayloadKHR. closesthit/miss/anyhit/intersection:
     # IncomingRayPayloadKHR. Used by `payload_sc_for_state` so the access
     # chain that loads/stores the payload picks the right storage class on
-    # every stage — previously this was inferred from `rt_tlas_var_id !==
-    # nothing` (only raygen had a TLAS), which broke once chit/miss/anyhit
-    # started emitting the TLAS descriptor too (for inline ray queries).
+    # every stage. Inferring it from `rt_tlas_var_id !== nothing` does not work:
+    # chit/miss/anyhit emit the TLAS descriptor too, for inline ray queries.
     rt_payload_storage_class::UInt32
     rt_hit_attrib_var_id::Union{Nothing, UInt32}  # HitAttributeKHR variable (vec2 barycentrics)
     # SER: cached OpTypeHitObjectNV id + the Private-storage HitObject variable
@@ -1580,14 +1579,13 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                     # same width under a different type (float/double out of an
                     # [N x i64]-packed MVector alloca).
                     #
-                    # This used to OpBitcast the POINTER whenever the load was narrower,
-                    # which Vulkan forbids on a logical pointer:
+                    # Reconciled VALUE-side, both directions. OpBitcast on the
+                    # POINTER is what Vulkan forbids on a logical pointer:
                     # "Instruction may not have a logical pointer operand"
-                    # (VUID-VkShaderModuleCreateInfo-pCode-08737). The widening case was
-                    # already handled value-side, for the separate reason that a wider
-                    # pointer reads past the field; `emit_reconciled_scalar_load!` now does
-                    # both directions, so narrowing gets the legal treatment too and the
-                    # two no longer have to agree by hand.
+                    # (VUID-VkShaderModuleCreateInfo-pCode-08737). Widening needs
+                    # the value side anyway, since a wider pointer reads past the
+                    # field, so `emit_reconciled_scalar_load!` does narrowing too
+                    # and the two cannot disagree.
                     val_id = emit_reconciled_scalar_load!(state, ptr_id, pointee_ty, eff_load_ty, sc)
                     finish_reconciled_load!(state, inst, val_id, actual_load_ty, load_ty,
                                             result_ty, needs_bitcast)
@@ -2410,10 +2408,11 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
                     # case where Julia/LLVM packs the alloca as [N x i64] but writes
                     # typed float/double values at GEP-derived offsets.
                     #
-                    # This used to OpBitcast the POINTER to match the value type, which
-                    # Vulkan forbids: the Logical addressing model gives no way to make
-                    # a differently-typed pointer to the same address, and spirv-val
-                    # says so — "Instruction may not have a logical pointer operand"
+                    # NOT an OpBitcast of the POINTER to match the value type:
+                    # the Logical addressing model gives no way to make a
+                    # differently-typed pointer to the same address, and
+                    # spirv-val says so — "Instruction may not have a logical
+                    # pointer operand"
                     # (VUID-VkShaderModuleCreateInfo-pCode-08737). Reproduced by a
                     # sliced setindex over Complex eltypes, which stores a uint into a
                     # Function-scope [2 x ulong] alloca.
@@ -5235,16 +5234,15 @@ function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     is_src_function = src_sc == SC.Function
     is_dest_function = dest_sc == SC.Function
 
-    # Chunk width. This used to be 4 unconditionally, with `Aligned 4` stamped on
-    # every load and store — but these copies are ARRAY ELEMENTS, and consecutive
-    # elements sit at multiples of the element size. For a 6-byte struct (three
-    # Int16s) element i is at byte 6(i-1), which is 4-aligned only for odd i, so
-    # every EVEN element declared an alignment its address did not have. The
-    # 32-bit access then dropped its high half: field `a` (bytes 0..1) survived and
-    # field `b` (bytes 2..3) came back zero, silently, for half the array.
-    #
-    # The intrinsic itself declares `align 1` here, so the old code was not merely
-    # optimistic — it contradicted the IR it was lowering.
+    # Chunk width, and NOT 4 unconditionally with `Aligned 4` stamped on every
+    # load and store: these copies are ARRAY ELEMENTS, and consecutive elements
+    # sit at multiples of the element size. For a 6-byte struct (three Int16s)
+    # element i is at byte 6(i-1), which is 4-aligned only for odd i, so every
+    # EVEN element would declare an alignment its address does not have. The
+    # 32-bit access then drops its high half: field `a` (bytes 0..1) survives and
+    # field `b` (bytes 2..3) comes back zero, silently, for half the array. The
+    # intrinsic itself declares `align 1` here, so claiming 4 contradicts the IR
+    # being lowered.
     #
     # Function storage keeps 4: `emit_function_ptr_word!` indexes 4-byte words
     # (`total_byte_offset ÷ 4 + word_idx`) and allocas are at least 4-aligned, so
@@ -6393,15 +6391,15 @@ function emit_select!(state::SPIRVEmitterState, inst::LLVM.SelectInst)
     # addressing model, under which OpBitcast may neither produce nor consume a
     # pointer: spirv-val rejects it with "Instruction may not have a logical
     # pointer operand" (VUID-StandaloneSpirv-Logical pointer-OpBitcast, surfaced
-    # as VUID-VkShaderModuleCreateInfo-pCode-08737). The PSB case below already
-    # knew bitcasting pointers was wrong and routed around it; every other
-    # storage class fell through to the bitcast and produced an invalid module.
+    # as VUID-VkShaderModuleCreateInfo-pCode-08737). The PSB case below routes
+    # around it; every other storage class has to as well, or the module is
+    # invalid.
     #
     # The case that actually occurs is a clamped ternary over shared memory,
     #     l = lid == 1 ? sh[lid] : sh[lid - 1]
     # which LLVM lowers to a select between the array base pointer and an element
-    # pointer, followed by a GEP [0]. The emitter used to reinterpret the element
-    # pointer as "an array starting here":
+    # pointer, followed by a GEP [0]. Reinterpreting the element pointer as "an
+    # array starting here" is the illegal form:
     #
     #     %99  = OpBitcast %_ptr_Workgroup__arr_float_128 %98      <- illegal
     #     %100 = OpSelect  %_ptr_Workgroup__arr_float_128 %93 %34 %99

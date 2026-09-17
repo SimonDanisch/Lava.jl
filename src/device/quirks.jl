@@ -197,11 +197,11 @@ else
         _mul_high_i64(a, b)
 end
 
-# NOTE: `Base.isless(::IEEEFloat,...)` used to be overridden here with a
-# branchless version to dodge an NVIDIA miscompile. That was a band-aid: the real
-# bug was loop unswitching turning the isless NaN-guard branch into a double-loop
-# NVIDIA mis-structures. It's now fixed generally by disabling SimpleLoopUnswitch
-# in `compiler/target.jl`, so no isless override is needed.
+# No `Base.isless(::IEEEFloat,...)` override: a branchless version dodges the
+# NVIDIA miscompile as a band-aid, where the real bug is loop unswitching
+# turning the isless NaN-guard branch into a double-loop NVIDIA mis-structures.
+# That is fixed generally by disabling SimpleLoopUnswitch in
+# `compiler/target.jl`.
 
 # ── sincos domain error ──
 @lava_device_override function Base.Math.sincos_domain_error(x)
