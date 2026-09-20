@@ -84,17 +84,72 @@ function coopmat_component_bytes(dtype::AbstractString)
     error("unsupported cooperative-matrix component type: $dtype")
 end
 
-"""Component type id for the dtype suffix used in the intrinsic name."""
+"""
+Component type id for the dtype suffix used in the intrinsic name.
+
+Integers are SIGNLESS, like every other integer this emitter makes (`types.jl`
+emits `OpTypeInt <width> 0` for all of them). A cooperative matrix loads out of
+an ordinary array and SPIR-V requires an access chain's result type to match the
+base's element type, so a signed component type on a signless array is a module
+that fails validation before it reaches the driver:
+
+    OpAccessChain result type (OpTypeInt) does not match the type that results
+    from indexing into the base <id> (OpTypeInt)
+    %211 = OpAccessChain %_ptr_Workgroup_char %37 %uint_0
+
+Signedness is a property of the OPERATION for integer matrices, not of the type:
+it rides on `OpCooperativeMatrixMulAddKHR`'s operands word, which is what
+`coopmat_muladd_operands` builds from the dtype suffixes.
+"""
 function coopmat_component_type!(state::SPIRVEmitterState, dtype::AbstractString)
     mod = state.mod
     dtype == "f16" && return emit_type_float!(mod, UInt32(16))
     dtype == "f32" && return emit_type_float!(mod, UInt32(32))
     dtype == "f64" && return emit_type_float!(mod, UInt32(64))
-    dtype == "i8" && return emit_type_int!(mod, UInt32(8), UInt32(1))
-    dtype == "u8" && return emit_type_int!(mod, UInt32(8), UInt32(0))
-    dtype == "i32" && return emit_type_int!(mod, UInt32(32), UInt32(1))
-    dtype == "u32" && return emit_type_int!(mod, UInt32(32), UInt32(0))
+    (dtype == "i8" || dtype == "u8") && return emit_type_int!(mod, UInt32(8), UInt32(0))
+    (dtype == "i32" || dtype == "u32") && return emit_type_int!(mod, UInt32(32), UInt32(0))
     error("unsupported cooperative-matrix component type: $dtype")
+end
+
+# `Cooperative Matrix Operands`, from SPV_KHR_cooperative_matrix. Absent, every
+# integer operand is read as unsigned — which for an int8 weight is not a
+# rounding difference but a different number.
+const COOPMAT_OPERAND_A_SIGNED = UInt32(0x1)
+const COOPMAT_OPERAND_B_SIGNED = UInt32(0x2)
+const COOPMAT_OPERAND_C_SIGNED = UInt32(0x4)
+const COOPMAT_OPERAND_RESULT_SIGNED = UInt32(0x8)
+
+"""Whether a dtype suffix names a signed integer component."""
+coopmat_signed(dtype::AbstractString) = dtype == "i8" || dtype == "i32"
+
+"""Whether a dtype suffix names an integer component at all."""
+coopmat_integer(dtype::AbstractString) =
+    dtype in ("i8", "u8", "i32", "u32")
+
+"""
+    coopmat_muladd_operands(state, a_val, b_val, dtype) -> UInt32
+
+The operands word for one `OpCooperativeMatrixMulAddKHR`, or zero for a float
+product, which needs none.
+
+The intrinsic's name carries only the ACCUMULATOR's component type — A and B
+are whatever was multiplied — so their signedness is read back from the emitted
+type ids, the same inversion `coopmat_type_use` does for a conversion.
+"""
+function coopmat_muladd_operands(state::SPIRVEmitterState, a_val, b_val,
+                                 dtype::AbstractString)
+    coopmat_integer(dtype) || return UInt32(0)
+    akey = coopmat_type_key(state, get(state.coopmat_value_types, a_val, UInt32(0)))
+    bkey = coopmat_type_key(state, get(state.coopmat_value_types, b_val, UInt32(0)))
+    operands = UInt32(0)
+    (akey !== nothing && coopmat_signed(akey[1])) &&
+        (operands |= COOPMAT_OPERAND_A_SIGNED)
+    (bkey !== nothing && coopmat_signed(bkey[1])) &&
+        (operands |= COOPMAT_OPERAND_B_SIGNED)
+    if coopmat_signed(dtype)
+        operands |= COOPMAT_OPERAND_C_SIGNED | COOPMAT_OPERAND_RESULT_SIGNED
+    end
+    operands
 end
 
 """
@@ -705,8 +760,17 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         b_id = get_value_id!(state, args[2])
         c_id = get_value_id!(state, args[3])
         id = fresh_id!(mod)
-        encode_instruction!(mod.functions, Op.OpCooperativeMatrixMulAddKHR,
-                            mat_ty, id, a_id, b_id, c_id)
+        # The trailing operands word is emitted only where it says something:
+        # a float product has no signedness and every name that existed before
+        # integer matrices did keeps the instruction it had.
+        operands = coopmat_muladd_operands(state, args[1], args[2], dtype)
+        if operands == 0
+            encode_instruction!(mod.functions, Op.OpCooperativeMatrixMulAddKHR,
+                                mat_ty, id, a_id, b_id, c_id)
+        else
+            encode_instruction!(mod.functions, Op.OpCooperativeMatrixMulAddKHR,
+                                mat_ty, id, a_id, b_id, c_id, operands)
+        end
         state.value_map[inst] = id
         state.coopmat_value_types[inst] = mat_ty
 
