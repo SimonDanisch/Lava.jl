@@ -7,11 +7,12 @@
 # the same case. A Metal backend reaches matrix hardware through
 # `simdgroup_matrix` and must not import a SPIR-V compiler to name the tile.
 #
-# What stayed is `coopmat_intrinsics.jl`: 766 lines of `llvmcall` that lower
-# KI's nine `coopmat_*` operations to `OpCooperativeMatrix*`. That is this
+# What stayed is `coopmat_intrinsics.jl`: the `llvmcall`s that lower KI's eleven
+# `coopmat_*` operations to `OpCooperativeMatrix*`. That is this
 # compiler's half, and it is the only half that was ever Vulkan's.
 using KernelInterface: CoopMatrix, AcceleratedMatrix, WorkgroupMatrix,
                        matrixuse, matrixscope
 import KernelInterface: coopmat_load, coopmat_store, coopmat_muladd,
+                        coopmat_mul, coopmat_add,
                         coopmat_zero, coopmat_undef, coopmat_convert,
                         coopmat_length, coopmat_getcomp, coopmat_setcomp

@@ -40,7 +40,7 @@ export @setup_workload
 # `AcceleratedMatrix`, `WorkgroupMatrix` and `CoopMatrix` are NOT exported here.
 # They are `KernelInterface`'s, and Mantle — the user-facing, cross-platform API
 # — is what re-exports them. This package is a Julia→SPIR-V compiler: it
-# implements the nine `coopmat_*` operations on them and uses the type
+# implements the eleven `coopmat_*` operations on them and uses the type
 # internally, which needs no export.
 #
 # `MatrixA`/`MatrixB`/`Accumulator` stay: they are the operand-position tags a

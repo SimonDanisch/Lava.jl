@@ -81,6 +81,7 @@ import KernelInterface as KI
 const KI_SHFL_TYPES = (Float32, Float64, Int32, UInt32, Int64, UInt64)
 
 for T in KI_SHFL_TYPES
+    @eval @inline KI.shfl(val::$T, lane::Integer) = subgroup_shuffle(val, lane)
     @eval @inline KI.shfl_down(val::$T, offset::Integer) = subgroup_shuffle_down(val, offset)
 end
 
