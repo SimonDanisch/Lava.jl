@@ -6566,11 +6566,64 @@ is_tensor_layout_type_id(state::SPIRVEmitterState, id::UInt32) =
     any(==(id), values(state.tensor_layout_type_ids))
 
 """
+Give every phi in a CYCLE the handle type its cycle carries.
+
+`defer_phi!` types a phi from its incoming values, and one pass over them cannot
+see a cycle: a loop-carried accumulator is a header phi whose latch edge is a
+phi that has not been reached yet, and whose entry edge is the `i32 0` LLVM uses
+for a null handle. The header therefore types itself `%uint`, and the module
+ends up with `OpPhi %uint` taking an `OpTypeCooperativeMatrixKHR` operand —
+which `spirv-val` rejects with "OpPhi's result type does not match incoming
+value type".
+
+Three things have to coincide to produce one, which is why it went unnoticed: a
+loop carrying a matrix, a BARRIER inside it — the barrier splits the body and
+the structurizer adds the latch phi — and a CONDITIONAL matrix value, whose two
+handles LLVM if-converts into a phi of its own. That is a flash-attention key
+loop reading its K tile from one of two addresses, and it is how this was found.
+`test_coopmat_phi_cycle.jl` pins the pattern.
+
+Works in result ids rather than LLVM values so that nothing has to be carried
+alongside the deferred entry: `value_map` already gives every phi its id before
+any block is emitted, which is exactly the property a cycle needs.
+"""
+function propagate_coopmat_phi_types!(state::SPIRVEmitterState)
+    known = Dict{UInt32,UInt32}()
+    for src in (state.coopmat_value_types, state.tensor_value_types)
+        for (val, ty) in src
+            id = get(state.value_map, val, nothing)
+            id === nothing || (known[id] = ty)
+        end
+    end
+    while true
+        changed = false
+        for (i, (result_id, type_id, incoming, label)) in enumerate(state.deferred_phis)
+            haskey(known, result_id) && continue
+            for (val, _) in incoming
+                vid = get(state.value_map, val, nothing)
+                vid === nothing && continue
+                ty = get(known, vid, nothing)
+                ty === nothing && continue
+                state.deferred_phis[i] = (result_id, ty, incoming, label)
+                known[result_id] = ty
+                changed = true
+                break
+            end
+        end
+        # Each round either types a phi that had none or changes nothing, and
+        # there are finitely many phis, so this terminates.
+        changed || break
+    end
+    return nothing
+end
+
+"""
 Resolve all deferred PHI nodes by inserting them right after their block's OpLabel.
 Must be called after all blocks are emitted so all operand values have IDs.
 """
 function resolve_deferred_phis!(state::SPIRVEmitterState)
     isempty(state.deferred_phis) && return
+    propagate_coopmat_phi_types!(state)
 
     # DEBUG: dump all deferred phis
     if get(ENV, "LAVA_DEBUG_PHI", "") == "1"
