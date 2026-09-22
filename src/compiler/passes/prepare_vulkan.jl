@@ -31,6 +31,16 @@ function llvm_type_size(t::LLVM.LLVMType)
         return 2
     elseif t isa LLVM.ArrayType
         return length(t) * llvm_type_size(LLVM.eltype(t))
+    elseif t isa LLVM.VectorType
+        # Without this, a vector fell through to the 8-byte fallback below, and
+        # every size test in the packed-alloca passes read `<2 x half>` as the
+        # same width as the `i64` element it is packed into. The typepunned-GEP
+        # conversion is gated on the access being STRICTLY smaller, so it left
+        # `gep <2 x half>, ptr %arr_i64, i64 %r` alone, the emitter had no
+        # lowering for it and dropped the access chain, and the module failed
+        # validation with the store's pointer and object types disagreeing.
+        # `scalar_size` right below has always had this branch.
+        return length(t) * llvm_type_size(LLVM.eltype(t))
     elseif t isa LLVM.StructType
         total = 0
         for m in LLVM.elements(t)
@@ -3327,6 +3337,116 @@ function lower_direct_mismatched_access!(fn, alloca, alloca_ty, alloca_elem_ty,
 end
 
 """
+    lower_constant_subelement_access!(mod::LLVM.Module)
+
+A store or load of `<T>` at a CONSTANT element of an `[N x E]` alloca, where `E`
+is an integer at least as wide as `T` and not `T` itself: read-modify-written
+into that word, or bitcast when the two are the same width.
+
+Three pointer shapes, each of which every other pass here declines:
+
+    store <2 x half> %v, ptr %alloca                            ; element zero
+    store <2 x half> %v, ptr (gep [N x i64], ptr %alloca, 0, k) ; element k
+    store <4 x half> %v, ptr (gep <4 x half>, ptr %alloca, k)   ; same-width pun
+
+The first has no GEP at all. It arrives that way by constant folding rather than
+from the front end: the offset into element zero is zero, `gep i8, ptr %a, 0`
+folds to `%a` inside the IRBuilder, and a bare store of a narrow value through a
+pointer to a wide slot is what is left. The second is the front end's own
+spelling whenever the access happens to land exactly on an element boundary —
+for `MVector{10,f16vec2}` in `[5 x i64]` that is every other element, which is
+why half the stores lowered and half did not. The third is a typed GEP that
+stayed typed: `convert_typepunned_geps_to_byte_geps!` converts only STRICTLY
+narrower accesses, so an `<4 x half>` indexing an `i64` slot goes through it
+untouched.
+
+The emitter has no lowering for either, and emits them verbatim:
+
+    OpStore Pointer's type does not match Object's type
+
+Runs after `lower_byte_gep_chain_on_allocas!`, so anything still expressible as
+a byte GEP has already been lowered as one and this sees only the residue.
+"""
+function lower_constant_subelement_access!(mod::LLVM.Module)
+    for fn in LLVM.functions(mod)
+        isempty(LLVM.blocks(fn)) && continue
+        to_erase = LLVM.Instruction[]
+        for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+            if inst isa LLVM.StoreInst
+                ptr = LLVM.operands(inst)[2]
+                access_ty = LLVM.value_type(LLVM.operands(inst)[1])
+                mode = :store
+            elseif inst isa LLVM.LoadInst
+                ptr = LLVM.operands(inst)[1]
+                access_ty = LLVM.value_type(inst)
+                mode = :load
+            else
+                continue
+            end
+            # Which alloca, which index, and what the index counts. The three
+            # pointer shapes differ only in that last part.
+            alloca, idx, idx_in_elems = if ptr isa LLVM.AllocaInst
+                # No GEP: element zero, whose offset folded the GEP away.
+                ptr, 0, true
+            elseif ptr isa LLVM.GetElementPtrInst
+                ops = LLVM.operands(ptr)
+                ops[1] isa LLVM.AllocaInst || continue
+                alloca_ty0 = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(ops[1]))
+                src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(ptr))
+                if length(ops) == 3
+                    # `[N x E], ptr, 0, k`: the leading zero is the array itself,
+                    # so `k` counts ELEMENTS.
+                    (ops[2] isa LLVM.ConstantInt && convert(Int64, ops[2]) == 0) || continue
+                    ops[3] isa LLVM.ConstantInt || continue
+                    src_ty == alloca_ty0 || continue
+                    ops[1], convert(Int64, ops[3]), true
+                elseif length(ops) == 2
+                    # `<T>, ptr, k`: `k` counts ACCESS-type units. This is what a
+                    # type-pun of the SAME width leaves behind, since
+                    # `convert_typepunned_geps_to_byte_geps!` only takes strictly
+                    # narrower accesses and declines it.
+                    ops[2] isa LLVM.ConstantInt || continue
+                    src_ty == access_ty || continue
+                    ops[1], convert(Int64, ops[2]), false
+                else
+                    continue
+                end
+            else
+                continue
+            end
+            alloca_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(alloca))
+            alloca_ty isa LLVM.ArrayType || continue
+            alloca_elem_ty = LLVM.eltype(alloca_ty)
+            alloca_elem_ty isa LLVM.IntegerType || continue
+            access_size = llvm_type_size(access_ty)
+            elem_size = llvm_type_size(alloca_elem_ty)
+            (access_size > 0 && elem_size > 0 && access_size <= elem_size) || continue
+            # Equal widths are a pure type-pun rather than a sub-element access:
+            # `<4 x half>` is exactly an `i64`, so the word needs a bitcast and
+            # no shifting. `lower_direct_mismatched_access!` degenerates to that
+            # on its own — the mask clears nothing and the shift is zero — which
+            # is why it is worth routing here instead of spelling it twice. An
+            # access that IS the element type is not a pun and must not be
+            # touched.
+            (access_size < elem_size || access_ty != alloca_elem_ty) || continue
+            elem_size % access_size == 0 || continue
+            idx >= 0 || continue
+            # `lower_direct_mismatched_access!` counts its index in units of the
+            # ACCESS type, so an element index is scaled into those units. Exact,
+            # because the access divides the element.
+            const_idx = idx_in_elems ? idx * (elem_size ÷ access_size) : idx
+            lower_direct_mismatched_access!(fn, alloca, alloca_ty, alloca_elem_ty,
+                                            elem_size, access_size,
+                                            elem_size ÷ access_size, const_idx,
+                                            inst, mode, to_erase)
+        end
+        for inst in to_erase
+            LLVM.erase!(inst)
+        end
+    end
+end
+
+"""
 Emit element-level RMW access given a byte offset expression (may be variable).
 Computes: elem_idx = byte_off / elem_size, inner = byte_off % elem_size
 Then does proper load/store with shift/mask for partial element access.
@@ -4344,8 +4464,14 @@ function convert_typepunned_geps_to_byte_geps!(mod::LLVM.Module)
                         alloca_elem_ty = LLVM.eltype(alloca_ty)
                         elem_size = llvm_type_size(alloca_elem_ty)
                         elem_size > 0 || continue
-                        # Only convert when accessing with smaller type than alloca element
-                        src_size < elem_size || continue
+                        # Only convert when the access is not the element type
+                        # itself. Narrower is the usual case; EQUAL width and a
+                        # different type is a pure pun — `<4 x half>` indexing an
+                        # `[N x i64]` — and it needs the same treatment, because
+                        # the typed GEP is just as unlowerable at equal width as
+                        # at a narrower one.
+                        src_size <= elem_size || continue
+                        (src_size < elem_size || src_ty != alloca_elem_ty) || continue
                     elseif alloca_ty isa LLVM.StructType
                         # Struct alloca: GEP treats struct as flat array of src_ty.
                         # Convert to byte GEP so downstream passes can decompose properly.
@@ -4455,10 +4581,14 @@ function lower_byte_gep_chain_on_allocas!(mod::LLVM.Module)
                     alloca_elem_ty = LLVM.eltype(alloca_ty)
                     alloca_elem_ty isa LLVM.IntegerType || continue
 
-                    # Access type must be smaller than alloca element type
+                    # Access type must not be wider than the alloca element, and
+                    # must not BE it: at equal width the read-modify-write below
+                    # degenerates to a bitcast, which is exactly right for a pun
+                    # like `<4 x half>` in an `i64` slot.
                     access_size = llvm_type_size(access_ty)
                     elem_size = llvm_type_size(alloca_elem_ty)
-                    (access_size > 0 && elem_size > 0 && access_size < elem_size) || continue
+                    (access_size > 0 && elem_size > 0 && access_size <= elem_size) || continue
+                    (access_size < elem_size || access_ty != alloca_elem_ty) || continue
                     # elem_size must be power of 2 for shift/mask
                     (elem_size & (elem_size - 1)) == 0 || continue
 

@@ -336,14 +336,38 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
                         ]
                         elem0_gep = LLVM.gep!(builder, alloca_type, alloca_inst,
                                                idx_vals, "arr_elem0")
+                        # A GEP indexed in the ACCESSED type, for the users whose
+                        # type is not the array's element type. `arr_elem0` says
+                        # "element zero of `[N x E]`", which is the right pointer
+                        # only when the access IS an `E`; handing it a narrower
+                        # access describes a sub-element write as though it
+                        # covered the whole slot. That store then carries a
+                        # three-operand GEP, and every pass that lowers a
+                        # mismatched access matches a two-operand one, so it
+                        # reached the emitter untouched and the module failed
+                        # validation with the pointer and object types
+                        # disagreeing. Indexing in the access type instead gives
+                        # exactly the form `convert_typepunned_geps_to_byte_geps!`
+                        # takes, which is where a narrow access belongs.
+                        typed_elem0 = IdDict{LLVM.LLVMType,LLVM.Value}()
+                        function elem0_for(access_ty)
+                            access_ty == elem_type && return elem0_gep
+                            get!(typed_elem0, access_ty) do
+                                LLVM.gep!(builder, access_ty, alloca_inst,
+                                          LLVM.Value[LLVM.ConstantInt(LLVM.Int64Type(), 0)],
+                                          "arr_elem0_typed")
+                            end
+                        end
                         # Redirect all direct load/store uses from alloca to elem0_gep
                         for usr in direct_users
                             if usr isa LLVM.StoreInst
                                 # store val, ptr %alloca -> store val, ptr %elem0_gep
                                 # The pointer is operand 2 (value=op1, ptr=op2)
-                                LLVM.API.LLVMSetOperand(usr, 1, elem0_gep)
+                                LLVM.API.LLVMSetOperand(usr, 1,
+                                    elem0_for(LLVM.value_type(LLVM.operands(usr)[1])))
                             elseif usr isa LLVM.LoadInst
-                                LLVM.API.LLVMSetOperand(usr, 0, elem0_gep)
+                                LLVM.API.LLVMSetOperand(usr, 0,
+                                    elem0_for(LLVM.value_type(usr)))
                             end
                         end
                     end

@@ -1452,6 +1452,13 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # Lower to proper element-level access with shift/mask (no integer divide).
     lower_byte_gep_chain_on_allocas!(mod)
 
+    # ── Lower a sub-element access at a CONSTANT element ────────────────────
+    # Either straight to the alloca (element zero's offset folds its GEP away)
+    # or through `gep [N x E], ptr, 0, k` (the front end's spelling when the
+    # access lands on an element boundary). Every pass above matches a
+    # two-operand GEP, so these are the forms none of them sees.
+    lower_constant_subelement_access!(mod)
+
     # ── Lower PHI-chained typepunned loads on array allocas ──
     # When byte-offset GEPs flow through PHI chains (from StructurizeCFG) before being
     # loaded, lower_byte_gep_chain_on_allocas! can't handle them (it requires direct

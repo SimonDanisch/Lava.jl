@@ -5616,10 +5616,19 @@ function emit_conversion!(state::SPIRVEmitterState, inst::LLVM.Instruction, opco
     llvm_ty = LLVM.value_type(inst)
     result_ty = if llvm_ty isa LLVM.PointerType
         map_pointer_type_for_value!(state.type_ctx, inst)
-    elseif opcode in (Op.OpUConvert, Op.OpSConvert) && llvm_ty isa LLVM.IntegerType
-        # Integer conversion ops MUST produce integer result type.
-        # Use emit_type_int! directly — map_type! cache can be poisoned by
-        # type-punned load analysis that maps i32 → %float.
+    elseif opcode in (Op.OpUConvert, Op.OpSConvert, Op.OpBitcast) &&
+           llvm_ty isa LLVM.IntegerType
+        # These MUST produce an integer result type. Use emit_type_int! directly
+        # — the map_type! cache can be poisoned by type-punned load analysis that
+        # maps i32 → %float.
+        #
+        # `OpBitcast` belongs in this list for the same reason and was missing
+        # from it. Packing an `MVector{N,f16vec4}` into `[N x i64]` bitcasts the
+        # vector to the word before storing it; the analysis had already decided
+        # that word is "really" a `<4 x half>`, so `map_type!` handed back
+        # `%v4half` and the bitcast returned its own input type. The store into
+        # `_ptr_Function_ulong` then failed validation. Whatever a pointee is
+        # used as elsewhere, a bitcast's destination type is the one LLVM wrote.
         emit_type_int!(state.mod, spirv_int_width(LLVM.width(llvm_ty)), UInt32(0))
     else
         map_type!(state.type_ctx, llvm_ty)
@@ -5700,12 +5709,19 @@ function emit_trunc!(state::SPIRVEmitterState, inst::LLVM.TruncInst)
             int_ty = emit_type_int!(state.mod, spirv_int_width(LLVM.width(dst_ty)), UInt32(0))
             trunc_id = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpUConvert, int_ty, trunc_id, src_id)
-            # `scalar_bit_width`, not `LLVMFloat ? 32 : 64`: a `half` is neither
-            # an `LLVMFloat` nor an `LLVMDouble`, so the two-way test bitcast a
-            # 16-bit value to `%double` and spirv-val rejected the width.
-            float_ty = emit_type_float!(state.mod, UInt32(scalar_bit_width(bcast_dst)))
+            # `map_type!` and not a hand-built float of `scalar_bit_width`
+            # width. The width test came first, because a `half` is neither an
+            # `LLVMFloat` nor an `LLVMDouble` and the original two-way test
+            # bitcast a 16-bit value to `%double`; but it still assumed the
+            # destination is a SCALAR float. Unpacking an `MVector` of
+            # `NTuple{2,VecElement{Float16}}` truncates to `i32` and bitcasts to
+            # `<2 x half>`, and `scalar_bit_width` answers `nothing` for a
+            # vector, which reached `UInt32(nothing)`. Mapping the destination
+            # type is what the instruction actually means and covers half,
+            # float, double and vectors of them alike.
+            bcast_ty = map_type!(state.type_ctx, bcast_dst)
             bcast_id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.functions, Op.OpBitcast, float_ty, bcast_id, trunc_id)
+            encode_instruction!(state.mod.functions, Op.OpBitcast, bcast_ty, bcast_id, trunc_id)
             # Map BOTH the trunc and bitcast in value_map
             state.value_map[inst] = trunc_id
             state.value_map[bcast_inst] = bcast_id
