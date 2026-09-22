@@ -5700,7 +5700,10 @@ function emit_trunc!(state::SPIRVEmitterState, inst::LLVM.TruncInst)
             int_ty = emit_type_int!(state.mod, spirv_int_width(LLVM.width(dst_ty)), UInt32(0))
             trunc_id = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpUConvert, int_ty, trunc_id, src_id)
-            float_ty = emit_type_float!(state.mod, UInt32(bcast_dst isa LLVM.LLVMFloat ? 32 : 64))
+            # `scalar_bit_width`, not `LLVMFloat ? 32 : 64`: a `half` is neither
+            # an `LLVMFloat` nor an `LLVMDouble`, so the two-way test bitcast a
+            # 16-bit value to `%double` and spirv-val rejected the width.
+            float_ty = emit_type_float!(state.mod, UInt32(scalar_bit_width(bcast_dst)))
             bcast_id = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpBitcast, float_ty, bcast_id, trunc_id)
             # Map BOTH the trunc and bitcast in value_map
@@ -5716,11 +5719,12 @@ function emit_trunc!(state::SPIRVEmitterState, inst::LLVM.TruncInst)
         # trunc with non-IntegerType dst — shouldn't happen in valid LLVM but handle gracefully.
         # Force i32 and emit OpUConvert + OpBitcast if needed for float result.
         src_id = get_value_id!(state, LLVM.operands(inst)[1])
-        int_ty = emit_type_int!(state.mod, UInt32(32), UInt32(0))
+        w = scalar_bit_width(dst_ty)
+        int_ty = emit_type_int!(state.mod, UInt32(w === nothing ? 32 : w), UInt32(0))
         trunc_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpUConvert, int_ty, trunc_id, src_id)
-        if dst_ty isa LLVM.LLVMFloat || dst_ty isa LLVM.LLVMDouble
-            float_ty = emit_type_float!(state.mod, UInt32(dst_ty isa LLVM.LLVMFloat ? 32 : 64))
+        if dst_ty isa LLVM.LLVMHalf || dst_ty isa LLVM.LLVMFloat || dst_ty isa LLVM.LLVMDouble
+            float_ty = emit_type_float!(state.mod, UInt32(w))
             bcast_id = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpBitcast, float_ty, bcast_id, trunc_id)
             state.value_map[inst] = bcast_id

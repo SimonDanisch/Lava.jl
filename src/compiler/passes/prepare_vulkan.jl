@@ -3239,6 +3239,33 @@ function lower_byte_offset_access!(fn, alloca, alloca_ty, alloca_elem_ty,
 end
 
 """
+A scalar as an integer of the same width, so it can take part in the shift and
+mask arithmetic that packing into a wider element needs.
+
+`zext` and `trunc` are integer-only in LLVM, but nothing in the C builder API
+checks that: `LLVM.zext!` on a `half` builds `zext half %x to i64` and returns
+it happily. The result verifies nowhere, survives every later pass, and reaches
+the SPIR-V emitter as a conversion with a float operand, which it lowers to a
+bare `OpUConvert %uint` — an integer where the store wants a `half`. That is
+how a packed `@private Float16` array became `OpStore Pointer's type does not
+match Object's type` rather than a compile error.
+"""
+function pack_as_int!(builder, value, name)
+    ty = LLVM.value_type(value)
+    ty isa LLVM.IntegerType && return value
+    int_ty = LLVM.IntType(llvm_type_size(ty) * 8)
+    ty isa LLVM.PointerType && return LLVM.ptrtoint!(builder, value, int_ty, name)
+    LLVM.bitcast!(builder, value, int_ty, name)
+end
+
+"""Inverse of [`pack_as_int!`](@ref): an integer of the right width back to `ty`."""
+function unpack_from_int!(builder, value, ty, name)
+    ty isa LLVM.IntegerType && return value
+    ty isa LLVM.PointerType && return LLVM.inttoptr!(builder, value, ty, name)
+    LLVM.bitcast!(builder, value, ty, name)
+end
+
+"""
 Lower a direct access (constant index only) through the base mismatched GEP.
 """
 function lower_direct_mismatched_access!(fn, alloca, alloca_ty, alloca_elem_ty,
@@ -3269,7 +3296,9 @@ function lower_direct_mismatched_access!(fn, alloca, alloca_ty, alloca_elem_ty,
             shift_bits = inner * 8
 
             old_val = LLVM.load!(builder, alloca_elem_ty, gep, "dm_load")
-            ext_val = LLVM.zext!(builder, value, alloca_elem_ty, "dm_zext")
+            int_val = pack_as_int!(builder, value, "dm_bits")
+            ext_val = store_bits < elem_bits ?
+                LLVM.zext!(builder, int_val, alloca_elem_ty, "dm_zext") : int_val
             if shift_bits > 0
                 ext_val = LLVM.shl!(builder, ext_val, LLVM.ConstantInt(alloca_elem_ty, shift_bits), "dm_shl")
             end
@@ -3281,13 +3310,16 @@ function lower_direct_mismatched_access!(fn, alloca, alloca_ty, alloca_elem_ty,
         else  # :load
             load_ty = LLVM.value_type(inst)
             load_bits = llvm_type_size(load_ty) * 8
+            elem_bits = elem_size * 8
             shift_bits = inner * 8
 
             full = LLVM.load!(builder, alloca_elem_ty, gep, "dm_full")
             if shift_bits > 0
                 full = LLVM.lshr!(builder, full, LLVM.ConstantInt(alloca_elem_ty, shift_bits), "dm_shr")
             end
-            result = LLVM.trunc!(builder, full, load_ty, "dm_trunc")
+            narrowed = load_bits < elem_bits ?
+                LLVM.trunc!(builder, full, LLVM.IntType(load_bits), "dm_trunc") : full
+            result = unpack_from_int!(builder, narrowed, load_ty, "dm_bits")
             LLVM.replace_uses!(inst, result)
             push!(to_erase, inst)
         end
@@ -3324,14 +3356,12 @@ function emit_element_rmw_access!(builder, alloca, alloca_ty, alloca_elem_ty,
 
         old_val = LLVM.load!(builder, alloca_elem_ty, gep, "chain_old")
 
-        # Zero-extend stored value to element width
-        ext_val = if store_ty == alloca_elem_ty
-            store_value
-        elseif llvm_type_size(store_ty) < elem_size
-            LLVM.zext!(builder, store_value, alloca_elem_ty, "chain_zext")
-        else
-            store_value
-        end
+        # Zero-extend stored value to element width. `pack_as_int!` first: a
+        # `half` or a `float` has no `zext`, and building one anyway is what
+        # produced invalid SPIR-V from a packed `@private Float16` array.
+        int_val = pack_as_int!(builder, store_value, "chain_bits")
+        ext_val = store_bits < elem_bits ?
+            LLVM.zext!(builder, int_val, alloca_elem_ty, "chain_zext") : int_val
 
         # Convert shift from i64 to alloca_elem_ty
         shift_in_elem_ty = LLVM.trunc!(builder, shift_bits, alloca_elem_ty, "chain_shift_t")
@@ -3362,8 +3392,10 @@ function emit_element_rmw_access!(builder, alloca, alloca_ty, alloca_elem_ty,
         # Shift right
         shifted = LLVM.lshr!(builder, full, shift_in_elem_ty, "chain_shr")
 
-        # Truncate
-        result = LLVM.trunc!(builder, shifted, load_ty, "chain_trunc")
+        # Truncate to the loaded width, then back to the loaded type
+        narrowed = load_bits < elem_bits ?
+            LLVM.trunc!(builder, shifted, LLVM.IntType(load_bits), "chain_trunc") : shifted
+        result = unpack_from_int!(builder, narrowed, load_ty, "chain_bits")
         LLVM.replace_uses!(inst, result)
         push!(to_erase, inst)
     end
