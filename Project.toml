@@ -77,7 +77,7 @@ GPUCompiler = "1, 2"
 # `KernelInterface` without `MatrixShape` and fail at load with an
 # `UndefVarError` instead of failing at resolve, where the message is legible.
 # Until it is upstreamed, `dev` the local checkout.
-KernelInterface = "0.1"
+KernelInterface = "0.1, 0.2"
 
 # Only the test suite touches this jll: test/spirv_test_utils.jl runs `llc` as a
 # reference oracle against our own emitter. Nothing in src/ uses it, so the
