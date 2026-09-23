@@ -26,21 +26,35 @@ import KernelInterface as KI
 
 # ── Indexing ────────────────────────────────────────────────────────────────
 
-@inline KI.get_global_id() = (x = Int(lava_global_invocation_id(1)) + 1,
-                              y = Int(lava_global_invocation_id(2)) + 1,
-                              z = Int(lava_global_invocation_id(3)) + 1)
+# **Typed**, which is KernelInterface 0.2's contract for the 3D queries: a
+# backend implements `f(::Type{T})` and KI itself owns the zero-argument form as
+# `f() = f(Int)`. Implementing the zero-argument one here instead OVERWRITES
+# that definition, and method overwriting is an error during precompilation —
+# `Method definition get_global_id() in module KernelInterface … overwritten in
+# module Lava`, which takes the whole tree down.
+#
+# The element type is what a kernel wanting `Int32` indices asks for, so it no
+# longer has to convert after the fact.
+@inline KI.get_global_id(::Type{T}) where {T} =
+    (x = T(lava_global_invocation_id(1)) + one(T),
+     y = T(lava_global_invocation_id(2)) + one(T),
+     z = T(lava_global_invocation_id(3)) + one(T))
 
-@inline KI.get_local_id() = (x = Int(lava_local_invocation_id(1)) + 1,
-                             y = Int(lava_local_invocation_id(2)) + 1,
-                             z = Int(lava_local_invocation_id(3)) + 1)
+@inline KI.get_local_id(::Type{T}) where {T} =
+    (x = T(lava_local_invocation_id(1)) + one(T),
+     y = T(lava_local_invocation_id(2)) + one(T),
+     z = T(lava_local_invocation_id(3)) + one(T))
 
-@inline KI.get_group_id() = (x = Int(lava_workgroup_id(1)) + 1,
-                             y = Int(lava_workgroup_id(2)) + 1,
-                             z = Int(lava_workgroup_id(3)) + 1)
+@inline KI.get_group_id(::Type{T}) where {T} =
+    (x = T(lava_workgroup_id(1)) + one(T),
+     y = T(lava_workgroup_id(2)) + one(T),
+     z = T(lava_workgroup_id(3)) + one(T))
 
-@inline KI.get_num_groups() = (x = Int(lava_num_workgroups(1)),
-                               y = Int(lava_num_workgroups(2)),
-                               z = Int(lava_num_workgroups(3)))
+# A COUNT, so no `+ 1` — see this file's header on the 1-based convention.
+@inline KI.get_num_groups(::Type{T}) where {T} =
+    (x = T(lava_num_workgroups(1)),
+     y = T(lava_num_workgroups(2)),
+     z = T(lava_num_workgroups(3)))
 
 # `get_local_size` and `get_global_size` are NOT implemented yet, and the reason
 # is a bug they uncovered rather than an oversight.
