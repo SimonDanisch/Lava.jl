@@ -490,7 +490,7 @@ function lava_compile_full(@nospecialize(f), @nospecialize(tt);
         wrapper_fn = LLVM.functions(mod)[wrapper_name]
 
         # LLVM passes
-        run_llvm_passes!(mod, wrapper_fn)
+        run_llvm_passes!(mod, wrapper_fn; kernelname = entry_name)
         post_pass_ir = string(mod)
 
         # SPIR-V emission
@@ -756,7 +756,7 @@ function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob;
 
         # ── Stage 1: LLVM passes ──
         timed_phase("stage", "run_llvm_passes!") do
-            run_llvm_passes!(mod, wrapper_fn; force_inline_all)
+            run_llvm_passes!(mod, wrapper_fn; force_inline_all, kernelname = entry_name)
         end
 
         # Materialising the post-pass IR is not free: `string(mod)` is
@@ -1171,7 +1171,8 @@ function unroll_loops!(mod::LLVM.Module)
 end
 
 function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
-                           force_inline_all::Bool=false)
+                           force_inline_all::Bool=false,
+                           kernelname::AbstractString="")
     # ── CFG cleanup ──
     # Verify IR after each custom pass to catch corruption early.
     # Only in debug mode — verify is cheap but adds up across 30+ passes.
@@ -1206,7 +1207,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     rm_trap!(mod)
     # Pass entry_fn so the pass warns (rather than silently miscompiles) if it
     # ever lowers an `unreachable` in a non-entry helper — see replace_unreachable!.
-    replace_unreachable!(mod, entry_fn)
+    replace_unreachable!(mod, entry_fn; kernelname)
     strip_noreturn!(mod)
     verify_ir!("pre_inline")
 

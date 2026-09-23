@@ -82,7 +82,8 @@ path — it is kept (and hardened) as vendored defensive code for the day a
 GPUCompiler version stops doing so. It is exercised directly by
 `test/test_replace_unreachable.jl`.
 """
-function replace_unreachable!(mod::LLVM.Module, entry::Union{LLVM.Function,Nothing}=nothing)
+function replace_unreachable!(mod::LLVM.Module, entry::Union{LLVM.Function,Nothing}=nothing;
+                              kernelname::AbstractString="")
     for f in LLVM.functions(mod)
         isempty(LLVM.blocks(f)) && continue
 
@@ -107,8 +108,13 @@ function replace_unreachable!(mod::LLVM.Module, entry::Union{LLVM.Function,Nothi
             rt = LLVM.return_type(LLVM.function_type(f))
             ptr_note = rt isa LLVM.PointerType ?
                 " WARNING: helper returns a POINTER — the undef return is liable to be dereferenced." : ""
+            # The ENTRY is the Vulkan wrapper and is always called `main`, which
+            # names no kernel. `kernelname` is the Julia one the caller still
+            # had, and without it this warning cannot be acted on.
+            who = isempty(kernelname) ? LLVM.name(entry) : kernelname
             msg = "replace_unreachable!: lowering `unreachable` in non-entry helper " *
-                  "`$(LLVM.name(f))` (returns $(rt)). Its throw path will return undef and " *
+                  "`$(LLVM.name(f))` of kernel `$(who)` (returns $(rt)). " *
+                  "Its throw path will return undef and " *
                   "the caller will resume with that value instead of aborting. This is safe " *
                   "only if the throw path is never taken; inline the helper into the kernel " *
                   "to make it an early exit." * ptr_note
