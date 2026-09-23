@@ -492,6 +492,56 @@ function emit_rt_hit_attrib_load_at!(state::SPIRVEmitterState, inst::LLVM.CallIn
     state.value_map[inst] = result_id
 end
 
+"""
+Emit OpAccessChain + OpStore for `lava_rt_hit_attrib_store_f32_at(idx, v)`.
+
+The write side of the same variable [`emit_rt_hit_attrib_load_at!`](@ref)
+reads. An INTERSECTION shader fills it and the closest-hit shader that follows
+reads it — for a triangle the hardware fills it with barycentrics, and for a
+procedural primitive there is no hardware to do it, so the intersection shader
+is the only thing that can.
+
+Written before `OpReportIntersectionKHR`, not after: reporting is what makes the
+attribute visible to the hit shaders, so a store afterwards is a store into the
+next candidate.
+"""
+function emit_rt_hit_attrib_store_at!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    mod = state.mod
+    idx_id = get_value_id!(state, LLVM.operands(inst)[1])
+    val_id = get_value_id!(state, LLVM.operands(inst)[2])
+
+    hit_var = state.rt_hit_attrib_var_id
+    hit_var === nothing && error(
+        "lava_rt_hit_attrib_store_f32_at requires a HitAttributeKHR variable, " *
+        "which exists only in an intersection/closest-hit/any-hit stage")
+
+    f32_ty = emit_type_float!(mod, UInt32(32))
+    elem_ptr_ty = map_pointer_type!(state.type_ctx, f32_ty, SC.HitAttributeKHR)
+    ac_id = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpAccessChain, elem_ptr_ty, ac_id,
+                        hit_var, idx_id)
+    encode_instruction!(mod.functions, Op.OpStore, ac_id, val_id)
+end
+
+"""
+Emit `OpReportIntersectionKHR hit_t hit_kind`.
+
+The instruction an intersection shader exists to issue: it offers a hit at
+distance `hit_t` to the traversal, which accepts it if it is inside the ray's
+current `[tmin, tmax]` and closer than what it already has. Its `Bool` result —
+whether the hit was accepted — is discarded here; a shader that wants it can
+have it when something needs to branch on acceptance.
+"""
+function emit_rt_report_intersection!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    mod = state.mod
+    t_id = get_value_id!(state, LLVM.operands(inst)[1])
+    kind_id = get_value_id!(state, LLVM.operands(inst)[2])
+    bool_ty = emit_type_bool!(mod)
+    result_id = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpReportIntersectionKHR, bool_ty, result_id,
+                        t_id, kind_id)
+end
+
 # ── OpIgnoreIntersectionKHR / OpTerminateRayKHR Emission ──
 
 """

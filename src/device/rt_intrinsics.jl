@@ -286,6 +286,56 @@ end
 @inline lava_rt_hit_bary_u() = lava_rt_hit_attrib_load_f32_at(UInt32(0))
 @inline lava_rt_hit_bary_v() = lava_rt_hit_attrib_load_f32_at(UInt32(1))
 
+# ── Intersection shader: writing the attribute, and reporting the hit ──
+#
+# The write side of the hit attribute, and the instruction that offers a hit to
+# traversal. Both are only meaningful in an INTERSECTION stage.
+#
+# For a triangle the hardware fills the attribute with barycentrics and reports
+# the hit itself. A procedural primitive has neither — the AABB only says
+# "maybe", and this pair is how the shader answers "yes, at this distance, with
+# this surface coordinate".
+
+@inline function lava_rt_hit_attrib_store_f32_at(idx::UInt32, v::Float32)
+    Base.llvmcall(("""
+        declare void @lava_rt_hit_attrib_store_f32_at(i32, float) #0
+        define void @entry(i32 %idx, float %v) #0 {
+            call void @lava_rt_hit_attrib_store_f32_at(i32 %idx, float %v)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32, Float32}, idx, v)
+end
+
+"""
+    lava_rt_report_intersection(t::Float32, kind::UInt32)
+
+Offer a hit at distance `t`. Traversal accepts it if it lies within the ray's
+`[tmin, tmax]` and is closer than the current best.
+
+Store the hit attribute BEFORE calling this: reporting is what publishes the
+attribute to the hit shaders, so a store afterwards belongs to the next
+candidate rather than to this one.
+"""
+@inline function lava_rt_report_intersection(t::Float32, kind::UInt32)
+    Base.llvmcall(("""
+        declare void @lava_rt_report_intersection(float, i32) #0
+        define void @entry(float %t, i32 %k) #0 {
+            call void @lava_rt_report_intersection(float %t, i32 %k)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{Float32, UInt32}, t, kind)
+end
+
+"""Report a hit at `t` whose surface coordinate is `(u, v)`."""
+@inline function lava_rt_report_hit(t::Float32, u::Float32, v::Float32,
+                                    kind::UInt32 = UInt32(0))
+    lava_rt_hit_attrib_store_f32_at(UInt32(0), u)
+    lava_rt_hit_attrib_store_f32_at(UInt32(1), v)
+    lava_rt_report_intersection(t, kind)
+end
+
 # ── OpIgnoreIntersectionKHR / OpTerminateRayKHR Intrinsics ──
 # These are SPIR-V block terminators — valid only in any-hit shaders.
 # OpIgnoreIntersectionKHR: reject the current intersection, continue traversal.
@@ -391,6 +441,8 @@ push!(KNOWN_INTRINSICS, "lava_rt_payload_load_f32")
 push!(KNOWN_INTRINSICS, "lava_rt_payload_store_f32_at")
 push!(KNOWN_INTRINSICS, "lava_rt_payload_load_f32_at")
 push!(KNOWN_INTRINSICS, "lava_rt_hit_attrib_load_f32_at")
+push!(KNOWN_INTRINSICS, "lava_rt_report_intersection")
+push!(KNOWN_INTRINSICS, "lava_rt_hit_attrib_store_f32_at")
 push!(KNOWN_INTRINSICS, "lava_rt_ignore_intersection")
 push!(KNOWN_INTRINSICS, "lava_rt_terminate_ray")
 push!(KNOWN_INTRINSICS, "lava_rt_hit_object_trace_ray")

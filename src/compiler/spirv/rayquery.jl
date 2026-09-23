@@ -215,6 +215,53 @@ function emit_ray_query_proceed!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     return nothing
 end
 
+"""
+`OpRayQueryGenerateIntersectionKHR query hit_t` — the inline-traversal analogue
+of `OpReportIntersectionKHR`.
+
+An AABB candidate is only "the ray entered this box". This is how a shader says
+"and it really hits, at `hit_t`", which commits the candidate. Without it a
+procedural primitive is never hit, no matter what the traversal reports.
+"""
+function emit_ray_query_generate_intersection!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    mod = state.mod
+    qvar = get_or_create_ray_query_var!(state)
+    t_id = get_value_id!(state, LLVM.operands(inst)[1])
+    push!(mod.functions, (UInt32(3) << 16) | UInt32(Op.OpRayQueryGenerateIntersectionKHR))
+    push!(mod.functions, qvar)
+    push!(mod.functions, t_id)
+    return nothing
+end
+
+"""A vec3 getter, component-extracted — the ray-query getters return whole vectors."""
+function emit_rq_get_vec3_component!(state::SPIRVEmitterState, inst::LLVM.CallInst,
+                                     opcode::UInt16)
+    mod = state.mod
+    qvar = get_or_create_ray_query_var!(state)
+    committed_id = get_value_id!(state, LLVM.operands(inst)[1])
+    dim_id = get_value_id!(state, LLVM.operands(inst)[2])
+    f32_ty = emit_type_float!(mod, UInt32(32))
+    vec3_ty = emit_type_vector!(mod, f32_ty, UInt32(3))
+    vec_id = fresh_id!(mod)
+    push!(mod.functions, (UInt32(5) << 16) | UInt32(opcode))
+    push!(mod.functions, vec3_ty)
+    push!(mod.functions, vec_id)
+    push!(mod.functions, qvar)
+    push!(mod.functions, committed_id)
+    res_id = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpVectorExtractDynamic, f32_ty, res_id,
+                        vec_id, dim_id)
+    state.value_map[inst] = res_id
+    return nothing
+end
+
+emit_ray_query_get_object_ray_origin!(state, inst) =
+    emit_rq_get_vec3_component!(state, inst,
+                                Op.OpRayQueryGetIntersectionObjectRayOriginKHR)
+emit_ray_query_get_object_ray_direction!(state, inst) =
+    emit_rq_get_vec3_component!(state, inst,
+                                Op.OpRayQueryGetIntersectionObjectRayDirectionKHR)
+
 emit_ray_query_confirm!(state::SPIRVEmitterState, ::LLVM.CallInst) =
     emit_rq_no_arg!(state, Op.OpRayQueryConfirmIntersectionKHR)
 

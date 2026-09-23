@@ -442,8 +442,8 @@ Compile a Julia function through the full Lava pipeline, returning a `Compilatio
 with IR at every stage for introspection and validation.
 
 Supports all shader stages: `:compute`, `:vertex`, `:fragment`, `:geometry`,
-`:tess_control`, `:tess_eval`, `:raygen`, `:closesthit`, `:miss`, `:anyhit`,
-`:intersection`, `:callable`.
+`:tess_control`, `:tess_eval`, `:mesh`, `:task`, `:raygen`, `:closesthit`,
+`:miss`, `:anyhit`, `:intersection`, `:callable`.
 """
 function lava_compile(@nospecialize(f), @nospecialize(tt);
                       stage::Symbol=:compute,
@@ -454,7 +454,7 @@ function lava_compile(@nospecialize(f), @nospecialize(tt);
     if stage == :compute
         result = lava_compile_full(f, tt; workgroup_size, validate)
         return result
-    elseif stage in (:vertex, :fragment, :geometry, :tess_control, :tess_eval)
+    elseif stage in (:vertex, :fragment, :geometry, :tess_control, :tess_eval, :mesh, :task)
         return lava_compile_gfx_full(f, tt; stage, config, validate)
     elseif stage in (:raygen, :closesthit, :miss, :anyhit, :intersection, :callable)
         return lava_compile_rt_full(f, tt; stage, payload_type, validate)

@@ -135,6 +135,10 @@ module Op
     const OpDPdx                    = UInt16(207)
     const OpDPdy                    = UInt16(208)
     const OpFwidth                  = UInt16(209)
+    # Not a block terminator, unlike `OpKill`: the invocation carries on and its
+    # stores are thrown away. That is what lets a `discard` sit in the middle of
+    # inlined straight-line code without the CFG having to end there.
+    const OpDemoteToHelperInvocation = UInt16(5380)
     const OpControlBarrier          = UInt16(224)
     const OpMemoryBarrier           = UInt16(225)
     const OpAtomicLoad              = UInt16(227)
@@ -331,6 +335,12 @@ module Op
     const OpRayQueryGetIntersectionInstanceCustomIndexKHR = UInt16(6019)
     const OpRayQueryGetIntersectionInstanceIdKHR          = UInt16(6020)
     const OpRayQueryGetIntersectionPrimitiveIndexKHR      = UInt16(6023)
+    # Needed for PROCEDURAL geometry on the inline path: an AABB candidate has
+    # to be solved in OBJECT space, so the shader asks the query for the ray it
+    # is currently testing rather than transforming one itself.
+    const OpRayQueryGetRayTMinKHR                         = UInt16(6016)
+    const OpRayQueryGetIntersectionObjectRayDirectionKHR  = UInt16(6027)
+    const OpRayQueryGetIntersectionObjectRayOriginKHR     = UInt16(6028)
     const OpRayQueryGetIntersectionBarycentricsKHR        = UInt16(6024)
     # Intersection-kind operand to GetIntersection* (and related ops)
     const RayQueryCandidateIntersectionKHR = UInt32(0)
@@ -374,11 +384,17 @@ module Op
     const OpReorderThreadWithHitObjectNV              = UInt16(5279)
     const OpReorderThreadWithHintNV                   = UInt16(5280)
     const OpTypeHitObjectNV                           = UInt16(5281)
+    # SPV_EXT_mesh_shader. Both take only operands, no result id: the mesh
+    # stage's outputs are variables, so these two just say HOW MUCH of them the
+    # workgroup filled, and (from a task stage) how many mesh workgroups to run.
+    const OpEmitMeshTasksEXT                          = UInt16(5294)
+    const OpSetMeshOutputsEXT                         = UInt16(5295)
 end
 
 # ---- Capabilities ----
 module Cap
     const Shader                        = UInt32(1)
+    const DemoteToHelperInvocation      = UInt32(5379)
     const Float16                       = UInt32(9)
     const Float64                       = UInt32(10)
     const Int8                          = UInt32(39)
@@ -392,6 +408,7 @@ module Cap
     const VariablePointersStorageBuffer = UInt32(4441)
     const Geometry                  = UInt32(2)
     const Tessellation              = UInt32(3)
+    const MeshShadingEXT            = UInt32(5283)
     const InputAttachment           = UInt32(40)
     const RayTracingKHR             = UInt32(4479)
     const WorkgroupMemoryExplicitLayoutKHR = UInt32(4428)
@@ -471,6 +488,10 @@ module Dec
     const NonWritable       = UInt32(24)
     const NonReadable       = UInt32(25)
     const Location          = UInt32(30)
+    # SPV_EXT_mesh_shader: marks an output as belonging to the PER-PRIMITIVE
+    # plane rather than the per-vertex one. The two are separate arrays, indexed
+    # by primitive slot and vertex slot respectively.
+    const PerPrimitiveEXT   = UInt32(5271)
     const Binding           = UInt32(33)
     const DescriptorSet     = UInt32(34)
     const Offset            = UInt32(35)
@@ -527,6 +548,13 @@ module BuiltIn
     const SampleId                  = UInt32(18)
     const SamplePosition            = UInt32(19)
     const SampleMask                = UInt32(20)
+    # Mesh shading (SPV_EXT_mesh_shader). The index arrays are the primitive
+    # plane's topology: one entry per primitive slot, holding indices INTO the
+    # vertices this workgroup wrote.
+    const PrimitivePointIndicesEXT    = UInt32(5294)
+    const PrimitiveLineIndicesEXT     = UInt32(5295)
+    const PrimitiveTriangleIndicesEXT = UInt32(5296)
+    const CullPrimitiveEXT            = UInt32(5299)
 end
 
 # ---- Execution Models ----
@@ -543,6 +571,10 @@ module ExecModel
     const ClosestHitKHR             = UInt32(5316)
     const MissKHR                   = UInt32(5317)
     const CallableKHR               = UInt32(5318)
+    # Mesh shading. NOT 5267/5268 — those are the NV models, which take a
+    # different set of builtins and a different Op for the output counts.
+    const TaskEXT                   = UInt32(5364)
+    const MeshEXT                   = UInt32(5365)
 end
 
 # ---- Execution Modes ----
@@ -569,6 +601,12 @@ module ExecMode
     const OutputPoints          = UInt32(27)
     const OutputLineStrip       = UInt32(28)
     const OutputTriangleStrip   = UInt32(29)
+    # Mesh shading output topology. `OutputVertices` and `OutputPrimitivesEXT`
+    # give the MAXIMA the stage may emit — the pipeline allocates for them — and
+    # one of the three below says what a primitive is.
+    const OutputLinesEXT        = UInt32(5269)
+    const OutputPrimitivesEXT   = UInt32(5270)
+    const OutputTrianglesEXT    = UInt32(5298)
 end
 
 # ---- Addressing / Memory Models ----

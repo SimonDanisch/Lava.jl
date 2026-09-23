@@ -154,7 +154,7 @@ function compile_and_disasm(@nospecialize(f), @nospecialize(tt);
     if stage == :compute
         result = Lava.lava_compile_gpu(f, tt; workgroup_size, enable_ray_query, validate, features)
         bytes = result.spirv_bytes
-    elseif stage in (:vertex, :fragment, :geometry, :tess_control, :tess_eval)
+    elseif stage in (:vertex, :fragment, :geometry, :tess_control, :tess_eval, :mesh, :task)
         result = Lava.lava_compile_gfx_shader(f, tt; stage, config, validate)
         bytes = result.spirv_bytes
     elseif stage in (:raygen, :closesthit, :miss, :anyhit, :intersection, :callable)

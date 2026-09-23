@@ -43,6 +43,12 @@ const GFX_STAGE_INFO = Dict{Symbol, GfxShaderStageInfo}(
     :geometry     => GfxShaderStageInfo(ExecModel.Geometry, "geometry"),
     :tess_control => GfxShaderStageInfo(ExecModel.TessellationControl, "tess_control"),
     :tess_eval    => GfxShaderStageInfo(ExecModel.TessellationEvaluation, "tess_eval"),
+    # Mesh shading. A mesh stage is a WORKGROUP, not an invocation per vertex:
+    # it runs like a compute shader, writes into output ARRAYS, and declares at
+    # the end how much of them it filled. So it carries `LocalSize` the way a
+    # compute entry point does, which no other graphics stage here does.
+    :mesh         => GfxShaderStageInfo(ExecModel.MeshEXT, "mesh"),
+    :task         => GfxShaderStageInfo(ExecModel.TaskEXT, "task"),
 )
 
 # ── Graphics I/O Variable Tracking ──
@@ -70,6 +76,21 @@ mutable struct GfxIOState
     # TessLevelOuter/Inner output variables
     tess_outer_var_id::Union{Nothing, UInt32}
     tess_inner_var_id::Union{Nothing, UInt32}
+    # Mesh stage output arrays: the per-vertex block array (gl_MeshVerticesEXT)
+    # and the primitive index array, whose element arity follows the topology.
+    mesh_vertices_var_id::Union{Nothing, UInt32}
+    mesh_indices_var_id::Union{Nothing, UInt32}
+    # Taken from the stage's `MeshConfig`, because the array LENGTHS are the
+    # declared maxima and the emitter has no other way to know them.
+    mesh_max_vertices::Int
+    mesh_max_primitives::Int
+    mesh_index_arity::Int
+    # The index array's BuiltIn, resolved from the topology up front: the
+    # prescan creates the variable and is not given the stage's config.
+    mesh_index_builtin::UInt32
+    # A mesh stage's user outputs are ARRAYS — one element per vertex slot —
+    # unlike a vertex stage's, which are one value per invocation.
+    mesh_output_vars::Dict{UInt32, Tuple{UInt32, Symbol}}
     # Texture sampler variables: binding → var_id
     sampler_vars::Dict{UInt32, UInt32}
     # Combined image sampler type ID (cached)
@@ -83,6 +104,8 @@ GfxIOState() = GfxIOState(
     nothing,
     0,
     nothing, nothing, nothing, nothing,
+    nothing, nothing, 0, 0, 0, UInt32(0),
+    Dict{UInt32, Tuple{UInt32, Symbol}}(),
     Dict{UInt32, UInt32}(),
     nothing,
 )
@@ -123,6 +146,12 @@ function emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
         require_capability!(spirv_mod, Cap.Geometry)
     elseif stage in (:tess_control, :tess_eval)
         require_capability!(spirv_mod, Cap.Tessellation)
+    elseif stage in (:mesh, :task)
+        require_capability!(spirv_mod, Cap.MeshShadingEXT)
+        # The capability alone is not enough: unlike Geometry and Tessellation,
+        # which are core, mesh shading is an extension and spirv-val rejects a
+        # module that uses the capability without declaring it.
+        require_extension!(spirv_mod, "SPV_EXT_mesh_shader")
     end
 
     # Build struct pointer member type map
@@ -139,6 +168,11 @@ function emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
     # Set geometry shader input vertex count from config
     if stage == :geometry && config !== nothing
         gfx_io.geom_input_vertex_count = KernelInterface.primitivevertices(config.input_topology)
+    elseif stage == :mesh && config !== nothing
+        gfx_io.mesh_max_vertices = config.max_vertices
+        gfx_io.mesh_max_primitives = config.max_primitives
+        gfx_io.mesh_index_arity = KernelInterface.primitivevertices(config.topology)
+        gfx_io.mesh_index_builtin = mesh_index_builtin(config.topology)
     end
 
     # Find entry function
@@ -166,6 +200,11 @@ function emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
     gfx_io.point_size_var_id !== nothing && push!(interface_ids, gfx_io.point_size_var_id)
     gfx_io.tess_outer_var_id !== nothing && push!(interface_ids, gfx_io.tess_outer_var_id)
     gfx_io.tess_inner_var_id !== nothing && push!(interface_ids, gfx_io.tess_inner_var_id)
+    gfx_io.mesh_vertices_var_id !== nothing && push!(interface_ids, gfx_io.mesh_vertices_var_id)
+    gfx_io.mesh_indices_var_id !== nothing && push!(interface_ids, gfx_io.mesh_indices_var_id)
+    for (_, (var_id, _)) in gfx_io.mesh_output_vars
+        push!(interface_ids, var_id)
+    end
     for (_, var_id) in gfx_io.sampler_vars
         push!(interface_ids, var_id)
     end
@@ -218,6 +257,19 @@ function emit_gfx_execution_modes!(mod::SPIRVModule, func_id::UInt32,
         emit_execution_mode!(mod, func_id, ExecMode.Invocations, UInt32(config.invocations))
     elseif stage == :tess_control && config !== nothing
         emit_execution_mode!(mod, func_id, ExecMode.OutputVertices, UInt32(config.patch_vertices))
+    elseif stage == :mesh && config !== nothing
+        # A mesh stage is a workgroup, so it declares its width like a compute
+        # entry point does.
+        emit_execution_mode!(mod, func_id, ExecMode.LocalSize,
+                             UInt32(config.threads), UInt32(1), UInt32(1))
+        # The MAXIMA, which is what the pipeline allocates output storage for.
+        # `OpSetMeshOutputsEXT` then says how much of it was actually written.
+        emit_execution_mode!(mod, func_id, ExecMode.OutputVertices, UInt32(config.max_vertices))
+        emit_execution_mode!(mod, func_id, ExecMode.OutputPrimitivesEXT, UInt32(config.max_primitives))
+        emit_execution_mode!(mod, func_id, mesh_output_mode(config.topology))
+    elseif stage == :task && config !== nothing
+        emit_execution_mode!(mod, func_id, ExecMode.LocalSize,
+                             UInt32(config.threads), UInt32(1), UInt32(1))
     elseif stage == :tess_eval && config !== nothing
         # Domain
         domain_mode = tess_domain_mode(config.domain)
@@ -249,6 +301,24 @@ geometry_input_mode(::LineStripAdjacency) = ExecMode.InputLinesAdjacency
 geometry_output_mode(::PointList)     = ExecMode.OutputPoints
 geometry_output_mode(::LineStrip)     = ExecMode.OutputLineStrip
 geometry_output_mode(::TriangleStrip) = ExecMode.OutputTriangleStrip
+
+# A mesh stage emits an indexed LIST, never a strip: the primitive array says
+# which vertices each primitive uses, so there is nothing for a strip's implicit
+# adjacency to add. That is why these three are the only topologies, and why a
+# strip reaching here is a caller error rather than something to map onto a list.
+mesh_output_mode(::PointList)    = ExecMode.OutputPoints
+mesh_output_mode(::LineList)     = ExecMode.OutputLinesEXT
+mesh_output_mode(::TriangleList) = ExecMode.OutputTrianglesEXT
+mesh_output_mode(t::Topology) = error(
+    "a mesh stage emits $(t), and its output topology has to be one of " *
+    "`PointList`, `LineList`, `TriangleList` — the primitive index array " *
+    "gives every primitive its own vertices, so a strip has nothing to express.")
+
+# The builtin whose array carries those indices. One per arity, and the arity is
+# already fixed by the topology, so these two dispatch together.
+mesh_index_builtin(::PointList)    = BuiltIn.PrimitivePointIndicesEXT
+mesh_index_builtin(::LineList)     = BuiltIn.PrimitiveLineIndicesEXT
+mesh_index_builtin(::TriangleList) = BuiltIn.PrimitiveTriangleIndicesEXT
 
 function tess_domain_mode(d::TessDomain)
     d isa TessTriangles ? ExecMode.Triangles :
@@ -309,6 +379,17 @@ function gfx_prescan_io!(state::SPIRVEmitterState, gfx_io::GfxIOState,
                 gfx_ensure_sampler_var!(state, gfx_io, binding)
             elseif fn_name == "_lava_gfx_emit_vertex" || fn_name == "_lava_gfx_end_primitive"
                 # No I/O variables needed, just capability (already added)
+            elseif startswith(fn_name, "_lava_mesh_output_")
+                loc = extract_constant_u32(LLVM.operands(inst)[1])
+                gfx_ensure_mesh_output_var!(state, gfx_io, loc,
+                                            gfx_output_type_from_name(fn_name))
+            elseif fn_name == "_lava_mesh_set_position"
+                gfx_ensure_mesh_vertices_var!(state, gfx_io)
+            elseif startswith(fn_name, "_lava_mesh_set_primitive")
+                gfx_ensure_mesh_indices_var!(state, gfx_io)
+            elseif fn_name == "_lava_mesh_set_outputs"
+                # Only a statement about the arrays; the arrays themselves are
+                # created by the calls that WRITE them.
             elseif fn_name == "_lava_geom_input_position"
                 gfx_ensure_geom_position_input_var!(state, gfx_io)
             elseif startswith(fn_name, "_lava_geom_input_")
@@ -486,6 +567,95 @@ function gfx_ensure_geom_position_input_var!(state::SPIRVEmitterState, gfx_io::G
     gfx_io.geom_position_input_var_id = var_id
 end
 
+"""
+Create `gl_MeshVerticesEXT` — the mesh stage's per-vertex output array.
+
+    OpTypeStruct { vec4 }            (gl_MeshPerVertexEXT, Block, member 0 = Position)
+    OpTypeArray(that, max_vertices)
+    OpVariable Output
+
+The shape mirrors `gl_in` for a geometry shader, with two differences that
+matter: the storage class is Output, and the array is indexed by the VERTEX SLOT
+the shader chooses rather than by an input primitive's corner. A mesh stage can
+write its slots in any order and from any invocation in the workgroup.
+"""
+function gfx_ensure_mesh_vertices_var!(state::SPIRVEmitterState, gfx_io::GfxIOState)
+    gfx_io.mesh_vertices_var_id !== nothing && return
+    n = gfx_io.mesh_max_vertices
+    n > 0 || error("mesh output vertex count not set — is the stage's `MeshConfig` missing?")
+    mod = state.mod
+    f32_ty = emit_type_float!(mod, UInt32(32))
+    vec4_ty = emit_type_vector!(mod, f32_ty, UInt32(4))
+    struct_ty = fresh_id!(mod)
+    encode_instruction!(mod.types_constants, Op.OpTypeStruct, struct_ty, vec4_ty)
+    emit_decorate!(mod, struct_ty, Dec.Block)
+    emit_member_decorate!(mod, struct_ty, UInt32(0), Dec.BuiltIn, BuiltIn.Position)
+    emit_name!(mod, struct_ty, "gl_MeshPerVertexEXT")
+    len_id = emit_constant_u32!(mod, UInt32(n))
+    arr_ty = emit_type_array!(mod, struct_ty, len_id)
+    ptr_ty = map_pointer_type!(state.type_ctx, arr_ty, SC.Output)
+    var_id = fresh_id!(mod)
+    encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Output)
+    emit_name!(mod, var_id, "gl_MeshVerticesEXT")
+    gfx_io.mesh_vertices_var_id = var_id
+end
+
+"""
+Create one of the mesh stage's user (varying) output arrays.
+
+The vertex stage writes one value per invocation; a mesh stage writes a whole
+array, indexed by the vertex slot it chose. So the SAME declared varying is a
+`vec2` there and a `vec2[max_vertices]` here — the fragment stage sees no
+difference, because what it links against is the Location.
+
+Integer varyings carry no `Flat` decoration on this side: flatness is a property
+of the FRAGMENT INPUT, and an integer output cannot be interpolated anyway.
+"""
+function gfx_ensure_mesh_output_var!(state::SPIRVEmitterState, gfx_io::GfxIOState,
+                                     location::UInt32, iotype::Symbol)
+    haskey(gfx_io.mesh_output_vars, location) && return
+    n = gfx_io.mesh_max_vertices
+    n > 0 || error("mesh output vertex count not set — is the stage's `MeshConfig` missing?")
+    mod = state.mod
+    value_ty = gfx_spirv_type_for_io(mod, iotype)
+    len_id = emit_constant_u32!(mod, UInt32(n))
+    arr_ty = emit_type_array!(mod, value_ty, len_id)
+    ptr_ty = map_pointer_type!(state.type_ctx, arr_ty, SC.Output)
+    var_id = fresh_id!(mod)
+    encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Output)
+    emit_decorate!(mod, var_id, Dec.Location, location)
+    emit_name!(mod, var_id, "mesh_out_loc$(location)")
+    gfx_io.mesh_output_vars[location] = (var_id, iotype)
+end
+
+"""
+Create the mesh stage's primitive index array.
+
+    OpTypeArray(uvec{arity}, max_primitives)   — or uint for points
+    OpVariable Output, BuiltIn Primitive{Point,Line,Triangle}IndicesEXT
+
+Element `k` holds the indices, into this workgroup's own vertex slots, of the
+primitive in slot `k`. Points are a scalar `uint` rather than a one-component
+vector, which is the spec's shape and not a simplification.
+"""
+function gfx_ensure_mesh_indices_var!(state::SPIRVEmitterState, gfx_io::GfxIOState)
+    gfx_io.mesh_indices_var_id !== nothing && return
+    m = gfx_io.mesh_max_primitives
+    m > 0 || error("mesh output primitive count not set — is the stage's `MeshConfig` missing?")
+    mod = state.mod
+    u32_ty = emit_type_int!(mod, UInt32(32), UInt32(0))
+    arity = gfx_io.mesh_index_arity
+    elem_ty = arity == 1 ? u32_ty : emit_type_vector!(mod, u32_ty, UInt32(arity))
+    len_id = emit_constant_u32!(mod, UInt32(m))
+    arr_ty = emit_type_array!(mod, elem_ty, len_id)
+    ptr_ty = map_pointer_type!(state.type_ctx, arr_ty, SC.Output)
+    var_id = fresh_id!(mod)
+    encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Output)
+    emit_decorate!(mod, var_id, Dec.BuiltIn, gfx_io.mesh_index_builtin)
+    emit_name!(mod, var_id, "gl_PrimitiveIndicesEXT")
+    gfx_io.mesh_indices_var_id = var_id
+end
+
 function gfx_ensure_tess_outer_var!(state::SPIRVEmitterState, gfx_io::GfxIOState)
     gfx_io.tess_outer_var_id !== nothing && return
     mod = state.mod
@@ -578,6 +748,125 @@ function emit_gfx_set_position!(state::SPIRVEmitterState, inst::LLVM.CallInst)
 
     # Store to gl_Position
     encode_instruction!(mod.functions, Op.OpStore, var_id, vec_id)
+end
+
+"""
+`OpSetMeshOutputsEXT nvertices nprimitives` — how much of the output arrays this
+workgroup filled.
+
+Takes no result id and produces no value: it is a statement about the arrays,
+issued once per workgroup. Anything the shader wrote beyond these counts is not
+rasterised, so this is what turns written slots into geometry.
+"""
+function emit_mesh_set_outputs!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    mod = state.mod
+    nv_id = get_value_id!(state, LLVM.operands(inst)[1])
+    np_id = get_value_id!(state, LLVM.operands(inst)[2])
+    encode_instruction!(mod.functions, Op.OpSetMeshOutputsEXT, nv_id, np_id)
+end
+
+"""
+Write one user varying at one vertex slot.
+
+Operands are `(location, slot, components...)`, so the slot is separate from the
+value — the same intrinsic serves every slot, and the location is a constant the
+prescan already read to create the array.
+"""
+function emit_mesh_output!(state::SPIRVEmitterState, inst::LLVM.CallInst, iotype::Symbol)
+    mod = state.mod
+    gfx_io = state.gfx_io::GfxIOState
+    loc = extract_constant_u32(LLVM.operands(inst)[1])
+    entry = get(gfx_io.mesh_output_vars, loc, nothing)
+    entry === nothing && error("mesh varying at location $loc written but never created")
+    var_id, _ = entry
+
+    ops = LLVM.operands(inst)
+    slot_id = get_value_id!(state, ops[2])
+    comp_ids = UInt32[get_value_id!(state, ops[2 + k]) for k in 1:gfx_io_component_count(iotype)]
+
+    value_ty = gfx_spirv_type_for_io(mod, iotype)
+    value_id = if length(comp_ids) == 1
+        only(comp_ids)
+    else
+        vid = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpCompositeConstruct, value_ty, vid, comp_ids...)
+        vid
+    end
+
+    elem_ptr_ty = map_pointer_type!(state.type_ctx, value_ty, SC.Output)
+    ac_id = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpAccessChain, elem_ptr_ty, ac_id, var_id, slot_id)
+    encode_instruction!(mod.functions, Op.OpStore, ac_id, value_id)
+end
+
+gfx_io_component_count(t::Symbol) =
+    t === :f32 ? 1 : t === :u32 ? 1 : t === :i32 ? 1 :
+    t === :vec2 ? 2 : t === :vec3 ? 3 : t === :vec4 ? 4 :
+    error("unknown mesh varying type $t")
+
+"""Write `gl_MeshVerticesEXT[slot].Position`."""
+function emit_mesh_set_position!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    mod = state.mod
+    gfx_io = state.gfx_io::GfxIOState
+    var_id = gfx_io.mesh_vertices_var_id
+    var_id === nothing && error("mesh position written but gl_MeshVerticesEXT was never created")
+
+    slot_id = get_value_id!(state, LLVM.operands(inst)[1])
+    x_id = get_value_id!(state, LLVM.operands(inst)[2])
+    y_id = get_value_id!(state, LLVM.operands(inst)[3])
+    z_id = get_value_id!(state, LLVM.operands(inst)[4])
+    w_id = get_value_id!(state, LLVM.operands(inst)[5])
+
+    f32_ty = emit_type_float!(mod, UInt32(32))
+    vec4_ty = emit_type_vector!(mod, f32_ty, UInt32(4))
+    vec_id = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpCompositeConstruct, vec4_ty, vec_id,
+                        x_id, y_id, z_id, w_id)
+
+    vec4_ptr_ty = map_pointer_type!(state.type_ctx, vec4_ty, SC.Output)
+    zero_id = emit_constant_u32!(mod, UInt32(0))
+    ac_id = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpAccessChain, vec4_ptr_ty, ac_id,
+                        var_id, slot_id, zero_id)
+    encode_instruction!(mod.functions, Op.OpStore, ac_id, vec_id)
+end
+
+"""
+Write one primitive's vertex indices into the index array.
+
+`arity` comes from the stage's topology, and the intrinsic that called this
+carries exactly that many index operands — so a triangle stage cannot write a
+line, which is the invariant the one-function-per-topology API exists to keep.
+"""
+function emit_mesh_set_primitive!(state::SPIRVEmitterState, inst::LLVM.CallInst, arity::Int)
+    mod = state.mod
+    gfx_io = state.gfx_io::GfxIOState
+    var_id = gfx_io.mesh_indices_var_id
+    var_id === nothing && error("mesh primitive written but the index array was never created")
+    arity == gfx_io.mesh_index_arity || error(
+        "a $(arity)-index primitive was written by a stage whose topology takes " *
+        "$(gfx_io.mesh_index_arity); the topology in the stage's `MeshConfig` and " *
+        "the `set_mesh_*!` the body calls have to agree.")
+
+    ops = LLVM.operands(inst)
+    slot_id = get_value_id!(state, ops[1])
+    idx_ids = UInt32[get_value_id!(state, ops[1 + k]) for k in 1:arity]
+
+    u32_ty = emit_type_int!(mod, UInt32(32), UInt32(0))
+    elem_ty = arity == 1 ? u32_ty : emit_type_vector!(mod, u32_ty, UInt32(arity))
+    elem_ptr_ty = map_pointer_type!(state.type_ctx, elem_ty, SC.Output)
+
+    value_id = if arity == 1
+        only(idx_ids)
+    else
+        vid = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpCompositeConstruct, elem_ty, vid, idx_ids...)
+        vid
+    end
+
+    ac_id = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpAccessChain, elem_ptr_ty, ac_id, var_id, slot_id)
+    encode_instruction!(mod.functions, Op.OpStore, ac_id, value_id)
 end
 
 function emit_gfx_set_point_size!(state::SPIRVEmitterState, inst::LLVM.CallInst)
@@ -773,6 +1062,25 @@ function emit_gfx_derivative!(state::SPIRVEmitterState, inst::LLVM.CallInst, opc
     result_id = fresh_id!(mod)
     encode_instruction!(mod.functions, opcode, f32_ty, result_id, operand_id)
     state.value_map[inst] = result_id
+end
+
+"""
+`discard` — drop this fragment's writes.
+
+`OpDemoteToHelperInvocation`, not `OpKill`. `OpKill` is a block TERMINATOR, so
+it can only appear where the CFG genuinely ends, and a `discard` reached through
+an inlined call sits in the middle of straight-line code with real instructions
+after it. Demoting keeps the invocation running — its derivatives stay valid for
+neighbouring fragments — and throws its stores away, which is the behaviour a
+blended overlay wants: an alpha-zero texel must not write DEPTH.
+"""
+function emit_gfx_discard!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    # The module is emitted as SPIR-V 1.4, where this is an EXTENSION; it only
+    # became core in 1.6. The device feature is already on —
+    # `shader_demote_to_helper_invocation` in Mantle's Vulkan 1.3 feature set.
+    require_extension!(state.mod, "SPV_EXT_demote_to_helper_invocation")
+    require_capability!(state.mod, Cap.DemoteToHelperInvocation)
+    encode_instruction!(state.mod.functions, Op.OpDemoteToHelperInvocation)
 end
 
 function emit_gfx_emit_vertex!(state::SPIRVEmitterState, inst::LLVM.CallInst)

@@ -7100,6 +7100,13 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return emit_rt_payload_load_at!(state, inst)
         elseif fn_name == "lava_rt_hit_attrib_load_f32_at"
             return emit_rt_hit_attrib_load_at!(state, inst)
+        elseif fn_name == "lava_rt_hit_attrib_store_f32_at"
+
+            return emit_rt_hit_attrib_store_at!(state, inst)
+
+        elseif fn_name == "lava_rt_report_intersection"
+
+            return emit_rt_report_intersection!(state, inst)
         elseif fn_name == "lava_rt_ignore_intersection"
             return emit_rt_ignore_intersection!(state, inst)
         elseif fn_name == "lava_rt_terminate_ray"
@@ -7116,6 +7123,18 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return emit_ray_query_proceed!(state, inst)
         elseif fn_name == "lava_ray_query_confirm"
             return emit_ray_query_confirm!(state, inst)
+
+        elseif fn_name == "lava_ray_query_generate_intersection"
+
+            return emit_ray_query_generate_intersection!(state, inst)
+
+        elseif fn_name == "lava_ray_query_get_object_ray_origin"
+
+            return emit_ray_query_get_object_ray_origin!(state, inst)
+
+        elseif fn_name == "lava_ray_query_get_object_ray_direction"
+
+            return emit_ray_query_get_object_ray_direction!(state, inst)
         elseif fn_name == "lava_ray_query_terminate"
             return emit_ray_query_terminate!(state, inst)
         elseif fn_name == "lava_ray_query_get_type"
@@ -7155,6 +7174,8 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return emit_gfx_input!(state, inst, :vec2)
         elseif fn_name == "_lava_gfx_input_f32" || fn_name == "_lava_gfx_input_flat_f32"
             return emit_gfx_input!(state, inst, :f32)
+        elseif fn_name == "_lava_gfx_discard"
+            return emit_gfx_discard!(state, inst)
         elseif fn_name == "_lava_gfx_dFdx_f32"
             return emit_gfx_derivative!(state, inst, Op.OpDPdx)
         elseif fn_name == "_lava_gfx_dFdy_f32"
@@ -7169,6 +7190,25 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return emit_gfx_set_tess_level!(state, inst, false)
         elseif fn_name == "_lava_gfx_sample_2d"
             return emit_gfx_sample_2d!(state, inst)
+        # Mesh stage outputs
+        elseif fn_name == "_lava_mesh_set_outputs"
+            return emit_mesh_set_outputs!(state, inst)
+        elseif fn_name == "_lava_mesh_output_f32"
+            return emit_mesh_output!(state, inst, :f32)
+        elseif fn_name == "_lava_mesh_output_vec2"
+            return emit_mesh_output!(state, inst, :vec2)
+        elseif fn_name == "_lava_mesh_output_vec3"
+            return emit_mesh_output!(state, inst, :vec3)
+        elseif fn_name == "_lava_mesh_output_vec4"
+            return emit_mesh_output!(state, inst, :vec4)
+        elseif fn_name == "_lava_mesh_set_position"
+            return emit_mesh_set_position!(state, inst)
+        elseif fn_name == "_lava_mesh_set_primitive1"
+            return emit_mesh_set_primitive!(state, inst, 1)
+        elseif fn_name == "_lava_mesh_set_primitive2"
+            return emit_mesh_set_primitive!(state, inst, 2)
+        elseif fn_name == "_lava_mesh_set_primitive3"
+            return emit_mesh_set_primitive!(state, inst, 3)
         # Geometry shader arrayed inputs
         elseif fn_name == "_lava_geom_input_position"
             return emit_geom_input_position!(state, inst)

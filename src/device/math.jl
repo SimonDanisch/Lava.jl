@@ -275,6 +275,46 @@ end
 @lava_device_override @inline Base.FastMath.min_fast(x::T, y::T) where {T<:Union{Float16,Float32,Float64}} = min(x, y)
 @lava_device_override @inline Base.FastMath.max_fast(x::T, y::T) where {T<:Union{Float16,Float32,Float64}} = max(x, y)
 
+# isfinite / isinf — MEASURED WRONG on device before these overrides, 2026-09-22.
+#
+# `isfinite(NaN32)`, `isfinite(Inf32)` and `isfinite(-Inf32)` all returned
+# `true` inside a kernel on RADV. Base writes it as
+#
+#     isfinite(x) = !isnan(x - x)      # fsub x, x  +  fcmp ord
+#
+# and the `x - x` is the problem: SPIR-V does not guarantee NaN/Inf semantics
+# unless the module asks for `SignedZeroInfNanPreserve`, so the driver is
+# entitled to fold `x - x` to zero, and ACO does. `fcmp ord 0.0, 0.0` is then
+# true and every non-finite value reports itself finite. `isnan` is unaffected
+# because it is a bare `fcmp uno`, which the emitter turns into `OpIsNan`
+# directly, with no arithmetic in front of it to fold.
+#
+# Tested rather than reasoned about: on device `isnan` gave [0,1,0,0,0] over
+# [1, NaN, Inf, -Inf, 0] (correct) while `isfinite` gave [1,1,1,1,1].
+#
+# Fixed here rather than by requesting NaN preservation for the whole module:
+# the execution mode constrains EVERY float operation in the kernel, to repair
+# two predicates that have an exact bitwise spelling. The exponent field being
+# all ones is what "not finite" MEANS in IEEE 754, so these are not
+# approximations of the Base definitions — they are the definitions.
+#
+# Any device code testing for a NaN should use `isnan`, which works; this is
+# about the two predicates that need the *exponent*, not a comparison.
+
+@lava_device_override @inline Base.isfinite(x::Float32) =
+    (reinterpret(UInt32, x) & 0x7f800000) != 0x7f800000
+@lava_device_override @inline Base.isfinite(x::Float64) =
+    (reinterpret(UInt64, x) & 0x7ff0000000000000) != 0x7ff0000000000000
+@lava_device_override @inline Base.isfinite(x::Float16) =
+    (reinterpret(UInt16, x) & UInt16(0x7c00)) != UInt16(0x7c00)
+
+@lava_device_override @inline Base.isinf(x::Float32) =
+    (reinterpret(UInt32, x) & 0x7fffffff) == 0x7f800000
+@lava_device_override @inline Base.isinf(x::Float64) =
+    (reinterpret(UInt64, x) & 0x7fffffffffffffff) == 0x7ff0000000000000
+@lava_device_override @inline Base.isinf(x::Float16) =
+    (reinterpret(UInt16, x) & UInt16(0x7fff)) == UInt16(0x7c00)
+
 # ══════════════════════════════════════════════════════════════════════
 # Integer overrides
 # ══════════════════════════════════════════════════════════════════════

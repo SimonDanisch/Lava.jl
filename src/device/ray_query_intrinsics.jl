@@ -92,6 +92,52 @@ end
     return nothing
 end
 
+# ── Procedural geometry on the inline path ──────────────────────────────────
+#
+# A triangle candidate is answered by the hardware. An AABB candidate is not:
+# the traversal only says "the ray entered this box", and the shader has to
+# decide whether and where it actually hits. These three are what that needs —
+# the object-space ray to solve against, and the call that commits the answer.
+
+@inline function lava_ray_query_generate_intersection(t::Float32)::Nothing
+    Base.llvmcall(("""
+        declare void @lava_ray_query_generate_intersection(float) #0
+        define void @entry(float %t) #0 {
+            call void @lava_ray_query_generate_intersection(float %t)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+        """, "entry"), Cvoid, Tuple{Float32}, t)
+    return nothing
+end
+
+@inline function lava_ray_query_get_object_ray_origin(committed::Int32, dim::UInt32)
+    Base.llvmcall(("""
+        declare float @lava_ray_query_get_object_ray_origin(i32, i32) #0
+        define float @entry(i32 %c, i32 %d) #0 {
+            %v = call float @lava_ray_query_get_object_ray_origin(i32 %c, i32 %d)
+            ret float %v
+        }
+        attributes #0 = { alwaysinline }
+        """, "entry"), Float32, Tuple{Int32, UInt32}, committed, dim)
+end
+
+@inline function lava_ray_query_get_object_ray_direction(committed::Int32, dim::UInt32)
+    Base.llvmcall(("""
+        declare float @lava_ray_query_get_object_ray_direction(i32, i32) #0
+        define float @entry(i32 %c, i32 %d) #0 {
+            %v = call float @lava_ray_query_get_object_ray_direction(i32 %c, i32 %d)
+            ret float %v
+        }
+        attributes #0 = { alwaysinline }
+        """, "entry"), Float32, Tuple{Int32, UInt32}, committed, dim)
+end
+
+lava_ray_query_get_object_ray_origin(committed::Bool, dim::Integer) =
+    lava_ray_query_get_object_ray_origin(committed_to_int32(committed), UInt32(dim - 1))
+lava_ray_query_get_object_ray_direction(committed::Bool, dim::Integer) =
+    lava_ray_query_get_object_ray_direction(committed_to_int32(committed), UInt32(dim - 1))
+
 # Typed user-facing getters: take `committed::Bool`, dispatch to scalar form.
 
 lava_ray_query_get_type(committed::Bool)                  = lava_ray_query_get_type(committed_to_int32(committed))
@@ -184,6 +230,9 @@ end
 # Register all new intrinsics with GPUCompiler validation.
 push!(KNOWN_INTRINSICS, "lava_ray_query_proceed")
 push!(KNOWN_INTRINSICS, "lava_ray_query_confirm")
+push!(KNOWN_INTRINSICS, "lava_ray_query_get_object_ray_direction")
+push!(KNOWN_INTRINSICS, "lava_ray_query_get_object_ray_origin")
+push!(KNOWN_INTRINSICS, "lava_ray_query_generate_intersection")
 push!(KNOWN_INTRINSICS, "lava_ray_query_terminate")
 push!(KNOWN_INTRINSICS, "lava_ray_query_get_type")
 push!(KNOWN_INTRINSICS, "lava_ray_query_get_t")

@@ -135,6 +135,27 @@ end
     """, "entry"), Cvoid, Tuple{UInt32, Float32}, location, val)
 end
 
+"""
+    gfx_discard()
+
+Throw this fragment's writes away — colour AND depth.
+
+The depth part is the point. A blended overlay draws quads whose corners are
+transparent; with depth writes on, those corners claim depth and occlude
+whatever should have shown through. Discarding them is what lets an overlay pass
+use a depth buffer at all.
+"""
+@inline function gfx_discard()
+    Base.llvmcall(("""
+        declare void @_lava_gfx_discard() #0
+        define void @entry() #0 {
+            call void @_lava_gfx_discard()
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{})
+end
+
 @inline function gfx_output_vec4(location::UInt32,
         x::Float32, y::Float32, z::Float32, w::Float32)
     Base.llvmcall(("""
@@ -297,6 +318,8 @@ end
     gfx_input_vec2(UInt32(loc), UInt32(1)),
 )
 @inline gfx_input(::Type{Float32}, loc::Integer) = gfx_input_f32(UInt32(loc))
+
+@lava_device_override @inline KernelInterface.discard() = gfx_discard()
 
 # ── Fragment Derivatives (dFdx, dFdy) ──
 
@@ -785,8 +808,196 @@ FragmentWrapper{F, VOut}() where {F, VOut} = FragmentWrapper{F, VOut, ()}()
     end
 end
 
+# ── Mesh Shader ──
+#
+# These implement KernelInterface's mesh verbs for this backend. The `out`
+# handle is `LavaMeshOut()`, a zero-field marker: on Metal the output object is
+# a real pointer the stage is handed, while in SPIR-V the outputs are module
+# variables and there is nothing to pass. The parameter stays because the
+# PORTABLE signature has it, and a body written against it compiles on both.
+#
+# Slots are one-based at this boundary, like every other index in the API, and
+# are converted once here — the SPIR-V arrays are zero-based.
+
+struct LavaMeshOut end
+
+"""
+Wraps a mesh stage that takes `(out, args...)`.
+
+The same role `VertexWrapper` plays for a vertex body: a stage is declared
+portably and compiled here, and the wrapper is where the two meet. There is no
+output type parameter, unlike the vertex and geometry wrappers, because a mesh
+body names its own varyings — `set_mesh_vertex!` takes the whole named tuple and
+numbers its fields in declaration order — so nothing about the interface has to
+be carried around the body.
+"""
+struct MeshWrapper{F} end
+
+@generated function (::MeshWrapper{F})(args...) where {F}
+    quote
+        F.instance(LavaMeshOut(), args...)
+        return nothing
+    end
+end
+
+@lava_device_override @inline function KernelInterface.set_mesh_outputs!(::LavaMeshOut,
+                                                                        nvertices::Integer,
+                                                                        nprimitives::Integer)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_set_outputs(i32, i32) #0
+        define void @entry(i32 %nv, i32 %np) #0 {
+            call void @_lava_mesh_set_outputs(i32 %nv, i32 %np)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{Int32, Int32}, Int32(nvertices), Int32(nprimitives))
+end
+
+# Which invocation and which threadgroup. A mesh stage is a workgroup, so these
+# are the SAME builtins a compute kernel reads — `LocalInvocationId` and
+# `WorkgroupId` — rather than anything mesh-specific. One-based, like every
+# other index in this API.
+@lava_device_override @inline KernelInterface.mesh_thread_index() =
+    Int32(lava_local_invocation_id(1)) + Int32(1)
+@lava_device_override @inline KernelInterface.mesh_group_index() =
+    Int32(lava_workgroup_id(1)) + Int32(1)
+
+@inline function mesh_set_position!(slot::Int32, x::Float32, y::Float32, z::Float32, w::Float32)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_set_position(i32, float, float, float, float) #0
+        define void @entry(i32 %s, float %x, float %y, float %z, float %w) #0 {
+            call void @_lava_mesh_set_position(i32 %s, float %x, float %y, float %z, float %w)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{Int32, Float32, Float32, Float32, Float32}, slot, x, y, z, w)
+end
+
+@lava_device_override @inline function KernelInterface.set_mesh_vertex!(::LavaMeshOut,
+                                                                       slot::Integer,
+                                                                       v::NamedTuple)
+    s = Int32(slot) - Int32(1)
+    p = v.position
+    mesh_set_position!(s, p[1], p[2], p[3], p[4])
+    # Everything that is not `position` is a varying, numbered in declaration
+    # order — the same rule the vertex stage's outputs follow, so a fragment
+    # stage links against either one without knowing which drew it.
+    mesh_write_varyings!(s, Base.structdiff(v, NamedTuple{(:position,)}))
+end
+
+@lava_device_override @inline function KernelInterface.set_mesh_triangle!(::LavaMeshOut,
+                                                                         slot::Integer,
+                                                                         i0::Integer, i1::Integer, i2::Integer)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_set_primitive3(i32, i32, i32, i32) #0
+        define void @entry(i32 %s, i32 %a, i32 %b, i32 %c) #0 {
+            call void @_lava_mesh_set_primitive3(i32 %s, i32 %a, i32 %b, i32 %c)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{Int32, Int32, Int32, Int32},
+    Int32(slot) - Int32(1), Int32(i0) - Int32(1), Int32(i1) - Int32(1), Int32(i2) - Int32(1))
+end
+
+@lava_device_override @inline function KernelInterface.set_mesh_line!(::LavaMeshOut,
+                                                                     slot::Integer,
+                                                                     i0::Integer, i1::Integer)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_set_primitive2(i32, i32, i32) #0
+        define void @entry(i32 %s, i32 %a, i32 %b) #0 {
+            call void @_lava_mesh_set_primitive2(i32 %s, i32 %a, i32 %b)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{Int32, Int32, Int32},
+    Int32(slot) - Int32(1), Int32(i0) - Int32(1), Int32(i1) - Int32(1))
+end
+
+@lava_device_override @inline function KernelInterface.set_mesh_point!(::LavaMeshOut,
+                                                                      slot::Integer, i0::Integer)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_set_primitive1(i32, i32) #0
+        define void @entry(i32 %s, i32 %a) #0 {
+            call void @_lava_mesh_set_primitive1(i32 %s, i32 %a)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{Int32, Int32}, Int32(slot) - Int32(1), Int32(i0) - Int32(1))
+end
+
+# The mesh stage's user varyings.
+#
+# One per width, and each takes `(location, slot, components...)` — the slot is
+# separate from the value because a mesh stage writes a whole ARRAY of each
+# varying, one element per vertex it emits, where a vertex stage writes one.
+#
+# There is no integer width here on purpose. The only integer varying anything
+# has wanted is an id that is constant across its primitive, and that is exactly
+# what a FLAT fragment input delivers: flat takes the provoking vertex's value
+# rather than interpolating, so an `f32` carrying a small integer arrives
+# unchanged. An integer output plane can be added when something needs one that
+# is not per-primitive constant.
+
+@inline function mesh_output!(loc::UInt32, slot::Int32, v::Float32)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_output_f32(i32, i32, float) #0
+        define void @entry(i32 %l, i32 %s, float %v) #0 {
+            call void @_lava_mesh_output_f32(i32 %l, i32 %s, float %v)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32, Int32, Float32}, loc, slot, v)
+end
+
+@inline function mesh_output!(loc::UInt32, slot::Int32, v::Vec2f)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_output_vec2(i32, i32, float, float) #0
+        define void @entry(i32 %l, i32 %s, float %x, float %y) #0 {
+            call void @_lava_mesh_output_vec2(i32 %l, i32 %s, float %x, float %y)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32, Int32, Float32, Float32}, loc, slot, v[1], v[2])
+end
+
+@inline function mesh_output!(loc::UInt32, slot::Int32, v::Vec3f)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_output_vec3(i32, i32, float, float, float) #0
+        define void @entry(i32 %l, i32 %s, float %x, float %y, float %z) #0 {
+            call void @_lava_mesh_output_vec3(i32 %l, i32 %s, float %x, float %y, float %z)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32, Int32, Float32, Float32, Float32}, loc, slot, v[1], v[2], v[3])
+end
+
+@inline function mesh_output!(loc::UInt32, slot::Int32, v::Vec4f)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_output_vec4(i32, i32, float, float, float, float) #0
+        define void @entry(i32 %l, i32 %s, float %x, float %y, float %z, float %w) #0 {
+            call void @_lava_mesh_output_vec4(i32 %l, i32 %s, float %x, float %y, float %z, float %w)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32, Int32, Float32, Float32, Float32, Float32},
+    loc, slot, v[1], v[2], v[3], v[4])
+end
+
+"""
+Write every varying of one vertex, locations in declaration order.
+
+`@generated` so the location is a literal at each call: the emitter reads it as
+a constant to find which output array to write, and a loop variable would not be
+one. `position` is written separately and takes no location — it is a builtin.
+"""
+@generated function mesh_write_varyings!(slot::Int32, nt::NamedTuple{N,T}) where {N,T}
+    calls = [:(mesh_output!(UInt32($(i - 1)), slot, nt[$i])) for i in 1:length(N)]
+    return Expr(:block, calls..., :nothing)
+end
+
 # ── Register intrinsic names for GPUCompiler validation ──
 # These are the LLVM IR function names (not the Julia names)
+push!(KNOWN_INTRINSICS, "_lava_gfx_discard")
 push!(KNOWN_INTRINSICS, "_lava_gfx_set_position")
 push!(KNOWN_INTRINSICS, "_lava_gfx_set_point_size")
 push!(KNOWN_INTRINSICS, "_lava_gfx_output_f32")
@@ -811,6 +1022,16 @@ push!(KNOWN_INTRINSICS, "_lava_gfx_end_primitive")
 push!(KNOWN_INTRINSICS, "_lava_gfx_set_tess_level_outer")
 push!(KNOWN_INTRINSICS, "_lava_gfx_set_tess_level_inner")
 push!(KNOWN_INTRINSICS, "_lava_gfx_sample_2d")
+# Mesh stage
+push!(KNOWN_INTRINSICS, "_lava_mesh_set_outputs")
+push!(KNOWN_INTRINSICS, "_lava_mesh_set_position")
+push!(KNOWN_INTRINSICS, "_lava_mesh_set_primitive1")
+push!(KNOWN_INTRINSICS, "_lava_mesh_set_primitive2")
+push!(KNOWN_INTRINSICS, "_lava_mesh_set_primitive3")
+push!(KNOWN_INTRINSICS, "_lava_mesh_output_f32")
+push!(KNOWN_INTRINSICS, "_lava_mesh_output_vec2")
+push!(KNOWN_INTRINSICS, "_lava_mesh_output_vec3")
+push!(KNOWN_INTRINSICS, "_lava_mesh_output_vec4")
 # Geometry shader arrayed inputs
 push!(KNOWN_INTRINSICS, "_lava_geom_input_position")
 push!(KNOWN_INTRINSICS, "_lava_geom_input_vec4")
