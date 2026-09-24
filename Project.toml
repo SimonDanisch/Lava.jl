@@ -14,36 +14,22 @@ GeometryBasics = "5c1252a2-5f33-56bf-86c9-59e7332b4326"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 LLVM = "929cbde3-209d-540e-8aea-75f648917ca0"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 Raycore = "afc56b53-c9a9-482a-a956-d1d800e05559"
 SPIRV_LLVM_Backend_jll = "4376b9bf-cff8-51b6-bb48-39421dff0d0c"
-PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
-Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 SPIRV_Tools_jll = "6ac6d60f-d740-5983-97d7-a4482c0689f4"
+Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 UnsafeAtomics = "013be700-e6cd-48c3-b4a1-df204f14c38f"
 Vulkan = "9f14b124-c50e-4008-a7d4-969b3a6cd68a"
 
-[sources]
-Raycore = {url = "https://github.com/JuliaGeometry/Raycore.jl", rev = "master"}
+[sources.Raycore]
+rev = "master"
+url = "https://github.com/JuliaGeometry/Raycore.jl"
 
 [compat]
-# Lava depends on a few GPUCompiler internals (rm_trap! was one, now vendored;
-# kernel_state_type, methodinstance, method_table, cached_compilation remain).
-# GPUCompiler removes/renames internals across PATCH releases (1.13.1 → 1.13.3
-# dropped rm_trap!), so a bump is only ever made after testing. Validated on
-# 1.23.0: no source changes needed, kernels bit-identical, and ~20% faster
-# end-to-end than 1.13.3.
-#
-# 2 is allowed, and has to be: CUDA's own `CUDACore` requires `GPUCompiler = 2.1`
-# from 6.2.1 on, so pinning Lava to 1 is what would make the two unsatisfiable in
-# one project — the reverse of what an earlier note here claimed.
 GPUCompiler = "1, 2"
-
-# Only the test suite touches this jll: test/spirv_test_utils.jl runs `llc` as a
-# reference oracle against our own emitter. Nothing in src/ uses it, so the
-# emitted SPIR-V is unaffected by the backend version. 22 is allowed so OpenCL
-# (which requires 22 from 0.10.10 on) can coexist here — that is what unblocks
-# GPUCompiler 2, since no registered OpenCL allows GPUCompiler 2.
+GeometryBasics = "0.5"
 SPIRV_LLVM_Backend_jll = "21.1.4, 22"
 StaticArrays = "1.9.17"
 julia = "1.12"
