@@ -718,6 +718,11 @@ struct VertexWrapper{F, Flats} end
 
 VertexWrapper{F}() where {F} = VertexWrapper{F, ()}()
 
+# Every wrapper hands the body its arguments WRITTEN OUT, never as `args...`:
+# inference resolves a splat of at most 32 elements, and past that the call
+# stays a dynamic `_apply_iterate`, which does not compile to SPIR-V. RayMakie's
+# mesh shader takes 51. A comprehension over `args`, not a helper function: a
+# generator runs in the world its method was defined in.
 @generated function (::VertexWrapper{F, Flats})(args...) where {F, Flats}
     # `Val{Flats}()` and not `Val($Flats)`: splicing a tuple of SYMBOLS into an
     # expression puts each symbol in value position, where it reads as a
@@ -725,7 +730,7 @@ VertexWrapper{F}() where {F} = VertexWrapper{F, ()}()
     # vertex shader. The parameter is already a type parameter here; using it
     # directly is both correct and one less thing to evaluate.
     quote
-        result = F.instance(args...)
+        result = F.instance($((:(args[$i]) for i in 1:length(args))...))
         emit_vertex_outputs(result, Val{Flats}())
     end
 end
@@ -783,7 +788,8 @@ struct GeometryWrapper{F, VIn, Out, Flats, NV} end
     end
     prim = :(NamedTuple{$(Expr(:tuple, QuoteNode.(names)...))}($(Expr(:tuple, vals...))))
     quote
-        F.instance(KernelInterface.NativeEmitter{Out, Flats}(), $prim, args...)
+        F.instance(KernelInterface.NativeEmitter{Out, Flats}(), $prim,
+                   $((:(args[$i]) for i in 1:length(args))...))
         return nothing
     end
 end
@@ -803,7 +809,7 @@ FragmentWrapper{F, VOut}() where {F, VOut} = FragmentWrapper{F, VOut, ()}()
 @generated function (::FragmentWrapper{F, VOut, Flats})(args...) where {F, VOut, Flats}
     quote
         inputs = load_fragment_inputs(VOut, Val{Flats}())
-        result = F.instance(inputs, args...)
+        result = F.instance(inputs, $((:(args[$i]) for i in 1:length(args))...))
         emit_fragment_output(result)
     end
 end
@@ -835,7 +841,7 @@ struct MeshWrapper{F} end
 
 @generated function (::MeshWrapper{F})(args...) where {F}
     quote
-        F.instance(LavaMeshOut(), args...)
+        F.instance(LavaMeshOut(), $((:(args[$i]) for i in 1:length(args))...))
         return nothing
     end
 end
