@@ -483,6 +483,17 @@ end
     """, "entry"), Float32, Tuple{UInt32, UInt32}, location, component)
 end
 
+@inline function gfx_input_flat_vec3(location::UInt32, component::UInt32)
+    Base.llvmcall(("""
+        declare float @_lava_gfx_input_flat_vec3(i32, i32) #0
+        define float @entry(i32 %loc, i32 %comp) #0 {
+            %val = call float @_lava_gfx_input_flat_vec3(i32 %loc, i32 %comp)
+            ret float %val
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Float32, Tuple{UInt32, UInt32}, location, component)
+end
+
 @inline function gfx_input_flat_vec2(location::UInt32, component::UInt32)
     Base.llvmcall(("""
         declare float @_lava_gfx_input_flat_vec2(i32, i32) #0
@@ -511,6 +522,10 @@ end
     gfx_input_flat_vec4(UInt32(loc), UInt32(1)),
     gfx_input_flat_vec4(UInt32(loc), UInt32(2)),
     gfx_input_flat_vec4(UInt32(loc), UInt32(3)))
+@inline gfx_input_flat(::Type{Vec3f}, loc::Integer) = Vec3f(
+    gfx_input_flat_vec3(UInt32(loc), UInt32(0)),
+    gfx_input_flat_vec3(UInt32(loc), UInt32(1)),
+    gfx_input_flat_vec3(UInt32(loc), UInt32(2)))
 @inline gfx_input_flat(::Type{Vec2f}, loc::Integer) = Vec2f(
     gfx_input_flat_vec2(UInt32(loc), UInt32(0)),
     gfx_input_flat_vec2(UInt32(loc), UInt32(1)))
@@ -579,6 +594,12 @@ the pass, not a name the shader chooses.
 @inline emit_fragment_output(::Nothing) = nothing
 
 @generated function emit_fragment_output(colors::T) where {T<:Tuple}
+    # A colour IS a four-tuple, so `T <: Tuple` alone read a fragment returning
+    # an `NTuple{4,Float32}` varying as four targets of one float each, and the
+    # attachment got a red channel's worth of the colour. The test is on the
+    # ELEMENT: a per-target tuple holds colours and a colour is not a `Real`.
+    # The same rule as Metal's `stage_fragment_out`.
+    fieldcount(T) > 0 && fieldtype(T, 1) <: Real && return :(gfx_output(0, colors))
     # Literal locations, so each reaches the emitter as the constant it needs.
     stores = [:(gfx_output($(i - 1), colors[$i])) for i in 1:fieldcount(T)]
     quote
@@ -989,6 +1010,25 @@ end
     loc, slot, v[1], v[2], v[3], v[4])
 end
 
+# The TUPLE spellings of a varying. `NTuple{N,Float32}` is the same N floats as
+# `Vec{N,Float32}`, and a portable stage may declare and write either: Metal's
+# mesh and vertex stages take both. The interface variable is typed by the
+# intrinsic the value goes through, so a tuple routed through the vector one
+# links against a stage that spelled it as a vector. Without these a tuple
+# varying had no method, the stage inferred to `Union{}`, and Mantle's access
+# walk refused the draw.
+const FloatTuple = Union{NTuple{2,Float32}, NTuple{3,Float32}, NTuple{4,Float32}}
+
+@inline gfx_output(loc::Integer, v::FloatTuple) = gfx_output(loc, Vec(v))
+@inline gfx_output_flat(loc::Integer, v::FloatTuple) = gfx_output_flat(loc, Vec(v))
+@inline mesh_output!(loc::UInt32, slot::Int32, v::FloatTuple) = mesh_output!(loc, slot, Vec(v))
+@inline gfx_input(::Type{NTuple{N,Float32}}, loc::Integer) where {N} =
+    Tuple(gfx_input(Vec{N,Float32}, loc))
+@inline gfx_input_flat(::Type{NTuple{N,Float32}}, loc::Integer) where {N} =
+    Tuple(gfx_input_flat(Vec{N,Float32}, loc))
+@inline geom_input(::Type{NTuple{N,Float32}}, loc::Integer, vidx::Integer) where {N} =
+    Tuple(geom_input(Vec{N,Float32}, loc, vidx))
+
 """
 Write every varying of one vertex, locations in declaration order.
 
@@ -1019,6 +1059,7 @@ push!(KNOWN_INTRINSICS, "_lava_gfx_input_vec3")
 push!(KNOWN_INTRINSICS, "_lava_gfx_input_vec2")
 push!(KNOWN_INTRINSICS, "_lava_gfx_input_f32")
 push!(KNOWN_INTRINSICS, "_lava_gfx_input_flat_vec4")
+push!(KNOWN_INTRINSICS, "_lava_gfx_input_flat_vec3")
 push!(KNOWN_INTRINSICS, "_lava_gfx_input_flat_vec2")
 push!(KNOWN_INTRINSICS, "_lava_gfx_input_flat_f32")
 push!(KNOWN_INTRINSICS, "_lava_gfx_dFdx_f32")
