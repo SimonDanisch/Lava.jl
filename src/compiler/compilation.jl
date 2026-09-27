@@ -2700,7 +2700,8 @@ end
 
 """
 Validate SPIR-V binary using spirv-val. On failure, writes debug artifacts
-to /tmp/lava_last.{spv,dis,ll} and throws with a focused error excerpt.
+to `lava_debug_path("lava_last.{spv,dis,ll}")` — the `.ll` only when the IR was
+captured — and throws with a focused error excerpt.
 """
 function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
                           source_map::Dict{UInt32, Tuple{String, Int}}=Dict{UInt32, Tuple{String, Int}}())
@@ -2743,9 +2744,13 @@ function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
         @warn "Lava: spirv-dis failed; diagnostic will omit the disassembly" exception = ex
         ""
     end
-    if !isempty(dis)
-        write(lava_debug_path("lava_last.dis"), dis)
-    end
+    dis_path = lava_debug_path("lava_last.dis")
+    ll_path = lava_debug_path("lava_last.ll")
+    isempty(dis) || write(dis_path, dis)
+    # The IR is only captured when kernels are being dumped, so it can be empty
+    # here; listing a `lava_last.ll` that was never written sent a reader to a
+    # file from some earlier compile, or to none.
+    isempty(llvm_ir) || write(ll_path, llvm_ir)
 
     io = IOBuffer()
 
@@ -2836,9 +2841,9 @@ function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
     $(strip(val_errors))
     $excerpt
     Debug files:
-      LLVM IR:     /tmp/lava_last.ll
-      SPIR-V bin:  /tmp/lava_last.spv
-      SPIR-V dis:  /tmp/lava_last.dis
+      LLVM IR:     $(isempty(llvm_ir) ? "not kept for this compile; LAVA_DUMP_KERNELS=1 keeps it" : ll_path)
+      SPIR-V bin:  $spv_path
+      SPIR-V dis:  $(isempty(dis) ? "spirv-dis failed" : dis_path)
     """)
 end
 
