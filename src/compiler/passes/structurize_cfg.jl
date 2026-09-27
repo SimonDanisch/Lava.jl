@@ -265,6 +265,118 @@ end
 # structurization pipeline with no benefit is a mysterious regression waiting to
 # happen. Left out, recorded here so it is not re-derived.
 
+# ── Loop unroll hints ─────────────────────────────────────────────────────────
+#
+# `OpLoopMerge`'s Loop Control is the only way SPIR-V has to tell a driver's
+# compiler whether to unroll, and Lava used to write `None` on every loop, so
+# the driver decided alone. RADV's NIR fully unrolls a loop whose trip count it
+# can see. On the implicit-GEMM convolution (`conv2d_igemm_ki!`: 16 steps of 64
+# FMAs and 8 shared loads) that took the kernel from 120 VGPRs and 12 waves per
+# SIMD to 156 and 8, and the Qwen-Image VAE's `convolution_37` from 285 ms to
+# 330. LLVM's AMDGPU backend keeps the same loop rolled, which is how ROCm ran
+# the same source 20% faster.
+#
+# So a hint written in Julia now reaches the driver: `llvm.loop.unroll.disable`
+# becomes DontUnroll, `.enable` and `.full` become Unroll, `.count N` becomes
+# PartialCount N (SPIR-V 1.4, which this emitter targets; a count of 1 is
+# DontUnroll). The loop metadata is what `Expr(:loopinfo, …)` produces, so
+# KernelAbstractions' `LoopInfo` and `Base`'s own loop hints are the source
+# syntax, and a backend that compiles through LLVM reads the same metadata
+# directly: one annotation, the same meaning everywhere.
+#
+# StructurizeCFG replaces the latch branches and the new ones carry no
+# metadata. So the hints are read off the latches just before it runs, held by
+# HEADER block, which survives it, and stamped on each header's terminator once
+# the whole structurize pipeline is done. The emitter reads them there, at the
+# header, which is where it writes `OpLoopMerge`. Stamping any earlier does not
+# hold: in a single-block loop the header IS the latch, and its terminator is
+# one of the branches StructurizeCFG replaces.
+
+const LOOP_CONTROL_UNROLL = UInt32(0x1)
+const LOOP_CONTROL_DONT_UNROLL = UInt32(0x2)
+const LOOP_CONTROL_PARTIAL_COUNT = UInt32(0x100)
+"""The metadata kind the header's terminator carries the Loop Control words in."""
+const LOOP_CONTROL_MD = "lava.loop.control"
+
+"""Operand `i` of an MDNode that holds a constant integer, as an `Int`."""
+function md_constant_int(node::LLVM.MDNode, i::Int)
+    # The value-level API unwraps `ConstantAsMetadata` to the constant itself,
+    # which the metadata-level `operands` does not.
+    v = LLVM.Value(node)
+    ops = Vector{LLVM.API.LLVMValueRef}(undef, LLVM.API.LLVMGetMDNodeNumOperands(v))
+    LLVM.API.LLVMGetMDNodeOperands(v, ops)
+    return convert(Int, LLVM.Value(ops[i])::LLVM.ConstantInt)
+end
+
+"""
+    loop_control_words(loopid::LLVM.MDNode) -> Union{Nothing, Vector{UInt32}}
+
+The Loop Control mask and its literals for an `!llvm.loop` node, or `nothing`
+when the node says nothing about unrolling.
+"""
+function loop_control_words(loopid::LLVM.MDNode)
+    for op in LLVM.operands(loopid)
+        # The first operand of a loop id is the node itself.
+        op isa LLVM.MDNode || continue
+        hint = LLVM.operands(op)
+        !isempty(hint) && hint[1] isa LLVM.MDString || continue
+        name = convert(String, hint[1])
+        if name == "llvm.loop.unroll.disable"
+            return [LOOP_CONTROL_DONT_UNROLL]
+        elseif name == "llvm.loop.unroll.enable" || name == "llvm.loop.unroll.full"
+            return [LOOP_CONTROL_UNROLL]
+        elseif name == "llvm.loop.unroll.count"
+            n = md_constant_int(op, 2)
+            return n <= 1 ? [LOOP_CONTROL_DONT_UNROLL] : [LOOP_CONTROL_PARTIAL_COUNT, UInt32(n)]
+        end
+    end
+    return nothing
+end
+
+"""
+    loop_hints(mod) -> Dict{LLVM.BasicBlock, Vector{UInt32}}
+
+Each hinted loop's header, with the Loop Control words its latch's `!llvm.loop`
+asks for. See the note above.
+"""
+function loop_hints(mod::LLVM.Module)
+    hints = Dict{LLVM.BasicBlock, Vector{UInt32}}()
+    for f in LLVM.functions(mod)
+        isempty(LLVM.blocks(f)) && continue
+        rpo = reverse_postorder(f)
+        pos = Dict(bb => i for (i, bb) in enumerate(rpo))
+        for bb in rpo
+            term = LLVM.terminator(bb)
+            md = LLVM.metadata(term)
+            haskey(md, LLVM.MD_loop) || continue
+            words = loop_control_words(md[LLVM.MD_loop]::LLVM.MDNode)
+            words === nothing && continue
+            for succ in LLVM.successors(term)
+                # The back edge: the header comes no later than the latch in RPO,
+                # the same test `analyze_loops` finds headers with.
+                get(pos, succ, typemax(Int)) <= pos[bb] && (hints[succ] = words)
+            end
+        end
+    end
+    return hints
+end
+
+"""Put each header's Loop Control words on its terminator, as `$LOOP_CONTROL_MD`."""
+function stamp_loop_controls!(hints::Dict{LLVM.BasicBlock, Vector{UInt32}})
+    for (header, words) in hints
+        LLVM.metadata(LLVM.terminator(header))[LOOP_CONTROL_MD] =
+            LLVM.MDNode([LLVM.MDString(string(w)) for w in words])
+    end
+end
+
+"""The Loop Control words for the loop whose header ends in `term`: `[0]` (None) unless a hint was stamped."""
+function header_loop_control(term::LLVM.Instruction)
+    md = LLVM.metadata(term)
+    haskey(md, LOOP_CONTROL_MD) || return UInt32[0]
+    return [parse(UInt32, convert(String, w::LLVM.MDString))
+            for w in LLVM.operands(md[LOOP_CONTROL_MD]::LLVM.MDNode)]
+end
+
 """
     run_structurize_cfg_pipeline!(mod::LLVM.Module)
 
@@ -318,6 +430,8 @@ function run_structurize_cfg_pipeline!(mod::LLVM.Module)
     run_or_skip("UnifyFunctionExitNodes", () -> LLVM.run!(LLVM.UnifyFunctionExitNodesPass(), mod))
     run_or_skip("FixIrreducible",         () -> LLVM.run!(LLVM.FixIrreduciblePass(), mod))
     run_or_skip("LoopSimplify",           () -> LLVM.run!(LLVM.LoopSimplifyPass(), mod))
+    # Last thing before StructurizeCFG, which drops every `!llvm.loop` it touches.
+    hints = loop_hints(mod)
     run_or_skip("StructurizeCFG",         () -> LLVM.run!(LLVM.StructurizeCFGPass(), mod))
     run_or_skip("InstCombine",            () -> LLVM.run!(LLVM.InstCombinePass(), mod))
     # Collapse duplicated loop-carried phis that StructurizeCFG introduces for
@@ -330,6 +444,7 @@ function run_structurize_cfg_pipeline!(mod::LLVM.Module)
     run_or_skip("replace_undef_phi_operands",
                 () -> replace_undef_phi_operands_with_constants!(mod))
     run_or_skip("fixup_post_structurize", () -> fixup_post_structurize!(mod))
+    stamp_loop_controls!(hints)
 end
 
 # Post-StructurizeCFG fixup: insert trampolines for SPIR-V continue-construct conflicts.

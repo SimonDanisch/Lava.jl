@@ -942,7 +942,8 @@ function emit_block!(state::SPIRVEmitterState, bb::LLVM.BasicBlock)
                 merge_bb, continue_bb = loop_entry
                 merge_id = get_block_id!(state, merge_bb)
                 continue_id = get_block_id!(state, continue_bb)
-                encode_instruction!(state.mod.functions, Op.OpLoopMerge, merge_id, continue_id, UInt32(0))
+                encode_instruction!(state.mod.functions, Op.OpLoopMerge, merge_id, continue_id,
+                                    header_loop_control(inst)...)
             end
         end
         emit_instruction!(state, inst)
