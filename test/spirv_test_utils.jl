@@ -19,13 +19,15 @@ using Lava
 const SPIRV_Tools_jll = Lava.SPIRV_Tools_jll
 
 # The llc oracle is genuinely optional and stays a test-target dep; every use is
-# already behind `HAS_LLC`.
-const HAS_LLC = try
+# behind `HAS_LLC`. Two questions, asked rather than caught: is the package in
+# this environment, and does the version installed ship an `llc` at all. 23.x
+# ships only `libspirv`, and a `try using` answered yes to it, so six tests
+# threw `llc not defined` instead of reporting the oracle missing.
+if Base.find_package("SPIRV_LLVM_Backend_jll") !== nothing
     using SPIRV_LLVM_Backend_jll
-    true
-catch
-    false
 end
+const HAS_LLC = isdefined(@__MODULE__, :SPIRV_LLVM_Backend_jll) &&
+                isdefined(SPIRV_LLVM_Backend_jll, :llc)
 
 export check, check_not, check_dag, check_sequence, check_count, check_regex,
        normalize_spirv, compare_golden, compile_and_disasm,

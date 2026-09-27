@@ -134,10 +134,10 @@ end
         @test (f, sort(collect(hits); by = string)) == (f, Symbol[])
     end
 
-    # The one exemption is one line, and this is what keeps it that way: a second
-    # `Vulkan` in `Lava.jl` — a `using Vulkan`, a `Vulkan.Device` — would pass the
-    # loop above and fail here.
-    @testset "the dependency is one import and nothing more" begin
+    # The one exemption is the import and the loader gate, and this is what keeps
+    # it that way: any other `Vulkan` in `Lava.jl` — a `using Vulkan`, a
+    # `Vulkan.Device` — would pass the loop above and fail here.
+    @testset "the dependency is one import and a loader gate" begin
         toml = read(joinpath(pkgdir(Lava), "Project.toml"), String)
         deps = split(split(toml, "[deps]")[2], "[")[1]
         @test occursin(Regex("^Vulkan = ", "m"), deps)
@@ -146,7 +146,11 @@ end
         # so the word itself is expected in prose several times over.
         code = [strip(l) for l in split(body, '\n')
                 if occursin(r"\bVulkan\b", l) && !startswith(strip(l), "#")]
-        @test code == ["import Vulkan"]
+        # And the gate around the body (`bedf7c9`): a machine with no Vulkan
+        # loader compiles none of the compiler, since nothing there can use it.
+        # It asks the loader question and names nothing else of the package.
+        @test code == ["import Vulkan", "@static if Vulkan.HAS_LOADER",
+                       "end # @static if Vulkan.HAS_LOADER"]
 
         # The RUNTIME's dependencies are still gone, which is what the split was
         # for. These left with `Mantle/src/vulkan/` and none of them came back.

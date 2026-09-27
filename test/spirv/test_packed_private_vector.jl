@@ -43,6 +43,9 @@ end
 import .SPIRVTestUtils: check, check_not, compile_and_disasm
 
 using StaticArrays
+# For `llvm_type_size` below. Without it the file threw `LLVM not defined` at
+# load, inside the Tier 1 loop, and every file sorted after it never ran.
+using LLVM
 
 # Ten `f16vec2`s: 40 bytes, which Julia packs two-per-word into `[5 x i64]`, and
 # past the point where the scalariser keeps each element in its own SSA value.
