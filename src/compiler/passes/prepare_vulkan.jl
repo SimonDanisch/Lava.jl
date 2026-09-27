@@ -3789,19 +3789,40 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                     # These have src_ty=i8, elem_ty=i8, but the alloca is a struct/array.
                     # Resolve byte offset to the containing field, load it, and extract
                     # the relevant bits via bitcast+shift+trunc.
-                    if src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8 &&
-                       (alloca_ty isa LLVM.StructType || alloca_ty isa LLVM.ArrayType)
-                        all_fields = flatten_type_with_offsets(alloca_ty; dl)
-                        # Find the scalar field that contains this byte offset
-                        containing = nothing
-                        for (path, fty, foff) in all_fields
+                    #
+                    # A flat GEP in any other type is the same pointer arithmetic, and
+                    # reading its source type as the field's is what let one through:
+                    # `lift_byte_geps_on_allocas!` spells element zero's narrow access
+                    # `gep i32, ptr %alloca, 0`, because a byte GEP at offset zero folds
+                    # back to the bare alloca. An `i32` load through an `i32` GEP looked
+                    # like no pun at all, and on the `[3 x double]` a struct of three
+                    # `Float64` is copied through in 4-byte chunks, the offset-zero chunk
+                    # reached the emitter as an `OpLoad %uint` of a `double` array. So a
+                    # flat GEP is taken here too — when the load disagrees with the field
+                    # it lands in, and stays inside it, which is what the extraction
+                    # below can express.
+                    is_byte_gep = src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8
+                    aggregate = alloca_ty isa LLVM.StructType || alloca_ty isa LLVM.ArrayType
+                    # Straight off the alloca, because the offset is computed from
+                    # this GEP's own indices and would be relative to whatever a
+                    # chained base points at.
+                    flat = !is_byte_gep && length(ops) == 2 && ops[1] == alloca
+                    containing = nothing
+                    if aggregate && (is_byte_gep || flat)
+                        for (path, fty, foff) in flatten_type_with_offsets(alloca_ty; dl)
                             fsz = llvm_type_size(fty)
                             if gep_byte_off >= foff && gep_byte_off < foff + fsz
                                 containing = (path, fty, foff)
                                 break
                             end
                         end
-                        containing === nothing && continue
+                    end
+                    is_byte_gep && aggregate && containing === nothing && continue
+                    flat_pun = flat && containing !== nothing &&
+                               (containing[2] != load_ty || gep_byte_off != containing[3]) &&
+                               gep_byte_off - containing[3] + load_size <=
+                                   llvm_type_size(containing[2])
+                    if containing !== nothing && (is_byte_gep || flat_pun)
                         cpath, cfty, cfoff = containing
                         byte_within_field = gep_byte_off - cfoff
 
@@ -3845,6 +3866,16 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                         changed && break  # restart inner loop
                         continue
                     end
+
+                    # A flat GEP's own source type says nothing about the slot it
+                    # lands in, so the width a load is compared against is the
+                    # field's. `lower_phi_select_function_ptrs!` reads a whole
+                    # `ComplexF32` as `load i64, ptr (gep i64, ptr %[2 x float], 0)`;
+                    # sized by the GEP that was an `i64` field and no pun, and
+                    # reached the emitter as `OpLoad %ulong` of a float array. Sized
+                    # by the field it is two floats, the wider load below.
+                    flat && containing !== nothing &&
+                        (elem_size = llvm_type_size(containing[2]))
 
                     # Only handle type-punning (load size != element size)
                     elem_size == load_size && continue
