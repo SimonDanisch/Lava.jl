@@ -35,23 +35,26 @@ import KernelInterface as KI
 #
 # The element type is what a kernel wanting `Int32` indices asks for, so it no
 # longer has to convert after the fact.
-@inline KI.get_global_id(::Type{T}) where {T} =
+#
+# In Lava's own method table, like the subgroup queries below and for the same
+# reason: a plain method is what every other backend's compiler finds too.
+@lava_device_override @inline KI.get_global_id(::Type{T}) where {T} =
     (x = T(lava_global_invocation_id(1)) + one(T),
      y = T(lava_global_invocation_id(2)) + one(T),
      z = T(lava_global_invocation_id(3)) + one(T))
 
-@inline KI.get_local_id(::Type{T}) where {T} =
+@lava_device_override @inline KI.get_local_id(::Type{T}) where {T} =
     (x = T(lava_local_invocation_id(1)) + one(T),
      y = T(lava_local_invocation_id(2)) + one(T),
      z = T(lava_local_invocation_id(3)) + one(T))
 
-@inline KI.get_group_id(::Type{T}) where {T} =
+@lava_device_override @inline KI.get_group_id(::Type{T}) where {T} =
     (x = T(lava_workgroup_id(1)) + one(T),
      y = T(lava_workgroup_id(2)) + one(T),
      z = T(lava_workgroup_id(3)) + one(T))
 
 # A COUNT, so no `+ 1` — see this file's header on the 1-based convention.
-@inline KI.get_num_groups(::Type{T}) where {T} =
+@lava_device_override @inline KI.get_num_groups(::Type{T}) where {T} =
     (x = T(lava_num_workgroups(1)),
      y = T(lava_num_workgroups(2)),
      z = T(lava_num_workgroups(3)))
@@ -79,10 +82,18 @@ import KernelInterface as KI
 
 # ── Subgroups ───────────────────────────────────────────────────────────────
 
-@inline KI.get_sub_group_size()     = lava_subgroup_size()
-@inline KI.get_num_sub_groups()     = lava_num_subgroups()
-@inline KI.get_sub_group_id()       = lava_subgroup_id() + UInt32(1)
-@inline KI.get_sub_group_local_id() = lava_subgroup_local_id() + UInt32(1)
+# Every method in this section is `@lava_device_override`, in Lava's own method
+# table. They were plain methods on KernelInterface's functions until 2026-09-26,
+# which made them the methods EVERY backend's compiler found wherever it had no
+# override of its own: ROCm compiled `Mantle.gemv!`'s `sub_group_reduce_add` to
+# `_lava_subgroup_reduce_add_f32`, an unknown function in a GCN module, and AMDGPU
+# had grown an override of `shfl` only to keep `_lava_subgroup_shuffle_f32` out.
+# KernelInterface's contract is `@device_override`, and a backend without the
+# capability has a missing method, not Lava's.
+@lava_device_override @inline KI.get_sub_group_size()     = lava_subgroup_size()
+@lava_device_override @inline KI.get_num_sub_groups()     = lava_num_subgroups()
+@lava_device_override @inline KI.get_sub_group_id()       = lava_subgroup_id() + UInt32(1)
+@lava_device_override @inline KI.get_sub_group_local_id() = lava_subgroup_local_id() + UInt32(1)
 
 # `get_max_sub_group_size` is missing on purpose: SPIR-V puts SubgroupMaxSize
 # under the Kernel (OpenCL) capability and spirv-val rejects it in a Vulkan
@@ -95,8 +106,10 @@ import KernelInterface as KI
 const KI_SHFL_TYPES = (Float32, Float64, Int32, UInt32, Int64, UInt64)
 
 for T in KI_SHFL_TYPES
-    @eval @inline KI.shfl(val::$T, lane::Integer) = subgroup_shuffle(val, lane)
-    @eval @inline KI.shfl_down(val::$T, offset::Integer) = subgroup_shuffle_down(val, offset)
+    @eval @lava_device_override @inline KI.shfl(val::$T, lane::Integer) =
+        subgroup_shuffle(val, lane)
+    @eval @lava_device_override @inline KI.shfl_down(val::$T, offset::Integer) =
+        subgroup_shuffle_down(val, offset)
 end
 
 # `KI.shfl_down_types(::LavaBackend)` reads this list but dispatches on a
@@ -114,16 +127,15 @@ end
 const KI_REDUCE_ADD_TYPES = (Float32, Float64, Int32, UInt32, Int64, UInt64)
 
 for T in KI_REDUCE_ADD_TYPES
-    @eval @inline KI.sub_group_reduce_add(val::$T) = subgroup_add(val)
+    @eval @lava_device_override @inline KI.sub_group_reduce_add(val::$T) = subgroup_add(val)
 end
 
 # ── Barriers ────────────────────────────────────────────────────────────────
 #
-# `@lava_device_override`, not a plain method, and the difference matters here in
-# a way it does not above. KI gives `barrier` a HOST method that errors, so a
-# plain method would shadow it and a host-side call would reach an `llvmcall` of
-# a SPIR-V intrinsic on the CPU. The index queries above are bare stubs with no
-# host method, so a plain method shadows nothing.
+# `@lava_device_override` like everything above, and here for a second reason as
+# well: KI gives `barrier` a HOST method that errors, so a plain method would
+# shadow it and a host-side call would reach an `llvmcall` of a SPIR-V intrinsic
+# on the CPU.
 #
 # Same instruction `KA.@synchronize` lowers to: `OpControlBarrier Workgroup
 # Workgroup` with AcquireRelease | WorkgroupMemory | MakeAvailable | MakeVisible
