@@ -1121,7 +1121,11 @@ function emit_gfx_sample_2d!(state::SPIRVEmitterState, inst::LLVM.CallInst)
 
     # Cache texture samples by (binding, u_id, v_id) to avoid redundant
     # OpImageSampleImplicitLod when tex[Vec2f(u,v)] samples all 4 components.
-    cache_key = (:tex_sample, binding, u_id, v_id)
+    # Per BLOCK: those four calls are in one block, and a sample of the same
+    # coordinates anywhere else — a branch that does not dominate it, another
+    # function — reusing this one is an ID used where it is not defined
+    # (test/spirv/test_texture_sample_dominance.jl).
+    cache_key = (:tex_sample, LLVM.parent(inst).ref, binding, u_id, v_id)
     sample_id = get(mod.constant_cache, cache_key, UInt32(0))
 
     if sample_id == UInt32(0)
