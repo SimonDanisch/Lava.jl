@@ -1606,7 +1606,10 @@ function map_constant!(ctx::SPIRVTypeContext, val::LLVM.Constant)
         return map_undef!(ctx, ty)
     elseif val isa LLVM.ConstantAggregateZero
         return map_null_constant!(ctx, ty)
-    elseif val isa LLVM.ConstantArray || val isa LLVM.ConstantDataArray
+    elseif val isa LLVM.ConstantArray || val isa LLVM.ConstantDataArray ||
+           val isa LLVM.ConstantVector || val isa LLVM.ConstantDataVector
+        # A constant vector is the same `OpConstantComposite` as an array's:
+        # `fsub <2 x half> %x, <half 1152.0, half 1152.0>` needs one.
         return map_constant_array!(ctx, val, ty)
     else
         error("Unsupported constant type: $(typeof(val))")
@@ -1722,14 +1725,17 @@ function map_null_constant!(ctx::SPIRVTypeContext, ty::LLVM.LLVMType)
     end
 end
 
-function map_constant_array!(ctx::SPIRVTypeContext, val::Union{LLVM.ConstantArray, LLVM.ConstantDataArray}, ty::LLVM.LLVMType)
+function map_constant_array!(ctx::SPIRVTypeContext,
+                             val::Union{LLVM.ConstantArray, LLVM.ConstantDataArray,
+                                        LLVM.ConstantVector, LLVM.ConstantDataVector},
+                             ty::LLVM.LLVMType)
     type_id = map_type!(ctx, ty)
     elem_ty = LLVM.eltype(ty)
     n = length(ty)
     elem_ids = UInt32[]
 
-    if val isa LLVM.ConstantDataArray
-        # ConstantDataArray stores data as packed scalars — extract element-by-element
+    if val isa LLVM.ConstantDataArray || val isa LLVM.ConstantDataVector
+        # ConstantData* stores data as packed scalars — extract element-by-element
         for i in 0:(n-1)
             # Use LLVM API to get element at index
             elem_val = LLVM.API.LLVMGetElementAsConstant(val, Cuint(i))
@@ -1738,7 +1744,7 @@ function map_constant_array!(ctx::SPIRVTypeContext, val::Union{LLVM.ConstantArra
             push!(elem_ids, elem_id)
         end
     else
-        # ConstantArray stores elements as operands
+        # ConstantArray / ConstantVector store elements as operands
         for i in 0:(n-1)
             elem = LLVM.operands(val)[i + 1]
             elem_id = map_constant!(ctx, elem)

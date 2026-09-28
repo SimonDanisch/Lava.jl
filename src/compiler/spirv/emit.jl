@@ -468,7 +468,8 @@ function get_value_id!(state::SPIRVEmitterState, val::LLVM.Value)
     if val isa LLVM.ConstantInt || val isa LLVM.ConstantFP ||
        val isa LLVM.UndefValue || val isa LLVM.PoisonValue ||
        val isa LLVM.ConstantAggregateZero || val isa LLVM.ConstantArray ||
-       val isa LLVM.ConstantDataArray
+       val isa LLVM.ConstantDataArray || val isa LLVM.ConstantVector ||
+       val isa LLVM.ConstantDataVector
         id = map_constant!(state.type_ctx, val)
         state.value_map[val] = id
         return id
@@ -2468,6 +2469,21 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
                         encode_instruction!(state.mod.functions, Op.OpBitcast, new_ptr_ty, cast_id, ptr_id)
                         ptr_id = cast_id
                     end
+                elseif val_ty != pointee_ty && pointee_ty isa LLVM.VectorType &&
+                       (val_ty isa LLVM.VectorType || val_ty isa LLVM.IntegerType ||
+                        val_ty isa LLVM.FloatingPointType) &&
+                       LLVM.API.LLVMSizeOfTypeInBits(state.data_layout, val_ty) ==
+                       LLVM.API.LLVMSizeOfTypeInBits(state.data_layout, pointee_ty) &&
+                       !val_was_bitcasted
+                    # A vector slot stored with a value of the same width and another
+                    # type: InstCombine folds `bitcast <2 x i32> to <4 x half>` into the
+                    # store that follows it, and the array's element is still
+                    # `<4 x half>`. Bitcast the VALUE back, as the integer branch above
+                    # does; a logical pointer cannot be retyped.
+                    bc = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpBitcast,
+                                        map_type!(state.type_ctx, pointee_ty), bc, val_id)
+                    val_id = bc
                 elseif val_ty != pointee_ty && pointee_ty isa LLVM.ArrayType &&
                        !(val_ty isa LLVM.PointerType) && !(val_ty isa LLVM.ArrayType) &&
                        !(val_ty isa LLVM.StructType) &&
