@@ -398,6 +398,17 @@ function fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
 
         target = succs[1]
         target in return_blocks || continue   # must branch to return block
+        # ...and to a BARE one, only the `ret` (and the phis feeding it). A
+        # lowered `throw` returns there: the kernel's returns meet in the inlined
+        # function's exit, which keeps nothing else. A return block that holds
+        # the kernel's TAIL is the join of an ordinary branch whose other arm
+        # rejoined it, and rerouting its edge changes what the program does. Two
+        # such edges were rerouted, both in DNNKernels' `attn_flash_rows!`: the
+        # empty arm of `if c; store; end` before the final barrier, which then
+        # stored on every invocation; and a key loop's zero-trip edge, which was
+        # sent into the loop and left the exit's phis naming a predecessor it no
+        # longer had.
+        bare_return_block(target) || continue
 
         # This block branches directly to return. Check predecessor.
         preds = collect(LLVM.predecessors(bb))
@@ -431,12 +442,54 @@ function fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
                 undef = LLVM.UndefValue(LLVM.value_type(inst))
                 push!(LLVM.incoming(inst), (undef, bb))
             end
+            # ...and take `bb` out of the old target's: it is no longer a
+            # predecessor there, and a phi naming it is invalid IR.
+            for phi in [i for i in LLVM.instructions(target) if i isa LLVM.PHIInst]
+                drop_incoming!(phi, bb)
+            end
 
             changed = true
         end
     end
 
     return changed
+end
+
+"""
+    bare_return_block(bb) -> Bool
+
+Whether `bb` does nothing but return: phis, the `ret`, and markers that do no
+work — the entry wrapper's `llvm.lifetime.end`s and debug intrinsics.
+"""
+function bare_return_block(bb::LLVM.BasicBlock)
+    term = LLVM.terminator(bb)
+    all(LLVM.instructions(bb)) do i
+        i isa LLVM.PHIInst && return true
+        i === term && return true
+        i isa LLVM.CallInst || return false
+        callee = LLVM.called_operand(i)
+        callee isa LLVM.Function || return false
+        n = LLVM.name(callee)
+        startswith(n, "llvm.lifetime.") || startswith(n, "llvm.dbg.")
+    end
+end
+
+"""
+    drop_incoming!(phi, from)
+
+Rebuild `phi` without its entry for predecessor `from`. LLVM's C API can add an
+incoming value and cannot remove one, so the phi is replaced.
+"""
+function drop_incoming!(phi::LLVM.PHIInst, from::LLVM.BasicBlock)
+    keep = Tuple{LLVM.Value,LLVM.BasicBlock}[(v, b) for (v, b) in LLVM.incoming(phi) if b != from]
+    LLVM.@dispose builder = LLVM.IRBuilder() begin
+        LLVM.position!(builder, phi)
+        new = LLVM.phi!(builder, LLVM.value_type(phi))
+        append!(LLVM.incoming(new), keep)
+        LLVM.replace_uses!(phi, new)
+        LLVM.erase!(phi)
+    end
+    return nothing
 end
 
 """

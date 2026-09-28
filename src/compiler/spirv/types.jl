@@ -1915,6 +1915,8 @@ end
 
 """Compute byte size of an LLVM type using DataLayout for accurate struct sizes."""
 function compute_type_size_with_dl(ty::LLVM.LLVMType, dl::LLVM.DataLayout)
+    # See `compute_type_size`: a vector is sized as LLVM allocates it.
+    ty isa LLVM.VectorType && return UInt32(API.LLVMABISizeOfType(dl, ty))
     if ty isa LLVM.StructType
         # Use DataLayout for accurate struct size (includes padding)
         n = length(LLVM.elements(ty))

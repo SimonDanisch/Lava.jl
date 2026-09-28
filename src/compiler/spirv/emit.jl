@@ -1091,6 +1091,8 @@ function emit_instruction!(state::SPIRVEmitterState, inst::LLVM.Instruction)
         emit_extractelement!(state, inst)
     elseif inst isa LLVM.InsertElementInst
         emit_insertelement!(state, inst)
+    elseif inst isa LLVM.ShuffleVectorInst
+        emit_shufflevector!(state, inst)
     # Atomics
     elseif inst isa LLVM.AtomicRMWInst
         emit_atomicrmw!(state, inst)
@@ -1494,7 +1496,9 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
         is_scalar_load = !(actual_load isa LLVM.StructType || actual_load isa LLVM.ArrayType)
         if is_scalar_load && psb_needs_decomposition(state, ptr, actual_load; llvm_align)
             access_align = get_alignment_for_type(actual_load)
-            if access_align <= 4
+            if actual_load isa LLVM.VectorType
+                load_id = emit_psb_decomposed_vector_load!(state, ptr_id, actual_load, spirv_load_ty)
+            elseif access_align <= 4
                 # Small type (i32/float/i16) at potentially non-4-aligned address:
                 # decompose into individual byte loads with Aligned 1
                 load_id = emit_psb_decomposed_small_load!(state, ptr_id, actual_load, spirv_load_ty)
@@ -1515,7 +1519,7 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
             end
         else
             align_ty = needs_bitcast ? actual_load_ty : load_ty
-            align = get_alignment_for_type(align_ty)
+            align = psb_access_alignment(align_ty, llvm_align)
 
             # Special case: loading ptr from PSB where pointee was mapped to i64
             # (from emit_psb_byte_offset_with_user_type!). Load i64, then ConvertUToPtr.
@@ -2358,7 +2362,9 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
         llvm_align = UInt32(LLVM.alignment(inst))
         if psb_needs_decomposition(state, ptr, store_ty; llvm_align)
             access_align = get_alignment_for_type(store_ty)
-            if access_align <= 4
+            if store_ty isa LLVM.VectorType
+                emit_psb_decomposed_vector_store!(state, ptr_id, val_id, store_ty)
+            elseif access_align <= 4
                 # Small type (i32/float/i16) at potentially non-4-aligned address:
                 # decompose into individual byte stores with Aligned 1
                 emit_psb_decomposed_small_store!(state, ptr_id, val_id, store_ty)
@@ -2368,7 +2374,7 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
                 emit_psb_decomposed_store!(state, ptr_id, val_id, store_ty)
             end
         else
-            align = get_alignment_for_type(store_ty)
+            align = psb_access_alignment(store_ty, llvm_align)
             ptr_id = fix_psb_ptr_type_for_store!(state, ptr, ptr_id, value)
             word_count = UInt32(5)  # opcode + ptr + val + mem_operand + alignment
             push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpStore))
@@ -2847,9 +2853,31 @@ function get_alignment_for_type(ty::LLVM.LLVMType)
         return max_align
     elseif ty isa LLVM.ArrayType
         return get_alignment_for_type(eltype(ty))
+    elseif ty isa LLVM.VectorType
+        # The component's, which is what VUID-06314 asks of a PSB access ("at
+        # least the size of the largest scalar"). Absent this branch a vector
+        # fell to the 4 below: an under-aligned `<4 x i32>` then took the 4-byte
+        # decomposition and moved only its first component, silently, and
+        # `<2 x double>` was declared `Aligned 4`.
+        return get_alignment_for_type(eltype(ty))
     else
         return UInt32(4)  # Default alignment
     end
+end
+
+"""
+The `Aligned` literal for a PSB access of `ty` that is NOT decomposed.
+
+For a vector, LLVM's own alignment where it promises more than the component's:
+`load <4 x i32>, align 16` is what lets the driver issue one 16-byte load, and
+declaring the component's 4 there throws that away. Scalars keep the type's
+alignment, as they always have — only the vector case had a larger fact to pass
+on.
+"""
+function psb_access_alignment(ty::LLVM.LLVMType, llvm_align::UInt32)
+    a = get_alignment_for_type(ty)
+    ty isa LLVM.VectorType && llvm_align > a && ispow2(llvm_align) && return llvm_align
+    return a
 end
 
 """
@@ -3289,6 +3317,73 @@ function emit_psb_decomposed_small_load!(state::SPIRVEmitterState, ptr_id::UInt3
         return result_id
     end
     return combined
+end
+
+"""
+The PSB address `ptr_id + offset` as a pointer the scalar decompositions accept.
+They convert whatever they are handed back to an integer, so the pointee type
+here is only a carrier.
+"""
+function psb_component_pointer!(state::SPIRVEmitterState, base_u64::UInt32, offset::Integer)
+    u8_spirv = emit_type_int!(state.mod, UInt32(8), UInt32(0))
+    u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+    u8_ptr_ty = map_pointer_type!(state.type_ctx, u8_spirv, SC.PhysicalStorageBuffer)
+    addr = base_u64
+    if offset != 0
+        addr = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpIAdd, u64_spirv, addr, base_u64,
+                            emit_constant_u64!(state.mod, UInt64(offset)))
+    end
+    p = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, u8_ptr_ty, p, addr)
+    return p
+end
+
+"""
+A decomposed PSB load of a VECTOR: each component through the scalar
+decomposition its own width takes, then one `OpCompositeConstruct`.
+
+The scalar helpers size their byte loop by the type they are handed, and handed
+a vector they read one component's worth and returned it as the whole value.
+"""
+function emit_psb_decomposed_vector_load!(state::SPIRVEmitterState, ptr_id::UInt32,
+                                          vec_ty::LLVM.VectorType, result_spirv_ty::UInt32)
+    el = eltype(vec_ty)
+    elsize = compute_type_size(el, state.data_layout)
+    el_spirv = map_type!(state.type_ctx, el)
+    u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+    base_u64 = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, ptr_id)
+    comps = map(0:(length(vec_ty) - 1)) do i
+        cptr = psb_component_pointer!(state, base_u64, i * elsize)
+        get_alignment_for_type(el) <= 4 ?
+            emit_psb_decomposed_small_load!(state, cptr, el, el_spirv) :
+            emit_psb_decomposed_load!(state, cptr, el, el_spirv)
+    end
+    result_id = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpCompositeConstruct, result_spirv_ty,
+                        result_id, comps...)
+    return result_id
+end
+
+"""The store half of [`emit_psb_decomposed_vector_load!`](@ref)."""
+function emit_psb_decomposed_vector_store!(state::SPIRVEmitterState, ptr_id::UInt32,
+                                           val_id::UInt32, vec_ty::LLVM.VectorType)
+    el = eltype(vec_ty)
+    elsize = compute_type_size(el, state.data_layout)
+    el_spirv = map_type!(state.type_ctx, el)
+    u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+    base_u64 = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, ptr_id)
+    for i in 0:(length(vec_ty) - 1)
+        comp = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpCompositeExtract, el_spirv, comp,
+                            val_id, UInt32(i))
+        cptr = psb_component_pointer!(state, base_u64, i * elsize)
+        get_alignment_for_type(el) <= 4 ?
+            emit_psb_decomposed_small_store!(state, cptr, comp, el) :
+            emit_psb_decomposed_store!(state, cptr, comp, el)
+    end
 end
 
 function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
@@ -5562,7 +5657,11 @@ function decompose_flat_index_for_composite!(state::SPIRVEmitterState,
 end
 
 function compute_type_size(ty::LLVM.LLVMType, dl::LLVM.DataLayout)
-    if ty isa LLVM.StructType || ty isa LLVM.ArrayType
+    # Vectors with the aggregates: this is a GEP STRIDE as often as a size, and
+    # LLVM steps a `getelementptr <4 x i32>` by the allocation size. Falling to
+    # the default 4 made `unsafe_load(p::Ptr{NTuple{4,VecElement{UInt32}}}, i)`
+    # step 4 bytes per index instead of 16.
+    if ty isa LLVM.StructType || ty isa LLVM.ArrayType || ty isa LLVM.VectorType
         return UInt32(API.LLVMABISizeOfType(dl, ty))
     end
     if ty isa LLVM.LLVMFloat
@@ -8024,6 +8123,31 @@ function emit_extractelement!(state::SPIRVEmitterState, inst::LLVM.ExtractElemen
         encode_instruction!(state.mod.functions, Op.OpVectorExtractDynamic,
                             result_ty, result_id, vec, idx_id)
     end
+    state.value_map[inst] = result_id
+end
+
+"""
+`shufflevector` is `OpVectorShuffle`, operand for operand: two vectors of one
+component type, and a literal index per result component into their
+concatenation. LLVM's undefined mask element (-1) is SPIR-V's `0xFFFFFFFF`.
+
+What produces one: SROA splitting a vector, e.g. `(a[1], a[2])` taken from an
+`NTuple{4,VecElement{Float16}}` becomes `shufflevector <4 x half> %a, poison,
+<0, 1>`.
+"""
+function emit_shufflevector!(state::SPIRVEmitterState, inst::LLVM.ShuffleVectorInst)
+    ops = LLVM.operands(inst)
+    v1 = get_value_id!(state, ops[1])
+    v2 = get_value_id!(state, ops[2])
+    result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+    result_id = fresh_id!(state.mod)
+    n = Int(LLVM.API.LLVMGetNumMaskElements(inst))
+    comps = map(0:(n - 1)) do i
+        m = LLVM.API.LLVMGetMaskValue(inst, i)
+        m < 0 ? 0xFFFFFFFF : UInt32(m)
+    end
+    encode_instruction!(state.mod.functions, Op.OpVectorShuffle,
+                        result_ty, result_id, v1, v2, comps...)
     state.value_map[inst] = result_id
 end
 

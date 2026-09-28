@@ -195,6 +195,7 @@ module Op
     const OpConvertUToPtr           = UInt16(120)
     const OpCompositeExtract        = UInt16(81)
     const OpVectorExtractDynamic    = UInt16(77)
+    const OpVectorShuffle           = UInt16(79)
     const OpCompositeConstruct      = UInt16(80)
     # `emit.jl` has always *used* `Op.OpCompositeInsert` — it was simply never
     # declared here, so every kernel that reached that path died with
