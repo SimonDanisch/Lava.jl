@@ -5768,6 +5768,12 @@ function emit_conversion!(state::SPIRVEmitterState, inst::LLVM.Instruction, opco
     end
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, opcode, result_ty, result_id, src)
+    # A float conversion is exact: `Float32(Float16(x))` means the rounding. A
+    # driver may treat an instruction without `NoContraction` as inexact, and
+    # Mesa then folds a narrowing and a widening back into `x`, which silently
+    # drops the rounding (test/spirv/test_fconvert_exact.jl). Arithmetic is not
+    # marked: fusing `a * b + c` is the contraction SPIR-V allows.
+    opcode == Op.OpFConvert && emit_decorate!(state.mod, result_id, Dec.NoContraction)
     state.value_map[inst] = result_id
 end
 

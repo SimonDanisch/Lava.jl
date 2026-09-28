@@ -496,8 +496,11 @@ module Dec
     const Binding           = UInt32(33)
     const DescriptorSet     = UInt32(34)
     const Offset            = UInt32(35)
-    const Restrict          = UInt32(42)
+    # 19, not 42: 42 is NoContraction. Nothing emitted Restrict while it had
+    # the wrong number, so no module carried the mix-up.
+    const Restrict          = UInt32(19)
     const Aliased           = UInt32(20)
+    const NoContraction     = UInt32(42)
 end
 
 # ---- Built-in Variables ----
