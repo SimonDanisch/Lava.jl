@@ -67,6 +67,31 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         check_not(d, "OpAtomicCompareExchange")
     end
 
+    @testset "CAS loop carries the { old, success } aggregate" begin
+        # A hash map's linear probing: LLVM rotates the loop and carries the
+        # cmpxchg result `{ T, i1 }` through a phi. That aggregate has to be a
+        # real SPIR-V struct, or the phi is emitted over the bare old value and
+        # spirv-val rejects it (`compile_and_disasm` validates).
+        function cas_insert(keys, vals, key, val, cap)
+            slot = Int32(1)
+            while true
+                prev = (Lava.Atomix.@atomicreplace keys[slot] typemax(UInt64) => key).old
+                if prev == typemax(UInt64) || prev == key
+                    @inbounds vals[slot] = val
+                    return nothing
+                end
+                slot = slot == cap ? Int32(1) : slot + Int32(1)
+            end
+        end
+        d, _ = compile_and_disasm(cas_insert,
+                                   Tuple{Lava.LavaDeviceArray{UInt64,1},
+                                         Lava.LavaDeviceArray{Int32,1}, UInt64, Int32, Int32})
+        check(d, "OpAtomicCompareExchange")
+        check(d, "Int64Atomics")
+        # The aggregate: `OpCompositeConstruct %struct %old %success`.
+        check_regex(d, "OpCompositeConstruct %_struct_\\d+ %\\d+ %\\d+")
+    end
+
     @testset "barrier" begin
         function barrier_kernel(A)
             Lava.lava_workgroup_barrier()

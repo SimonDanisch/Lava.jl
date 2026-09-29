@@ -403,8 +403,65 @@ end
 
 # ── Functions that ccall libm and must be overridden to avoid GPU crashes ──
 
-@lava_device_override @inline Base.Math.log1p(x::Float32) = log(1.0f0 + x)
-@lava_device_override @inline Base.Math.log1p(x::Float64) = Float64(log(1.0f0 + Float32(x)))
+# openlibm's `log1pf` (FreeBSD `s_log1pf.c`), not `log(1 + x)`: that loses every
+# digit of `x` below the ulp of 1 — at `x = 1e-7` it is 19% off, and TRELLIS.2's
+# `softplus` split weights, `log1p(exp(logit))`, came out 24% wrong on a third
+# of the voxels. Kahan's `log(u) x / (u - 1)` does not help here: the driver
+# folds `(1 + x) - 1` to `x` (the same algebra that folded `x - x` to 0 under
+# `isfinite`), which turns it back into `log(1 + x)`.
+#
+# This form is robust to that folding. Below `sqrt(2) - 1` the polynomial runs
+# on `f = x` itself, which is exact; above, `1 + x` is normalised through its
+# bits, which no algebra sees through. What the folding does cost is the
+# rounding correction `c = 1 - (u - x)`, at most a couple of ulp where it
+# applies (`k > 0`, where `log` is at least 0.35), so it is left out.
+@lava_device_override @inline function Base.Math.log1p(x::Float32)
+    hx = reinterpret(Int32, x)
+    ax = hx & Int32(0x7fffffff)
+    k = Int32(1)
+    f = x
+    hu = Int32(1)
+    if hx < Int32(0x3ed413d0)                  # 1 + x < sqrt(2)
+        ax >= Int32(0x3f800000) && return x == -1.0f0 ? -Inf32 : NaN32   # x <= -1
+        if ax < Int32(0x38000000)              # |x| < 2^-15
+            return ax < Int32(0x33800000) ? x : x - x * x * 0.5f0
+        end
+        if hx > Int32(0) || hx <= reinterpret(Int32, 0xbe95f619)
+            k = Int32(0)                       # sqrt(2)/2 <= 1 + x < sqrt(2)
+        end
+    end
+    hx >= Int32(0x7f800000) && return x + x    # Inf or NaN
+    if k != Int32(0)
+        u = hx < Int32(0x5a000000) ? 1.0f0 + x : x
+        hu = reinterpret(Int32, u)
+        k = (hu >> 23) - Int32(127)
+        hu &= Int32(0x007fffff)
+        if hu < Int32(0x3504f4)                # u < sqrt(2)
+            u = reinterpret(Float32, hu | Int32(0x3f800000))
+        else
+            k += Int32(1)
+            u = reinterpret(Float32, hu | Int32(0x3f000000))
+            hu = (Int32(0x00800000) - hu) >> 2
+        end
+        f = u - 1.0f0
+    end
+    hfsq = 0.5f0 * f * f
+    kf = Float32(k)
+    ln2_hi, ln2_lo = 6.9313812256f-1, 9.0580006145f-6
+    if hu == Int32(0)                          # |f| < 2^-20
+        if f == 0.0f0
+            return k == Int32(0) ? 0.0f0 : kf * ln2_hi + kf * ln2_lo
+        end
+        R = hfsq * (1.0f0 - 0.66666666666666666f0 * f)
+        return k == Int32(0) ? f - R : kf * ln2_hi - ((R - kf * ln2_lo) - f)
+    end
+    s = f / (2.0f0 + f)
+    z = s * s
+    R = z * (6.6666668653f-1 + z * (4.0000000596f-1 + z * (2.8571429849f-1 + z * (2.2222198546f-1 +
+        z * (1.8183572590f-1 + z * (1.5313838422f-1 + z * 1.4798198640f-1))))))
+    return k == Int32(0) ? f - (hfsq - s * (hfsq + R)) : kf * ln2_hi - ((hfsq - (s * (hfsq + R) + kf * ln2_lo)) - f)
+end
+@lava_device_override @inline Base.Math.log1p(x::Float64) = Float64(log1p(Float32(x)))
 
 @lava_device_override @inline function Base.Math.cbrt(x::Float32)
     s = sign(x)

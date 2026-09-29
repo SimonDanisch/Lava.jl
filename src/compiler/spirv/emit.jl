@@ -45,9 +45,6 @@ mutable struct SPIRVEmitterState
     trampolines::Dict{Tuple{UInt32, UInt32}, UInt32}
     # Immediate post-dominator tree: block → ipdom block (for merge block finding)
     ipdom::Dict{LLVM.BasicBlock, LLVM.BasicBlock}
-    # cmpxchg compare value IDs: cmpxchg_inst → compare_value_spirv_id
-    # Used by extractvalue to compute success flag (old == expected)
-    cmpxchg_cmp_vals::Dict{LLVM.Value, UInt32}
     # Block redirects for PHI resolution: (original_block_id, target_block_id) → new_block_id
     # When a loop header is split into header + selection header, PHIs referencing
     # the original header as predecessor must reference the selection header instead.
@@ -228,7 +225,6 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Set{UInt32}(),
         Dict{Tuple{UInt32, UInt32}, UInt32}(),
         Dict{LLVM.BasicBlock, LLVM.BasicBlock}(),
-        Dict{LLVM.Value, UInt32}(),
         Dict{Tuple{UInt32, UInt32}, UInt32}(),
         Dict{LLVM.Value, Tuple{UInt32, Vector{UInt32}, UInt32, LLVM.ArrayType}}(),
         Dict{LLVM.Value, UInt32}(),
@@ -8062,31 +8058,7 @@ function emit_extractvalue!(state::SPIRVEmitterState, inst::LLVM.ExtractValueIns
     indices_ptr = API.LLVMGetIndices(inst)
     indices = UInt32[unsafe_load(indices_ptr, i) for i in 1:n_indices]
 
-    # Special handling for cmpxchg results: { T, i1 }
-    # Our emit_cmpxchg! maps the cmpxchg instruction to just the old value,
-    # and stores the compare value for computing success.
-    if agg_val isa LLVM.AtomicCmpXchgInst
-        old_id = get_value_id!(state, agg_val)
-        if length(indices) == 1 && indices[1] == 0
-            # extractvalue { T, i1 } %result, 0 → old value (already have it)
-            state.value_map[inst] = old_id
-            return
-        elseif length(indices) == 1 && indices[1] == 1
-            # extractvalue { T, i1 } %result, 1 → success flag (old == expected)
-            cmp_id = get(state.cmpxchg_cmp_vals, agg_val, nothing)
-            if cmp_id !== nothing
-                # Emit: success = (old == expected) via OpIEqual
-                bool_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
-                result_id = fresh_id!(state.mod)
-                encode_instruction!(state.mod.functions, Op.OpIEqual,
-                    bool_ty, result_id, old_id, cmp_id)
-                state.value_map[inst] = result_id
-                return
-            end
-        end
-    end
-
-    # Normal extractvalue path
+    # A cmpxchg result is an ordinary `{ T, i1 }` composite here; see emit_cmpxchg!.
     agg = get_value_id!(state, agg_val)
     result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
     result_id = fresh_id!(state.mod)
@@ -8416,21 +8388,30 @@ function emit_cmpxchg!(state::SPIRVEmitterState, inst::LLVM.AtomicCmpXchgInst)
         end
     end
 
-    # OpAtomicCompareExchange returns just the old value (not a struct like LLVM)
-    # LLVM cmpxchg returns { T, i1 } where T is the old value and i1 is success
+    # OpAtomicCompareExchange returns just the old value; LLVM's cmpxchg returns
+    # `{ T, i1 }`, the old value and whether the exchange happened.
     old_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, Op.OpAtomicCompareExchange,
         val_ty, old_id, ptr_id, scope_id,
         mem_sem_equal_id, mem_sem_unequal_id,
         new_id, cmp_id)
 
-    # LLVM cmpxchg result is { T, i1 }. Users extract with extractvalue.
-    # We store the old value and compute success (old == expected) lazily in extractvalue.
-    # Store a mapping: inst → old_id, and handle extractvalue specially.
-    state.value_map[inst] = old_id
-
-    # Store the compare value for extractvalue index 1 (success = old == expected)
-    state.cmpxchg_cmp_vals[inst] = cmp_id
+    # The aggregate is built as a real SPIR-V struct, `(old, old == expected)`,
+    # and the instruction maps to it. Mapping it to the bare old value and
+    # answering `extractvalue` specially covered the straight-line case only:
+    # when LLVM rotates a CAS loop (`while true; prev = cas(...); ... end`, a
+    # hash map's linear probing) the aggregate is loop-carried through a phi,
+    # and that phi was emitted as `OpPhi %struct` over a `%uint` operand, which
+    # spirv-val rejects. As a composite, a phi or an extractvalue sees the type
+    # it declared.
+    agg_ty_llvm = LLVM.value_type(inst)
+    agg_ty = map_type!(state.type_ctx, agg_ty_llvm)
+    bool_ty = map_type!(state.type_ctx, LLVM.elements(agg_ty_llvm)[2])
+    success_id = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpIEqual, bool_ty, success_id, old_id, cmp_id)
+    agg_id = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpCompositeConstruct, agg_ty, agg_id, old_id, success_id)
+    state.value_map[inst] = agg_id
 end
 
 # ================================================================
