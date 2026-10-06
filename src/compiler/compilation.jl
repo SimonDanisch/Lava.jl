@@ -2707,32 +2707,45 @@ function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
                           source_map::Dict{UInt32, Tuple{String, Int}}=Dict{UInt32, Tuple{String, Int}}())
     spirv_val = SPIRV_Tools_jll.spirv_val()
     spirv_dis_cmd = SPIRV_Tools_jll.spirv_dis()
-    spv_path = lava_debug_path("lava_last.spv")
-
-    # Write SPIR-V binary so spirv-val can read it
-    write(spv_path, spirv_bytes)
-    record_subprocess!("write lava_last.spv", 0.0, length(spirv_bytes))
+    # A file of this call's own, not `lava_last.spv`: that is ONE path per
+    # machine, and parallel precompile workers all compile kernels. spirv-val
+    # read whatever another process had just written there, or the empty file
+    # its `write` truncated to — "Invalid instruction word count: 0" and a
+    # duplicate Id in DepthAnything's precompile, on NVIDIA and on RADV; 3 of 300
+    # validations of a valid kernel failed with a second process rewriting the
+    # path. The other direction is silent: an invalid kernel validated as the
+    # valid one next door.
+    val_path = tempname() * ".spv"
+    write(val_path, spirv_bytes)
+    record_subprocess!("write spirv for spirv-val", 0.0, length(spirv_bytes))
 
     # Validate — capture stderr via temp file (spirv-val writes errors to stderr)
     val_err_file = tempname()
     # `lava_run` (not `wait(p)`): the wait condition can be lost once a Vulkan
     # device is up. Fail open on timeout — Vulkan rejects invalid SPIR-V anyway.
-    p = lava_run(pipeline(`$spirv_val --target-env vulkan1.3 --scalar-block-layout $spv_path`;
+    p = lava_run(pipeline(`$spirv_val --target-env vulkan1.3 --scalar-block-layout $val_path`;
                           stderr=val_err_file, stdout=devnull); label="spirv-val")
+    # Kept afterwards as the "last compiled kernel" dump the other compile paths
+    # write too — moved there, never read back from there.
+    spv_path = lava_debug_path("lava_last.spv")
     if !process_exited(p)
         rm(val_err_file; force=true)
+        mv(val_path, spv_path; force = true)
         return nothing
     end
     val_errors = isfile(val_err_file) ? read(val_err_file, String) : ""
     rm(val_err_file; force=true)
-    p.exitcode == 0 && return nothing
+    if p.exitcode == 0
+        mv(val_path, spv_path; force = true)
+        return nothing
+    end
 
     # ── Validation failed — build a useful error message ──
 
     # Disassemble and save (spawn + poll, not the deadlock-prone read(cmd))
     dis = try
         dis_out = tempname() * ".dis"
-        pd = lava_run(pipeline(`$spirv_dis_cmd --no-color $spv_path`; stdout=dis_out); label="spirv-dis")
+        pd = lava_run(pipeline(`$spirv_dis_cmd --no-color $val_path`; stdout=dis_out); label="spirv-dis")
         txt = (process_exited(pd) && pd.exitcode == 0 && isfile(dis_out)) ? read(dis_out, String) : ""
         rm(dis_out; force=true)
         txt
@@ -2744,6 +2757,9 @@ function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
         @warn "Lava: spirv-dis failed; diagnostic will omit the disassembly" exception = ex
         ""
     end
+    # The binary that FAILED, where the message says to look. Another process
+    # may overwrite it later; the message is built from this call's own copy.
+    mv(val_path, spv_path; force = true)
     dis_path = lava_debug_path("lava_last.dis")
     ll_path = lava_debug_path("lava_last.ll")
     isempty(dis) || write(dis_path, dis)
