@@ -3556,8 +3556,19 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
         # matches source_ty. This happens with shared memory globals: the variable is
         # `ptr → [N x T]` but LLVM generates `gep T, ptr @global, i64 %idx`.
         # In SPIR-V we must use OpAccessChain into the array, not OpPtrAccessChain.
+        #
+        # NOT for a PhysicalStorageBuffer pointer. There `gep T, ptr, i` is plain
+        # pointer arithmetic and the byte-offset path below is always right, while
+        # this branch turns it into an index INTO the pointee array — and the size
+        # match cannot tell the two apart for a one-element array, whose element
+        # is as large as the array. Julia's `[1 x [4 x float]]` (a `Vec4f` slot)
+        # stepped back by `i64 -1` became `OpAccessChain %arr %uint_4294967295`:
+        # out of bounds, and on an RTX 3070 Laptop (Ampere, driver 595.91) a hung
+        # dispatch, Xid 109 and a lost device for a 1-based `Vec4f` gather; the
+        # RTX 4000 Ada (595.99) happened to wrap it to the intended -16 bytes.
         base_pointee = get_pointee_type(state.type_ctx.ptm, base_ptr)
-        if base_pointee isa LLVM.ArrayType && (LLVM.eltype(base_pointee) == source_ty ||
+        if sc != SC.PhysicalStorageBuffer && base_pointee isa LLVM.ArrayType &&
+           (LLVM.eltype(base_pointee) == source_ty ||
             compute_type_size(LLVM.eltype(base_pointee), state.data_layout) == compute_type_size(source_ty, state.data_layout))
             idx_i32 = ensure_index_i32!(state, ops[2])
             result_id = fresh_id!(state.mod)
