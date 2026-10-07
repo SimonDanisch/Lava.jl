@@ -157,8 +157,12 @@ using GPUCompiler, LLVM
 
     @testset "lava_run does not quantise short waits to 5 ms" begin
         # The old flat `sleep(0.005)` made every spawn cost >= ~5 ms regardless
-        # of how fast the child was. Assert we are well under two of those.
+        # of how fast the child was. Measured against Base's own blocking `run`
+        # of the same child, so what is asserted is the WAIT, not the spawn: a
+        # process start alone is 15-20 ms on Windows (measured 17 ms on LapWin,
+        # 2026-10-07), which an absolute 4 ms bound read as this regression.
+        base = minimum(@elapsed(run(`true`)) for _ in 1:15)
         best = minimum(@elapsed(Lava.lava_run(`true`; label = "test-fast")) for _ in 1:15)
-        @test best < 0.004
+        @test best - base < 0.004
     end
 end

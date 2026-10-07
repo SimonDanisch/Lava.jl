@@ -24,6 +24,18 @@ using Lava
 # `KernelInterface.vertex_index`, not `Lava.vertex_index`.
 import KernelInterface
 
+# "No Vulkan driver" means no GPU, not no loader. `src/Lava.jl` builds the
+# compiler only under `@static if Vulkan.HAS_LOADER`, and macOS has no loader, so
+# there the module is empty. This suite said so as `UndefVarError:
+# lava_method_table` from its first include; it says it plainly instead.
+# `@static`, so the imports below stay at top level on the machines that run them.
+@static if !Lava.Vulkan.HAS_LOADER
+@info "Lava tests: no Vulkan loader here, so Lava builds no compiler and there is nothing to test"
+@testset "Lava.jl" begin
+    @test_skip Lava.Vulkan.HAS_LOADER
+end
+else
+
 # Loaded once; each test file guards with `@isdefined(SPIRVTestUtils)` so it also
 # runs standalone, which is how a file gets run while a feature is being added.
 include(joinpath(@__DIR__, "test_mul_high_override.jl"))
@@ -99,3 +111,5 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         include(joinpath(@__DIR__, "test_compile_overhead.jl"))
     end
 end
+
+end # @static if Vulkan.HAS_LOADER

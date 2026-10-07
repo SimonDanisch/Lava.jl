@@ -120,7 +120,8 @@ end
     src = joinpath(pkgdir(Lava), "src")
     found = String[]
     for (root, _, files) in walkdir(src), f in files
-        endswith(f, ".jl") && push!(found, relpath(joinpath(root, f), src))
+        # `/` on every OS: `LAVA_SOURCES` is written that way.
+        endswith(f, ".jl") && push!(found, replace(relpath(joinpath(root, f), src), '\\' => '/'))
     end
 
     # Exhaustive in both directions: nothing unlisted, nothing stale.
