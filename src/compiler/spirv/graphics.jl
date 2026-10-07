@@ -409,6 +409,8 @@ function extract_constant_u32(val::LLVM.Value)
 end
 
 function gfx_output_type_from_name(name::String)
+    endswith(name, "_uvec2") && return :uvec2
+    endswith(name, "_u32") && return :u32
     endswith(name, "_vec4") && return :vec4
     endswith(name, "_vec3") && return :vec3
     endswith(name, "_vec2") && return :vec2
@@ -427,6 +429,11 @@ end
 # ── Create I/O Variables ──
 
 function gfx_spirv_type_for_io(mod::SPIRVModule, iotype::Symbol)
+    if iotype == :uvec2
+        return emit_type_vector!(mod,emit_type_int!(mod,UInt32(32),UInt32(0)),UInt32(2))
+    elseif iotype == :u32
+        return emit_type_int!(mod,UInt32(32),UInt32(0))
+    end
     f32_ty = emit_type_float!(mod, UInt32(32))
     if iotype == :f32
         return f32_ty
@@ -918,13 +925,12 @@ function emit_gfx_output_vec2!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
     loc = extract_constant_u32(LLVM.operands(inst)[1])
-    var_id, _ = gfx_io.output_vars[loc]
+    var_id, iotype = gfx_io.output_vars[loc]
 
     x_id = get_value_id!(state, LLVM.operands(inst)[2])
     y_id = get_value_id!(state, LLVM.operands(inst)[3])
 
-    f32_ty = emit_type_float!(mod, UInt32(32))
-    vec2_ty = emit_type_vector!(mod, f32_ty, UInt32(2))
+    vec2_ty = gfx_spirv_type_for_io(mod, iotype)
     vec_id = fresh_id!(mod)
     encode_instruction!(mod.functions, Op.OpCompositeConstruct, vec2_ty, vec_id,
                         x_id, y_id)

@@ -7291,9 +7291,9 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return emit_gfx_output_vec4!(state, inst)
         elseif fn_name == "_lava_gfx_output_vec3" || fn_name == "_lava_gfx_output_flat_vec3"
             return emit_gfx_output_vec3!(state, inst)
-        elseif fn_name == "_lava_gfx_output_vec2" || fn_name == "_lava_gfx_output_flat_vec2"
+        elseif fn_name == "_lava_gfx_output_vec2" || fn_name == "_lava_gfx_output_flat_vec2" || fn_name == "_lava_gfx_output_uvec2"
             return emit_gfx_output_vec2!(state, inst)
-        elseif fn_name == "_lava_gfx_output_f32" || fn_name == "_lava_gfx_output_flat_f32"
+        elseif fn_name == "_lava_gfx_output_f32" || fn_name == "_lava_gfx_output_flat_f32" || fn_name == "_lava_gfx_output_u32"
             return emit_gfx_output_f32!(state, inst)
         elseif fn_name == "_lava_gfx_input_vec4" || fn_name == "_lava_gfx_input_flat_vec4"
             return emit_gfx_input!(state, inst, :vec4)

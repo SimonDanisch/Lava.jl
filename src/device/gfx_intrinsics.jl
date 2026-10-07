@@ -194,6 +194,30 @@ end
 end
 
 # High-level dispatch: gfx_output(location, value)
+@inline function gfx_output_uvec2(location::UInt32, x::UInt32, y::UInt32)
+    Base.llvmcall(("""
+        declare void @_lava_gfx_output_uvec2(i32, i32, i32) #0
+        define void @entry(i32 %loc, i32 %x, i32 %y) #0 {
+            call void @_lava_gfx_output_uvec2(i32 %loc, i32 %x, i32 %y)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32,UInt32,UInt32}, location,x,y)
+end
+
+@inline function gfx_output_u32(location::UInt32, value::UInt32)
+    Base.llvmcall(("""
+        declare void @_lava_gfx_output_u32(i32, i32) #0
+        define void @entry(i32 %loc, i32 %value) #0 {
+            call void @_lava_gfx_output_u32(i32 %loc, i32 %value)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32,UInt32}, location,value)
+end
+
+@inline gfx_output(loc::Integer, v::Vec{2,UInt32}) = gfx_output_uvec2(UInt32(loc),v[1],v[2])
+@inline gfx_output(loc::Integer, v::UInt32) = gfx_output_u32(UInt32(loc),v)
 @inline gfx_output(loc::Integer, v::Vec4f) = gfx_output_vec4(UInt32(loc), v[1], v[2], v[3], v[4])
 @inline gfx_output(loc::Integer, v::Vec3f) = gfx_output_vec3(UInt32(loc), v[1], v[2], v[3])
 @inline gfx_output(loc::Integer, v::Vec2f) = gfx_output_vec2(UInt32(loc), v[1], v[2])
@@ -587,6 +611,8 @@ are positional everywhere else — `location = 0` is the first colour attachment
 the pass, not a name the shader chooses.
 """
 @inline emit_fragment_output(color::Vec4f) = gfx_output(0, color)
+@inline emit_fragment_output(ids::Vec{2,UInt32}) = gfx_output(0, ids)
+@inline emit_fragment_output(id::UInt32) = gfx_output(0, id)
 
 # A fragment shader that returns `nothing` writes no attachment, which is what a
 # depth-only pass wants: the depth test and the depth write are the whole of it,
@@ -1050,6 +1076,8 @@ push!(KNOWN_INTRINSICS, "_lava_gfx_output_f32")
 push!(KNOWN_INTRINSICS, "_lava_gfx_output_vec4")
 push!(KNOWN_INTRINSICS, "_lava_gfx_output_vec3")
 push!(KNOWN_INTRINSICS, "_lava_gfx_output_vec2")
+push!(KNOWN_INTRINSICS, "_lava_gfx_output_uvec2")
+push!(KNOWN_INTRINSICS, "_lava_gfx_output_u32")
 push!(KNOWN_INTRINSICS, "_lava_gfx_output_flat_f32")
 push!(KNOWN_INTRINSICS, "_lava_gfx_output_flat_vec4")
 push!(KNOWN_INTRINSICS, "_lava_gfx_output_flat_vec3")
