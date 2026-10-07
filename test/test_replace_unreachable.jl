@@ -17,6 +17,10 @@
 #      miscompile that motivated the hardening).
 #   3. Lowering an `unreachable` in the *entry/kernel* itself is silent (there
 #      it is a legitimate early thread-exit, the best a GPU can do).
+#   4. A helper NOTHING calls is dead code: removed, and silent. GPUCompiler's
+#      runtime (`gpu_gc_pool_alloc`) stays in a ray-tracing shader's module after
+#      its last caller is optimized away, and warning about it reported a GPU
+#      allocation no shader made.
 
 using Test
 using Lava
@@ -35,11 +39,13 @@ function count_unreachable(mod::LLVM.Module)
     return total
 end
 
-# An entry kernel + two value-returning helpers, each with a throw path that
-# ends in `unreachable`. The pointer-returning helper is the dangerous case.
+# An entry kernel + two value-returning helpers it CALLS, each with a throw path
+# that ends in `unreachable`. The pointer-returning helper is the dangerous case.
 const _IR_KERNEL_AND_HELPERS = """
 define void @kernel(i1 %c) {
 entry:
+  %a = call i32 @helper_i32(i1 %c)
+  %p = call ptr @helper_ptr(i1 %c)
   br i1 %c, label %bad, label %ok
 bad:
   unreachable
@@ -59,6 +65,25 @@ ok:
 define ptr @helper_ptr(i1 %c) {
 entry:
   br i1 %c, label %bad, label %ok
+bad:
+  unreachable
+ok:
+  ret ptr null
+}
+"""
+
+# The shape of the ray-tracing shader that raised a false warning: the runtime's
+# allocator, defined, throwing on its failure path, and called by nobody.
+const _IR_KERNEL_AND_DEAD_HELPER = """
+define void @kernel(i1 %c) {
+entry:
+  ret void
+}
+
+define ptr @gpu_gc_pool_alloc(i64 %sz) {
+entry:
+  %fail = icmp eq i64 %sz, 0
+  br i1 %fail, label %bad, label %ok
 bad:
   unreachable
 ok:
@@ -107,6 +132,17 @@ ok:
                 match_mode = :any,
                 Lava.replace_unreachable!(mod, entry),
             )
+        end
+    end
+
+    @testset "a helper nothing calls is removed, silently" begin
+        LLVM.Context() do ctx
+            mod = parse(LLVM.Module, _IR_KERNEL_AND_DEAD_HELPER)
+            entry = LLVM.functions(mod)["kernel"]
+            @test_logs min_level = Logging.Warn Lava.replace_unreachable!(mod, entry)
+            @test !haskey(LLVM.functions(mod), "gpu_gc_pool_alloc")
+            @test count_unreachable(mod) == 0
+            @test (LLVM.verify(mod); true)
         end
     end
 
