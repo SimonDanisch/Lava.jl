@@ -197,12 +197,9 @@ include("compiler/passes/lower_intrinsics.jl")
 include("compiler/target.jl")
 include("compiler/entry_wrapper.jl")
 include("compiler/compilation.jl")
-# The frozen cache's COMPILER half: keys, paths, eligibility and the
-# ray-tracing entries, which `compilation.jl` consults before it compiles. AFTER
-# it, and that ordering is real rather than tidiness: `FROZEN_LAYOUT` is a
-# `const` that hashes `fieldnames(LavaGPUKernel)` at LOAD time, so the struct has
-# to exist. The device half is `runtime/frozen_pipeline.jl`.
-include("compiler/frozen_spirv.jl")
+# Compiled kernels and stages, kept with their `CodeInstance`s: the lookups in
+# front of `compilation.jl`'s compilers, and what a package image persists.
+include("compiler/cache.jl")
 # Planned files consolidated into emit.jl (4431 lines) and compilation.jl:
 #   sourcemap.jl, intrinsics.jl, control_flow.jl, decorations.jl, compute.jl
 include("compiler/spirv/raytracing.jl")    # RT stages, OpTraceRayKHR, payload handling
@@ -265,11 +262,6 @@ include("device/tensor_intrinsics.jl")     # SPV_NV_tensor_addressing layouts
 include("compiler/frozen_world.jl")
 
 # ---- Launch API (depends on LavaArray / LavaDeviceArray) ----
-# Frozen kernel cache — `launch.jl` calls into it, and it calls `link_kernel`
-# back; both are resolved at call time, so the include order is free.
-# The workload macros sit on top of the frozen cache and PrecompileTools.
-# Pipeline cache persistence — depends on lava_disk_cache_dir from launch.jl;
-# referenced by VkContext constructor (forward at include time, resolved at call time)
 # runtime/sync.jl — sync handled via vk_flush!() in launch.jl
 
 # ---- KernelAbstractions backend ----
@@ -293,22 +285,11 @@ include("compiler/frozen_world.jl")
 
 
 function __init__()
-    # No counters or logs to reset: module-level `Ref`s and `Vector`s let a
-    # device crash during precompilation serialise its wreckage into the
-    # pkgimage and poison every later session. They are `ctx.diag` fields, built
-    # fresh with the context, so nothing survives into the image.
-    # Frozen kernel cache ON by default. The key already mixes in
-    # `Base.module_build_id` of both the kernel's defining module and Lava, so a
-    # changed kernel body produces a different key; `frozen_eligible` restricts
-    # it to package modules, whose build ids actually move (Main's does not --
-    # measured: an edited Main kernel was served stale SPIR-V).
-    #
-    # This is what makes a package's SECOND session cheap: Hikari's 45-kernel
-    # scene goes 31.5 s -> 20.1 s, and per frozen_cache.jl crown's hw_accel
-    # startup ~1063 s -> ~123 s. Recording costs nothing measurable (31.9 s vs
-    # 31.5 s), so both halves are on.
-    FROZEN_VERSION[] = "1"
-    FROZEN_RECORDING[] = true
+    # Device state lives in `ctx.diag` fields, built fresh with the context, so
+    # a device crash during precompilation leaves nothing in the image. The one
+    # module-level counter is the compile statistics, whose image value is
+    # whatever the precompile workload counted.
+    reset_compile_stats!()
 
     # Capture BEFORE any other package loads. The precompile workload above put
     # the pipeline's native code in THIS package image; a later-loaded package

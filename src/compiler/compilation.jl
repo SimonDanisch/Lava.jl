@@ -406,13 +406,6 @@ struct LavaGPUKernel
     # IR, it is session-portable, so the caches keep it.
     source_name::String
 end
-# Backward-compat constructors for cache deserialisation (older entries have
-# fewer fields). A stale entry that misses these raises MethodError/TypeError,
-# which `cache_io_error` classifies as "recompile", not as a failure.
-LavaGPUKernel(spirv_bytes, entry_name, workgroup_size, push_info, ir) =
-    LavaGPUKernel(spirv_bytes, entry_name, workgroup_size, push_info, ir, false, "")
-LavaGPUKernel(spirv_bytes, entry_name, workgroup_size, push_info, ir, enable_ray_query) =
-    LavaGPUKernel(spirv_bytes, entry_name, workgroup_size, push_info, ir, enable_ray_query, "")
 
 # ── Unified introspection result ──
 
@@ -710,10 +703,8 @@ end
 """
     lava_compile_gpu_from_job(job::CompilerJob; validate=true) -> LavaGPUKernel
 
-Run the full LLVM → SPIR-V pipeline on a pre-built `CompilerJob`.  This is the
-`compiler` function passed to `GPUCompiler.cached_compilation` in `launch.jl`,
-so the cache keys it off of Julia's `MethodInstance` (type-based) and gets
-proper world-age tracking for free.
+Run the full LLVM → SPIR-V pipeline on a pre-built `CompilerJob`. Always
+compiles; [`compile_or_lookup`](@ref) is the cache in front of it.
 """
 function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob;
                                     enable_ray_query::Bool = job.config.params.enable_ray_query,
@@ -884,9 +875,8 @@ clear_rt_job_capture!() = (empty!(RT_JOB_CAPTURE); nothing)
 """
     replay_rt_job(job; validate=true) -> LavaRTShader
 
-Recompile a captured shader, from scratch. `frozen_rt_load` is disabled by
-default (`FROZEN_VERSION[] == ""`), so this genuinely re-runs the whole
-pipeline rather than returning a cached result.
+Recompile a captured shader, from scratch: `lava_compile_rt_shader` has no
+cache in front of it, so this re-runs the whole pipeline.
 """
 replay_rt_job(job::RTShaderJob; validate::Bool=true) =
     lava_compile_rt_shader(job.f, job.tt; stage=job.stage,
@@ -906,8 +896,21 @@ struct LavaRTShader
 end
 
 """
+    lava_rt_job(f, tt, features) -> CompilerJob
+
+The compile job of a ray-tracing stage `f` taking arguments of types `tt`, in
+the current world: what a cache of compiled stages looks its entries up by
+(`GPUCompiler.cached_results`), and what `lava_compile_rt_shader` compiles.
+"""
+lava_rt_job(@nospecialize(f), @nospecialize(tt), features::TargetFeatures) =
+    GPUCompiler.CompilerJob(GPUCompiler.methodinstance(typeof(f), tt),
+                            lava_compiler_config(; workgroup_size = (1, 1, 1),
+                                                 enable_ray_query = true, features))
+
+"""
     lava_compile_rt_shader(f, tt; stage=:raygen, push_constant_size=8,
-                            payload_type=:f32, validate=true) -> LavaRTShader
+                            payload_type=:f32, validate=true, features,
+                            job=lava_rt_job(f, tt, features)) -> LavaRTShader
 
 Compile a Julia function to a ray tracing shader stage (raygen, closesthit, miss).
 
@@ -928,31 +931,17 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
                                  push_constant_size::Integer=8,
                                  payload_type::Symbol=:f32,
                                  validate::Bool=true,
-                                 features::TargetFeatures=TargetFeatures())
-    # Before the frozen check, so a cache hit is still recorded — the capture is
-    # about learning WHICH shaders a scene compiles, not about timing them.
-    if get(ENV, "LAVA_CAPTURE_RT_JOBS", "") == "1"
-        push!(RT_JOB_CAPTURE, RTShaderJob(f, tt, stage, payload_type, Int(push_constant_size)))
-    end
-
-    # Frozen SPIR-V, before any of the compiler runs.  Everything below —
-    # GPUCompiler, the LLVM pass pipeline, structurize, the SPIR-V emitter — is
-    # what an hw_accel=true scene pays in every session, and it dwarfs rendering
-    # (crown: ~610 s of compile against ~7.8 s of frames).  `ctx.pipeline_cache`
-    # does not help here; it caches the driver's SPIR-V → ISA step, which cannot
-    # start until this function has produced the SPIR-V.
-    let hit = frozen_rt_load(f, tt, stage, payload_type, push_constant_size, features)
-        hit === nothing || return hit
-    end
-
+                                 features::TargetFeatures=TargetFeatures(),
+                                 job::GPUCompiler.CompilerJob=lava_rt_job(f, tt, features))
+    # Always compiles; `cached_rt_shader` is the lookup in front of this, and
+    # records the capture (`LAVA_CAPTURE_RT_JOBS`).
+    #
     # Per-material chit shaders may do inline shadow-ray traces via ray query
     # (`surface_direct_lighting_inner_typed!`), so the chit shader needs
     # `enable_ray_query=true` to bring in the TLAS variable + the rayQuery
-    # capability. The cost of enabling on RT shaders that don't actually use
-    # ray query is one unused descriptor binding (the driver strips dead code).
-    config = lava_compiler_config(; workgroup_size=(1, 1, 1), enable_ray_query=true, features)
-    source = GPUCompiler.methodinstance(typeof(f), tt)
-    job = GPUCompiler.CompilerJob(source, config)
+    # capability (`lava_rt_job`). The cost of enabling on RT shaders that don't
+    # actually use ray query is one unused descriptor binding (the driver strips
+    # dead code).
 
     GPUCompiler.JuliaContext() do ctx
         local mod, meta
@@ -1005,9 +994,7 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
             checkpoint("validate_spirv")
         end
 
-        shader = LavaRTShader(spirv_bytes, stage, push_info, ir)
-        frozen_rt_store(f, tt, stage, payload_type, push_constant_size, features, shader)
-        return shader
+        return LavaRTShader(spirv_bytes, stage, push_info, ir)
     end
 end
 
@@ -1026,7 +1013,20 @@ struct LavaGfxShader
 end
 
 """
-    lava_compile_gfx_shader(f, tt; stage=:vertex, config=nothing, validate=true) -> LavaGfxShader
+    lava_gfx_job(f, tt) -> CompilerJob
+
+The compile job of a graphics stage `f` taking arguments of types `tt`, in the
+current world. Every stage shares one compiler configuration, so the job is the
+function and the world: what a cache of compiled stages looks its entries up
+by (`GPUCompiler.cached_results`), and what `lava_compile_gfx_shader` compiles.
+"""
+lava_gfx_job(@nospecialize(f), @nospecialize(tt)) =
+    GPUCompiler.CompilerJob(GPUCompiler.methodinstance(typeof(f), tt),
+                            lava_compiler_config(; workgroup_size = (1, 1, 1)))
+
+"""
+    lava_compile_gfx_shader(f, tt; stage=:vertex, config=nothing, validate=true,
+                            job=lava_gfx_job(f, tt)) -> LavaGfxShader
 
 Compile a Julia function to a graphics shader stage (vertex, fragment, geometry,
 tess_control, tess_eval).
@@ -1044,11 +1044,8 @@ Graphics-specific builtins and I/O variables are handled automatically by the em
 function lava_compile_gfx_shader(@nospecialize(f), @nospecialize(tt);
                                    stage::Symbol=:vertex,
                                    config=nothing,
-                                   validate::Bool=true)
-    config_wg = lava_compiler_config(; workgroup_size=(1, 1, 1))
-    source = GPUCompiler.methodinstance(typeof(f), tt)
-    job = GPUCompiler.CompilerJob(source, config_wg)
-
+                                   validate::Bool=true,
+                                   job::GPUCompiler.CompilerJob=lava_gfx_job(f, tt))
     GPUCompiler.JuliaContext() do ctx
         local mod, meta
         try

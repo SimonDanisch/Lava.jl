@@ -6,7 +6,7 @@ a capability declared on a device that lacks it is a **validation error**, not a
 slow path. As a process global pushed when the runtime bound a device, the
 record answers for the bound device rather than the one being
 compiled for. It is part of `LavaCompilerParams` now: a compile job carries it,
-the frozen keys mix it in, and there is no global to swap.
+so it is part of what the compile cache keys on, and there is no global to swap.
 
 The assertions are about the SPIR-V, not about the plumbing. Compiling the same
 raygen shader with `ser = true` and with `ser = false` has to produce modules that
@@ -38,7 +38,8 @@ end
         @test Lava.lava_compiler_config(; features = Lava.TargetFeatures(; ser = true)).params.features.ser
         @test !isdefined(Lava, :targetfeatures)
         @test !isdefined(Lava, :TARGET_FEATURES)
-        # Content-hashed, so a frozen key that mixes it in is stable across sessions.
+        # Content-hashed, so a compiler configuration holding it is the same
+        # configuration in every session.
         @test hash(Lava.TargetFeatures(; ser = true)) == hash(Lava.TargetFeatures(; ser = true))
         @test hash(Lava.TargetFeatures(; ser = true)) != hash(Lava.TargetFeatures())
     end
@@ -49,25 +50,19 @@ end
         tt = Tuple{Lava.LavaDeviceArray{Float32,1}}
         declares_ser(sh) =
             occursin("ShaderInvocationReorder", Lava.disassemble_spirv(sh.spirv_bytes))
-        Lava.frozen_rt_clear!()
-        try
-            on = Lava.lava_compile_rt_shader(tf_raygen_kernel, tt; stage = :raygen,
-                                             features = Lava.TargetFeatures(; ser = true))
-            off = Lava.lava_compile_rt_shader(tf_raygen_kernel, tt; stage = :raygen,
-                                              features = Lava.TargetFeatures(; ser = false))
-            @test declares_ser(on)
-            @test !declares_ser(off)
-            # Both are real modules, so "no capability" is not "no output".
-            @test !isempty(on.spirv_bytes)
-            @test !isempty(off.spirv_bytes)
-            # Two records, two frozen entries.
-            @test Lava.frozen_rt_key(tf_raygen_kernel, tt, :raygen, :f32, 8, Lava.TargetFeatures(; ser = true)) !=
-                  Lava.frozen_rt_key(tf_raygen_kernel, tt, :raygen, :f32, 8, Lava.TargetFeatures())
-            @test Lava.frozen_key(tf_raygen_kernel, tt, (64, 1, 1), Lava.TargetFeatures(; ray_query = true)) !=
-                  Lava.frozen_key(tf_raygen_kernel, tt, (64, 1, 1), Lava.TargetFeatures())
-        finally
-            Lava.frozen_rt_clear!()
-        end
+        cached(features) = Lava.cached_rt_shader(tf_raygen_kernel, tt; stage = :raygen,
+                                                 push_constant_size = 8, payload_type = :f32,
+                                                 features)
+        on = cached(Lava.TargetFeatures(; ser = true))
+        off = cached(Lava.TargetFeatures(; ser = false))
+        @test declares_ser(on)
+        @test !declares_ser(off)
+        # Both are real modules, so "no capability" is not "no output".
+        @test !isempty(on.spirv_bytes)
+        @test !isempty(off.spirv_bytes)
+        # Two records, two cached stages, each found again as itself.
+        @test cached(Lava.TargetFeatures(; ser = true)) === on
+        @test cached(Lava.TargetFeatures(; ser = false)) === off
     end
 
     @testset "ray_query is refused rather than emitted" begin

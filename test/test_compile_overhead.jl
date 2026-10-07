@@ -75,10 +75,10 @@ using GPUCompiler, LLVM
 
     @testset "the profiler can still name a kernel without the IR" begin
         # Gating the IR string initially blinded `kernel_source_name`, which had
-        # recovered the name by regexing the IR. `test_frozen_kernels_visible.jl`
-        # caught it. The name now comes from `source_name` (the mangled entry
-        # symbol), which is small, session-portable and kept by both caches —
-        # so the profiler works whether or not the IR was materialised.
+        # recovered the name by regexing the IR. The name now comes from
+        # `source_name` (the mangled entry symbol), which is small and
+        # session-portable, so the profiler works whether or not the IR was
+        # materialised.
         kernel = withenv("LAVA_DUMP_KERNELS" => nothing,
                          "LAVA_DEBUG_PASSES" => nothing,
                          "LAVA_SPIRV_DUMP_DIR" => nothing) do

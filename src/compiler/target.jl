@@ -87,6 +87,18 @@ end
 # Vulkan doesn't use GPUCompiler's kernel state mechanism
 GPUCompiler.kernel_state_type(::LavaCompilerJob) = Nothing
 
+# Relocatable code, so compiled SPIR-V can go into a package image with its
+# `CodeInstance` (`compiler/cache.jl`): GPUCompiler keeps results across sessions
+# only for the `:patch` and `:table` lowerings. `:table` is the one Vulkan can
+# take — code cannot be patched after `vkCreateShaderModule` — and no Lava kernel
+# needs it: SPIR-V cannot reach host memory, so a kernel that names a host
+# object (a Julia value's address, a global binding) is refused here.
+GPUCompiler.relocation_lowering(::LavaCompilerJob) = :table
+GPUCompiler.relocation_table_pointer(job::LavaCompilerJob, builder, fun) =
+    error("$(job.source) refers to a host object (a Julia value's address or a global " *
+          "binding). A Vulkan kernel cannot reach host memory: pass the value as an " *
+          "argument, or make it a constant the kernel can hold.")
+
 # ── Disable loop unswitching ──
 #
 # GPUCompiler's optimizer runs `SimpleLoopUnswitchPass` (twice, at opt_level≥2).

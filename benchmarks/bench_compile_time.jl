@@ -382,14 +382,10 @@ end
 
 # ── Axis B: world-age invalidation ───────────────────────────────────────────
 #
-# `get_compiled_kernel_and_pipeline` delegates to `GPUCompiler.cached_compilation`,
-# which keys on `(objectid(ci), world, cfg)`. Defining any method anywhere bumps
-# `Base.get_world_counter()`, so the key changes and the kernel is compiled again
-# from scratch — SPIR-V emission, spirv-opt, spirv-val, disk writes and all —
-# even though the source and the argument types are untouched.
-#
-# `frozen_cache.jl` does NOT absorb this: `FROZEN_VERSION[]` is `""` by default,
-# which disables that cache entirely (it is a `@compile_workload` mechanism).
+# Defining any method anywhere bumps `Base.get_world_counter()`. The SPIR-V is
+# kept with the kernel's `CodeInstance` (`Lava.compile_or_lookup`), which an
+# unrelated definition leaves valid, so a launch after a bump should find it and
+# compile nothing; this axis measures whether it does.
 
 const WORLD_BUMPS = Ref(0)
 
@@ -457,10 +453,8 @@ end
 # fingerprint that is invariant to <id> numbering and to instruction ordering.
 #
 # NOTE (worth knowing on its own): this means Lava's SPIR-V is NOT reproducible
-# across sessions, which is an assumption `lava_disk_cache_store` states it
-# relies on ("same (specTypes, workgroup_size) yields the same SPIR-V bytes
-# across sessions, which lets the driver's persistent VkPipelineCache match by
-# bit-identical SPIR-V hash"). That assumption does not currently hold.
+# across sessions, so the driver's persistent VkPipelineCache, which matches by
+# bit-identical SPIR-V, misses for a kernel compiled again in a new session.
 #
 # ── What the fingerprint catches, and what it does not ───────────────────────
 #

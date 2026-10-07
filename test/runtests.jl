@@ -10,7 +10,7 @@
 #            instructions. `spirv/` holds one file per stage and feature.
 #   Tier 1b  Compiler IR passes, on LLVM IR, before any SPIR-V exists.
 #   Tier 2   Validation and structure: every builtin through `spirv-val`, the
-#            emitter's capability decisions, and the compiler's own frozen cache.
+#            emitter's capability decisions, and the compiler's kernel cache.
 #
 # There is no Tier 3: GPU execution is Mantle's.
 #
@@ -82,10 +82,10 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         include(joinpath(@__DIR__, "test_compiler_runtime_split.jl"))
     end
 
-    # The ray-tracing half of the frozen cache takes no context — that asymmetry
-    # is what let it stay with the compiler when the compute half left.
-    @testset "frozen RT cache" begin
-        include(joinpath(@__DIR__, "test_frozen_rt_cache.jl"))
+    # The kernel cache: SPIR-V kept with each `CodeInstance`, found again in a
+    # new world and from the package image, compiled again after an edit.
+    @testset "compile cache" begin
+        include(joinpath(@__DIR__, "test_compile_cache.jl"))
     end
 
     # SPV_NV_tensor_addressing layout emission.

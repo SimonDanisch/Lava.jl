@@ -24,9 +24,8 @@ What had to be untangled before the move was possible, each of which would put a
   * The emitter read `VK_CONTEXT_REF[]` for two booleans (SER, ray-query). It
     reads `TargetFeatures` now, which the runtime pushes from `bind_context!`.
   * `spirv_content_hash` lived with the pipeline code; both sides reached for it.
-  * The frozen cache mixed a SPIR-V cache with a `VkPipelineCache` blob store.
-    The ray-tracing entries take no context and the compute ones take one — that
-    asymmetry was the split.
+  * The kernel cache: the SPIR-V is kept with each kernel's `CodeInstance`
+    (`compiler/cache.jl`), the pipelines built from it are the runtime's.
 
 Parsed, not grepped, so a `VkContext` named in a docstring does not count. Several
 are, deliberately, to say where something went; `Vulkan` itself appears many times
@@ -46,7 +45,7 @@ const LAVA_SOURCES = [
     "runtime/errors.jl",
     "runtime/intrinsics.jl",
     "compiler/phase_timer.jl", "compiler/target.jl", "compiler/entry_wrapper.jl",
-    "compiler/compilation.jl", "compiler/target_features.jl", "compiler/frozen_spirv.jl",
+    "compiler/compilation.jl", "compiler/target_features.jl", "compiler/cache.jl",
     "compiler/frozen_world.jl",
     "compiler/spirv/module.jl", "compiler/spirv/content_hash.jl", "compiler/spirv/types.jl",
     "compiler/spirv/emit.jl", "compiler/spirv/raytracing.jl", "compiler/spirv/rayquery.jl",

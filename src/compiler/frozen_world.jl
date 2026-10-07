@@ -87,12 +87,14 @@ end
 
 PrecompileTools.@setup_workload begin
     PrecompileTools.@compile_workload begin
-        lava_compile_gpu(_precompile_warmup_kernel!,
-                         Tuple{LavaDeviceArray{Float32, 1}, LavaDeviceArray{Float32, 1}};
-                         validate = false)
-        lava_compile_gpu(_precompile_warmup_kernel2!,
-                         Tuple{LavaDeviceArray{Float32, 1}, LavaDeviceArray{Int32, 1},
-                               _PrecompileWarmupParams};
-                         validate = false)
+        # Through the cache, so the image also holds both kernels' SPIR-V with
+        # their `CodeInstance`s, and a session that asks for them compiles nothing.
+        compile_or_lookup(lava_kernel_job(_precompile_warmup_kernel!,
+                                          Tuple{LavaDeviceArray{Float32, 1}, LavaDeviceArray{Float32, 1}};
+                                          workgroup_size = (64, 1, 1)))
+        compile_or_lookup(lava_kernel_job(_precompile_warmup_kernel2!,
+                                          Tuple{LavaDeviceArray{Float32, 1}, LavaDeviceArray{Int32, 1},
+                                                _PrecompileWarmupParams};
+                                          workgroup_size = (64, 1, 1)))
     end
 end
