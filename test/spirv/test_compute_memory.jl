@@ -92,6 +92,28 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         check_regex(d, "OpCompositeConstruct %_struct_\\d+ %\\d+ %\\d+")
     end
 
+    @testset "a struct with nested arrays in workgroup memory" begin
+        # A reduction's partial result: a `Point3f` (`[1 x [3 x float]]`) and a
+        # flag, stored into and loaded from shared memory field by field, each
+        # field through a byte-offset GEP. The second float sits 4 bytes into
+        # element 0 of the outer array; resolving that offset stopped at the
+        # inner array and fell back to dividing by the struct's size, an
+        # `OpPtrAccessChain` spirv-val rejects (`compile_and_disasm` validates).
+        function lane_kernel(out, src)
+            ptr = Lava.lava_alloc_shared(Val(:test_lanes), Tuple{NTuple{1,NTuple{3,Float32}}, Bool}, Val(64))
+            shared = Lava.LavaSharedArray{Tuple{NTuple{1,NTuple{3,Float32}}, Bool}}(ptr, 64)
+            lid = Lava.lava_local_invocation_id_x() + 1
+            @inbounds shared[lid] = (((src[lid], 2f0 * src[lid], 3f0 * src[lid]),), true)
+            Lava.lava_workgroup_barrier()
+            v, ok = @inbounds shared[65 - lid]
+            @inbounds out[lid] = ok ? v[1][2] : 0f0
+            return nothing
+        end
+        d, _ = compile_and_disasm(lane_kernel, Tuple{Lava.LavaDeviceArray{Float32,1}, Lava.LavaDeviceArray{Float32,1}})
+        check(d, "Workgroup")
+        check_not(d, "OpPtrAccessChain %_ptr_Workgroup")
+    end
+
     @testset "barrier" begin
         function barrier_kernel(A)
             Lava.lava_workgroup_barrier()

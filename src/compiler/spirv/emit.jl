@@ -1859,33 +1859,39 @@ function find_struct_member_path_recursive!(path::Vector{Int}, struct_ty::LLVM.S
                 end
                 pop!(path)
             elseif mt isa LLVM.ArrayType
-                # Decompose byte offset within an array member into element index
-                elem_ty = mt.element_type
-                elem_size = Int(compute_type_size(elem_ty, dl))
-                if elem_size > 0
-                    elem_idx = remaining ÷ elem_size
-                    sub_remaining = remaining % elem_size
-                    if sub_remaining == 0
-                        # Exact element boundary
-                        push!(path, i - 1)   # struct member index
-                        push!(path, elem_idx) # array element index
-                        return true
-                    elseif elem_ty isa LLVM.StructType
-                        # Sub-element within array element (nested struct in array)
-                        push!(path, i - 1)
-                        push!(path, elem_idx)
-                        if find_struct_member_path_recursive!(path, elem_ty, sub_remaining, dl)
-                            return true
-                        end
-                        pop!(path)
-                        pop!(path)
-                    end
-                end
+                push!(path, i - 1)
+                find_array_member_path_recursive!(path, mt, remaining, dl) && return true
+                pop!(path)
             end
             return false
         end
     end
     return false
+end
+
+"""
+The element path to `target_offset` bytes into an array: the element index, then,
+for an offset inside the element, the path into it. Elements may be arrays
+themselves: a `Point3f` is `[1 x [3 x float]]`, and its second float sits 4 bytes
+into element 0 of the outer array.
+"""
+function find_array_member_path_recursive!(path::Vector{Int}, arr_ty::LLVM.ArrayType, target_offset::Int, dl)
+    elem_ty = arr_ty.element_type
+    elem_size = Int(compute_type_size(elem_ty, dl))
+    elem_size > 0 || return false
+    elem_idx, sub_remaining = divrem(target_offset, elem_size)
+    elem_idx < arr_ty.length || return false
+    push!(path, elem_idx)
+    sub_remaining == 0 && return true
+    found = if elem_ty isa LLVM.StructType
+        find_struct_member_path_recursive!(path, elem_ty, sub_remaining, dl)
+    elseif elem_ty isa LLVM.ArrayType
+        find_array_member_path_recursive!(path, elem_ty, sub_remaining, dl)
+    else
+        false
+    end
+    found || pop!(path)
+    return found
 end
 
 """
