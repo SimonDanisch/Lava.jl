@@ -8202,7 +8202,7 @@ invocations. Without these, even seq_cst atomics provide only atomicity
 writes node data, atomics on a flag, and Thread B reads via the flag.
 """
 function atomic_mem_semantics(inst::LLVM.Instruction, ptr::LLVM.Value)::UInt32
-    ord = inst.ordering
+    ord = atomic_ordering(inst)
 
     # Determine storage class bit for the pointer's memory
     sc = get_pointer_storage_class(ptr)
@@ -8229,9 +8229,18 @@ function atomic_mem_semantics(inst::LLVM.Instruction, ptr::LLVM.Value)::UInt32
     end
 end
 
+"""
+The ordering an atomic instruction's memory semantics come from. A `cmpxchg` has
+two, and LLVM.jl 10 refuses `ordering` on one: the semantics of the exchange are
+its success ordering's, and [`atomic_mem_semantics_acquire_only`](@ref) reads the
+failure ordering for the path where it writes nothing.
+"""
+atomic_ordering(inst::LLVM.AtomicCmpXchgInst) = inst.success_ordering
+atomic_ordering(inst::LLVM.Instruction) = inst.ordering
+
 """Acquire-only variant for cmpxchg failure path (no release, a failed CAS writes nothing)."""
-function atomic_mem_semantics_acquire_only(inst::LLVM.Instruction, ptr::LLVM.Value)::UInt32
-    ord = inst.ordering
+function atomic_mem_semantics_acquire_only(inst::LLVM.AtomicCmpXchgInst, ptr::LLVM.Value)::UInt32
+    ord = inst.failure_ordering
     if ord == LLVM.API.LLVMAtomicOrderingMonotonic ||
        ord == LLVM.API.LLVMAtomicOrderingUnordered
         return MemSem.Relaxed
