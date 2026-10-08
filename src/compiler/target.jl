@@ -87,6 +87,60 @@ end
 # Vulkan doesn't use GPUCompiler's kernel state mechanism
 GPUCompiler.kernel_state_type(::LavaCompilerJob) = Nothing
 
+# ── Finishing the IR for Lava's emitter ──
+#
+# Since 2.13, GPUCompiler's SPIR-V target selects `__spirv_Atomic*` builtins for
+# LLVM's atomics in `finish_ir!`, and its `validate_ir` rejects atomics outside
+# address spaces 1, 3 and 4. Both are for the Khronos translator and LLVM's SPIR-V
+# back-end. Lava emits SPIR-V itself: it lowers `atomicrmw` and `cmpxchg` to the
+# atomic instructions, on PhysicalStorageBuffer pointers, which are address space 0.
+# So these two keep the target's other steps and leave the atomics to the emitter.
+function GPUCompiler.validate_ir(job::LavaCompilerJob, mod::LLVM.Module)
+    errors = GPUCompiler.IRError[]
+    target = job.config.target
+    target.supports_fp16 || append!(errors, GPUCompiler.check_ir_values(mod, LLVM.HalfType()))
+    target.supports_fp64 || append!(errors, GPUCompiler.check_ir_values(mod, LLVM.DoubleType()))
+    target.supports_bfloat16 ||
+        append!(errors, GPUCompiler.check_ir_values(mod, LLVM.BFloatType()))
+    return errors
+end
+
+function GPUCompiler.finish_ir!(job::LavaCompilerJob, mod::LLVM.Module, entry::LLVM.Function)
+    # SPIR-V cannot abort a compute kernel: `trap` goes, `unreachable` becomes `ret`
+    GPUCompiler.lower_unreachable_control_flow!(job, mod)
+    demote_atomic_accesses!(mod)
+    # LLVM's minimum/maximum order signed zeros and propagate NaNs
+    GPUCompiler.lower_minimum_maximum!(mod)
+    # byval parameters wrapped in a struct, which the entry wrapper expects
+    job.config.kernel && (entry = GPUCompiler.wrap_byval(job, mod, entry))
+    # SPIR-V has no i128: alloca arrays of it become vectors
+    GPUCompiler.convert_i128_allocas!(mod)
+    push!(get!(mod.metadata, "opencl.ocl.version").operands,
+          LLVM.MDNode([LLVM.ConstantInt(Int32(2)), LLVM.ConstantInt(Int32(0))]))
+    push!(get!(mod.metadata, "opencl.spirv.version").operands,
+          LLVM.MDNode([LLVM.ConstantInt(Int32(1)), LLVM.ConstantInt(Int32(5))]))
+    return entry
+end
+
+"""
+    demote_atomic_accesses!(mod) -> Bool
+
+Make every atomic load and store a plain one, leaving `atomicrmw` and `cmpxchg`.
+The emitter has no atomic load or store, and on the device the orderings of the
+loads and stores Julia emits (type tags, references, `unordered` heap accesses)
+carry no meaning. GPUCompiler did this for every SPIR-V job until 2.10.
+"""
+function demote_atomic_accesses!(mod::LLVM.Module)
+    changed = false
+    for f in mod.functions, bb in f.blocks, inst in bb.instructions
+        (inst isa LLVM.LoadInst || inst isa LLVM.StoreInst) || continue
+        LLVM.isatomic(inst) || continue
+        inst.ordering = LLVM.AtomicOrdering.NotAtomic
+        changed = true
+    end
+    return changed
+end
+
 # Relocatable code, so compiled SPIR-V can go into a package image with its
 # `CodeInstance` (`compiler/cache.jl`): GPUCompiler keeps results across sessions
 # only for the `:patch` and `:table` lowerings. `:table` is the one Vulkan can
