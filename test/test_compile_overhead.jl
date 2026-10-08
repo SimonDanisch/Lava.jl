@@ -122,7 +122,7 @@ using GPUCompiler, LLVM
             job = GPUCompiler.CompilerJob(source, config)
             m, meta = GPUCompiler.compile(:llvm, job)
             cache = Dict{LLVM.API.LLVMMetadataRef, Union{Nothing, Tuple{String, Int}}}()
-            for fn in LLVM.functions(m), bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+            for fn in m.functions, bb in fn.blocks, inst in bb.instructions
                 dbg = Lava.instruction_diloc(inst)
                 dbg === nothing && continue
                 a = Lava.diloc_outermost(dbg, cache)

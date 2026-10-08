@@ -472,7 +472,7 @@ function lava_compile_full(@nospecialize(f), @nospecialize(tt);
             wrap_gpu_compiler_error(e, f, tt)
         end
         entry_fn = meta.entry
-        entry_name = LLVM.name(entry_fn)
+        entry_name = entry_fn.name
 
         # Capture pre-pass IR
         pre_pass_ir = string(mod)
@@ -480,7 +480,7 @@ function lava_compile_full(@nospecialize(f), @nospecialize(tt);
         # BDA entry wrapper
         push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size)
         wrapper_name = push_info.wrapper_name
-        wrapper_fn = LLVM.functions(mod)[wrapper_name]
+        wrapper_fn = mod.functions[wrapper_name]
 
         # LLVM passes
         run_llvm_passes!(mod, wrapper_fn; kernelname = entry_name)
@@ -521,13 +521,13 @@ function lava_compile_gfx_full(@nospecialize(f), @nospecialize(tt);
             wrap_gpu_compiler_error(e, f, tt)
         end
         entry_fn = meta.entry
-        entry_name = LLVM.name(entry_fn)
+        entry_name = entry_fn.name
 
         pre_pass_ir = string(mod)
 
         push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
         wrapper_name = push_info.wrapper_name
-        wrapper_fn = LLVM.functions(mod)[wrapper_name]
+        wrapper_fn = mod.functions[wrapper_name]
 
         # GFX shader emission has no multi-OpFunction walker, so this path
         # collapses the module into one.
@@ -568,13 +568,13 @@ function lava_compile_rt_full(@nospecialize(f), @nospecialize(tt);
             wrap_gpu_compiler_error(e, f, tt)
         end
         entry_fn = meta.entry
-        entry_name = LLVM.name(entry_fn)
+        entry_name = entry_fn.name
 
         pre_pass_ir = string(mod)
 
         push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
         wrapper_name = push_info.wrapper_name
-        wrapper_fn = LLVM.functions(mod)[wrapper_name]
+        wrapper_fn = mod.functions[wrapper_name]
 
         # RT shader emission has no multi-OpFunction walker, so this path
         # collapses the module into one.
@@ -650,7 +650,7 @@ function lava_compile_to_llvm(@nospecialize(f), @nospecialize(tt);
         catch e
             wrap_gpu_compiler_error(e, f, tt)
         end
-        entry_name = LLVM.name(meta.entry)
+        entry_name = meta.entry.name
         ir = string(mod)
         return LavaLLVMResult(ir, entry_name, workgroup_size)
     end
@@ -680,7 +680,7 @@ function lava_compile_to_spirv(@nospecialize(f), @nospecialize(tt);
             wrap_gpu_compiler_error(e, f, tt)
         end
         entry_fn = meta.entry
-        entry_name = LLVM.name(entry_fn)
+        entry_name = entry_fn.name
 
         # ── Stage 1: LLVM passes ──
         run_llvm_passes!(mod, entry_fn)
@@ -732,7 +732,7 @@ function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob;
             wrap_gpu_compiler_error(e, job.source.def.sig, job.source.specTypes)
         end
         entry_fn = meta.entry
-        entry_name = LLVM.name(entry_fn)
+        entry_name = entry_fn.name
         phase_kernel!(entry_name)
 
         # ── Stage 0: BDA entry wrapper ──
@@ -743,7 +743,7 @@ function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob;
         wrapper_name = push_info.wrapper_name
 
         # The wrapper function is now the entry point
-        wrapper_fn = LLVM.functions(mod)[wrapper_name]
+        wrapper_fn = mod.functions[wrapper_name]
 
         # ── Stage 1: LLVM passes ──
         timed_phase("stage", "run_llvm_passes!") do
@@ -953,7 +953,7 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
         end
         checkpoint("GPUCompiler.compile(:llvm)")
         entry_fn = meta.entry
-        entry_name = LLVM.name(entry_fn)
+        entry_name = entry_fn.name
         # Tag this compile's phases with the shader they belong to. Without it
         # every RT phase inherits whatever `lava_compile_gpu_from_job` set last,
         # so a per-shader breakdown bills all five RT shaders to some unrelated
@@ -964,7 +964,7 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
         # BDA entry wrapper (same as compute — args via push constant buffer)
         push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
         wrapper_name = push_info.wrapper_name
-        wrapper_fn = LLVM.functions(mod)[wrapper_name]
+        wrapper_fn = mod.functions[wrapper_name]
         checkpoint("wrap_entry_for_vulkan!")
 
         # LLVM passes. The RT emitter now has the multi-OpFunction walker, so
@@ -1054,12 +1054,12 @@ function lava_compile_gfx_shader(@nospecialize(f), @nospecialize(tt);
             wrap_gpu_compiler_error(e, f, tt)
         end
         entry_fn = meta.entry
-        entry_name = LLVM.name(entry_fn)
+        entry_name = entry_fn.name
 
         # BDA entry wrapper (same as compute — args via push constant buffer)
         push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
         wrapper_name = push_info.wrapper_name
-        wrapper_fn = LLVM.functions(mod)[wrapper_name]
+        wrapper_fn = mod.functions[wrapper_name]
 
         # LLVM passes; GFX emit has no multi-OpFunction walker, so the module
         # collapses into one.
@@ -1145,15 +1145,15 @@ real work; neither is done. Until then this is a no-op that costs compile time,
 hence `LOOP_UNROLL[] = false`.
 
 Note the pass plumbing itself is correct and worth keeping: loop passes need a
-`NewPMLoopPassManager` nested in a function pass manager, and the loop must be
+`LoopPassManager` nested in a function pass manager, and the loop must be
 rotated with a canonical induction variable before the trip count is visible.
 """
 function unroll_loops!(mod::LLVM.Module)
     LOOP_UNROLL[] || return mod
-    @dispose pb = LLVM.NewPMPassBuilder() begin
-        LLVM.add!(pb, LLVM.NewPMFunctionPassManager()) do fpm
+    @dispose pb = LLVM.PassBuilder() begin
+        LLVM.add!(pb, LLVM.FunctionPassManager()) do fpm
             LLVM.add!(fpm, LLVM.LoopSimplifyPass())
-            LLVM.add!(fpm, LLVM.NewPMLoopPassManager()) do lpm
+            LLVM.add!(fpm, LLVM.LoopPassManager()) do lpm
                 LLVM.add!(lpm, LLVM.LoopRotatePass())
                 LLVM.add!(lpm, LLVM.IndVarSimplifyPass())
             end
@@ -1338,7 +1338,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # storage type with its uniform access pattern (e.g. MVector{N, Vec3f}
     # alloca [N x i64] → [3N x float]), eliminating the per-access type-pun
     # fixups the emitter would otherwise need.
-    retype_uniform_typed_allocas!(mod, LLVM.datalayout(mod))
+    retype_uniform_typed_allocas!(mod, mod.datalayout)
     if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
         write(lava_debug_path("lava_ir_2_post_retype.ll"), string(mod))
     end
@@ -1368,7 +1368,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # ── Lift byte-offset GEPs on workgroup globals ──
     # Convert `gep i8, @shared, <offset>` ConstantExpr to typed struct-member GEPs.
     # Must run before decompose passes so the emitter sees proper typed access patterns.
-    dl = LLVM.datalayout(mod)
+    dl = mod.datalayout
     # ── Decompose workgroup typepun copies ──
     # LLVM may optimize shared memory struct copies (shared[i] = shared[j]) into raw
     # integer block copies. Detect and replace with per-field typed copies.
@@ -1533,15 +1533,15 @@ function fix_bool_call_mismatches!(mod::LLVM.Module)
     i8_ty  = LLVM.Int8Type()
     to_fix = Tuple{LLVM.CallInst, LLVM.Function}[]
 
-    for fn in LLVM.functions(mod)
-        for bb in LLVM.blocks(fn)
-            for inst in LLVM.instructions(bb)
+    for fn in mod.functions
+        for bb in fn.blocks
+            for inst in bb.instructions
                 inst isa LLVM.CallInst || continue
-                called = LLVM.called_operand(inst)
+                called = inst.called_operand
                 called isa LLVM.Function || continue
                 # Check: call site returns i8 but definition returns i1
-                LLVM.value_type(inst) == i8_ty || continue
-                def_ret = LLVM.return_type(LLVM.function_type(called))
+                inst.value_type == i8_ty || continue
+                def_ret = called.function_type.return_type
                 def_ret == i1_ty || continue
                 push!(to_fix, (inst, called))
             end
@@ -1551,7 +1551,7 @@ function fix_bool_call_mismatches!(mod::LLVM.Module)
     for (call_inst, callee) in to_fix
         # Build replacement: call i1 @callee(); zext i1 to i8
         LLVM.@dispose builder=LLVM.IRBuilder() begin
-            LLVM.position!(builder, call_inst)
+            LLVM.position!(builder, insertion_point(call_inst))
             fn_ty = LLVM.FunctionType(i1_ty, LLVM.LLVMType[])
             new_call = LLVM.call!(builder, fn_ty, callee)
             zext_val = LLVM.zext!(builder, new_call, i8_ty)
@@ -1605,9 +1605,9 @@ function outline_oversized!(mod::LLVM.Module; force_inline_all::Bool=false)
 
     function max_bbs_per_function(mod)
         m = 0
-        for fn in LLVM.functions(mod)
-            isempty(LLVM.blocks(fn)) && continue
-            n = count(_ -> true, LLVM.blocks(fn))
+        for fn in mod.functions
+            isempty(fn.blocks) && continue
+            n = count(_ -> true, fn.blocks)
             m = max(m, n)
         end
         m
@@ -1627,9 +1627,9 @@ function outline_oversized!(mod::LLVM.Module; force_inline_all::Bool=false)
     function iterate_pass!(pass_ctor)
         for _ in 1:8
             max_bbs_per_function(mod) <= threshold && return true
-            before_n = count(_ -> true, LLVM.functions(mod))
+            before_n = count(_ -> true, mod.functions)
             LLVM.run!(pass_ctor(), mod)
-            after_n = count(_ -> true, LLVM.functions(mod))
+            after_n = count(_ -> true, mod.functions)
             after_n == before_n && return false
         end
         return false
@@ -1647,12 +1647,12 @@ function collect_reachable_callees(entry_fn::LLVM.Function)
     function visit(fn::LLVM.Function)
         fn in visited && return
         push!(visited, fn)
-        for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+        for bb in fn.blocks, inst in bb.instructions
             inst isa LLVM.CallInst || continue
-            callee = LLVM.called_operand(inst)
+            callee = inst.called_operand
             callee isa LLVM.Function || continue
-            isempty(LLVM.blocks(callee)) && continue
-            startswith(LLVM.name(callee), "llvm.") && continue
+            isempty(callee.blocks) && continue
+            startswith(callee.name, "llvm.") && continue
             visit(callee)
         end
         push!(order, fn)  # post-order: callees pushed before caller
@@ -1676,9 +1676,9 @@ function strongly_connected_components(fns::Vector{LLVM.Function})
         next_index[] += 1
         push!(stack, v)
         push!(on_stack, v)
-        for bb in LLVM.blocks(v), inst in LLVM.instructions(bb)
+        for bb in v.blocks, inst in bb.instructions
             inst isa LLVM.CallInst || continue
-            w = LLVM.called_operand(inst)
+            w = inst.called_operand
             w isa LLVM.Function || continue
             w in fnset || continue
             if !haskey(indices, w)
@@ -1720,12 +1720,12 @@ function trace_alloca_allocated_type(value::LLVM.Value,
     if value isa LLVM.AllocaInst
         return LLVM.LLVMType(API.LLVMGetAllocatedType(value))
     elseif value isa LLVM.GetElementPtrInst
-        return trace_alloca_allocated_type(LLVM.operands(value)[1], visited)
+        return trace_alloca_allocated_type(value.operands[1], visited)
     elseif value isa LLVM.BitCastInst || value isa LLVM.AddrSpaceCastInst
-        return trace_alloca_allocated_type(LLVM.operands(value)[1], visited)
+        return trace_alloca_allocated_type(value.operands[1], visited)
     elseif value isa LLVM.PHIInst
         incoming_types = LLVM.LLVMType[]
-        for (val, _) in LLVM.incoming(value)
+        for (val, _) in value.incoming
             t = trace_alloca_allocated_type(val, visited)
             t === nothing && return nothing
             push!(incoming_types, t)
@@ -1748,17 +1748,17 @@ types to match the parameter type — no implicit coercion.
 """
 function helper_gep_element_types(fn::LLVM.Function, param::LLVM.Argument)
     types = Set{LLVM.LLVMType}()
-    for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+    for bb in fn.blocks, inst in bb.instructions
         if inst isa LLVM.GetElementPtrInst
-            ops = LLVM.operands(inst)
+            ops = inst.operands
             ops[1] === param || continue
             src_ty = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(inst))
             push!(types, src_ty)
         elseif inst isa LLVM.LoadInst || inst isa LLVM.StoreInst
-            ptr_op = inst isa LLVM.LoadInst ? LLVM.operands(inst)[1] : LLVM.operands(inst)[2]
+            ptr_op = inst isa LLVM.LoadInst ? inst.operands[1] : inst.operands[2]
             ptr_op === param || continue
-            loaded_ty = inst isa LLVM.LoadInst ? LLVM.value_type(inst) :
-                                                  LLVM.value_type(LLVM.operands(inst)[1])
+            loaded_ty = inst isa LLVM.LoadInst ? inst.value_type :
+                                                  inst.operands[1].value_type
             push!(types, loaded_ty)
         end
     end
@@ -1781,8 +1781,8 @@ inside one OpFunction, where Lava's PTM resolves the pointer's type
 context-locally per access.
 """
 function has_alloca_type_mismatch_at_callsites(fn::LLVM.Function, mod::LLVM.Module)
-    params = collect(LLVM.parameters(fn))
-    ptr_params = [(i, p) for (i, p) in enumerate(params) if LLVM.value_type(p) isa LLVM.PointerType]
+    params = collect(fn.parameters)
+    ptr_params = [(i, p) for (i, p) in enumerate(params) if p.value_type isa LLVM.PointerType]
     isempty(ptr_params) && return false
 
     # For each pointer param, find the helper's expected element type(s).
@@ -1799,14 +1799,14 @@ function has_alloca_type_mismatch_at_callsites(fn::LLVM.Function, mod::LLVM.Modu
         caller_types_per_param[i] = Set{LLVM.LLVMType}()
     end
     has_any_callsite = false
-    for caller in LLVM.functions(mod)
-        isempty(LLVM.blocks(caller)) && continue
-        for bb in LLVM.blocks(caller), inst in LLVM.instructions(bb)
+    for caller in mod.functions
+        isempty(caller.blocks) && continue
+        for bb in caller.blocks, inst in bb.instructions
             inst isa LLVM.CallInst || continue
-            callee = LLVM.called_operand(inst)
+            callee = inst.called_operand
             callee === fn || continue
             has_any_callsite = true
-            ops = LLVM.operands(inst)
+            ops = inst.operands
             n_args = length(ops) - 1
             for (i, _) in ptr_params
                 i <= n_args || continue
@@ -1847,7 +1847,7 @@ const FORCE_INLINE_KERNEL_PATTERNS = String[]
 
 function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
                             force_inline_all::Bool=false)
-    entry_name = LLVM.name(entry_fn)
+    entry_name = entry_fn.name
     # Promote to force_inline_all if entry_fn matches any debug pattern
     if !force_inline_all && !isempty(FORCE_INLINE_KERNEL_PATTERNS)
         if any(p -> occursin(p, entry_name), FORCE_INLINE_KERNEL_PATTERNS)
@@ -1856,12 +1856,12 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
     end
 
     if force_inline_all
-        for fn in LLVM.functions(mod)
-            fn_name = LLVM.name(fn)
+        for fn in mod.functions
+            fn_name = fn.name
             fn === entry_fn && continue
-            isempty(LLVM.blocks(fn)) && continue
+            isempty(fn.blocks) && continue
             startswith(fn_name, "llvm.") && continue
-            attrs = LLVM.function_attributes(fn)
+            attrs = fn.function_attributes
             delete!(attrs, LLVM.EnumAttribute("noinline"))
             push!(attrs, LLVM.EnumAttribute("alwaysinline"))
         end
@@ -1892,21 +1892,21 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
                                 "jl_throw")
 
         wrapper_direct_callees = Set{String}()
-        for bb in LLVM.blocks(entry_fn), inst in LLVM.instructions(bb)
+        for bb in entry_fn.blocks, inst in bb.instructions
             inst isa LLVM.CallInst || continue
-            callee = LLVM.called_operand(inst)
+            callee = inst.called_operand
             callee isa LLVM.Function || continue
-            isempty(LLVM.blocks(callee)) && continue
-            push!(wrapper_direct_callees, LLVM.name(callee))
+            isempty(callee.blocks) && continue
+            push!(wrapper_direct_callees, callee.name)
         end
 
-        for fn in LLVM.functions(mod)
-            isempty(LLVM.blocks(fn)) && continue
-            startswith(LLVM.name(fn), "llvm.") && continue
-            fname = LLVM.name(fn)
+        for fn in mod.functions
+            isempty(fn.blocks) && continue
+            startswith(fn.name, "llvm.") && continue
+            fname = fn.name
             any(p -> occursin(p, fname), must_inline_prefixes) && continue
             fname in wrapper_direct_callees && continue
-            attrs = LLVM.function_attributes(fn)
+            attrs = fn.function_attributes
             delete!(attrs, LLVM.EnumAttribute("alwaysinline"))
         end
 
@@ -1918,13 +1918,13 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
         # so if it survives as an OpFunction the emitter aborts on parameter 1.
         # Same storage-class-comes-from-the-call-site problem as the
         # pointer-return rule below, one argument position over. Mark them.
-        for fn in LLVM.functions(mod)
-            isempty(LLVM.blocks(fn)) && continue
-            fname = LLVM.name(fn)
+        for fn in mod.functions
+            isempty(fn.blocks) && continue
+            fname = fn.name
             startswith(fname, "llvm.") && continue
             fn === entry_fn && continue
             any(p -> occursin(p, fname), must_inline_prefixes) || continue
-            attrs = LLVM.function_attributes(fn)
+            attrs = fn.function_attributes
             delete!(attrs, LLVM.EnumAttribute("noinline"))
             push!(attrs, LLVM.EnumAttribute("alwaysinline"))
         end
@@ -1941,13 +1941,13 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
         # because the emitter has no way to pick a storage class.  Re-mark
         # `alwaysinline` (and strip `noinline`) so the AlwaysInlinerPass below
         # eats them and DCE removes the surrounding error path entirely.
-        for fn in LLVM.functions(mod)
-            isempty(LLVM.blocks(fn)) && continue
-            startswith(LLVM.name(fn), "llvm.") && continue
+        for fn in mod.functions
+            isempty(fn.blocks) && continue
+            startswith(fn.name, "llvm.") && continue
             fn === entry_fn && continue
-            fn_ty = LLVM.function_type(fn)
-            LLVM.return_type(fn_ty) isa LLVM.PointerType || continue
-            attrs = LLVM.function_attributes(fn)
+            fn_ty = fn.function_type
+            fn_ty.return_type isa LLVM.PointerType || continue
+            attrs = fn.function_attributes
             delete!(attrs, LLVM.EnumAttribute("noinline"))
             push!(attrs, LLVM.EnumAttribute("alwaysinline"))
         end
@@ -1961,10 +1961,10 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
         # Logical addressing. Re-mark such helpers `alwaysinline` so the
         # type-pun stays inside one OpFunction where Lava's PTM resolves it
         # context-locally.
-        for fn in LLVM.functions(mod)
-            isempty(LLVM.blocks(fn)) && continue
-            startswith(LLVM.name(fn), "llvm.") && continue
-            fname = LLVM.name(fn)
+        for fn in mod.functions
+            isempty(fn.blocks) && continue
+            startswith(fn.name, "llvm.") && continue
+            fname = fn.name
             fn === entry_fn && continue
             any(p -> occursin(p, fname), must_inline_prefixes) && continue
             # NOTE: do NOT skip wrapper_direct_callees here. Even kernels called
@@ -1972,12 +1972,12 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
             # disagree on pointer-arg alloca types — the SPIR-V type mismatch is
             # a hard validation error.
 
-            has_ptr_param = any(p -> LLVM.value_type(p) isa LLVM.PointerType,
-                                LLVM.parameters(fn))
+            has_ptr_param = any(p -> p.value_type isa LLVM.PointerType,
+                                fn.parameters)
             has_ptr_param || continue
 
             if has_alloca_type_mismatch_at_callsites(fn, mod)
-                attrs = LLVM.function_attributes(fn)
+                attrs = fn.function_attributes
                 delete!(attrs, LLVM.EnumAttribute("noinline"))
                 push!(attrs, LLVM.EnumAttribute("alwaysinline"))
             end
@@ -2019,13 +2019,13 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # register frame.
     rayquery_init_callers = Set{LLVM.Function}()
     rayquery_other_callers = Set{LLVM.Function}()
-    for fn in LLVM.functions(mod)
-        isempty(LLVM.blocks(fn)) && continue
-        for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+    for fn in mod.functions
+        isempty(fn.blocks) && continue
+        for bb in fn.blocks, inst in bb.instructions
             inst isa LLVM.CallInst || continue
-            callee = LLVM.called_operand(inst)
+            callee = inst.called_operand
             callee isa LLVM.Function || continue
-            cname = LLVM.name(callee)
+            cname = callee.name
             startswith(cname, "lava_ray_query_") || continue
             if cname == "lava_ray_query_init"
                 push!(rayquery_init_callers, fn)
@@ -2040,7 +2040,7 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
     incomplete_rayquery = symdiff(rayquery_init_callers, rayquery_other_callers)
     for fn in incomplete_rayquery
         fn === entry_fn && continue
-        attrs = LLVM.function_attributes(fn)
+        attrs = fn.function_attributes
         delete!(attrs, LLVM.EnumAttribute("noinline"))
         push!(attrs, LLVM.EnumAttribute("alwaysinline"))
     end
@@ -2091,18 +2091,18 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
 
     # Create emitter state
     state = SPIRVEmitterState(spirv_mod, type_ctx)
-    state.data_layout = LLVM.datalayout(llvm_mod)
+    state.data_layout = llvm_mod.datalayout
 
     # Find the entry function
-    entry_fn = LLVM.functions(llvm_mod)[entry_name]
+    entry_fn = llvm_mod.functions[entry_name]
 
     # Pre-allocate SPIR-V function IDs for every function with a body so that
     # OpFunctionCall can forward-reference callees regardless of emission order.
     # No effect today (single-function case after force_inline_all!), but enables
     # the multi-function emission walker in Step 6 and avoids needing a strict
     # topological sort. SPIR-V allows forward references to function IDs.
-    for fn in LLVM.functions(llvm_mod)
-        isempty(LLVM.blocks(fn)) && continue
+    for fn in llvm_mod.functions
+        isempty(fn.blocks) && continue
         get!(state.value_map, fn) do
             fresh_id!(spirv_mod)
         end
@@ -2133,22 +2133,22 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
         sccs = strongly_connected_components(reachable)
         for scc in sccs
             if length(scc) > 1
-                names = join(LLVM.name.(scc), " -> ")
+                names = join((f.name for f in scc), " -> ")
                 error("Mutual recursion is not supported in SPIR-V multi-OpFunction emission: cycle through $names")
             end
         end
         emit_check("collect_reachable_callees+SCC")
         for fn in reachable
             fn === entry_fn && continue
-            isempty(LLVM.blocks(fn)) && continue
+            isempty(fn.blocks) && continue
             emit_function!(state, fn; is_entry=false)
         end
         emit_check("emit_function! (helpers)")
     end
 
     # Check if entry function has parameters
-    fn_ty = LLVM.function_type(entry_fn)
-    n_params = length(collect(LLVM.parameters(fn_ty)))
+    fn_ty = entry_fn.function_type
+    n_params = length(collect(fn_ty.parameters))
 
     if n_params == 0
         # No parameters — emit directly as entry point
@@ -2205,8 +2205,8 @@ function emit_entry_wrapper!(state::SPIRVEmitterState, entry_fn::LLVM.Function)
 
     # Build undef arguments for each parameter
     arg_ids = UInt32[]
-    for param in LLVM.parameters(entry_fn)
-        param_ty = LLVM.value_type(param)
+    for param in entry_fn.parameters
+        param_ty = param.value_type
         if param_ty isa LLVM.PointerType
             param_spirv_ty = map_pointer_type_for_value!(state.type_ctx, param)
         else
@@ -2242,10 +2242,10 @@ function emit_globals!(state::SPIRVEmitterState, llvm_mod::LLVM.Module)
     interface_ids = UInt32[]
     wg_globals = LLVM.GlobalVariable[]
 
-    for gv in LLVM.globals(llvm_mod)
-        gv_ty = LLVM.value_type(gv)
+    for gv in llvm_mod.globals
+        gv_ty = gv.value_type
         gv_ty isa LLVM.PointerType || continue
-        as = LLVM.addrspace(gv_ty)
+        as = gv_ty.addrspace
 
         if as == 2
             # Push constant global (addrspace 2)
@@ -2290,7 +2290,7 @@ Creates the struct type with Block decoration, pointer type, and OpVariable.
 """
 function emit_push_constant_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariable)
     mod = state.mod
-    gv_value_ty = LLVM.global_value_type(gv)
+    gv_value_ty = gv.global_value_type
 
     # Map the struct type
     struct_spirv_id = map_type!(state.type_ctx, gv_value_ty)
@@ -2300,7 +2300,7 @@ function emit_push_constant_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVar
 
     # Add MemberOffset decorations
     if gv_value_ty isa LLVM.StructType
-        members = LLVM.elements(gv_value_ty)
+        members = gv_value_ty.elements
         offset = UInt32(0)
         for (i, member_ty) in enumerate(members)
             emit_member_decorate!(mod, struct_spirv_id, UInt32(i - 1), Dec.Offset, offset)
@@ -2358,7 +2358,7 @@ with the Block struct and the note stayed here.
 """
 function emit_workgroup_globals!(state::SPIRVEmitterState,
                                  wg_globals::Vector{<:LLVM.GlobalVariable})
-    member_lly = LLVM.LLVMType[LLVM.global_value_type(gv) for gv in wg_globals]
+    member_lly = LLVM.LLVMType[gv.global_value_type for gv in wg_globals]
     return UInt32[emit_combined_workgroup_block!(state, wg_globals, member_lly)]
 end
 
@@ -2433,7 +2433,7 @@ function emit_combined_workgroup_block!(state::SPIRVEmitterState,
         # (var, inner_type_spirv, inner_llvm_type, member_index) — preamble drills to member i.
         state.wg_wrapped_vars[gv] = (var_id, member_spirv[i], member_lly[i], UInt32(i - 1))
         set_pointee_type!(state.type_ctx.ptm, gv, member_lly[i]; priority=5)
-        gv_name = LLVM.name(gv)
+        gv_name = gv.name
         isempty(gv_name) || emit_name!(mod, var_id, gv_name)
     end
 
@@ -2443,11 +2443,11 @@ end
 """Check if an LLVM type contains an integer element of the given bit width."""
 function wg_type_contains_width(ty::LLVM.LLVMType, bits::Int)
     if ty isa LLVM.IntegerType
-        return LLVM.width(ty) == bits
+        return ty.width == bits
     elseif ty isa LLVM.StructType
-        return any(mt -> wg_type_contains_width(mt, bits), LLVM.elements(ty))
+        return any(mt -> wg_type_contains_width(mt, bits), ty.elements)
     elseif ty isa LLVM.ArrayType
-        return wg_type_contains_width(LLVM.eltype(ty), bits)
+        return wg_type_contains_width(ty.element_type, bits)
     else
         return false
     end
@@ -2494,8 +2494,8 @@ and BuiltIn decoration based on the global's name.
 """
 function emit_builtin_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariable)
     mod = state.mod
-    gv_name = LLVM.name(gv)
-    gv_value_ty = LLVM.global_value_type(gv)
+    gv_name = gv.name
+    gv_value_ty = gv.global_value_type
 
     # Look up builtin decoration from name
     builtin_id = get(SPIRV_BUILTIN_MAP, gv_name, nothing)
@@ -2537,14 +2537,14 @@ end
 Whether code reads `v`: an instruction or a global uses it, directly or through
 constants built on it.
 
-Not `!isempty(LLVM.uses(v))`. LLVM keeps constant expressions alive in the context
+Not `!isempty(v.uses)`. LLVM keeps constant expressions alive in the context
 after the last instruction using them is gone, and each still lists `v` among its
 uses — Julia's `jl_small_typeof` type-tag table in a ray-tracing shader has such
 uses and no reader at all.
 """
 function reached(v::LLVM.Value)
-    for u in LLVM.uses(v)
-        usr = LLVM.user(u)
+    for u in v.uses
+        usr = u.user
         (usr isa LLVM.Instruction || usr isa LLVM.GlobalValue) && return true
         usr isa LLVM.Constant && reached(usr) && return true
     end
@@ -2561,8 +2561,8 @@ an OpVariable in Private storage class with the composite as initializer.
 """
 function emit_constant_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariable)
     mod = state.mod
-    gv_value_ty = LLVM.global_value_type(gv)
-    gv_name = LLVM.name(gv)
+    gv_value_ty = gv.global_value_type
+    gv_name = gv.name
 
     # Nothing reads it: nothing to emit and nothing to warn about. The warnings
     # below fired on every traced compile for `jl_small_typeof`, which the module
@@ -2579,7 +2579,7 @@ function emit_constant_global!(state::SPIRVEmitterState, gv::LLVM.GlobalVariable
     end
 
     # Must have an initializer
-    init = LLVM.initializer(gv)
+    init = gv.initializer
     if init === nothing
         @warn "Skipping constant global without initializer: $gv_name"
         return
@@ -2647,8 +2647,8 @@ end
 
 """Emit a ConstantDataArray (packed scalar data) as OpConstantComposite."""
 function emit_constant_data_array!(state::SPIRVEmitterState, val::LLVM.ConstantDataSequential, ty::LLVM.ArrayType)
-    n = LLVM.length(ty)
-    elem_ty = LLVM.eltype(ty)
+    n = ty.length
+    elem_ty = ty.element_type
     arr_spirv_ty = map_type!(state.type_ctx, ty)
 
     # Extract each element via LLVMGetElementAsConstant
@@ -2673,11 +2673,11 @@ end
 
 """Emit a ConstantArray (array of aggregate elements) as OpConstantComposite."""
 function emit_constant_array!(state::SPIRVEmitterState, val::LLVM.Constant, ty::LLVM.ArrayType)
-    n = LLVM.length(ty)
-    elem_ty = LLVM.eltype(ty)
+    n = ty.length
+    elem_ty = ty.element_type
     arr_spirv_ty = map_type!(state.type_ctx, ty)
 
-    ops = LLVM.operands(val)
+    ops = val.operands
     elem_ids = UInt32[]
     for i in 1:n
         elem_id = emit_llvm_constant!(state, ops[i]::LLVM.Constant, elem_ty)
@@ -2697,10 +2697,10 @@ end
 
 """Emit a ConstantStruct as OpConstantComposite."""
 function emit_constant_struct!(state::SPIRVEmitterState, val::LLVM.Constant, ty::LLVM.StructType)
-    members = LLVM.elements(ty)
+    members = ty.elements
     struct_spirv_ty = map_type!(state.type_ctx, ty)
 
-    ops = LLVM.operands(val)
+    ops = val.operands
     member_ids = UInt32[]
     for (i, member_ty) in enumerate(members)
         member_id = emit_llvm_constant!(state, ops[i]::LLVM.Constant, member_ty)
@@ -2951,15 +2951,15 @@ Lower LLVM intrinsics that SPIR-V cannot represent:
 """
 function lower_unsupported_intrinsics!(mod::LLVM.Module)
     to_erase = LLVM.Instruction[]
-    dl = LLVM.datalayout(mod)
+    dl = mod.datalayout
 
-    for fn in LLVM.functions(mod)
-        for bb in LLVM.blocks(fn)
-            for inst in LLVM.instructions(bb)
+    for fn in mod.functions
+        for bb in fn.blocks
+            for inst in bb.instructions
                 inst isa LLVM.CallInst || continue
-                called = LLVM.called_operand(inst)
+                called = inst.called_operand
                 called isa LLVM.Function || continue
-                fname = LLVM.name(called)
+                fname = called.name
 
                 if startswith(fname, "llvm.memcpy")
                     lower_memcpy!(inst, dl)
@@ -2979,10 +2979,10 @@ function lower_unsupported_intrinsics!(mod::LLVM.Module)
     end
 
     # Remove dead intrinsic declarations
-    for fn in collect(LLVM.functions(mod))
-        fname = LLVM.name(fn)
+    for fn in collect(mod.functions)
+        fname = fn.name
         if (startswith(fname, "llvm.memcpy") || startswith(fname, "llvm.memset") ||
-            startswith(fname, "llvm.lifetime")) && isempty(LLVM.uses(fn))
+            startswith(fname, "llvm.lifetime")) && isempty(fn.uses)
             LLVM.erase!(fn)
         end
     end
@@ -3004,7 +3004,7 @@ type it cannot map at all. The byte-chunk path below already copies exactly
 `len` bytes, so a partial copy goes there.
 """
 function lower_memcpy!(inst::LLVM.CallInst, dl::LLVM.DataLayout)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     dst = ops[1]
     src = ops[2]
     len_val = ops[3]
@@ -3019,7 +3019,7 @@ function lower_memcpy!(inst::LLVM.CallInst, dl::LLVM.DataLayout)
     end
 
     LLVM.@dispose builder=LLVM.IRBuilder() begin
-        LLVM.position!(builder, inst)
+        LLVM.position!(builder, insertion_point(inst))
 
         if copy_type !== nothing
             # Typed load/store using the alloca's type
@@ -3044,9 +3044,9 @@ function lower_memcpy!(inst::LLVM.CallInst, dl::LLVM.DataLayout)
                 s_ptr = off == 0 ? src : LLVM.gep!(builder, T_i8, src, [LLVM.ConstantInt(T_i64, off)])
                 d_ptr = off == 0 ? dst : LLVM.gep!(builder, T_i8, dst, [LLVM.ConstantInt(T_i64, off)])
                 val = LLVM.load!(builder, T_i32, s_ptr)
-                LLVM.alignment!(val, 4)
+                val.alignment = 4
                 st = LLVM.store!(builder, val, d_ptr)
-                LLVM.alignment!(st, 4)
+                st.alignment = 4
             end
             # Handle tail bytes
             for i in (n_words*4):(nbytes-1)
@@ -3065,7 +3065,7 @@ SPIR-V has no memset intrinsic, so we replace with i32 stores (4-byte chunks)
 plus i8 tail stores. For addrspace 0 (allocas), uses GEP-based addressing.
 """
 function lower_memset!(inst::LLVM.CallInst)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     dst = ops[1]
     fill_val = ops[2]  # i8
     len_val = ops[3]
@@ -3080,7 +3080,7 @@ function lower_memset!(inst::LLVM.CallInst)
     T_i64 = LLVM.Int64Type()
 
     LLVM.@dispose builder=LLVM.IRBuilder() begin
-        LLVM.position!(builder, inst)
+        LLVM.position!(builder, insertion_point(inst))
 
         # Build fill word: replicate i8 val to i32
         val32 = LLVM.zext!(builder, fill_val, T_i32)
@@ -3099,14 +3099,14 @@ function lower_memset!(inst::LLVM.CallInst)
                 LLVM.gep!(builder, T_i8, dst, [LLVM.ConstantInt(T_i64, off)])
             end
             st = LLVM.store!(builder, val32, ptr)
-            LLVM.alignment!(st, 4)
+            st.alignment = 4
         end
 
         # Handle tail bytes
         for i in (n_words*4):(nbytes-1)
             ptr = LLVM.gep!(builder, T_i8, dst, [LLVM.ConstantInt(T_i64, i)])
             st = LLVM.store!(builder, fill_val, ptr)
-            LLVM.alignment!(st, 1)
+            st.alignment = 1
         end
     end
 end

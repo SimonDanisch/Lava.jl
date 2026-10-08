@@ -94,12 +94,12 @@ that no parameter has type OpTypeRayQueryKHR — ray queries must be allocated
 inside the function that uses them per SPIR-V spec.
 """
 function prescan_function_for_rayquery!(state::SPIRVEmitterState, fn::LLVM.Function)
-    isempty(LLVM.blocks(fn)) && return nothing
-    for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+    isempty(fn.blocks) && return nothing
+    for bb in fn.blocks, inst in bb.instructions
         inst isa LLVM.CallInst || continue
-        callee = LLVM.called_operand(inst)
+        callee = inst.called_operand
         callee isa LLVM.Function || continue
-        name = LLVM.name(callee)
+        name = callee.name
         if startswith(name, "lava_ray_query_")
             get_or_create_ray_query_var!(state)
             return nothing
@@ -139,7 +139,7 @@ Arguments: flags, mask, ox, oy, oz, tmin, dx, dy, dz, tmax (10 scalars).
 """
 function emit_ray_query_init!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
-    args = LLVM.operands(inst)
+    args = inst.operands
 
     flags_id = get_value_id!(state, args[1])
     mask_id  = get_value_id!(state, args[2])
@@ -226,7 +226,7 @@ procedural primitive is never hit, no matter what the traversal reports.
 function emit_ray_query_generate_intersection!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     qvar = get_or_create_ray_query_var!(state)
-    t_id = get_value_id!(state, LLVM.operands(inst)[1])
+    t_id = get_value_id!(state, inst.operands[1])
     push!(mod.functions, (UInt32(3) << 16) | UInt32(Op.OpRayQueryGenerateIntersectionKHR))
     push!(mod.functions, qvar)
     push!(mod.functions, t_id)
@@ -238,8 +238,8 @@ function emit_rq_get_vec3_component!(state::SPIRVEmitterState, inst::LLVM.CallIn
                                      opcode::UInt16)
     mod = state.mod
     qvar = get_or_create_ray_query_var!(state)
-    committed_id = get_value_id!(state, LLVM.operands(inst)[1])
-    dim_id = get_value_id!(state, LLVM.operands(inst)[2])
+    committed_id = get_value_id!(state, inst.operands[1])
+    dim_id = get_value_id!(state, inst.operands[2])
     f32_ty = emit_type_float!(mod, UInt32(32))
     vec3_ty = emit_type_vector!(mod, f32_ty, UInt32(3))
     vec_id = fresh_id!(mod)
@@ -274,7 +274,7 @@ function emit_rq_get_scalar!(state::SPIRVEmitterState, inst::LLVM.CallInst,
                               opcode::UInt16, result_ty::UInt32)
     mod = state.mod
     qvar = get_or_create_ray_query_var!(state)
-    committed_id = get_value_id!(state, LLVM.operands(inst)[1])
+    committed_id = get_value_id!(state, inst.operands[1])
     res_id = fresh_id!(mod)
     push!(mod.functions, (UInt32(5) << 16) | UInt32(opcode))
     push!(mod.functions, result_ty)
@@ -311,7 +311,7 @@ function emit_rq_barycentric_component!(state::SPIRVEmitterState, inst::LLVM.Cal
                                         component::UInt32)
     mod = state.mod
     qvar = get_or_create_ray_query_var!(state)
-    committed_id = get_value_id!(state, LLVM.operands(inst)[1])
+    committed_id = get_value_id!(state, inst.operands[1])
     f32_ty  = emit_type_float!(mod, UInt32(32))
     vec2_ty = emit_type_vector!(mod, f32_ty, UInt32(2))
     vec_id  = fresh_id!(mod)

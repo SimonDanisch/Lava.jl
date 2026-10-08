@@ -103,18 +103,18 @@ function emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
 
     # Create emitter state
     state = SPIRVEmitterState(spirv_mod, type_ctx)
-    state.data_layout = LLVM.datalayout(llvm_mod)
+    state.data_layout = llvm_mod.datalayout
     state.features = features
 
     # Find entry function
-    entry_fn = LLVM.functions(llvm_mod)[entry_name]
+    entry_fn = llvm_mod.functions[entry_name]
 
     # Pre-allocate SPIR-V function IDs for every function with a body so that
     # OpFunctionCall can forward-reference callees regardless of emission order.
     # Enables multi-OpFunction emission when force_inline_all=false (no effect in
     # the single-function case). Mirrors the compute emitter (emit_spirv_from_llvm).
-    for fn in LLVM.functions(llvm_mod)
-        isempty(LLVM.blocks(fn)) && continue
+    for fn in llvm_mod.functions
+        isempty(fn.blocks) && continue
         get!(state.value_map, fn) do
             fresh_id!(spirv_mod)
         end
@@ -165,18 +165,18 @@ function emit_spirv_from_llvm_rt(llvm_mod::LLVM.Module, entry_name::String,
     let reachable = collect_reachable_callees(entry_fn)
         for scc in strongly_connected_components(reachable)
             length(scc) > 1 && error("Mutual recursion is not supported in SPIR-V " *
-                "multi-OpFunction emission: cycle through " * join(LLVM.name.(scc), " -> "))
+                "multi-OpFunction emission: cycle through " * join((f.name for f in scc), " -> "))
         end
         for fn in reachable
             fn === entry_fn && continue
-            isempty(LLVM.blocks(fn)) && continue
+            isempty(fn.blocks) && continue
             emit_function!(state, fn; is_entry=false)
         end
     end
 
     # Emit entry function
-    fn_ty = LLVM.function_type(entry_fn)
-    n_params = length(collect(LLVM.parameters(fn_ty)))
+    fn_ty = entry_fn.function_type
+    n_params = length(collect(fn_ty.parameters))
 
     if n_params == 0
         func_id = emit_function!(state, entry_fn; is_entry=true)
@@ -292,7 +292,7 @@ function emit_rt_trace_ray!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     # Get operand SPIR-V IDs
     args = UInt32[]
     for i in 1:LLVM.API.LLVMGetNumArgOperands(inst)
-        arg = LLVM.operands(inst)[i]
+        arg = inst.operands[i]
         push!(args, get_value_id!(state, arg))
     end
 
@@ -357,7 +357,7 @@ Emit OpStore to the payload variable from lava_rt_payload_store_f32.
 """
 function emit_rt_payload_store!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
-    val = LLVM.operands(inst)[1]
+    val = inst.operands[1]
     val_id = get_value_id!(state, val)
     payload_var = state.rt_payload_var_id
     encode_instruction!(mod.functions, Op.OpStore, payload_var, val_id)
@@ -392,8 +392,8 @@ Payload must be an array type (e.g., :f32_6).
 """
 function emit_rt_payload_store_at!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
-    val = LLVM.operands(inst)[1]
-    idx = LLVM.operands(inst)[2]
+    val = inst.operands[1]
+    idx = inst.operands[2]
     val_id = get_value_id!(state, val)
     idx_id = get_value_id!(state, idx)
     payload_var = state.rt_payload_var_id
@@ -414,7 +414,7 @@ Emit OpAccessChain + OpLoad for lava_rt_payload_load_f32_at(idx).
 """
 function emit_rt_payload_load_at!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
-    idx = LLVM.operands(inst)[1]
+    idx = inst.operands[1]
     idx_id = get_value_id!(state, idx)
     payload_var = state.rt_payload_var_id
 
@@ -473,7 +473,7 @@ Reads a component from the HitAttributeKHR vec2 variable.
 """
 function emit_rt_hit_attrib_load_at!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
-    idx = LLVM.operands(inst)[1]
+    idx = inst.operands[1]
     idx_id = get_value_id!(state, idx)
 
     hit_var = state.rt_hit_attrib_var_id
@@ -507,8 +507,8 @@ next candidate.
 """
 function emit_rt_hit_attrib_store_at!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
-    idx_id = get_value_id!(state, LLVM.operands(inst)[1])
-    val_id = get_value_id!(state, LLVM.operands(inst)[2])
+    idx_id = get_value_id!(state, inst.operands[1])
+    val_id = get_value_id!(state, inst.operands[2])
 
     hit_var = state.rt_hit_attrib_var_id
     hit_var === nothing && error(
@@ -534,8 +534,8 @@ have it when something needs to branch on acceptance.
 """
 function emit_rt_report_intersection!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
-    t_id = get_value_id!(state, LLVM.operands(inst)[1])
-    kind_id = get_value_id!(state, LLVM.operands(inst)[2])
+    t_id = get_value_id!(state, inst.operands[1])
+    kind_id = get_value_id!(state, inst.operands[2])
     bool_ty = emit_type_bool!(mod)
     result_id = fresh_id!(mod)
     encode_instruction!(mod.functions, Op.OpReportIntersectionKHR, bool_ty, result_id,
@@ -628,7 +628,7 @@ function emit_rt_hit_object_trace_ray!(state::SPIRVEmitterState, inst::LLVM.Call
 
     args = UInt32[]
     for i in 1:LLVM.API.LLVMGetNumArgOperands(inst)
-        push!(args, get_value_id!(state, LLVM.operands(inst)[i]))
+        push!(args, get_value_id!(state, inst.operands[i]))
     end
     length(args) == 13 || error("lava_rt_hit_object_trace_ray expects 13 arguments, got $(length(args))")
 

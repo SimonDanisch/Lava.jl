@@ -43,7 +43,7 @@ entry:
     LLVM.Context() do ctx
         mod = parse(LLVM.Module, _IR_PTM_DISAGREE)
         @test (LLVM.verify(mod); true)
-        insts = collect(LLVM.instructions(first(LLVM.blocks(LLVM.functions(mod)["k"]))))
+        insts = collect(first(mod.functions["k"].blocks).instructions)
         itp, q = insts[1], insts[2]
         itp isa LLVM.IntToPtrInst || error("test IR drifted: first instruction is $itp")
         q isa LLVM.LoadInst || error("test IR drifted: second instruction is $q")

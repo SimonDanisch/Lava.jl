@@ -21,35 +21,15 @@ import KernelAbstractions as KA
 # Allocate shared memory (Workgroup storage class) for GPU kernels.
 # Follows AMDGPU's pattern: create an LLVM global variable in addrspace(3),
 # return a typed LLVMPtr. Each call site gets a unique global via Val{Id}.
-@inline @generated function lava_alloc_shared(::Val{Id}, ::Type{T}, ::Val{N}) where {Id, T, N}
-    Context() do ctx
-        eltyp = convert(LLVM.LLVMType, T)
-
-        # Unique global name from the call-site Id
-        gv_name = "lava_shared_$Id"
-
-        T_ptr = convert(LLVM.LLVMType, Core.LLVMPtr{T, 3})
-
-        # Create a function returning ptr addrspace(3)
-        llvm_f, _ = LLVM.Interop.create_function(T_ptr)
-        mod = LLVM.parent(llvm_f)
-
-        # Create global variable: [N x T] in addrspace(3)
-        gv_typ = LLVM.ArrayType(eltyp, N)
-        gv = LLVM.GlobalVariable(mod, gv_typ, gv_name, 3)
-        LLVM.linkage!(gv, LLVM.API.LLVMExternalLinkage)
-        LLVM.alignment!(gv, max(16, Base.datatype_alignment(T)))
-
-        # Generate IR: GEP to get pointer to first element, return it
-        @dispose builder=LLVM.IRBuilder() begin
-            entry = LLVM.BasicBlock(llvm_f, "entry")
-            LLVM.position!(builder, entry)
-            ptr = LLVM.gep!(builder, gv_typ, gv, [LLVM.ConstantInt(0), LLVM.ConstantInt(0)])
-            LLVM.ret!(builder, ptr)
-        end
-
-        LLVM.Interop.call_function(llvm_f, Core.LLVMPtr{T, 3})
-    end
+LLVM.Interop.@llvmgenerated builder function lava_alloc_shared(
+        ::Val{Id}, ::Type{T}, ::Val{N})::Core.LLVMPtr{T, 3} where {Id, T, N}
+    # [N x T] in addrspace(3), named by the call-site Id
+    gv_typ = LLVM.ArrayType(convert(LLVM.LLVMType, T), N)
+    gv = LLVM.GlobalVariable(LLVM.Interop.current_module(builder), gv_typ, "lava_shared_$Id", 3)
+    gv.linkage = LLVM.Linkage.External
+    gv.alignment = max(16, Base.datatype_alignment(T))
+    # the pointer to its first element
+    LLVM.gep!(builder, gv_typ, gv, [LLVM.ConstantInt(0), LLVM.ConstantInt(0)])
 end
 
 # KA SharedMemory override: allocate workgroup-shared array, return indexable wrapper

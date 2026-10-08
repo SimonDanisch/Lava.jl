@@ -132,7 +132,7 @@ function GPUCompiler.buildLoopOptimizerPipeline(fpm, job::LavaCompilerJob, opt_l
     # All pass/helper symbols are qualified `GPUCompiler.` — that's the namespace
     # the original pipeline uses them from (some, e.g. LowerSIMDLoopPass /
     # JuliaLICMPass, live in LLVM.Interop and are not bare `LLVM` bindings).
-    GPUCompiler.add!(fpm, GPUCompiler.NewPMLoopPassManager(; use_memory_ssa=true)) do lpm
+    GPUCompiler.add!(fpm, GPUCompiler.LoopPassManager(; use_memory_ssa=true)) do lpm
         GPUCompiler.add!(lpm, GPUCompiler.LowerSIMDLoopPass())
         if opt_level >= 2
             GPUCompiler.add!(lpm, GPUCompiler.LoopInstSimplifyPass())
@@ -153,7 +153,7 @@ function GPUCompiler.buildLoopOptimizerPipeline(fpm, job::LavaCompilerJob, opt_l
     end
     GPUCompiler.add!(fpm, GPUCompiler.SimplifyCFGPass(; GPUCompiler.BasicSimplifyCFGOptions...))
     GPUCompiler.add!(fpm, GPUCompiler.instcombine_pass(job))
-    GPUCompiler.add!(fpm, GPUCompiler.NewPMLoopPassManager()) do lpm
+    GPUCompiler.add!(fpm, GPUCompiler.LoopPassManager()) do lpm
         if opt_level >= 2
             GPUCompiler.add!(lpm, GPUCompiler.LoopIdiomRecognizePass())
             GPUCompiler.add!(lpm, GPUCompiler.IndVarSimplifyPass())

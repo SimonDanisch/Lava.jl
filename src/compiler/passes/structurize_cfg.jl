@@ -29,8 +29,8 @@ merge target. Without this, StructurizeCFG can produce incorrect back-edge condi
 causing loops to exit after a single iteration.
 """
 function fixup_structured_cfg!(mod::LLVM.Module)
-    for f in LLVM.functions(mod)
-        isempty(LLVM.blocks(f)) && continue
+    for f in mod.functions
+        isempty(f.blocks) && continue
         isolate_shared_merge_targets!(f)
     end
 end
@@ -55,22 +55,22 @@ back-edges — the source of the walk-with-`continue` miscompile.
 """
 function merge_equivalent_loop_phis!(mod::LLVM.Module)
     merged = 0
-    for f in LLVM.functions(mod)
-        isempty(LLVM.blocks(f)) && continue
+    for f in mod.functions
+        isempty(f.blocks) && continue
         while true
             changed = false
-            for bb in LLVM.blocks(f)
+            for bb in f.blocks
                 phis = LLVM.PHIInst[]
-                for inst in LLVM.instructions(bb)
+                for inst in bb.instructions
                     inst isa LLVM.PHIInst && push!(phis, inst)
                 end
                 length(phis) >= 2 || continue
                 # Pairwise equivalence check
                 for i in 1:length(phis), j in (i+1):length(phis)
                     a = phis[i]; b = phis[j]
-                    LLVM.value_type(a) == LLVM.value_type(b) || continue
-                    ai = collect(LLVM.incoming(a))
-                    bi = collect(LLVM.incoming(b))
+                    a.value_type == b.value_type || continue
+                    ai = collect(a.incoming)
+                    bi = collect(b.incoming)
                     length(ai) == length(bi) || continue
                     amap = Dict{LLVM.BasicBlock, LLVM.Value}(blk => val for (val, blk) in ai)
                     bmap = Dict{LLVM.BasicBlock, LLVM.Value}(blk => val for (val, blk) in bi)
@@ -123,33 +123,33 @@ predecessor block (see emit.jl's deferred-phi handling).
 """
 function replace_undef_phi_operands_with_constants!(mod::LLVM.Module)
     replaced = 0
-    for f in LLVM.functions(mod)
-        isempty(LLVM.blocks(f)) && continue
-        for bb in LLVM.blocks(f)
+    for f in mod.functions
+        isempty(f.blocks) && continue
+        for bb in f.blocks
             phis = LLVM.PHIInst[]
-            for inst in LLVM.instructions(bb)
+            for inst in bb.instructions
                 inst isa LLVM.PHIInst && push!(phis, inst)
             end
             for phi in phis
-                ty = LLVM.value_type(phi)
+                ty = phi.value_type
                 # Only rewrite scalar types where LLVM.null produces a constant
                 # that the SPIR-V emitter accepts. Pointer types are handled in
                 # emit.jl via OpConvertUToPtr.
-                ty isa LLVM.IntegerType || ty isa LLVM.LLVMFloat ||
-                    ty isa LLVM.LLVMDouble || ty isa LLVM.LLVMHalf || continue
-                incoming_list = [(v, b) for (v, b) in LLVM.incoming(phi)]
+                ty isa LLVM.IntegerType || ty isa LLVM.FloatType ||
+                    ty isa LLVM.DoubleType || ty isa LLVM.HalfType || continue
+                incoming_list = [(v, b) for (v, b) in phi.incoming]
                 any(v -> v isa LLVM.UndefValue || v isa LLVM.PoisonValue,
                     (v for (v, _) in incoming_list)) || continue
                 zero = LLVM.null(ty)
                 builder = LLVM.IRBuilder()
-                LLVM.position!(builder, phi)
+                LLVM.position!(builder, insertion_point(phi))
                 new_phi = LLVM.phi!(builder, ty)
                 new_incoming = Tuple{LLVM.Value, LLVM.BasicBlock}[]
                 for (v, b) in incoming_list
                     new_v = (v isa LLVM.UndefValue || v isa LLVM.PoisonValue) ? zero : v
                     push!(new_incoming, (new_v, b))
                 end
-                LLVM.append!(LLVM.incoming(new_phi), new_incoming)
+                LLVM.append!(new_phi.incoming, new_incoming)
                 LLVM.replace_uses!(phi, new_phi)
                 LLVM.API.LLVMInstructionEraseFromParent(phi.ref)
                 replaced += 1
@@ -170,11 +170,11 @@ has a unique merge target for SPIR-V's OpSelectionMerge/OpLoopMerge.
 function isolate_shared_merge_targets!(f::LLVM.Function)
     # Build map: target_block -> [source_blocks that conditionally branch to it]
     cond_sources = Dict{LLVM.BasicBlock, Vector{LLVM.BasicBlock}}()
-    for bb in LLVM.blocks(f)
-        term = LLVM.terminator(bb)
+    for bb in f.blocks
+        term = bb.terminator
         term isa LLVM.BrInst || continue
         LLVM.isconditional(term) || continue
-        for succ in LLVM.successors(term)
+        for succ in term.successors
             # Skip self-loops (loop back-edges). These are handled correctly by
             # the SPIR-V backend as OpLoopMerge, not OpSelectionMerge. Including
             # them creates dead trampoline blocks that break PHI node invariants.
@@ -222,14 +222,14 @@ function insert_cfg_trampoline!(f::LLVM.Function, src::LLVM.BasicBlock,
         bb in inside && continue
         bb == target && continue
         push!(inside, bb)
-        term = LLVM.terminator(bb)
-        for succ in LLVM.successors(term)
+        term = bb.terminator
+        for succ in term.successors
             push!(worklist, succ)
         end
     end
 
     inside_branchers = [bb for bb in inside
-                         if any(==(target), LLVM.successors(LLVM.terminator(bb)))]
+                         if any(==(target), bb.terminator.successors)]
     isempty(inside_branchers) && return
     insert_edge_trampoline!(f, inside_branchers, target; name = "cfg_fixup")
     return
@@ -248,9 +248,9 @@ end
 # Adding it is three lines — it is a loop pass, so it needs the
 # `function(loop(loop-rotate))` nesting rather than a bare `LLVM.run!`:
 #
-#     @dispose pb = LLVM.NewPMPassBuilder() begin
-#         LLVM.add!(pb, LLVM.NewPMFunctionPassManager()) do fpm
-#             LLVM.add!(fpm, LLVM.NewPMLoopPassManager()) do lpm
+#     @dispose pb = LLVM.PassBuilder() begin
+#         LLVM.add!(pb, LLVM.FunctionPassManager()) do fpm
+#             LLVM.add!(fpm, LLVM.LoopPassManager()) do lpm
 #                 LLVM.add!(lpm, LLVM.LoopRotatePass())
 #             end
 #         end
@@ -315,10 +315,10 @@ The Loop Control mask and its literals for an `!llvm.loop` node, or `nothing`
 when the node says nothing about unrolling.
 """
 function loop_control_words(loopid::LLVM.MDNode)
-    for op in LLVM.operands(loopid)
+    for op in loopid.operands
         # The first operand of a loop id is the node itself.
         op isa LLVM.MDNode || continue
-        hint = LLVM.operands(op)
+        hint = op.operands
         !isempty(hint) && hint[1] isa LLVM.MDString || continue
         name = convert(String, hint[1])
         if name == "llvm.loop.unroll.disable"
@@ -341,17 +341,17 @@ asks for. See the note above.
 """
 function loop_hints(mod::LLVM.Module)
     hints = Dict{LLVM.BasicBlock, Vector{UInt32}}()
-    for f in LLVM.functions(mod)
-        isempty(LLVM.blocks(f)) && continue
+    for f in mod.functions
+        isempty(f.blocks) && continue
         rpo = reverse_postorder(f)
         pos = Dict(bb => i for (i, bb) in enumerate(rpo))
         for bb in rpo
-            term = LLVM.terminator(bb)
-            md = LLVM.metadata(term)
+            term = bb.terminator
+            md = term.metadata
             haskey(md, LLVM.MD_loop) || continue
             words = loop_control_words(md[LLVM.MD_loop]::LLVM.MDNode)
             words === nothing && continue
-            for succ in LLVM.successors(term)
+            for succ in term.successors
                 # The back edge: the header comes no later than the latch in RPO,
                 # the same test `analyze_loops` finds headers with.
                 get(pos, succ, typemax(Int)) <= pos[bb] && (hints[succ] = words)
@@ -364,17 +364,17 @@ end
 """Put each header's Loop Control words on its terminator, as `$LOOP_CONTROL_MD`."""
 function stamp_loop_controls!(hints::Dict{LLVM.BasicBlock, Vector{UInt32}})
     for (header, words) in hints
-        LLVM.metadata(LLVM.terminator(header))[LOOP_CONTROL_MD] =
+        header.terminator.metadata[LOOP_CONTROL_MD] =
             LLVM.MDNode([LLVM.MDString(string(w)) for w in words])
     end
 end
 
 """The Loop Control words for the loop whose header ends in `term`: `[0]` (None) unless a hint was stamped."""
 function header_loop_control(term::LLVM.Instruction)
-    md = LLVM.metadata(term)
+    md = term.metadata
     haskey(md, LOOP_CONTROL_MD) || return UInt32[0]
     return [parse(UInt32, convert(String, w::LLVM.MDString))
-            for w in LLVM.operands(md[LOOP_CONTROL_MD]::LLVM.MDNode)]
+            for w in (md[LOOP_CONTROL_MD]::LLVM.MDNode).operands]
 end
 
 """
@@ -455,15 +455,15 @@ end
 # converges at the loop's continue target. This pass inserts trampoline blocks between
 # such selections and the continue target.
 function fixup_post_structurize!(mod::LLVM.Module)
-    for f in LLVM.functions(mod)
-        isempty(LLVM.blocks(f)) && continue
+    for f in mod.functions
+        isempty(f.blocks) && continue
         fixup_continue_merge_conflicts!(f)
     end
 end
 
 # Find loops and insert trampolines where selections merge at the continue target.
 function fixup_continue_merge_conflicts!(f::LLVM.Function)
-    blocks = collect(LLVM.blocks(f))
+    blocks = collect(f.blocks)
     length(blocks) <= 1 && return
 
     # Compute RPO
@@ -476,9 +476,9 @@ function fixup_continue_merge_conflicts!(f::LLVM.Function)
     # Find loops: back-edges A→B where B appears before A in RPO
     loops = Dict{LLVM.BasicBlock, Tuple{LLVM.BasicBlock, LLVM.BasicBlock}}()
     for bb in blocks
-        term = LLVM.terminator(bb)
+        term = bb.terminator
         bb_pos = get(rpo_pos, bb, 0)
-        for succ in LLVM.successors(term)
+        for succ in term.successors
             succ_pos = get(rpo_pos, succ, 0)
             if succ_pos > 0 && succ_pos <= bb_pos
                 header = succ
@@ -503,15 +503,15 @@ function fixup_continue_merge_conflicts!(f::LLVM.Function)
     # converge at a continue target. If so, insert a trampoline.
     for _iter1 in 1:100  # Safety limit to prevent infinite loops
         found = false
-        for bb in collect(LLVM.blocks(f))
-            term = LLVM.terminator(bb)
+        for bb in collect(f.blocks)
+            term = bb.terminator
             term isa LLVM.BrInst || continue
             LLVM.isconditional(term) || continue
 
             # Skip loop headers (their branches are handled by OpLoopMerge)
             haskey(loops, bb) && continue
 
-            succs = LLVM.successors(term)
+            succs = term.successors
             true_bb = succs[1]
             false_bb = succs[2]
 
@@ -540,10 +540,10 @@ function fixup_continue_merge_conflicts!(f::LLVM.Function)
         rpo_pos[bb] = i
     end
     loops = Dict{LLVM.BasicBlock, Tuple{LLVM.BasicBlock, LLVM.BasicBlock}}()
-    for bb in collect(LLVM.blocks(f))
-        term = LLVM.terminator(bb)
+    for bb in collect(f.blocks)
+        term = bb.terminator
         bb_pos = get(rpo_pos, bb, 0)
-        for succ in LLVM.successors(term)
+        for succ in term.successors
             succ_pos = get(rpo_pos, succ, 0)
             if succ_pos > 0 && succ_pos <= bb_pos
                 header = succ
@@ -581,10 +581,10 @@ function fixup_continue_merge_conflicts!(f::LLVM.Function)
                 rpo_pos[bb] = i
             end
             loops = Dict{LLVM.BasicBlock, Tuple{LLVM.BasicBlock, LLVM.BasicBlock}}()
-            for bb in collect(LLVM.blocks(f))
-                term = LLVM.terminator(bb)
+            for bb in collect(f.blocks)
+                term = bb.terminator
                 bb_pos = get(rpo_pos, bb, 0)
-                for succ in LLVM.successors(term)
+                for succ in term.successors
                     succ_pos = get(rpo_pos, succ, 0)
                     if succ_pos > 0 && succ_pos <= bb_pos
                         h = succ
@@ -621,8 +621,8 @@ function find_loop_merge_llvm(header::LLVM.BasicBlock, latch::LLVM.BasicBlock,
     # Find first successor (in RPO order) that's outside the loop
     for bb in rpo
         bb in loop_blocks || continue
-        term = LLVM.terminator(bb)
-        for succ in LLVM.successors(term)
+        term = bb.terminator
+        for succ in term.successors
             if !(succ in loop_blocks)
                 return succ
             end
@@ -636,13 +636,13 @@ end
 # After StructurizeCFG, convergence is always at most 1-2 hops away.
 function find_shallow_convergence(a::LLVM.BasicBlock, b::LLVM.BasicBlock)
     # Case 1: a is a direct successor of b (if-else with inverted condition)
-    b_succs = Set(LLVM.successors(LLVM.terminator(b)))
+    b_succs = Set(b.terminator.successors)
     if a in b_succs
         return a
     end
 
     # Case 2: b is a direct successor of a (if-then pattern)
-    a_succs = Set(LLVM.successors(LLVM.terminator(a)))
+    a_succs = Set(a.terminator.successors)
     if b in a_succs
         return b
     end
@@ -656,13 +656,13 @@ function find_shallow_convergence(a::LLVM.BasicBlock, b::LLVM.BasicBlock)
     # Case 4: a leads to X, b leads to X (1-hop from each)
     a_2hop = Set{LLVM.BasicBlock}()
     for s in a_succs
-        for ss in LLVM.successors(LLVM.terminator(s))
+        for ss in s.terminator.successors
             push!(a_2hop, ss)
         end
     end
     b_2hop = Set{LLVM.BasicBlock}()
     for s in b_succs
-        for ss in LLVM.successors(LLVM.terminator(s))
+        for ss in s.terminator.successors
             push!(b_2hop, ss)
         end
     end

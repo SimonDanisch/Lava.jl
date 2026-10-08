@@ -278,7 +278,7 @@ end
 
 """The `DILocation` attached to `inst`, or `nothing` when it carries no debug info."""
 function instruction_diloc(inst::LLVM.Instruction)
-    md = LLVM.metadata(inst)
+    md = inst.metadata
     haskey(md, LLVM.MD_dbg) || return nothing
     dbg = md[LLVM.MD_dbg]
     dbg isa LLVM.DILocation || return nothing
@@ -330,7 +330,7 @@ function diloc_outermost_walk(dbg::LLVM.DILocation, cache)
     # throws instead of returning `nothing`. That is the tolerated case;
     # anything else is our bug.
     parent = try
-        LLVM.inlined_at(dbg)
+        dbg.inlined_at
     catch ex
         ex isa Union{ArgumentError, MethodError, UndefRefError} || rethrow()
         nothing
@@ -338,11 +338,11 @@ function diloc_outermost_walk(dbg::LLVM.DILocation, cache)
     # An outer link wins over this one, exactly as the original loop's
     # `best_file`/`best_line` overwrite did. A parent whose line is 0 ends the
     # chain, so it and anything beyond it are not considered.
-    if parent isa LLVM.DILocation && LLVM.line(parent) != 0
+    if parent isa LLVM.DILocation && parent.line != 0
         outer = diloc_outermost(parent, cache)
         outer === nothing || return outer
     end
-    line = LLVM.line(dbg)
+    line = dbg.line
     line == 0 && return nothing
     file = diloc_file(dbg)
     return isempty(file) ? nothing : (file, Int(line))
@@ -359,7 +359,7 @@ enough that "produces the same answer as the loop it replaced" is worth pinning
 on real debug metadata rather than asserting by inspection.
 """
 function extract_source_location_legacy(dbg::LLVM.DILocation)
-    line = LLVM.line(dbg)
+    line = dbg.line
     line == 0 && return nothing
 
     # Walk the inlined_at chain to collect all locations from leaf to root.
@@ -374,13 +374,13 @@ function extract_source_location_legacy(dbg::LLVM.DILocation)
         # LLVM.jl throws instead of returning `nothing`. That is the tolerated
         # case and the loop terminates on it; anything else is our bug.
         inlined = try
-            LLVM.inlined_at(loc)
+            loc.inlined_at
         catch ex
             ex isa Union{ArgumentError, MethodError, UndefRefError} || rethrow()
             nothing
         end
         (inlined === nothing || !(inlined isa LLVM.DILocation)) && break
-        il = LLVM.line(inlined)
+        il = inlined.line
         il == 0 && break
         f = diloc_file(inlined)
         if !isempty(f)
@@ -397,10 +397,10 @@ end
 """Extract file path from a DILocation's scope."""
 function diloc_file(dbg::LLVM.DILocation)
     try
-        scope = LLVM.scope(dbg)
-        f = LLVM.file(scope)
-        dir = LLVM.directory(f)
-        name = LLVM.filename(f)
+        scope = dbg.scope
+        f = scope.file
+        dir = f.directory
+        name = f.filename
         if isempty(dir)
             return string(name)
         end
@@ -485,7 +485,7 @@ function get_value_id!(state::SPIRVEmitterState, val::LLVM.Value)
     # e.g., @jl_int64_type is declared as a function but used as `load i64, ptr @jl_int64_type`.
     # These appear in error/boxing paths that should never execute on GPU.
     # Emit a zero constant of pointer-width as a safe fallback.
-    if val isa LLVM.Function && LLVM.isintrinsic(val) == false && isempty(LLVM.blocks(val))
+    if val isa LLVM.Function && LLVM.isintrinsic(val) == false && isempty(val.blocks)
         # This is a declaration (no body) used as a value — Julia runtime type tag
         u64_ty = emit_type_int!(state.mod, UInt32(64), UInt32(0))
         zero_id = emit_u64_constant!(state.mod, UInt64(0))
@@ -504,7 +504,7 @@ Vulkan SPIR-V requires OpAccessChain indices to be 32-bit integers.
 If the source value is i64, inserts an OpUConvert to truncate to i32.
 """
 function ensure_index_i32!(state::SPIRVEmitterState, val::LLVM.Value)
-    ty = LLVM.value_type(val)
+    ty = val.value_type
     # Compile-time literal: emit a fresh u32 OpConstant directly.  Going
     # through `get_value_id! + OpUConvert` would produce a runtime UConvert,
     # which is fine for array element indices but breaks `OpAccessChain` for
@@ -517,7 +517,7 @@ function ensure_index_i32!(state::SPIRVEmitterState, val::LLVM.Value)
     end
 
     id = get_value_id!(state, val)
-    if ty isa LLVM.IntegerType && LLVM.width(ty) > 32
+    if ty isa LLVM.IntegerType && ty.width > 32
         # Runtime index wider than i32 — truncate via OpUConvert.
         u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
         conv_id = fresh_id!(state.mod)
@@ -546,7 +546,7 @@ This ensures dominators are emitted before dominated blocks in SPIR-V,
 preventing forward references in non-PHI instructions.
 """
 function reverse_postorder(fn::LLVM.Function)
-    blocks = collect(LLVM.blocks(fn))
+    blocks = collect(fn.blocks)
     isempty(blocks) && return blocks
 
     visited = Set{LLVM.BasicBlock}()
@@ -555,8 +555,8 @@ function reverse_postorder(fn::LLVM.Function)
     function dfs(bb)
         bb in visited && return
         push!(visited, bb)
-        term = LLVM.terminator(bb)
-        for succ in LLVM.successors(term)
+        term = bb.terminator
+        for succ in term.successors
             dfs(succ)
         end
         push!(postorder, bb)
@@ -586,7 +586,7 @@ algorithm (Cooper, Harvey, Kennedy). The ipdom of a selection header is the
 correct merge block for SPIR-V's OpSelectionMerge.
 """
 function compute_ipostdom(fn::LLVM.Function)
-    blocks = collect(LLVM.blocks(fn))
+    blocks = collect(fn.blocks)
     isempty(blocks) && return Dict{LLVM.BasicBlock, LLVM.BasicBlock}()
 
     rpo = reverse_postorder(fn)
@@ -603,11 +603,11 @@ function compute_ipostdom(fn::LLVM.Function)
     # Find exit blocks (ret/unreachable/no successors)
     exits = LLVM.BasicBlock[]
     for bb in blocks
-        term = LLVM.terminator(bb)
+        term = bb.terminator
         if term isa LLVM.RetInst || term isa LLVM.UnreachableInst
             push!(exits, bb)
         else
-            succs = collect(LLVM.successors(term))
+            succs = collect(term.successors)
             isempty(succs) && push!(exits, bb)
         end
     end
@@ -651,8 +651,8 @@ function compute_ipostdom(fn::LLVM.Function)
             any(bb === e for e in exits) && continue
 
             # Collect successors that already have an ipdom
-            term = LLVM.terminator(bb)
-            succs = collect(LLVM.successors(term))
+            term = bb.terminator
+            succs = collect(term.successors)
             processed = [s for s in succs if haskey(ipdom, s)]
             isempty(processed) && continue
 
@@ -703,8 +703,8 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
     prescan_function_for_rayquery!(state, fn)
     prescan_function_for_coopmat_components!(state, fn)
 
-    fn_ty = LLVM.function_type(fn)
-    ret_ty = LLVM.return_type(fn_ty)
+    fn_ty = fn.function_type
+    ret_ty = fn_ty.return_type
     # SPIR-V Logical addressing requires every OpTypePointer to carry a
     # StorageClass.  A pointer-return function can't be expressed as a
     # standalone OpFunction — the storage class would need to flow from the
@@ -713,7 +713,7 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
     # this reason; this guard is a sharp error message for the case where
     # something slips through (e.g. a new GPUCompiler runtime stub).
     if ret_ty isa LLVM.PointerType
-        error("emit_function!: function `$(LLVM.name(fn))` has pointer return " *
+        error("emit_function!: function `$(fn.name)` has pointer return " *
               "type `$(string(ret_ty))` and survived as a non-inlined OpFunction. " *
               "SPIR-V Logical addressing cannot express pointer returns across " *
               "function boundaries — the function must be `alwaysinline`. " *
@@ -724,8 +724,8 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
 
     # Map parameter types — use actual parameter values to resolve pointer types
     param_spirv = UInt32[]
-    for param in LLVM.parameters(fn)
-        param_ty = LLVM.value_type(param)
+    for param in fn.parameters
+        param_ty = param.value_type
         if param_ty isa LLVM.PointerType
             push!(param_spirv, map_pointer_type_for_value!(state.type_ctx, param))
         else
@@ -749,18 +749,17 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
     # `@noinline` in Julia only so it survives as a function for
     # `OpCooperativeMatrixPerElementOpNV` to name, and the driver is supposed to
     # inline it into its own element loop. See `inline_callbacks`.
-    noinline_kind = LLVM.API.LLVMGetEnumAttributeKindForName("noinline", 8)
-    has_noinline = any(a -> a isa LLVM.EnumAttribute && LLVM.kind(a) == noinline_kind,
-                        collect(LLVM.function_attributes(fn)))
+    has_noinline = any(a -> a isa LLVM.EnumAttribute && a.kind === :noinline,
+                        collect(fn.function_attributes))
     fc = fn in state.inline_callbacks ? FuncControl.Inline :
          (is_entry || !has_noinline) ? FuncControl.None : FuncControl.DontInline
     encode_instruction!(state.mod.functions, Op.OpFunction, ret_spirv, func_id, fc, func_type_id)
 
     # OpFunctionParameter for each parameter
-    for param in LLVM.parameters(fn)
+    for param in fn.parameters
         param_id = fresh_id!(state.mod)
         state.value_map[param] = param_id
-        param_ty = LLVM.value_type(param)
+        param_ty = param.value_type
         if param_ty isa LLVM.PointerType
             # For pointer params, use the pointer type from PointeeTypeMap
             spirv_ty = map_pointer_type_for_value!(state.type_ctx, param)
@@ -771,9 +770,9 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
     end
 
     # Pre-allocate block labels and PHI result IDs
-    for bb in LLVM.blocks(fn)
+    for bb in fn.blocks
         get_block_id!(state, bb)
-        for inst in LLVM.instructions(bb)
+        for inst in bb.instructions
             if inst isa LLVM.PHIInst
                 phi_id = fresh_id!(state.mod)
                 state.value_map[inst] = phi_id
@@ -799,7 +798,7 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
     # Pre-emit all allocas into a temporary buffer, register them in value_map,
     # then inject the preamble right after the entry block's OpLabel during emission.
     all_allocas = LLVM.AllocaInst[]
-    for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+    for bb in fn.blocks, inst in bb.instructions
         inst isa LLVM.AllocaInst && push!(all_allocas, inst)
     end
     # Emit allocas to a temporary buffer (not state.mod.functions)
@@ -904,7 +903,7 @@ function emit_block!(state::SPIRVEmitterState, bb::LLVM.BasicBlock)
     label_id = get_block_id!(state, bb)
 
     if get(ENV, "LAVA_DEBUG_PHI", "") == "1"
-        println("  EMIT BLOCK: $(String(LLVM.name(bb))) → SPIR-V %$label_id")
+        println("  EMIT BLOCK: $(String(bb.name)) → SPIR-V %$label_id")
     end
 
     encode_instruction!(state.mod.functions, Op.OpLabel, label_id)
@@ -921,14 +920,14 @@ function emit_block!(state::SPIRVEmitterState, bb::LLVM.BasicBlock)
 
     # PHI nodes: defer to after all blocks are emitted (operands may be forward references)
     # Their result IDs are already pre-allocated in value_map.
-    for inst in LLVM.instructions(bb)
+    for inst in bb.instructions
         if inst isa LLVM.PHIInst
             defer_phi!(state, inst, label_id)
         end
     end
 
     # Emit non-PHI, non-terminator instructions
-    insts = collect(LLVM.instructions(bb))
+    insts = collect(bb.instructions)
     for inst in insts
         inst isa LLVM.PHIInst && continue
         # Terminator (branch/ret) is handled specially for loop headers
@@ -1039,20 +1038,20 @@ function emit_instruction!(state::SPIRVEmitterState, inst::LLVM.Instruction)
     elseif inst isa LLVM.FPToUIInst
         emit_conversion!(state, inst, Op.OpConvertFToU)
     elseif inst isa LLVM.BitCastInst
-        src_val = LLVM.operands(inst)[1]
-        src_ty = LLVM.value_type(src_val)
-        dst_ty = LLVM.value_type(inst)
-        if src_ty isa LLVM.IntegerType && (dst_ty isa LLVM.LLVMFloat || dst_ty isa LLVM.LLVMDouble)
+        src_val = inst.operands[1]
+        src_ty = src_val.value_type
+        dst_ty = inst.value_type
+        if src_ty isa LLVM.IntegerType && (dst_ty isa LLVM.FloatType || dst_ty isa LLVM.DoubleType)
             # bitcast int → float (type-punned field access).
             # The source is typically a trunc i64→i32. We need:
             #   OpUConvert %uint %src_i64  (if src is wider than float)
             #   OpBitcast %float %uint_val
             # Use emit_type_float! directly to avoid PTM contamination.
             src_id = get_value_id!(state, src_val)
-            int_width = dst_ty isa LLVM.LLVMFloat ? 32 : 64
+            int_width = dst_ty isa LLVM.FloatType ? 32 : 64
             float_width = int_width
             # If source integer is wider than target float, truncate first
-            src_width = LLVM.width(src_ty)
+            src_width = src_ty.width
             if src_width > int_width
                 int_ty = emit_type_int!(state.mod, UInt32(int_width), UInt32(0))
                 trunc_id = fresh_id!(state.mod)
@@ -1097,7 +1096,7 @@ function emit_instruction!(state::SPIRVEmitterState, inst::LLVM.Instruction)
         emit_cmpxchg!(state, inst)
     # Freeze — treat as no-op (pass through operand)
     elseif inst isa LLVM.FreezeInst
-        ops = LLVM.operands(inst)
+        ops = inst.operands
         state.value_map[inst] = get_value_id!(state, ops[1])
     # Unreachable — should have been removed by passes
     elseif inst isa LLVM.UnreachableInst
@@ -1125,40 +1124,40 @@ end
 # ================================================================
 
 function emit_binary_op!(state::SPIRVEmitterState, inst::LLVM.Instruction, opcode::UInt16)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     lhs = get_value_id!(state, ops[1])
     rhs = get_value_id!(state, ops[2])
-    result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+    result_ty = map_type!(state.type_ctx, inst.value_type)
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, opcode, result_ty, result_id, lhs, rhs)
     state.value_map[inst] = result_id
 end
 
 function emit_unary_op!(state::SPIRVEmitterState, inst::LLVM.Instruction, opcode::UInt16)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     operand = get_value_id!(state, ops[1])
-    result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+    result_ty = map_type!(state.type_ctx, inst.value_type)
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, opcode, result_ty, result_id, operand)
     state.value_map[inst] = result_id
 end
 
 function is_bool_type(ty::LLVM.LLVMType)
-    ty isa LLVM.IntegerType && LLVM.width(ty) == 1
+    ty isa LLVM.IntegerType && ty.width == 1
 end
 
 function emit_bitwise_or_logical!(state::SPIRVEmitterState, inst::LLVM.Instruction,
                                     bitwise_op::UInt16, logical_op::UInt16)
-    result_ty = LLVM.value_type(inst)
+    result_ty = inst.value_type
     opcode = is_bool_type(result_ty) ? logical_op : bitwise_op
     emit_binary_op!(state, inst, opcode)
 end
 
 function emit_xor!(state::SPIRVEmitterState, inst::LLVM.Instruction)
-    result_ty = LLVM.value_type(inst)
+    result_ty = inst.value_type
     if is_bool_type(result_ty)
         # xor i1 %a, true → OpLogicalNot; xor i1 %a, %b → OpLogicalNotEqual
-        ops = LLVM.operands(inst)
+        ops = inst.operands
         rhs = ops[2]
         if rhs isa LLVM.ConstantInt && convert(Int64, rhs) != 0
             # xor i1 %a, true = logical not
@@ -1194,13 +1193,13 @@ const ICMP_OPCODE_MAP = Dict{LLVM.API.LLVMIntPredicate, UInt16}(
 )
 
 function emit_icmp!(state::SPIRVEmitterState, inst::LLVM.ICmpInst)
-    pred = LLVM.predicate(inst)
+    pred = inst.predicate
     opcode = get(ICMP_OPCODE_MAP, pred, nothing)
     if opcode === nothing
         error("Unsupported ICmp predicate: $pred")
     end
 
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     lhs_val = ops[1]
     rhs_val = ops[2]
     lhs = get_value_id!(state, lhs_val)
@@ -1209,11 +1208,11 @@ function emit_icmp!(state::SPIRVEmitterState, inst::LLVM.ICmpInst)
     # SPIR-V requires both operands to have the same type.
     # LLVM constants may be i32 when the other operand is i8/i64/etc.
     # Insert OpUConvert or OpSConvert if widths don't match.
-    lhs_ty = LLVM.value_type(lhs_val)
-    rhs_ty = LLVM.value_type(rhs_val)
+    lhs_ty = lhs_val.value_type
+    rhs_ty = rhs_val.value_type
     if lhs_ty isa LLVM.IntegerType && rhs_ty isa LLVM.IntegerType
-        lw = LLVM.width(lhs_ty)
-        rw = LLVM.width(rhs_ty)
+        lw = lhs_ty.width
+        rw = rhs_ty.width
         if lw != rw
             # Widen the narrower operand to match the wider one
             target_w = max(lw, rw)
@@ -1230,7 +1229,7 @@ function emit_icmp!(state::SPIRVEmitterState, inst::LLVM.ICmpInst)
         end
     end
 
-    result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))  # i1 → OpTypeBool
+    result_ty = map_type!(state.type_ctx, inst.value_type)  # i1 → OpTypeBool
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, opcode, result_ty, result_id, lhs, rhs)
     state.value_map[inst] = result_id
@@ -1254,11 +1253,11 @@ const FCMP_OPCODE_MAP = Dict{LLVM.API.LLVMRealPredicate, UInt16}(
 )
 
 function emit_fcmp!(state::SPIRVEmitterState, inst::LLVM.FCmpInst)
-    pred = LLVM.predicate(inst)
-    ops = LLVM.operands(inst)
+    pred = inst.predicate
+    ops = inst.operands
     lhs = get_value_id!(state, ops[1])
     rhs = get_value_id!(state, ops[2])
-    result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+    result_ty = map_type!(state.type_ctx, inst.value_type)
 
     if pred == LLVM.API.LLVMRealORD
         # fcmp ord x, y → NOT(IsNan(x) OR IsNan(y))
@@ -1316,10 +1315,10 @@ Bit width of an LLVM scalar for the purpose of reconciling a load/store against 
 differently-typed slot. `nothing` for anything that is not a plain integer or float.
 """
 function scalar_bit_width(ty)
-    ty isa LLVM.IntegerType && return Int(LLVM.width(ty))
-    ty isa LLVM.LLVMHalf    && return 16
-    ty isa LLVM.LLVMFloat   && return 32
-    ty isa LLVM.LLVMDouble  && return 64
+    ty isa LLVM.IntegerType && return Int(ty.width)
+    ty isa LLVM.HalfType    && return 16
+    ty isa LLVM.FloatType   && return 32
+    ty isa LLVM.DoubleType  && return 64
     return nothing
 end
 
@@ -1344,7 +1343,7 @@ mirror of the store-side reconciliation in `emit_store!`.
 """
 function emit_reconciled_scalar_load!(state::SPIRVEmitterState, ptr_id::UInt32,
                                       slot_ty::LLVM.IntegerType, want_ty, sc)
-    slot_w = Int(LLVM.width(slot_ty))
+    slot_w = Int(slot_ty.width)
     slot_spirv = emit_type_int!(state.mod, spirv_int_width(slot_w), UInt32(0))
     raw = fresh_id!(state.mod)
     if sc == SC.Workgroup || sc == SC.Function
@@ -1356,7 +1355,7 @@ function emit_reconciled_scalar_load!(state::SPIRVEmitterState, ptr_id::UInt32,
 
     # i1 is OpTypeBool, not a 1-bit integer, so it cannot be reached by convert/bitcast.
     # `trunc iN to i1` keeps the low bit, which is `(x & 1) != 0`.
-    if want_ty isa LLVM.IntegerType && LLVM.width(want_ty) == 1
+    if want_ty isa LLVM.IntegerType && want_ty.width == 1
         # Both constants must carry `slot_spirv`'s width, not a 32/64 guess: a
         # `Bool` slot loads as `%uchar`, and `OpBitwiseAnd`/`OpINotEqual` against
         # a `%uint` operand is rejected by spirv-val.
@@ -1415,8 +1414,8 @@ function finish_reconciled_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst, 
 end
 
 function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
-    ptr = LLVM.operands(inst)[1]
-    load_ty = LLVM.value_type(inst)
+    ptr = inst.operands[1]
+    load_ty = inst.value_type
 
     # Padding GEP: the pointer targets struct padding (no field at this offset).
     # Emit OpUndef since padding bytes are undefined.
@@ -1487,7 +1486,7 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
         # SPIR-V VUID-StandaloneSpirv-PhysicalStorageBuffer64-06314 requires the
         # Aligned literal to be >= sizeof(largest scalar). If we know the runtime
         # pointer is less aligned than that, we must decompose into smaller accesses.
-        llvm_align = UInt32(LLVM.alignment(inst))
+        llvm_align = UInt32(inst.alignment)
         # Never decompose composite types (struct/array) - decomposition only handles
         # scalar types (i32/i64/float/double). Composite PSB loads use typed OpLoad.
         is_scalar_load = !(actual_load isa LLVM.StructType || actual_load isa LLVM.ArrayType)
@@ -1503,7 +1502,7 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                 # Wide type (i64/double) at non-8-aligned address:
                 # decompose into two i32 loads with Aligned 4
                 load_id = emit_psb_decomposed_load!(state, ptr_id, actual_load, spirv_load_ty)
-                if actual_load isa LLVM.IntegerType && LLVM.width(actual_load) == 64
+                if actual_load isa LLVM.IntegerType && actual_load.width == 64
                     decomposed_raw_value_ty = actual_load
                 end
             end
@@ -1522,7 +1521,7 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
             # (from emit_psb_byte_offset_with_user_type!). Load i64, then ConvertUToPtr.
             psb_ptr_as_i64 = false
             if actual_load isa LLVM.PointerType && pointee_ty_ld !== nothing &&
-               pointee_ty_ld isa LLVM.IntegerType && LLVM.width(pointee_ty_ld) == 64
+               pointee_ty_ld isa LLVM.IntegerType && pointee_ty_ld.width == 64
                 psb_ptr_as_i64 = true
                 align = UInt32(8)
             elseif pointee_ty_ld !== nothing && actual_load != pointee_ty_ld &&
@@ -1569,7 +1568,7 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
             pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
             if pointee_ty !== nothing
                 eff_load_ty = needs_bitcast ? actual_load_ty : load_ty
-                if eff_load_ty isa LLVM.PointerType && pointee_ty isa LLVM.IntegerType && LLVM.width(pointee_ty) == 64
+                if eff_load_ty isa LLVM.PointerType && pointee_ty isa LLVM.IntegerType && pointee_ty.width == 64
                     # Loading a PSB pointer from a local variable typed as i64.
                     # Must load as i64 first, then OpConvertUToPtr.
                     load_as_int_then_convert_to_ptr = true
@@ -1607,7 +1606,7 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                     #
                     # A vector load cannot be served from one drilled element, so it is
                     # left alone rather than silently given the wrong address.
-                    elem_ty = LLVM.eltype(pointee_ty)
+                    elem_ty = pointee_ty.element_type
                     elem_spirv = map_type!(state.type_ctx, elem_ty)
                     elem_ptr_ty = map_pointer_type!(state.type_ctx, elem_spirv, sc)
                     zero_id = emit_constant_u32!(state.mod, UInt32(0))
@@ -1833,9 +1832,9 @@ function find_struct_member_path_by_offset(struct_ty::LLVM.StructType, target_of
     leaf_ty = struct_ty
     for idx in path
         if leaf_ty isa LLVM.StructType
-            leaf_ty = LLVM.elements(leaf_ty)[idx + 1]
+            leaf_ty = leaf_ty.elements[idx + 1]
         elseif leaf_ty isa LLVM.ArrayType
-            leaf_ty = LLVM.eltype(leaf_ty)  # array index selects an element
+            leaf_ty = leaf_ty.element_type  # array index selects an element
         else
             return (nothing, nothing)
         end
@@ -1844,7 +1843,7 @@ function find_struct_member_path_by_offset(struct_ty::LLVM.StructType, target_of
 end
 
 function find_struct_member_path_recursive!(path::Vector{Int}, struct_ty::LLVM.StructType, target_offset::Int, dl)
-    member_types = LLVM.elements(struct_ty)
+    member_types = struct_ty.elements
     for (i, mt) in enumerate(member_types)
         field_offset = Int(compute_struct_field_offset(struct_ty, i - 1; dl))
         member_size = Int(compute_type_size(mt, dl))
@@ -1861,7 +1860,7 @@ function find_struct_member_path_recursive!(path::Vector{Int}, struct_ty::LLVM.S
                 pop!(path)
             elseif mt isa LLVM.ArrayType
                 # Decompose byte offset within an array member into element index
-                elem_ty = LLVM.eltype(mt)
+                elem_ty = mt.element_type
                 elem_size = Int(compute_type_size(elem_ty, dl))
                 if elem_size > 0
                     elem_idx = remaining ÷ elem_size
@@ -1908,14 +1907,14 @@ function find_array_field_in_struct(struct_ty::LLVM.StructType, dl, elem_stride:
         matches = Tuple{Vector{Int}, Int, LLVM.ArrayType}[]
         for (path, offset, arr_ty) in candidates
             # Check immediate element size
-            elem_ty = LLVM.eltype(arr_ty)
+            elem_ty = arr_ty.element_type
             if compute_type_size(elem_ty, dl) == elem_stride
                 push!(matches, (path, offset, arr_ty))
             else
                 # Check leaf element size for nested arrays (e.g., [1 x [8 x double]])
                 leaf = elem_ty
                 while leaf isa LLVM.ArrayType
-                    leaf = LLVM.eltype(leaf)
+                    leaf = leaf.element_type
                 end
                 if compute_type_size(leaf, dl) == elem_stride
                     push!(matches, (path, offset, arr_ty))
@@ -1941,7 +1940,7 @@ end
 
 function collect_array_fields!(results::Vector{Tuple{Vector{Int}, Int, LLVM.ArrayType}},
                                  path::Vector{Int}, struct_ty::LLVM.StructType, base_offset::Int, dl)
-    member_types = LLVM.elements(struct_ty)
+    member_types = struct_ty.elements
     for (i, mt) in enumerate(member_types)
         field_offset = Int(compute_struct_field_offset(struct_ty, i - 1; dl))
         if mt isa LLVM.ArrayType
@@ -1965,12 +1964,12 @@ function find_array_nested_path(ty::LLVM.LLVMType, target_offset::Int, dl)
 end
 
 function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.ArrayType, target_offset::Int, dl)
-    elem_ty = LLVM.eltype(ty)
+    elem_ty = ty.element_type
     elem_size = compute_type_size(elem_ty, dl)
     elem_size == 0 && return nothing
     outer_idx = target_offset ÷ elem_size
     remainder = target_offset % elem_size
-    outer_idx >= LLVM.length(ty) && return nothing
+    outer_idx >= ty.length && return nothing
     push!(path, outer_idx)
     if remainder == 0
         return elem_ty
@@ -1985,7 +1984,7 @@ function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.ArrayType
 end
 
 function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.StructType, target_offset::Int, dl)
-    member_types = LLVM.elements(ty)
+    member_types = ty.elements
     for (i, mt) in enumerate(member_types)
         field_offset = Int(compute_struct_field_offset(ty, i - 1; dl))
         member_size = Int(compute_type_size(mt, dl))
@@ -2020,23 +2019,23 @@ function find_zero_index_path(from_ty::LLVM.LLVMType, target_ty::LLVM.LLVMType)
     current = from_ty
     while current != target_ty
         if current isa LLVM.StructType
-            elems = LLVM.elements(current)
+            elems = current.elements
             isempty(elems) && return nothing
             push!(path, 0)
             current = first(elems)
         elseif current isa LLVM.ArrayType
-            LLVM.length(current) == 0 && return nothing
+            current.length == 0 && return nothing
             push!(path, 0)
-            current = LLVM.eltype(current)
+            current = current.element_type
         elseif current isa LLVM.VectorType
             # SROA/InstCombine folds `load <N x T>, ptr %v; extractelement 0`
             # into `load T, ptr %v`.  In SPIR-V Logical addressing the scalar
             # element of a vector pointer must be reached via OpAccessChain
             # (you can't OpLoad a scalar from a vector pointer).  Treat vectors
             # the same as arrays here so the caller emits the AccessChain.
-            LLVM.length(current) == 0 && return nothing
+            current.length == 0 && return nothing
             push!(path, 0)
-            current = LLVM.eltype(current)
+            current = current.element_type
         else
             return nothing  # Can't drill further, type not found
         end
@@ -2054,18 +2053,18 @@ function find_zero_index_path_to_leaf(from_ty::LLVM.LLVMType)
     current = from_ty
     while current isa LLVM.StructType || current isa LLVM.ArrayType || current isa LLVM.VectorType
         if current isa LLVM.StructType
-            elems = LLVM.elements(current)
+            elems = current.elements
             isempty(elems) && return (nothing, nothing)
             push!(path, 0)
             current = first(elems)
         elseif current isa LLVM.ArrayType
-            LLVM.length(current) == 0 && return (nothing, nothing)
+            current.length == 0 && return (nothing, nothing)
             push!(path, 0)
-            current = LLVM.eltype(current)
+            current = current.element_type
         else  # VectorType — same handling as array (SROA scalar-from-vector)
-            LLVM.length(current) == 0 && return (nothing, nothing)
+            current.length == 0 && return (nothing, nothing)
             push!(path, 0)
-            current = LLVM.eltype(current)
+            current = current.element_type
         end
     end
     isempty(path) && return (nothing, nothing)
@@ -2086,14 +2085,14 @@ function find_zero_index_path_to_pointer(from_ty::LLVM.LLVMType)
             isempty(path) && return nothing  # Already a pointer, no drill needed
             return path
         elseif current isa LLVM.StructType
-            elems = LLVM.elements(current)
+            elems = current.elements
             isempty(elems) && return nothing
             push!(path, 0)
             current = first(elems)
         elseif current isa LLVM.ArrayType
-            LLVM.length(current) == 0 && return nothing
+            current.length == 0 && return nothing
             push!(path, 0)
-            current = LLVM.eltype(current)
+            current = current.element_type
         else
             return nothing  # Hit a scalar, no pointer at offset 0
         end
@@ -2107,12 +2106,12 @@ end
 
 function llvm_type_bit_width(ty::LLVM.LLVMType)
     if ty isa LLVM.IntegerType
-        return LLVM.width(ty)
-    elseif ty isa LLVM.LLVMFloat
+        return ty.width
+    elseif ty isa LLVM.FloatType
         return 32
-    elseif ty isa LLVM.LLVMDouble
+    elseif ty isa LLVM.DoubleType
         return 64
-    elseif ty isa LLVM.LLVMHalf
+    elseif ty isa LLVM.HalfType
         return 16
     else
         return -1  # Unknown
@@ -2141,7 +2140,7 @@ function rederive_store_ptr_at_parent_level!(state::SPIRVEmitterState,
                                                gep_id::UInt32,
                                                store_ty::LLVM.LLVMType,
                                                reverse_path::Vector{Int})
-    ops = LLVM.operands(gep_inst)
+    ops = gep_inst.operands
     n_indices = length(ops) - 1  # total GEP indices (including first)
     n_drop = length(reverse_path)  # how many trailing indices to remove
 
@@ -2295,7 +2294,7 @@ function resolve_struct_field_store!(state::SPIRVEmitterState, ptr::LLVM.Value,
 end
 
 function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     value = ops[1]
     ptr = ops[2]
 
@@ -2312,7 +2311,7 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
 
     # NOTE: Composite workgroup stores are decomposed in the LLVM pass
     # decompose_composite_workgroup_accesses! before reaching the emitter.
-    store_ty = LLVM.value_type(value)
+    store_ty = value.value_type
     if store_ty isa LLVM.StructType && get_pointer_storage_class(ptr) == SC.Workgroup
         error("Unexpected composite store to Workgroup memory — should have been decomposed by LLVM pass")
         return
@@ -2323,7 +2322,7 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
 
     # Handle struct-pointer mismatch for stores (same as loads):
     # If the stored type is a scalar but the pointer points to a composite, drill down.
-    store_ty = LLVM.value_type(value)
+    store_ty = value.value_type
     orig_ptr_id = ptr_id
     ptr_id, store_val_bitcast_to = resolve_struct_field_store!(state, ptr, ptr_id, store_ty, value)
 
@@ -2351,12 +2350,12 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
 
     # PhysicalStorageBuffer stores MUST have Aligned memory operand
     if is_psb
-        store_ty = LLVM.value_type(value)
+        store_ty = value.value_type
         # Check if this store needs decomposition due to misaligned PSB address.
         # SPIR-V VUID-StandaloneSpirv-PhysicalStorageBuffer64-06314 requires the
         # Aligned literal to be >= sizeof(largest scalar). If we know the runtime
         # pointer is less aligned than that, we must decompose into smaller stores.
-        llvm_align = UInt32(LLVM.alignment(inst))
+        llvm_align = UInt32(inst.alignment)
         if psb_needs_decomposition(state, ptr, store_ty; llvm_align)
             access_align = get_alignment_for_type(store_ty)
             if store_ty isa LLVM.VectorType
@@ -2397,8 +2396,8 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
         if (sc == SC.Workgroup || sc == SC.Function) && !store_did_drill
             pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
             if pointee_ty !== nothing
-                val_ty = LLVM.value_type(value)
-                if val_ty isa LLVM.PointerType && pointee_ty isa LLVM.IntegerType && LLVM.width(pointee_ty) == 64
+                val_ty = value.value_type
+                if val_ty isa LLVM.PointerType && pointee_ty isa LLVM.IntegerType && pointee_ty.width == 64
                     # Storing a PSB pointer into a local variable typed as i64.
                     # Must OpConvertPtrToU first.
                     i64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
@@ -2429,11 +2428,11 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
                     # A wider value would overflow the field, so it keeps the previous
                     # behaviour rather than silently truncating; `emit.jl`'s widening
                     # LOAD branch refuses the mirror case for the same reason.
-                    pw = LLVM.width(pointee_ty)
-                    vw = val_ty isa LLVM.IntegerType ? LLVM.width(val_ty) :
-                         val_ty isa LLVM.LLVMHalf   ? 16 :
-                         val_ty isa LLVM.LLVMFloat  ? 32 :
-                         val_ty isa LLVM.LLVMDouble ? 64 : pw
+                    pw = pointee_ty.width
+                    vw = val_ty isa LLVM.IntegerType ? val_ty.width :
+                         val_ty isa LLVM.HalfType   ? 16 :
+                         val_ty isa LLVM.FloatType  ? 32 :
+                         val_ty isa LLVM.DoubleType ? 64 : pw
                     pointee_spirv = emit_type_int!(state.mod, UInt32(spirv_int_width(pw)), UInt32(0))
                     if vw == pw
                         bc = fresh_id!(state.mod)
@@ -2493,7 +2492,7 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
                     # is still wider than the value — a uint into [2 x ulong], which is
                     # what the Complex sliced-setindex reproducer produces — splice it
                     # in with a read-modify-write so the high bits survive.
-                    elem_ty = LLVM.eltype(pointee_ty)
+                    elem_ty = pointee_ty.element_type
                     elem_spirv = map_type!(state.type_ctx, elem_ty)
                     elem_ptr_ty = map_pointer_type!(state.type_ctx, elem_spirv, sc)
                     zero_id = emit_constant_u32!(state.mod, UInt32(0))
@@ -2501,11 +2500,11 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
                     encode_instruction!(state.mod.functions, Op.OpAccessChain, elem_ptr_ty, drill, ptr_id, zero_id)
                     ptr_id = drill
                     if elem_ty isa LLVM.IntegerType && val_ty != elem_ty
-                        ew = LLVM.width(elem_ty)
-                        vw = val_ty isa LLVM.IntegerType ? LLVM.width(val_ty) :
-                             val_ty isa LLVM.LLVMHalf   ? 16 :
-                             val_ty isa LLVM.LLVMFloat  ? 32 :
-                             val_ty isa LLVM.LLVMDouble ? 64 : ew
+                        ew = elem_ty.width
+                        vw = val_ty isa LLVM.IntegerType ? val_ty.width :
+                             val_ty isa LLVM.HalfType   ? 16 :
+                             val_ty isa LLVM.FloatType  ? 32 :
+                             val_ty isa LLVM.DoubleType ? 64 : ew
                         if vw == ew
                             bc = fresh_id!(state.mod)
                             encode_instruction!(state.mod.functions, Op.OpBitcast, elem_spirv, bc, val_id)
@@ -2565,7 +2564,7 @@ function try_decomposed_struct_store!(state::SPIRVEmitterState, ptr_id::UInt32, 
     leaf_path, leaf_ty = find_zero_index_path_to_leaf(struct_ty)
     (leaf_path === nothing || leaf_ty === nothing) && return false
     leaf_bits = llvm_type_bit_width(leaf_ty)
-    store_width = val_ty isa LLVM.IntegerType ? LLVM.width(val_ty) : 64
+    store_width = val_ty isa LLVM.IntegerType ? val_ty.width : 64
     (leaf_bits <= 0 || store_width < leaf_bits || store_width % leaf_bits != 0) && return false
     emit_decomposed_struct_store!(state, ptr_id, val_id, val_ty, leaf_path, leaf_ty, leaf_bits, store_width)
     return true
@@ -2646,12 +2645,12 @@ end
 function collect_scalar_fields!(results::Vector{Tuple{Int, LLVM.LLVMType, Vector{Int}}},
                                  path::Vector{Int}, ty::LLVM.LLVMType, base_offset::Int, dl)
     if ty isa LLVM.StructType
-        for (i, mt) in enumerate(LLVM.elements(ty))
+        for (i, mt) in enumerate(ty.elements)
             field_offset = base_offset + Int(compute_struct_field_offset(ty, i - 1; dl))
             collect_scalar_fields!(results, vcat(path, [i - 1]), mt, field_offset, dl)
         end
     elseif ty isa LLVM.ArrayType
-        elem_ty = LLVM.eltype(ty)
+        elem_ty = ty.element_type
         elem_size = Int(compute_type_size(elem_ty, dl))
         for i in 0:(length(ty) - 1)
             collect_scalar_fields!(results, vcat(path, [i]), elem_ty, base_offset + i * elem_size, dl)
@@ -2668,7 +2667,7 @@ Returns the (possibly new) value ID to use for the store.
 """
 function bitcast_store_value_if_needed!(state::SPIRVEmitterState, ptr::LLVM.Value,
                                           value::LLVM.Value, val_id::UInt32)
-    val_ty = LLVM.value_type(value)
+    val_ty = value.value_type
     pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
     pointee_ty === nothing && return val_id
 
@@ -2726,7 +2725,7 @@ the value type. E.g. storing i8 (Bool) into ptr<i64,PSB> → bitcast ptr to ptr<
 """
 function fix_psb_ptr_type_for_store!(state::SPIRVEmitterState, ptr::LLVM.Value,
                                        ptr_id::UInt32, value::LLVM.Value)
-    val_ty = LLVM.value_type(value)
+    val_ty = value.value_type
     pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
     pointee_ty === nothing && return ptr_id
     val_ty == pointee_ty && return ptr_id
@@ -2744,11 +2743,11 @@ end
 # Traces through GEPs to find whether the pointer originates from an alloca
 # (Function storage) or from device memory (PhysicalStorageBuffer).
 function get_pointer_storage_class(ptr::LLVM.Value)
-    ty = LLVM.value_type(ptr)
+    ty = ptr.value_type
     if !(ty isa LLVM.PointerType)
         return SC.Function
     end
-    as = LLVM.addrspace(ty)
+    as = ty.addrspace
     if as == 1
         # Addrspace 1: Julia constant globals (Private) or PSB pointers
         if is_constant_global_ptr(ptr)
@@ -2774,9 +2773,9 @@ function get_pointer_storage_class(ptr::LLVM.Value)
 end
 
 function is_psb_pointer(ptr::LLVM.Value)
-    ty = LLVM.value_type(ptr)
+    ty = ptr.value_type
     ty isa LLVM.PointerType || return false
-    as = LLVM.addrspace(ty)
+    as = ty.addrspace
     # Addrspace 1: PSB unless it's a constant global (Julia _j_const lookup tables → Private SC)
     as == 1 && return !is_constant_global_ptr(ptr)
     # Addrspace 0: PSB unless it's an alloca (which is genuinely Function storage)
@@ -2791,14 +2790,14 @@ Check if an addrspace(1) pointer traces back to a constant global variable
 function is_constant_global_ptr(ptr::LLVM.Value)
     ptr isa LLVM.GlobalVariable && return true
     if ptr isa LLVM.GetElementPtrInst
-        base = LLVM.operands(ptr)[1]
+        base = ptr.operands[1]
         return is_constant_global_ptr(base)
     end
     if ptr isa LLVM.ConstantExpr
         # ConstantExpr GEP on a global
         opcode = LLVM.API.LLVMGetConstOpcode(ptr)
         if opcode == LLVM.API.LLVMGetElementPtr
-            base = LLVM.operands(ptr)[1]
+            base = ptr.operands[1]
             return is_constant_global_ptr(base)
         end
     end
@@ -2814,13 +2813,13 @@ function trace_to_non_alloca(ptr::LLVM.Value, visited::Set{LLVM.Value}=Set{LLVM.
     push!(visited, ptr)
     ptr isa LLVM.AllocaInst && return false
     if ptr isa LLVM.GetElementPtrInst
-        base = LLVM.operands(ptr)[1]
+        base = ptr.operands[1]
         return trace_to_non_alloca(base, visited)
     end
     # PHI nodes: trace all incoming values. If ANY traces to an alloca,
     # the pointer may be Function-space — return false (not PSB).
     if ptr isa LLVM.PHIInst
-        for (val, _) in LLVM.incoming(ptr)
+        for (val, _) in ptr.incoming
             if !trace_to_non_alloca(val, visited)
                 return false
             end
@@ -2845,21 +2844,21 @@ NOTE: We always use Aligned 1 for PSB access to avoid misalignment bugs.
 The only exception is i64/ptr loads where we use Aligned 4 (two-u32 decomposition).
 This function is kept for the decomposition check in psb_needs_decomposition."""
 function get_alignment_for_type(ty::LLVM.LLVMType)
-    if ty isa LLVM.LLVMFloat
+    if ty isa LLVM.FloatType
         return UInt32(4)
-    elseif ty isa LLVM.LLVMDouble
+    elseif ty isa LLVM.DoubleType
         return UInt32(8)
-    elseif ty isa LLVM.LLVMHalf
+    elseif ty isa LLVM.HalfType
         return UInt32(2)
     elseif ty isa LLVM.IntegerType
-        w = LLVM.width(ty)
+        w = ty.width
         return UInt32(max(1, w ÷ 8))
     elseif ty isa LLVM.PointerType
         return UInt32(8)  # Pointers are 8 bytes
     elseif ty isa LLVM.StructType
         # Alignment of a struct = max alignment of its members
         max_align = UInt32(1)
-        for elem in LLVM.elements(ty)
+        for elem in ty.elements
             max_align = max(max_align, get_alignment_for_type(elem))
         end
         return max_align
@@ -2975,7 +2974,7 @@ function psb_needs_decomposition(state::SPIRVEmitterState, ptr::LLVM.Value, acce
 
     # Check 4: inttoptr(add(..., const)) chains from LLVM optimization passes.
     if ptr isa LLVM.IntToPtrInst
-        src = LLVM.operands(ptr)[1]
+        src = ptr.operands[1]
         const_offset = extract_constant_offset_from_adds(src)
         if const_offset > 0
             offset_align = UInt32(1 << trailing_zeros(const_offset))
@@ -3001,15 +3000,15 @@ function extract_constant_offset_from_adds(val::LLVM.Value)
     if val isa LLVM.ConstantInt
         return convert(Int64, val)
     end
-    if !(val isa LLVM.Instruction) || LLVM.opcode(val) != LLVM.API.LLVMAdd
+    if !(val isa LLVM.Instruction) || val.opcode != LLVM.API.LLVMAdd
         return Int64(0)
     end
-    ops = LLVM.operands(val)
+    ops = val.operands
     total = Int64(0)
     for op in (ops[1], ops[2])
         if op isa LLVM.ConstantInt
             total += convert(Int64, op)
-        elseif op isa LLVM.Instruction && LLVM.opcode(op) == LLVM.API.LLVMAdd
+        elseif op isa LLVM.Instruction && op.opcode == LLVM.API.LLVMAdd
             total += extract_constant_offset_from_adds(op)
         end
     end
@@ -3087,7 +3086,7 @@ function emit_psb_decomposed_store!(state::SPIRVEmitterState, ptr_id::UInt32, va
 
     # Convert value to i64 if it's a double
     raw_val = val_id
-    if val_ty isa LLVM.LLVMDouble
+    if val_ty isa LLVM.DoubleType
         raw_val = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpBitcast, u64_spirv, raw_val, val_id)
     end
@@ -3183,7 +3182,7 @@ function emit_psb_decomposed_load!(state::SPIRVEmitterState, ptr_id::UInt32,
     encode_instruction!(state.mod.functions, Op.OpBitwiseOr, u64_spirv, combined, lo_u64, hi_shifted)
 
     # If the result should be double, bitcast i64 → double
-    if load_ty isa LLVM.LLVMDouble
+    if load_ty isa LLVM.DoubleType
         result_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpBitcast, result_spirv_ty, result_id, combined)
         return result_id
@@ -3204,16 +3203,16 @@ function emit_psb_decomposed_small_store!(state::SPIRVEmitterState, ptr_id::UInt
 
     # Convert value to u32 for uniform byte extraction
     raw_val = val_id
-    if val_ty isa LLVM.LLVMFloat
+    if val_ty isa LLVM.FloatType
         raw_val = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpBitcast, u32_spirv, raw_val, val_id)
-    elseif val_ty isa LLVM.LLVMHalf
+    elseif val_ty isa LLVM.HalfType
         u16_spirv = emit_type_int!(state.mod, UInt32(16), UInt32(0))
         half_as_u16 = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpBitcast, u16_spirv, half_as_u16, val_id)
         raw_val = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpUConvert, u32_spirv, raw_val, half_as_u16)
-    elseif val_ty isa LLVM.IntegerType && LLVM.width(val_ty) < 32
+    elseif val_ty isa LLVM.IntegerType && val_ty.width < 32
         raw_val = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpUConvert, u32_spirv, raw_val, val_id)
     end
@@ -3311,18 +3310,18 @@ function emit_psb_decomposed_small_load!(state::SPIRVEmitterState, ptr_id::UInt3
     end
 
     # Convert u32 combined value to the actual target type
-    if load_ty isa LLVM.LLVMFloat
+    if load_ty isa LLVM.FloatType
         result_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpBitcast, result_spirv_ty, result_id, combined)
         return result_id
-    elseif load_ty isa LLVM.LLVMHalf
+    elseif load_ty isa LLVM.HalfType
         u16_spirv = emit_type_int!(state.mod, UInt32(16), UInt32(0))
         truncated = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpUConvert, u16_spirv, truncated, combined)
         result_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpBitcast, result_spirv_ty, result_id, truncated)
         return result_id
-    elseif load_ty isa LLVM.IntegerType && LLVM.width(load_ty) < 32
+    elseif load_ty isa LLVM.IntegerType && load_ty.width < 32
         # Truncate u32 to narrower integer (i16, i8)
         result_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpUConvert, result_spirv_ty, result_id, combined)
@@ -3399,7 +3398,7 @@ function emit_psb_decomposed_vector_store!(state::SPIRVEmitterState, ptr_id::UIn
 end
 
 function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     base_ptr = ops[1]
     base_id = get_value_id!(state, base_ptr)
 
@@ -3415,10 +3414,10 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
     # LLVM uses i8-sourced GEPs for pointer arithmetic with byte offsets.
     # In SPIR-V, we must use the base pointer's actual element type and convert
     # the byte offset to an element index (byte_offset / sizeof(element)).
-    if source_ty isa LLVM.IntegerType && LLVM.width(source_ty) == 8 && n_indices == 1
+    if source_ty isa LLVM.IntegerType && source_ty.width == 8 && n_indices == 1
         base_pointee = get_pointee_type(state.type_ctx.ptm, base_ptr)
         sc = get_pointer_storage_class(base_ptr)
-        if base_pointee !== nothing && !(base_pointee isa LLVM.IntegerType && LLVM.width(base_pointee) == 8)
+        if base_pointee !== nothing && !(base_pointee isa LLVM.IntegerType && base_pointee.width == 8)
             if base_pointee isa LLVM.PointerType
                 # Opaque pointer base (e.g. BDA inttoptr after SROA): infer actual access
                 # type from users and use PSB byte arithmetic.
@@ -3488,7 +3487,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
     # which uses `find_zero_index_path` to navigate arr_eltype → source_ty.
     aeo_eltype_match = if haskey(state.array_element_origin, base_ptr)
         _, _, _, arr_ty_check = state.array_element_origin[base_ptr]
-        arr_ty_check isa LLVM.ArrayType && LLVM.eltype(arr_ty_check) == source_ty
+        arr_ty_check isa LLVM.ArrayType && arr_ty_check.element_type == source_ty
     else
         false
     end
@@ -3568,15 +3567,15 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
         # RTX 4000 Ada (595.99) happened to wrap it to the intended -16 bytes.
         base_pointee = get_pointee_type(state.type_ctx.ptm, base_ptr)
         if sc != SC.PhysicalStorageBuffer && base_pointee isa LLVM.ArrayType &&
-           (LLVM.eltype(base_pointee) == source_ty ||
-            compute_type_size(LLVM.eltype(base_pointee), state.data_layout) == compute_type_size(source_ty, state.data_layout))
+           (base_pointee.element_type == source_ty ||
+            compute_type_size(base_pointee.element_type, state.data_layout) == compute_type_size(source_ty, state.data_layout))
             idx_i32 = ensure_index_i32!(state, ops[2])
             result_id = fresh_id!(state.mod)
 
             # When source_ty differs from array element type (type-punning via opaque ptrs,
             # e.g. gep float, ptr @alloca_of_i32_array, i64 %idx), use the array's actual
             # element type for OpAccessChain. Downstream load/store handles the bitcast.
-            arr_elem_ty = LLVM.eltype(base_pointee)
+            arr_elem_ty = base_pointee.element_type
             actual_result_ptr_ty = if arr_elem_ty != source_ty
                 elem_spirv = sc == SC.Workgroup ? map_workgroup_type!(state.type_ctx, arr_elem_ty) :
                     map_type!(state.type_ctx, arr_elem_ty)
@@ -3630,7 +3629,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                 # PSB pointer arithmetic: use manual byte-offset instead of OpPtrAccessChain
                 # (OpPtrAccessChain on PSB struct pointers is broken on AMD RADV)
                 result_id = emit_psb_ptr_arithmetic!(state, base_id, idx, result_ptr_ty, source_ty;
-                    idx_llvm_ty=LLVM.value_type(ops[2]), base_pointee=base_pointee)
+                    idx_llvm_ty=ops[2].value_type, base_pointee=base_pointee)
                 # Track pointer alignment from element stride.
                 # E.g., stride=6 (array of {i16,i16,i16}) → ptr alignment = gcd(base, 6) = 2
                 # Downstream stores of i32/float at these addresses need byte decomposition.
@@ -3659,7 +3658,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     actual_leaf_ty = base_pointee
                     for _ in ac_indices
                         if actual_leaf_ty isa LLVM.ArrayType
-                            actual_leaf_ty = LLVM.eltype(actual_leaf_ty)
+                            actual_leaf_ty = actual_leaf_ty.element_type
                         elseif actual_leaf_ty isa LLVM.StructType
                             # Conservative: stop walking; the OpAccessChain emit
                             # below would already need to be more careful for
@@ -3821,9 +3820,9 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     idx_val = convert(Int64, idx_op)
                     if current_walk_ty isa LLVM.StructType
                         total_byte_offset += compute_struct_field_offset(current_walk_ty, idx_val; dl=state.data_layout)
-                        current_walk_ty = LLVM.elements(current_walk_ty)[idx_val+1]
+                        current_walk_ty = current_walk_ty.elements[idx_val+1]
                     elseif current_walk_ty isa LLVM.ArrayType
-                        elem_ty = LLVM.eltype(current_walk_ty)
+                        elem_ty = current_walk_ty.element_type
                         total_byte_offset += idx_val * Int64(compute_type_size(elem_ty, state.data_layout))
                         current_walk_ty = elem_ty
                     else
@@ -3837,13 +3836,13 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     # Fallback: compute byte offset dynamically (rare, only if non-const index)
                     # For now, just handle the simple [N x T] single-index case
                     if length(ops) == 3 && source_ty isa LLVM.ArrayType
-                        elem_ty = LLVM.eltype(source_ty)
+                        elem_ty = source_ty.element_type
                         elem_size = compute_type_size(elem_ty, state.data_layout)
                         idx_op = ops[3]
                         idx_id = get_value_id!(state, idx_op)
                         idx_u64 = idx_id
-                        idx_ty = LLVM.value_type(idx_op)
-                        if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) < 64
+                        idx_ty = idx_op.value_type
+                        if idx_ty isa LLVM.IntegerType && idx_ty.width < 64
                             idx_u64 = fresh_id!(state.mod)
                             encode_instruction!(state.mod.functions, Op.OpSConvert, u64_spirv, idx_u64, idx_id)
                         end
@@ -3895,7 +3894,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
             # In SPIR-V this is OpAccessChain (not OpPtrAccessChain) because we're
             # indexing INTO the array, not doing pointer arithmetic.
             base_pointee = get_pointee_type(state.type_ctx.ptm, base_ptr)
-            if base_pointee isa LLVM.ArrayType && LLVM.eltype(base_pointee) == source_ty
+            if base_pointee isa LLVM.ArrayType && base_pointee.element_type == source_ty
                 # Use OpAccessChain with all indices
                 index_ids = UInt32[]
                 for i in 2:length(ops)
@@ -3917,7 +3916,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     first_idx = get_value_id!(state, ops[2])
                     elem_ptr_id = emit_psb_ptr_arithmetic!(state, base_id, first_idx,
                         map_pointer_type!(state.type_ctx, map_type!(state.type_ctx, source_ty), sc),
-                        source_ty; idx_llvm_ty=LLVM.value_type(ops[2]), base_pointee=base_pointee)
+                        source_ty; idx_llvm_ty=ops[2].value_type, base_pointee=base_pointee)
                     # Track stride alignment on the result pointer (inherits from element)
                     elem_stride = compute_type_size(source_ty, state.data_layout)
                     if elem_stride > 0
@@ -3939,7 +3938,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     first_idx = get_value_id!(state, ops[2])
                     elem_ptr_id = emit_psb_ptr_arithmetic!(state, base_id, first_idx,
                         map_pointer_type!(state.type_ctx, map_type!(state.type_ctx, source_ty), sc),
-                        source_ty; idx_llvm_ty=LLVM.value_type(ops[2]), base_pointee=base_pointee)
+                        source_ty; idx_llvm_ty=ops[2].value_type, base_pointee=base_pointee)
                     elem_stride = compute_type_size(source_ty, state.data_layout)
                     if elem_stride > 0
                         stride_align = UInt32(1 << trailing_zeros(elem_stride))
@@ -4032,7 +4031,7 @@ function map_gep_ptr_result!(ctx::SPIRVTypeContext, source_ty::LLVM.LLVMType,
                                gep::LLVM.GetElementPtrInst)
     # Walk the GEP indices to find the FINAL struct + member index where the result is a pointer.
     # Multi-level GEPs like (0, 0, 0, 1, 0) drill through struct→struct→array→struct→ptr.
-    ops = LLVM.operands(gep)
+    ops = gep.operands
     n_ops = length(ops)
     if n_ops >= 3
         current_ty = source_ty
@@ -4045,13 +4044,13 @@ function map_gep_ptr_result!(ctx::SPIRVTypeContext, source_ty::LLVM.LLVMType,
             idx = convert(Int, idx_val)
 
             if current_ty isa LLVM.StructType
-                members = LLVM.elements(current_ty)
+                members = current_ty.elements
                 (idx + 1) <= length(members) || break
                 final_struct_ty = current_ty
                 final_member_idx = idx
                 current_ty = members[idx + 1]
             elseif current_ty isa LLVM.ArrayType
-                current_ty = LLVM.eltype(current_ty)
+                current_ty = current_ty.element_type
             else
                 break
             end
@@ -4088,8 +4087,8 @@ handlers to emit OpUndef for loads and skip stores to padding.
 function is_padding_gep(gep::LLVM.GetElementPtrInst, dl::Union{Nothing, LLVM.DataLayout})
     # Must be a byte-offset GEP (gep i8, ptr, i64 const)
     src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
-    !(src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8) && return false
-    ops = LLVM.operands(gep)
+    !(src_ty isa LLVM.IntegerType && src_ty.width == 8) && return false
+    ops = gep.operands
     length(ops) != 2 && return false
     ops[2] isa LLVM.ConstantInt || return false
 
@@ -4118,13 +4117,13 @@ Also updates the PTM so downstream stores/loads see the correct pointee type.
 function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst,
                                  base_ptr::LLVM.Value, base_id::UInt32,
                                  base_pointee::LLVM.LLVMType)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     byte_offset_id = get_value_id!(state, ops[2])
 
     # Get pointer storage class
     sc = get_pointer_storage_class(base_ptr)
 
-    idx_ty = LLVM.value_type(ops[2])
+    idx_ty = ops[2].value_type
     idx_spirv_ty = map_type!(state.type_ctx, idx_ty)
 
     # When base_pointee is an array or struct, the byte offset may be accessing
@@ -4133,7 +4132,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
     # means "access element at byte 4" = float[1], NOT advance by 4 * sizeof([3 x float]).
     if base_pointee isa LLVM.ArrayType
         # Array: divide by element size to get array index, use OpAccessChain
-        elem_ty = LLVM.eltype(base_pointee)
+        elem_ty = base_pointee.element_type
         elem_size = compute_type_size(elem_ty, state.data_layout)
 
         # Check for constant byte offset that needs recursive decomposition.
@@ -4165,7 +4164,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                     encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, base_id)
 
                     bo_u64 = byte_offset_id
-                    if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) < 64
+                    if idx_ty isa LLVM.IntegerType && idx_ty.width < 64
                         bo_u64 = fresh_id!(state.mod)
                         encode_instruction!(state.mod.functions, Op.OpSConvert, u64_spirv, bo_u64, byte_offset_id)
                     end
@@ -4222,8 +4221,8 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
 
             # Try to extract constant addend from add/or instruction
             if byte_offset_val isa LLVM.Instruction
-                bo_opcode = LLVM.opcode(byte_offset_val)
-                bo_ops = LLVM.operands(byte_offset_val)
+                bo_opcode = byte_offset_val.opcode
+                bo_ops = byte_offset_val.operands
                 if bo_opcode == LLVM.API.LLVMAdd && length(bo_ops) >= 2
                     if bo_ops[2] isa LLVM.ConstantInt
                         const_part = convert(Int64, bo_ops[2])
@@ -4268,7 +4267,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                     return
                 elseif sub_path !== nothing && sub_leaf isa LLVM.ArrayType
                     # Constant part points to an array field. Dynamic part indexes within it.
-                    inner_elem_ty = LLVM.eltype(sub_leaf)
+                    inner_elem_ty = sub_leaf.element_type
                     inner_elem_size = Int(compute_type_size(inner_elem_ty, state.data_layout))
                     if inner_elem_size > 0
                         inner_spirv = map_type!(state.type_ctx, inner_elem_ty)
@@ -4278,7 +4277,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                         sz_id = emit_int_constant!(state, idx_ty, Int64(inner_elem_size))
                         dyn_idx_id = fresh_id!(state.mod)
                         encode_instruction!(state.mod.functions, Op.OpSDiv, idx_spirv_ty, dyn_idx_id, dyn_id, sz_id)
-                        dyn_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
+                        dyn_idx_i32 = if idx_ty isa LLVM.IntegerType && idx_ty.width > 32
                             u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
                             conv_id = fresh_id!(state.mod)
                             encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, dyn_idx_id)
@@ -4334,7 +4333,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
         end
 
         # Convert to i32 for OpAccessChain index (SPIR-V requires i32 indices)
-        idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
+        idx_i32 = if idx_ty isa LLVM.IntegerType && idx_ty.width > 32
             u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
             conv_id = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, idx_id)
@@ -4401,7 +4400,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
             # → the offset 32 means +2 elements from the dynamic index.
             if (sc == SC.Function || sc == SC.Private) && haskey(state.array_element_origin, base_ptr)
                 arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
-                arr_elem_ty = LLVM.eltype(arr_type)
+                arr_elem_ty = arr_type.element_type
                 arr_elem_size = compute_type_size(arr_elem_ty, state.data_layout)
                 if arr_elem_size > 0
                     arr_idx_adjust = offset ÷ arr_elem_size
@@ -4476,7 +4475,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
             # offset %b*16, which is wrong when %b selects another array element.
             if (sc == SC.Function || sc == SC.Private) && haskey(state.array_element_origin, base_ptr)
                 arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
-                arr_elem_ty = LLVM.eltype(arr_type)
+                arr_elem_ty = arr_type.element_type
                 arr_elem_size = compute_type_size(arr_elem_ty, state.data_layout)
                 if arr_elem_size > 0
                     # Compute the dynamic additional index: byte_offset / elem_size
@@ -4486,7 +4485,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
 
                     # Combined index = previous dynamic index + new dynamic index
                     u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
-                    dyn_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
+                    dyn_idx_i32 = if idx_ty isa LLVM.IntegerType && idx_ty.width > 32
                         conv_id = fresh_id!(state.mod)
                         encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, dyn_idx_id)
                         conv_id
@@ -4532,8 +4531,8 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                 const_part = Int64(-1)
                 dynamic_part_val = nothing
                 if byte_offset_val isa LLVM.Instruction
-                    bo_opcode = LLVM.opcode(byte_offset_val)
-                    bo_ops = LLVM.operands(byte_offset_val)
+                    bo_opcode = byte_offset_val.opcode
+                    bo_ops = byte_offset_val.operands
                     if (bo_opcode == LLVM.API.LLVMAdd || bo_opcode == LLVM.API.LLVMOr) && length(bo_ops) >= 2
                         if bo_ops[2] isa LLVM.ConstantInt
                             const_part = convert(Int64, bo_ops[2])
@@ -4549,7 +4548,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                     # (handles nested structs like { {ptr, [4xi64]}, [3xi64] })
                     sub_path, sub_leaf = find_struct_member_path_by_offset(base_pointee, Int(const_part), state.data_layout)
                     if sub_path !== nothing && sub_leaf isa LLVM.ArrayType
-                        inner_elem_ty = LLVM.eltype(sub_leaf)
+                        inner_elem_ty = sub_leaf.element_type
                         inner_elem_size = Int(compute_type_size(inner_elem_ty, state.data_layout))
                         if inner_elem_size > 0
                             inner_spirv = map_type!(state.type_ctx, inner_elem_ty)
@@ -4558,7 +4557,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                             sz_id = emit_int_constant!(state, idx_ty, Int64(inner_elem_size))
                             dyn_idx_id = fresh_id!(state.mod)
                             encode_instruction!(state.mod.functions, Op.OpSDiv, idx_spirv_ty, dyn_idx_id, dyn_id, sz_id)
-                            dyn_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
+                            dyn_idx_i32 = if idx_ty isa LLVM.IntegerType && idx_ty.width > 32
                                 u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
                                 conv_id = fresh_id!(state.mod)
                                 encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, dyn_idx_id)
@@ -4623,8 +4622,8 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                 elem_stride = 0
                 byte_offset_val = ops[2]
                 if byte_offset_val isa LLVM.Instruction
-                    bo_opcode = LLVM.opcode(byte_offset_val)
-                    bo_ops = LLVM.operands(byte_offset_val)
+                    bo_opcode = byte_offset_val.opcode
+                    bo_ops = byte_offset_val.operands
                     if bo_opcode == LLVM.API.LLVMShl && length(bo_ops) >= 2 && bo_ops[2] isa LLVM.ConstantInt
                         shift = convert(Int64, bo_ops[2])
                         elem_stride = 1 << shift
@@ -4639,7 +4638,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                 arr_info = find_array_field_in_struct(base_pointee, state.data_layout, elem_stride)
                 if arr_info !== nothing
                     arr_path, arr_byte_offset, arr_ty = arr_info
-                    arr_elem_ty = LLVM.eltype(arr_ty)
+                    arr_elem_ty = arr_ty.element_type
                     arr_elem_size = compute_type_size(arr_elem_ty, state.data_layout)
                     if arr_elem_size > 0
                         # When the array element is itself composite (nested arrays/structs),
@@ -4648,7 +4647,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                         #   flat_idx = byte_offset / 4, then decompose into [outer, inner] indices.
                         leaf_ty = arr_elem_ty
                         while leaf_ty isa LLVM.ArrayType
-                            leaf_ty = LLVM.eltype(leaf_ty)
+                            leaf_ty = leaf_ty.element_type
                         end
                         leaf_size = compute_type_size(leaf_ty, state.data_layout)
                         if leaf_size > 0 && arr_elem_ty isa LLVM.ArrayType
@@ -4667,7 +4666,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                                 encode_instruction!(state.mod.functions, Op.OpSDiv, idx_spirv_ty, flat_idx_id, adjusted_id, sz_id)
                             end
                             # Convert to i32 for OpAccessChain
-                            flat_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
+                            flat_idx_i32 = if idx_ty isa LLVM.IntegerType && idx_ty.width > 32
                                 u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
                                 conv_id = fresh_id!(state.mod)
                                 encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, flat_idx_id)
@@ -4717,7 +4716,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                         end
 
                         # Convert to i32 for OpAccessChain
-                        dyn_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
+                        dyn_idx_i32 = if idx_ty isa LLVM.IntegerType && idx_ty.width > 32
                             u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
                             conv_id = fresh_id!(state.mod)
                             encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, dyn_idx_id)
@@ -4789,7 +4788,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
         base_u64 = cached_psb_ptr_to_u64!(state, base_id)
         # Widen byte offset to u64 if needed
         bo_u64 = byte_offset_id
-        if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) < 64
+        if idx_ty isa LLVM.IntegerType && idx_ty.width < 64
             bo_u64 = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpSConvert, u64_spirv, bo_u64, byte_offset_id)
         end
@@ -4821,7 +4820,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
             arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
             # idx_id is already byte_offset / elem_size (computed above as SDiv)
             # Convert idx_id to i32 for OpAccessChain
-            new_idx_i32 = if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) > 32
+            new_idx_i32 = if idx_ty isa LLVM.IntegerType && idx_ty.width > 32
                 u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
                 conv_id = fresh_id!(state.mod)
                 encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, idx_id)
@@ -4862,7 +4861,7 @@ Emit an integer constant of the given LLVM integer type.
 """
 function emit_int_constant!(state::SPIRVEmitterState, ty::LLVM.LLVMType, value::Int64)
     type_id = map_type!(state.type_ctx, ty)
-    w = ty isa LLVM.IntegerType ? LLVM.width(ty) : 64
+    w = ty isa LLVM.IntegerType ? ty.width : 64
     if w <= 32
         return emit_constant_u32!(state.mod, UInt32(value & 0xFFFFFFFF))
     else
@@ -4909,7 +4908,7 @@ function emit_psb_byte_offset_with_user_type!(state::SPIRVEmitterState,
                                                 base_id::UInt32,
                                                 ops)
     byte_offset_id = get_value_id!(state, ops[2])
-    idx_ty = LLVM.value_type(ops[2])
+    idx_ty = ops[2].value_type
 
     # Infer the result pointee type from users (what type will be loaded/stored)
     result_pointee = infer_type_from_gep_users(inst)
@@ -4934,7 +4933,7 @@ function emit_psb_byte_offset_with_user_type!(state::SPIRVEmitterState,
     base_u64 = cached_psb_ptr_to_u64!(state, base_id)
 
     bo_u64 = byte_offset_id
-    if idx_ty isa LLVM.IntegerType && LLVM.width(idx_ty) < 64
+    if idx_ty isa LLVM.IntegerType && idx_ty.width < 64
         bo_u64 = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpSConvert, u64_spirv, bo_u64, byte_offset_id)
     end
@@ -4982,8 +4981,8 @@ overwrites the inferred entry at equal priority). The disagreement produces
 """
 function infer_inner_ptr_pointee(gep_or_load::LLVM.Instruction, ptm::Union{PointeeTypeMap,Nothing}=nothing)
     # Look at users of loads from this GEP/inttoptr
-    for use in LLVM.uses(gep_or_load)
-        user = LLVM.user(use)
+    for use in gep_or_load.uses
+        user = use.user
         if user isa LLVM.LoadInst
             # The PTM entry for this load is authoritative for the load's
             # emitted result type (see docstring). Skip pointer-typed entries:
@@ -4998,34 +4997,34 @@ function infer_inner_ptr_pointee(gep_or_load::LLVM.Instruction, ptm::Union{Point
             # Two passes: prefer struct GEPs (non-byte-offset) over byte-offset GEPs,
             # since byte-offset GEPs access individual fields while struct GEPs give
             # the real base type.
-            for inner_use in LLVM.uses(user)
-                inner_user = LLVM.user(inner_use)
+            for inner_use in user.uses
+                inner_user = inner_use.user
                 if inner_user isa LLVM.GetElementPtrInst
                     src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inner_user))
-                    if !(src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8)
+                    if !(src_ty isa LLVM.IntegerType && src_ty.width == 8)
                         return src_ty
                     end
                 end
             end
             # Second pass: byte-offset GEPs, loads, stores
-            for inner_use in LLVM.uses(user)
-                inner_user = LLVM.user(inner_use)
+            for inner_use in user.uses
+                inner_user = inner_use.user
                 if inner_user isa LLVM.GetElementPtrInst
                     src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inner_user))
-                    if src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8
+                    if src_ty isa LLVM.IntegerType && src_ty.width == 8
                         inner_result = infer_type_from_gep_users(inner_user)
                         inner_result !== nothing && return inner_result
                     end
                 elseif inner_user isa LLVM.LoadInst
-                    return LLVM.value_type(inner_user)
+                    return inner_user.value_type
                 elseif inner_user isa LLVM.StoreInst
-                    if LLVM.operands(inner_user)[2] === user
-                        return LLVM.value_type(LLVM.operands(inner_user)[1])
+                    if inner_user.operands[2] === user
+                        return inner_user.operands[1].value_type
                     end
                 elseif inner_user isa LLVM.AtomicRMWInst
-                    return LLVM.value_type(LLVM.operands(inner_user)[2])
+                    return inner_user.operands[2].value_type
                 elseif inner_user isa LLVM.AtomicCmpXchgInst
-                    return LLVM.value_type(LLVM.operands(inner_user)[2])
+                    return inner_user.operands[2].value_type
                 end
             end
         end
@@ -5074,7 +5073,7 @@ function emit_psb_ptr_arithmetic!(state::SPIRVEmitterState, base_id::UInt32,
     is_scalar = !(element_ty isa LLVM.StructType) && !(element_ty isa LLVM.ArrayType)
     if is_scalar && !type_mismatch
         ensure_array_stride_decoration!(state, result_ptr_ty, element_ty)
-        is_i64 = idx_llvm_ty isa LLVM.IntegerType && LLVM.width(idx_llvm_ty) == 64
+        is_i64 = idx_llvm_ty isa LLVM.IntegerType && idx_llvm_ty.width == 64
         # Chain-fold: when the base is itself a tracked PSB access chain, combine the
         # indices and emit a fresh OpPtrAccessChain from the ROOT base. This guarantees
         # the loop-invariant intermediate (e.g. `base + (-1)` from 1-based indexing) is
@@ -5109,7 +5108,7 @@ function emit_psb_ptr_arithmetic!(state::SPIRVEmitterState, base_id::UInt32,
 
     # Ensure index is u64 — widen i32 indices to i64
     idx_u64 = idx_id
-    if idx_llvm_ty !== nothing && idx_llvm_ty isa LLVM.IntegerType && LLVM.width(idx_llvm_ty) < 64
+    if idx_llvm_ty !== nothing && idx_llvm_ty isa LLVM.IntegerType && idx_llvm_ty.width < 64
         idx_u64 = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpSConvert, u64_spirv, idx_u64, idx_id)
     end
@@ -5165,13 +5164,13 @@ function emit_function_ptr_word!(state::SPIRVEmitterState, llvm_val::LLVM.Value,
             break
         elseif current isa LLVM.GetElementPtrInst
             # Compute byte offset from this GEP's indices
-            gep_ops = LLVM.operands(current)
+            gep_ops = current.operands
             source_ty_gep = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(current))
             byte_offset = compute_gep_constant_byte_offset(source_ty_gep, gep_ops; dl=state.data_layout)
             total_byte_offset += byte_offset
             current = gep_ops[1]  # walk up to base pointer
         elseif current isa LLVM.BitCastInst
-            current = LLVM.operands(current)[1]
+            current = current.operands[1]
         else
             # Fallback: use array_element_origin if available
             if haskey(state.array_element_origin, llvm_val)
@@ -5229,9 +5228,9 @@ function compute_gep_constant_byte_offset(source_ty::LLVM.LLVMType, ops; dl::Uni
         idx_val = idx_op isa LLVM.ConstantInt ? convert(Int64, idx_op) : 0
         if current_ty isa LLVM.StructType
             total += compute_struct_field_offset(current_ty, idx_val; dl)
-            current_ty = LLVM.elements(current_ty)[idx_val + 1]
+            current_ty = current_ty.elements[idx_val + 1]
         elseif current_ty isa LLVM.ArrayType
-            elem_ty = LLVM.eltype(current_ty)
+            elem_ty = current_ty.element_type
             total += idx_val * compute_type_size(elem_ty, dl)
             current_ty = elem_ty
         else
@@ -5246,7 +5245,7 @@ Emit memset as scalar store pairs via PSB pointer arithmetic.
 LLVM uses memset for zeroing structs (e.g., zero(ComplexF64) → memset 0, 16 bytes).
 """
 function emit_memset!(state::SPIRVEmitterState, inst::LLVM.CallInst)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     dest_ptr = ops[1]
     fill_val = ops[2]   # i8 value to fill with
     size_val = ops[3]
@@ -5260,7 +5259,7 @@ function emit_memset!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     nbytes == 0 && return
 
     # For shared memory (addrspace 3), skip — GPU doesn't require zero-init
-    dest_as = LLVM.value_type(dest_ptr) isa LLVM.PointerType ? LLVM.addrspace(LLVM.value_type(dest_ptr)) : 0
+    dest_as = dest_ptr.value_type isa LLVM.PointerType ? dest_ptr.value_type.addrspace : 0
     if dest_as == 3
         return  # Skip shared memory memset
     end
@@ -5323,7 +5322,7 @@ Emit memcpy/memmove as scalar load/store pairs via PSB pointer arithmetic.
 Handles struct copies like ComplexF64 (16 bytes) that LLVM optimizes to memcpy.
 """
 function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     dest_ptr = ops[1]
     src_ptr = ops[2]
     size_val = ops[3]
@@ -5520,13 +5519,13 @@ function compute_struct_field_offset(struct_ty::LLVM.StructType, field_idx::Int;
     # Fallback: manual computation matching LLVM's default layout rules
     offset = UInt32(0)
     for j in 0:(field_idx - 1)
-        elem = LLVM.elements(struct_ty)[j + 1]
+        elem = struct_ty.elements[j + 1]
         elem_align = UInt32(compute_type_alignment(elem, dl))
         offset = (offset + elem_align - 1) & ~(elem_align - 1)
         offset += compute_type_size(elem, dl)
     end
     if field_idx > 0
-        target_align = UInt32(compute_type_alignment(LLVM.elements(struct_ty)[field_idx + 1], dl))
+        target_align = UInt32(compute_type_alignment(struct_ty.elements[field_idx + 1], dl))
         offset = (offset + target_align - 1) & ~(target_align - 1)
     end
     return Int64(offset)
@@ -5551,17 +5550,17 @@ function compute_type_alignment(ty::LLVM.LLVMType, dl::LLVM.DataLayout)
     if ty isa LLVM.StructType || ty isa LLVM.ArrayType
         return Int(API.LLVMABIAlignmentOfType(dl, ty))
     end
-    if ty isa LLVM.LLVMFloat
+    if ty isa LLVM.FloatType
         return 4
-    elseif ty isa LLVM.LLVMDouble
+    elseif ty isa LLVM.DoubleType
         return 8
-    elseif ty isa LLVM.LLVMHalf
+    elseif ty isa LLVM.HalfType
         return 2
     elseif ty isa LLVM.IntegerType
-        return max(1, LLVM.width(ty) ÷ 8)
+        return max(1, ty.width ÷ 8)
     elseif ty isa LLVM.StructType
         max_align = 1
-        for elem in LLVM.elements(ty)
+        for elem in ty.elements
             max_align = max(max_align, compute_type_alignment(elem, dl))
         end
         return max_align
@@ -5583,12 +5582,12 @@ function count_scalar_elements(ty::LLVM.LLVMType, leaf_ty::LLVM.LLVMType)
         return 1  # same-sized scalar (e.g. i32 vs float)
     elseif ty isa LLVM.StructType
         total = 0
-        for field in LLVM.elements(ty)
+        for field in ty.elements
             total += count_scalar_elements(field, leaf_ty)
         end
         return total
     elseif ty isa LLVM.ArrayType
-        return Int(LLVM.length(ty)) * count_scalar_elements(LLVM.eltype(ty), leaf_ty)
+        return Int(ty.length) * count_scalar_elements(ty.element_type, leaf_ty)
     else
         return 0
     end
@@ -5608,7 +5607,7 @@ function decompose_flat_index_for_composite!(state::SPIRVEmitterState,
     while current_ty != leaf_ty && !(types_same_size(current_ty, leaf_ty) &&
             !(current_ty isa LLVM.StructType) && !(current_ty isa LLVM.ArrayType))
         if current_ty isa LLVM.StructType
-            fields = LLVM.elements(current_ty)
+            fields = current_ty.elements
             if length(fields) == 1
                 # Single-field struct: always index 0, descend into the field
                 push!(indices, emit_constant_u32!(state.mod, UInt32(0)))
@@ -5653,7 +5652,7 @@ function decompose_flat_index_for_composite!(state::SPIRVEmitterState,
                 end
             end
         elseif current_ty isa LLVM.ArrayType
-            elem_ty = LLVM.eltype(current_ty)
+            elem_ty = current_ty.element_type
             elem_count = count_scalar_elements(elem_ty, leaf_ty)
             if elem_count == 1
                 # Leaf array: index directly
@@ -5687,19 +5686,19 @@ function compute_type_size(ty::LLVM.LLVMType, dl::LLVM.DataLayout)
     if ty isa LLVM.StructType || ty isa LLVM.ArrayType || ty isa LLVM.VectorType
         return UInt32(API.LLVMABISizeOfType(dl, ty))
     end
-    if ty isa LLVM.LLVMFloat
+    if ty isa LLVM.FloatType
         return UInt32(4)
-    elseif ty isa LLVM.LLVMDouble
+    elseif ty isa LLVM.DoubleType
         return UInt32(8)
-    elseif ty isa LLVM.LLVMHalf
+    elseif ty isa LLVM.HalfType
         return UInt32(2)
     elseif ty isa LLVM.IntegerType
-        return UInt32(max(1, LLVM.width(ty) ÷ 8))
+        return UInt32(max(1, ty.width ÷ 8))
     elseif ty isa LLVM.StructType
         # Fallback: manual computation matching LLVM's default layout rules
         total = UInt32(0)
         struct_align = UInt32(1)
-        for elem in LLVM.elements(ty)
+        for elem in ty.elements
             elem_align = UInt32(compute_type_alignment(elem, dl))
             struct_align = max(struct_align, elem_align)
             total = (total + elem_align - 1) & ~(elem_align - 1)
@@ -5734,9 +5733,9 @@ end
 # ================================================================
 
 function emit_conversion!(state::SPIRVEmitterState, inst::LLVM.Instruction, opcode::UInt16)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     src = get_value_id!(state, ops[1])
-    llvm_ty = LLVM.value_type(inst)
+    llvm_ty = inst.value_type
     result_ty = if llvm_ty isa LLVM.PointerType
         map_pointer_type_for_value!(state.type_ctx, inst)
     elseif opcode in (Op.OpUConvert, Op.OpSConvert, Op.OpBitcast) &&
@@ -5752,7 +5751,7 @@ function emit_conversion!(state::SPIRVEmitterState, inst::LLVM.Instruction, opco
         # `%v4half` and the bitcast returned its own input type. The store into
         # `_ptr_Function_ulong` then failed validation. Whatever a pointee is
         # used as elsewhere, a bitcast's destination type is the one LLVM wrote.
-        emit_type_int!(state.mod, spirv_int_width(LLVM.width(llvm_ty)), UInt32(0))
+        emit_type_int!(state.mod, spirv_int_width(llvm_ty.width), UInt32(0))
     else
         map_type!(state.type_ctx, llvm_ty)
     end
@@ -5762,11 +5761,11 @@ function emit_conversion!(state::SPIRVEmitterState, inst::LLVM.Instruction, opco
     # the source to `%float`), insert an OpBitcast to the matching integer
     # type so the conversion sees an integer source.
     if opcode in (Op.OpUConvert, Op.OpSConvert)
-        src_llvm_ty = LLVM.value_type(ops[1])
+        src_llvm_ty = ops[1].value_type
         if src_llvm_ty isa LLVM.FloatingPointType
-            fp_width = src_llvm_ty isa LLVM.LLVMHalf ? 16 :
-                       src_llvm_ty isa LLVM.LLVMFloat ? 32 :
-                       src_llvm_ty isa LLVM.LLVMDouble ? 64 : 32
+            fp_width = src_llvm_ty isa LLVM.HalfType ? 16 :
+                       src_llvm_ty isa LLVM.FloatType ? 32 :
+                       src_llvm_ty isa LLVM.DoubleType ? 64 : 32
             int_ty = emit_type_int!(state.mod, UInt32(fp_width), UInt32(0))
             bitcast_id = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpBitcast, int_ty, bitcast_id, src)
@@ -5787,9 +5786,9 @@ end
 function emit_int_to_fp!(state::SPIRVEmitterState, inst::LLVM.Instruction, opcode::UInt16)
     # SPIR-V's OpConvertSToF/OpConvertUToF require integer input, not bool.
     # LLVM's sitofp/uitofp i1 is valid but we must first convert i1 → i32.
-    src_val = LLVM.operands(inst)[1]
-    src_ty = LLVM.value_type(src_val)
-    if src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 1
+    src_val = inst.operands[1]
+    src_ty = src_val.value_type
+    if src_ty isa LLVM.IntegerType && src_ty.width == 1
         # i1 → select(bool, 1, 0) → OpConvertUToF/OpConvertSToF
         src_id = get_value_id!(state, src_val)
         i32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
@@ -5797,7 +5796,7 @@ function emit_int_to_fp!(state::SPIRVEmitterState, inst::LLVM.Instruction, opcod
         zero_id = emit_constant_u32!(state.mod, UInt32(0))
         int_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpSelect, i32_ty, int_id, src_id, one_id, zero_id)
-        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+        result_ty = map_type!(state.type_ctx, inst.value_type)
         result_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, opcode, result_ty, result_id, int_id)
         state.value_map[inst] = result_id
@@ -5812,11 +5811,11 @@ function emit_trunc!(state::SPIRVEmitterState, inst::LLVM.TruncInst)
     # IMPORTANT: Use map_type! on the raw LLVM IntegerType, NOT on the instruction result.
     # The PTM (Pointee Type Map) may resolve the instruction's type to float (due to
     # type-punned bitcast users), but OpUConvert requires an integer result type.
-    src_ty = LLVM.value_type(LLVM.operands(inst)[1])
-    dst_ty = LLVM.value_type(inst)
-    if dst_ty isa LLVM.IntegerType && LLVM.width(dst_ty) == 1
+    src_ty = inst.operands[1].value_type
+    dst_ty = inst.value_type
+    if dst_ty isa LLVM.IntegerType && dst_ty.width == 1
         # trunc to i1: compare != 0
-        src_id = get_value_id!(state, LLVM.operands(inst)[1])
+        src_id = get_value_id!(state, inst.operands[1])
         zero_id = get_zero_constant!(state, src_ty)
         result_ty = map_type!(state.type_ctx, dst_ty)
         result_id = fresh_id!(state.mod)
@@ -5826,16 +5825,16 @@ function emit_trunc!(state::SPIRVEmitterState, inst::LLVM.TruncInst)
         # Integer truncation: emit OpUConvert with integer result type + OpBitcast if
         # the ONLY user is a bitcast to float. This avoids the mysterious corruption
         # where the trunc's result type gets overwritten to float in the SPIR-V.
-        src_id = get_value_id!(state, LLVM.operands(inst)[1])
+        src_id = get_value_id!(state, inst.operands[1])
         # Check: does this trunc feed directly into a bitcast to float?
-        users = collect(LLVM.uses(inst))
-        is_typepun = length(users) == 1 && LLVM.user(first(users)) isa LLVM.BitCastInst
+        users = collect(inst.uses)
+        is_typepun = length(users) == 1 && first(users).user isa LLVM.BitCastInst
         if is_typepun
             # Fold trunc+bitcast: emit OpUConvert %uint then OpBitcast %float
             # and register the BITCAST instruction's value_map to the final float result.
-            bcast_inst = LLVM.user(first(users))
-            bcast_dst = LLVM.value_type(bcast_inst)
-            int_ty = emit_type_int!(state.mod, spirv_int_width(LLVM.width(dst_ty)), UInt32(0))
+            bcast_inst = first(users).user
+            bcast_dst = bcast_inst.value_type
+            int_ty = emit_type_int!(state.mod, spirv_int_width(dst_ty.width), UInt32(0))
             trunc_id = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpUConvert, int_ty, trunc_id, src_id)
             # `map_type!` and not a hand-built float of `scalar_bit_width`
@@ -5855,7 +5854,7 @@ function emit_trunc!(state::SPIRVEmitterState, inst::LLVM.TruncInst)
             state.value_map[inst] = trunc_id
             state.value_map[bcast_inst] = bcast_id
         else
-            result_ty = emit_type_int!(state.mod, spirv_int_width(LLVM.width(dst_ty)), UInt32(0))
+            result_ty = emit_type_int!(state.mod, spirv_int_width(dst_ty.width), UInt32(0))
             result_id = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpUConvert, result_ty, result_id, src_id)
             state.value_map[inst] = result_id
@@ -5863,12 +5862,12 @@ function emit_trunc!(state::SPIRVEmitterState, inst::LLVM.TruncInst)
     else
         # trunc with non-IntegerType dst — shouldn't happen in valid LLVM but handle gracefully.
         # Force i32 and emit OpUConvert + OpBitcast if needed for float result.
-        src_id = get_value_id!(state, LLVM.operands(inst)[1])
+        src_id = get_value_id!(state, inst.operands[1])
         w = scalar_bit_width(dst_ty)
         int_ty = emit_type_int!(state.mod, UInt32(w === nothing ? 32 : w), UInt32(0))
         trunc_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpUConvert, int_ty, trunc_id, src_id)
-        if dst_ty isa LLVM.LLVMHalf || dst_ty isa LLVM.LLVMFloat || dst_ty isa LLVM.LLVMDouble
+        if dst_ty isa LLVM.HalfType || dst_ty isa LLVM.FloatType || dst_ty isa LLVM.DoubleType
             float_ty = emit_type_float!(state.mod, UInt32(w))
             bcast_id = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpBitcast, float_ty, bcast_id, trunc_id)
@@ -5880,14 +5879,14 @@ function emit_trunc!(state::SPIRVEmitterState, inst::LLVM.TruncInst)
 end
 
 function emit_sext!(state::SPIRVEmitterState, inst::LLVM.SExtInst)
-    src_ty = LLVM.value_type(LLVM.operands(inst)[1])
-    dst_ty = LLVM.value_type(inst)
-    if src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 1
+    src_ty = inst.operands[1].value_type
+    dst_ty = inst.value_type
+    if src_ty isa LLVM.IntegerType && src_ty.width == 1
         # sext i1 to iN: true → all-ones (-1), false → 0
-        src_id = get_value_id!(state, LLVM.operands(inst)[1])
+        src_id = get_value_id!(state, inst.operands[1])
         result_ty_id = map_type!(state.type_ctx, dst_ty)
         # sext true = all 1s = -1 in two's complement
-        w = LLVM.width(dst_ty)
+        w = dst_ty.width
         all_ones = w >= 64 ? typemax(UInt64) : UInt64((UInt64(1) << w) - 1)
         one_id = emit_int_constant!(state, dst_ty, all_ones)
         zero_id = emit_int_constant!(state, dst_ty, UInt64(0))
@@ -5900,12 +5899,12 @@ function emit_sext!(state::SPIRVEmitterState, inst::LLVM.SExtInst)
 end
 
 function emit_zext!(state::SPIRVEmitterState, inst::LLVM.ZExtInst)
-    src_ty = LLVM.value_type(LLVM.operands(inst)[1])
-    dst_ty = LLVM.value_type(inst)
-    if src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 1
+    src_ty = inst.operands[1].value_type
+    dst_ty = inst.value_type
+    if src_ty isa LLVM.IntegerType && src_ty.width == 1
         # zext i1 to iN: OpSelect %dst_type %bool_val %one %zero
         # SPIR-V OpBool can't be converted with OpUConvert
-        src_id = get_value_id!(state, LLVM.operands(inst)[1])
+        src_id = get_value_id!(state, inst.operands[1])
         result_ty_id = map_type!(state.type_ctx, dst_ty)
         one_id = emit_int_constant!(state, dst_ty, UInt64(1))
         zero_id = emit_int_constant!(state, dst_ty, UInt64(0))
@@ -5920,7 +5919,7 @@ end
 """Create an integer constant with the given type and value."""
 function emit_int_constant!(state::SPIRVEmitterState, ty::LLVM.IntegerType, val::UInt64)
     type_id = map_type!(state.type_ctx, ty)
-    w = LLVM.width(ty)
+    w = ty.width
     if w <= 32
         bits = UInt32(val & 0xFFFFFFFF)
         key = (:const, type_id, bits)
@@ -5945,8 +5944,8 @@ function emit_inttoptr!(state::SPIRVEmitterState, inst::LLVM.IntToPtrInst)
     # inttoptr i64 %val to ptr addrspace(N)
     # In Vulkan SPIR-V, OpConvertUToPtr REQUIRES PhysicalStorageBuffer storage class.
     # inttoptr always produces a PSB pointer (it reconstructs a device address).
-    src = get_value_id!(state, LLVM.operands(inst)[1])
-    result_ptr_ty = LLVM.value_type(inst)
+    src = get_value_id!(state, inst.operands[1])
+    result_ptr_ty = inst.value_type
     if result_ptr_ty isa LLVM.PointerType
         # inttoptr always produces PhysicalStorageBuffer pointers
         # (OpConvertUToPtr requires this storage class)
@@ -5991,8 +5990,8 @@ We need to find what type the ultimate use stores/loads through that pointer.
 """
 function infer_inner_ptr_pointee(inttoptr_inst::LLVM.Value)
     # Find loads from this inttoptr (which load a ptr value)
-    for use in LLVM.uses(inttoptr_inst)
-        user = LLVM.user(use)
+    for use in inttoptr_inst.uses
+        user = use.user
         if user isa LLVM.LoadInst
             # The loaded ptr — check direct uses first
             result = infer_pointee_from_users(user)
@@ -6000,15 +5999,15 @@ function infer_inner_ptr_pointee(inttoptr_inst::LLVM.Value)
 
             # Follow store→alloca→load chain:
             # The loaded ptr might be stored to an alloca, then reloaded
-            for use2 in LLVM.uses(user)
-                user2 = LLVM.user(use2)
+            for use2 in user.uses
+                user2 = use2.user
                 if user2 isa LLVM.StoreInst
                     # user2: store ptr %loaded, ptr %alloca
-                    alloca = LLVM.operands(user2)[2]
+                    alloca = user2.operands[2]
                     if alloca isa LLVM.AllocaInst
                         # Find loads from this alloca
-                        for use3 in LLVM.uses(alloca)
-                            user3 = LLVM.user(use3)
+                        for use3 in alloca.uses
+                            user3 = use3.user
                             if user3 isa LLVM.LoadInst && user3 !== user
                                 result = infer_pointee_from_users(user3)
                                 result !== nothing && return result
@@ -6029,7 +6028,7 @@ function get_zero_constant!(state::SPIRVEmitterState, ty::LLVM.IntegerType)
     # `%uint 0` to an `OpINotEqual` whose other operand is an `OpLoad %uchar` is
     # rejected by spirv-val with "Expected both operands to have the same
     # component bit width". Map the type and match it, at every width.
-    return emit_constant_uint!(state.mod, spirv_int_width(LLVM.width(ty)), UInt64(0))
+    return emit_constant_uint!(state.mod, spirv_int_width(ty.width), UInt64(0))
 end
 
 # ================================================================
@@ -6039,7 +6038,7 @@ end
 function emit_ret!(state::SPIRVEmitterState, inst::LLVM.RetInst)
     # Skip if block was already terminated by OpIgnoreIntersectionKHR/OpTerminateRayKHR
     state.rt_block_terminated && return
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     if isempty(ops)
         encode_instruction!(state.mod.functions, Op.OpReturn)
     else
@@ -6052,12 +6051,12 @@ function emit_br!(state::SPIRVEmitterState, inst::LLVM.BrInst)
     # Skip if block was already terminated by OpIgnoreIntersectionKHR/OpTerminateRayKHR
     state.rt_block_terminated && return
 
-    current_bb = LLVM.parent(inst)
+    current_bb = inst.parent
 
     if LLVM.isconditional(inst)
-        cond = get_value_id!(state, LLVM.condition(inst))
-        true_bb = LLVM.successors(inst)[1]
-        false_bb = LLVM.successors(inst)[2]
+        cond = get_value_id!(state, inst.condition)
+        true_bb = inst.successors[1]
+        false_bb = inst.successors[2]
         true_id = get_block_id!(state, true_bb)
         false_id = get_block_id!(state, false_bb)
 
@@ -6124,7 +6123,7 @@ function emit_br!(state::SPIRVEmitterState, inst::LLVM.BrInst)
         encode_instruction!(state.mod.functions, Op.OpBranchConditional, cond, true_id, false_id)
     else
         # Unconditional branch — OpLoopMerge (if any) already emitted in emit_block!
-        target = get_block_id!(state, LLVM.successors(inst)[1])
+        target = get_block_id!(state, inst.successors[1])
         encode_instruction!(state.mod.functions, Op.OpBranch, target)
     end
 end
@@ -6138,7 +6137,7 @@ that comes later in RPO order).
 """
 function analyze_loops(fn::LLVM.Function)
     loops = Dict{LLVM.BasicBlock, Tuple{LLVM.BasicBlock, LLVM.BasicBlock}}()
-    blocks = collect(LLVM.blocks(fn))
+    blocks = collect(fn.blocks)
     isempty(blocks) && return LoopInfo(loops)
 
     # Compute RPO position for each block
@@ -6150,9 +6149,9 @@ function analyze_loops(fn::LLVM.Function)
 
     # Find back-edges: edge A→B where B appears before A in RPO
     for bb in blocks
-        term = LLVM.terminator(bb)
+        term = bb.terminator
         bb_pos = get(rpo_pos, bb, 0)
-        for succ in LLVM.successors(term)
+        for succ in term.successors
             succ_pos = get(rpo_pos, succ, 0)
             if succ_pos > 0 && succ_pos <= bb_pos
                 # Back-edge: bb → succ. succ is the loop header, bb is the latch/continue
@@ -6187,7 +6186,7 @@ function find_loop_merge(header::LLVM.BasicBlock, latch::LLVM.BasicBlock,
     # Find the first successor of any loop block that's outside the loop
     for bb in rpo
         bb in loop_blocks || continue
-        for succ in LLVM.successors(LLVM.terminator(bb))
+        for succ in bb.terminator.successors
             if !(succ in loop_blocks)
                 return succ
             end
@@ -6215,9 +6214,9 @@ function find_merge_block(state::SPIRVEmitterState, inst::LLVM.BrInst)
     #
     # We check reachability: follow forward edges from one branch target to see if it
     # reaches the other (without going through loop back-edges or the header itself).
-    current_bb = LLVM.parent(inst)
-    true_bb = LLVM.successors(inst)[1]
-    false_bb = LLVM.successors(inst)[2]
+    current_bb = inst.parent
+    true_bb = inst.successors[1]
+    false_bb = inst.successors[2]
 
     # Fast path: the merge of a structured conditional is the immediate
     # post-dominator of the branch block, already computed in `state.ipdom`.
@@ -6254,8 +6253,8 @@ function is_forward_reachable(start::LLVM.BasicBlock, target::LLVM.BasicBlock,
 
     while !isempty(queue)
         bb = popfirst!(queue)
-        term = LLVM.terminator(bb)
-        for succ in LLVM.successors(term)
+        term = bb.terminator
+        for succ in term.successors
             succ === target && return true
             if succ ∉ visited
                 # Only block actual back-edges: from a loop's continue block to its header
@@ -6376,8 +6375,8 @@ function is_forward_reachable_inner(start::LLVM.BasicBlock, target::LLVM.BasicBl
 
     while !isempty(queue)
         bb = popfirst!(queue)
-        term = LLVM.terminator(bb)
-        for succ in LLVM.successors(term)
+        term = bb.terminator
+        for succ in term.successors
             succ === target && return true
             succ === loop_merge_bb && continue
             if succ ∉ visited
@@ -6449,11 +6448,11 @@ function emit_remaining_trampolines!(state::SPIRVEmitterState)
 end
 
 function emit_select!(state::SPIRVEmitterState, inst::LLVM.SelectInst)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     cond = get_value_id!(state, ops[1])
     true_val = get_value_id!(state, ops[2])
     false_val = get_value_id!(state, ops[3])
-    llvm_ty = LLVM.value_type(inst)
+    llvm_ty = inst.value_type
 
     # `select i1` becomes logical ops, never `OpSelect %bool`.
     #
@@ -6565,8 +6564,8 @@ function emit_select!(state::SPIRVEmitterState, inst::LLVM.SelectInst)
             end
             t_pte, f_pte = pte(ops[2]), pte(ops[3])
             if t_pte !== nothing && f_pte !== nothing && t_pte != f_pte
-                agg_is_true = t_pte isa LLVM.ArrayType && LLVM.eltype(t_pte) == f_pte
-                agg_is_false = f_pte isa LLVM.ArrayType && LLVM.eltype(f_pte) == t_pte
+                agg_is_true = t_pte isa LLVM.ArrayType && t_pte.element_type == f_pte
+                agg_is_false = f_pte isa LLVM.ArrayType && f_pte.element_type == t_pte
                 if agg_is_true || agg_is_false
                     elem = agg_is_true ? f_pte : t_pte
                     elem_ptr_ty = map_pointer_type!(state.type_ctx,
@@ -6637,7 +6636,7 @@ Records the block label ID so the PHI can be inserted right after its OpLabel.
 function defer_phi!(state::SPIRVEmitterState, inst::LLVM.PHIInst, block_label_id::UInt32)
     result_id = state.value_map[inst]  # Pre-allocated
 
-    llvm_ty = LLVM.value_type(inst)
+    llvm_ty = inst.value_type
     result_ty = if llvm_ty isa LLVM.PointerType
         # Opaque pointer — infer pointee type from uses or incoming values
         pointee = infer_pointee_from_users(inst)
@@ -6778,7 +6777,7 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
     if get(ENV, "LAVA_DEBUG_PHI", "") == "1"
         println("=== DEFERRED PHIS: $(length(state.deferred_phis)) ===")
         for (result_id, type_id, incoming, block_label_id) in state.deferred_phis
-            preds = [(get_block_id!(state, bb), String(LLVM.name(bb))) for (val, bb) in incoming]
+            preds = [(get_block_id!(state, bb), String(bb.name)) for (val, bb) in incoming]
             println("  PHI %$result_id (type %$type_id) in block %$block_label_id <- $preds")
         end
         println("=== PHI BLOCK REDIRECTS: $(length(state.phi_block_redirects)) ===")
@@ -6797,7 +6796,7 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
     for (result_id, type_id, incoming, block_label_id) in state.deferred_phis
         operands = UInt32[]
         for (val, bb) in incoming
-            val_id = if val isa LLVM.UndefValue && LLVM.value_type(val) isa LLVM.PointerType
+            val_id = if val isa LLVM.UndefValue && val.value_type isa LLVM.PointerType
                 # UndefValue with opaque pointer type — can't map via map_type!.
                 # Emitting OpUndef here lets RADV yield a different bit pattern per
                 # consumption, which breaks StructurizeCFG-inserted guard phis: the
@@ -6887,7 +6886,7 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
             # SPIR-V pointer types. PHI requires all operands match result type.
             # Insert OpBitcast in predecessor block if types differ.
             # Skip PHI values themselves — their pointee types aren't in PTM.
-            if LLVM.value_type(val) isa LLVM.PointerType && !(val isa LLVM.UndefValue || val isa LLVM.PoisonValue) && !(val isa LLVM.PHIInst)
+            if val.value_type isa LLVM.PointerType && !(val isa LLVM.UndefValue || val isa LLVM.PoisonValue) && !(val isa LLVM.PHIInst)
                 val_spirv_ty = map_pointer_type_for_value!(state.type_ctx, val)
                 if val_spirv_ty != type_id
                     # Check if this is a cross-storage-class mismatch by looking up
@@ -7152,10 +7151,10 @@ function emit_debug_printf!(state::SPIRVEmitterState, inst::LLVM.CallInst, fn_na
     set_id = setup_debug_printf!(state.mod)
     fmt_id = emit_op_string!(state.mod, fmt)
 
-    ops = LLVM.operands(inst)            # [args..., callee]
+    ops = inst.operands            # [args..., callee]
     arg_ids = UInt32[get_value_id!(state, ops[i]) for i in 1:(length(ops) - 1)]
 
-    void_ty = map_type!(state.type_ctx, LLVM.value_type(inst))  # call returns Cvoid
+    void_ty = map_type!(state.type_ctx, inst.value_type)  # call returns Cvoid
     result_id = fresh_id!(state.mod)
     word_count = UInt32(6 + length(arg_ids))   # opcode + restype + resid + set + instr(1) + fmt + args
     push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpExtInst))
@@ -7172,14 +7171,14 @@ function emit_debug_printf!(state::SPIRVEmitterState, inst::LLVM.CallInst, fn_na
 end
 
 function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
-    called = LLVM.called_operand(inst)
+    called = inst.called_operand
 
     # A call that exists only to name a cooperative-matrix per-element callback
     # is not a call. See `coopmat_perelement_marker`.
     coopmat_perelement_marker(inst) && return nothing
 
     if called isa LLVM.Function
-        fn_name = LLVM.name(called)
+        fn_name = called.name
 
         # Check for LLVM intrinsics → GLSL.std.450
         if startswith(fn_name, "llvm.")
@@ -7440,11 +7439,11 @@ function emit_lava_subgroup!(state::SPIRVEmitterState, inst::LLVM.CallInst, name
     require_capability!(state.mod, Cap.GroupNonUniform)
 
     subgroup_scope_id = emit_constant_u32!(state.mod, Scope.Subgroup)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
 
     # ── Elect ──
     if name == "_lava_subgroup_elect"
-        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+        result_ty = map_type!(state.type_ctx, inst.value_type)
         result_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpGroupNonUniformElect,
             result_ty, result_id, subgroup_scope_id)
@@ -7454,7 +7453,7 @@ function emit_lava_subgroup!(state::SPIRVEmitterState, inst::LLVM.CallInst, name
 
     # ── Broadcast-first (value from first active lane → all lanes) ──
     if startswith(name, "_lava_subgroup_broadcast_first_")
-        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+        result_ty = map_type!(state.type_ctx, inst.value_type)
         result_id = fresh_id!(state.mod)
         val_id = get_value_id!(state, ops[1])
         encode_instruction!(state.mod.functions, Op.OpGroupNonUniformBroadcastFirst,
@@ -7474,7 +7473,7 @@ function emit_lava_subgroup!(state::SPIRVEmitterState, inst::LLVM.CallInst, name
         require_capability!(state.mod, Cap.GroupNonUniformBallot)
         # Declare uvec4 result type (ballot is always <4 x i32>); caller sees
         # just the low lane via extract, which is handled at the Julia side.
-        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+        result_ty = map_type!(state.type_ctx, inst.value_type)
         result_id = fresh_id!(state.mod)
         pred_id = get_value_id!(state, ops[1])
         encode_instruction!(state.mod.functions, Op.OpGroupNonUniformBallot,
@@ -7512,7 +7511,7 @@ function emit_lava_subgroup!(state::SPIRVEmitterState, inst::LLVM.CallInst, name
                 require_extension!(state.mod, "SPV_KHR_subgroup_rotate")
             end
             require_capability!(state.mod, cap)
-            result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+            result_ty = map_type!(state.type_ctx, inst.value_type)
             result_id = fresh_id!(state.mod)
             val_id = get_value_id!(state, ops[1])
             sel_id = get_value_id!(state, ops[2])
@@ -7526,7 +7525,7 @@ function emit_lava_subgroup!(state::SPIRVEmitterState, inst::LLVM.CallInst, name
     # ── All/Any boolean vote ──
     if name == "_lava_subgroup_all" || name == "_lava_subgroup_any"
         require_capability!(state.mod, Cap.GroupNonUniformVote)
-        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+        result_ty = map_type!(state.type_ctx, inst.value_type)
         result_id = fresh_id!(state.mod)
         pred_id = get_value_id!(state, ops[1])
         opcode = name == "_lava_subgroup_all" ? Op.OpGroupNonUniformAll : Op.OpGroupNonUniformAny
@@ -7553,7 +7552,7 @@ function emit_lava_subgroup!(state::SPIRVEmitterState, inst::LLVM.CallInst, name
     # GroupOperation is a LITERAL immediate in the SPIR-V encoding, not a constant <id>.
     group_op_literal = LAVA_SUBGROUP_GROUPOP[kind]
     val_id = get_value_id!(state, ops[1])
-    result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+    result_ty = map_type!(state.type_ctx, inst.value_type)
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, opcode,
         result_ty, result_id, subgroup_scope_id, group_op_literal, val_id)
@@ -7627,8 +7626,8 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
         # Integer abs → GLSL.std.450 SAbs (5)
         # llvm.abs.i32(val, is_int_min_poison) — ignore poison flag, take only val
         glsl_id = setup_glsl_std_450!(state.mod)
-        val_id = get_value_id!(state, LLVM.operands(inst)[1])
-        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+        val_id = get_value_id!(state, inst.operands[1])
+        result_ty = map_type!(state.type_ctx, inst.value_type)
         result_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpExtInst, result_ty, result_id, glsl_id, UInt32(5), val_id)
         state.value_map[inst] = result_id
@@ -7641,10 +7640,10 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
         # split. FindILsb(0) is -1 on most drivers; LLVM cttz(val, false) is
         # bitwidth on zero, so we guard with an explicit val==0 check.
         glsl_id = setup_glsl_std_450!(state.mod)
-        val_id = get_value_id!(state, LLVM.operands(inst)[1])
-        result_llvm_ty = LLVM.value_type(inst)
+        val_id = get_value_id!(state, inst.operands[1])
+        result_llvm_ty = inst.value_type
         result_ty = map_type!(state.type_ctx, result_llvm_ty)
-        bw = LLVM.width(result_llvm_ty)
+        bw = result_llvm_ty.width
 
         if bw <= 32
             lsb_id = fresh_id!(state.mod)
@@ -7704,10 +7703,10 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
         # GLSL.std.450 FindUMsb (75) returns position of MSB (0-based from LSB)
         # ctlz = bitwidth - 1 - FindUMsb for non-zero values
         glsl_id = setup_glsl_std_450!(state.mod)
-        val_id = get_value_id!(state, LLVM.operands(inst)[1])
-        result_llvm_ty = LLVM.value_type(inst)
+        val_id = get_value_id!(state, inst.operands[1])
+        result_llvm_ty = inst.value_type
         result_ty = map_type!(state.type_ctx, result_llvm_ty)
-        bw = LLVM.width(result_llvm_ty)
+        bw = result_llvm_ty.width
 
         if bw <= 32
             msb_id = fresh_id!(state.mod)
@@ -7766,16 +7765,16 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
         return
     elseif startswith(base_name, "llvm.ctpop")
         # Population count → OpBitCount
-        val_id = get_value_id!(state, LLVM.operands(inst)[1])
-        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+        val_id = get_value_id!(state, inst.operands[1])
+        result_ty = map_type!(state.type_ctx, inst.value_type)
         result_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpBitCount, result_ty, result_id, val_id)
         state.value_map[inst] = result_id
         return
     elseif startswith(base_name, "llvm.bitreverse")
         # Bit reverse → OpBitReverse
-        val_id = get_value_id!(state, LLVM.operands(inst)[1])
-        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+        val_id = get_value_id!(state, inst.operands[1])
+        result_ty = map_type!(state.type_ctx, inst.value_type)
         result_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpBitReverse, result_ty, result_id, val_id)
         state.value_map[inst] = result_id
@@ -7811,12 +7810,12 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
     # intrinsic support; our custom SPIR-V emitter has to implement them.
     if base_name == "llvm.usub.sat" || base_name == "llvm.uadd.sat" ||
        base_name == "llvm.ssub.sat" || base_name == "llvm.sadd.sat"
-        ops = LLVM.operands(inst)
+        ops = inst.operands
         a_id = get_value_id!(state, ops[1])
         b_id = get_value_id!(state, ops[2])
-        result_llvm_ty = LLVM.value_type(inst)
+        result_llvm_ty = inst.value_type
         result_ty = map_type!(state.type_ctx, result_llvm_ty)
-        bw = Int(LLVM.width(result_llvm_ty))
+        bw = Int(result_llvm_ty.width)
         bool_ty = map_type!(state.type_ctx, LLVM.IntType(1))
         zero_id = map_constant!(state.type_ctx, LLVM.ConstantInt(result_llvm_ty, 0))
 
@@ -7903,13 +7902,13 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
     # llvm.fshl(a, b, shift) = (a << shift) | (b >> (bitwidth - shift))
     # llvm.fshr(a, b, shift) = (a << (bitwidth - shift)) | (b >> shift)
     if base_name == "llvm.fshl" || base_name == "llvm.fshr"
-        ops = LLVM.operands(inst)
+        ops = inst.operands
         a_id = get_value_id!(state, ops[1])
         b_id = get_value_id!(state, ops[2])
         shift_id = get_value_id!(state, ops[3])
-        result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
-        bitwidth = LLVM.width(LLVM.value_type(ops[1]))
-        bw_id = map_constant!(state.type_ctx, LLVM.ConstantInt(LLVM.value_type(ops[1]), bitwidth))
+        result_ty = map_type!(state.type_ctx, inst.value_type)
+        bitwidth = ops[1].value_type.width
+        bw_id = map_constant!(state.type_ctx, LLVM.ConstantInt(ops[1].value_type, bitwidth))
         # shift_mod = shift % bitwidth (SPIR-V shift is modulo, but be explicit)
         shift_mod = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpUMod, result_ty, shift_mod, shift_id, bw_id)
@@ -7954,14 +7953,14 @@ sign bit of `y`. Exact for every input including zeros, infinities and NaNs,
 which is the property `FAbs * FSign` lacks.
 """
 function emit_copysign!(state::SPIRVEmitterState, inst::LLVM.CallInst)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     n_args = length(ops) - 1        # last operand of a CallInst is the callee
     n_args == 2 || error("llvm.copysign expects 2 arguments, got $n_args")
 
-    ty = LLVM.value_type(inst)
-    w = ty isa LLVM.LLVMHalf   ? 16 :
-        ty isa LLVM.LLVMFloat  ? 32 :
-        ty isa LLVM.LLVMDouble ? 64 :
+    ty = inst.value_type
+    w = ty isa LLVM.HalfType   ? 16 :
+        ty isa LLVM.FloatType  ? 32 :
+        ty isa LLVM.DoubleType ? 64 :
         error("llvm.copysign on unsupported type $(string(ty)) — " *
               "scalar f16/f32/f64 only (a vector copysign would need a " *
               "vector mask constant; no code path produces one yet)")
@@ -7996,7 +7995,7 @@ function emit_glsl_ext_inst!(state::SPIRVEmitterState, inst::LLVM.CallInst, glsl
     # Ensure GLSL.std.450 is imported
     glsl_id = setup_glsl_std_450!(state.mod)
 
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     # Last operand of a CallInst is the called function itself — skip it
     n_args = length(ops) - 1
 
@@ -8005,7 +8004,7 @@ function emit_glsl_ext_inst!(state::SPIRVEmitterState, inst::LLVM.CallInst, glsl
         push!(arg_ids, get_value_id!(state, ops[i]))
     end
 
-    result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+    result_ty = map_type!(state.type_ctx, inst.value_type)
     result_id = fresh_id!(state.mod)
 
     # OpExtInst: result_type result_id set instruction [operands]
@@ -8025,7 +8024,7 @@ function emit_direct_call!(state::SPIRVEmitterState, inst::LLVM.CallInst, called
         fresh_id!(state.mod)
     end
 
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     n_args = length(ops) - 1  # Last operand is the called function
 
     arg_ids = UInt32[]
@@ -8033,7 +8032,7 @@ function emit_direct_call!(state::SPIRVEmitterState, inst::LLVM.CallInst, called
         push!(arg_ids, get_value_id!(state, ops[i]))
     end
 
-    result_ty_llvm = LLVM.value_type(inst)
+    result_ty_llvm = inst.value_type
     if result_ty_llvm isa LLVM.VoidType
         # Void call — no result
         word_count = UInt32(4 + length(arg_ids))
@@ -8061,7 +8060,7 @@ end
 # ================================================================
 
 function emit_extractvalue!(state::SPIRVEmitterState, inst::LLVM.ExtractValueInst)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     agg_val = ops[1]
 
     # Get indices from the extractvalue instruction
@@ -8071,7 +8070,7 @@ function emit_extractvalue!(state::SPIRVEmitterState, inst::LLVM.ExtractValueIns
 
     # A cmpxchg result is an ordinary `{ T, i1 }` composite here; see emit_cmpxchg!.
     agg = get_value_id!(state, agg_val)
-    result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+    result_ty = map_type!(state.type_ctx, inst.value_type)
     result_id = fresh_id!(state.mod)
 
     # OpCompositeExtract (opcode 81): result_type result_id composite [indices]
@@ -8085,10 +8084,10 @@ function emit_extractvalue!(state::SPIRVEmitterState, inst::LLVM.ExtractValueIns
 end
 
 function emit_insertvalue!(state::SPIRVEmitterState, inst::LLVM.InsertValueInst)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     agg = get_value_id!(state, ops[1])
     val = get_value_id!(state, ops[2])
-    result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+    result_ty = map_type!(state.type_ctx, inst.value_type)
     result_id = fresh_id!(state.mod)
 
     n_indices = API.LLVMGetNumIndices(inst)
@@ -8111,10 +8110,10 @@ end
 # ================================================================
 
 function emit_extractelement!(state::SPIRVEmitterState, inst::LLVM.ExtractElementInst)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     vec = get_value_id!(state, ops[1])
     idx = ops[2]
-    result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+    result_ty = map_type!(state.type_ctx, inst.value_type)
     result_id = fresh_id!(state.mod)
 
     if idx isa LLVM.ConstantInt
@@ -8141,10 +8140,10 @@ What produces one: SROA splitting a vector, e.g. `(a[1], a[2])` taken from an
 <0, 1>`.
 """
 function emit_shufflevector!(state::SPIRVEmitterState, inst::LLVM.ShuffleVectorInst)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     v1 = get_value_id!(state, ops[1])
     v2 = get_value_id!(state, ops[2])
-    result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+    result_ty = map_type!(state.type_ctx, inst.value_type)
     result_id = fresh_id!(state.mod)
     n = Int(LLVM.API.LLVMGetNumMaskElements(inst))
     comps = map(0:(n - 1)) do i
@@ -8157,11 +8156,11 @@ function emit_shufflevector!(state::SPIRVEmitterState, inst::LLVM.ShuffleVectorI
 end
 
 function emit_insertelement!(state::SPIRVEmitterState, inst::LLVM.InsertElementInst)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     vec = get_value_id!(state, ops[1])
     val = get_value_id!(state, ops[2])
     idx = ops[3]
-    result_ty = map_type!(state.type_ctx, LLVM.value_type(inst))
+    result_ty = map_type!(state.type_ctx, inst.value_type)
     result_id = fresh_id!(state.mod)
 
     if idx isa LLVM.ConstantInt
@@ -8203,7 +8202,7 @@ invocations. Without these, even seq_cst atomics provide only atomicity
 writes node data, atomics on a flag, and Thread B reads via the flag.
 """
 function atomic_mem_semantics(inst::LLVM.Instruction, ptr::LLVM.Value)::UInt32
-    ord = LLVM.ordering(inst)
+    ord = inst.ordering
 
     # Determine storage class bit for the pointer's memory
     sc = get_pointer_storage_class(ptr)
@@ -8232,7 +8231,7 @@ end
 
 """Acquire-only variant for cmpxchg failure path (no release, a failed CAS writes nothing)."""
 function atomic_mem_semantics_acquire_only(inst::LLVM.Instruction, ptr::LLVM.Value)::UInt32
-    ord = LLVM.ordering(inst)
+    ord = inst.ordering
     if ord == LLVM.API.LLVMAtomicOrderingMonotonic ||
        ord == LLVM.API.LLVMAtomicOrderingUnordered
         return MemSem.Relaxed
@@ -8243,7 +8242,7 @@ function atomic_mem_semantics_acquire_only(inst::LLVM.Instruction, ptr::LLVM.Val
 end
 
 function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     ptr = ops[1]
     val = ops[2]
 
@@ -8251,7 +8250,7 @@ function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
     val_id = get_value_id!(state, val)
 
     # Result type is the value type (same as the loaded value)
-    result_llvm_ty = LLVM.value_type(val)
+    result_llvm_ty = val.value_type
     result_ty = map_type!(state.type_ctx, result_llvm_ty)
     result_id = fresh_id!(state.mod)
 
@@ -8263,7 +8262,7 @@ function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
     mem_sem_id = emit_constant_u32!(state.mod, atomic_mem_semantics(inst, ptr))
 
     # 64-bit atomics require Int64Atomics capability
-    if result_llvm_ty isa LLVM.IntegerType && LLVM.width(result_llvm_ty) == 64
+    if result_llvm_ty isa LLVM.IntegerType && result_llvm_ty.width == 64
         require_capability!(state.mod, Cap.Int64Atomics)
     end
 
@@ -8295,9 +8294,9 @@ function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
         # VK_EXT_shader_atomic_float + SPV_EXT_shader_atomic_float_add. f16/f32/f64
         # pick different capabilities; f64 isn't enabled by Lava's device features
         # today, so we require the f32/f16 cap based on operand width.
-        w = result_llvm_ty isa LLVM.LLVMFloat  ? 32 :
-            result_llvm_ty isa LLVM.LLVMDouble ? 64 :
-            result_llvm_ty isa LLVM.LLVMHalf   ? 16 :
+        w = result_llvm_ty isa LLVM.FloatType  ? 32 :
+            result_llvm_ty isa LLVM.DoubleType ? 64 :
+            result_llvm_ty isa LLVM.HalfType   ? 16 :
             error("OpAtomicFAdd: unsupported float width for $result_llvm_ty")
         cap = w == 32 ? Cap.AtomicFloat32AddEXT :
               w == 64 ? Cap.AtomicFloat64AddEXT :
@@ -8313,7 +8312,7 @@ function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
         is_min = binop == LLVM.API.LLVMAtomicRMWBinOpFMin
         # SPV_EXT_shader_atomic_float_min_max covers the f32 case. f64 / f16
         # variants need their own capability bits (not defined in Lava today).
-        result_llvm_ty isa LLVM.LLVMFloat ||
+        result_llvm_ty isa LLVM.FloatType ||
             error("OpAtomicFMin/FMax: only Float32 is wired up today")
         # Capability numbers for the min/max variants live in the SPV_EXT spec;
         # we gate the op on the same buffer-atomics device feature as FAdd,
@@ -8358,7 +8357,7 @@ function is_signed_integer_context(ty::LLVM.LLVMType)
 end
 
 function emit_cmpxchg!(state::SPIRVEmitterState, inst::LLVM.AtomicCmpXchgInst)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     ptr = ops[1]
     cmp_val = ops[2]    # expected value
     new_val = ops[3]    # desired value
@@ -8368,11 +8367,11 @@ function emit_cmpxchg!(state::SPIRVEmitterState, inst::LLVM.AtomicCmpXchgInst)
     new_id = get_value_id!(state, new_val)
 
     # The value type (what we're comparing/exchanging)
-    val_llvm_ty = LLVM.value_type(cmp_val)
+    val_llvm_ty = cmp_val.value_type
     val_ty = map_type!(state.type_ctx, val_llvm_ty)
 
     # 64-bit atomics require Int64Atomics capability
-    if val_llvm_ty isa LLVM.IntegerType && LLVM.width(val_llvm_ty) == 64
+    if val_llvm_ty isa LLVM.IntegerType && val_llvm_ty.width == 64
         require_capability!(state.mod, Cap.Int64Atomics)
     end
 
@@ -8415,9 +8414,9 @@ function emit_cmpxchg!(state::SPIRVEmitterState, inst::LLVM.AtomicCmpXchgInst)
     # and that phi was emitted as `OpPhi %struct` over a `%uint` operand, which
     # spirv-val rejects. As a composite, a phi or an extractvalue sees the type
     # it declared.
-    agg_ty_llvm = LLVM.value_type(inst)
+    agg_ty_llvm = inst.value_type
     agg_ty = map_type!(state.type_ctx, agg_ty_llvm)
-    bool_ty = map_type!(state.type_ctx, LLVM.elements(agg_ty_llvm)[2])
+    bool_ty = map_type!(state.type_ctx, agg_ty_llvm.elements[2])
     success_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, Op.OpIEqual, bool_ty, success_id, old_id, cmp_id)
     agg_id = fresh_id!(state.mod)
@@ -8432,13 +8431,13 @@ end
 function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
     # ConstantExpr is an LLVM value that represents a constant computation
     # Common cases: GEP on globals, bitcast, inttoptr
-    op = LLVM.opcode(val)
+    op = val.opcode
 
     if op == LLVM.API.LLVMGetElementPtr
         # Constant GEP on a global variable (e.g., shared memory array)
         # Pattern: getelementptr [N x T], ptr addrspace(3) @global, i64 0, i64 0
         # → OpAccessChain into the global variable
-        ops = LLVM.operands(val)
+        ops = val.operands
         base = ops[1]
         base_id = get_value_id!(state, base)
 
@@ -8465,8 +8464,8 @@ function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
         # Address space 1 only. The value-level answer for address space 0
         # differs from the type-level one — a global there traces to "not an
         # alloca" and so reads as PSB — and nothing has asked for that change.
-        base_ty = LLVM.value_type(base)
-        as = base_ty isa LLVM.PointerType ? LLVM.addrspace(base_ty) : 0
+        base_ty = base.value_type
+        as = base_ty isa LLVM.PointerType ? base_ty.addrspace : 0
         sc = as == 1 ? get_pointer_storage_class(base) : llvm_addrspace_to_storage_class(as)
 
         # Use fresh workgroup types for addrspace(3) to avoid layout decoration conflicts
@@ -8494,7 +8493,7 @@ function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
             # For getelementptr [N x T], ptr @base, i64 A, i64 B:
             #   flat_offset = A * N + B
             # Then: AccessChain @base[0] → PtrAccessChain by flat_offset
-            array_len = Int64(LLVM.length(source_ty))
+            array_len = Int64(source_ty.length)
             inner_idx = ops[3] isa LLVM.ConstantInt ? convert(Int64, ops[3]) : 0
             flat_offset = first_idx * array_len + inner_idx
 
@@ -8524,7 +8523,7 @@ function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
             zero_id = emit_constant_u32!(state.mod, UInt32(0))
 
             # Map element type for Workgroup storage class
-            elem_ty = LLVM.eltype(source_ty)
+            elem_ty = source_ty.element_type
             elem_spirv = if sc == SC.Workgroup
                 map_workgroup_type!(state.type_ctx, elem_ty)
             else
@@ -8603,7 +8602,7 @@ function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
         return result_id
     elseif op == LLVM.API.LLVMBitCast || op == LLVM.API.LLVMAddrSpaceCast
         # Constant bitcast / addrspacecast — pass through
-        ops = LLVM.operands(val)
+        ops = val.operands
         return get_value_id!(state, ops[1])
     elseif op == LLVM.API.LLVMIntToPtr
         # inttoptr(small_constant) — Julia runtime error paths (GC tag slots).
@@ -8611,7 +8610,7 @@ function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
         # but if any survive, emit as a zero pointer constant (dead code path).
         # SPIR-V doesn't have inttoptr; use OpConvertUToPtr if available,
         # or just return a null/zero constant since this is dead error code.
-        result_ty = LLVM.value_type(val)
+        result_ty = val.value_type
         # Create a null pointer — these paths never execute on GPU
         spirv_ty = map_type!(state.type_ctx, result_ty)
         null_id = fresh_id!(state.mod)

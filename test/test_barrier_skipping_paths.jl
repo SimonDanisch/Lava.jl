@@ -91,13 +91,13 @@ done:
 """
 
 successorsof(f, name) =
-    [LLVM.name(s) for s in LLVM.successors(LLVM.terminator(only(b for b in LLVM.blocks(f) if LLVM.name(b) == name)))]
+    [s.name for s in only(b for b in f.blocks if b.name == name).terminator.successors]
 
 @testset "fix_barrier_skipping_paths!" begin
     @testset "an empty arm into the barrier-holding tail is left alone" begin
         LLVM.Context() do ctx
             mod = parse(LLVM.Module, _IR_TAIL_BARRIER)
-            f = LLVM.functions(mod)["kernel"]
+            f = mod.functions["kernel"]
             Lava.fix_barrier_skipping_paths!(f)
             # The empty arm is first, as it was where this was found: visited
             # first, it was the one rerouted.
@@ -110,7 +110,7 @@ successorsof(f, name) =
     @testset "a loop's zero-trip edge is left alone" begin
         LLVM.Context() do ctx
             mod = parse(LLVM.Module, _IR_ZERO_TRIP)
-            f = LLVM.functions(mod)["kernel"]
+            f = mod.functions["kernel"]
             Lava.fix_barrier_skipping_paths!(f)
             @test successorsof(f, "skip") == ["tail"]
             @test (LLVM.verify(mod); true)
@@ -120,7 +120,7 @@ successorsof(f, name) =
     @testset "an early return before a barrier is rerouted" begin
         LLVM.Context() do ctx
             mod = parse(LLVM.Module, _IR_EARLY_RETURN)
-            f = LLVM.functions(mod)["kernel"]
+            f = mod.functions["kernel"]
             @test Lava.fix_barrier_skipping_paths!(f)
             @test successorsof(f, "bail") == ["work"]
             @test (LLVM.verify(mod); true)

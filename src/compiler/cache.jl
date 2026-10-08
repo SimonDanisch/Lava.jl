@@ -88,8 +88,10 @@ runs in the world Lava was loaded in (`invoke_frozen`), so methods defined since
 cannot invalidate the compiler's own code.
 """
 @noinline function compile_or_lookup(job::LavaCompilerJob)::LavaGPUKernel
+    # reflection (`@device_code_*`) sees cached kernels too, without recompiling
+    GPUCompiler.run_compile_hook(job)
     res = GPUCompiler.cached_results(LavaKernelResults, job)
-    if res !== nothing && res.kernel !== nothing && GPUCompiler.compile_hook[] === nothing
+    if res !== nothing && res.kernel !== nothing
         COMPILE_STATS.hits += 1
         return res.kernel
     end

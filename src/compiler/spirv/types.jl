@@ -53,14 +53,14 @@ function build_pointee_type_map(mod::LLVM.Module)
     ptm = PointeeTypeMap()
 
     # 1. Global variables: their value type IS the pointee type
-    for gv in LLVM.globals(mod)
-        set_pointee_type!(ptm, gv, LLVM.global_value_type(gv); priority=3)
+    for gv in mod.globals
+        set_pointee_type!(ptm, gv, gv.global_value_type; priority=3)
     end
 
     # 2. Scan all instructions in all functions
-    for fn in LLVM.functions(mod)
-        for bb in LLVM.blocks(fn)
-            for inst in LLVM.instructions(bb)
+    for fn in mod.functions
+        for bb in fn.blocks
+            for inst in bb.instructions
                 collect_pointee_types!(ptm, inst)
             end
         end
@@ -70,14 +70,13 @@ function build_pointee_type_map(mod::LLVM.Module)
     # type directly. Needed once we emit helper OpFunctions whose only signal
     # for the pointee is the byval annotation. Priority 4: above load/store/GEP,
     # below alloca (which is authoritative for stack-local types).
-    byval_kind = LLVM.API.LLVMGetEnumAttributeKindForName("byval", Csize_t(5))
-    for fn in LLVM.functions(mod)
-        isempty(LLVM.blocks(fn)) && continue
-        for (i, param) in enumerate(LLVM.parameters(fn))
-            LLVM.value_type(param) isa LLVM.PointerType || continue
-            for attr in collect(LLVM.parameter_attributes(fn, i))
-                if attr isa LLVM.TypeAttribute && LLVM.kind(attr) == byval_kind
-                    set_pointee_type!(ptm, param, LLVM.value(attr); priority=4)
+    for fn in mod.functions
+        isempty(fn.blocks) && continue
+        for (i, param) in enumerate(fn.parameters)
+            param.value_type isa LLVM.PointerType || continue
+            for attr in collect(fn.parameter_attributes[i])
+                if attr isa LLVM.TypeAttribute && attr.kind === :byval
+                    set_pointee_type!(ptm, param, attr.value; priority=4)
                     break
                 end
             end
@@ -93,18 +92,18 @@ function build_pointee_type_map(mod::LLVM.Module)
     # load/store inference (priority 2) but loses to byval (4) and alloca (5).
     for iter in 1:10
         changed = false
-        for fn in LLVM.functions(mod), bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+        for fn in mod.functions, bb in fn.blocks, inst in bb.instructions
             inst isa LLVM.CallInst || continue
-            callee = LLVM.called_operand(inst)
+            callee = inst.called_operand
             callee isa LLVM.Function || continue
-            isempty(LLVM.blocks(callee)) && continue
-            params = collect(LLVM.parameters(callee))
-            ops = LLVM.operands(inst)
+            isempty(callee.blocks) && continue
+            params = collect(callee.parameters)
+            ops = inst.operands
             n_args = length(ops) - 1
             for i in 1:min(n_args, length(params))
                 arg = ops[i]
                 param = params[i]
-                LLVM.value_type(param) isa LLVM.PointerType || continue
+                param.value_type isa LLVM.PointerType || continue
                 arg_pointee = get_pointee_type(ptm, arg)
                 arg_pointee === nothing && continue
                 existing = get(ptm.map, param, nothing)
@@ -133,10 +132,10 @@ function build_pointee_type_map(mod::LLVM.Module)
     # the real type. For other values (allocas, GEP intermediates) without
     # existing inference, this is the fallback. Priority 1 (lowest) so any
     # other inference wins if present.
-    for fn in LLVM.functions(mod)
-        isempty(LLVM.blocks(fn)) && continue
-        for param in LLVM.parameters(fn)
-            LLVM.value_type(param) isa LLVM.PointerType || continue
+    for fn in mod.functions
+        isempty(fn.blocks) && continue
+        for param in fn.parameters
+            param.value_type isa LLVM.PointerType || continue
             existing = get(ptm.map, param, nothing)
             existing === nothing || continue  # caller knows better
             offset_type = infer_param_composite_pointee(param)
@@ -170,10 +169,10 @@ function infer_param_composite_pointee(param::LLVM.Argument)
         return true
     end
 
-    for use in LLVM.uses(param)
-        user = LLVM.user(use)
+    for use in param.uses
+        user = use.user
         if user isa LLVM.LoadInst
-            ty = LLVM.value_type(user)
+            ty = user.value_type
             ty isa LLVM.PointerType && return nothing  # ptr-of-ptr: too complex here
             record!(Int64(0), ty) || return nothing
         elseif user isa LLVM.StoreInst
@@ -182,17 +181,17 @@ function infer_param_composite_pointee(param::LLVM.Argument)
         elseif user isa LLVM.GetElementPtrInst
             # Only handle byte-offset GEPs: source type i8, single index
             src_ty = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(user))
-            (src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8) || continue
-            ops = LLVM.operands(user)
+            (src_ty isa LLVM.IntegerType && src_ty.width == 8) || continue
+            ops = user.operands
             length(ops) == 2 || continue
             offset_op = ops[2]
             offset_op isa LLVM.ConstantInt || continue
             byte_offset = convert(Int64, offset_op)
             # The GEP result must be loaded as a scalar at offset `byte_offset`
-            for gep_use in LLVM.uses(user)
-                gep_user = LLVM.user(gep_use)
+            for gep_use in user.uses
+                gep_user = gep_use.user
                 gep_user isa LLVM.LoadInst || continue
-                ty = LLVM.value_type(gep_user)
+                ty = gep_user.value_type
                 ty isa LLVM.PointerType && return nothing
                 record!(byte_offset, ty) || return nothing
             end
@@ -259,8 +258,8 @@ end
 function collect_load!(ptm::PointeeTypeMap, inst::LLVM.LoadInst)
     # Load: the loaded type is the pointee type of the pointer operand
     # Priority 2: loads reveal the "true" type the code uses
-    ptr_operand = LLVM.operands(inst)[1]
-    loaded_type = LLVM.value_type(inst)
+    ptr_operand = inst.operands[1]
+    loaded_type = inst.value_type
     set_pointee_type!(ptm, ptr_operand, loaded_type; priority=2)
 
     # When the loaded value IS a pointer (loading a pointer from a struct/buffer),
@@ -283,10 +282,10 @@ function infer_loaded_ptr_pointee!(ptm::PointeeTypeMap, load_inst::LLVM.LoadInst
     # If the loaded ptr is stored as VALUE into another pointer (e.g., alloca),
     # trace through: store val→alloca → load from alloca → check that load's users.
     # Pattern from SROA of struct containing pointer fields.
-    for use in LLVM.uses(load_inst)
-        user = LLVM.user(use)
-        if user isa LLVM.StoreInst && LLVM.operands(user)[1] === load_inst
-            store_target = LLVM.operands(user)[2]
+    for use in load_inst.uses
+        user = use.user
+        if user isa LLVM.StoreInst && user.operands[1] === load_inst
+            store_target = user.operands[2]
             pointee = infer_type_through_alloca(store_target, load_inst)
             if pointee !== nothing
                 set_pointee_type!(ptm, load_inst, pointee; priority=1)
@@ -302,9 +301,9 @@ Also handles the case where store target is a GEP and the corresponding
 load comes from a different GEP to the same alloca at the same byte offset."""
 function infer_type_through_alloca(store_target::LLVM.Value, original_ptr::LLVM.Value)
     # Case 1: Direct loads from the same store target
-    for use in LLVM.uses(store_target)
-        user = LLVM.user(use)
-        if user isa LLVM.LoadInst && LLVM.value_type(user) isa LLVM.PointerType
+    for use in store_target.uses
+        user = use.user
+        if user isa LLVM.LoadInst && user.value_type isa LLVM.PointerType
             # This load reads back the pointer. Check its users for type info.
             result = infer_pointee_from_users(user)
             result !== nothing && return result
@@ -334,13 +333,13 @@ function walk_gep_to_base(gep::LLVM.GetElementPtrInst)
     # Follow GEP chains (max 10 levels to avoid infinite loops)
     for _ in 1:10
         src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(current))
-        indices = LLVM.operands(current)[2:end]  # skip base pointer
+        indices = current.operands[2:end]  # skip base pointer
 
         offset = compute_gep_byte_offset(src_ty, indices)
         offset === nothing && return (nothing, nothing)
         total_offset += offset
 
-        base_ptr = LLVM.operands(current)[1]
+        base_ptr = current.operands[1]
         if base_ptr isa LLVM.AllocaInst
             return (base_ptr, total_offset)
         elseif base_ptr isa LLVM.GetElementPtrInst
@@ -376,14 +375,14 @@ function compute_gep_byte_offset(src_ty::LLVM.LLVMType, indices::Vector{<:LLVM.V
             if current_ty isa LLVM.StructType
                 # Struct: sum field sizes up to idx
                 for f in 0:(idx-1)
-                    ft = LLVM.elements(current_ty)[f+1]
+                    ft = current_ty.elements[f+1]
                     sz = approx_sizeof(ft)
                     sz === nothing && return nothing
                     offset += sz
                 end
-                current_ty = LLVM.elements(current_ty)[idx+1]
+                current_ty = current_ty.elements[idx+1]
             elseif current_ty isa LLVM.ArrayType
-                elem_ty = LLVM.eltype(current_ty)
+                elem_ty = current_ty.element_type
                 sz = approx_sizeof(elem_ty)
                 sz === nothing && return nothing
                 offset += idx * sz
@@ -399,31 +398,31 @@ end
 """Approximate sizeof for LLVM types (no padding/alignment — good enough for offset matching)."""
 function approx_sizeof(ty::LLVM.LLVMType)
     if ty isa LLVM.IntegerType
-        return div(LLVM.width(ty) + 7, 8)
-    elseif ty isa LLVM.LLVMHalf
+        return div(ty.width + 7, 8)
+    elseif ty isa LLVM.HalfType
         return 2
-    elseif ty isa LLVM.LLVMFloat
+    elseif ty isa LLVM.FloatType
         return 4
-    elseif ty isa LLVM.LLVMDouble
+    elseif ty isa LLVM.DoubleType
         return 8
     elseif ty isa LLVM.PointerType
         return 8  # 64-bit pointers
     elseif ty isa LLVM.StructType
         total = 0
-        for elem in LLVM.elements(ty)
+        for elem in ty.elements
             sz = approx_sizeof(elem)
             sz === nothing && return nothing
             total += sz
         end
         return total
     elseif ty isa LLVM.ArrayType
-        n = LLVM.length(ty)
-        elem_sz = approx_sizeof(LLVM.eltype(ty))
+        n = ty.length
+        elem_sz = approx_sizeof(ty.element_type)
         elem_sz === nothing && return nothing
         return n * elem_sz
     elseif ty isa LLVM.VectorType
-        n = LLVM.size(ty)
-        elem_sz = approx_sizeof(LLVM.eltype(ty))
+        n = ty.length
+        elem_sz = approx_sizeof(ty.element_type)
         elem_sz === nothing && return nothing
         return n * elem_sz
     else
@@ -435,8 +434,8 @@ end
 and check if any reveal their pointee type from downstream usage."""
 function find_ptr_load_at_offset(alloca::LLVM.AllocaInst, target_offset::Int)
     # Collect all GEPs and direct accesses from this alloca
-    for use in LLVM.uses(alloca)
-        user = LLVM.user(use)
+    for use in alloca.uses
+        user = use.user
         result = check_gep_or_load_at_offset(user, alloca, target_offset, 0)
         result !== nothing && return result
     end
@@ -447,20 +446,20 @@ end
 function check_gep_or_load_at_offset(user::LLVM.Value, base::LLVM.Value, target_offset::Int, current_offset::Int)
     if user isa LLVM.LoadInst
         # Direct load from base at current_offset
-        if current_offset == target_offset && LLVM.value_type(user) isa LLVM.PointerType
+        if current_offset == target_offset && user.value_type isa LLVM.PointerType
             result = infer_pointee_from_users(user)
             result !== nothing && return result
         end
-    elseif user isa LLVM.GetElementPtrInst && LLVM.operands(user)[1] === base
+    elseif user isa LLVM.GetElementPtrInst && user.operands[1] === base
         # GEP from base — compute offset and recurse into users
         src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(user))
-        indices = LLVM.operands(user)[2:end]
+        indices = user.operands[2:end]
         gep_offset = compute_gep_byte_offset(src_ty, indices)
         gep_offset === nothing && return nothing
         new_offset = current_offset + gep_offset
 
-        for use2 in LLVM.uses(user)
-            user2 = LLVM.user(use2)
+        for use2 in user.uses
+            user2 = use2.user
             result = check_gep_or_load_at_offset(user2, user, target_offset, new_offset)
             result !== nothing && return result
         end
@@ -480,34 +479,34 @@ function infer_pointee_from_users(ptr_value::LLVM.Value, visited::Set{LLVM.Value
     # then fall back to byte-offset GEPs, loads, stores, atomics, PHIs.
     # This prevents byte-offset GEPs (accessing individual fields) from overriding the
     # struct source type when both exist on the same pointer.
-    for use in LLVM.uses(ptr_value)
-        user = LLVM.user(use)
+    for use in ptr_value.uses
+        user = use.user
         if user isa LLVM.GetElementPtrInst
             src_ty = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(user))
-            if !(src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8)
+            if !(src_ty isa LLVM.IntegerType && src_ty.width == 8)
                 return src_ty
             end
         end
     end
     # Second pass: byte-offset GEPs, loads, stores, atomics, PHIs
-    for use in LLVM.uses(ptr_value)
-        user = LLVM.user(use)
+    for use in ptr_value.uses
+        user = use.user
         if user isa LLVM.GetElementPtrInst
             src_ty = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(user))
-            if src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8
+            if src_ty isa LLVM.IntegerType && src_ty.width == 8
                 result = infer_type_from_gep_users(user)
                 result !== nothing && return result
             end
         elseif user isa LLVM.LoadInst
-            return LLVM.value_type(user)
+            return user.value_type
         elseif user isa LLVM.StoreInst
-            if LLVM.operands(user)[2] === ptr_value
-                return LLVM.value_type(LLVM.operands(user)[1])
+            if user.operands[2] === ptr_value
+                return user.operands[1].value_type
             end
         elseif user isa LLVM.AtomicRMWInst
-            return LLVM.value_type(LLVM.operands(user)[2])
+            return user.operands[2].value_type
         elseif user isa LLVM.AtomicCmpXchgInst
-            return LLVM.value_type(LLVM.operands(user)[2])
+            return user.operands[2].value_type
         elseif user isa LLVM.PHIInst
             result = infer_pointee_from_users(user, visited)
             result !== nothing && return result
@@ -519,23 +518,23 @@ end
 function collect_store!(ptm::PointeeTypeMap, inst::LLVM.StoreInst)
     # Store: the stored value type is the pointee type of the pointer operand
     # Priority 1 (lowest): LLVM may optimize e.g. `store float 0.0` → `store i32 0`
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     value = ops[1]
     ptr = ops[2]
-    stored_type = LLVM.value_type(value)
+    stored_type = value.value_type
     set_pointee_type!(ptm, ptr, stored_type; priority=1)
 end
 
 function collect_gep!(ptm::PointeeTypeMap, inst::LLVM.GetElementPtrInst)
     # GEP source element type tells us what the base pointer points to (highest priority)
     source_ty = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(inst))
-    base_ptr = LLVM.operands(inst)[1]
+    base_ptr = inst.operands[1]
 
     # Byte-offset GEPs (source type = i8) carry no real type information.
     # LLVM uses `getelementptr i8, ptr %p, i64 <byte_offset>` for pointer arithmetic.
     # Don't let this overwrite the base pointer's actual type, and don't assign i8
     # as the result type. Downstream loads/stores will provide the real type.
-    if source_ty isa LLVM.IntegerType && LLVM.width(source_ty) == 8
+    if source_ty isa LLVM.IntegerType && source_ty.width == 8
         # Don't set base_ptr type (would overwrite the real type)
         # Don't set result type (i8 is not the real pointee type)
         return
@@ -556,11 +555,11 @@ function collect_inttoptr!(ptm::PointeeTypeMap, inst::LLVM.IntToPtrInst)
     # But if the only user is a byte-offset GEP (source=i8), the type won't
     # be propagated back. Trace through byte-offset GEP chains to find
     # the eventual load/store type and assign it to the inttoptr result.
-    for use in LLVM.uses(inst)
-        user = LLVM.user(use)
+    for use in inst.uses
+        user = use.user
         if user isa LLVM.GetElementPtrInst
             src_ty = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(user))
-            if src_ty isa LLVM.IntegerType && LLVM.width(src_ty) == 8
+            if src_ty isa LLVM.IntegerType && src_ty.width == 8
                 # Byte-offset GEP — trace to find actual type from load/store
                 pointee = infer_type_from_gep_users(user)
                 if pointee !== nothing
@@ -575,19 +574,19 @@ end
 """Infer the pointee type by looking at loads/stores that use a GEP result.
 Follows chained byte-offset GEPs (i8 source type) to reach the final load/store."""
 function infer_type_from_gep_users(gep::LLVM.GetElementPtrInst)
-    for use in LLVM.uses(gep)
-        user = LLVM.user(use)
+    for use in gep.uses
+        user = use.user
         if user isa LLVM.LoadInst
-            return LLVM.value_type(user)
+            return user.value_type
         elseif user isa LLVM.StoreInst
             # Check if gep is the pointer (operand 2), not the value
-            if LLVM.operands(user)[2] === gep
-                return LLVM.value_type(LLVM.operands(user)[1])
+            if user.operands[2] === gep
+                return user.operands[1].value_type
             end
         elseif user isa LLVM.GetElementPtrInst
             # Follow chained byte-offset GEPs (common pattern: two i8 GEPs in sequence)
             sub_src = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(user))
-            if sub_src isa LLVM.IntegerType && LLVM.width(sub_src) == 8
+            if sub_src isa LLVM.IntegerType && sub_src.width == 8
                 result = infer_type_from_gep_users(user)
                 result !== nothing && return result
             end
@@ -600,11 +599,11 @@ function collect_call!(ptm::PointeeTypeMap, inst::LLVM.CallInst)
     # Handle llvm.memcpy: propagate pointee type between dst and src
     # memcpy(dst, src, len, isvolatile) — if dst is an alloca with known type,
     # src gets the same type (and vice versa).
-    called = LLVM.called_operand(inst)
+    called = inst.called_operand
     if called isa LLVM.Function
-        fname = LLVM.name(called)
+        fname = called.name
         if startswith(fname, "llvm.memcpy")
-            ops = LLVM.operands(inst)
+            ops = inst.operands
             dst = ops[1]
             src = ops[2]
             # If dst has a known type (e.g. alloca), propagate to src
@@ -623,24 +622,24 @@ end
 
 function collect_bitcast!(ptm::PointeeTypeMap, inst::LLVM.BitCastInst)
     # Bitcast: if source has a known pointee type, propagate to result
-    src = LLVM.operands(inst)[1]
+    src = inst.operands[1]
     src_ty = get_pointee_type(PointeeTypeMap(), src)  # will be filled in later passes
 end
 
 function collect_atomicrmw!(ptm::PointeeTypeMap, inst::LLVM.AtomicRMWInst)
     # AtomicRMW: pointer operand's pointee type = value type
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     ptr = ops[1]
     val = ops[2]
-    set_pointee_type!(ptm, ptr, LLVM.value_type(val); priority=2)
+    set_pointee_type!(ptm, ptr, val.value_type; priority=2)
 end
 
 function collect_cmpxchg!(ptm::PointeeTypeMap, inst::LLVM.AtomicCmpXchgInst)
     # CmpXchg: pointer operand's pointee type = compare value type
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     ptr = ops[1]
     cmp_val = ops[2]
-    set_pointee_type!(ptm, ptr, LLVM.value_type(cmp_val); priority=2)
+    set_pointee_type!(ptm, ptr, cmp_val.value_type; priority=2)
 end
 
 """
@@ -653,12 +652,12 @@ For `getelementptr T, ptr %base, i64 %idx1, i32 %idx2, ...`:
 - Subsequent indices: drill into nested types (struct fields, array elements)
 """
 function compute_gep_result_type(source_ty::LLVM.LLVMType, inst::LLVM.GetElementPtrInst)
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     compute_gep_result_type_from_ops(source_ty, ops)
 end
 
 function compute_gep_result_type(source_ty::LLVM.LLVMType, val::LLVM.ConstantExpr)
-    ops = LLVM.operands(val)
+    ops = val.operands
     compute_gep_result_type_from_ops(source_ty, ops)
 end
 
@@ -698,7 +697,7 @@ function index_into_type(ty::LLVM.LLVMType, idx::LLVM.Value)
         # Struct field access — index must be a constant integer
         if idx isa LLVM.ConstantInt
             field_idx = convert(Int, idx) + 1  # Julia is 1-indexed
-            elems = LLVM.elements(ty)
+            elems = ty.elements
             if 1 <= field_idx <= length(elems)
                 return elems[field_idx]
             end
@@ -822,7 +821,7 @@ end
 function emit_workgroup_type!(ctx::SPIRVTypeContext, ty::LLVM.StructType)
     # { T1, T2, ... } → OpTypeStruct, with members mapped via workgroup path.
     # MUST bypass emit_type_struct!'s type_cache for the same reason as arrays.
-    member_types = LLVM.elements(ty)
+    member_types = ty.elements
     member_spirv_ids = UInt32[]
     for mt in member_types
         push!(member_spirv_ids, map_workgroup_type!(ctx, mt))
@@ -849,18 +848,18 @@ end
 # Size/alignment helpers for workgroup explicit layout decorations.
 # Mirror compute_type_size/compute_type_alignment from emit.jl but available in types.jl.
 function wg_compute_type_size(ty::LLVM.LLVMType)
-    if ty isa LLVM.LLVMFloat
+    if ty isa LLVM.FloatType
         return UInt32(4)
-    elseif ty isa LLVM.LLVMDouble
+    elseif ty isa LLVM.DoubleType
         return UInt32(8)
-    elseif ty isa LLVM.LLVMHalf
+    elseif ty isa LLVM.HalfType
         return UInt32(2)
     elseif ty isa LLVM.IntegerType
-        return UInt32(max(1, LLVM.width(ty) ÷ 8))
+        return UInt32(max(1, ty.width ÷ 8))
     elseif ty isa LLVM.StructType
         total = UInt32(0)
         struct_align = UInt32(1)
-        for elem in LLVM.elements(ty)
+        for elem in ty.elements
             elem_align = UInt32(wg_compute_type_alignment(elem))
             struct_align = max(struct_align, elem_align)
             total = (total + elem_align - 1) & ~(elem_align - 1)
@@ -886,17 +885,17 @@ function wg_compute_type_size(ty::LLVM.LLVMType)
 end
 
 function wg_compute_type_alignment(ty::LLVM.LLVMType)
-    if ty isa LLVM.LLVMFloat
+    if ty isa LLVM.FloatType
         return 4
-    elseif ty isa LLVM.LLVMDouble
+    elseif ty isa LLVM.DoubleType
         return 8
-    elseif ty isa LLVM.LLVMHalf
+    elseif ty isa LLVM.HalfType
         return 2
     elseif ty isa LLVM.IntegerType
-        return max(1, LLVM.width(ty) ÷ 8)
+        return max(1, ty.width ÷ 8)
     elseif ty isa LLVM.StructType
         max_align = 1
-        for elem in LLVM.elements(ty)
+        for elem in ty.elements
             max_align = max(max_align, wg_compute_type_alignment(elem))
         end
         return max_align
@@ -935,7 +934,7 @@ function spirv_int_width(w::Integer)::UInt32
 end
 
 function emit_llvm_type!(ctx::SPIRVTypeContext, ty::LLVM.IntegerType)
-    w = LLVM.width(ty)
+    w = ty.width
     if w == 1
         # i1 → OpTypeBool
         return emit_type_bool!(ctx.mod)
@@ -945,15 +944,15 @@ function emit_llvm_type!(ctx::SPIRVTypeContext, ty::LLVM.IntegerType)
     end
 end
 
-function emit_llvm_type!(ctx::SPIRVTypeContext, ty::LLVM.LLVMHalf)
+function emit_llvm_type!(ctx::SPIRVTypeContext, ty::LLVM.HalfType)
     return emit_type_float!(ctx.mod, UInt32(16))
 end
 
-function emit_llvm_type!(ctx::SPIRVTypeContext, ty::LLVM.LLVMFloat)
+function emit_llvm_type!(ctx::SPIRVTypeContext, ty::LLVM.FloatType)
     return emit_type_float!(ctx.mod, UInt32(32))
 end
 
-function emit_llvm_type!(ctx::SPIRVTypeContext, ty::LLVM.LLVMDouble)
+function emit_llvm_type!(ctx::SPIRVTypeContext, ty::LLVM.DoubleType)
     return emit_type_float!(ctx.mod, UInt32(64))
 end
 
@@ -974,7 +973,7 @@ function emit_llvm_type!(ctx::SPIRVTypeContext, ty::LLVM.StructType)
     # { T1, T2, ... } → OpTypeStruct
     # Pointer members require special handling: LLVM uses opaque pointers (ptr)
     # but SPIR-V requires typed pointers. Use struct_ptr_members map to resolve.
-    member_types = LLVM.elements(ty)
+    member_types = ty.elements
     member_spirv_ids = UInt32[]
     for (i, mt) in enumerate(member_types)
         if mt isa LLVM.PointerType
@@ -1009,7 +1008,7 @@ pointee type. Falls back to PhysicalStorageBuffer pointer to i8 if unknown.
 """
 function map_struct_ptr_member!(ctx::SPIRVTypeContext, struct_ty::LLVM.StructType,
                                   member_idx::Int, ptr_ty::LLVM.PointerType)
-    as = LLVM.addrspace(ptr_ty)
+    as = ptr_ty.addrspace
     sc = llvm_addrspace_to_storage_class(as)
     # Non-alloca addrspace 0 pointers are PSB in our convention
     if sc == SC.Function
@@ -1040,9 +1039,9 @@ This enables SPIR-V struct emission to use correct typed pointers for
 pointer members (LLVM's opaque `ptr` → SPIR-V typed pointer).
 """
 function build_struct_ptr_member_types!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Module)
-    for fn in LLVM.functions(llvm_mod)
-        for bb in LLVM.blocks(fn)
-            for inst in LLVM.instructions(bb)
+    for fn in llvm_mod.functions
+        for bb in fn.blocks
+            for inst in bb.instructions
                 if inst isa LLVM.GetElementPtrInst
                     scan_gep_for_struct_ptr_member!(ctx, inst)
                 elseif inst isa LLVM.LoadInst
@@ -1072,20 +1071,20 @@ This pass finds such loads, walks the GEP chain to the alloca, identifies which
 struct types with unresolved ptr members exist in the alloca's type, and resolves them.
 """
 function resolve_unresolved_struct_ptr_members!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Module)
-    for fn in LLVM.functions(llvm_mod)
-        for bb in LLVM.blocks(fn)
-            for inst in LLVM.instructions(bb)
+    for fn in llvm_mod.functions
+        for bb in fn.blocks
+            for inst in bb.instructions
                 inst isa LLVM.LoadInst || continue
-                LLVM.value_type(inst) isa LLVM.PointerType || continue
+                inst.value_type isa LLVM.PointerType || continue
 
                 # Does PTM know this loaded pointer's pointee type?
                 pointee = get_pointee_type(ctx.ptm, inst)
                 pointee === nothing && continue
                 # Skip i8 (the default fallback — not a real resolved type)
-                pointee isa LLVM.IntegerType && LLVM.width(pointee) == 8 && continue
+                pointee isa LLVM.IntegerType && pointee.width == 8 && continue
 
                 # Walk GEP chain to find the base alloca
-                alloca = find_alloca_base(LLVM.operands(inst)[1])
+                alloca = find_alloca_base(inst.operands[1])
                 alloca === nothing && continue
 
                 alloca_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(alloca))
@@ -1102,7 +1101,7 @@ function find_alloca_base(ptr::LLVM.Value)
         if current isa LLVM.AllocaInst
             return current
         elseif current isa LLVM.GetElementPtrInst
-            current = LLVM.operands(current)[1]
+            current = current.operands[1]
         else
             return nothing
         end
@@ -1120,7 +1119,7 @@ accessed via static GEPs should already be resolved by the main scan.
 function resolve_array_struct_ptr_members!(ctx::SPIRVTypeContext, ty::LLVM.LLVMType, pointee::LLVM.LLVMType;
                                              in_array::Bool=false)
     if ty isa LLVM.StructType
-        for (i, field_ty) in enumerate(LLVM.elements(ty))
+        for (i, field_ty) in enumerate(ty.elements)
             if field_ty isa LLVM.PointerType && in_array
                 key = (ty, i - 1)
                 if !haskey(ctx.struct_ptr_members, key)
@@ -1131,7 +1130,7 @@ function resolve_array_struct_ptr_members!(ctx::SPIRVTypeContext, ty::LLVM.LLVMT
             end
         end
     elseif ty isa LLVM.ArrayType
-        resolve_array_struct_ptr_members!(ctx, LLVM.eltype(ty), pointee; in_array=true)
+        resolve_array_struct_ptr_members!(ctx, ty.element_type, pointee; in_array=true)
     end
 end
 
@@ -1144,11 +1143,11 @@ Walk the struct layout following member 0 to find the first pointer member,
 then trace the loaded pointer's users to determine its pointee type.
 """
 function scan_load_from_struct_base!(ctx::SPIRVTypeContext, load_inst::LLVM.LoadInst)
-    load_ty = LLVM.value_type(load_inst)
+    load_ty = load_inst.value_type
     load_ty isa LLVM.PointerType || return
 
     # Get the source pointer and find its pointee type
-    src_ptr = LLVM.operands(load_inst)[1]
+    src_ptr = load_inst.operands[1]
     src_pointee = get_pointee_type(ctx.ptm, src_ptr)
     src_pointee === nothing && return
     (src_pointee isa LLVM.StructType || src_pointee isa LLVM.ArrayType) || return
@@ -1161,11 +1160,11 @@ function scan_load_from_struct_base!(ctx::SPIRVTypeContext, load_inst::LLVM.Load
     haskey(ctx.struct_ptr_members, key) && return  # Already resolved
 
     # Trace the loaded pointer's users to determine pointee type
-    for use in LLVM.uses(load_inst)
-        user = LLVM.user(use)
+    for use in load_inst.uses
+        user = use.user
         if user isa LLVM.GetElementPtrInst
             sub_src = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(user))
-            if sub_src isa LLVM.IntegerType && LLVM.width(sub_src) == 8
+            if sub_src isa LLVM.IntegerType && sub_src.width == 8
                 # Byte-offset GEP — trace through to find real type
                 pointee = infer_type_from_gep_users(user)
                 if pointee !== nothing
@@ -1179,19 +1178,19 @@ function scan_load_from_struct_base!(ctx::SPIRVTypeContext, load_inst::LLVM.Load
                 return
             end
         elseif user isa LLVM.StoreInst
-            if LLVM.operands(user)[2] === load_inst
-                val_ty = LLVM.value_type(LLVM.operands(user)[1])
+            if user.operands[2] === load_inst
+                val_ty = user.operands[1].value_type
                 ctx.struct_ptr_members[key] = (val_ty, 0)
                 return
             end
         elseif user isa LLVM.AtomicRMWInst || user isa LLVM.AtomicCmpXchgInst
             # atomicrmw add ptr %loaded_ptr, i32 1 → pointee is i32
-            val_ty = LLVM.value_type(LLVM.operands(user)[2])
+            val_ty = user.operands[2].value_type
             ctx.struct_ptr_members[key] = (val_ty, 0)
             return
         elseif user isa LLVM.LoadInst
             # load i32, ptr %loaded_ptr → pointee is i32
-            ld_ty = LLVM.value_type(user)
+            ld_ty = user.value_type
             if !(ld_ty isa LLVM.PointerType)
                 ctx.struct_ptr_members[key] = (ld_ty, 0)
                 return
@@ -1208,7 +1207,7 @@ function find_offset0_ptr_member(ty::LLVM.LLVMType)
     current = ty
     while true
         if current isa LLVM.StructType
-            members = LLVM.elements(current)
+            members = current.elements
             isempty(members) && return (nothing, 0)
             first_member = members[1]
             if first_member isa LLVM.PointerType
@@ -1216,8 +1215,8 @@ function find_offset0_ptr_member(ty::LLVM.LLVMType)
             end
             current = first_member
         elseif current isa LLVM.ArrayType
-            LLVM.length(current) == 0 && return (nothing, 0)
-            current = LLVM.eltype(current)
+            current.length == 0 && return (nothing, 0)
+            current = current.element_type
         else
             return (nothing, 0)  # Hit a scalar, no pointer at offset 0
         end
@@ -1227,7 +1226,7 @@ end
 function scan_gep_for_struct_ptr_member!(ctx::SPIRVTypeContext, gep::LLVM.GetElementPtrInst)
     src_ty = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(gep))
 
-    ops = LLVM.operands(gep)
+    ops = gep.operands
     # Need at least: base_ptr, first_idx, and one more index
     length(ops) >= 3 || return
 
@@ -1245,7 +1244,7 @@ function scan_gep_for_struct_ptr_member!(ctx::SPIRVTypeContext, gep::LLVM.GetEle
         idx = convert(Int, idx_val)
 
         if current_ty isa LLVM.StructType
-            members = LLVM.elements(current_ty)
+            members = current_ty.elements
             (idx + 1) <= length(members) || return
             next_ty = members[idx + 1]
             # Record struct + member index at every level
@@ -1253,7 +1252,7 @@ function scan_gep_for_struct_ptr_member!(ctx::SPIRVTypeContext, gep::LLVM.GetEle
             final_member_idx = idx
             current_ty = next_ty
         elseif current_ty isa LLVM.ArrayType
-            current_ty = LLVM.eltype(current_ty)
+            current_ty = current_ty.element_type
         else
             return  # Can't index further
         end
@@ -1263,7 +1262,7 @@ function scan_gep_for_struct_ptr_member!(ctx::SPIRVTypeContext, gep::LLVM.GetEle
     current_ty isa LLVM.PointerType || return
     final_struct_ty === nothing && return
 
-    as = LLVM.addrspace(current_ty)
+    as = current_ty.addrspace
 
     key = (final_struct_ty, final_member_idx)
     haskey(ctx.struct_ptr_members, key) && return  # Already resolved
@@ -1277,8 +1276,8 @@ of a pointer member accessed by the GEP.
 """
 function trace_gep_ptr_users!(ctx::SPIRVTypeContext, gep::LLVM.Value,
                                 key::Tuple{LLVM.StructType, Int}, as::Int)
-    for use in LLVM.uses(gep)
-        user = LLVM.user(use)
+    for use in gep.uses
+        user = use.user
         if user isa LLVM.LoadInst
             # The load gives us the pointer value — check PTM for its pointee type
             pointee = get_pointee_type(ctx.ptm, user)
@@ -1287,11 +1286,11 @@ function trace_gep_ptr_users!(ctx::SPIRVTypeContext, gep::LLVM.Value,
                 return
             end
             # Also check: how is the loaded pointer used? (byte-offset GEP → load/store)
-            for load_use in LLVM.uses(user)
-                load_user = LLVM.user(load_use)
+            for load_use in user.uses
+                load_user = load_use.user
                 if load_user isa LLVM.GetElementPtrInst
                     sub_src = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(load_user))
-                    if sub_src isa LLVM.IntegerType && LLVM.width(sub_src) == 8
+                    if sub_src isa LLVM.IntegerType && sub_src.width == 8
                         # Byte-offset GEP — trace through to find real type
                         pointee = infer_type_from_gep_users(load_user)
                         if pointee !== nothing
@@ -1305,19 +1304,19 @@ function trace_gep_ptr_users!(ctx::SPIRVTypeContext, gep::LLVM.Value,
                     end
                 elseif load_user isa LLVM.StoreInst
                     # Pointer used directly in store (as the pointer operand)
-                    if LLVM.operands(load_user)[2] === user
-                        val_ty = LLVM.value_type(LLVM.operands(load_user)[1])
+                    if load_user.operands[2] === user
+                        val_ty = load_user.operands[1].value_type
                         ctx.struct_ptr_members[key] = (val_ty, as)
                         return
                     end
                 elseif load_user isa LLVM.AtomicRMWInst || load_user isa LLVM.AtomicCmpXchgInst
                     # atomicrmw/cmpxchg on loaded pointer → value type is pointee type
-                    val_ty = LLVM.value_type(LLVM.operands(load_user)[2])
+                    val_ty = load_user.operands[2].value_type
                     ctx.struct_ptr_members[key] = (val_ty, as)
                     return
                 elseif load_user isa LLVM.LoadInst
                     # load from loaded pointer → load type is pointee type
-                    ld_ty = LLVM.value_type(load_user)
+                    ld_ty = load_user.value_type
                     if !(ld_ty isa LLVM.PointerType)
                         ctx.struct_ptr_members[key] = (ld_ty, as)
                         return
@@ -1330,9 +1329,9 @@ end
 
 function emit_llvm_type!(ctx::SPIRVTypeContext, ty::LLVM.FunctionType)
     # Function types: return type + param types
-    ret_ty = map_type!(ctx, LLVM.return_type(ty))
+    ret_ty = map_type!(ctx, ty.return_type)
     param_types = UInt32[]
-    for pt in LLVM.parameters(ty)
+    for pt in ty.parameters
         push!(param_types, map_type!(ctx, pt))
     end
     return emit_type_function!(ctx.mod, ret_ty, param_types)
@@ -1393,10 +1392,10 @@ ptr is a struct member with a declared pointee type.
 """
 function infer_ptr_type_from_source_gep(ctx::SPIRVTypeContext, ptr_value::LLVM.Value)
     ptr_value isa LLVM.LoadInst || return nothing
-    loaded_ty = LLVM.value_type(ptr_value)
+    loaded_ty = ptr_value.value_type
     loaded_ty isa LLVM.PointerType || return nothing
 
-    src_ptr = LLVM.operands(ptr_value)[1]
+    src_ptr = ptr_value.operands[1]
     src_pointee = get_pointee_type(ctx.ptm, src_ptr)
     src_pointee === nothing && return nothing
 
@@ -1410,9 +1409,9 @@ Falls back to i8 if the struct has a ptr member but no declared type (e.g., ptr
 is passed through but never dereferenced)."""
 function find_ptr_member_type_in_hierarchy(ctx::SPIRVTypeContext, ty::LLVM.LLVMType)
     if ty isa LLVM.ArrayType
-        return find_ptr_member_type_in_hierarchy(ctx, LLVM.eltype(ty))
+        return find_ptr_member_type_in_hierarchy(ctx, ty.element_type)
     elseif ty isa LLVM.StructType
-        for (i, ft) in enumerate(LLVM.elements(ty))
+        for (i, ft) in enumerate(ty.elements)
             if ft isa LLVM.PointerType
                 info = get(ctx.struct_ptr_members, (ty, i - 1), nothing)
                 if info !== nothing
@@ -1423,7 +1422,7 @@ function find_ptr_member_type_in_hierarchy(ctx::SPIRVTypeContext, ty::LLVM.LLVMT
             end
         end
         # Recurse into first non-ptr member in case of nested structs
-        for ft in LLVM.elements(ty)
+        for ft in ty.elements
             if ft isa LLVM.StructType || ft isa LLVM.ArrayType
                 result = find_ptr_member_type_in_hierarchy(ctx, ft)
                 result !== nothing && return result
@@ -1447,15 +1446,15 @@ function trace_pointer_to_alloca(ptr::LLVM.Value, visited::Set{LLVM.Value}=Set{L
     push!(visited, ptr)
     ptr isa LLVM.AllocaInst && return true
     if ptr isa LLVM.GetElementPtrInst
-        base = LLVM.operands(ptr)[1]
+        base = ptr.operands[1]
         return trace_pointer_to_alloca(base, visited)
     end
     if ptr isa LLVM.BitCastInst
-        src = LLVM.operands(ptr)[1]
+        src = ptr.operands[1]
         return trace_pointer_to_alloca(src, visited)
     end
     if ptr isa LLVM.PHIInst
-        for (val, _) in LLVM.incoming(ptr)
+        for (val, _) in ptr.incoming
             trace_pointer_to_alloca(val, visited) && return true
         end
         return false
@@ -1471,24 +1470,24 @@ Map a pointer value to its SPIR-V pointer type, using the PointeeTypeMap for typ
 function param_called_with_alloca_arg(param::LLVM.Argument)
     fn = LLVM.Function(LLVM.API.LLVMGetParamParent(param))
     param_idx = nothing
-    for (i, p) in enumerate(LLVM.parameters(fn))
+    for (i, p) in enumerate(fn.parameters)
         if p === param
             param_idx = i
             break
         end
     end
     param_idx === nothing && return false
-    mod = LLVM.parent(fn)
-    for caller in LLVM.functions(mod)
-        isempty(LLVM.blocks(caller)) && continue
-        for bb in LLVM.blocks(caller), inst in LLVM.instructions(bb)
+    mod = fn.parent
+    for caller in mod.functions
+        isempty(caller.blocks) && continue
+        for bb in caller.blocks, inst in bb.instructions
             inst isa LLVM.CallInst || continue
-            callee = LLVM.called_operand(inst)
+            callee = inst.called_operand
             callee === fn || continue
-            ops = LLVM.operands(inst)
+            ops = inst.operands
             param_idx <= length(ops) - 1 || continue
             arg = ops[param_idx]
-            LLVM.value_type(arg) isa LLVM.PointerType || continue
+            arg.value_type isa LLVM.PointerType || continue
             trace_pointer_to_alloca(arg) && return true
         end
     end
@@ -1507,13 +1506,13 @@ function map_pointer_type_for_value!(ctx::SPIRVTypeContext, ptr_value::LLVM.Valu
     end
     if pointee_llvm === nothing
         # Last resort fallbacks:
-        if ptr_value isa LLVM.LoadInst && LLVM.value_type(ptr_value) isa LLVM.PointerType
+        if ptr_value isa LLVM.LoadInst && ptr_value.value_type isa LLVM.PointerType
             # Loaded pointers that are only stored (never dereferenced) → i8
             pointee_llvm = LLVM.Int8Type()
         elseif ptr_value isa LLVM.BitCastInst
             # Pointer bitcast (typepun): try to get pointee from source operand
-            src_op = LLVM.operands(ptr_value)[1]
-            if LLVM.value_type(src_op) isa LLVM.PointerType
+            src_op = ptr_value.operands[1]
+            if src_op.value_type isa LLVM.PointerType
                 src_pointee = get_pointee_type(ctx.ptm, src_op)
                 if src_pointee !== nothing
                     pointee_llvm = src_pointee
@@ -1530,25 +1529,25 @@ function map_pointer_type_for_value!(ctx::SPIRVTypeContext, ptr_value::LLVM.Valu
             # the enclosing function and the parameter position with it.
             ctxinfo = if ptr_value isa LLVM.Argument
                 fn = LLVM.Function(LLVM.API.LLVMGetParamParent(ptr_value))
-                idx = findfirst(==(ptr_value), collect(LLVM.parameters(fn)))
-                "parameter $(idx === nothing ? "?" : idx) of `$(LLVM.name(fn))`"
+                idx = findfirst(==(ptr_value), collect(fn.parameters))
+                "parameter $(idx === nothing ? "?" : idx) of `$(fn.name)`"
             elseif ptr_value isa LLVM.Instruction
-                "instruction in `$(LLVM.name(LLVM.parent(LLVM.parent(ptr_value))))`"
+                "instruction in `$(ptr_value.parent.parent.name)`"
             else
                 "$(typeof(ptr_value))"
             end
             error("Could not recover pointee type for pointer value: " *
-                  "$(LLVM.name(ptr_value))::$(string(LLVM.value_type(ptr_value))) " *
+                  "$(ptr_value.name)::$(string(ptr_value.value_type)) " *
                   "($ctxinfo)")
         end
     end
 
     # Get storage class from address space
-    ptr_ty = LLVM.value_type(ptr_value)
+    ptr_ty = ptr_value.value_type
     if !(ptr_ty isa LLVM.PointerType)
         error("Expected pointer type, got: $(typeof(ptr_ty))")
     end
-    as = LLVM.addrspace(ptr_ty)
+    as = ptr_ty.addrspace
     sc = llvm_addrspace_to_storage_class(as)
 
     # Override: In Vulkan SPIR-V, function parameters and GEP results in addrspace 0
@@ -1596,7 +1595,7 @@ end
 Map an LLVM constant to a SPIR-V constant ID.
 """
 function map_constant!(ctx::SPIRVTypeContext, val::LLVM.Constant)
-    ty = LLVM.value_type(val)
+    ty = val.value_type
 
     if val isa LLVM.ConstantInt
         return map_constant_int!(ctx, val, ty)
@@ -1617,7 +1616,7 @@ function map_constant!(ctx::SPIRVTypeContext, val::LLVM.Constant)
 end
 
 function map_constant_int!(ctx::SPIRVTypeContext, val::LLVM.ConstantInt, ty::LLVM.IntegerType)
-    w = LLVM.width(ty)
+    w = ty.width
     type_id = map_type!(ctx, ty)
     int_val = convert(Int64, val)
 
@@ -1659,12 +1658,12 @@ function map_constant_int!(ctx::SPIRVTypeContext, val::LLVM.ConstantInt, ty::LLV
     end
 end
 
-function map_constant_fp!(ctx::SPIRVTypeContext, val::LLVM.ConstantFP, ty::LLVM.LLVMFloat)
+function map_constant_fp!(ctx::SPIRVTypeContext, val::LLVM.ConstantFP, ty::LLVM.FloatType)
     fval = convert(Float32, val)
     return emit_constant_f32!(ctx.mod, fval)
 end
 
-function map_constant_fp!(ctx::SPIRVTypeContext, val::LLVM.ConstantFP, ty::LLVM.LLVMDouble)
+function map_constant_fp!(ctx::SPIRVTypeContext, val::LLVM.ConstantFP, ty::LLVM.DoubleType)
     type_id = map_type!(ctx, ty)
     fval = convert(Float64, val)
     bits = reinterpret(UInt64, fval)
@@ -1678,7 +1677,7 @@ function map_constant_fp!(ctx::SPIRVTypeContext, val::LLVM.ConstantFP, ty::LLVM.
     end
 end
 
-function map_constant_fp!(ctx::SPIRVTypeContext, val::LLVM.ConstantFP, ty::LLVM.LLVMHalf)
+function map_constant_fp!(ctx::SPIRVTypeContext, val::LLVM.ConstantFP, ty::LLVM.HalfType)
     type_id = map_type!(ctx, ty)
     fval = convert(Float16, val)
     bits = UInt32(reinterpret(UInt16, fval))
@@ -1702,7 +1701,7 @@ function map_undef!(ctx::SPIRVTypeContext, ty::LLVM.LLVMType)
     # OpUndef behavior; PhysicalStorageBuffer pointer types can't use
     # OpConstantNull (SPIR-V validation forbids it) so fall back to OpUndef.
     if ty isa LLVM.PointerType &&
-            llvm_addrspace_to_storage_class(Int(LLVM.addrspace(ty))) == SC.PhysicalStorageBuffer
+            llvm_addrspace_to_storage_class(Int(ty.addrspace)) == SC.PhysicalStorageBuffer
         type_id = map_type!(ctx, ty)
         key = (:undef, type_id)
         return get!(ctx.mod.constant_cache, key) do
@@ -1730,7 +1729,7 @@ function map_constant_array!(ctx::SPIRVTypeContext,
                                         LLVM.ConstantVector, LLVM.ConstantDataVector},
                              ty::LLVM.LLVMType)
     type_id = map_type!(ctx, ty)
-    elem_ty = LLVM.eltype(ty)
+    elem_ty = ty.element_type
     n = length(ty)
     elem_ids = UInt32[]
 
@@ -1746,7 +1745,7 @@ function map_constant_array!(ctx::SPIRVTypeContext,
     else
         # ConstantArray / ConstantVector store elements as operands
         for i in 0:(n-1)
-            elem = LLVM.operands(val)[i + 1]
+            elem = val.operands[i + 1]
             elem_id = map_constant!(ctx, elem)
             push!(elem_ids, elem_id)
         end
@@ -1788,7 +1787,7 @@ end
 Add MemberOffset decorations to a SPIR-V struct type based on LLVM DataLayout.
 """
 function decorate_struct_layout!(ctx::SPIRVTypeContext, struct_spirv_id::UInt32, struct_llvm_ty::LLVM.StructType, dl::LLVM.DataLayout)
-    n_members = length(LLVM.elements(struct_llvm_ty))
+    n_members = length(struct_llvm_ty.elements)
     for i in 0:(n_members - 1)
         offset = API.LLVMOffsetOfElement(dl, struct_llvm_ty, UInt32(i))
         emit_member_decorate!(ctx.mod, struct_spirv_id, UInt32(i), Dec.Offset, UInt32(offset))
@@ -1807,7 +1806,7 @@ Scans the PTM for pointer values in addrspace 1 (PSB) or addrspace 0 non-allocas
 them and all nested structs.
 """
 function decorate_psb_struct_layouts!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Module)
-    dl = LLVM.datalayout(llvm_mod)
+    dl = llvm_mod.datalayout
     decorated_structs = Set{UInt32}()
     decorated_arrays = Set{UInt32}()
 
@@ -1873,9 +1872,9 @@ end
 
 """Check if an LLVM value is a PSB pointer (addrspace 1, or addrspace 0 non-alloca)."""
 function is_psb_value(val::LLVM.Value)
-    ty = LLVM.value_type(val)
+    ty = val.value_type
     ty isa LLVM.PointerType || return false
-    as = LLVM.addrspace(ty)
+    as = ty.addrspace
     as == 1 && return true
     # addrspace 0 non-allocas map to PSB in our convention
     as == 0 && !(val isa LLVM.AllocaInst) && return true
@@ -1884,7 +1883,7 @@ end
 
 """Collect all struct types that are members of `sty` (directly or via arrays)."""
 function collect_nested_member_structs!(nested::Set{LLVM.StructType}, sty::LLVM.StructType)
-    for elem in LLVM.elements(sty)
+    for elem in sty.elements
         collect_nested_member_structs_inner!(nested, elem)
     end
 end
@@ -1893,7 +1892,7 @@ function collect_nested_member_structs_inner!(nested::Set{LLVM.StructType}, ty::
     if ty isa LLVM.StructType
         ty in nested && return
         push!(nested, ty)
-        for elem in LLVM.elements(ty)
+        for elem in ty.elements
             collect_nested_member_structs_inner!(nested, elem)
         end
     elseif ty isa LLVM.ArrayType
@@ -1908,7 +1907,7 @@ function collect_nested_types_for_psb!(structs::Set{LLVM.StructType},
     if ty isa LLVM.StructType
         ty in structs && return
         push!(structs, ty)
-        for elem in LLVM.elements(ty)
+        for elem in ty.elements
             collect_nested_types_for_psb!(structs, arrays, elem)
         end
     elseif ty isa LLVM.ArrayType
@@ -1925,20 +1924,20 @@ function compute_type_size_with_dl(ty::LLVM.LLVMType, dl::LLVM.DataLayout)
     ty isa LLVM.VectorType && return UInt32(API.LLVMABISizeOfType(dl, ty))
     if ty isa LLVM.StructType
         # Use DataLayout for accurate struct size (includes padding)
-        n = length(LLVM.elements(ty))
+        n = length(ty.elements)
         n == 0 && return UInt32(0)
         last_offset = API.LLVMOffsetOfElement(dl, ty, UInt32(n - 1))
-        last_elem = collect(LLVM.elements(ty))[n]
+        last_elem = collect(ty.elements)[n]
         return UInt32(last_offset + compute_type_size_with_dl(last_elem, dl))
     elseif ty isa LLVM.ArrayType
         return UInt32(length(ty)) * compute_type_size_with_dl(eltype(ty), dl)
     elseif ty isa LLVM.IntegerType
-        return UInt32(max(1, LLVM.width(ty) ÷ 8))
-    elseif ty isa LLVM.LLVMFloat
+        return UInt32(max(1, ty.width ÷ 8))
+    elseif ty isa LLVM.FloatType
         return UInt32(4)
-    elseif ty isa LLVM.LLVMDouble
+    elseif ty isa LLVM.DoubleType
         return UInt32(8)
-    elseif ty isa LLVM.LLVMHalf
+    elseif ty isa LLVM.HalfType
         return UInt32(2)
     elseif ty isa LLVM.PointerType
         return UInt32(8)
@@ -1959,29 +1958,29 @@ This ensures type IDs are allocated before instruction emission begins.
 """
 function collect_module_types!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Module)
     # Collect types from global variables
-    for gv in LLVM.globals(llvm_mod)
+    for gv in llvm_mod.globals
         collect_value_type!(ctx, gv)
     end
 
     # Collect types from all functions
-    for fn in LLVM.functions(llvm_mod)
-        isempty(LLVM.blocks(fn)) && continue  # Skip declarations (intrinsics, etc.)
+    for fn in llvm_mod.functions
+        isempty(fn.blocks) && continue  # Skip declarations (intrinsics, etc.)
 
         # Function return type
-        fn_ty = LLVM.function_type(fn)
-        ret_ty = LLVM.return_type(fn_ty)
+        fn_ty = fn.function_type
+        ret_ty = fn_ty.return_type
         if !(ret_ty isa LLVM.PointerType)
             map_type!(ctx, ret_ty)
         end
 
         # Parameter types (skip pointer types — handled per-use)
-        for param in LLVM.parameters(fn)
+        for param in fn.parameters
             collect_value_type!(ctx, param)
         end
 
         # Instruction result types
-        for bb in LLVM.blocks(fn)
-            for inst in LLVM.instructions(bb)
+        for bb in fn.blocks
+            for inst in bb.instructions
                 collect_value_type!(ctx, inst)
             end
         end
@@ -1989,7 +1988,7 @@ function collect_module_types!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Module)
 end
 
 function collect_value_type!(ctx::SPIRVTypeContext, val::LLVM.Value)
-    ty = LLVM.value_type(val)
+    ty = val.value_type
     if ty isa LLVM.PointerType
         # Pointer type — don't map directly, handled per-use via PointeeTypeMap
         return

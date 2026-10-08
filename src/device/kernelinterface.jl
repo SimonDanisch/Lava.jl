@@ -26,7 +26,7 @@ import KernelInterface as KI
 
 # ── Indexing ────────────────────────────────────────────────────────────────
 
-# **Typed**, which is KernelInterface 0.2's contract for the 3D queries: a
+# **Typed**, which is KernelInterface's contract for the 3D queries: a
 # backend implements `f(::Type{T})` and KI itself owns the zero-argument form as
 # `f() = f(Int)`. Implementing the zero-argument one here instead OVERWRITES
 # that definition, and method overwriting is an error during precompilation —
@@ -34,30 +34,31 @@ import KernelInterface as KI
 # module Lava`, which takes the whole tree down.
 #
 # The element type is what a kernel wanting `Int32` indices asks for, so it no
-# longer has to convert after the fact.
+# longer has to convert after the fact. `% T` rather than `T(x)`, as KI asks: a
+# checked conversion leaves an error branch in every kernel.
 #
 # In Lava's own method table, like the subgroup queries below and for the same
 # reason: a plain method is what every other backend's compiler finds too.
 @lava_device_override @inline KI.get_global_id(::Type{T}) where {T} =
-    (x = T(lava_global_invocation_id(1)) + one(T),
-     y = T(lava_global_invocation_id(2)) + one(T),
-     z = T(lava_global_invocation_id(3)) + one(T))
+    (x = lava_global_invocation_id(1) % T + one(T),
+     y = lava_global_invocation_id(2) % T + one(T),
+     z = lava_global_invocation_id(3) % T + one(T))
 
 @lava_device_override @inline KI.get_local_id(::Type{T}) where {T} =
-    (x = T(lava_local_invocation_id(1)) + one(T),
-     y = T(lava_local_invocation_id(2)) + one(T),
-     z = T(lava_local_invocation_id(3)) + one(T))
+    (x = lava_local_invocation_id(1) % T + one(T),
+     y = lava_local_invocation_id(2) % T + one(T),
+     z = lava_local_invocation_id(3) % T + one(T))
 
 @lava_device_override @inline KI.get_group_id(::Type{T}) where {T} =
-    (x = T(lava_workgroup_id(1)) + one(T),
-     y = T(lava_workgroup_id(2)) + one(T),
-     z = T(lava_workgroup_id(3)) + one(T))
+    (x = lava_workgroup_id(1) % T + one(T),
+     y = lava_workgroup_id(2) % T + one(T),
+     z = lava_workgroup_id(3) % T + one(T))
 
 # A COUNT, so no `+ 1` — see this file's header on the 1-based convention.
 @lava_device_override @inline KI.get_num_groups(::Type{T}) where {T} =
-    (x = T(lava_num_workgroups(1)),
-     y = T(lava_num_workgroups(2)),
-     z = T(lava_num_workgroups(3)))
+    (x = lava_num_workgroups(1) % T,
+     y = lava_num_workgroups(2) % T,
+     z = lava_num_workgroups(3) % T)
 
 # `get_local_size` and `get_global_size` are NOT implemented yet, and the reason
 # is a bug they uncovered rather than an oversight.
@@ -90,6 +91,19 @@ import KernelInterface as KI
 # had grown an override of `shfl` only to keep `_lava_subgroup_shuffle_f32` out.
 # KernelInterface's contract is `@device_override`, and a backend without the
 # capability has a missing method, not Lava's.
+#
+# Typed, as KI defines them, and the zero-argument forms kept in `UInt32` beside
+# them: KI's own zero-argument forms answer `Int`, and the kernels here do their
+# lane arithmetic in the builtins' 32 bits.
+@lava_device_override @inline KI.get_sub_group_size(::Type{T}) where {T} =
+    lava_subgroup_size() % T
+@lava_device_override @inline KI.get_num_sub_groups(::Type{T}) where {T} =
+    lava_num_subgroups() % T
+@lava_device_override @inline KI.get_sub_group_id(::Type{T}) where {T} =
+    (lava_subgroup_id() + UInt32(1)) % T
+@lava_device_override @inline KI.get_sub_group_local_id(::Type{T}) where {T} =
+    (lava_subgroup_local_id() + UInt32(1)) % T
+
 @lava_device_override @inline KI.get_sub_group_size()     = lava_subgroup_size()
 @lava_device_override @inline KI.get_num_sub_groups()     = lava_num_subgroups()
 @lava_device_override @inline KI.get_sub_group_id()       = lava_subgroup_id() + UInt32(1)
@@ -101,7 +115,7 @@ import KernelInterface as KI
 # constant fed from `subgroup_size_control(ctx).max` — its own task.
 
 # `shfl_down` is KI's name for the down-shuffle. Lava generates the family for
-# six element types; KI's `shfl_down_types` is what tells its own test suite
+# six element types; KI's `supports_shuffle` is what tells its own test suite
 # which ones to exercise, so the two lists are derived from one place.
 const KI_SHFL_TYPES = (Float32, Float64, Int32, UInt32, Int64, UInt64)
 
@@ -112,7 +126,7 @@ for T in KI_SHFL_TYPES
         subgroup_shuffle_down(val, offset)
 end
 
-# `KI.shfl_down_types(::LavaBackend)` reads this list but dispatches on a
+# `KI.supports_shuffle(::LavaBackend, T)` reads this list but dispatches on a
 # backend, which is a host handle — so it is in the host half, and this is the
 # one list both sides derive from.
 

@@ -32,11 +32,11 @@ trap-stripping is ours to do. Vendored permanently — `rm_trap!` is not
 coming back, and we shouldn't depend on a GPUCompiler internal regardless.
 """
 function rm_trap!(mod::LLVM.Module)
-    fns = LLVM.functions(mod)
+    fns = mod.functions
     haskey(fns, "llvm.trap") || return mod
     trap = fns["llvm.trap"]
-    for use in LLVM.uses(trap)
-        val = LLVM.user(use)
+    for use in trap.uses
+        val = use.user
         val isa LLVM.CallInst && LLVM.erase!(val)
     end
     LLVM.erase!(trap)
@@ -89,13 +89,13 @@ GPUCompiler version stops doing so. It is exercised directly by
 function replace_unreachable!(mod::LLVM.Module, entry::Union{LLVM.Function,Nothing}=nothing;
                               kernelname::AbstractString="")
     # Collected: a dead helper is erased inside the loop.
-    for f in collect(LLVM.functions(mod))
-        isempty(LLVM.blocks(f)) && continue
+    for f in collect(mod.functions)
+        isempty(f.blocks) && continue
 
         # Find unreachable instructions and exit blocks
         unreachables = LLVM.Instruction[]
         exit_blocks = LLVM.BasicBlock[]
-        for bb in LLVM.blocks(f), inst in LLVM.instructions(bb)
+        for bb in f.blocks, inst in bb.instructions
             if inst isa LLVM.UnreachableInst
                 push!(unreachables, inst)
             end
@@ -110,7 +110,7 @@ function replace_unreachable!(mod::LLVM.Module, entry::Union{LLVM.Function,Nothi
         # optimized away — `gpu_gc_pool_alloc`, whose out-of-memory path throws, in
         # Hikari's closest-hit shader. Lowered, it raised the warning below: a GPU
         # heap allocation in a shader that makes none.
-        if entry !== nothing && f !== entry && isempty(LLVM.uses(f))
+        if entry !== nothing && f !== entry && isempty(f.uses)
             LLVM.erase!(f)
             continue
         end
@@ -120,15 +120,15 @@ function replace_unreachable!(mod::LLVM.Module, entry::Union{LLVM.Function,Nothi
         # then dereferenced → wild access). Lower it anyway (the emitter has no
         # `unreachable`), but make it loud.
         if entry !== nothing && f !== entry
-            rt = LLVM.return_type(LLVM.function_type(f))
+            rt = f.function_type.return_type
             ptr_note = rt isa LLVM.PointerType ?
                 " WARNING: helper returns a POINTER — the undef return is liable to be dereferenced." : ""
             # The ENTRY is the Vulkan wrapper and is always called `main`, which
             # names no kernel. `kernelname` is the Julia one the caller still
             # had, and without it this warning cannot be acted on.
-            who = isempty(kernelname) ? LLVM.name(entry) : kernelname
+            who = isempty(kernelname) ? entry.name : kernelname
             msg = "replace_unreachable!: lowering `unreachable` in non-entry helper " *
-                  "`$(LLVM.name(f))` of kernel `$(who)` (returns $(rt)). " *
+                  "`$(f.name)` of kernel `$(who)` (returns $(rt)). " *
                   "Its throw path will return undef and " *
                   "the caller will resume with that value instead of aborting. This is safe " *
                   "only if the throw path is never taken; inline the helper into the kernel " *
@@ -138,10 +138,10 @@ function replace_unreachable!(mod::LLVM.Module, entry::Union{LLVM.Function,Nothi
 
         # If no exit block exists, create one with `ret void` (or `ret null`)
         if isempty(exit_blocks)
-            ret_type = LLVM.return_type(LLVM.function_type(f))
+            ret_type = f.function_type.return_type
             return_block = LLVM.BasicBlock(f, "ret")
             LLVM.@dispose builder=LLVM.IRBuilder() begin
-                LLVM.position!(builder, return_block)
+                LLVM.position!(builder, insertion_point(return_block))
                 if ret_type == LLVM.VoidType()
                     LLVM.ret!(builder)
                 else
@@ -154,49 +154,49 @@ function replace_unreachable!(mod::LLVM.Module, entry::Union{LLVM.Function,Nothi
         LLVM.@dispose builder=LLVM.IRBuilder() begin
             # Use the last exit block (mirrors Metal's heuristic)
             exit_block = last(exit_blocks)
-            ret = LLVM.terminator(exit_block)
+            ret = exit_block.terminator
 
             # Create a dedicated return block with only the return instruction.
             # If the exit block already only contains the ret, reuse it.
-            if first(LLVM.instructions(exit_block)) == ret
+            if first(exit_block.instructions) == ret
                 return_block = exit_block
             else
                 return_block = LLVM.BasicBlock(f, "ret")
                 LLVM.API.LLVMMoveBasicBlockAfter(return_block, exit_block)
 
-                LLVM.position!(builder, ret)
+                LLVM.position!(builder, insertion_point(ret))
                 LLVM.br!(builder, return_block)
 
                 LLVM.API.LLVMInstructionRemoveFromParent(ret)
-                LLVM.position!(builder, return_block)
+                LLVM.position!(builder, insertion_point(return_block))
                 LLVM.API.LLVMInsertIntoBuilder(builder, ret)
             end
 
             # When returning a value, add a phi node to merge return values
-            ret_ops = LLVM.operands(ret)
+            ret_ops = ret.operands
             if !isempty(ret_ops)
-                LLVM.position!(builder, ret)
+                LLVM.position!(builder, insertion_point(ret))
                 val = ret_ops[1]
-                phi = LLVM.phi!(builder, LLVM.value_type(val))
-                for pred in LLVM.predecessors(return_block)
-                    push!(LLVM.incoming(phi), (val, pred))
+                phi = LLVM.phi!(builder, val.value_type)
+                for pred in return_block.predecessors
+                    push!(phi.incoming, (val, pred))
                 end
-                LLVM.operands(ret)[1] = phi
+                ret.operands[1] = phi
             end
 
             # Replace unreachable terminators with branches to return block
             for unreachable in unreachables
-                bb = LLVM.parent(unreachable)
+                bb = unreachable.parent
 
-                LLVM.position!(builder, unreachable)
+                LLVM.position!(builder, insertion_point(unreachable))
                 LLVM.br!(builder, return_block)
                 LLVM.erase!(unreachable)
 
                 # Patch up phi nodes in the return block with undef values
-                for inst in LLVM.instructions(return_block)
+                for inst in return_block.instructions
                     if inst isa LLVM.PHIInst
-                        undef = LLVM.UndefValue(LLVM.value_type(inst))
-                        push!(LLVM.incoming(inst), (undef, bb))
+                        undef = LLVM.UndefValue(inst.value_type)
+                        push!(inst.incoming, (undef, bb))
                     end
                 end
             end
@@ -215,12 +215,12 @@ Without this, the SPIR-V emitter would need to handle an opcode that has no
 SPIR-V equivalent.
 """
 function replace_freeze!(mod::LLVM.Module)
-    for f in LLVM.functions(mod)
-        isempty(LLVM.blocks(f)) && continue
+    for f in mod.functions
+        isempty(f.blocks) && continue
         to_erase = LLVM.Instruction[]
-        for bb in LLVM.blocks(f), inst in LLVM.instructions(bb)
+        for bb in f.blocks, inst in bb.instructions
             inst isa LLVM.FreezeInst || continue
-            LLVM.replace_uses!(inst, LLVM.operands(inst)[1])
+            LLVM.replace_uses!(inst, inst.operands[1])
             push!(to_erase, inst)
         end
         for inst in to_erase
@@ -240,20 +240,19 @@ the functions are no longer truly noreturn. But LLVM's SimplifyCFG sees the
 to these functions, undoing our fix. Stripping the attribute prevents this.
 """
 function strip_noreturn!(mod::LLVM.Module)
-    noreturn_kind = LLVM.kind(LLVM.EnumAttribute("noreturn"))
-    for f in LLVM.functions(mod)
+    for f in mod.functions
         # Strip from function definition attributes
-        for attr in collect(LLVM.function_attributes(f))
-            if LLVM.kind(attr) == noreturn_kind
-                delete!(LLVM.function_attributes(f), attr)
+        for attr in collect(f.function_attributes)
+            if attr.kind === :noreturn
+                delete!(f.function_attributes, attr)
             end
         end
         # Strip from call-site attributes on call instructions
-        for bb in LLVM.blocks(f), inst in LLVM.instructions(bb)
+        for bb in f.blocks, inst in bb.instructions
             if inst isa LLVM.CallInst
-                for attr in collect(LLVM.function_attributes(inst))
-                    if LLVM.kind(attr) == noreturn_kind
-                        delete!(LLVM.function_attributes(inst), attr)
+                for attr in collect(inst.function_attributes)
+                    if attr.kind === :noreturn
+                        delete!(inst.function_attributes, attr)
                     end
                 end
             end
@@ -271,15 +270,15 @@ emitter doesn't need them, and they can cause issues if misplaced relative
 to OpSelectionMerge instructions during structured control flow emission.
 """
 function strip_assume!(mod::LLVM.Module)
-    if haskey(LLVM.functions(mod), "llvm.assume")
-        assume_fn = LLVM.functions(mod)["llvm.assume"]
-        for use in collect(LLVM.uses(assume_fn))
-            val = LLVM.user(use)
+    if haskey(mod.functions, "llvm.assume")
+        assume_fn = mod.functions["llvm.assume"]
+        for use in collect(assume_fn.uses)
+            val = use.user
             if val isa LLVM.CallInst
                 LLVM.erase!(val)
             end
         end
-        if isempty(LLVM.uses(assume_fn))
+        if isempty(assume_fn.uses)
             LLVM.erase!(assume_fn)
         end
     end
@@ -301,14 +300,14 @@ the dead invocation's writes on real hardware).
 function function_contains_barrier(f::LLVM.Function, barrier_fn_name::AbstractString,
                                    memo::Dict{LLVM.Function,Bool})
     haskey(memo, f) && return memo[f]
-    isempty(LLVM.blocks(f)) && (memo[f] = false; return false)
+    isempty(f.blocks) && (memo[f] = false; return false)
     memo[f] = false  # break recursion cycles: treat as non-barrier while descending
     result = false
-    for bb in LLVM.blocks(f), inst in LLVM.instructions(bb)
+    for bb in f.blocks, inst in bb.instructions
         inst isa LLVM.CallInst || continue
-        callee = LLVM.called_operand(inst)
+        callee = inst.called_operand
         callee isa LLVM.Function || continue
-        if LLVM.name(callee) == barrier_fn_name ||
+        if callee.name == barrier_fn_name ||
            (callee !== f && function_contains_barrier(callee, barrier_fn_name, memo))
             result = true
             break
@@ -342,7 +341,7 @@ function block_reaches(start::LLVM.BasicBlock, target::LLVM.BasicBlock)
         bb in visited && continue
         push!(visited, bb)
         bb === target && return true
-        for succ in LLVM.successors(LLVM.terminator(bb))
+        for succ in bb.terminator.successors
             succ in visited || push!(queue, succ)
         end
     end
@@ -371,18 +370,18 @@ function that (transitively) contains a barrier — the latter is the no-inline 
 where each `@synchronize` is its own wrapper function (see `function_contains_barrier`).
 """
 function fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
-    isempty(LLVM.blocks(entry_fn)) && return false
+    isempty(entry_fn.blocks) && return false
 
     # 1. Find all blocks containing barrier calls (direct intrinsic or a call to
     #    a wrapper function that contains one — the no-inline `@synchronize` case).
     barrier_fn_name = "llvm.spv.group.memory.barrier.with.group.sync"
     barrier_blocks = Set{LLVM.BasicBlock}()
     barrier_memo = Dict{LLVM.Function,Bool}()
-    for bb in LLVM.blocks(entry_fn), inst in LLVM.instructions(bb)
+    for bb in entry_fn.blocks, inst in bb.instructions
         inst isa LLVM.CallInst || continue
-        callee = LLVM.called_operand(inst)
+        callee = inst.called_operand
         callee isa LLVM.Function || continue
-        if LLVM.name(callee) == barrier_fn_name ||
+        if callee.name == barrier_fn_name ||
            function_contains_barrier(callee, barrier_fn_name, barrier_memo)
             push!(barrier_blocks, bb)
         end
@@ -391,8 +390,8 @@ function fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
 
     # 2. Find the return block(s)
     return_blocks = Set{LLVM.BasicBlock}()
-    for bb in LLVM.blocks(entry_fn)
-        term = LLVM.terminator(bb)
+    for bb in entry_fn.blocks
+        term = bb.terminator
         if term isa LLVM.RetInst
             push!(return_blocks, bb)
         end
@@ -402,13 +401,13 @@ function fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
     # 3. Find blocks that skip barriers: branch directly to a return block,
     #    while their predecessor's other path leads to a barrier.
     changed = false
-    for bb in collect(LLVM.blocks(entry_fn))
+    for bb in collect(entry_fn.blocks)
         bb in barrier_blocks && continue
         bb in return_blocks && continue
 
-        term = LLVM.terminator(bb)
+        term = bb.terminator
         term isa LLVM.BrInst || continue
-        succs = collect(LLVM.successors(term))
+        succs = collect(term.successors)
         length(succs) == 1 || continue   # must be unconditional branch
 
         target = succs[1]
@@ -426,13 +425,13 @@ function fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
         bare_return_block(target) || continue
 
         # This block branches directly to return. Check predecessor.
-        preds = collect(LLVM.predecessors(bb))
+        preds = collect(bb.predecessors)
         length(preds) == 1 || continue
 
         pred = preds[1]
-        pred_term = LLVM.terminator(pred)
+        pred_term = pred.terminator
         pred_term isa LLVM.BrInst || continue
-        pred_succs = collect(LLVM.successors(pred_term))
+        pred_succs = collect(pred_term.successors)
         length(pred_succs) == 2 || continue  # must be conditional branch
 
         # Find the "other" target (the non-error path)
@@ -446,20 +445,20 @@ function fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
            !block_reaches(other_target, bb)
             # Redirect this block to the barrier-containing path
             LLVM.@dispose builder = LLVM.IRBuilder() begin
-                LLVM.position!(builder, term)
+                LLVM.position!(builder, insertion_point(term))
                 LLVM.br!(builder, other_target)
             end
             LLVM.erase!(term)
 
             # Add incoming values for any PHI nodes in the target
-            for inst in LLVM.instructions(other_target)
+            for inst in other_target.instructions
                 inst isa LLVM.PHIInst || break  # PHIs must be at block start
-                undef = LLVM.UndefValue(LLVM.value_type(inst))
-                push!(LLVM.incoming(inst), (undef, bb))
+                undef = LLVM.UndefValue(inst.value_type)
+                push!(inst.incoming, (undef, bb))
             end
             # ...and take `bb` out of the old target's: it is no longer a
             # predecessor there, and a phi naming it is invalid IR.
-            for phi in [i for i in LLVM.instructions(target) if i isa LLVM.PHIInst]
+            for phi in [i for i in target.instructions if i isa LLVM.PHIInst]
                 drop_incoming!(phi, bb)
             end
 
@@ -477,14 +476,14 @@ Whether `bb` does nothing but return: phis, the `ret`, and markers that do no
 work — the entry wrapper's `llvm.lifetime.end`s and debug intrinsics.
 """
 function bare_return_block(bb::LLVM.BasicBlock)
-    term = LLVM.terminator(bb)
-    all(LLVM.instructions(bb)) do i
+    term = bb.terminator
+    all(bb.instructions) do i
         i isa LLVM.PHIInst && return true
         i === term && return true
         i isa LLVM.CallInst || return false
-        callee = LLVM.called_operand(i)
+        callee = i.called_operand
         callee isa LLVM.Function || return false
-        n = LLVM.name(callee)
+        n = callee.name
         startswith(n, "llvm.lifetime.") || startswith(n, "llvm.dbg.")
     end
 end
@@ -496,11 +495,11 @@ Rebuild `phi` without its entry for predecessor `from`. LLVM's C API can add an
 incoming value and cannot remove one, so the phi is replaced.
 """
 function drop_incoming!(phi::LLVM.PHIInst, from::LLVM.BasicBlock)
-    keep = Tuple{LLVM.Value,LLVM.BasicBlock}[(v, b) for (v, b) in LLVM.incoming(phi) if b != from]
+    keep = Tuple{LLVM.Value,LLVM.BasicBlock}[(v, b) for (v, b) in phi.incoming if b != from]
     LLVM.@dispose builder = LLVM.IRBuilder() begin
-        LLVM.position!(builder, phi)
-        new = LLVM.phi!(builder, LLVM.value_type(phi))
-        append!(LLVM.incoming(new), keep)
+        LLVM.position!(builder, insertion_point(phi))
+        new = LLVM.phi!(builder, phi.value_type)
+        append!(new.incoming, keep)
         LLVM.replace_uses!(phi, new)
         LLVM.erase!(phi)
     end
@@ -523,8 +522,8 @@ function path_reaches_barrier(start::LLVM.BasicBlock,
         push!(visited, bb)
         bb in barrier_blocks && return true
         bb in return_blocks && continue  # don't search past return
-        term = LLVM.terminator(bb)
-        for succ in LLVM.successors(term)
+        term = bb.terminator
+        for succ in term.successors
             succ in visited || push!(queue, succ)
         end
     end
@@ -547,18 +546,18 @@ These are dead error paths that should never execute on GPU. We replace:
 3. Runs DCE to clean up dead code chains
 """
 function remove_julia_runtime_artifacts!(mod::LLVM.Module)
-    for fn in LLVM.functions(mod)
-        isempty(LLVM.blocks(fn)) && continue
+    for fn in mod.functions
+        isempty(fn.blocks) && continue
         to_erase = LLVM.Instruction[]
 
-        for bb in LLVM.blocks(fn)
-            for inst in LLVM.instructions(bb)
+        for bb in fn.blocks
+            for inst in bb.instructions
                 # Remove stores to inttoptr(small_constant) — Julia GC/error paths
                 if inst isa LLVM.StoreInst
-                    ops = LLVM.operands(inst)
+                    ops = inst.operands
                     ptr_op = ops[2]
-                    if ptr_op isa LLVM.ConstantExpr && LLVM.opcode(ptr_op) == LLVM.API.LLVMIntToPtr
-                        ce_ops = LLVM.operands(ptr_op)
+                    if ptr_op isa LLVM.ConstantExpr && ptr_op.opcode == LLVM.API.LLVMIntToPtr
+                        ce_ops = ptr_op.operands
                         if ce_ops[1] isa LLVM.ConstantInt
                             addr = convert(UInt64, ce_ops[1])
                             if addr < 4096  # Small addresses are error paths
@@ -570,9 +569,9 @@ function remove_julia_runtime_artifacts!(mod::LLVM.Module)
 
                 # Replace loads from external function decls (jl_*_type) with zero
                 if inst isa LLVM.LoadInst
-                    ptr_op = LLVM.operands(inst)[1]
-                    if ptr_op isa LLVM.Function && isempty(LLVM.blocks(ptr_op))
-                        load_ty = LLVM.value_type(inst)
+                    ptr_op = inst.operands[1]
+                    if ptr_op isa LLVM.Function && isempty(ptr_op.blocks)
+                        load_ty = inst.value_type
                         if load_ty isa LLVM.IntegerType
                             zero = LLVM.ConstantInt(load_ty, 0)
                             LLVM.replace_uses!(inst, zero)

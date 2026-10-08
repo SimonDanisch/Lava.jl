@@ -30,9 +30,9 @@ using Logging
 # Count `unreachable` terminators across every defined function in a module.
 function count_unreachable(mod::LLVM.Module)
     total = 0
-    for f in LLVM.functions(mod)
-        isempty(LLVM.blocks(f)) && continue
-        for bb in LLVM.blocks(f), inst in LLVM.instructions(bb)
+    for f in mod.functions
+        isempty(f.blocks) && continue
+        for bb in f.blocks, inst in bb.instructions
             inst isa LLVM.UnreachableInst && (total += 1)
         end
     end
@@ -106,7 +106,7 @@ ok:
     @testset "lowers every unreachable to valid IR" begin
         LLVM.Context() do ctx
             mod = parse(LLVM.Module, _IR_KERNEL_AND_HELPERS)
-            entry = LLVM.functions(mod)["kernel"]
+            entry = mod.functions["kernel"]
             @test count_unreachable(mod) == 3
             # Suppress the (expected) warnings here; correctness is the focus.
             Logging.with_logger(Logging.NullLogger()) do
@@ -121,7 +121,7 @@ ok:
     @testset "warns for non-entry helpers, loud for pointer return" begin
         LLVM.Context() do ctx
             mod = parse(LLVM.Module, _IR_KERNEL_AND_HELPERS)
-            entry = LLVM.functions(mod)["kernel"]
+            entry = mod.functions["kernel"]
             # A warning naming each helper must fire; the pointer helper's
             # warning must additionally flag the POINTER hazard. match_mode=:any
             # ignores ordering and any non-matching logs.
@@ -138,9 +138,9 @@ ok:
     @testset "a helper nothing calls is removed, silently" begin
         LLVM.Context() do ctx
             mod = parse(LLVM.Module, _IR_KERNEL_AND_DEAD_HELPER)
-            entry = LLVM.functions(mod)["kernel"]
+            entry = mod.functions["kernel"]
             @test_logs min_level = Logging.Warn Lava.replace_unreachable!(mod, entry)
-            @test !haskey(LLVM.functions(mod), "gpu_gc_pool_alloc")
+            @test !haskey(mod.functions, "gpu_gc_pool_alloc")
             @test count_unreachable(mod) == 0
             @test (LLVM.verify(mod); true)
         end
@@ -149,7 +149,7 @@ ok:
     @testset "entry/kernel lowering is silent" begin
         LLVM.Context() do ctx
             mod = parse(LLVM.Module, _IR_KERNEL_ONLY)
-            entry = LLVM.functions(mod)["kernel"]
+            entry = mod.functions["kernel"]
             # No warn/error-level logs when the only lowered unreachable is in
             # the entry kernel itself.
             @test_logs min_level = Logging.Warn Lava.replace_unreachable!(mod, entry)

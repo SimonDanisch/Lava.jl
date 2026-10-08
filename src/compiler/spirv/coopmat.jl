@@ -346,12 +346,12 @@ pre-scan is not optional.
 """
 function prescan_function_for_coopmat_components!(state::SPIRVEmitterState,
                                                   fn::LLVM.Function)
-    isempty(LLVM.blocks(fn)) && return nothing
-    for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+    isempty(fn.blocks) && return nothing
+    for bb in fn.blocks, inst in bb.instructions
         inst isa LLVM.CallInst || continue
-        callee = LLVM.called_operand(inst)
+        callee = inst.called_operand
         callee isa LLVM.Function || continue
-        parsed = parse_coopmat_name(LLVM.name(callee))
+        parsed = parse_coopmat_name(callee.name)
         parsed === nothing && continue
         op, dtype, M, N, use, _, scope = parsed
         (op == "getcomp" || op == "setcomp") || continue
@@ -463,7 +463,7 @@ function emit_tensor_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
     op, dim, clamp, rest = parsed
 
     mod = state.mod
-    args = LLVM.operands(inst)          # trailing operand is the callee
+    args = inst.operands          # trailing operand is the callee
     nargs = length(args) - 1
     layout_ty = emit_tensor_layout_type!(state, dim, clamp)
     require_capability!(mod, Cap.TensorAddressingNV)
@@ -671,7 +671,7 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
 
     mod = state.mod
     mat_ty = emit_coopmat_type!(state, dtype, M, N, use, scope)
-    args = LLVM.operands(inst)
+    args = inst.operands
     # Both layouts, because the operands want different ones from the same block:
     # `mul_mm.comp` stages A and B identically and reads A `RowMajor`, B
     # `ColumnMajor`. Hardcoding one forces a transposing staging pass for the
@@ -910,18 +910,18 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
             error("cooperative-matrix per-element callback did not survive as a call; " *
                   "the callback must be a top-level `@noinline` function of " *
                   "(::UInt32, ::UInt32, ::$dtype), not a closure")
-        callee = LLVM.called_operand(marker)
+        callee = marker.called_operand
         callee isa LLVM.Function ||
             error("cooperative-matrix per-element callback is an indirect call")
         func_id = get(state.value_map, callee, nothing)
         func_id === nothing &&
-            error("cooperative-matrix per-element callback $(LLVM.name(callee)) has no " *
+            error("cooperative-matrix per-element callback $(callee.name) has no " *
                   "SPIR-V function; it was probably inlined away")
         # Everything the callback needs beyond (row, col, element) rides along as
         # a trailing operand. They are read off the marker call, where they are
         # the real values — only the first three arguments there are dummies.
         # A CallInst's operand list ends with the callee, hence `end - 1`.
-        margs = LLVM.operands(marker)
+        margs = marker.operands
         extras = if op == "perelemm"
             # args = (matrix, marker, other-matrix); the marker's own trailing
             # argument is the dummy element that gave `f` its signature.
@@ -971,12 +971,12 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         marker isa LLVM.CallInst ||
             error("cooperative-matrix reduce callback did not survive as a call; " *
                   "it must be a top-level function of (::$dtype, ::$dtype), not a closure")
-        callee = LLVM.called_operand(marker)
+        callee = marker.called_operand
         callee isa LLVM.Function ||
             error("cooperative-matrix reduce callback is an indirect call")
         func_id = get(state.value_map, callee, nothing)
         func_id === nothing &&
-            error("cooperative-matrix reduce callback $(LLVM.name(callee)) has no " *
+            error("cooperative-matrix reduce callback $(callee.name) has no " *
                   "SPIR-V function; it was probably inlined away")
         id = fresh_id!(mod)
         encode_instruction!(mod.functions, Op.OpCooperativeMatrixReduceNV,
@@ -1009,16 +1009,16 @@ its call, and the pattern degrades to a redundant evaluation rather than to a
 missing one.
 """
 function coopmat_perelement_marker(inst::LLVM.CallInst)
-    callee = LLVM.called_operand(inst)
+    callee = inst.called_operand
     callee isa LLVM.Function || return false
-    startswith(LLVM.name(callee), "_lava_") && return false
+    startswith(callee.name, "_lava_") && return false
     n = 0
-    for use in LLVM.uses(inst)
-        user = LLVM.user(use)
+    for use in inst.uses
+        user = use.user
         user isa LLVM.CallInst || return false
-        target = LLVM.called_operand(user)
+        target = user.called_operand
         target isa LLVM.Function || return false
-        parsed = parse_coopmat_name(LLVM.name(target))
+        parsed = parse_coopmat_name(target.name)
         # `perelemm` — the MATRIX-operand form — is a per-element op too. Matching
         # `perelem` exactly excluded it here and in `collect_inline_callbacks!`
         # below, so its callback was never marked `Inline` and the driver emitted
@@ -1041,13 +1041,13 @@ emitted *ahead of* the entry function that names it and `emit_function!` has to
 already know not to mark it `DontInline`. See `inline_callbacks`.
 """
 function collect_inline_callbacks!(state::SPIRVEmitterState, llvm_mod::LLVM.Module)
-    for fn in LLVM.functions(llvm_mod)
-        isempty(LLVM.blocks(fn)) && continue
-        for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+    for fn in llvm_mod.functions
+        isempty(fn.blocks) && continue
+        for bb in fn.blocks, inst in bb.instructions
             inst isa LLVM.CallInst || continue
-            callee = LLVM.called_operand(inst)
+            callee = inst.called_operand
             callee isa LLVM.Function || continue
-            parsed = parse_coopmat_name(LLVM.name(callee))
+            parsed = parse_coopmat_name(callee.name)
             parsed === nothing && continue
             # `reduce<mask>` too. `OpCooperativeMatrixReduceNV` names a combiner
             # the driver is meant to inline into its reduction loop for exactly
@@ -1058,9 +1058,9 @@ function collect_inline_callbacks!(state::SPIRVEmitterState, llvm_mod::LLVM.Modu
             # Operand 2 is the marker in all three forms: the scalar llvmcall is
             # `(i32 %m, T %p)`, the matrix one `(i32 %m, T %p, i32 %o)`, and the
             # reduce one `(i32 %m, T %p)`.
-            marker = LLVM.operands(inst)[2]
+            marker = inst.operands[2]
             marker isa LLVM.CallInst || continue
-            cb = LLVM.called_operand(marker)
+            cb = marker.called_operand
             cb isa LLVM.Function && push!(state.inline_callbacks, cb)
         end
     end

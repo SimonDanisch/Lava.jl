@@ -160,7 +160,7 @@ function emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
 
     # Create emitter state
     state = SPIRVEmitterState(spirv_mod, type_ctx)
-    state.data_layout = LLVM.datalayout(llvm_mod)
+    state.data_layout = llvm_mod.datalayout
 
     # Graphics I/O state — stored in a module-level ref during emission
     gfx_io = GfxIOState()
@@ -176,7 +176,7 @@ function emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
     end
 
     # Find entry function
-    entry_fn = LLVM.functions(llvm_mod)[entry_name]
+    entry_fn = llvm_mod.functions[entry_name]
 
     # Emit standard globals (push constants, builtins, constants)
     interface_ids = emit_globals!(state, llvm_mod)
@@ -215,8 +215,8 @@ function emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
     state.gfx_io = gfx_io
 
     # Emit function
-    fn_ty = LLVM.function_type(entry_fn)
-    n_params = length(collect(LLVM.parameters(fn_ty)))
+    fn_ty = entry_fn.function_type
+    n_params = length(collect(fn_ty.parameters))
 
     if n_params == 0
         func_id = emit_function!(state, entry_fn; is_entry=true)
@@ -349,24 +349,24 @@ function gfx_prescan_io!(state::SPIRVEmitterState, gfx_io::GfxIOState,
     mod = state.mod
 
     # Walk all instructions in the function to find graphics intrinsic calls
-    for bb in LLVM.blocks(entry_fn)
-        for inst in LLVM.instructions(bb)
+    for bb in entry_fn.blocks
+        for inst in bb.instructions
             inst isa LLVM.CallInst || continue
-            called = LLVM.called_operand(inst)
+            called = inst.called_operand
             called isa LLVM.Function || continue
-            fn_name = LLVM.name(called)
+            fn_name = called.name
 
             if fn_name == "_lava_gfx_set_position"
                 gfx_ensure_position_var!(state, gfx_io, stage)
             elseif fn_name == "_lava_gfx_set_point_size"
                 gfx_ensure_point_size_var!(state, gfx_io, stage)
             elseif startswith(fn_name, "_lava_gfx_output_")
-                loc = extract_constant_u32(LLVM.operands(inst)[1])
+                loc = extract_constant_u32(inst.operands[1])
                 is_flat = contains(fn_name, "_flat_")
                 iotype = gfx_output_type_from_name(fn_name)
                 gfx_ensure_output_var!(state, gfx_io, loc, iotype, stage; flat=is_flat)
             elseif startswith(fn_name, "_lava_gfx_input_")
-                loc = extract_constant_u32(LLVM.operands(inst)[1])
+                loc = extract_constant_u32(inst.operands[1])
                 is_flat = contains(fn_name, "_flat_")
                 iotype = gfx_input_type_from_name(fn_name)
                 gfx_ensure_input_var!(state, gfx_io, loc, iotype, stage; flat=is_flat)
@@ -375,12 +375,12 @@ function gfx_prescan_io!(state::SPIRVEmitterState, gfx_io::GfxIOState,
             elseif fn_name == "_lava_gfx_set_tess_level_inner"
                 gfx_ensure_tess_inner_var!(state, gfx_io)
             elseif fn_name == "_lava_gfx_sample_2d"
-                binding = extract_constant_u32(LLVM.operands(inst)[1])
+                binding = extract_constant_u32(inst.operands[1])
                 gfx_ensure_sampler_var!(state, gfx_io, binding)
             elseif fn_name == "_lava_gfx_emit_vertex" || fn_name == "_lava_gfx_end_primitive"
                 # No I/O variables needed, just capability (already added)
             elseif startswith(fn_name, "_lava_mesh_output_")
-                loc = extract_constant_u32(LLVM.operands(inst)[1])
+                loc = extract_constant_u32(inst.operands[1])
                 gfx_ensure_mesh_output_var!(state, gfx_io, loc,
                                             gfx_output_type_from_name(fn_name))
             elseif fn_name == "_lava_mesh_set_position"
@@ -393,7 +393,7 @@ function gfx_prescan_io!(state::SPIRVEmitterState, gfx_io::GfxIOState,
             elseif fn_name == "_lava_geom_input_position"
                 gfx_ensure_geom_position_input_var!(state, gfx_io)
             elseif startswith(fn_name, "_lava_geom_input_")
-                loc = extract_constant_u32(LLVM.operands(inst)[1])
+                loc = extract_constant_u32(inst.operands[1])
                 iotype = geom_input_type_from_name(fn_name)
                 gfx_ensure_geom_input_var!(state, gfx_io, loc, iotype)
             end
@@ -741,10 +741,10 @@ function emit_gfx_set_position!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     var_id === nothing && error("_lava_gfx_set_position called but no Position variable created")
 
     # Get x, y, z, w arguments
-    x_id = get_value_id!(state, LLVM.operands(inst)[1])
-    y_id = get_value_id!(state, LLVM.operands(inst)[2])
-    z_id = get_value_id!(state, LLVM.operands(inst)[3])
-    w_id = get_value_id!(state, LLVM.operands(inst)[4])
+    x_id = get_value_id!(state, inst.operands[1])
+    y_id = get_value_id!(state, inst.operands[2])
+    z_id = get_value_id!(state, inst.operands[3])
+    w_id = get_value_id!(state, inst.operands[4])
 
     # Construct vec4
     f32_ty = emit_type_float!(mod, UInt32(32))
@@ -767,8 +767,8 @@ rasterised, so this is what turns written slots into geometry.
 """
 function emit_mesh_set_outputs!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
-    nv_id = get_value_id!(state, LLVM.operands(inst)[1])
-    np_id = get_value_id!(state, LLVM.operands(inst)[2])
+    nv_id = get_value_id!(state, inst.operands[1])
+    np_id = get_value_id!(state, inst.operands[2])
     encode_instruction!(mod.functions, Op.OpSetMeshOutputsEXT, nv_id, np_id)
 end
 
@@ -782,12 +782,12 @@ prescan already read to create the array.
 function emit_mesh_output!(state::SPIRVEmitterState, inst::LLVM.CallInst, iotype::Symbol)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
-    loc = extract_constant_u32(LLVM.operands(inst)[1])
+    loc = extract_constant_u32(inst.operands[1])
     entry = get(gfx_io.mesh_output_vars, loc, nothing)
     entry === nothing && error("mesh varying at location $loc written but never created")
     var_id, _ = entry
 
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     slot_id = get_value_id!(state, ops[2])
     comp_ids = UInt32[get_value_id!(state, ops[2 + k]) for k in 1:gfx_io_component_count(iotype)]
 
@@ -818,11 +818,11 @@ function emit_mesh_set_position!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     var_id = gfx_io.mesh_vertices_var_id
     var_id === nothing && error("mesh position written but gl_MeshVerticesEXT was never created")
 
-    slot_id = get_value_id!(state, LLVM.operands(inst)[1])
-    x_id = get_value_id!(state, LLVM.operands(inst)[2])
-    y_id = get_value_id!(state, LLVM.operands(inst)[3])
-    z_id = get_value_id!(state, LLVM.operands(inst)[4])
-    w_id = get_value_id!(state, LLVM.operands(inst)[5])
+    slot_id = get_value_id!(state, inst.operands[1])
+    x_id = get_value_id!(state, inst.operands[2])
+    y_id = get_value_id!(state, inst.operands[3])
+    z_id = get_value_id!(state, inst.operands[4])
+    w_id = get_value_id!(state, inst.operands[5])
 
     f32_ty = emit_type_float!(mod, UInt32(32))
     vec4_ty = emit_type_vector!(mod, f32_ty, UInt32(4))
@@ -855,7 +855,7 @@ function emit_mesh_set_primitive!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         "$(gfx_io.mesh_index_arity); the topology in the stage's `MeshConfig` and " *
         "the `set_mesh_*!` the body calls have to agree.")
 
-    ops = LLVM.operands(inst)
+    ops = inst.operands
     slot_id = get_value_id!(state, ops[1])
     idx_ids = UInt32[get_value_id!(state, ops[1 + k]) for k in 1:arity]
 
@@ -880,20 +880,20 @@ function emit_gfx_set_point_size!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
     var_id = gfx_io.point_size_var_id
-    val_id = get_value_id!(state, LLVM.operands(inst)[1])
+    val_id = get_value_id!(state, inst.operands[1])
     encode_instruction!(mod.functions, Op.OpStore, var_id, val_id)
 end
 
 function emit_gfx_output_vec4!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
-    loc = extract_constant_u32(LLVM.operands(inst)[1])
+    loc = extract_constant_u32(inst.operands[1])
     var_id, _ = gfx_io.output_vars[loc]
 
-    x_id = get_value_id!(state, LLVM.operands(inst)[2])
-    y_id = get_value_id!(state, LLVM.operands(inst)[3])
-    z_id = get_value_id!(state, LLVM.operands(inst)[4])
-    w_id = get_value_id!(state, LLVM.operands(inst)[5])
+    x_id = get_value_id!(state, inst.operands[2])
+    y_id = get_value_id!(state, inst.operands[3])
+    z_id = get_value_id!(state, inst.operands[4])
+    w_id = get_value_id!(state, inst.operands[5])
 
     f32_ty = emit_type_float!(mod, UInt32(32))
     vec4_ty = emit_type_vector!(mod, f32_ty, UInt32(4))
@@ -906,12 +906,12 @@ end
 function emit_gfx_output_vec3!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
-    loc = extract_constant_u32(LLVM.operands(inst)[1])
+    loc = extract_constant_u32(inst.operands[1])
     var_id, _ = gfx_io.output_vars[loc]
 
-    x_id = get_value_id!(state, LLVM.operands(inst)[2])
-    y_id = get_value_id!(state, LLVM.operands(inst)[3])
-    z_id = get_value_id!(state, LLVM.operands(inst)[4])
+    x_id = get_value_id!(state, inst.operands[2])
+    y_id = get_value_id!(state, inst.operands[3])
+    z_id = get_value_id!(state, inst.operands[4])
 
     f32_ty = emit_type_float!(mod, UInt32(32))
     vec3_ty = emit_type_vector!(mod, f32_ty, UInt32(3))
@@ -924,11 +924,11 @@ end
 function emit_gfx_output_vec2!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
-    loc = extract_constant_u32(LLVM.operands(inst)[1])
+    loc = extract_constant_u32(inst.operands[1])
     var_id, iotype = gfx_io.output_vars[loc]
 
-    x_id = get_value_id!(state, LLVM.operands(inst)[2])
-    y_id = get_value_id!(state, LLVM.operands(inst)[3])
+    x_id = get_value_id!(state, inst.operands[2])
+    y_id = get_value_id!(state, inst.operands[3])
 
     vec2_ty = gfx_spirv_type_for_io(mod, iotype)
     vec_id = fresh_id!(mod)
@@ -940,16 +940,16 @@ end
 function emit_gfx_output_f32!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
-    loc = extract_constant_u32(LLVM.operands(inst)[1])
+    loc = extract_constant_u32(inst.operands[1])
     var_id, _ = gfx_io.output_vars[loc]
-    val_id = get_value_id!(state, LLVM.operands(inst)[2])
+    val_id = get_value_id!(state, inst.operands[2])
     encode_instruction!(mod.functions, Op.OpStore, var_id, val_id)
 end
 
 function emit_gfx_input!(state::SPIRVEmitterState, inst::LLVM.CallInst, iotype::Symbol)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
-    loc = extract_constant_u32(LLVM.operands(inst)[1])
+    loc = extract_constant_u32(inst.operands[1])
     var_id, _ = gfx_io.input_vars[loc]
 
     value_ty = gfx_spirv_type_for_io(mod, iotype)
@@ -963,7 +963,7 @@ function emit_gfx_input!(state::SPIRVEmitterState, inst::LLVM.CallInst, iotype::
         # Load vec, then extract component
         vec_id = fresh_id!(mod)
         encode_instruction!(mod.functions, Op.OpLoad, value_ty, vec_id, var_id)
-        comp = LLVM.operands(inst)[2]  # component index
+        comp = inst.operands[2]  # component index
         comp_id = get_value_id!(state, comp)
         f32_ty = emit_type_float!(mod, UInt32(32))
         result_id = fresh_id!(mod)
@@ -987,14 +987,14 @@ For f32/i32: loads the scalar directly.
 function emit_geom_input!(state::SPIRVEmitterState, inst::LLVM.CallInst, iotype::Symbol)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
-    loc = extract_constant_u32(LLVM.operands(inst)[1])
+    loc = extract_constant_u32(inst.operands[1])
     var_id, _ = gfx_io.geom_input_vars[loc]
 
     elem_ty = gfx_spirv_type_for_geom_io(mod, iotype)
     elem_ptr_ty = map_pointer_type!(state.type_ctx, elem_ty, SC.Input)
 
     # OpAccessChain into the array: var[vertex_idx]
-    vidx_id = get_value_id!(state, LLVM.operands(inst)[2])
+    vidx_id = get_value_id!(state, inst.operands[2])
     ac_id = fresh_id!(mod)
     encode_instruction!(mod.functions, Op.OpAccessChain, elem_ptr_ty, ac_id, var_id, vidx_id)
 
@@ -1012,7 +1012,7 @@ function emit_geom_input!(state::SPIRVEmitterState, inst::LLVM.CallInst, iotype:
         # Load vec, extract component
         vec_id = fresh_id!(mod)
         encode_instruction!(mod.functions, Op.OpLoad, elem_ty, vec_id, ac_id)
-        comp_id = get_value_id!(state, LLVM.operands(inst)[3])
+        comp_id = get_value_id!(state, inst.operands[3])
         f32_ty = emit_type_float!(mod, UInt32(32))
         result_id = fresh_id!(mod)
         encode_instruction!(mod.functions, Op.OpVectorExtractDynamic, f32_ty, result_id,
@@ -1037,8 +1037,8 @@ function emit_geom_input_position!(state::SPIRVEmitterState, inst::LLVM.CallInst
     vec4_ty = emit_type_vector!(mod, f32_ty, UInt32(4))
     vec4_ptr_ty = map_pointer_type!(state.type_ctx, vec4_ty, SC.Input)
 
-    vidx_id = get_value_id!(state, LLVM.operands(inst)[1])
-    comp_id = get_value_id!(state, LLVM.operands(inst)[2])
+    vidx_id = get_value_id!(state, inst.operands[1])
+    comp_id = get_value_id!(state, inst.operands[2])
 
     # Member 0 of gl_PerVertex = Position
     zero_id = emit_constant_u32!(mod, UInt32(0))
@@ -1062,7 +1062,7 @@ end
 function emit_gfx_derivative!(state::SPIRVEmitterState, inst::LLVM.CallInst, opcode::UInt16)
     # OpDPdx/OpDPdy: result_type result_id operand
     mod = state.mod
-    operand = LLVM.operands(inst)[1]
+    operand = inst.operands[1]
     operand_id = state.value_map[operand]
     f32_ty = emit_type_float!(mod, UInt32(32))
     result_id = fresh_id!(mod)
@@ -1102,8 +1102,8 @@ function emit_gfx_set_tess_level!(state::SPIRVEmitterState, inst::LLVM.CallInst,
     gfx_io = state.gfx_io::GfxIOState
     var_id = is_outer ? gfx_io.tess_outer_var_id : gfx_io.tess_inner_var_id
 
-    idx_id = get_value_id!(state, LLVM.operands(inst)[1])
-    val_id = get_value_id!(state, LLVM.operands(inst)[2])
+    idx_id = get_value_id!(state, inst.operands[1])
+    val_id = get_value_id!(state, inst.operands[2])
 
     f32_ty = emit_type_float!(mod, UInt32(32))
     elem_ptr_ty = map_pointer_type!(state.type_ctx, f32_ty, SC.Output)
@@ -1118,10 +1118,10 @@ function emit_gfx_sample_2d!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     mod = state.mod
     gfx_io = state.gfx_io::GfxIOState
 
-    binding = extract_constant_u32(LLVM.operands(inst)[1])
-    u_id = get_value_id!(state, LLVM.operands(inst)[2])
-    v_id = get_value_id!(state, LLVM.operands(inst)[3])
-    comp_id = get_value_id!(state, LLVM.operands(inst)[4])
+    binding = extract_constant_u32(inst.operands[1])
+    u_id = get_value_id!(state, inst.operands[2])
+    v_id = get_value_id!(state, inst.operands[3])
+    comp_id = get_value_id!(state, inst.operands[4])
 
     f32_ty = emit_type_float!(mod, UInt32(32))
 
@@ -1131,7 +1131,7 @@ function emit_gfx_sample_2d!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     # coordinates anywhere else — a branch that does not dominate it, another
     # function — reusing this one is an ID used where it is not defined
     # (test/spirv/test_texture_sample_dominance.jl).
-    cache_key = (:tex_sample, LLVM.parent(inst).ref, binding, u_id, v_id)
+    cache_key = (:tex_sample, inst.parent.ref, binding, u_id, v_id)
     sample_id = get(mod.constant_cache, cache_key, UInt32(0))
 
     if sample_id == UInt32(0)

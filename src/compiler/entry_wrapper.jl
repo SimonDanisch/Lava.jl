@@ -49,9 +49,9 @@ inlined into the wrapper by the AlwaysInliner pass.
 """
 function wrap_entry_for_vulkan!(mod::LLVM.Module, entry::LLVM.Function;
                                  workgroup_size::NTuple{3,Int}=(64,1,1))
-    entry_name = LLVM.name(entry)
-    ft = LLVM.function_type(entry)
-    param_types = collect(LLVM.parameters(ft))
+    entry_name = entry.name
+    ft = entry.function_type
+    param_types = collect(ft.parameters)
 
     # No parameters → no wrapping needed
     if isempty(param_types)
@@ -59,8 +59,8 @@ function wrap_entry_for_vulkan!(mod::LLVM.Module, entry::LLVM.Function;
     end
 
     # Mark original entry as internal + alwaysinline
-    LLVM.linkage!(entry, LLVM.API.LLVMInternalLinkage)
-    attrs = LLVM.function_attributes(entry)
+    entry.linkage = LLVM.API.LLVMInternalLinkage
+    attrs = entry.function_attributes
     delete!(attrs, LLVM.EnumAttribute("noinline"))
     push!(attrs, LLVM.EnumAttribute("alwaysinline"))
 
@@ -81,14 +81,13 @@ function wrap_entry_for_vulkan!(mod::LLVM.Module, entry::LLVM.Function;
     # structs with mixed-size fields (e.g., WorkQueue{T} has {DevArr, DevArr, i32}
     # → llvm_sizeof=36 but ABI size=40 due to trailing padding).
     # Multiple byval args with padding gaps cause inline data overlap in the arg buffer.
-    dl = LLVM.datalayout(mod)
-    byval_kind_id = LLVM.API.LLVMGetEnumAttributeKindForName("byval", 5)
+    dl = mod.datalayout
     byval_llvm_sizes = zeros(Int, length(param_types))
     for (i, pt) in enumerate(param_types)
         pt isa LLVM.PointerType || continue
-        for attr in collect(LLVM.parameter_attributes(entry, i))
-            if attr isa LLVM.TypeAttribute && LLVM.kind(attr) == byval_kind_id
-                byval_type = LLVM.value(attr)
+        for attr in collect(entry.parameter_attributes[i])
+            if attr isa LLVM.TypeAttribute && attr.kind === :byval
+                byval_type = attr.value
                 byval_llvm_sizes[i] = Int(LLVM.API.LLVMABISizeOfType(dl, byval_type))
                 break
             end
@@ -99,7 +98,7 @@ function wrap_entry_for_vulkan!(mod::LLVM.Module, entry::LLVM.Function;
     T_i64 = LLVM.Int64Type()
     T_push = LLVM.StructType([T_i64])
     gv = LLVM.GlobalVariable(mod, T_push, "__push_constants", 2)
-    LLVM.linkage!(gv, LLVM.API.LLVMExternalLinkage)
+    gv.linkage = LLVM.API.LLVMExternalLinkage
 
     # Create wrapper function: void()
     T_void = LLVM.VoidType()
@@ -110,7 +109,7 @@ function wrap_entry_for_vulkan!(mod::LLVM.Module, entry::LLVM.Function;
     # Build wrapper body
     bb = LLVM.BasicBlock(wrapper, "entry")
     LLVM.@dispose builder=LLVM.IRBuilder() begin
-        LLVM.position!(builder, bb)
+        LLVM.position!(builder, insertion_point(bb))
 
         # Load BDA from push constant
         push_val = LLVM.load!(builder, T_push, gv, "push_load")
@@ -130,7 +129,7 @@ function wrap_entry_for_vulkan!(mod::LLVM.Module, entry::LLVM.Function;
                                  "arg$(i)_addr")
                 field_ptr = LLVM.inttoptr!(builder, addr, T_ptr_as1, "arg$(i)_ptr")
                 bda_val = LLVM.load!(builder, T_i64, field_ptr, "arg$(i)_bda")
-                LLVM.alignment!(bda_val, 8)
+                bda_val.alignment = 8
                 ptr_val = LLVM.inttoptr!(builder, bda_val, pt, "arg$(i)")
                 push!(args, ptr_val)
             else
@@ -141,7 +140,7 @@ function wrap_entry_for_vulkan!(mod::LLVM.Module, entry::LLVM.Function;
                 field_ptr = LLVM.inttoptr!(builder, addr, T_ptr_as1, "arg$(i)_ptr")
                 val = LLVM.load!(builder, pt, field_ptr, "arg$(i)")
                 align = max(4, llvm_sizeof(pt))
-                LLVM.alignment!(val, align)
+                val.alignment = align
                 push!(args, val)
             end
         end
@@ -183,12 +182,12 @@ end
 """Size of an LLVM type in bytes."""
 function llvm_sizeof(t::LLVM.LLVMType)
     if t isa LLVM.IntegerType
-        return max(1, LLVM.width(t) ÷ 8)
-    elseif t isa LLVM.LLVMFloat
+        return max(1, t.width ÷ 8)
+    elseif t isa LLVM.FloatType
         return 4
-    elseif t isa LLVM.LLVMDouble
+    elseif t isa LLVM.DoubleType
         return 8
-    elseif t isa LLVM.LLVMHalf
+    elseif t isa LLVM.HalfType
         return 2
     elseif t isa LLVM.PointerType
         return 8  # 64-bit pointers → stored as i64 BDA
@@ -196,7 +195,7 @@ function llvm_sizeof(t::LLVM.LLVMType)
         return length(t) * llvm_sizeof(eltype(t))
     elseif t isa LLVM.StructType
         total = 0
-        for m in LLVM.elements(t)
+        for m in t.elements
             total += llvm_sizeof(m)
         end
         return total
