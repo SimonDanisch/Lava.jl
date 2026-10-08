@@ -305,11 +305,19 @@ function lava_run(cmd::Base.AbstractCmd; timeout::Float64=180.0,
     # was the single largest Lava-owned cost for a small kernel. Spinning for
     # the first few ms recovers all of it; backing off afterwards keeps a
     # genuinely stuck child from pegging a core for the full timeout.
-    nap = 0.0
+    #
+    # The backoff starts at 100 ms, not at the end of the spin. A process start
+    # alone is 15-20 ms on Windows, so every spawn there outlived the spin, and
+    # doubling from 0.5 ms (1 ms once Windows rounds it) overshot a 17 ms child by
+    # up to 8 ms, measured on LapWin. Polling every millisecond until 100 ms costs
+    # nothing a core would notice.
+    nap = 0.001
     while !process_exited(p) && time() < deadline
-        if nap == 0.0
+        elapsed = time() - t_spawn
+        if elapsed < 0.005
             yield()
-            (time() - t_spawn) > 0.005 && (nap = 0.0005)
+        elseif elapsed < 0.1
+            sleep(0.001)
         else
             sleep(nap)
             nap = min(nap * 2, 0.05)
