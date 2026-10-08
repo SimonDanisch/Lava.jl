@@ -2458,7 +2458,7 @@ function wg_type_contains_struct(ty::LLVM.LLVMType)
     if ty isa LLVM.StructType
         return true
     elseif ty isa LLVM.ArrayType
-        return wg_type_contains_struct(eltype(ty))
+        return wg_type_contains_struct(ty.element_type)
     else
         return false
     end

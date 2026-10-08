@@ -192,7 +192,7 @@ function llvm_sizeof(t::LLVM.LLVMType)
     elseif t isa LLVM.PointerType
         return 8  # 64-bit pointers → stored as i64 BDA
     elseif t isa LLVM.ArrayType
-        return length(t) * llvm_sizeof(eltype(t))
+        return t.length * llvm_sizeof(t.element_type)
     elseif t isa LLVM.StructType
         total = 0
         for m in t.elements

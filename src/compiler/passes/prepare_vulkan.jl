@@ -30,7 +30,7 @@ function llvm_type_size(t::LLVM.LLVMType)
     elseif t == LLVM.HalfType()
         return 2
     elseif t isa LLVM.ArrayType
-        return length(t) * llvm_type_size(t.element_type)
+        return t.length * llvm_type_size(t.element_type)
     elseif t isa LLVM.VectorType
         # Without this, a vector fell through to the 8-byte fallback below, and
         # every size test in the packed-alloca passes read `<2 x half>` as the
@@ -40,7 +40,7 @@ function llvm_type_size(t::LLVM.LLVMType)
         # lowering for it and dropped the access chain, and the module failed
         # validation with the store's pointer and object types disagreeing.
         # `scalar_size` right below has always had this branch.
-        return length(t) * llvm_type_size(t.element_type)
+        return t.length * llvm_type_size(t.element_type)
     elseif t isa LLVM.StructType
         total = 0
         for m in t.elements
@@ -2017,7 +2017,7 @@ function fix_shared_geps!(mod::LLVM.Module)
                 a = convert(Int, arr_idx)
                 b = convert(Int, elem_idx)
                 arr_ty = shared_globals[gv]
-                N = length(arr_ty)
+                N = arr_ty.length
                 offset = a * N + b
                 push!(constexpr_fixes, (inst, gv, arr_ty, offset))
             end
@@ -2117,9 +2117,9 @@ function fix_shared_geps!(mod::LLVM.Module)
             function _flat_count(ty::LLVM.LLVMType, leaf_ty::LLVM.LLVMType)
                 ty == leaf_ty && return 1
                 ty isa LLVM.ArrayType || return nothing
-                inner = _flat_count(eltype(ty), leaf_ty)
+                inner = _flat_count(ty.element_type, leaf_ty)
                 inner === nothing && return nothing
-                return length(ty) * inner
+                return ty.length * inner
             end
 
             # Helper: compute flat index from nested indices on a (nested) array type.
@@ -2143,7 +2143,7 @@ function fix_shared_geps!(mod::LLVM.Module)
                         LLVM.add!(builder, flat_idx, term, "shmem_flat")
 
                     # Descend into element type for next index
-                    cur_ty = cur_ty isa LLVM.ArrayType ? eltype(cur_ty) : elem_ty
+                    cur_ty = cur_ty isa LLVM.ArrayType ? cur_ty.element_type : elem_ty
                 end
                 return flat_idx
             end
@@ -2184,7 +2184,7 @@ function fix_shared_geps!(mod::LLVM.Module)
                         ptr_op = ops[1]
                         LLVM.position!(builder, insertion_point(gep))
                         src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
-                        elem_ty = eltype(arr_ty)
+                        elem_ty = arr_ty.element_type
 
                         total = _flat_count(src_ty, elem_ty)
                         total === nothing && continue
@@ -5315,7 +5315,7 @@ function compute_gep_byte_offset(src_ty::LLVM.LLVMType, operands, dl::LLVM.DataL
             current_ty = current_ty.elements[idx+1]
         elseif current_ty isa LLVM.ArrayType
             # Array: offset = idx * element_size
-            elem_ty = eltype(current_ty)
+            elem_ty = current_ty.element_type
             elem_size = Int64(LLVM.API.LLVMABISizeOfType(dl, elem_ty))
             offset += idx * elem_size
             current_ty = elem_ty

@@ -2652,7 +2652,7 @@ function collect_scalar_fields!(results::Vector{Tuple{Int, LLVM.LLVMType, Vector
     elseif ty isa LLVM.ArrayType
         elem_ty = ty.element_type
         elem_size = Int(compute_type_size(elem_ty, dl))
-        for i in 0:(length(ty) - 1)
+        for i in 0:(ty.length - 1)
             collect_scalar_fields!(results, vcat(path, [i]), elem_ty, base_offset + i * elem_size, dl)
         end
     else
@@ -2863,14 +2863,14 @@ function get_alignment_for_type(ty::LLVM.LLVMType)
         end
         return max_align
     elseif ty isa LLVM.ArrayType
-        return get_alignment_for_type(eltype(ty))
+        return get_alignment_for_type(ty.element_type)
     elseif ty isa LLVM.VectorType
         # The component's, which is what VUID-06314 asks of a PSB access ("at
         # least the size of the largest scalar"). Absent this branch a vector
         # fell to the 4 below: an under-aligned `<4 x i32>` then took the 4-byte
         # decomposition and moved only its first component, silently, and
         # `<2 x double>` was declared `Aligned 4`.
-        return get_alignment_for_type(eltype(ty))
+        return get_alignment_for_type(ty.element_type)
     else
         return UInt32(4)  # Default alignment
     end
@@ -3359,13 +3359,13 @@ a vector they read one component's worth and returned it as the whole value.
 """
 function emit_psb_decomposed_vector_load!(state::SPIRVEmitterState, ptr_id::UInt32,
                                           vec_ty::LLVM.VectorType, result_spirv_ty::UInt32)
-    el = eltype(vec_ty)
+    el = vec_ty.element_type
     elsize = compute_type_size(el, state.data_layout)
     el_spirv = map_type!(state.type_ctx, el)
     u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
     base_u64 = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, ptr_id)
-    comps = map(0:(length(vec_ty) - 1)) do i
+    comps = map(0:(vec_ty.length - 1)) do i
         cptr = psb_component_pointer!(state, base_u64, i * elsize)
         get_alignment_for_type(el) <= 4 ?
             emit_psb_decomposed_small_load!(state, cptr, el, el_spirv) :
@@ -3380,13 +3380,13 @@ end
 """The store half of [`emit_psb_decomposed_vector_load!`](@ref)."""
 function emit_psb_decomposed_vector_store!(state::SPIRVEmitterState, ptr_id::UInt32,
                                            val_id::UInt32, vec_ty::LLVM.VectorType)
-    el = eltype(vec_ty)
+    el = vec_ty.element_type
     elsize = compute_type_size(el, state.data_layout)
     el_spirv = map_type!(state.type_ctx, el)
     u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
     base_u64 = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, u64_spirv, base_u64, ptr_id)
-    for i in 0:(length(vec_ty) - 1)
+    for i in 0:(vec_ty.length - 1)
         comp = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpCompositeExtract, el_spirv, comp,
                             val_id, UInt32(i))
@@ -5565,7 +5565,7 @@ function compute_type_alignment(ty::LLVM.LLVMType, dl::LLVM.DataLayout)
         end
         return max_align
     elseif ty isa LLVM.ArrayType
-        return compute_type_alignment(eltype(ty), dl)
+        return compute_type_alignment(ty.element_type, dl)
     elseif ty isa LLVM.PointerType
         return 8
     else
@@ -5707,7 +5707,7 @@ function compute_type_size(ty::LLVM.LLVMType, dl::LLVM.DataLayout)
         total = (total + struct_align - 1) & ~(struct_align - 1)
         return total
     elseif ty isa LLVM.ArrayType
-        return UInt32(length(ty)) * compute_type_size(eltype(ty), dl)
+        return UInt32(ty.length) * compute_type_size(ty.element_type, dl)
     elseif ty isa LLVM.PointerType
         return UInt32(8)
     else

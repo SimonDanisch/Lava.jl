@@ -705,9 +705,9 @@ function index_into_type(ty::LLVM.LLVMType, idx::LLVM.Value)
         return nothing
     elseif ty isa LLVM.ArrayType
         # Array element access — result is the element type
-        return eltype(ty)
+        return ty.element_type
     elseif ty isa LLVM.VectorType
-        return eltype(ty)
+        return ty.element_type
     else
         return nothing
     end
@@ -803,15 +803,15 @@ function emit_workgroup_type!(ctx::SPIRVTypeContext, ty::LLVM.ArrayType)
     # MUST bypass emit_type_array!'s type_cache to get a fresh ID —
     # the cache deduplicates on (element_id, length_id), which would return
     # the same type ID that PSB decorations are applied to.
-    elem_spirv = map_workgroup_type!(ctx, eltype(ty))
-    n = length(ty)
+    elem_spirv = map_workgroup_type!(ctx, ty.element_type)
+    n = ty.length
     len_id = emit_constant_u32!(ctx.mod, UInt32(n))
     id = fresh_id!(ctx.mod)
     encode_instruction!(ctx.mod.types_constants, Op.OpTypeArray, id, elem_spirv, len_id)
 
     # ArrayStride decoration is required by VK_KHR_workgroup_memory_explicit_layout
     # for ALL arrays inside Block-decorated structs, not just arrays of structs.
-    elem_llvm = eltype(ty)
+    elem_llvm = ty.element_type
     stride = UInt32(wg_compute_type_size(elem_llvm))
     emit_decorate!(ctx.mod, id, Dec.ArrayStride, stride)
 
@@ -868,7 +868,7 @@ function wg_compute_type_size(ty::LLVM.LLVMType)
         total = (total + struct_align - 1) & ~(struct_align - 1)
         return total
     elseif ty isa LLVM.ArrayType
-        return UInt32(length(ty)) * wg_compute_type_size(eltype(ty))
+        return UInt32(ty.length) * wg_compute_type_size(ty.element_type)
     elseif ty isa LLVM.VectorType
         # A vector is its components, packed. Absent this branch it fell through
         # to the 4 below, which is right for `<2 x half>` BY ACCIDENT and wrong
@@ -876,7 +876,7 @@ function wg_compute_type_size(ty::LLVM.LLVMType)
         # element and `spirv-val` rejected the module ("array with stride 4 not
         # satisfying alignment to 8"). The staged GEMM's `vec2` staging is the
         # only thing that had ever used this path.
-        return UInt32(length(ty)) * wg_compute_type_size(eltype(ty))
+        return UInt32(ty.length) * wg_compute_type_size(ty.element_type)
     elseif ty isa LLVM.PointerType
         return UInt32(8)
     else
@@ -900,14 +900,14 @@ function wg_compute_type_alignment(ty::LLVM.LLVMType)
         end
         return max_align
     elseif ty isa LLVM.ArrayType
-        return wg_compute_type_alignment(eltype(ty))
+        return wg_compute_type_alignment(ty.element_type)
     elseif ty isa LLVM.VectorType
         # Vulkan's rule, not the packed size: a 2-component vector aligns to 2x
         # its component and a 3- or 4-component one to 4x. `<2 x half>` therefore
         # keeps the 4 it was getting from the fallthrough, so nothing that worked
         # before moves; `<4 x half>` gets the 8 the validator demands.
-        n = length(ty)
-        return (n == 2 ? 2 : 4) * wg_compute_type_alignment(eltype(ty))
+        n = ty.length
+        return (n == 2 ? 2 : 4) * wg_compute_type_alignment(ty.element_type)
     elseif ty isa LLVM.PointerType
         return 8
     else
@@ -962,8 +962,8 @@ end
 
 function emit_llvm_type!(ctx::SPIRVTypeContext, ty::LLVM.ArrayType)
     # [N x T] → OpTypeArray
-    elem_spirv = map_type!(ctx, eltype(ty))
-    n = length(ty)
+    elem_spirv = map_type!(ctx, ty.element_type)
+    n = ty.length
     # OpTypeArray needs the length as an OpConstant
     len_id = emit_constant_u32!(ctx.mod, UInt32(n))
     return emit_type_array!(ctx.mod, elem_spirv, len_id)
@@ -987,8 +987,8 @@ end
 
 function emit_llvm_type!(ctx::SPIRVTypeContext, ty::LLVM.VectorType)
     # <N x T> → OpTypeVector
-    elem_spirv = map_type!(ctx, eltype(ty))
-    n = length(ty)
+    elem_spirv = map_type!(ctx, ty.element_type)
+    n = ty.length
     return emit_type_vector!(ctx.mod, elem_spirv, UInt32(n))
 end
 
@@ -1730,7 +1730,7 @@ function map_constant_array!(ctx::SPIRVTypeContext,
                              ty::LLVM.LLVMType)
     type_id = map_type!(ctx, ty)
     elem_ty = ty.element_type
-    n = length(ty)
+    n = ty.length
     elem_ids = UInt32[]
 
     if val isa LLVM.ConstantDataArray || val isa LLVM.ConstantDataVector
@@ -1835,7 +1835,7 @@ function decorate_psb_struct_layouts!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Modu
     # Also mark structs that are elements of PSB arrays as nested —
     # SPIR-V forbids ArrayStride on arrays whose element has Block decoration.
     for llvm_aty in all_psb_array_types
-        elem_ty = eltype(llvm_aty)
+        elem_ty = llvm_aty.element_type
         if elem_ty isa LLVM.StructType
             push!(nested_structs, elem_ty)
         end
@@ -1863,7 +1863,7 @@ function decorate_psb_struct_layouts!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Modu
         spirv_id in decorated_arrays && continue
         push!(decorated_arrays, spirv_id)
 
-        elem_ty = eltype(llvm_aty)
+        elem_ty = llvm_aty.element_type
         # Use ABI size for stride — includes alignment padding
         stride = UInt32(API.LLVMABISizeOfType(dl, elem_ty))
         emit_decorate!(ctx.mod, spirv_id, Dec.ArrayStride, stride)
@@ -1896,7 +1896,7 @@ function collect_nested_member_structs_inner!(nested::Set{LLVM.StructType}, ty::
             collect_nested_member_structs_inner!(nested, elem)
         end
     elseif ty isa LLVM.ArrayType
-        collect_nested_member_structs_inner!(nested, eltype(ty))
+        collect_nested_member_structs_inner!(nested, ty.element_type)
     end
 end
 
@@ -1913,7 +1913,7 @@ function collect_nested_types_for_psb!(structs::Set{LLVM.StructType},
     elseif ty isa LLVM.ArrayType
         if !(ty in arrays)
             push!(arrays, ty)
-            collect_nested_types_for_psb!(structs, arrays, eltype(ty))
+            collect_nested_types_for_psb!(structs, arrays, ty.element_type)
         end
     end
 end
@@ -1930,7 +1930,7 @@ function compute_type_size_with_dl(ty::LLVM.LLVMType, dl::LLVM.DataLayout)
         last_elem = collect(ty.elements)[n]
         return UInt32(last_offset + compute_type_size_with_dl(last_elem, dl))
     elseif ty isa LLVM.ArrayType
-        return UInt32(length(ty)) * compute_type_size_with_dl(eltype(ty), dl)
+        return UInt32(ty.length) * compute_type_size_with_dl(ty.element_type, dl)
     elseif ty isa LLVM.IntegerType
         return UInt32(max(1, ty.width ÷ 8))
     elseif ty isa LLVM.FloatType
