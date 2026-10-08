@@ -3031,13 +3031,17 @@ function lower_memcpy!(inst::LLVM.CallInst, dl::LLVM.DataLayout; overlapping::Bo
             copy_type = allocated
         end
     end
-    # Workgroup memory is addressed logically: a struct element cannot be read as
-    # i32 words, so the chunked copy below emits loads `spirv-val` rejects. Copy it
-    # as the element it is instead; `decompose_wg_accesses!` splits that into its
-    # fields. This is a copy of one array element onto another, `tile[a] = tile[b]`,
-    # which Julia 1.12 emits as `llvm.memcpy`/`llvm.memmove` for a struct element.
+    # Workgroup memory is addressed logically: a struct element cannot be written
+    # or read as i32 words. Between two workgroup elements the chunked copy below
+    # emits loads `spirv-val` rejects; from the stack INTO workgroup memory it
+    # validates and is wrong: AcceleratedKernels stores its scan seed, a
+    # `_Lane{Tuple{Int,Int}}` kernel argument, as `running_prefix[1] = seed`, and
+    # the words never became the struct the next load reads, so `init = (1, 0)`
+    # scanned from `(0, 0)`. Copy it as the element it is instead;
+    # `decompose_wg_accesses!` splits that into its fields. Julia 1.12 emits these
+    # as `llvm.memcpy`/`llvm.memmove` for a struct element.
     if copy_type === nothing && len_val isa LLVM.ConstantInt &&
-       dst.value_type.addrspace == 3 && src.value_type.addrspace == 3
+       (dst.value_type.addrspace == 3 || src.value_type.addrspace == 3)
         nbytes = convert(Int, len_val)
         for p in (dst, src)
             copy_type = leading_type(addressed_type(p), nbytes, dl)
@@ -3096,9 +3100,10 @@ end
 """
     addressed_type(ptr)
 
-The type `ptr` points at, when the IR says: what a GEP indexes to, a global's value
-type. `nothing` for anything else.
+The type `ptr` points at, when the IR says: what an alloca allocates, what a GEP
+indexes to, a global's value type. `nothing` for anything else.
 """
+addressed_type(a::LLVM.AllocaInst) = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(a))
 addressed_type(gv::LLVM.GlobalVariable) = gv.global_value_type
 addressed_type(gep::LLVM.GetElementPtrInst) = indexed_type(gep.source_element_type, gep.operands[3:end])
 addressed_type(ce::LLVM.ConstantExpr) =
