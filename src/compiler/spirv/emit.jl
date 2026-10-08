@@ -7770,11 +7770,42 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
         state.value_map[inst] = result_id
         return
     elseif startswith(base_name, "llvm.ctpop")
-        # Population count → OpBitCount
+        # Population count → OpBitCount, which Vulkan allows on 32-bit integers
+        # only (VUID-RuntimeSpirv-None-10824, unless maintenance9). A narrower
+        # value is zero-extended, a 64-bit one counted as its two halves:
+        # AcceleratedKernels' `mapreduce_nd` counts the bits of an `Int`.
         val_id = get_value_id!(state, inst.operands[1])
-        result_ty = map_type!(state.type_ctx, inst.value_type)
-        result_id = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpBitCount, result_ty, result_id, val_id)
+        result_llvm_ty = inst.value_type
+        result_ty = map_type!(state.type_ctx, result_llvm_ty)
+        bw = result_llvm_ty.width
+        u32_llvm = LLVM.IntType(32)
+        u32_ty = map_type!(state.type_ctx, u32_llvm)
+        function bitcount32(v)
+            id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpBitCount, u32_ty, id, v)
+            return id
+        end
+        function convert_to(ty, v)
+            id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpUConvert, ty, id, v)
+            return id
+        end
+        result_id = if bw == 32
+            bitcount32(val_id)
+        elseif bw < 32
+            convert_to(result_ty, bitcount32(convert_to(u32_ty, val_id)))
+        elseif bw == 64
+            c32_id = map_constant!(state.type_ctx, LLVM.ConstantInt(result_llvm_ty, 32))
+            hi_64 = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpShiftRightLogical, result_ty, hi_64, val_id, c32_id)
+            n_hi = bitcount32(convert_to(u32_ty, hi_64))
+            n_lo = bitcount32(convert_to(u32_ty, val_id))
+            n = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, n, n_hi, n_lo)
+            convert_to(result_ty, n)
+        else
+            error("llvm.ctpop on a $bw-bit integer is not supported")
+        end
         state.value_map[inst] = result_id
         return
     elseif startswith(base_name, "llvm.bitreverse")
@@ -8285,6 +8316,14 @@ function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
     binop = LLVM.API.LLVMGetAtomicRMWBinOp(inst)
     is_signed = is_signed_integer_context(result_llvm_ty)
 
+    # SPV_EXT_shader_atomic_float_add has no subtract: `fsub` is an add of the
+    # negated operand, which returns the same old value.
+    if binop == LLVM.API.LLVMAtomicRMWBinOpFSub
+        neg_id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpFNegate, result_ty, neg_id, val_id)
+        val_id = neg_id
+    end
+
     opcode = if binop == LLVM.API.LLVMAtomicRMWBinOpAdd
         Op.OpAtomicIAdd
     elseif binop == LLVM.API.LLVMAtomicRMWBinOpSub
@@ -8305,7 +8344,7 @@ function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
         Op.OpAtomicUMax
     elseif binop == LLVM.API.LLVMAtomicRMWBinOpXchg
         Op.OpAtomicExchange
-    elseif binop == LLVM.API.LLVMAtomicRMWBinOpFAdd
+    elseif binop == LLVM.API.LLVMAtomicRMWBinOpFAdd || binop == LLVM.API.LLVMAtomicRMWBinOpFSub
         # VK_EXT_shader_atomic_float + SPV_EXT_shader_atomic_float_add. f16/f32/f64
         # pick different capabilities; f64 isn't enabled by Lava's device features
         # today, so we require the f32/f16 cap based on operand width.
@@ -8319,9 +8358,6 @@ function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
         require_capability!(state.mod, cap)
         require_extension!(state.mod, "SPV_EXT_shader_atomic_float_add")
         Op.OpAtomicFAddEXT
-    elseif binop == LLVM.API.LLVMAtomicRMWBinOpFSub
-        error("atomicrmw fsub: not in SPV_EXT_shader_atomic_float_add. " *
-              "Negate the operand and use fadd instead.")
     elseif binop == LLVM.API.LLVMAtomicRMWBinOpFMin ||
            binop == LLVM.API.LLVMAtomicRMWBinOpFMax
         is_min = binop == LLVM.API.LLVMAtomicRMWBinOpFMin

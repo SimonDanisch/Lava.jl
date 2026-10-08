@@ -510,10 +510,12 @@ end
     old => old - val
 end
 
-# ── Seq_cst ordering wrappers ──
-# Atomix defaults to seq_cst. Keep using the same implementation path as the
-# monotonic methods, but note that the underlying LLVM atomics above are
-# emitted as `seq_cst` for cross-vendor correctness.
+# ── What Atomix calls ──
+# Atomix defaults to seq_cst, and since 1.5 it passes the scope as a fifth
+# argument, `UnsafeAtomics.device`. These forward that call to the methods above,
+# whose LLVM atomics are `seq_cst` for cross-vendor correctness. Without them,
+# UnsafeAtomics' own `atomicrmw` is what reaches the emitter: no CAS loop for
+# Float64, which the device does not enable `atomicrmw fadd` for.
 
 for T in (Int32, UInt32, Int64, UInt64, Float32, Float64)
     for OP in (:(typeof(+)), :(typeof(-)), :(typeof(&)), :(typeof(|)), :(typeof(xor)),
@@ -530,7 +532,8 @@ for T in (Int32, UInt32, Int64, UInt64, Float32, Float64)
             continue  # no bitwise atomics for 64-bit (not commonly needed)
         end
         @eval @lava_device_override @inline function UnsafeAtomics.modify!(
-            ptr::Ptr{$T}, op::$OP, val::$T, ::typeof(UnsafeAtomics.seq_cst)
+            ptr::Ptr{$T}, op::$OP, val::$T, ::typeof(UnsafeAtomics.seq_cst),
+            ::typeof(UnsafeAtomics.device)
         )
             UnsafeAtomics.modify!(ptr, op, val, UnsafeAtomics.monotonic)
         end

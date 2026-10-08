@@ -2946,8 +2946,14 @@ end
 
 """
 Lower LLVM intrinsics that SPIR-V cannot represent:
-- llvm.memcpy → typed load + store (using destination alloca's type)
+- llvm.memcpy and llvm.memmove → typed load + store (using destination alloca's type)
 - llvm.lifetime.start/end → removed (no-op)
+
+`llvm.memmove` has to be lowered here too. Julia 1.12 copies an array element of a
+struct type onto another element of the same array with it, and when that array is
+workgroup memory the emitter's fallback cannot take it: it addresses the copy as
+integers, and `OpConvertPtrToU` exists only for `PhysicalStorageBuffer` pointers.
+AcceleratedKernels' block scan does this with its `_Lane` tiles.
 """
 function lower_unsupported_intrinsics!(mod::LLVM.Module)
     to_erase = LLVM.Instruction[]
@@ -2963,6 +2969,9 @@ function lower_unsupported_intrinsics!(mod::LLVM.Module)
 
                 if startswith(fname, "llvm.memcpy")
                     lower_memcpy!(inst, dl)
+                    push!(to_erase, inst)
+                elseif startswith(fname, "llvm.memmove")
+                    lower_memcpy!(inst, dl; overlapping = true)
                     push!(to_erase, inst)
                 elseif startswith(fname, "llvm.memset")
                     lower_memset!(inst)
@@ -2981,8 +2990,9 @@ function lower_unsupported_intrinsics!(mod::LLVM.Module)
     # Remove dead intrinsic declarations
     for fn in collect(mod.functions)
         fname = fn.name
-        if (startswith(fname, "llvm.memcpy") || startswith(fname, "llvm.memset") ||
-            startswith(fname, "llvm.lifetime")) && isempty(fn.uses)
+        if (startswith(fname, "llvm.memcpy") || startswith(fname, "llvm.memmove") ||
+            startswith(fname, "llvm.memset") || startswith(fname, "llvm.lifetime")) &&
+           isempty(fn.uses)
             LLVM.erase!(fn)
         end
     end
@@ -3002,8 +3012,12 @@ reached the emitter as a load with no member to address: `OpLoad %uchar` on a
 struct pointer, which `spirv-val` rejects, or (with a pointer at offset 0) a
 type it cannot map at all. The byte-chunk path below already copies exactly
 `len` bytes, so a partial copy goes there.
+
+`overlapping = true` is `llvm.memmove`: the source and destination may overlap, so
+every chunk is loaded before the first one is stored. The typed path is one load
+and one store already.
 """
-function lower_memcpy!(inst::LLVM.CallInst, dl::LLVM.DataLayout)
+function lower_memcpy!(inst::LLVM.CallInst, dl::LLVM.DataLayout; overlapping::Bool = false)
     ops = inst.operands
     dst = ops[1]
     src = ops[2]
@@ -3015,6 +3029,19 @@ function lower_memcpy!(inst::LLVM.CallInst, dl::LLVM.DataLayout)
         allocated = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(dst))
         if convert(Int, len_val) == Int(compute_type_size(allocated, dl))
             copy_type = allocated
+        end
+    end
+    # Workgroup memory is addressed logically: a struct element cannot be read as
+    # i32 words, so the chunked copy below emits loads `spirv-val` rejects. Copy it
+    # as the element it is instead; `decompose_wg_accesses!` splits that into its
+    # fields. This is a copy of one array element onto another, `tile[a] = tile[b]`,
+    # which Julia 1.12 emits as `llvm.memcpy`/`llvm.memmove` for a struct element.
+    if copy_type === nothing && len_val isa LLVM.ConstantInt &&
+       dst.value_type.addrspace == 3 && src.value_type.addrspace == 3
+        nbytes = convert(Int, len_val)
+        for p in (dst, src)
+            copy_type = leading_type(addressed_type(p), nbytes, dl)
+            copy_type === nothing || break
         end
     end
 
@@ -3037,26 +3064,71 @@ function lower_memcpy!(inst::LLVM.CallInst, dl::LLVM.DataLayout)
             T_i32 = LLVM.Int32Type()
             T_i64 = LLVM.Int64Type()
             T_i8 = LLVM.Int8Type()
-            offset = 0
             n_words = nbytes ÷ 4
-            for i in 0:(n_words-1)
-                off = i * 4
-                s_ptr = off == 0 ? src : LLVM.gep!(builder, T_i8, src, [LLVM.ConstantInt(T_i64, off)])
-                d_ptr = off == 0 ? dst : LLVM.gep!(builder, T_i8, dst, [LLVM.ConstantInt(T_i64, off)])
-                val = LLVM.load!(builder, T_i32, s_ptr)
-                val.alignment = 4
-                st = LLVM.store!(builder, val, d_ptr)
-                st.alignment = 4
+            # Words, then the tail bytes: (offset, type, alignment).
+            chunks = [[(i * 4, T_i32, 4) for i in 0:(n_words-1)];
+                      [(i, T_i8, 1) for i in (n_words*4):(nbytes-1)]]
+            at(ptr, off) = off == 0 ? ptr : LLVM.gep!(builder, T_i8, ptr, [LLVM.ConstantInt(T_i64, off)])
+            function load(off, ty, align)
+                val = LLVM.load!(builder, ty, at(src, off))
+                val.alignment = align
+                return val
             end
-            # Handle tail bytes
-            for i in (n_words*4):(nbytes-1)
-                src_ptr = LLVM.gep!(builder, T_i8, src, [LLVM.ConstantInt(T_i64, i)])
-                dst_ptr = LLVM.gep!(builder, T_i8, dst, [LLVM.ConstantInt(T_i64, i)])
-                val = LLVM.load!(builder, T_i8, src_ptr)
-                LLVM.store!(builder, val, dst_ptr)
+            function store(off, val, align)
+                st = LLVM.store!(builder, val, at(dst, off))
+                st.alignment = align
+                return st
+            end
+            if overlapping
+                vals = [load(c...) for c in chunks]
+                for ((off, _, align), val) in zip(chunks, vals)
+                    store(off, val, align)
+                end
+            else
+                for (off, ty, align) in chunks
+                    store(off, load(off, ty, align), align)
+                end
             end
         end
     end
+end
+
+"""
+    addressed_type(ptr)
+
+The type `ptr` points at, when the IR says: what a GEP indexes to, a global's value
+type. `nothing` for anything else.
+"""
+addressed_type(gv::LLVM.GlobalVariable) = gv.global_value_type
+addressed_type(gep::LLVM.GetElementPtrInst) = indexed_type(gep.source_element_type, gep.operands[3:end])
+addressed_type(ce::LLVM.ConstantExpr) =
+    ce.opcode == LLVM.API.LLVMGetElementPtr ?
+        indexed_type(ce.source_element_type, ce.operands[3:end]) : nothing
+addressed_type(::LLVM.Value) = nothing
+
+"""The type GEP indices after the first select inside `ty`."""
+function indexed_type(ty::LLVM.LLVMType, idxs)
+    for idx in idxs
+        ty = ty isa LLVM.StructType ? ty.elements[convert(Int, idx) + 1] : ty.element_type
+    end
+    return ty
+end
+
+"""
+    leading_type(ty, nbytes, dl)
+
+The type of the first `nbytes` of a `ty`: `ty` itself when that is its size, else
+its first member's, recursively. `nothing` when no member starts there with exactly
+that size.
+"""
+leading_type(::Nothing, nbytes, dl) = nothing
+function leading_type(ty::LLVM.LLVMType, nbytes::Int, dl::LLVM.DataLayout)
+    size = Int(compute_type_size(ty, dl))
+    size == nbytes && return ty
+    size > nbytes || return nothing
+    ty isa LLVM.StructType && return leading_type(first(ty.elements), nbytes, dl)
+    ty isa Union{LLVM.ArrayType,LLVM.VectorType} && return leading_type(ty.element_type, nbytes, dl)
+    return nothing
 end
 
 """
