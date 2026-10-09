@@ -536,7 +536,7 @@ parameter at all and the thunk's LLVM signature is exactly
 end
 
 """
-    coopmat_perelement(f, m) -> AcceleratedMatrix
+    lava_coopmat_perelement(f, m) -> AcceleratedMatrix
 
 `m` with `f(row, col, element)` applied to every element —
 `OpCooperativeMatrixPerElementOpNV`, from `VK_NV_cooperative_matrix2`.
@@ -579,7 +579,7 @@ still the right answer.
 
 The `f(...)` call below is a marker, not the work — see `coopmat_perelement_marker`.
 """
-@generated function coopmat_perelement(f::F, m::CoopMatrix{T,M,N,U,SC},
+@generated function lava_coopmat_perelement(f::F, m::CoopMatrix{T,M,N,U,SC},
                                        extras::Vararg{Any,NE}) where {F,T,M,N,U,SC,NE}
     fname = coopmat_intrinsic_name("perelem", T, M, N, U, SC)
     irty = COOPMAT_IR_TYPE[T]
@@ -615,7 +615,7 @@ The `f(...)` call below is a marker, not the work — see `coopmat_perelement_ma
 end
 
 """
-    coopmat_perelement(f, m, o::CoopMatrix) -> CoopMatrix
+    lava_coopmat_perelement(f, m, o::CoopMatrix) -> CoopMatrix
 
 `m` with `f(row, col, m_element, o_element)` applied to every element — the
 per-element op with a **matrix** as its extra operand.
@@ -640,7 +640,7 @@ an element. So the matrix goes through the `llvmcall` — where the emitter can
 resolve its handle to the matrix id — and the marker gets a dummy element of the
 right type. One kernel may use both forms; they are different LLVM symbols.
 """
-@generated function coopmat_perelement(f::F, m::CoopMatrix{T,M,N,U,SC},
+@generated function lava_coopmat_perelement(f::F, m::CoopMatrix{T,M,N,U,SC},
                                        o::CoopMatrix{T,M,N,U2,SC}) where {F,T,M,N,U,U2,SC}
     fname = coopmat_intrinsic_name("perelemm", T, M, N, U, SC)
     irty = COOPMAT_IR_TYPE[T]
@@ -664,19 +664,11 @@ right type. One kernel may use both forms; they are different LLVM symbols.
     end
 end
 
-"""
-`OpCooperativeMatrixReduceNV`'s reduce mask. `Row` and `Column` are bits, so
-`RowAndColumn` is their union — which `flash_attn_cm2.comp` uses as
-`gl_CooperativeMatrixReduceRowAndColumnNV`, and which is how `Column = 2` is
-known without the extension spec to hand. `TwoByTwo` is the remaining bit and is
-**unverified**; nothing here uses it yet.
-"""
-module CoopMatReduce
-const Row          = UInt32(1)
-const Column       = UInt32(2)
-const RowAndColumn = UInt32(3)
-const TwoByTwo     = UInt32(4)
-end
+# The reduce mask, `CoopMatReduce`, is KernelInterface's. `Row` and `Column` are
+# bits, so `RowAndColumn` is their union — which `flash_attn_cm2.comp` uses as
+# `gl_CooperativeMatrixReduceRowAndColumnNV`, and which is how `Column = 2` is known
+# without the extension spec to hand.
+import KernelInterface: CoopMatReduce, coopmat_perelement, coopmat_reduce
 
 """
 The combiner the instruction actually names, wrapping the user's `f`.
@@ -696,7 +688,7 @@ dead-argument elimination and emit a module the validator rejects.
 end
 
 """
-    coopmat_reduce(f, AcceleratedMatrix{T,M,N,U}, m, mask) -> AcceleratedMatrix
+    lava_coopmat_reduce(f, AcceleratedMatrix{T,M,N,U}, m, mask) -> AcceleratedMatrix
 
 Combine `m` along `mask` with the binary function `f`, into a matrix of the
 **destination** type — `OpCooperativeMatrixReduceNV`, from
@@ -724,7 +716,7 @@ no operand slot for it. Do not mark it `@noinline` — the thunk already is, and
 
 Check `vk_context().coopmat2.reductions` before compiling a kernel that uses this.
 """
-@generated function coopmat_reduce(f::F, ::Type{CoopMatrix{T,M,N,U,SC}},
+@generated function lava_coopmat_reduce(f::F, ::Type{CoopMatrix{T,M,N,U,SC}},
                                    m::CoopMatrix{S,MM,NN,UU,SC},
                                    ::Val{MASK}) where {F,T,M,N,U,SC,S,MM,NN,UU,MASK}
     fname = coopmat_intrinsic_name("reduce$(UInt32(MASK))", T, M, N, U, SC)
@@ -764,3 +756,9 @@ end
 # shape outside its limits. `coopmat_shape(ctx, T, M, N, K)` is the host-side
 # query for deciding whether to take this path at all.
 
+# KernelInterface's per-element and reduce operations, lowered — overlays, for the
+# reason the tensor operations in `tensor_intrinsics.jl` are.
+@lava_device_override @inline coopmat_perelement(f::F, m::CoopMatrix, extras::Vararg{Any,N}) where {F,N} =
+    lava_coopmat_perelement(f, m, extras...)
+@lava_device_override @inline coopmat_reduce(f::F, ::Type{D}, m::CoopMatrix, mask::Val) where {F,D<:CoopMatrix} =
+    lava_coopmat_reduce(f, D, m, mask)

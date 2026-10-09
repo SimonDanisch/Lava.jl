@@ -41,9 +41,8 @@ const COOPMAT_SCOPE_SUBGROUP  = UInt32(3)
 # driver bounds-checks the load itself and substitutes a constant out of range,
 # which is what makes an unpadded extent legal — i.e. what would retire
 # `gemm_padn`, the `GEMM_BLOCK` pad on M and `padtile`/`crsextent` on K.
-const TENSOR_CLAMP_UNDEFINED    = UInt32(0)
-const TENSOR_CLAMP_CONSTANT     = UInt32(1)
-const TENSOR_CLAMP_TO_EDGE      = UInt32(2)
+# KernelInterface's, so a kernel names them without naming this compiler.
+import KernelInterface: TENSOR_CLAMP_UNDEFINED, TENSOR_CLAMP_CONSTANT, TENSOR_CLAMP_TO_EDGE
 
 """
     parse_coopmat_name(fn_name) -> (op, T, M, N, use, rowmajor, scope) | nothing
