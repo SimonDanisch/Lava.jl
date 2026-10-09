@@ -7303,6 +7303,14 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return emit_gfx_input!(state, inst, :vec2)
         elseif fn_name == "_lava_gfx_input_f32" || fn_name == "_lava_gfx_input_flat_f32"
             return emit_gfx_input!(state, inst, :f32)
+        elseif fn_name == "_lava_gfx_input_primitive_vec4"
+            return emit_gfx_input!(state, inst, :vec4)
+        elseif fn_name == "_lava_gfx_input_primitive_vec3"
+            return emit_gfx_input!(state, inst, :vec3)
+        elseif fn_name == "_lava_gfx_input_primitive_vec2"
+            return emit_gfx_input!(state, inst, :vec2)
+        elseif fn_name == "_lava_gfx_input_primitive_f32"
+            return emit_gfx_input!(state, inst, :f32)
         elseif fn_name == "_lava_gfx_discard"
             return emit_gfx_discard!(state, inst)
         elseif fn_name == "_lava_gfx_dFdx_f32"
@@ -7330,6 +7338,14 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return emit_mesh_output!(state, inst, :vec3)
         elseif fn_name == "_lava_mesh_output_vec4"
             return emit_mesh_output!(state, inst, :vec4)
+        elseif fn_name == "_lava_mesh_primitive_output_f32"
+            return emit_mesh_primitive_output!(state, inst, :f32)
+        elseif fn_name == "_lava_mesh_primitive_output_vec2"
+            return emit_mesh_primitive_output!(state, inst, :vec2)
+        elseif fn_name == "_lava_mesh_primitive_output_vec3"
+            return emit_mesh_primitive_output!(state, inst, :vec3)
+        elseif fn_name == "_lava_mesh_primitive_output_vec4"
+            return emit_mesh_primitive_output!(state, inst, :vec4)
         elseif fn_name == "_lava_mesh_set_position"
             return emit_mesh_set_position!(state, inst)
         elseif fn_name == "_lava_mesh_set_primitive1"

@@ -91,6 +91,10 @@ mutable struct GfxIOState
     # A mesh stage's user outputs are ARRAYS — one element per vertex slot —
     # unlike a vertex stage's, which are one value per invocation.
     mesh_output_vars::Dict{UInt32, Tuple{UInt32, Symbol}}
+    # Its per-PRIMITIVE outputs: arrays too, one element per primitive slot, and
+    # decorated `PerPrimitiveEXT`. Same location space as the per-vertex ones —
+    # the declaration numbers both — so a location is in one dict or the other.
+    mesh_primitive_output_vars::Dict{UInt32, Tuple{UInt32, Symbol}}
     # Texture sampler variables: binding → var_id
     sampler_vars::Dict{UInt32, UInt32}
     # Combined image sampler type ID (cached)
@@ -105,6 +109,7 @@ GfxIOState() = GfxIOState(
     0,
     nothing, nothing, nothing, nothing,
     nothing, nothing, 0, 0, 0, UInt32(0),
+    Dict{UInt32, Tuple{UInt32, Symbol}}(),
     Dict{UInt32, Tuple{UInt32, Symbol}}(),
     Dict{UInt32, UInt32}(),
     nothing,
@@ -203,6 +208,9 @@ function emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
     gfx_io.mesh_vertices_var_id !== nothing && push!(interface_ids, gfx_io.mesh_vertices_var_id)
     gfx_io.mesh_indices_var_id !== nothing && push!(interface_ids, gfx_io.mesh_indices_var_id)
     for (_, (var_id, _)) in gfx_io.mesh_output_vars
+        push!(interface_ids, var_id)
+    end
+    for (_, (var_id, _)) in gfx_io.mesh_primitive_output_vars
         push!(interface_ids, var_id)
     end
     for (_, var_id) in gfx_io.sampler_vars
@@ -367,9 +375,11 @@ function gfx_prescan_io!(state::SPIRVEmitterState, gfx_io::GfxIOState,
                 gfx_ensure_output_var!(state, gfx_io, loc, iotype, stage; flat=is_flat)
             elseif startswith(fn_name, "_lava_gfx_input_")
                 loc = extract_constant_u32(inst.operands[1])
-                is_flat = contains(fn_name, "_flat_")
+                perprimitive = contains(fn_name, "_primitive_")
+                is_flat = perprimitive || contains(fn_name, "_flat_")
                 iotype = gfx_input_type_from_name(fn_name)
-                gfx_ensure_input_var!(state, gfx_io, loc, iotype, stage; flat=is_flat)
+                gfx_ensure_input_var!(state, gfx_io, loc, iotype, stage; flat=is_flat,
+                                      perprimitive)
             elseif fn_name == "_lava_gfx_set_tess_level_outer"
                 gfx_ensure_tess_outer_var!(state, gfx_io)
             elseif fn_name == "_lava_gfx_set_tess_level_inner"
@@ -383,6 +393,10 @@ function gfx_prescan_io!(state::SPIRVEmitterState, gfx_io::GfxIOState,
                 loc = extract_constant_u32(inst.operands[1])
                 gfx_ensure_mesh_output_var!(state, gfx_io, loc,
                                             gfx_output_type_from_name(fn_name))
+            elseif startswith(fn_name, "_lava_mesh_primitive_output_")
+                loc = extract_constant_u32(inst.operands[1])
+                gfx_ensure_mesh_primitive_output_var!(state, gfx_io, loc,
+                                                      gfx_output_type_from_name(fn_name))
             elseif fn_name == "_lava_mesh_set_position"
                 gfx_ensure_mesh_vertices_var!(state, gfx_io)
             elseif startswith(fn_name, "_lava_mesh_set_primitive")
@@ -488,9 +502,19 @@ function gfx_ensure_output_var!(state::SPIRVEmitterState, gfx_io::GfxIOState,
     gfx_io.output_vars[location] = (var_id, iotype)
 end
 
+"""
+Create a fragment (or other stage's) input variable at `location`.
+
+`perprimitive` is a mesh stage's per-primitive output arriving: decorated
+`PerPrimitiveEXT`, which has to match the producing side, and `Flat` as well —
+glslang emits both for `perprimitiveEXT flat in`, and the value is one per
+primitive either way. The decoration belongs to SPV_EXT_mesh_shader, so a
+fragment stage that reads one declares the capability and the extension too,
+although it is not a mesh stage itself; spirv-val rejects the module otherwise.
+"""
 function gfx_ensure_input_var!(state::SPIRVEmitterState, gfx_io::GfxIOState,
                                   location::UInt32, iotype::Symbol, stage::Symbol;
-                                  flat::Bool=false)
+                                  flat::Bool=false, perprimitive::Bool=false)
     haskey(gfx_io.input_vars, location) && return
     mod = state.mod
     value_ty = gfx_spirv_type_for_io(mod, iotype)
@@ -499,7 +523,13 @@ function gfx_ensure_input_var!(state::SPIRVEmitterState, gfx_io::GfxIOState,
     encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Input)
     emit_decorate!(mod, var_id, Dec.Location, location)
     flat && emit_decorate!(mod, var_id, Dec.Flat)
-    emit_name!(mod, var_id, flat ? "in_flat_loc$(location)" : "in_loc$(location)")
+    if perprimitive
+        emit_decorate!(mod, var_id, Dec.PerPrimitiveEXT)
+        require_capability!(mod, Cap.MeshShadingEXT)
+        require_extension!(mod, "SPV_EXT_mesh_shader")
+    end
+    emit_name!(mod, var_id, perprimitive ? "in_primitive_loc$(location)" :
+                            flat ? "in_flat_loc$(location)" : "in_loc$(location)")
     gfx_io.input_vars[location] = (var_id, iotype)
 end
 
@@ -621,6 +651,7 @@ of the FRAGMENT INPUT, and an integer output cannot be interpolated anyway.
 function gfx_ensure_mesh_output_var!(state::SPIRVEmitterState, gfx_io::GfxIOState,
                                      location::UInt32, iotype::Symbol)
     haskey(gfx_io.mesh_output_vars, location) && return
+    check_one_mesh_plane(gfx_io, location)
     n = gfx_io.mesh_max_vertices
     n > 0 || error("mesh output vertex count not set — is the stage's `MeshConfig` missing?")
     mod = state.mod
@@ -633,6 +664,49 @@ function gfx_ensure_mesh_output_var!(state::SPIRVEmitterState, gfx_io::GfxIOStat
     emit_decorate!(mod, var_id, Dec.Location, location)
     emit_name!(mod, var_id, "mesh_out_loc$(location)")
     gfx_io.mesh_output_vars[location] = (var_id, iotype)
+end
+
+# A location is one output, in one plane. The stage's declaration numbers both
+# planes in one sequence and puts each name in exactly one of them (`Flat` is the
+# primitive's), so finding a location in both is two declarations disagreeing —
+# and the fragment stage could read only one of the two arrays.
+check_one_mesh_plane(gfx_io::GfxIOState, location::UInt32) =
+    (haskey(gfx_io.mesh_output_vars, location) ||
+     haskey(gfx_io.mesh_primitive_output_vars, location)) && error(
+        "mesh location $location is written both per vertex and per primitive; " *
+        "the stage's declaration puts each output in one plane.")
+
+"""
+Create one of the mesh stage's PER-PRIMITIVE output arrays.
+
+    OpTypeArray(T, max_primitives)
+    OpVariable Output, Location L, PerPrimitiveEXT
+
+What glslang emits for `layout(location = L) perprimitiveEXT out T x[]`: the
+array is as long as the primitive maximum, not the vertex one, and is indexed by
+the PRIMITIVE slot. The fragment stage reads location L as a `PerPrimitiveEXT`
+input; the decoration has to be on both sides.
+
+No `Flat` here, for the reason the per-vertex arrays have none: interpolation is
+a property of the fragment input, and a per-primitive value is never interpolated.
+"""
+function gfx_ensure_mesh_primitive_output_var!(state::SPIRVEmitterState, gfx_io::GfxIOState,
+                                               location::UInt32, iotype::Symbol)
+    haskey(gfx_io.mesh_primitive_output_vars, location) && return
+    check_one_mesh_plane(gfx_io, location)
+    m = gfx_io.mesh_max_primitives
+    m > 0 || error("mesh output primitive count not set — is the stage's `MeshConfig` missing?")
+    mod = state.mod
+    value_ty = gfx_spirv_type_for_io(mod, iotype)
+    len_id = emit_constant_u32!(mod, UInt32(m))
+    arr_ty = emit_type_array!(mod, value_ty, len_id)
+    ptr_ty = map_pointer_type!(state.type_ctx, arr_ty, SC.Output)
+    var_id = fresh_id!(mod)
+    encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.Output)
+    emit_decorate!(mod, var_id, Dec.Location, location)
+    emit_decorate!(mod, var_id, Dec.PerPrimitiveEXT)
+    emit_name!(mod, var_id, "mesh_prim_out_loc$(location)")
+    gfx_io.mesh_primitive_output_vars[location] = (var_id, iotype)
 end
 
 """
@@ -773,18 +847,22 @@ function emit_mesh_set_outputs!(state::SPIRVEmitterState, inst::LLVM.CallInst)
 end
 
 """
-Write one user varying at one vertex slot.
+Write one user output at one slot of the arrays in `vars`: a vertex slot of a
+per-vertex varying (`mesh_output_vars`, the default), or a primitive slot of a
+per-primitive output (`mesh_primitive_output_vars`). The store is the same; only
+which array the location names differs.
 
 Operands are `(location, slot, components...)`, so the slot is separate from the
 value — the same intrinsic serves every slot, and the location is a constant the
 prescan already read to create the array.
 """
-function emit_mesh_output!(state::SPIRVEmitterState, inst::LLVM.CallInst, iotype::Symbol)
+function emit_mesh_output!(state::SPIRVEmitterState, inst::LLVM.CallInst, iotype::Symbol,
+                           vars::Dict{UInt32, Tuple{UInt32, Symbol}} =
+                               (state.gfx_io::GfxIOState).mesh_output_vars)
     mod = state.mod
-    gfx_io = state.gfx_io::GfxIOState
     loc = extract_constant_u32(inst.operands[1])
-    entry = get(gfx_io.mesh_output_vars, loc, nothing)
-    entry === nothing && error("mesh varying at location $loc written but never created")
+    entry = get(vars, loc, nothing)
+    entry === nothing && error("mesh output at location $loc written but never created")
     var_id, _ = entry
 
     ops = inst.operands
@@ -805,6 +883,10 @@ function emit_mesh_output!(state::SPIRVEmitterState, inst::LLVM.CallInst, iotype
     encode_instruction!(mod.functions, Op.OpAccessChain, elem_ptr_ty, ac_id, var_id, slot_id)
     encode_instruction!(mod.functions, Op.OpStore, ac_id, value_id)
 end
+
+"""Write one per-primitive output at one primitive slot — see `emit_mesh_output!`."""
+emit_mesh_primitive_output!(state::SPIRVEmitterState, inst::LLVM.CallInst, iotype::Symbol) =
+    emit_mesh_output!(state, inst, iotype, (state.gfx_io::GfxIOState).mesh_primitive_output_vars)
 
 gfx_io_component_count(t::Symbol) =
     t === :f32 ? 1 : t === :u32 ? 1 : t === :i32 ? 1 :
