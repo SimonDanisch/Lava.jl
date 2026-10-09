@@ -108,6 +108,10 @@ end
 
 # High-level: Vec4f
 @inline set_position!(v::Vec4f) = set_position!(v[1], v[2], v[3], v[4])
+# The tuple spelling of a position, as a varying has (`FloatTuple` below): a vertex
+# body that returns `position = verts[i]` from a buffer of `NTuple{4,Float32}` had no
+# method, inferred to `Union{}`, and the stage did not compile.
+@inline set_position!(v::NTuple{4,Float32}) = set_position!(v[1], v[2], v[3], v[4])
 
 @lava_device_override @inline function KernelInterface.set_point_size!(s::Float32)
     Base.llvmcall(("""
