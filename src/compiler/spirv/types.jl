@@ -1015,17 +1015,69 @@ function map_struct_ptr_member!(ctx::SPIRVTypeContext, struct_ty::LLVM.StructTyp
         sc = SC.PhysicalStorageBuffer
     end
 
-    # Look up in the pre-built struct member map
-    info = get(ctx.struct_ptr_members, (struct_ty, member_idx), nothing)
-    if info !== nothing
-        pointee_ty, _as = info
-        pointee_spirv = map_type!(ctx, pointee_ty)
-        return map_pointer_type!(ctx, pointee_spirv, sc)
-    end
+    pointee_spirv = map_type!(ctx, struct_ptr_member_pointee(ctx, struct_ty, member_idx))
+    return map_pointer_type!(ctx, pointee_spirv, sc)
+end
 
-    # Fallback: PhysicalStorageBuffer pointer to i8 (generic byte pointer)
-    i8_spirv = map_type!(ctx, LLVM.IntType(8))
-    return map_pointer_type!(ctx, i8_spirv, sc)
+"""
+    struct_ptr_member_pointee(ctx, struct_ty, member_idx) -> LLVM.LLVMType
+
+What the pointer member `member_idx` of `struct_ty` points to in the struct's
+SPIR-V DEFINITION: the pointee the module scan recorded for it
+(`struct_ptr_members`), or `i8` — the generic byte pointer — when nothing was
+recorded or the recorded pointee leads back to `struct_ty`.
+
+One function, because two places need the answer and must agree: the struct's
+definition (`map_struct_ptr_member!`), and the `OpAccessChain` that reaches the
+member to load it (`get_struct_member_ptr_spirv_type`). An access chain whose
+result type is not the member's type is rejected by spirv-val.
+
+The cycle is not a linked list. The member map is keyed by LLVM TYPE, and every
+`LavaDeviceArray{T,1}` is the same literal `{ ptr, [1 x i64] }` whatever `T` is,
+so a table of device arrays of device arrays records "member 0 points to
+`{ ptr, [1 x i64] }`" for the outer level and "member 0 points to `float`" for the
+inner one under ONE key. When the outer reading wins, the type contains itself,
+and mapping it recursed until the stack ran out. No single SPIR-V struct is right
+for both levels, so such a member gets the byte pointer: every load of it is
+reconciled with the loaded pointer VALUE's own type (`resolve_struct_field_load!`'s
+pointer override, an OpBitcast between PhysicalStorageBuffer pointers), and that
+value is where each level's real pointee lives — see `map_pointee_type!`.
+
+A property of the TYPES, so it is the same answer whichever struct happens to be
+mapped first.
+"""
+function struct_ptr_member_pointee(ctx::SPIRVTypeContext, struct_ty::LLVM.StructType,
+                                   member_idx::Int)
+    info = get(ctx.struct_ptr_members, (struct_ty, member_idx), nothing)
+    info === nothing && return LLVM.Int8Type()
+    pointee = first(info)
+    reaches_type(ctx, pointee, struct_ty, Set{LLVM.LLVMType}()) && return LLVM.Int8Type()
+    return pointee
+end
+
+"""
+    reaches_type(ctx, ty, target, seen) -> Bool
+
+Whether mapping `ty` maps `target`: `ty` is `target`, holds it by value in an
+array, vector or struct field, or holds a pointer member whose recorded pointee
+reaches it in turn.
+"""
+reaches_type(ctx::SPIRVTypeContext, ty::LLVM.LLVMType, target::LLVM.StructType,
+             seen::Set{LLVM.LLVMType}) = false
+reaches_type(ctx::SPIRVTypeContext, ty::Union{LLVM.ArrayType, LLVM.VectorType},
+             target::LLVM.StructType, seen::Set{LLVM.LLVMType}) =
+    reaches_type(ctx, ty.element_type, target, seen)
+function reaches_type(ctx::SPIRVTypeContext, ty::LLVM.StructType, target::LLVM.StructType,
+                      seen::Set{LLVM.LLVMType})
+    ty == target && return true
+    ty in seen && return false
+    push!(seen, ty)
+    for (i, el) in enumerate(ty.elements)
+        next = el isa LLVM.PointerType ?
+            first(get(ctx.struct_ptr_members, (ty, i - 1), (LLVM.Int8Type(), 0))) : el
+        reaches_type(ctx, next, target, seen) && return true
+    end
+    return false
 end
 
 """
@@ -1462,11 +1514,6 @@ function trace_pointer_to_alloca(ptr::LLVM.Value, visited::Set{LLVM.Value}=Set{L
     return false
 end
 
-"""
-    map_pointer_type_for_value!(ctx::SPIRVTypeContext, ptr_value::LLVM.Value) -> UInt32
-
-Map a pointer value to its SPIR-V pointer type, using the PointeeTypeMap for type recovery.
-"""
 function param_called_with_alloca_arg(param::LLVM.Argument)
     fn = LLVM.Function(LLVM.API.LLVMGetParamParent(param))
     param_idx = nothing
@@ -1494,7 +1541,19 @@ function param_called_with_alloca_arg(param::LLVM.Argument)
     return false
 end
 
-function map_pointer_type_for_value!(ctx::SPIRVTypeContext, ptr_value::LLVM.Value)
+"""
+    map_pointer_type_for_value!(ctx::SPIRVTypeContext, ptr_value::LLVM.Value) -> UInt32
+
+Map a pointer value to its SPIR-V pointer type, using the PointeeTypeMap for type recovery.
+
+`visiting` is the chain of pointers this call is resolving THROUGH, for a pointer
+whose pointee is itself a pointer — see [`map_pointee_type!`](@ref).
+"""
+map_pointer_type_for_value!(ctx::SPIRVTypeContext, ptr_value::LLVM.Value) =
+    map_pointer_type_for_value!(ctx, ptr_value, Set{LLVM.Value}())
+
+function map_pointer_type_for_value!(ctx::SPIRVTypeContext, ptr_value::LLVM.Value,
+                                     visiting::Set{LLVM.Value})
     # Get pointee type from the map
     pointee_llvm = get_pointee_type(ctx.ptm, ptr_value)
     if pointee_llvm === nothing
@@ -1579,10 +1638,100 @@ function map_pointer_type_for_value!(ctx::SPIRVTypeContext, ptr_value::LLVM.Valu
     # bitcast/select against the global (e.g. `lid==1 ? a[lid] : a[lid-1]`, which
     # LLVM lowers to an OpSelect of Workgroup pointers) tripped
     # "Expected both objects to be of Result Type: Select".
-    pointee_spirv = sc == SC.Workgroup ?
-        map_workgroup_type!(ctx, pointee_llvm) :
-        map_type!(ctx, pointee_llvm)
+    pointee_spirv = map_pointee_type!(ctx, ptr_value, pointee_llvm, sc, visiting)
     return map_pointer_type!(ctx, pointee_spirv, sc)
+end
+
+"""
+    map_pointee_type!(ctx, holder, pointee::LLVM.LLVMType, sc, visiting) -> UInt32
+
+The SPIR-V type of what the pointer `holder` points to, `pointee` being the LLVM
+type the pointee map recorded for it and `sc` the storage class `holder` lives in.
+
+Workgroup pointees go through the workgroup type path: an aggregate pointee has
+to share the layout-decoration-free, deduplicated type id of the shared-memory
+global, or a pointer select against that global fails validation with "Expected
+both objects to be of Result Type".
+"""
+map_pointee_type!(ctx::SPIRVTypeContext, holder, pointee::LLVM.LLVMType, sc::UInt32,
+                  ::Set{LLVM.Value}) =
+    sc == SC.Workgroup ? map_workgroup_type!(ctx, pointee) : map_type!(ctx, pointee)
+
+# A POINTER to a pointer. LLVM's `ptr` is opaque and a SPIR-V pointer type names
+# its pointee, so the TYPE `ptr` has no SPIR-V answer on its own —
+# `emit_llvm_type!(::PointerType)` refuses it, rightly. What the inner pointer
+# points to is a property of the pointer VALUE held there: the one a `load ptr,
+# ptr %holder` reads back, or failing that the one a `store ptr %v, ptr %holder`
+# writes. So this asks `map_pointer_type_for_value!` about that value, one level
+# down, and the two recurse until a level holds something that is not a pointer.
+#
+# That is what a device array STORED in device memory is. A kernel argument
+# `LavaDeviceArray{T}` is a struct whose first field is a buffer device address,
+# and the argument path already resolves that one level: the wrapper's
+# `inttoptr` points at the BDA and the BDA points at a `T`. A table of such
+# handles (`LavaDeviceArray{LavaDeviceArray{Float32,1},1}`, which is how
+# Raycore's `store_texture` keeps its textures and what Mantle's
+# `test_stored_device_array.jl` reads) is one level deeper: the argument's BDA
+# points at a handle, whose BDA points at the floats. After SROA that is three
+# chained `load ptr`s and no struct at all, so neither the struct-member map nor
+# the GEP source types have anything to say about the middle level — it failed
+# with "Cannot map opaque pointer type" until it was resolved by value.
+#
+# The result agrees with what `emit_load!` emits for the load that reads the
+# held pointer, by construction: that load's result type IS
+# `map_pointer_type_for_value!` of the load. A disagreement there is an OpLoad
+# whose result type is not its pointer's pointee, which spirv-val rejects.
+#
+# The held pointer's storage class is its own question, answered by the same
+# call from its own address space. A pointer that is only ever passed along, never
+# loaded or stored through, carries no information about its pointee; it gets the
+# PhysicalStorageBuffer `i8` pointer every other undereferenced loaded pointer in
+# this mapper gets. A holder that is reached again while resolving itself is a
+# self-referential type (a linked list's `next`), which SPIR-V can only express
+# with `OpTypeForwardPointer`; that is refused by name rather than recursing until
+# the stack runs out.
+function map_pointee_type!(ctx::SPIRVTypeContext, holder::LLVM.Value, ::LLVM.PointerType,
+                           ::UInt32, visiting::Set{LLVM.Value})
+    holder in visiting && error(
+        "the pointer $(holder.name)::$(string(holder.value_type)) is reached again " *
+        "while resolving what it points to: a pointer that (through memory) points " *
+        "to its own type, like a linked list's `next`. SPIR-V needs " *
+        "`OpTypeForwardPointer` for that, and this emitter does not emit one.")
+    push!(visiting, holder)
+    held = pointer_held_at(holder)
+    held === nothing &&
+        return map_pointer_type!(ctx, map_type!(ctx, LLVM.Int8Type()), SC.PhysicalStorageBuffer)
+    return map_pointer_type_for_value!(ctx, held, visiting)
+end
+
+# No holder VALUE at all — a caller that only knows a type. Same `i8` answer as
+# for a held pointer nothing dereferences.
+map_pointee_type!(ctx::SPIRVTypeContext, ::Nothing, ::LLVM.PointerType, ::UInt32,
+                  ::Set{LLVM.Value}) =
+    map_pointer_type!(ctx, map_type!(ctx, LLVM.Int8Type()), SC.PhysicalStorageBuffer)
+
+"""
+    pointer_held_at(holder::LLVM.Value) -> Union{LLVM.Value, Nothing}
+
+The pointer value stored at `holder`: the first `load ptr, ptr holder`, or else
+the value of the first `store ptr %v, ptr holder`. `nothing` when nothing reads
+or writes a pointer there.
+
+The load first, because it is the value a later instruction will dereference,
+and so the one whose pointee the emitted types have to agree with.
+"""
+function pointer_held_at(holder::LLVM.Value)
+    for use in holder.uses
+        user = use.user
+        user isa LLVM.LoadInst && user.operands[1] === holder &&
+            user.value_type isa LLVM.PointerType && return user
+    end
+    for use in holder.uses
+        user = use.user
+        user isa LLVM.StoreInst && user.operands[2] === holder &&
+            user.operands[1].value_type isa LLVM.PointerType && return user.operands[1]
+    end
+    return nothing
 end
 
 # ================================================================

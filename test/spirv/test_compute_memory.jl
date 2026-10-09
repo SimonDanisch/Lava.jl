@@ -114,6 +114,53 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         check_not(d, "OpPtrAccessChain %_ptr_Workgroup")
     end
 
+    @testset "a device array stored in device memory" begin
+        # A table of device-array handles, the way Raycore's `store_texture`
+        # keeps its textures and Mantle's `test_stored_device_array.jl` reads one:
+        # the argument's address points at a handle, and the handle's address
+        # points at the data. After SROA that is a chain of `load ptr` with no
+        # struct in it, so the middle pointer's pointee is an opaque `ptr`, and
+        # it only maps through the value loaded from it. It failed with "Cannot
+        # map opaque pointer type". `compile_and_disasm` validates, so each
+        # compile below is also a spirv-val pass.
+        DA = Lava.LavaDeviceArray
+        function stored_read(out, table)
+            i = Lava.lava_global_invocation_id_x() + 1
+            @inbounds out[i] = table[1][i]
+            return nothing
+        end
+        d, _ = compile_and_disasm(stored_read, Tuple{DA{Float32,1}, DA{DA{Float32,1},1}})
+        # Three levels of address, every one a typed PhysicalStorageBuffer pointer.
+        check(d, "%_ptr_PhysicalStorageBuffer__ptr_PhysicalStorageBuffer__ptr_PhysicalStorageBuffer_float")
+
+        # A handle at a computed slot, and a handle WRITTEN by the kernel.
+        function stored_dyn(out, table, j::Int32)
+            i = Lava.lava_global_invocation_id_x() + 1
+            @inbounds out[i] = table[j][i] + table[j + Int32(1)][i]
+            return nothing
+        end
+        d, _ = compile_and_disasm(stored_dyn, Tuple{DA{Float32,1}, DA{DA{Float32,1},1}, Int32})
+        check(d, "%_ptr_PhysicalStorageBuffer__ptr_PhysicalStorageBuffer_float")
+        function stored_write(table, src)
+            @inbounds table[2] = src
+            return nothing
+        end
+        d, _ = compile_and_disasm(stored_write, Tuple{DA{DA{Float32,1},1}, DA{Float32,1}})
+        check(d, "OpStore")
+
+        # A table of tables, indexed past the first slot at both levels so both
+        # are struct GEPs. Every `LavaDeviceArray{T,1}` is the same LLVM struct
+        # `{ ptr, [1 x i64] }`, so the struct-member map recorded that struct as
+        # pointing to ITSELF and mapping it recursed until the stack overflowed.
+        function stored_deep(out, t)
+            i = Lava.lava_global_invocation_id_x() + 1
+            @inbounds out[i] = t[2][3][i]
+            return nothing
+        end
+        d, _ = compile_and_disasm(stored_deep, Tuple{DA{Float32,1}, DA{DA{DA{Float32,1},1},1}})
+        check(d, "%_ptr_PhysicalStorageBuffer_float")
+    end
+
     @testset "barrier" begin
         function barrier_kernel(A)
             Lava.lava_workgroup_barrier()

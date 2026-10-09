@@ -1796,24 +1796,13 @@ Used to ensure AccessChain result types match the struct definition.
 function get_struct_member_ptr_spirv_type(state::SPIRVEmitterState, pointee_ty::LLVM.LLVMType)
     struct_ty, member_idx = find_offset0_ptr_member(pointee_ty)
     struct_ty === nothing && return nothing
-
-    info = get(state.type_ctx.struct_ptr_members, (struct_ty, member_idx), nothing)
-    if info !== nothing
-        declared_pointee, _as = info
-        declared_pointee_spirv = map_type!(state.type_ctx, declared_pointee)
-        return map_pointer_type!(state.type_ctx, declared_pointee_spirv, SC.PhysicalStorageBuffer)
-    end
-
-    # Fallback: struct_ptr_members has no entry, but the struct type was already mapped
-    # with an i8 fallback for ptr members (see find_ptr_member_type_in_hierarchy).
-    # Match that fallback so the AccessChain result type agrees with the struct definition.
-    fallback_pointee = find_ptr_member_type_in_hierarchy(state.type_ctx, struct_ty)
-    if fallback_pointee !== nothing
-        fallback_spirv = map_type!(state.type_ctx, fallback_pointee)
-        return map_pointer_type!(state.type_ctx, fallback_spirv, SC.PhysicalStorageBuffer)
-    end
-
-    return nothing
+    # The definition's own answer, including its `i8` for a member that was never
+    # recorded or whose recorded pointee leads back to the struct — asking
+    # `struct_ptr_members` directly here disagreed with the definition in exactly
+    # that second case.
+    declared_spirv = map_type!(state.type_ctx,
+                               struct_ptr_member_pointee(state.type_ctx, struct_ty, member_idx))
+    return map_pointer_type!(state.type_ctx, declared_spirv, SC.PhysicalStorageBuffer)
 end
 
 """
@@ -5975,7 +5964,13 @@ function emit_inttoptr!(state::SPIRVEmitterState, inst::LLVM.IntToPtrInst)
             if inner_pointee === nothing
                 inner_pointee = LLVM.IntType(8)  # fallback: ptr to i8
             end
-            inner_spirv = map_type!(state.type_ctx, inner_pointee)
+            # `map_pointee_type!` and not `map_type!`: the inner pointee is a
+            # POINTER when the address held here leads to yet another address —
+            # a device array stored inside a device array — and an opaque `ptr`
+            # only maps through the value loaded from it. The holder of that
+            # inner pointee is the pointer this one holds.
+            inner_spirv = map_pointee_type!(state.type_ctx, pointer_held_at(inst),
+                                            inner_pointee, sc, Set{LLVM.Value}([inst]))
             pointee_spirv = map_pointer_type!(state.type_ctx, inner_spirv, sc)
         else
             pointee_spirv = map_type!(state.type_ctx, pointee)
