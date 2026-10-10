@@ -365,6 +365,12 @@ its predecessor's alternative path leads to a barrier. If so, redirect the block
 to the barrier-containing path. This makes dead invocations participate in all
 remaining barriers before returning.
 
+**And the invocation stops** (`stopdeadinvocations!`): it reaches those barriers,
+and no store, atomic or call with an effect of its own runs for it on the way.
+That is what a throw means here — the invocation stops where it threw, the device
+records it, the next wait reports it — and before this the rerouted invocation
+ran the rest of the kernel and wrote its results with whatever its values were.
+
 A "barrier block" is one that calls the barrier intrinsic directly *or* calls a
 function that (transitively) contains a barrier — the latter is the no-inline case
 where each `@synchronize` is its own wrapper function (see `function_contains_barrier`).
@@ -401,6 +407,7 @@ function fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
     # 3. Find blocks that skip barriers: branch directly to a return block,
     #    while their predecessor's other path leads to a barrier.
     changed = false
+    rerouted = Tuple{LLVM.BasicBlock,LLVM.BasicBlock}[]
     for bb in collect(entry_fn.blocks)
         bb in barrier_blocks && continue
         bb in return_blocks && continue
@@ -462,11 +469,160 @@ function fix_barrier_skipping_paths!(entry_fn::LLVM.Function)
                 drop_incoming!(phi, bb)
             end
 
+            push!(rerouted, (bb, other_target))
             changed = true
         end
     end
 
+    changed && stopdeadinvocations!(entry_fn, rerouted, barrier_fn_name, barrier_memo)
     return changed
+end
+
+"""
+    stopdeadinvocations!(fn, rerouted, barrier_fn_name, barrier_memo)
+
+Make every effect an invocation could have after a rerouted throw conditional on
+it not having thrown.
+
+A flag in a local, false at entry and set in each rerouted block, and every
+store, atomic and effectful call in a block reachable from a reroute target is
+guarded by it: the block is split around the instruction, which runs only when
+the flag is clear. A barrier — or a call that reaches one — is not guarded, which
+is the point of the reroute. Calls of `llvm.` intrinsics are left alone except the
+memory-writing ones; they compute and do not write.
+
+What it costs a live invocation is a load of the flag and a branch per guarded
+instruction, and only in a kernel that throws before a barrier. The alternative,
+a copy of the rest of the kernel without its effects for the dead invocation to
+run, costs nothing at run time and a copy per throw site, which is quadratic in
+a kernel with many bounds checks before many barriers.
+"""
+function stopdeadinvocations!(fn::LLVM.Function,
+                              rerouted::Vector{Tuple{LLVM.BasicBlock,LLVM.BasicBlock}},
+                              barrier_fn_name::AbstractString,
+                              barrier_memo::Dict{LLVM.Function,Bool})
+    # The blocks a dead invocation runs: everything reachable from a target.
+    region = LLVM.BasicBlock[]
+    seen = Set{LLVM.BasicBlock}()
+    queue = LLVM.BasicBlock[t for (_, t) in rerouted]
+    while !isempty(queue)
+        b = popfirst!(queue)
+        b in seen && continue
+        push!(seen, b)
+        push!(region, b)
+        for s in b.terminator.successors
+            s in seen || push!(queue, s)
+        end
+    end
+    effects = LLVM.Instruction[]
+    for b in region, inst in b.instructions
+        haseffect(inst, barrier_fn_name, barrier_memo) && push!(effects, inst)
+    end
+    isempty(effects) && return nothing
+
+    T_i1 = LLVM.Int1Type()
+    entry = first(fn.blocks)
+    LLVM.@dispose builder = LLVM.IRBuilder() begin
+        LLVM.position!(builder, LLVM.after_phis(entry))
+        flag = LLVM.alloca!(builder, T_i1, "threw")
+        LLVM.store!(builder, LLVM.ConstantInt(T_i1, 0), flag)
+        for (bb, _) in rerouted
+            LLVM.position!(builder, insertion_point(bb.terminator))
+            LLVM.store!(builder, LLVM.ConstantInt(T_i1, 1), flag)
+        end
+        for inst in effects
+            guardeffect!(builder, fn, inst, flag)
+        end
+    end
+    return nothing
+end
+
+"""
+Whether `inst` does something a stopped invocation must not: a store, an atomic, a
+fence, or a call that is not a barrier, does not reach one, and is not a
+non-writing `llvm.` intrinsic.
+"""
+function haseffect(inst::LLVM.Instruction, barrier_fn_name::AbstractString,
+                   barrier_memo::Dict{LLVM.Function,Bool})
+    (inst isa LLVM.StoreInst || inst isa LLVM.AtomicRMWInst ||
+     inst isa LLVM.AtomicCmpXchgInst || inst isa LLVM.FenceInst) && return true
+    inst isa LLVM.CallInst || return false
+    callee = inst.called_operand
+    callee isa LLVM.Function || return true
+    name = callee.name
+    name == barrier_fn_name && return false
+    if startswith(name, "llvm.")
+        return startswith(name, "llvm.memcpy") || startswith(name, "llvm.memmove") ||
+               startswith(name, "llvm.memset")
+    end
+    function_contains_barrier(callee, barrier_fn_name, barrier_memo) && return false
+    return true
+end
+
+"""
+Split `inst`'s block around it so that it runs only while `flag` is clear: the
+block ends in a branch on the flag, `inst` gets a block of its own, and the rest of
+the block continues in a third, whose successors' phis are retargeted to it. A
+value `inst` produces is merged there with `undef` from the skipping edge.
+"""
+function guardeffect!(builder::LLVM.IRBuilder, fn::LLVM.Function, inst::LLVM.Instruction,
+                      flag::LLVM.Value)
+    b = LLVM.parent(inst)
+    run = LLVM.BasicBlock(LLVM.after(b), "$(b.name).effect")
+    rest = LLVM.BasicBlock(LLVM.after(run), "$(b.name).rest")
+    # Everything after `inst` moves to `rest`, terminator included, in order.
+    tail = LLVM.Instruction[]
+    let next = LLVM.next(inst)
+        while next !== nothing
+            push!(tail, next)
+            next = LLVM.next(next)
+        end
+    end
+    for t in tail
+        LLVM.move!(t, LLVM.at_end(rest))
+    end
+    for s in rest.terminator.successors, phi in [i for i in s.instructions if i isa LLVM.PHIInst]
+        retarget_incoming!(phi, b, rest)
+    end
+    LLVM.move!(inst, LLVM.at_end(run))
+    LLVM.position!(builder, LLVM.at_end(run))
+    LLVM.br!(builder, rest)
+    LLVM.position!(builder, LLVM.at_end(b))
+    threw = LLVM.load!(builder, LLVM.Int1Type(), flag, "threw.now")
+    LLVM.br!(builder, threw, rest, run)
+    if !(inst.value_type isa LLVM.VoidType) && !isempty(LLVM.uses(inst))
+        LLVM.position!(builder, LLVM.at_begin(rest))
+        merged = LLVM.phi!(builder, inst.value_type, "$(inst.name).guarded")
+        users = [LLVM.user(u) for u in LLVM.uses(inst)]
+        append!(merged.incoming, [(inst, run), (LLVM.UndefValue(inst.value_type), b)])
+        for u in users
+            u === merged && continue
+            ops = LLVM.operands(u)
+            for i in 1:length(ops)
+                ops[i] == inst && (ops[i] = merged)
+            end
+        end
+    end
+    return nothing
+end
+
+"""
+    retarget_incoming!(phi, from, to)
+
+Rebuild `phi` with its entry for predecessor `from` naming `to` instead. Like
+`drop_incoming!`, a phi's incoming blocks cannot be changed in place through the C API.
+"""
+function retarget_incoming!(phi::LLVM.PHIInst, from::LLVM.BasicBlock, to::LLVM.BasicBlock)
+    any(((_, b),) -> b == from, phi.incoming) || return nothing
+    entries = Tuple{LLVM.Value,LLVM.BasicBlock}[(v, b == from ? to : b) for (v, b) in phi.incoming]
+    LLVM.@dispose builder = LLVM.IRBuilder() begin
+        LLVM.position!(builder, insertion_point(phi))
+        new = LLVM.phi!(builder, phi.value_type)
+        append!(new.incoming, entries)
+        LLVM.replace_uses!(phi, new)
+        LLVM.erase!(phi)
+    end
+    return nothing
 end
 
 """

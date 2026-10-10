@@ -496,7 +496,7 @@ function lava_compile_full(@nospecialize(f), @nospecialize(tt);
         pre_pass_ir = string(mod)
 
         # BDA entry wrapper
-        push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size)
+        push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size, exceptions = true)
         wrapper_name = push_info.wrapper_name
         wrapper_fn = mod.functions[wrapper_name]
 
@@ -767,7 +767,7 @@ function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob;
         # ── Stage 0: BDA entry wrapper ──
         # Must happen BEFORE passes — the wrapper becomes the new entry point
         push_info = timed_phase("stage", "wrap_entry_for_vulkan!") do
-            wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size)
+            wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size, exceptions = true)
         end
         wrapper_name = push_info.wrapper_name
 

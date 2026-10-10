@@ -26,12 +26,35 @@ const LavaCompilerJob = GPUCompiler.CompilerJob{GPUCompiler.SPIRVCompilerTarget,
 # ── Device runtime stubs ──
 #
 # GPUCompiler's lower_throw! pass converts `throw(...)` into calls to these
-# runtime functions. On GPU we can't throw, so they're no-ops. The pass then
-# inserts `llvm.trap` + `unreachable` after these calls, which our LLVM passes
-# (rm_trap!, replace_unreachable!) clean up before SPIR-V emission.
+# runtime functions, then inserts `llvm.trap` + `unreachable` after them, which
+# `finish_ir!` turns into a return: the invocation stops there.
+#
+# `signal_exception` is the one that does something. It raises a word in device
+# memory, the device's exception flag, whose address a compute stage reads from
+# its push constants (`wrap_entry_for_vulkan!`); the host finds the word raised
+# when it next waits for the device, and throws. That is Metal.jl's contract for a
+# device-side exception, and CUDA's: the invocation stops, the device records it,
+# the next synchronize reports it. The rest stay no-ops: there is no mailbox to
+# record a name or a frame in.
 
 module LavaRuntime
-    signal_exception() = return
+    """
+    Raise the device's exception flag: one store, of 1, to the word whose address
+    a compute stage reads from its push constants. A call to an intrinsic the
+    entry wrapper lowers (`wrap_entry_for_vulkan!`), and not that store spelled
+    here, so the throwing block stays straight-line: a branch around the store
+    would hide the throw from `fix_barrier_skipping_paths!`, which recognises an
+    error path by its shape. Where nothing collects the flag — a graphics or
+    ray-tracing stage — the call is deleted and a throw only stops the invocation.
+    """
+    signal_exception() = Base.llvmcall(("""
+        declare void @_lava_signal_exception()
+        define void @entry() #0 {
+            call void @_lava_signal_exception()
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+        """, "entry"), Cvoid, Tuple{})
     report_exception(ex) = return
     report_oom(sz) = return
     report_exception_name(ex) = return
@@ -247,6 +270,9 @@ function GPUCompiler.isintrinsic(::LavaCompilerJob, fn::String)
     # "unsupported tensor-addressing op") rather than silently accepting.
     startswith(fn, "_lava_coopmat_") && return true
     startswith(fn, "_lava_tensor_") && return true
+    # A throw's flag store, which `wrap_entry_for_vulkan!` lowers (or deletes)
+    # before anything is emitted.
+    fn == "_lava_signal_exception" && return true
     # OpenCL C++ mangled builtins (thread indices, barriers, math)
     fn in KNOWN_INTRINSICS && return true
     return false

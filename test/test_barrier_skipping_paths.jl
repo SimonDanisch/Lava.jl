@@ -22,7 +22,13 @@
 # invocations reached, a deadlock on lavapipe and lost writes on hardware.
 # `function_contains_barrier` looks through such wrapper calls now. That unit
 # test came from Mantle's `test/vulkan/test_barrier_skip.jl`; the kernel half,
-# a dead invocation that still reaches the second barrier, is Mantle's.
+# a dead invocation that still reaches the second barrier, is Mantle's
+# (`test/test_kernel_error.jl`, on every backend).
+#
+# The rerouted invocation also STOPS: it reaches the barriers and nothing else.
+# Every store after the reroute target runs only while a flag the rerouted block
+# sets is clear (`stopdeadinvocations!`). Before that it ran the rest of the
+# kernel and stored its results, which is not what a throw means anywhere else.
 #
 # Not a GPU test: the question is only which block the edge targets.
 
@@ -133,6 +139,33 @@ successorsof(f, name) =
             @test Lava.fix_barrier_skipping_paths!(f)
             @test successorsof(f, "bail") == ["work"]
             @test (LLVM.verify(mod); true)
+        end
+    end
+
+    @testset "the rerouted invocation stores nothing" begin
+        LLVM.Context() do ctx
+            mod = parse(LLVM.Module, _IR_EARLY_RETURN)
+            f = mod.functions["kernel"]
+            Lava.fix_barrier_skipping_paths!(f)
+            @test (LLVM.verify(mod); true)
+            # The store has a block of its own, entered only on a branch.
+            store = only(i for b in f.blocks for i in b.instructions
+                         if i isa LLVM.StoreInst && i.operands[1] isa LLVM.ConstantInt &&
+                            convert(Int, i.operands[1]) == 1 &&
+                            !(LLVM.value_type(i.operands[1]) == LLVM.Int1Type()))
+            guarded = LLVM.parent(store)
+            preds = collect(LLVM.predecessors(guarded))
+            @test length(preds) == 1
+            @test length(only(preds).terminator.successors) == 2
+            # The barrier is not behind the branch: every invocation reaches it.
+            barrierblock = only(b for b in f.blocks for i in b.instructions
+                                if i isa LLVM.CallInst &&
+                                   i.called_operand.name == "llvm.spv.group.memory.barrier.with.group.sync")
+            @test barrierblock !== guarded
+            # `bail` sets the flag before it joins `work`.
+            bail = only(b for b in f.blocks if b.name == "bail")
+            @test any(i -> i isa LLVM.StoreInst &&
+                           LLVM.value_type(i.operands[1]) == LLVM.Int1Type(), bail.instructions)
         end
     end
 
