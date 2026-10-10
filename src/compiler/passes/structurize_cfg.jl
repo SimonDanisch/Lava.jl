@@ -168,8 +168,13 @@ trampolines for all but the first source. This ensures each structured construct
 has a unique merge target for SPIR-V's OpSelectionMerge/OpLoopMerge.
 """
 function isolate_shared_merge_targets!(f::LLVM.Function)
-    # Build map: target_block -> [source_blocks that conditionally branch to it]
+    # Build map: target_block -> [source_blocks that conditionally branch to it],
+    # and the targets in the order they are first met. The map is only looked up:
+    # a `Dict` keyed by blocks iterates in an order set by their addresses, so the
+    # same kernel came out with differently placed trampolines in every process,
+    # and one of those shapes crashed lavapipe.
     cond_sources = Dict{LLVM.BasicBlock, Vector{LLVM.BasicBlock}}()
+    targets = LLVM.BasicBlock[]
     for bb in f.blocks
         term = bb.terminator
         term isa LLVM.BrInst || continue
@@ -179,13 +184,15 @@ function isolate_shared_merge_targets!(f::LLVM.Function)
             # the SPIR-V backend as OpLoopMerge, not OpSelectionMerge. Including
             # them creates dead trampoline blocks that break PHI node invariants.
             succ == bb && continue
+            haskey(cond_sources, succ) || push!(targets, succ)
             sources = get!(cond_sources, succ, LLVM.BasicBlock[])
             # Avoid counting the same source twice (both branches to same target)
             bb in sources || push!(sources, bb)
         end
     end
 
-    for (target, sources) in cond_sources
+    for target in targets
+        sources = cond_sources[target]
         length(sources) <= 1 && continue
 
         # Keep the first source unchanged, redirect all others through trampolines.
@@ -228,8 +235,10 @@ function insert_cfg_trampoline!(f::LLVM.Function, src::LLVM.BasicBlock,
         end
     end
 
-    inside_branchers = [bb for bb in inside
-                         if any(==(target), bb.terminator.successors)]
+    # In block order, not the `Set`'s: its order is the blocks' addresses, and the
+    # trampoline's incoming edges follow this list.
+    inside_branchers = [bb for bb in f.blocks
+                         if bb in inside && any(==(target), bb.terminator.successors)]
     isempty(inside_branchers) && return
     insert_edge_trampoline!(f, inside_branchers, target; name = "cfg_fixup")
     return
@@ -562,7 +571,11 @@ function fixup_continue_merge_conflicts!(f::LLVM.Function)
 
     for _iter2 in 1:100  # Safety limit to prevent infinite loops
         found2 = false
-        for (header, (merge_bb, latch)) in loops
+        # Headers in RPO, not the `Dict`'s order (block addresses): which loop gets
+        # its trampoline first decides the shape of everything after it.
+        for header in rpo
+            haskey(loops, header) || continue
+            merge_bb, latch = loops[header]
             if merge_bb in continue_targets
                 insert_cfg_trampoline!(f, header, merge_bb)
                 found2 = true

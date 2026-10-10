@@ -241,9 +241,12 @@ function pick_uniform_type(accesses::Vector{AccessSite}, total_bytes::Int, dl::L
     end
     if !isempty(type_counts)
         best_count = maximum(values(type_counts))
-        for (T, cnt) in type_counts
-            if cnt == best_count
-                smallest_T = T
+        # A tie goes to the type accessed first. Not the `Dict`'s first: types are
+        # keyed by their address, so the pick, and the alloca's type with it,
+        # changed from one process to the next.
+        for a in accesses
+            if get(type_counts, a.access_type, 0) == best_count
+                smallest_T = a.access_type
                 break
             end
         end
