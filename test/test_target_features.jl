@@ -36,12 +36,32 @@ end
         # Part of the job, never a global.
         @test Lava.LavaCompilerParams().features == Lava.TargetFeatures()
         @test Lava.lava_compiler_config(; features = Lava.TargetFeatures(; ser = true)).params.features.ser
+        # There is no such global, not merely an unused one: no record, no
+        # setter for it.
         @test !isdefined(Lava, :targetfeatures)
+        @test !isdefined(Lava, :targetfeatures!)
         @test !isdefined(Lava, :TARGET_FEATURES)
         # Content-hashed, so a compiler configuration holding it is the same
         # configuration in every session.
         @test hash(Lava.TargetFeatures(; ser = true)) == hash(Lava.TargetFeatures(; ser = true))
         @test hash(Lava.TargetFeatures(; ser = true)) != hash(Lava.TargetFeatures())
+    end
+
+    # The compute-kernel side of the same rule. A runtime compiles a launch from
+    # `lava_kernel_job(...; features = <its device's record>)`, and the kernel
+    # cache keys on the job's configuration, so the same kernel for a device with
+    # the opposite SER flag is a different configuration and a different entry.
+    # From Mantle's `test/vulkan/test_target_features_push.jl`, which asked it of
+    # a live context's record; the record is the only input.
+    @testset "a compute job is keyed on its record" begin
+        tt = Tuple{Lava.LavaDeviceArray{Float32,1}}
+        job(features) = Lava.lava_kernel_job(identity, tt; workgroup_size = (64, 1, 1), features)
+        for ray_query in (false, true)
+            on = Lava.TargetFeatures(; ser = true, ray_query)
+            off = Lava.TargetFeatures(; ser = false, ray_query)
+            @test job(on).config != job(off).config
+            @test job(on).config == job(Lava.TargetFeatures(; ser = true, ray_query)).config
+        end
     end
 
     # The point of the whole exercise: the emitted module changes with the job's

@@ -15,6 +15,15 @@
 # hoists a value onto it; whether LLVM makes one is up to LLVM, so a
 # kernel-level test cannot pin either.
 #
+# And it once saw no barrier at all. With inlining off, each `@synchronize`
+# survives as its own wrapper function (`call @llvm.spv...barrier; ret`) rather
+# than an inlined intrinsic, so the pass found zero barrier blocks and did
+# nothing: an `error()` path that returned early skipped a barrier the other
+# invocations reached, a deadlock on lavapipe and lost writes on hardware.
+# `function_contains_barrier` looks through such wrapper calls now. That unit
+# test came from Mantle's `test/vulkan/test_barrier_skip.jl`; the kernel half,
+# a dead invocation that still reaches the second barrier, is Mantle's.
+#
 # Not a GPU test: the question is only which block the edge targets.
 
 using Test
@@ -124,6 +133,36 @@ successorsof(f, name) =
             @test Lava.fix_barrier_skipping_paths!(f)
             @test successorsof(f, "bail") == ["work"]
             @test (LLVM.verify(mod); true)
+        end
+    end
+
+    @testset "function_contains_barrier sees wrapped barriers" begin
+        ir = """
+        declare void @llvm.spv.group.memory.barrier.with.group.sync()
+
+        define internal void @sync_wrapper() {
+          call void @llvm.spv.group.memory.barrier.with.group.sync()
+          ret void
+        }
+
+        define internal void @plain_helper() {
+          ret void
+        }
+
+        define internal void @calls_wrapper() {
+          call void @sync_wrapper()
+          ret void
+        }
+        """
+        LLVM.Context() do ctx
+            mod = parse(LLVM.Module, ir)
+            memo = Dict{LLVM.Function,Bool}()
+            barrier = "llvm.spv.group.memory.barrier.with.group.sync"
+            fns = mod.functions
+            # Direct barrier wrapper, a transitive caller, and a plain helper.
+            @test Lava.function_contains_barrier(fns["sync_wrapper"], barrier, memo)
+            @test Lava.function_contains_barrier(fns["calls_wrapper"], barrier, memo)
+            @test !Lava.function_contains_barrier(fns["plain_helper"], barrier, memo)
         end
     end
 end

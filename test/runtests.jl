@@ -10,7 +10,8 @@
 #            instructions. `spirv/` holds one file per stage and feature.
 #   Tier 1b  Compiler IR passes, on LLVM IR, before any SPIR-V exists.
 #   Tier 2   Validation and structure: every builtin through `spirv-val`, the
-#            emitter's capability decisions, and the compiler's kernel cache.
+#            emitter's capability decisions, hand-built modules, workgroup
+#            layout, source maps and compile errors, and the kernel cache.
 #
 # There is no Tier 3: GPU execution is Mantle's.
 #
@@ -85,6 +86,23 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
     # Asserted on the emitted SPIR-V: flip the record, the capability changes.
     @testset "target features" begin
         include(joinpath(@__DIR__, "test_target_features.jl"))
+    end
+
+    # The module builder used directly: a compute shader and three ray-tracing
+    # shaders assembled instruction by instruction, through spirv-val.
+    @testset "hand-built shader modules" begin
+        include(joinpath(@__DIR__, "test_handbuilt_shaders.jl"))
+    end
+
+    # Packed size and alignment of vector types in workgroup memory.
+    @testset "workgroup vector layout" begin
+        include(joinpath(@__DIR__, "test_workgroup_vector_layout.jl"))
+    end
+
+    # SPIR-V id → Julia line, and the errors a kernel that cannot compile
+    # raises: which helper, why, and what to do about it.
+    @testset "source maps and compile errors" begin
+        include(joinpath(@__DIR__, "test_source_mapping.jl"))
     end
 
     # The boundary itself, from the source: no file in this package names
