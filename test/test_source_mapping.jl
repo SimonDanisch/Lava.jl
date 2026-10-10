@@ -88,6 +88,14 @@ function srcmap_bad_alloc!(A::LavaDeviceArray{Float32,1})
     return nothing
 end
 
+# The same, compiled only through the launch path (`compile_or_lookup`).
+function srcmap_launch_bad_alloc!(A::LavaDeviceArray{Float32,1})
+    i = Lava.lava_global_invocation_id_x() + UInt32(1)
+    x = rand()
+    @inbounds A[i] = Float32(x)
+    return nothing
+end
+
 # Type instability (Any element type → dynamic dispatch)
 function srcmap_bad_unstable!(A::LavaDeviceArray{Any,1})
     i = Lava.lava_global_invocation_id_x() + UInt32(1)
@@ -525,10 +533,20 @@ end
 # rather than from a function and a tuple type. In Mantle's suite this was a
 # KernelAbstractions kernel launched on the Vulkan backend; this is the same
 # call without the device.
+#
+# Two things this path got wrong and the device test did not look at. The
+# message named the kernel `DataType` ("Cannot compile DataType(var\"#k\", ...)"):
+# it was given the signature type and took the name of ITS type. And the error
+# was printed in the frozen world, where a kernel defined after Lava loaded has
+# no binding yet, so Julia 1.12 printed "Detected access to binding ... in a
+# world prior to its definition world" on stderr; `--depwarn=error` makes that
+# read an error, which would replace this one. `srcmap_launch_bad_alloc!` is a
+# global defined after Lava loaded, as every user kernel is, and compiled by no
+# other testset, so the warning would print here.
 @testset "Compilation error: launch path (compile_or_lookup)" begin
-    job = Lava.lava_kernel_job(srcmap_bad_alloc!, Tuple{LavaDeviceArray{Float32,1}};
+    job = Lava.lava_kernel_job(srcmap_launch_bad_alloc!, Tuple{LavaDeviceArray{Float32,1}};
                                workgroup_size = (64, 1, 1))
-    err = try
+    err = @test_nowarn try
         Lava.compile_or_lookup(job)
         nothing
     catch e
@@ -537,6 +555,10 @@ end
 
     @test err !== nothing
     @test err isa LavaCompilationError
+    # Named as `lava_compile` names it: the kernel, then its argument types.
+    @test occursin("srcmap_launch_bad_alloc!(", err.message)
+    @test occursin("LavaDeviceArray{Float32, 1})", err.message)
+    @test !occursin("DataType", err.message)
     @test occursin("allocat", lowercase(err.suggestion)) ||
           occursin("heap", lowercase(err.suggestion))
 end

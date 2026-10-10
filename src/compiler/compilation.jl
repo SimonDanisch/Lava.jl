@@ -13,6 +13,16 @@
 const KERNEL_DEBUG_COUNTER = Ref(0)
 
 """
+    kernel_display_name(f) -> Symbol
+
+The name a compile error gives the kernel: the function's. The job path has only
+the function's type (`job.source.specTypes.parameters[1]`), so a type is named
+as itself rather than as `DataType`.
+"""
+kernel_display_name(@nospecialize(f)) = nameof(typeof(f))
+kernel_display_name(@nospecialize(ft::Type)) = nameof(ft)
+
+"""
 Wrap GPUCompiler.InvalidIRError with Lava-specific context and actionable suggestions.
 Called from compilation entry points to provide better user-facing errors.
 """
@@ -23,7 +33,7 @@ function wrap_gpu_compiler_error(@nospecialize(e), @nospecialize(f), @nospeciali
     # anything else here is a bug in the error formatter and must not be masked
     # while it is formatting somebody else's error.
     fname = try
-        string(nameof(typeof(f)))
+        string(kernel_display_name(f))
     catch ex
         ex isa Union{ArgumentError, MethodError} || rethrow()
         string(f)
@@ -737,7 +747,18 @@ function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob;
                 GPUCompiler.compile(:llvm, job)
             end
         catch e
-            wrap_gpu_compiler_error(e, job.source.def.sig, job.source.specTypes)
+            # The function's type and the argument types, as the other entry
+            # points pass a function and its argument tuple.
+            #
+            # Formatted in the latest world. A launch compiles in the world Lava
+            # was loaded in (`invoke_frozen`), where a kernel defined since has
+            # no binding yet, and printing the error names the kernel: Julia 1.12
+            # warns about that read ("access to binding ... in a world prior to
+            # its definition world") and `--depwarn=error` makes it an error that
+            # replaces this one.
+            sig = job.source.specTypes
+            Base.invokelatest(wrap_gpu_compiler_error, e, sig.parameters[1],
+                              Tuple{sig.parameters[2:end]...})
         end
         entry_fn = meta.entry
         entry_name = entry_fn.name
