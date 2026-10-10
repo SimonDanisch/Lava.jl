@@ -258,4 +258,29 @@ end
         @test body != ["OpLabel", "OpReturn"]
         @test any(startswith("OpAtomic"), body)
     end
+
+    # A kernel handed bytes reads them as words (DNNKernels' PTQ1 decode does).
+    # Without the method, Base's `ReinterpretArray` wrapped the device array.
+    @testset "reinterpret views the same memory as another type" begin
+        a = Lava.LavaDeviceArray{UInt8, 1}(Ptr{UInt8}(0x1000), (28,))
+        w = reinterpret(UInt32, a)
+        @test w isa Lava.LavaDeviceArray{UInt32, 1}
+        @test size(w) == (7,)
+        @test pointer(w) == Ptr{UInt32}(0x1000)
+        @test size(reinterpret(UInt32, Lava.LavaDeviceArray{UInt8, 2}(Ptr{UInt8}(0x1000), (28, 3)))) == (7, 3)
+        @test_throws ArgumentError reinterpret(UInt32, Lava.LavaDeviceArray{UInt8, 1}(Ptr{UInt8}(0x1000), (27,)))
+
+        function split_words(out, bytes)
+            i = Lava.lava_global_invocation_id_x() + UInt32(1)
+            @inbounds out[i] = reinterpret(UInt32, bytes)[i]
+            return nothing
+        end
+        V32 = Lava.LavaDeviceArray{UInt32, 1}
+        V8 = Lava.LavaDeviceArray{UInt8, 1}
+        d = Lava.disassemble_spirv(
+            Lava.lava_compile_gpu(split_words, Tuple{V32, V8}).spirv_bytes)
+        body = main_body(d)
+        @test body != ["OpLabel", "OpReturn"]
+        @test "OpLoad" in body && "OpStore" in body
+    end
 end

@@ -39,6 +39,18 @@ struct LavaDeviceArray{T,N} <: GPUArrays.AbstractDeviceArray{T,N}
 end
 
 Base.size(a::LavaDeviceArray) = a.dims
+
+# The same memory as another element type, as `MtlDeviceArray` has it: a kernel
+# handed packed bytes reads them as words without its caller allocating a second
+# buffer. The first dimension scales by the size ratio, the pointer is the same.
+function Base.reinterpret(::Type{T}, a::LavaDeviceArray{S,N}) where {T,S,N}
+    err = GPUArrays._reinterpret_exception(T, a)
+    err === nothing || throw(err)
+    d = a.dims
+    n1 = div(d[1] * sizeof(S), sizeof(T))
+    return LavaDeviceArray{T,N}(reinterpret(Ptr{T}, a.ptr), (n1, Base.tail(d)...))
+end
+
 Base.pointer(a::LavaDeviceArray{T}) where {T} = a.ptr
 Base.pointer(a::LavaDeviceArray{T}, i::Integer) where {T} = a.ptr + (i - 1) * sizeof(T)
 Base.unsafe_convert(::Type{Ptr{T}}, a::LavaDeviceArray{T}) where {T} = a.ptr
