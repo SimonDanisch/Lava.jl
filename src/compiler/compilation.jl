@@ -1382,6 +1382,11 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # integer block copies. Detect and replace with per-field typed copies.
     decompose_workgroup_typepun_copies!(mod, dl)
 
+    # ── Split vector accesses on scalar workgroup memory ──
+    # `load <4 x float>` from a `[N x float]` shared array has no valid access chain.
+    split_vector_workgroup_accesses!(mod, dl)
+    verify_ir!("split_vector_wg_accesses")
+
     # ── Decompose composite workgroup accesses ──
     # Struct loads/stores on addrspace(3) must be decomposed into scalar ops
     # because shared memory is flattened to scalar arrays in SPIR-V.

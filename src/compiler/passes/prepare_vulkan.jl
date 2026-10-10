@@ -450,6 +450,130 @@ function decompose_composite_psb_accesses!(mod::LLVM.Module, dl::LLVM.DataLayout
 end
 
 # ============================================================================
+# Sub-pass: Split vector accesses on scalar Workgroup memory
+# ============================================================================
+
+# The scalar a workgroup pointer addresses: the leaf of the global's array type, or
+# of the type a typed GEP reaches. A byte GEP says nothing about the memory and a
+# vector GEP is one of the accesses being split, so both look through to their base.
+# `nothing` for memory declared as vectors or structs, and for a pointer that cannot
+# be traced (a phi, a select).
+function wg_scalar_type(ptr::LLVM.Value)
+    ty = if ptr isa LLVM.GlobalVariable
+        ptr.global_value_type
+    elseif ptr isa LLVM.GetElementPtrInst ||
+           (ptr isa LLVM.ConstantExpr && LLVM.API.LLVMGetConstOpcode(ptr) == LLVM.API.LLVMGetElementPtr)
+        source_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(ptr))
+        if length(ptr.operands) == 2 &&
+           (source_ty isa LLVM.VectorType || (source_ty isa LLVM.IntegerType && source_ty.width == 8))
+            return wg_scalar_type(ptr.operands[1])
+        end
+        resolve_wg_ptr_type(ptr)
+    else
+        nothing
+    end
+    while ty isa LLVM.ArrayType
+        ty = ty.element_type
+    end
+    return ty isa LLVM.IntegerType || ty isa LLVM.FloatingPointType ? ty : nothing
+end
+
+# The scalar to split a `vec` access through `ptr` into, when the memory holds scalars
+# exactly as wide as its components.
+function wg_split_scalar(ptr::LLVM.Value, vec::LLVM.VectorType, dl::LLVM.DataLayout)
+    ptr_ty = ptr.value_type
+    ptr_ty isa LLVM.PointerType && ptr_ty.addrspace == 3 || return nothing
+    comp = vec.element_type
+    comp isa LLVM.IntegerType || comp isa LLVM.FloatingPointType || return nothing
+    s = wg_scalar_type(ptr)
+    s === nothing && return nothing
+    LLVM.abi_size(dl, s) == LLVM.abi_size(dl, comp) || return nothing
+    return s
+end
+
+"""
+    split_vector_workgroup_accesses!(mod::LLVM.Module, dl::LLVM.DataLayout)
+
+Split a vector access to workgroup memory that holds scalars into one access per
+component. A kernel that stages Float32s may read them back four at a time
+(`reinterpret(NTuple{4,VecElement{Float32}}, sh)`): `gep <4 x float>` and
+`load <4 x float>` on a `[N x float]` global. A logical SPIR-V pointer cannot be
+retyped, so that access chain has no valid form. The GEP becomes a scalar GEP at `n`
+times the index, and each component is loaded or stored on its own, which the
+emitter folds into `OpAccessChain` on the array. Memory declared as vectors keeps
+its vector accesses.
+"""
+function split_vector_workgroup_accesses!(mod::LLVM.Module, dl::LLVM.DataLayout)
+    T_i32 = LLVM.Int32Type()
+    T_i64 = LLVM.Int64Type()
+
+    for f in mod.functions
+        isempty(f.blocks) && continue
+        to_erase = LLVM.Instruction[]
+
+        # GEPs first, so every access below addresses a scalar GEP.
+        for bb in f.blocks, inst in bb.instructions
+            inst isa LLVM.GetElementPtrInst || continue
+            vec = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inst))
+            vec isa LLVM.VectorType || continue
+            ops = inst.operands
+            length(ops) == 2 || continue
+            base, idx = ops[1], ops[2]
+            s = wg_split_scalar(base, vec, dl)
+            s === nothing && continue
+            n = Int(LLVM.abi_size(dl, vec) ÷ LLVM.abi_size(dl, s))
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                LLVM.position!(builder, insertion_point(inst))
+                scaled = LLVM.mul!(builder, idx, LLVM.ConstantInt(idx.value_type, n), "wg_vec_idx")
+                LLVM.replace_uses!(inst, LLVM.inbounds_gep!(builder, s, base, [scaled], "wg_vec_gep"))
+            end
+            push!(to_erase, inst)
+        end
+        foreach(LLVM.erase!, to_erase)
+        empty!(to_erase)
+
+        for bb in f.blocks, inst in bb.instructions
+            if inst isa LLVM.LoadInst
+                vec, ptr = inst.value_type, inst.operands[1]
+            elseif inst isa LLVM.StoreInst
+                vec, ptr = inst.operands[1].value_type, inst.operands[2]
+            else
+                continue
+            end
+            vec isa LLVM.VectorType || continue
+            s = wg_split_scalar(ptr, vec, dl)
+            s === nothing && continue
+            comp = vec.element_type
+            sz = Int(LLVM.abi_size(dl, s))
+            align = Int(inst.alignment)
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                LLVM.position!(builder, insertion_point(inst))
+                result = LLVM.UndefValue(vec)
+                for c in 0:vec.length-1
+                    p = c == 0 ? ptr :
+                        LLVM.inbounds_gep!(builder, s, ptr, [LLVM.ConstantInt(T_i64, c)], "wg_vec_comp")
+                    lane = LLVM.ConstantInt(T_i32, c)
+                    if inst isa LLVM.LoadInst
+                        x = LLVM.load!(builder, s, p)
+                        x.alignment = min(gcd(align, c * sz), sz)
+                        s == comp || (x = LLVM.bitcast!(builder, x, comp))
+                        result = LLVM.insert_element!(builder, result, x, lane)
+                    else
+                        x = LLVM.extract_element!(builder, inst.operands[1], lane)
+                        s == comp || (x = LLVM.bitcast!(builder, x, s))
+                        st = LLVM.store!(builder, x, p)
+                        st.alignment = min(gcd(align, c * sz), sz)
+                    end
+                end
+                inst isa LLVM.LoadInst && LLVM.replace_uses!(inst, result)
+            end
+            push!(to_erase, inst)
+        end
+        foreach(LLVM.erase!, to_erase)
+    end
+end
+
+# ============================================================================
 # Sub-pass: Decompose composite Workgroup (shared memory) accesses
 # ============================================================================
 

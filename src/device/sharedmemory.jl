@@ -167,3 +167,15 @@ Base.length(a::LavaSharedArray) = a.len
 Base.size(::LavaSharedArray{T, Dims}) where {T, Dims} = Dims
 Base.eltype(::LavaSharedArray{T}) where T = T
 
+# The same block as another element type, as `LavaDeviceArray` has it: a kernel
+# that stages Float32s reads them back four at a time without a second block.
+# Without it `reinterpret` fell to Base's `ReinterpretArray`, whose field-offset
+# `ccall` no kernel can run. The first dimension scales by the size ratio; the
+# shape is a type parameter, so the new one is computed at compile time.
+@inline function Base.reinterpret(::Type{T}, a::LavaSharedArray{S, Dims}) where {T, S, Dims}
+    n1 = div(Dims[1] * sizeof(S), sizeof(T))
+    n1 * sizeof(T) == Dims[1] * sizeof(S) || throw(ArgumentError(
+        "reinterpret: $(Dims[1]) elements of $S are not a whole number of $T"))
+    nd = (n1, Base.tail(Dims)...)
+    return LavaSharedArray{T, nd}(reinterpret(Core.LLVMPtr{T, 3}, a.ptr), prod(nd))
+end

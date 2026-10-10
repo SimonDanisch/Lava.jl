@@ -262,13 +262,14 @@ end
     # A kernel handed bytes reads them as words (DNNKernels' PTQ1 decode does).
     # Without the method, Base's `ReinterpretArray` wrapped the device array.
     @testset "reinterpret views the same memory as another type" begin
-        a = Lava.LavaDeviceArray{UInt8, 1}(Ptr{UInt8}(0x1000), (28,))
+        a = Lava.LavaDeviceArray{UInt8, 1}(Ptr{UInt8}(UInt(0x1000)), (28,))
         w = reinterpret(UInt32, a)
         @test w isa Lava.LavaDeviceArray{UInt32, 1}
         @test size(w) == (7,)
-        @test pointer(w) == Ptr{UInt32}(0x1000)
-        @test size(reinterpret(UInt32, Lava.LavaDeviceArray{UInt8, 2}(Ptr{UInt8}(0x1000), (28, 3)))) == (7, 3)
-        @test_throws ArgumentError reinterpret(UInt32, Lava.LavaDeviceArray{UInt8, 1}(Ptr{UInt8}(0x1000), (27,)))
+        @test pointer(w) == Ptr{UInt32}(UInt(0x1000))
+        @test size(reinterpret(UInt32, Lava.LavaDeviceArray{UInt8, 2}(Ptr{UInt8}(UInt(0x1000)), (28, 3)))) == (7, 3)
+        @test_throws Lava.GPUArrays.ReinterpretDivisibilityError reinterpret(UInt32,
+            Lava.LavaDeviceArray{UInt8, 1}(Ptr{UInt8}(UInt(0x1000)), (27,)))
 
         function split_words(out, bytes)
             i = Lava.lava_global_invocation_id_x() + UInt32(1)
@@ -279,6 +280,37 @@ end
         V8 = Lava.LavaDeviceArray{UInt8, 1}
         d = Lava.disassemble_spirv(
             Lava.lava_compile_gpu(split_words, Tuple{V32, V8}).spirv_bytes)
+        body = main_body(d)
+        @test body != ["OpLabel", "OpReturn"]
+        @test "OpLoad" in body && "OpStore" in body
+    end
+
+    @testset "reinterpret views a shared block as another type" begin
+        p = reinterpret(Core.LLVMPtr{Float32, 3}, UInt64(0x40))
+        a = Lava.LavaSharedArray{Float32, (64,)}(p, 64)
+        w = reinterpret(NTuple{4, VecElement{Float32}}, a)
+        @test w isa Lava.LavaSharedArray{NTuple{4, VecElement{Float32}}, (16,)}
+        @test length(w) == 16
+        @test reinterpret(UInt64, w.ptr) == UInt64(0x40)
+
+        # Staged as scalars, read back four at a time: the access Bonsai's prefill
+        # attention makes of its query tile, which fell to Base's `ReinterpretArray`
+        # and its field-offset `ccall` before. Then `spirv-val` refused the module:
+        # an `OpPtrAccessChain` to a `v4float` off the `float` array, until
+        # `split_vector_workgroup_accesses!` split the load per component.
+        # `lava_compile_gpu` validates, so compiling at all is the check.
+        function shared_vec4(out, x)
+            i = Lava.lava_global_invocation_id_x() + UInt32(1)
+            sh = Lava.KernelInterface.localmemory(Float32, Val((64,)), Val(1))
+            @inbounds sh[i] = x[i]
+            Lava.KernelInterface.barrier()
+            v = @inbounds reinterpret(NTuple{4, VecElement{Float32}}, sh)[(i - UInt32(1)) ÷ UInt32(4) + UInt32(1)]
+            @inbounds out[i] = v[1].value + v[4].value
+            return nothing
+        end
+        V = Lava.LavaDeviceArray{Float32, 1}
+        d = Lava.disassemble_spirv(
+            Lava.lava_compile_gpu(shared_vec4, Tuple{V, V}; workgroup_size = (64, 1, 1)).spirv_bytes)
         body = main_body(d)
         @test body != ["OpLabel", "OpReturn"]
         @test "OpLoad" in body && "OpStore" in body
