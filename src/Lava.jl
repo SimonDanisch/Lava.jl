@@ -191,7 +191,7 @@ include("compiler/passes/cfg_utils.jl")
 include("compiler/passes/structurize_cfg.jl")
 include("compiler/passes/prepare_vulkan.jl")
 include("compiler/passes/lower_intrinsics.jl")
-include("compiler/passes/exact_widening.jl")
+include("compiler/passes/exact_narrowing.jl")
 include("compiler/passes/wide_division.jl")
 # shared_memory.jl — consolidated into prepare_vulkan.jl
 

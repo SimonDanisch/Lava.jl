@@ -1558,15 +1558,16 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     propagate_psb_alignment!(mod, dl)
     checkpoint("workgroup_align+propagate_psb_alignment!")
 
-    # ── A widening of a just-narrowed value, in integers ──
-    # NVIDIA folds `fpext(fptrunc x)` back into `x` whatever the SPIR-V says
-    # (see the pass). Last, so no InstCombine runs after it; it adds no blocks.
-    widen_narrowed_floats!(mod)
+    # ── A narrowing the kernel keeps computing with, in integers ──
+    # NVIDIA drops the rounding of a narrowed value used in registers, whatever
+    # the SPIR-V says (see the pass). Last, so no InstCombine runs after it; it
+    # adds no blocks.
+    narrow_in_integers!(mod)
     # A divisor that became a constant after the first `lower_wide_divisions!`
     # (inlining, InstCombine, unrolling): straight-line, so safe after the CFG is
     # structurized.
     lower_wide_divisions!(mod; runtime = false)
-    checkpoint("widen_narrowed_floats! + lower_wide_divisions!")
+    checkpoint("narrow_in_integers! + lower_wide_divisions!")
 
     return nothing
 end

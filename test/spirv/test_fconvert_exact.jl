@@ -11,10 +11,10 @@
 # fusing `a * b + c` into an fma is the contraction SPIR-V permits and every GPU
 # Julia backend does, and it is not what this is about.
 #
-# NVIDIA folds the pair whatever the module says, so a widening of a value that
-# was just narrowed is not an `OpFConvert` at all: `widen_narrowed_floats!`
-# spells it in integer operations on the narrowed bits. An ordinary widening (a
-# half loaded from memory) stays one instruction.
+# NVIDIA drops the rounding of a narrowed value it keeps in registers, whatever
+# the module says, so `narrow_in_integers!` spells a narrowing the kernel computes
+# with in integer operations: no `OpFConvert` to half is left for it. A narrowing
+# that only goes to memory, and a widening of a loaded half, stay one instruction.
 
 using Test
 if !@isdefined(SPIRVTestUtils)
@@ -34,22 +34,43 @@ function fc_widen!(dst, src)
     return nothing
 end
 
+function fc_store!(dst, src, r::Float32)
+    i = Int(KernelInterface.get_global_id().x)
+    @inbounds dst[i] = Float16(src[i] * r)
+    return nothing
+end
+
+function fc_halfmul!(dst, src, g, r::Float32)
+    i = Int(KernelInterface.get_global_id().x)
+    @inbounds dst[i] = Float32(Float16(src[i] * r) * g[i])
+    return nothing
+end
+
+converts(d, ty) = [m[1] for m in eachmatch(Regex("(%\\w+) = OpFConvert %$ty "), d)]
+
+const F32V = Lava.LavaDeviceArray{Float32,1}
+const F16V = Lava.LavaDeviceArray{Float16,1}
+
 @testset "float conversions carry NoContraction" begin
-    tt = Tuple{Lava.LavaDeviceArray{Float32,1},Lava.LavaDeviceArray{Float32,1},Float32}
-    d, _ = compile_and_disasm(fc_roundtrip!, tt; validate = true)
-    converts = [m[1] for m in eachmatch(r"(%\w+) = OpFConvert", d)]
-    # The narrowing only: the widening of what it produced is integer arithmetic.
-    @test length(converts) == 1
-    for id in converts
-        @test occursin("OpDecorate $id NoContraction", d)
-    end
-    @test occursin("OpConvertUToF", d)        # the subnormal case
-    @test occursin("OpSelect", d)
+    # Stored only: the narrowing stays an instruction, decorated.
+    d, _ = compile_and_disasm(fc_store!, Tuple{F16V,F32V,Float32}; validate = true)
+    @test length(converts(d, "half")) == 1
+    @test all(id -> occursin("OpDecorate $id NoContraction", d), converts(d, "half"))
+    # Widened again: the narrowing is integer operations, the widening stays.
+    d, _ = compile_and_disasm(fc_roundtrip!, Tuple{F32V,F32V,Float32}; validate = true)
+    @test isempty(converts(d, "half"))
+    @test length(converts(d, "float")) == 1
+    @test all(id -> occursin("OpDecorate $id NoContraction", d), converts(d, "float"))
+    @test occursin("OpShiftRightLogical", d)
+end
+
+@testset "a narrowing multiplied in half is integer operations too" begin
+    d, _ = compile_and_disasm(fc_halfmul!, Tuple{F32V,F32V,F16V,Float32}; validate = true)
+    @test isempty(converts(d, "half"))
 end
 
 @testset "a widening of a loaded half stays one instruction" begin
-    tt = Tuple{Lava.LavaDeviceArray{Float32,1},Lava.LavaDeviceArray{Float16,1}}
-    d, _ = compile_and_disasm(fc_widen!, tt; validate = true)
-    @test length(collect(eachmatch(r"= OpFConvert", d))) == 1
-    @test !occursin("OpConvertUToF", d)
+    d, _ = compile_and_disasm(fc_widen!, Tuple{F32V,F16V}; validate = true)
+    @test length(converts(d, "float")) == 1
+    @test isempty(converts(d, "half"))
 end
