@@ -24,7 +24,11 @@
 # as the IEEE 754 round-to-nearest-even in integer operations, on every device.
 # Lava's `test_exact_narrowing.jl` runs this pass's IR on the host against
 # `Float16(::Float32)` for all 2^32 inputs. It costs about twenty integer
-# operations per half (MEASURE: experiments/portable-tests/tools/narrowing_bench.jl).
+# operations per half, which a kernel storing halves did not show: on the Radeon
+# 8060S, `Float16(a[i] * b[i])` over 2^26 elements took 3.49 ms with the hardware
+# conversion and 3.19-3.58 ms in three runs with this (minimum of 20 each), and a
+# 4096^3 Float16 `mul!` 524 ms against 397-524 ms
+# (`experiments/portable-tests/tools/narrowing_bench.jl` in the VideoEdit tree).
 
 """
     narrow_in_integers!(mod::LLVM.Module) -> Bool
