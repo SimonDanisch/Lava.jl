@@ -53,6 +53,7 @@ const LAVA_SOURCES = [
     "compiler/passes/lift_geps.jl", "compiler/passes/retype_allocas.jl",
     "compiler/passes/cfg_utils.jl", "compiler/passes/structurize_cfg.jl",
     "compiler/passes/prepare_vulkan.jl", "compiler/passes/lower_intrinsics.jl",
+    "compiler/passes/exact_widening.jl", "compiler/passes/wide_division.jl",
     "device/math.jl", "device/quirks.jl", "device/rt_intrinsics.jl",
     "device/ray_query_intrinsics.jl", "device/gfx_intrinsics.jl", "device/printf.jl",
     "device/atomics.jl", "device/subgroup.jl", "device/acceleratedmatrix.jl",
