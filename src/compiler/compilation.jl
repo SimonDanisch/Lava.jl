@@ -1245,6 +1245,12 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     checkpoint("pre_inline_cleanup")
     force_inline_all!(mod, entry_fn; force_inline_all)
     verify_ir!("force_inline")
+
+    # ── No 64-bit integer division reaches the driver ──
+    # NVIDIA miscompiles code around its own (see the pass). Here, before
+    # structurization: a runtime divisor becomes an inlined helper with a branch.
+    lower_wide_divisions!(mod)
+    verify_ir!("lower_wide_divisions")
     checkpoint("force_inline_all!")
 
     if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
@@ -1551,6 +1557,16 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # used via inttoptr is 8-aligned, GEPs preserve via gcd).
     propagate_psb_alignment!(mod, dl)
     checkpoint("workgroup_align+propagate_psb_alignment!")
+
+    # ── A widening of a just-narrowed value, in integers ──
+    # NVIDIA folds `fpext(fptrunc x)` back into `x` whatever the SPIR-V says
+    # (see the pass). Last, so no InstCombine runs after it; it adds no blocks.
+    widen_narrowed_floats!(mod)
+    # A divisor that became a constant after the first `lower_wide_divisions!`
+    # (inlining, InstCombine, unrolling): straight-line, so safe after the CFG is
+    # structurized.
+    lower_wide_divisions!(mod; runtime = false)
+    checkpoint("widen_narrowed_floats! + lower_wide_divisions!")
 
     return nothing
 end
