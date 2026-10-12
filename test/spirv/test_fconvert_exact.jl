@@ -13,8 +13,9 @@
 #
 # NVIDIA drops the rounding of a narrowed value it keeps in registers, and RADV
 # fuses a multiply into the conversion, whatever the module says, so
-# `narrow_in_integers!` spells every float-to-half narrowing in integer
-# operations: no `OpFConvert` to half is left. A widening stays one instruction.
+# `narrow_in_integers!` spells those narrowings in integer operations: no
+# `OpFConvert` to half is left for them. A loaded value narrowed and stored, and a
+# widening, stay one instruction.
 
 using Test
 if !@isdefined(SPIRVTestUtils)
@@ -40,6 +41,12 @@ function fc_store!(dst, src, r::Float32)
     return nothing
 end
 
+function fc_cast!(dst, src)
+    i = Int(KernelInterface.get_global_id().x)
+    @inbounds dst[i] = Float16(src[i])
+    return nothing
+end
+
 function fc_halfmul!(dst, src, g, r::Float32)
     i = Int(KernelInterface.get_global_id().x)
     @inbounds dst[i] = Float32(Float16(src[i] * r) * g[i])
@@ -52,10 +59,15 @@ const F32V = Lava.LavaDeviceArray{Float32,1}
 const F16V = Lava.LavaDeviceArray{Float16,1}
 
 @testset "float conversions carry NoContraction" begin
-    # Stored: the narrowing is integer operations too.
+    # A product, stored: integer operations, so it cannot be folded into the
+    # conversion.
     d, _ = compile_and_disasm(fc_store!, Tuple{F16V,F32V,Float32}; validate = true)
     @test isempty(converts(d, "half"))
     @test occursin("OpShiftRightLogical", d)
+    # A loaded value, stored: one instruction, decorated.
+    d, _ = compile_and_disasm(fc_cast!, Tuple{F16V,F32V}; validate = true)
+    @test length(converts(d, "half")) == 1
+    @test all(id -> occursin("OpDecorate $id NoContraction", d), converts(d, "half"))
     # Widened again: the narrowing is integer operations, the widening stays.
     d, _ = compile_and_disasm(fc_roundtrip!, Tuple{F32V,F32V,Float32}; validate = true)
     @test isempty(converts(d, "half"))

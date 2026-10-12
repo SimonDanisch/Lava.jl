@@ -1,4 +1,4 @@
-# LLVM pass: every float-to-half narrowing is done in integers.
+# LLVM pass: a float-to-half narrowing a driver would change is done in integers.
 #
 # `Float16(x)` rounds `x` to half precision, and Julia means that rounding of that
 # value. Two drivers compute something else from the hardware conversion:
@@ -20,8 +20,13 @@
 #     on the conversion.
 #
 # What neither compiler sees through is a half built from integer operations: it
-# is a 16-bit pattern like one loaded from memory. So every narrowing is spelled
-# as the IEEE 754 round-to-nearest-even in integer operations, on every device.
+# is a 16-bit pattern like one loaded from memory. So a narrowing is spelled as
+# the IEEE 754 round-to-nearest-even in integer operations, on every device, when
+# either case can apply to it: its value is used for more than storing it, or its
+# input is float arithmetic a conversion can absorb. A loaded value or a
+# transcendental narrowed and stored stays one instruction: doing every narrowing
+# in integers cost SAM 2's encode on RADV, where a flash-attention kernel narrows
+# `exp` results inside its loop.
 # Lava's `test_exact_narrowing.jl` runs this pass's IR on the host against
 # `Float16(::Float32)` for all 2^32 inputs. It costs about twenty integer
 # operations per half, which a kernel storing halves did not show: on the Radeon
@@ -33,17 +38,18 @@
 """
     narrow_in_integers!(mod::LLVM.Module) -> Bool
 
-Replace every `fptrunc float to half` (scalar or vector) with the same rounding
-written in integer operations on the float's bits. Returns whether anything
-changed.
+Replace every `fptrunc float to half` (scalar or vector) that is used for more
+than storing, or whose input is float arithmetic, with the same rounding written
+in integer operations on the float's bits. Returns whether anything changed.
 """
 function narrow_in_integers!(mod::LLVM.Module)
     found = LLVM.FPTruncInst[]
     for f in LLVM.functions(mod), bb in LLVM.blocks(f), inst in LLVM.instructions(bb)
         inst isa LLVM.FPTruncInst || continue
         scalartype(LLVM.value_type(inst)) isa LLVM.HalfType || continue
-        scalartype(LLVM.value_type(LLVM.operands(inst)[1])) isa LLVM.FloatType || continue
-        push!(found, inst)
+        x = LLVM.operands(inst)[1]
+        scalartype(LLVM.value_type(x)) isa LLVM.FloatType || continue
+        (absorbable(x) || !onlystored(inst)) && push!(found, inst)
     end
     isempty(found) && return false
     LLVM.@dispose builder = LLVM.IRBuilder() begin
@@ -55,6 +61,40 @@ function narrow_in_integers!(mod::LLVM.Module)
         end
     end
     return true
+end
+
+"""
+Whether every use of `v` only puts its bits into memory: a store of it, or a
+packing (insert, shuffle, bitcast, phi, select) whose own uses only store.
+"""
+onlystored(v::LLVM.Value, seen = Set{LLVM.Value}()) =
+    all(u -> storing(LLVM.user(u), v, seen), LLVM.uses(v))
+# The value stored, not the address stored to.
+storing(u::LLVM.StoreInst, v, seen) = LLVM.operands(u)[1] == v
+function storing(u::Union{LLVM.InsertElementInst, LLVM.InsertValueInst, LLVM.ShuffleVectorInst,
+                          LLVM.BitCastInst, LLVM.PHIInst, LLVM.SelectInst}, v, seen)
+    u in seen && return true
+    push!(seen, u)
+    return onlystored(u, seen)
+end
+storing(::LLVM.Value, v, seen) = false
+
+"""
+Whether `x` is float arithmetic a driver can fold into the conversion that
+narrows it: an add, subtract, multiply, divide (a multiply by a reciprocal once
+lowered) or fused multiply-add, through a negation or absolute value, which
+conversion instructions take as modifiers.
+"""
+absorbable(::LLVM.Value) = false
+absorbable(x::LLVM.Instruction) =
+    LLVM.opcode(x) in (LLVM.API.LLVMFAdd, LLVM.API.LLVMFSub, LLVM.API.LLVMFMul, LLVM.API.LLVMFDiv) ||
+    (LLVM.opcode(x) == LLVM.API.LLVMFNeg && absorbable(LLVM.operands(x)[1]))
+function absorbable(x::LLVM.CallInst)
+    callee = LLVM.called_operand(x)
+    callee isa LLVM.Function || return false
+    n = LLVM.name(callee)
+    startswith(n, "llvm.fma.") || startswith(n, "llvm.fmuladd.") ||
+        (startswith(n, "llvm.fabs.") && absorbable(LLVM.operands(x)[1]))
 end
 
 scalartype(t::LLVM.VectorType) = eltype(t)
