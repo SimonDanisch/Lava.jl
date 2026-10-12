@@ -699,8 +699,16 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         # (64-bit) shared accesses work by the same path. SPIR-V vectors are 2, 3
         # or 4 components, which is the ceiling here; `coopmat_sharedok` rejects
         # anything else before a name is ever built.
-        vw = (op == "load" || op == "loadw") ? 0 : parse(Int, op[6:end])
-        pointee = vw == 0 ? comp_ty : emit_type_vector!(mod, comp_ty, UInt32(vw))
+        #
+        # `loadwu4` is a uvec4 pointee whatever the matrix's component type: the
+        # one 128-bit shared access SPIR-V can name. See `coopmat_uvec4`.
+        pointee = if op == "load" || op == "loadw"
+            comp_ty
+        elseif op == "loadwu4"
+            emit_type_vector!(mod, emit_type_int!(mod, UInt32(32), UInt32(0)), UInt32(4))
+        else
+            emit_type_vector!(mod, comp_ty, UInt32(parse(Int, op[6:end])))
+        end
         # `loadw`/`loadw2` carry an extra element-index argument; see below.
         ptr_id, stride_arg = op != "load" ?
             (coopmat_workgroup_pointer!(state, args[1], args[2], pointee), args[3]) :

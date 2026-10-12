@@ -130,10 +130,23 @@ always sees the same shape and always emits exactly one `OpAccessChain`.
 coopmat_vecwidth(::Type{NTuple{N,VecElement{T}}}, ::Type{T}) where {N,T} = N
 coopmat_vecwidth(::Type, ::Type) = 0
 
+# A `uvec4` (16-byte) `@localmem` element backing a matrix of a narrower type: the
+# only way past the 4-component ceiling above to 128-bit shared accesses. The
+# pointee need not share the matrix's component type — NVIDIA's
+# `vk_cooperative_matrix_perf` loads fp16 tiles out of `shared uvec4` — and
+# `Stride` is then counted in uvec4s. On RADV a 4 x f16 pointee gives
+# `ds_load_b64` per fragment row half, a uvec4 one `ds_load_b128`.
+coopmat_uvec4(::Type{NTuple{4,VecElement{UInt32}}}, ::Type{T}) where {T} =
+    T !== UInt32 && 16 % sizeof(T) == 0
+coopmat_uvec4(::Type, ::Type) = false
+
 """Whether a `@localmem` element type may back a cooperative matrix of `T`:
-either `T` itself, or a SPIR-V-legal vector of it."""
+`T` itself, a SPIR-V-legal vector of it, or a `uvec4` (see `coopmat_uvec4`)."""
 coopmat_sharedok(::Type{S}, ::Type{T}) where {S,T} =
-    S === T || coopmat_vecwidth(S, T) in (2, 3, 4)
+    S === T || coopmat_vecwidth(S, T) in (2, 3, 4) || coopmat_uvec4(S, T)
+
+coopmat_sharedop(op, ::Type{S}, ::Type{T}) where {S,T} =
+    S === T ? op : coopmat_uvec4(S, T) ? op * "u4" : op * string(coopmat_vecwidth(S, T))
 
 @generated function coopmat_load(::Type{CoopMatrix{T,M,N,U,SC}},
                                  ptr::Core.LLVMPtr{S,3},
@@ -141,12 +154,12 @@ coopmat_sharedok(::Type{S}, ::Type{T}) where {S,T} =
                                  ::Val{RM} = Val(false)) where {T,M,N,U,SC,S,RM}
     coopmat_sharedok(S, T) ||
         throw(ArgumentError("coopmat_load: a Workgroup array of $S cannot back a \
-                             cooperative matrix of $T; use $T or \
-                             NTuple{2|3|4,VecElement{$T}}"))
-    # `loadw<W>` when the shared array is a W-wide vector of `T`: same
-    # instruction, but the emitter has to build a pointer to the *vector* rather
-    # than to `T`, and `Stride` is then counted in vectors.
-    fname = coopmat_intrinsic_name(S === T ? "loadw" : "loadw$(coopmat_vecwidth(S, T))",
+                             cooperative matrix of $T; use $T, \
+                             NTuple{2|3|4,VecElement{$T}} or NTuple{4,VecElement{UInt32}}"))
+    # `loadw<W>` when the shared array is a W-wide vector of `T`, `loadwu4` when
+    # it is a uvec4: same instruction, but the emitter has to build a pointer to
+    # the *vector* rather than to `T`, and `Stride` is then counted in vectors.
+    fname = coopmat_intrinsic_name(coopmat_sharedop("loadw", S, T),
                                    T, M, N, U, SC; rowmajor = RM)
     ir = """
         declare i32 @$fname(ptr addrspace(3), i32, i32) #0
