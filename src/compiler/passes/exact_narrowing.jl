@@ -1,36 +1,37 @@
-# LLVM pass: a narrowing the kernel keeps computing with is done in integers.
+# LLVM pass: every float-to-half narrowing is done in integers.
 #
-# `Float16(x)` rounds `x` to half precision, and Julia means the rounding. NVIDIA's
-# compiler drops it whenever the rounded value is used again in registers.
-# Measured on an RTX 4000 Ada (driver 595.99):
+# `Float16(x)` rounds `x` to half precision, and Julia means that rounding of that
+# value. Two drivers compute something else from the hardware conversion:
 #
-#   - `Float32(Float16(x))` comes back as `x` in every element, whatever the
-#     module says: `NoContraction` on both conversions (what Lava emits, and what
-#     Mesa honours); `FPFastMathMode None` from VK_KHR_shader_float_controls2,
-#     with the extension and feature enabled; the same on the multiplies around
-#     them plus `FPFastMathDefault None` for both float types; `RoundingModeRTE`
-#     16/32; `DenormPreserve` 16; a bitcast round trip through `i16`; the half
-#     through a `Volatile` Function variable; the pair as two-lane vectors.
-#   - DNNKernels' fused head norm + rotary (`test_fusermsrope.jl`) differs from
-#     the same chain run as separate kernels, where the narrowed value feeds a
-#     half multiply whose product is widened, after the direct pair above was
-#     already fixed.
+#   - NVIDIA drops the rounding when the narrowed value is used again in
+#     registers. Measured on an RTX 4000 Ada (driver 595.99): `Float32(Float16(x))`
+#     comes back as `x` in every element whatever the module says: `NoContraction`
+#     on both conversions; `FPFastMathMode None` from
+#     VK_KHR_shader_float_controls2, with the extension and feature enabled; the
+#     same on the multiplies around them plus `FPFastMathDefault None` for both
+#     float types; `RoundingModeRTE` 16/32; `DenormPreserve` 16; a bitcast round
+#     trip through `i16`; the half through a `Volatile` Function variable; the
+#     pair as two-lane vectors. DNNKernels' fused norm + rotary lost it where the
+#     narrowed value fed a half multiply.
+#   - RADV fuses a multiply into the conversion: `Float16(a * b)`, stored, is the
+#     exact product rounded once, not `a * b` rounded to Float32 and then to
+#     Float16 (Radeon 8060S, Mesa 26.x: 68 of 2^20 random products differ from
+#     Julia, 0 from the single rounding), with `NoContraction` on the multiply and
+#     on the conversion.
 #
-# A narrowing that only goes to memory is rounded correctly, and so is a half
-# product of two loaded halves widened. What the compiler cannot see through is a
-# half built from integer operations: it is a 16-bit pattern like one loaded from
-# memory. So a narrowing whose value is computed with (widened, multiplied,
-# compared...) is spelled as the IEEE 754 round-to-nearest-even in integers, on
-# every device. `narrowbits` in Lava's `test_exact_narrowing.jl` is the same
-# sequence in Julia and matches `Float16(::Float32)` on all 2^32 inputs; a
-# narrowing stored straight to memory stays one instruction.
+# What neither compiler sees through is a half built from integer operations: it
+# is a 16-bit pattern like one loaded from memory. So every narrowing is spelled
+# as the IEEE 754 round-to-nearest-even in integer operations, on every device.
+# Lava's `test_exact_narrowing.jl` runs this pass's IR on the host against
+# `Float16(::Float32)` for all 2^32 inputs. It costs about twenty integer
+# operations per half (MEASURE: experiments/portable-tests/tools/narrowing_bench.jl).
 
 """
     narrow_in_integers!(mod::LLVM.Module) -> Bool
 
-Replace every `fptrunc float to half` (scalar or vector) whose value is used for
-anything but storing it with the same rounding written in integer operations on
-the float's bits. Returns whether anything changed.
+Replace every `fptrunc float to half` (scalar or vector) with the same rounding
+written in integer operations on the float's bits. Returns whether anything
+changed.
 """
 function narrow_in_integers!(mod::LLVM.Module)
     found = LLVM.FPTruncInst[]
@@ -38,7 +39,7 @@ function narrow_in_integers!(mod::LLVM.Module)
         inst isa LLVM.FPTruncInst || continue
         scalartype(LLVM.value_type(inst)) isa LLVM.HalfType || continue
         scalartype(LLVM.value_type(LLVM.operands(inst)[1])) isa LLVM.FloatType || continue
-        onlystored(inst) || push!(found, inst)
+        push!(found, inst)
     end
     isempty(found) && return false
     LLVM.@dispose builder = LLVM.IRBuilder() begin
@@ -51,22 +52,6 @@ function narrow_in_integers!(mod::LLVM.Module)
     end
     return true
 end
-
-"""
-Whether every use of `v` only puts its bits into memory: a store of it, or a
-packing (insert, shuffle, bitcast, phi, select) whose own uses only store.
-"""
-onlystored(v::LLVM.Value, seen = Set{LLVM.Value}()) =
-    all(u -> storing(LLVM.user(u), v, seen), LLVM.uses(v))
-# The value stored, not the address stored to.
-storing(u::LLVM.StoreInst, v, seen) = LLVM.operands(u)[1] == v
-function storing(u::Union{LLVM.InsertElementInst, LLVM.InsertValueInst, LLVM.ShuffleVectorInst,
-                          LLVM.BitCastInst, LLVM.PHIInst, LLVM.SelectInst}, v, seen)
-    u in seen && return true
-    push!(seen, u)
-    return onlystored(u, seen)
-end
-storing(::LLVM.Value, v, seen) = false
 
 scalartype(t::LLVM.VectorType) = eltype(t)
 scalartype(t::LLVM.LLVMType) = t

@@ -11,10 +11,10 @@
 # fusing `a * b + c` into an fma is the contraction SPIR-V permits and every GPU
 # Julia backend does, and it is not what this is about.
 #
-# NVIDIA drops the rounding of a narrowed value it keeps in registers, whatever
-# the module says, so `narrow_in_integers!` spells a narrowing the kernel computes
-# with in integer operations: no `OpFConvert` to half is left for it. A narrowing
-# that only goes to memory, and a widening of a loaded half, stay one instruction.
+# NVIDIA drops the rounding of a narrowed value it keeps in registers, and RADV
+# fuses a multiply into the conversion, whatever the module says, so
+# `narrow_in_integers!` spells every float-to-half narrowing in integer
+# operations: no `OpFConvert` to half is left. A widening stays one instruction.
 
 using Test
 if !@isdefined(SPIRVTestUtils)
@@ -52,10 +52,10 @@ const F32V = Lava.LavaDeviceArray{Float32,1}
 const F16V = Lava.LavaDeviceArray{Float16,1}
 
 @testset "float conversions carry NoContraction" begin
-    # Stored only: the narrowing stays an instruction, decorated.
+    # Stored: the narrowing is integer operations too.
     d, _ = compile_and_disasm(fc_store!, Tuple{F16V,F32V,Float32}; validate = true)
-    @test length(converts(d, "half")) == 1
-    @test all(id -> occursin("OpDecorate $id NoContraction", d), converts(d, "half"))
+    @test isempty(converts(d, "half"))
+    @test occursin("OpShiftRightLogical", d)
     # Widened again: the narrowing is integer operations, the widening stays.
     d, _ = compile_and_disasm(fc_roundtrip!, Tuple{F32V,F32V,Float32}; validate = true)
     @test isempty(converts(d, "half"))
