@@ -24,16 +24,17 @@
 # the IEEE 754 round-to-nearest-even in integer operations, on every device, when
 # either case can apply to it: its value is used for more than storing it, or its
 # input is float arithmetic a conversion can absorb. A loaded value or a
-# transcendental narrowed and stored stays one instruction: doing every narrowing
-# in integers cost SAM 2's encode on RADV, where a flash-attention kernel narrows
-# `exp` results inside its loop.
+# transcendental narrowed and stored stays one instruction.
+#
+# Doing EVERY narrowing in integers was measured and is too slow: SAM 2's encode +
+# decode on the Radeon 8060S (benchmarks/jobs.jl, median of 20 per session, one
+# fresh session each) took 160.1 and 160.1 ms before these passes, 169.4, 188.6
+# and 176.5 ms with every narrowing in integers, and 155.7 and 167.3 ms with this
+# rule. A flash-attention kernel narrows `exp` results inside its loop; a
+# memory-bound kernel storing halves does not show the twenty integer operations.
+#
 # Lava's `test_exact_narrowing.jl` runs this pass's IR on the host against
-# `Float16(::Float32)` for all 2^32 inputs. It costs about twenty integer
-# operations per half, which a kernel storing halves did not show: on the Radeon
-# 8060S, `Float16(a[i] * b[i])` over 2^26 elements took 3.49 ms with the hardware
-# conversion and 3.19-3.58 ms in three runs with this (minimum of 20 each), and a
-# 4096^3 Float16 `mul!` 524 ms against 397-524 ms
-# (`experiments/portable-tests/tools/narrowing_bench.jl` in the VideoEdit tree).
+# `Float16(::Float32)` for all 2^32 inputs.
 
 """
     narrow_in_integers!(mod::LLVM.Module) -> Bool
