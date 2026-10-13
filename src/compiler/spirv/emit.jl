@@ -6767,6 +6767,17 @@ function propagate_coopmat_phi_types!(state::SPIRVEmitterState)
 end
 
 """
+The block an incoming edge of a phi in `block_label_id` really leaves: `bb`'s, or
+the trampoline or split block the edge was redirected through.
+"""
+function phipredecessor(state::SPIRVEmitterState, bb::LLVM.BasicBlock, block_label_id::UInt32)
+    from_id = get_block_id!(state, bb)
+    redirect = get(state.trampolines, (from_id, block_label_id), nothing)
+    redirect === nothing && (redirect = get(state.phi_block_redirects, (from_id, block_label_id), nothing))
+    return redirect !== nothing ? redirect : from_id
+end
+
+"""
 Resolve all deferred PHI nodes by inserting them right after their block's OpLabel.
 Must be called after all blocks are emitted so all operand values have IDs.
 """
@@ -6811,12 +6822,7 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
                 is_psb = any(pair -> pair[1][1] == SC.PhysicalStorageBuffer && pair[2] == type_id,
                              state.type_ctx.pointer_types)
                 if is_psb
-                    from_id = get_block_id!(state, bb)
-                    redirect = get(state.trampolines, (from_id, block_label_id), nothing)
-                    if redirect === nothing
-                        redirect = get(state.phi_block_redirects, (from_id, block_label_id), nothing)
-                    end
-                    pred_block_id = redirect !== nothing ? redirect : from_id
+                    pred_block_id = phipredecessor(state, bb, block_label_id)
                     zero_id = emit_u64_constant!(state.mod, UInt64(0))
                     null_ptr_id = fresh_id!(state.mod)
                     conv_words = UInt32[]
@@ -6879,6 +6885,23 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
                                         UInt16(46), type_id, uid)  # OpConstantNull
                     uid
                 end
+            elseif val isa LLVM.ConstantExpr
+                # A constant expression is emitted where it is asked for, and every
+                # block is closed by now: its `OpAccessChain` would land after the
+                # function's last `OpReturn`, outside any block, which spirv-val
+                # rejects ("AccessChain must appear in a block"). Moved into the
+                # edge's predecessor, before its terminator, it dominates the use.
+                # Appeared once `!range` on the invocation ids let LLVM fold one arm
+                # of a clamped shared-memory read to the constant `@sh[127]`.
+                n0 = length(state.mod.functions)
+                id = get_value_id!(state, val)
+                if length(state.mod.functions) > n0
+                    words = state.mod.functions[(n0 + 1):end]
+                    resize!(state.mod.functions, n0)
+                    append!(get!(() -> UInt32[], pre_terminator_insertions,
+                                 phipredecessor(state, bb, block_label_id)), words)
+                end
+                id
             else
                 get_value_id!(state, val)
             end
@@ -6918,12 +6941,7 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
                             push!(bitcast_words, bitcast_id)
                             push!(bitcast_words, val_id)
 
-                            from_id = get_block_id!(state, bb)
-                            redirect = get(state.trampolines, (from_id, block_label_id), nothing)
-                            if redirect === nothing
-                                redirect = get(state.phi_block_redirects, (from_id, block_label_id), nothing)
-                            end
-                            pred_block_id = redirect !== nothing ? redirect : from_id
+                            pred_block_id = phipredecessor(state, bb, block_label_id)
                             if !haskey(pre_terminator_insertions, pred_block_id)
                                 pre_terminator_insertions[pred_block_id] = UInt32[]
                             end
@@ -6946,12 +6964,7 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
                             push!(conv_words, u_to_ptr)
                             push!(conv_words, ptr_to_u)
 
-                            from_id = get_block_id!(state, bb)
-                            redirect = get(state.trampolines, (from_id, block_label_id), nothing)
-                            if redirect === nothing
-                                redirect = get(state.phi_block_redirects, (from_id, block_label_id), nothing)
-                            end
-                            pred_block_id = redirect !== nothing ? redirect : from_id
+                            pred_block_id = phipredecessor(state, bb, block_label_id)
                             if !haskey(pre_terminator_insertions, pred_block_id)
                                 pre_terminator_insertions[pred_block_id] = UInt32[]
                             end
@@ -6967,12 +6980,7 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
                         push!(bitcast_words, bitcast_id)
                         push!(bitcast_words, val_id)
 
-                        from_id = get_block_id!(state, bb)
-                        redirect = get(state.trampolines, (from_id, block_label_id), nothing)
-                        if redirect === nothing
-                            redirect = get(state.phi_block_redirects, (from_id, block_label_id), nothing)
-                        end
-                        pred_block_id = redirect !== nothing ? redirect : from_id
+                        pred_block_id = phipredecessor(state, bb, block_label_id)
                         if !haskey(pre_terminator_insertions, pred_block_id)
                             pre_terminator_insertions[pred_block_id] = UInt32[]
                         end
@@ -6984,12 +6992,7 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
 
             push!(operands, val_id)
             # Check if this incoming edge was redirected through a trampoline or block split
-            from_id = get_block_id!(state, bb)
-            redirect = get(state.trampolines, (from_id, block_label_id), nothing)
-            if redirect === nothing
-                redirect = get(state.phi_block_redirects, (from_id, block_label_id), nothing)
-            end
-            push!(operands, redirect !== nothing ? redirect : from_id)
+            push!(operands, phipredecessor(state, bb, block_label_id))
         end
 
         word_count = UInt32(3 + length(operands))
