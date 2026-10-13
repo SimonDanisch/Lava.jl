@@ -231,8 +231,11 @@ end
     @test r isa CompilationResult
     @test hasfield(CompilationResult, :source_map)
     @test r.source_map isa Dict{UInt32, Tuple{String, Int}}
-    # A simple add kernel should produce at least 10 mapped instructions
-    @test length(r.source_map) >= 10
+    # At least the load, the add and the store, each on this file's lines. Not an
+    # instruction count: `!range` on the invocation ids (Lava 532e128) dropped the
+    # sign handling around `i`, and the 10 this asked for became 7.
+    @test length(r.source_map) >= 3
+    @test count(((f, _),) -> endswith(f, basename(@__FILE__)), values(r.source_map)) >= 3
 end
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -281,8 +284,9 @@ end
     # A complex kernel with branches should map to at least 4 different lines
     @test length(lines_seen) >= 4
 
-    # Should have more mapped instructions than the simple kernel
-    @test length(r.source_map) >= 20
+    # More mapped instructions than the simple kernel
+    simple = lava_compile(srcmap_add!, Tuple{LavaDeviceArray{Float32,1}, Float32})
+    @test length(r.source_map) > length(simple.source_map)
 end
 
 # ═══════════════════════════════════════════════════════════════════════
