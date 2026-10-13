@@ -7377,11 +7377,31 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return emit_lava_subgroup!(state, inst, fn_name)
         end
 
+        if fn_name == "_lava_sdot4x8"
+            return emit_lava_sdot4x8!(state, inst)
+        end
+
         # Regular function call
         emit_direct_call!(state, inst, called)
     else
         error("Indirect calls not supported: $inst")
     end
+end
+
+# `OpSDotKHR` of two 32-bit words, each four signed bytes: the packed form, which
+# is what `KI.dot4x8` takes and what the hardware instruction (`v_dot4` on AMD)
+# reads. SPIR-V 1.4 needs the extension; the operation is core in 1.6.
+function emit_lava_sdot4x8!(state::SPIRVEmitterState, inst::LLVM.CallInst)
+    require_capability!(state.mod, Cap.DotProduct)
+    require_capability!(state.mod, Cap.DotProductInput4x8BitPacked)
+    require_extension!(state.mod, "SPV_KHR_integer_dot_product")
+    ops = inst.operands
+    result_ty = map_type!(state.type_ctx, inst.value_type)
+    result_id = fresh_id!(state.mod)
+    packed4x8 = UInt32(0)   # PackedVectorFormat4x8Bit
+    encode_instruction!(state.mod.functions, Op.OpSDotKHR, result_ty, result_id,
+                        get_value_id!(state, ops[1]), get_value_id!(state, ops[2]), packed4x8)
+    state.value_map[inst] = result_id
 end
 
 function emit_lava_glsl!(state::SPIRVEmitterState, inst::LLVM.CallInst, name::String)

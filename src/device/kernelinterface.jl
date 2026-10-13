@@ -144,6 +144,23 @@ for T in KI_REDUCE_ADD_TYPES
     @eval @lava_device_override @inline KI.sub_group_reduce_add(val::$T) = subgroup_add(val)
 end
 
+# ── Integer dot product ─────────────────────────────────────────────────────
+#
+# `OpSDotKHR` on two packed words (see `emit_lava_sdot4x8!`). KI's reference
+# definition is four sign extensions and multiply-adds, which RADV does not turn
+# back into `v_dot4`.
+@inline lava_sdot4x8(a::UInt32, b::UInt32) = Base.llvmcall(("""
+    declare i32 @_lava_sdot4x8(i32, i32)
+    define i32 @entry(i32 %a, i32 %b) #0 {
+        %r = call i32 @_lava_sdot4x8(i32 %a, i32 %b)
+        ret i32 %r
+    }
+    attributes #0 = { alwaysinline }
+    """, "entry"), Int32, Tuple{UInt32, UInt32}, a, b)
+push!(KNOWN_INTRINSICS, "_lava_sdot4x8")
+
+@lava_device_override @inline KI.dot4x8(a::UInt32, b::UInt32) = lava_sdot4x8(a, b)
+
 # ── Barriers ────────────────────────────────────────────────────────────────
 #
 # `@lava_device_override` like everything above, and here for a second reason as

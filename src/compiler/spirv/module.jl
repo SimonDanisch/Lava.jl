@@ -240,6 +240,11 @@ module Op
     # Geometry shader
     const OpEmitVertex              = UInt16(218)
     const OpEndPrimitive            = UInt16(219)
+    # SPV_KHR_integer_dot_product: the dot product of two vectors of integers,
+    # here always two 32-bit words of four packed bytes (PackedVectorFormat4x8Bit).
+    const OpSDotKHR                                       = UInt16(4450)
+    const OpUDotKHR                                       = UInt16(4451)
+    const OpSUDotKHR                                      = UInt16(4452)
     # SPV_KHR_cooperative_matrix — subgroup-scope matrix multiply-accumulate.
     # The matrix is an opaque type whose value is distributed across the lanes of
     # a subgroup; only these ops may produce or consume one.
@@ -447,6 +452,9 @@ module Cap
     const CooperativeMatrixTensorAddressingNV      = UInt32(5433)
     const TensorAddressingNV                       = UInt32(5439)
     const RayQueryKHR                   = UInt32(4472)
+    # SPV_KHR_integer_dot_product
+    const DotProductInput4x8BitPacked   = UInt32(6018)
+    const DotProduct                    = UInt32(6019)
     const CooperativeMatrixKHR          = UInt32(6022)
     # SER (SPV_NV_shader_invocation_reorder).  Value per the SPIR-V unified1
     # grammar (5383).  Earlier guesses (5288 / 5247) collided with
