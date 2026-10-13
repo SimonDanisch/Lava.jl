@@ -10,35 +10,24 @@
 # ── 3D Builtin Variables ──
 # Each produces a load from `<3 x i32>` global, extracting one component.
 
-# The value range each builtin can take, as LLVM `!range` metadata ([lo, hi),
-# hi = -2147483648 meaning 2^31), or `nothing`. What AMDGPU's work-item
-# intrinsics carry. Without it LLVM cannot know an index derived from these is
-# non-negative, so `÷` and `%` stay `sdiv`/`srem` (OpSDiv/OpSRem: a signed fixup
-# per division by a constant) and every widening is a sign extension, which also
-# keeps RADV from folding addresses into a scalar base plus a 32-bit offset.
-# 1024 is the largest workgroup extent any Vulkan implementation reports; 2^31
-# invocations or workgroups along one axis is beyond any 32-bit index anyway.
 const BUILTIN_3D = (
-    :lava_global_invocation_id => (:__spirv_BuiltInGlobalInvocationId, (0, -2147483648)),
-    :lava_local_invocation_id  => (:__spirv_BuiltInLocalInvocationId, (0, 1024)),
-    :lava_workgroup_id         => (:__spirv_BuiltInWorkgroupId, (0, -2147483648)),
-    :lava_num_workgroups       => (:__spirv_BuiltInNumWorkgroups, (1, -2147483648)),
-    :lava_workgroup_size       => (:__spirv_BuiltInWorkgroupSize, nothing),
+    :lava_global_invocation_id => :__spirv_BuiltInGlobalInvocationId,
+    :lava_local_invocation_id  => :__spirv_BuiltInLocalInvocationId,
+    :lava_workgroup_id         => :__spirv_BuiltInWorkgroupId,
+    :lava_num_workgroups       => :__spirv_BuiltInNumWorkgroups,
+    :lava_workgroup_size       => :__spirv_BuiltInWorkgroupSize,
 )
 
-for (jl_name, (spirv_name, range)) in BUILTIN_3D
+for (jl_name, spirv_name) in BUILTIN_3D
     gvar = "@$spirv_name"
-    rangemd = range === nothing ? "" : ", !range !0"
-    rangedef = range === nothing ? "" : "!0 = !{i32 $(range[1]), i32 $(range[2])}"
     ir = """
         $gvar = external addrspace(7) global <3 x i32>
         define i32 @entry(i32 %dim) #0 {
-            %vec = load <3 x i32>, ptr addrspace(7) $gvar, align 16$rangemd
+            %vec = load <3 x i32>, ptr addrspace(7) $gvar, align 16
             %x = extractelement <3 x i32> %vec, i32 %dim
             ret i32 %x
         }
         attributes #0 = { alwaysinline }
-        $rangedef
     """
 
     # 3D version: lava_foo(dim) where dim is 1-based
