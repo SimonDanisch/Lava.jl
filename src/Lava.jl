@@ -180,6 +180,7 @@ include("compiler/target_features.jl")
 # ---- SPIR-V emitter stages ----
 include("compiler/spirv/types.jl")
 include("compiler/spirv/emit.jl")
+include("compiler/spirv/foldedoffset.jl")   # keeps negative constants off loads RADV splits
 
 # ---- Compiler phase timing ----
 include("compiler/phase_timer.jl")

@@ -1149,7 +1149,8 @@ end
 function emit_bitwise_or_logical!(state::SPIRVEmitterState, inst::LLVM.Instruction,
                                     bitwise_op::UInt16, logical_op::UInt16)
     result_ty = inst.value_type
-    opcode = is_bool_type(result_ty) ? logical_op : bitwise_op
+    opcode = is_bool_type(result_ty) ? logical_op :
+             disjointor(inst) ? Op.OpIAdd : bitwise_op
     emit_binary_op!(state, inst, opcode)
 end
 
@@ -1490,7 +1491,13 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
         # Never decompose composite types (struct/array) - decomposition only handles
         # scalar types (i32/i64/float/double). Composite PSB loads use typed OpLoad.
         is_scalar_load = !(actual_load isa LLVM.StructType || actual_load isa LLVM.ArrayType)
-        if is_scalar_load && psb_needs_decomposition(state, ptr, actual_load; llvm_align)
+        decompose = is_scalar_load && psb_needs_decomposition(state, ptr, actual_load; llvm_align)
+        # A load ACO may split must not fold a negative constant (foldedoffset.jl).
+        if splitrisk(state.data_layout::LLVM.DataLayout, actual_load,
+                     psb_access_alignment(actual_load, llvm_align), decompose)
+            ptr_id = unfoldedaddress!(state, ptr, ptr_id, spirv_load_ty)
+        end
+        if decompose
             access_align = get_alignment_for_type(actual_load)
             if actual_load isa LLVM.VectorType
                 load_id = emit_psb_decomposed_vector_load!(state, ptr_id, actual_load, spirv_load_ty)
