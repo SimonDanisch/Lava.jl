@@ -9,6 +9,16 @@
 
 # ── 3D Builtin Variables ──
 # Each produces a load from `<3 x i32>` global, extracting one component.
+#
+# No `!range` metadata on these loads, on purpose. 532e128 attached it (ids
+# non-negative, local ids below 1024), so `÷`/`%` by constants became unsigned and
+# widenings zero-extends; reverted in 1917966. With the ranges known LLVM turns
+# additions into `or disjoint`, and that is the pattern ACO's GFX11 VOPD scheduling
+# bug miscompiles on Mesa 26.2 before 26.2.4: wrong staged-GEMM results and SAM 2
+# GPU faults on an 8060S (26.2.1), two device losses on a 7900 XTX (26.2.3).
+# Mesa 26.0.8 was fine, and SAM 2 measured no gain from it. Worth retrying only
+# once every machine runs Mesa 26.2.4 or later, and only with a benchmark that
+# shows the gain.
 
 const BUILTIN_3D = (
     :lava_global_invocation_id => :__spirv_BuiltInGlobalInvocationId,
