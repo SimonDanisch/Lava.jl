@@ -199,8 +199,9 @@ end
 end
 
 @generated function coopmat_store(ptr::Ptr{S}, offset::Integer, stride::Integer,
-                                  m::CoopMatrix{T,M,N,U,SC}) where {S,T,M,N,U,SC}
-    fname = coopmat_intrinsic_name("store", T, M, N, U, SC)
+                                  m::CoopMatrix{T,M,N,U,SC},
+                                  ::Val{RM} = Val(false)) where {S,T,M,N,U,SC,RM}
+    fname = coopmat_intrinsic_name("store", T, M, N, U, SC; rowmajor = RM)
     ir = """
         declare void @$fname(i64, i32, i32) #0
         define void @entry(i64 %p, i32 %s, i32 %h) #0 {
