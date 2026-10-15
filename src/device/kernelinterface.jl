@@ -117,13 +117,20 @@ import KernelInterface as KI
 # `shfl_down` is KI's name for the down-shuffle. Lava generates the family for
 # six element types; KI's `supports_shuffle` is what tells its own test suite
 # which ones to exercise, so the two lists are derived from one place.
+# KI's `shfl` takes the 1-based lane `get_sub_group_local_id` returns
+# (KernelInterface 0.4); SPIR-V's shuffle id is 0-based, so the one is
+# subtracted here and nowhere else.
 const KI_SHFL_TYPES = (Float32, Float64, Int32, UInt32, Int64, UInt64)
 
 for T in KI_SHFL_TYPES
     @eval @lava_device_override @inline KI.shfl(val::$T, lane::Integer) =
-        subgroup_shuffle(val, lane)
-    @eval @lava_device_override @inline KI.shfl_down(val::$T, offset::Integer) =
-        subgroup_shuffle_down(val, offset)
+        subgroup_shuffle(val, lane - one(lane))
+    # KernelInterface 0.4: a lane whose source is past the sub-group keeps its own
+    # value. SPIR-V leaves that lane undefined, so it is selected here.
+    @eval @lava_device_override @inline function KI.shfl_down(val::$T, offset::Integer)
+        moved = subgroup_shuffle_down(val, offset)
+        return lava_subgroup_local_id() + (offset % UInt32) < lava_subgroup_size() ? moved : val
+    end
 end
 
 # `KI.supports_shuffle(::LavaBackend, T)` reads this list but dispatches on a
