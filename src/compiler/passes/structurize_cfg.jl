@@ -160,6 +160,25 @@ function replace_undef_phi_operands_with_constants!(mod::LLVM.Module)
     return replaced
 end
 
+struct CFGTraversal
+    blocks::Vector{LLVM.BasicBlock}
+    successors::Vector{Vector{Int}}
+    predecessors::Vector{Vector{Int}}
+    visited::Vector{Int}
+    stamp::Base.RefValue{Int}
+end
+
+function CFGTraversal(f::LLVM.Function)
+    blocks = collect(f.blocks)
+    ids = Dict(bb => i for (i,bb) in enumerate(blocks))
+    successors = [Int[ids[s] for s in bb.terminator.successors] for bb in blocks]
+    predecessors = [Int[] for _ in blocks]
+    for (i,targets) in enumerate(successors), target in unique(targets)
+        push!(predecessors[target],i)
+    end
+    return CFGTraversal(blocks,successors,predecessors,zeros(Int,length(blocks)),Ref(0))
+end
+
 """
     isolate_shared_merge_targets!(f::LLVM.Function)
 
@@ -173,21 +192,26 @@ function isolate_shared_merge_targets!(f::LLVM.Function)
     # a `Dict` keyed by blocks iterates in an order set by their addresses, so the
     # same kernel came out with differently placed trampolines in every process,
     # and one of those shapes crashed lavapipe.
-    cond_sources = Dict{LLVM.BasicBlock, Vector{LLVM.BasicBlock}}()
-    targets = LLVM.BasicBlock[]
-    for bb in f.blocks
+    # Keep an indexed view of this pass's CFG. Re-reading LLVM successor views
+    # and the whole growing block list for every trampoline made large volume
+    # shaders spend minutes in this preparation step. Every inserted edge is
+    # mirrored below; the traversal and source ordering remain unchanged.
+    graph = CFGTraversal(f)
+    cond_sources = Dict{Int, Vector{Int}}()
+    targets = Int[]
+    for (id,bb) in enumerate(graph.blocks)
         term = bb.terminator
         term isa LLVM.BrInst || continue
         LLVM.isconditional(term) || continue
-        for succ in term.successors
+        for succ in graph.successors[id]
             # Skip self-loops (loop back-edges). These are handled correctly by
             # the SPIR-V backend as OpLoopMerge, not OpSelectionMerge. Including
             # them creates dead trampoline blocks that break PHI node invariants.
-            succ == bb && continue
+            succ == id && continue
             haskey(cond_sources, succ) || push!(targets, succ)
-            sources = get!(cond_sources, succ, LLVM.BasicBlock[])
+            sources = get!(cond_sources, succ, Int[])
             # Avoid counting the same source twice (both branches to same target)
-            bb in sources || push!(sources, bb)
+            id in sources || push!(sources, id)
         end
     end
 
@@ -199,9 +223,40 @@ function isolate_shared_merge_targets!(f::LLVM.Function)
         # The first source (in block order) keeps the direct edge; later ones get
         # trampolines. This matches clspv's isolateContinue() strategy.
         for src in sources[2:end]
-            insert_cfg_trampoline!(f, src, target)
+            insert_cfg_trampoline!(f, src, target, graph)
         end
     end
+end
+
+function insert_cfg_trampoline!(f::LLVM.Function, src::Int, target::Int, graph::CFGTraversal)
+    graph.stamp[] += 1
+    stamp = graph.stamp[]
+    worklist = Int[src]
+    while !isempty(worklist)
+        block = pop!(worklist)
+        (block == target || graph.visited[block] == stamp) && continue
+        graph.visited[block] = stamp
+        append!(worklist,graph.successors[block])
+    end
+    # Current predecessors are maintained in LLVM block order. Filtering this
+    # short list is equivalent to scanning every block in the function.
+    branchers = filter(i -> graph.visited[i] == stamp,graph.predecessors[target])
+    isempty(branchers) && return nothing
+    trampoline = insert_edge_trampoline!(f,graph.blocks[branchers],graph.blocks[target];name="cfg_fixup")
+    id = length(graph.blocks)+1
+    push!(graph.blocks,trampoline)
+    push!(graph.successors,Int[target])
+    push!(graph.predecessors,branchers)
+    push!(graph.visited,0)
+    for source in branchers
+        edges = graph.successors[source]
+        for i in eachindex(edges)
+            edges[i] == target && (edges[i] = id)
+        end
+    end
+    filter!(i -> graph.visited[i] != stamp,graph.predecessors[target])
+    push!(graph.predecessors[target],id)
+    return nothing
 end
 
 """

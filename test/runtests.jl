@@ -66,6 +66,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
     # On LLVM IR, before any SPIR-V exists.
     @testset "Tier 1b: Compiler IR passes" begin
         include(joinpath(@__DIR__, "test_replace_unreachable.jl"))
+        include(joinpath(@__DIR__, "test_cfg_traversal.jl"))
         include(joinpath(@__DIR__, "test_pointee_type_map.jl"))
         include(joinpath(@__DIR__, "test_barrier_skipping_paths.jl"))
         include(joinpath(@__DIR__, "test_constexpr_phi_operand.jl"))
