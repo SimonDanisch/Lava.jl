@@ -1205,8 +1205,11 @@ function emit_icmp!(state::SPIRVEmitterState, inst::LLVM.ICmpInst)
     ops = inst.operands
     lhs_val = ops[1]
     rhs_val = ops[2]
-    lhs = get_value_id!(state, lhs_val)
-    rhs = get_value_id!(state, rhs_val)
+    # Pointers compare as addresses. Julia's `===` on two structs holding device
+    # arrays compares them field by field, and a field LLVM loaded as `ptr` stays
+    # an `icmp` on pointers, which `OpIEqual` does not take.
+    lhs = operand_id!(state, lhs_val)
+    rhs = operand_id!(state, rhs_val)
 
     # SPIR-V requires both operands to have the same type.
     # LLVM constants may be i32 when the other operand is i8/i64/etc.
@@ -1236,6 +1239,24 @@ function emit_icmp!(state::SPIRVEmitterState, inst::LLVM.ICmpInst)
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, opcode, result_ty, result_id, lhs, rhs)
     state.value_map[inst] = result_id
+end
+
+"""
+    operand_id!(state, val) -> UInt32
+
+The id an integer comparison takes for `val`: its value, or for a pointer its
+address as a u64. Null is the constant 0. Any other pointer has to be a
+physical-storage-buffer pointer, the only kind SPIR-V converts to an integer.
+"""
+operand_id!(state::SPIRVEmitterState, val::LLVM.Value) =
+    val.value_type isa LLVM.PointerType ? pointer_address!(state, val) : get_value_id!(state, val)
+
+pointer_address!(state::SPIRVEmitterState, ::LLVM.PointerNull) =
+    emit_constant_u64!(state.mod, UInt64(0))
+function pointer_address!(state::SPIRVEmitterState, ptr::LLVM.Value)
+    is_psb_pointer(ptr) ||
+        error("Lava cannot compare a logical pointer by address (SPIR-V has no integer for it): $ptr")
+    return cached_psb_ptr_to_u64!(state, get_value_id!(state, ptr))
 end
 
 # FCmp predicate → SPIR-V opcode mapping
@@ -4321,47 +4342,54 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
             end
         end
 
-        # Simple case: byte offset evenly divides by element size
-        # Result is a pointer to the element type (not the array type)
-        elem_spirv = if sc == SC.Workgroup
-            map_workgroup_type!(state.type_ctx, elem_ty)
-        else
-            map_type!(state.type_ctx, elem_ty)
-        end
-        result_ptr_ty = map_pointer_type!(state.type_ctx, elem_spirv, sc)
+        # A dynamic offset that is not provably a whole number of elements, `(i << 4) | 8`
+        # into `[4 x float]` elements say, must not be divided by the element size: that
+        # drops the remainder, the float it picks, and every store lands on the first
+        # one. On a PSB pointer it is address arithmetic like any other byte offset (the
+        # non-composite path below, typed by its users).
+        if !(sc == SC.PhysicalStorageBuffer && elem_size > 0 && !divisible(ops[2], elem_size))
+            # Simple case: byte offset evenly divides by element size
+            # Result is a pointer to the element type (not the array type)
+            elem_spirv = if sc == SC.Workgroup
+                map_workgroup_type!(state.type_ctx, elem_ty)
+            else
+                map_type!(state.type_ctx, elem_ty)
+            end
+            result_ptr_ty = map_pointer_type!(state.type_ctx, elem_spirv, sc)
 
-        if elem_size == 1
-            idx_id = byte_offset_id
-        else
-            size_id = emit_int_constant!(state, idx_ty, Int64(elem_size))
-            idx_id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.functions, Op.OpSDiv, idx_spirv_ty, idx_id, byte_offset_id, size_id)
-        end
+            if elem_size == 1
+                idx_id = byte_offset_id
+            else
+                size_id = emit_int_constant!(state, idx_ty, Int64(elem_size))
+                idx_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpSDiv, idx_spirv_ty, idx_id, byte_offset_id, size_id)
+            end
 
-        # Convert to i32 for OpAccessChain index (SPIR-V requires i32 indices)
-        idx_i32 = if idx_ty isa LLVM.IntegerType && idx_ty.width > 32
-            u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
-            conv_id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, idx_id)
-            conv_id
-        else
-            idx_id
-        end
+            # Convert to i32 for OpAccessChain index (SPIR-V requires i32 indices)
+            idx_i32 = if idx_ty isa LLVM.IntegerType && idx_ty.width > 32
+                u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+                conv_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, idx_id)
+                conv_id
+            else
+                idx_id
+            end
 
-        # OpAccessChain into the array (not OpPtrAccessChain past it)
-        result_id = fresh_id!(state.mod)
-        word_count = UInt32(5)
-        push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
-        push!(state.mod.functions, result_ptr_ty)
-        push!(state.mod.functions, result_id)
-        push!(state.mod.functions, base_id)
-        push!(state.mod.functions, idx_i32)
-        state.value_map[inst] = result_id
-        set_pointee_type!(state.type_ctx.ptm, inst, elem_ty; priority=4)
-        # Register array element origin so chained byte-offset GEPs can fold offsets.
-        # E.g., gep i8, (gep i8, ptr @alloca, i64 %a), i64 %b  → AccessChain @alloca[a/sz + b/sz]
-        state.array_element_origin[inst] = (base_id, UInt32[], idx_i32, base_pointee)
-        return
+            # OpAccessChain into the array (not OpPtrAccessChain past it)
+            result_id = fresh_id!(state.mod)
+            word_count = UInt32(5)
+            push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
+            push!(state.mod.functions, result_ptr_ty)
+            push!(state.mod.functions, result_id)
+            push!(state.mod.functions, base_id)
+            push!(state.mod.functions, idx_i32)
+            state.value_map[inst] = result_id
+            set_pointee_type!(state.type_ctx.ptm, inst, elem_ty; priority=4)
+            # Register array element origin so chained byte-offset GEPs can fold offsets.
+            # E.g., gep i8, (gep i8, ptr @alloca, i64 %a), i64 %b  → AccessChain @alloca[a/sz + b/sz]
+            state.array_element_origin[inst] = (base_id, UInt32[], idx_i32, base_pointee)
+            return
+        end
     end
 
     # StructType: decompose constant byte offset into struct member index.
@@ -8788,7 +8816,48 @@ function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
         null_id = fresh_id!(state.mod)
         encode_instruction!(state.mod.types_constants, Op.OpConstantNull, spirv_ty, null_id)
         return null_id
+    elseif op == LLVM.API.LLVMICmp
+        # A pointer comparison LLVM left unfolded: Julia guards a constant global (a
+        # tuple a loop iterates over, say) with `icmp ne (addrspacecast (ptr null),
+        # @_j_const_1)`. A global's address is never null, so the answer is known.
+        answer = folded_pointer_icmp(val)
+        answer === nothing && error("Unsupported ConstantExpr icmp (operands not null or globals): $val")
+        id = fresh_id!(state.mod)
+        bool_ty = map_type!(state.type_ctx, LLVM.Int1Type())
+        encode_instruction!(state.mod.types_constants, answer ? UInt16(41) : UInt16(42), bool_ty, id)  # OpConstantTrue/False
+        return id
     else
         error("Unsupported ConstantExpr opcode: $op in $val")
     end
+end
+
+"""
+    constant_pointer(v) -> :null, the `GlobalVariable`, or `nothing`
+
+What a constant pointer is, looking through address-space casts and bitcasts: the null
+pointer, a global's address, or something else.
+"""
+function constant_pointer(v::LLVM.Value)
+    v isa LLVM.PointerNull && return :null
+    v isa LLVM.GlobalVariable && return v
+    if v isa LLVM.ConstantExpr && v.opcode in (LLVM.API.LLVMAddrSpaceCast, LLVM.API.LLVMBitCast)
+        return constant_pointer(v.operands[1])
+    end
+    return nothing
+end
+
+"""
+    folded_pointer_icmp(val) -> Bool or `nothing`
+
+The value of the constant `icmp eq`/`ne` `val` between pointers that are null or global
+addresses, which LLVM did not fold: globals are never null, and two globals are equal
+only if they are the same one. `nothing` for anything else.
+"""
+function folded_pointer_icmp(val::LLVM.ConstantExpr)
+    pred = LLVM.API.LLVMGetICmpPredicate(val)
+    pred in (LLVM.API.LLVMIntEQ, LLVM.API.LLVMIntNE) || return nothing
+    a = constant_pointer(val.operands[1]); b = constant_pointer(val.operands[2])
+    (a === nothing || b === nothing) && return nothing
+    equal = (a === :null && b === :null) || (a isa LLVM.GlobalVariable && b isa LLVM.GlobalVariable && a == b)
+    return pred == LLVM.API.LLVMIntEQ ? equal : !equal
 end

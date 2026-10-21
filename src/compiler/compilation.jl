@@ -1330,7 +1330,9 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     verify_passes = false
 
     # ── Lower LLVM intrinsics unsupported by SPIR-V ──
-    # memcpy → typed loads/stores, lifetime markers → removed
+    # memcpy → typed loads/stores, lifetime markers → removed. Struct results'
+    # boxes get their struct type first so the copies into them are typed.
+    type_sret_boxes!(mod, mod.datalayout)
     lower_unsupported_intrinsics!(mod)
     verify_ir!("lower_intrinsics")
     checkpoint("addrspace+runtime+lower_intrinsics")
@@ -3082,6 +3084,21 @@ function lower_memcpy!(inst::LLVM.CallInst, dl::LLVM.DataLayout; overlapping::Bo
             copy_type = allocated
         end
     end
+    # The same for a helper's `sret`/`byval` parameter on the stack: a helper that
+    # returns a struct field (`return m.c`, a device array) copies it into its
+    # `sret` slot. As i32 words the emitter has no member to address in the
+    # field's struct and emits `OpLoad %uint` on a struct pointer.
+    if copy_type === nothing && len_val isa LLVM.ConstantInt &&
+       dst.value_type.addrspace == 0 && src.value_type.addrspace == 0
+        for p in (dst, src)
+            p isa LLVM.Argument || continue
+            declared = param_type(p)
+            if declared !== nothing && convert(Int, len_val) == Int(compute_type_size(declared, dl))
+                copy_type = declared
+                break
+            end
+        end
+    end
     # Workgroup memory is addressed logically: a struct element cannot be written
     # or read as i32 words. Between two workgroup elements the chunked copy below
     # emits loads `spirv-val` rejects; from the stack INTO workgroup memory it
@@ -3156,11 +3173,61 @@ indexes to, a global's value type. `nothing` for anything else.
 """
 addressed_type(a::LLVM.AllocaInst) = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(a))
 addressed_type(gv::LLVM.GlobalVariable) = gv.global_value_type
+addressed_type(arg::LLVM.Argument) = param_type(arg)
 addressed_type(gep::LLVM.GetElementPtrInst) = indexed_type(gep.source_element_type, gep.operands[3:end])
 addressed_type(ce::LLVM.ConstantExpr) =
     ce.opcode == LLVM.API.LLVMGetElementPtr ?
         indexed_type(ce.source_element_type, ce.operands[3:end]) : nothing
 addressed_type(::LLVM.Value) = nothing
+
+"""
+    param_type(arg, kinds = (:sret, :byval))
+
+The type a pointer parameter declares it points at through one of the attributes
+`kinds`. `nothing` when it declares none.
+"""
+function param_type(arg::LLVM.Argument, kinds = (:sret, :byval))
+    fn = LLVM.parent(arg)
+    i = findfirst(==(arg), collect(LLVM.parameters(fn)))
+    for attr in collect(fn.parameter_attributes[i])
+        attr isa LLVM.TypeAttribute && attr.kind in kinds && return attr.value
+    end
+    return nothing
+end
+
+"""
+    type_sret_boxes!(mod, dl)
+
+Julia allocates the box a helper writes its struct result into as raw words,
+`alloca [2 x i64]` for a `{ptr, [1 x i64]}` device array. The helper's parameter
+takes its pointee type from that box, so the struct the helper stores has no
+matching member layout. Retype each box to the `sret` type the callee declares
+when the sizes agree; later passes fix the caller's word-typed GEPs on it.
+"""
+function type_sret_boxes!(mod::LLVM.Module, dl::LLVM.DataLayout)
+    for fn in mod.functions, bb in fn.blocks, inst in collect(bb.instructions)
+        inst isa LLVM.CallInst || continue
+        callee = inst.called_operand
+        callee isa LLVM.Function && !isempty(callee.blocks) || continue
+        for (i, param) in enumerate(LLVM.parameters(callee))
+            box = inst.operands[i]
+            box isa LLVM.AllocaInst || continue
+            declared = param_type(param, (:sret,))
+            declared === nothing && continue
+            allocated = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(box))
+            allocated == declared && continue
+            compute_type_size(allocated, dl) == compute_type_size(declared, dl) || continue
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                LLVM.position!(builder, LLVM.before(box))
+                typed = LLVM.alloca!(builder, declared, LLVM.name(box))
+                typed.alignment = box.alignment
+                LLVM.replace_uses!(box, typed)
+                LLVM.erase!(box)
+            end
+        end
+    end
+    return mod
+end
 
 """The type GEP indices after the first select inside `ty`."""
 function indexed_type(ty::LLVM.LLVMType, idxs)

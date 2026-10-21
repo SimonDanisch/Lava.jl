@@ -494,7 +494,7 @@ function infer_pointee_from_users(ptr_value::LLVM.Value, visited::Set{LLVM.Value
         if user isa LLVM.GetElementPtrInst
             src_ty = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(user))
             if src_ty isa LLVM.IntegerType && src_ty.width == 8
-                result = infer_type_from_gep_users(user)
+                result = infer_type_from_gep_users(user, visited)
                 result !== nothing && return result
             end
         elseif user isa LLVM.LoadInst
@@ -507,7 +507,7 @@ function infer_pointee_from_users(ptr_value::LLVM.Value, visited::Set{LLVM.Value
             return user.operands[2].value_type
         elseif user isa LLVM.AtomicCmpXchgInst
             return user.operands[2].value_type
-        elseif user isa LLVM.PHIInst
+        elseif user isa LLVM.PHIInst || user isa LLVM.SelectInst
             result = infer_pointee_from_users(user, visited)
             result !== nothing && return result
         end
@@ -572,8 +572,13 @@ function collect_inttoptr!(ptm::PointeeTypeMap, inst::LLVM.IntToPtrInst)
 end
 
 """Infer the pointee type by looking at loads/stores that use a GEP result.
-Follows chained byte-offset GEPs (i8 source type) to reach the final load/store."""
-function infer_type_from_gep_users(gep::LLVM.GetElementPtrInst)
+Follows chained byte-offset GEPs (i8 source type) to reach the final load/store, and
+the pointers a `phi` or `select` picks between: LLVM sinks one load below a choice
+of field pointers (one per type of a union, say), so the GEP's only user can be the
+`phi` and the load comes after it."""
+function infer_type_from_gep_users(gep::LLVM.GetElementPtrInst, visited::Set{LLVM.Value} = Set{LLVM.Value}())
+    gep in visited && return nothing
+    push!(visited, gep)
     for use in gep.uses
         user = use.user
         if user isa LLVM.LoadInst
@@ -584,14 +589,18 @@ function infer_type_from_gep_users(gep::LLVM.GetElementPtrInst)
                 return user.operands[1].value_type
             end
         elseif user isa LLVM.AtomicRMWInst || user isa LLVM.AtomicCmpXchgInst
-            return user.operands[2].value_type
+            # An atomic on the field: what it reads and writes
+            user.operands[1] === gep && return user.operands[2].value_type
         elseif user isa LLVM.GetElementPtrInst
             # Follow chained byte-offset GEPs (common pattern: two i8 GEPs in sequence)
             sub_src = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(user))
             if sub_src isa LLVM.IntegerType && sub_src.width == 8
-                result = infer_type_from_gep_users(user)
+                result = infer_type_from_gep_users(user, visited)
                 result !== nothing && return result
             end
+        elseif user isa LLVM.PHIInst || user isa LLVM.SelectInst
+            result = infer_pointee_from_users(user, visited)
+            result !== nothing && return result
         end
     end
     return nothing

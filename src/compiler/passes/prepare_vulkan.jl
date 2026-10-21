@@ -3930,7 +3930,13 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                     # Straight off the alloca, because the offset is computed from
                     # this GEP's own indices and would be relative to whatever a
                     # chained base points at.
-                    flat = !is_byte_gep && length(ops) == 2 && ops[1] == alloca
+                    # Straight off the alloca, with any number of indices: the offset
+                    # is then the alloca's, whatever type the GEP itself names. That
+                    # type can be stale, an alloca's former type left in a GEP after a
+                    # pass retyped the alloca (`[5 x i32]`, indexed as the
+                    # `{ [2 x i32], [2 x i32], float }` it was), and only the alloca's
+                    # own field at the offset says what a load there reads.
+                    flat = !is_byte_gep && ops[1] == alloca
                     containing = nothing
                     if aggregate && (is_byte_gep || flat)
                         for (path, fty, foff) in flatten_type_with_offsets(alloca_ty; dl)
@@ -3942,6 +3948,24 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                         end
                     end
                     is_byte_gep && aggregate && containing === nothing && continue
+                    # The load is exactly the alloca's field at the offset, but through a
+                    # GEP whose own type disagrees: address the field through the
+                    # alloca's type instead, and the emitter sees no pun at all.
+                    if flat && containing !== nothing && containing[2] == load_ty &&
+                       gep_byte_off == containing[3] && elem_ty != load_ty
+                        LLVM.@dispose builder=LLVM.IRBuilder() begin
+                            LLVM.position!(builder, insertion_point(inst))
+                            idx_values = LLVM.Value[LLVM.ConstantInt(LLVM.IntType(32), 0)]
+                            for idx in containing[1]
+                                push!(idx_values, LLVM.ConstantInt(LLVM.IntType(32), idx))
+                            end
+                            field_ptr = LLVM.gep!(builder, alloca_ty, alloca, idx_values, "typepun_gep")
+                            LLVM.API.LLVMSetOperand(inst, 0, field_ptr)
+                        end
+                        LLVM.name!(inst, "typepun_" * LLVM.name(inst))
+                        changed = true
+                        break
+                    end
                     flat_pun = flat && containing !== nothing &&
                                (containing[2] != load_ty || gep_byte_off != containing[3]) &&
                                gep_byte_off - containing[3] + load_size <=
@@ -4073,11 +4097,13 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                             LLVM.position!(builder, insertion_point(inst))
                             replaced = false
 
-                            # Avoid illegal i128/i256 bitcasts (unsupported in Vulkan SPIR-V):
-                            # for wide composite pointees, assemble only the needed low bytes
-                            # from scalar subfields.
-                            if (elem_ty isa LLVM.StructType || elem_ty isa LLVM.ArrayType) &&
-                               (elem_size * 8 > 64)
+                            # A composite pointee is never loaded whole and bitcast: SPIR-V has
+                            # no `OpBitcast` from an array or struct, and wider than 64 bits no
+                            # integer to cast to either. Assemble only the needed low bytes from
+                            # its scalar subfields. A `[2 x i32]` SetKey read as one `i32` (a
+                            # field of Hikari's `MediumInterfaceIdx` in its work items) came
+                            # through as `load [2 x i32]` + `bitcast to i64` before.
+                            if elem_ty isa LLVM.StructType || elem_ty isa LLVM.ArrayType
                                 subfields = flatten_type_with_offsets(elem_ty; dl)
                                 selected = filter(subfields) do (_, fty, foff)
                                     fsz = llvm_type_size(fty)

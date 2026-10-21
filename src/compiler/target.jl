@@ -128,6 +128,20 @@ function GPUCompiler.validate_ir(job::LavaCompilerJob, mod::LLVM.Module)
     return errors
 end
 
+# GPUCompiler's datalayout for SPIR-V names no native integer widths; LLVM's own SPIR-V
+# target's does (`n8:16:32:64`). Without them InstCombine narrows an integer to any
+# width it proves enough: a switch over `1:6` on a counter became a switch on an
+# `i63`, for which SPIR-V has no type. With them it keeps to the native widths. Set
+# once the run-time library is linked in (its layout has to match), before optimizing.
+GPUCompiler.finish_linked_module!(job::LavaCompilerJob, mod::LLVM.Module) = (native!(mod); nothing)
+
+"Declare SPIR-V's native integer widths in `mod`'s datalayout, unless it declares some (`n32:64`, not Julia's `ni:10:11`)."
+function native!(mod::LLVM.Module)
+    dl = string(mod.datalayout)
+    any(startswith(r"n\d"), split(dl, '-')) || LLVM.datalayout!(mod, dl * "-n8:16:32:64")
+    return mod
+end
+
 function GPUCompiler.finish_ir!(job::LavaCompilerJob, mod::LLVM.Module, entry::LLVM.Function)
     # SPIR-V cannot abort a compute kernel: `trap` goes, `unreachable` becomes `ret`
     GPUCompiler.lower_unreachable_control_flow!(job, mod)

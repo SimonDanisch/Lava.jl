@@ -40,6 +40,31 @@ stays visible (see the top of this file).
 disjointor(v::LLVM.Value) = v isa LLVM.OrInst && LLVM.API.LLVMGetIsDisjoint(v) != 0
 
 """
+    divisible(v, n) -> Bool
+
+Whether the integer `v` is provably a multiple of `n`: a constant multiple, a product
+or a shift with a factor that is, a sum, difference or disjoint `or` of two that are,
+an extension of one that is. `false` when it cannot tell.
+"""
+function divisible(v::LLVM.Value, n::Integer)
+    n == 1 && return true
+    v isa LLVM.ConstantInt && return convert(Int64, v) % n == 0
+    if v isa LLVM.ShlInst
+        a, b = LLVM.operands(v)
+        return (b isa LLVM.ConstantInt && (Int64(1) << convert(Int64, b)) % n == 0) || divisible(a, n)
+    elseif v isa LLVM.MulInst
+        a, b = LLVM.operands(v)
+        return divisible(a, n) || divisible(b, n)
+    elseif v isa LLVM.AddInst || v isa LLVM.SubInst || disjointor(v)
+        a, b = LLVM.operands(v)
+        return divisible(a, n) && divisible(b, n)
+    elseif v isa LLVM.ZExtInst || v isa LLVM.SExtInst
+        return divisible(LLVM.operands(v)[1], n)
+    end
+    return false
+end
+
+"""
     foldedoffset(dl, v) -> Int64
 
 The constant byte offset RADV folds out of the PSB address `v`: every constant
