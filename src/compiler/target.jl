@@ -131,7 +131,6 @@ end
 function GPUCompiler.finish_ir!(job::LavaCompilerJob, mod::LLVM.Module, entry::LLVM.Function)
     # SPIR-V cannot abort a compute kernel: `trap` goes, `unreachable` becomes `ret`
     GPUCompiler.lower_unreachable_control_flow!(job, mod)
-    demote_atomic_accesses!(mod)
     # LLVM's minimum/maximum order signed zeros and propagate NaNs
     GPUCompiler.lower_minimum_maximum!(mod)
     # byval parameters wrapped in a struct, which the entry wrapper expects
@@ -143,25 +142,6 @@ function GPUCompiler.finish_ir!(job::LavaCompilerJob, mod::LLVM.Module, entry::L
     push!(get!(mod.metadata, "opencl.spirv.version").operands,
           LLVM.MDNode([LLVM.ConstantInt(Int32(1)), LLVM.ConstantInt(Int32(5))]))
     return entry
-end
-
-"""
-    demote_atomic_accesses!(mod) -> Bool
-
-Make every atomic load and store a plain one, leaving `atomicrmw` and `cmpxchg`.
-The emitter has no atomic load or store, and on the device the orderings of the
-loads and stores Julia emits (type tags, references, `unordered` heap accesses)
-carry no meaning. GPUCompiler did this for every SPIR-V job until 2.10.
-"""
-function demote_atomic_accesses!(mod::LLVM.Module)
-    changed = false
-    for f in mod.functions, bb in f.blocks, inst in bb.instructions
-        (inst isa LLVM.LoadInst || inst isa LLVM.StoreInst) || continue
-        LLVM.isatomic(inst) || continue
-        inst.ordering = LLVM.AtomicOrdering.NotAtomic
-        changed = true
-    end
-    return changed
 end
 
 # Relocatable code, so compiled SPIR-V can go into a package image with its

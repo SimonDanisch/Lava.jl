@@ -583,6 +583,8 @@ function infer_type_from_gep_users(gep::LLVM.GetElementPtrInst)
             if user.operands[2] === gep
                 return user.operands[1].value_type
             end
+        elseif user isa LLVM.AtomicRMWInst || user isa LLVM.AtomicCmpXchgInst
+            return user.operands[2].value_type
         elseif user isa LLVM.GetElementPtrInst
             # Follow chained byte-offset GEPs (common pattern: two i8 GEPs in sequence)
             sub_src = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(user))

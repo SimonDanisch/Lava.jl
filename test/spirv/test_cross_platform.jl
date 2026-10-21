@@ -41,7 +41,7 @@ using GeometryBasics
 
     @testset "no CrossDevice scope in atomics" begin
         function atomic_kernel(counter)
-            Lava.Atomix.@atomic counter[1] += Int32(1)
+            Lava.Atomix.@atomic :monotonic counter[1] += Int32(1)
             return nothing
         end
         d, _ = compile_and_disasm(atomic_kernel,

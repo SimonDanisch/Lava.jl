@@ -29,7 +29,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
     @testset "atomic int add" begin
         function atomic_add(counter, A)
             i = Lava.lava_global_invocation_id_x()
-            @inbounds Lava.Atomix.@atomic counter[1] += A[i]
+            @inbounds Lava.Atomix.@atomic :monotonic counter[1] += A[i]
             return nothing
         end
         d, _ = compile_and_disasm(atomic_add,
@@ -42,7 +42,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
 
     @testset "atomic uint add" begin
         function atomic_uadd(counter, val)
-            Lava.Atomix.@atomic counter[1] += val
+            Lava.Atomix.@atomic :monotonic counter[1] += val
             return nothing
         end
         d, _ = compile_and_disasm(atomic_uadd,
@@ -52,7 +52,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
 
     @testset "f32 atomic add (hardware OpAtomicFAddEXT)" begin
         function f32_atomic(counter)
-            Lava.Atomix.@atomic counter[1] += 1.0f0
+            Lava.Atomix.@atomic :monotonic counter[1] += 1.0f0
             return nothing
         end
         d, _ = compile_and_disasm(f32_atomic,
@@ -75,7 +75,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         function cas_insert(keys, vals, key, val, cap)
             slot = Int32(1)
             while true
-                prev = (Lava.Atomix.@atomicreplace keys[slot] typemax(UInt64) => key).old
+                prev = (Lava.Atomix.@atomicreplace :monotonic keys[slot] typemax(UInt64) => key).old
                 if prev == typemax(UInt64) || prev == key
                     @inbounds vals[slot] = val
                     return nothing

@@ -250,7 +250,7 @@ end
     @testset "atomics reach linear_index" begin
         function split_atomic(A)
             i = Int(Lava.lava_global_invocation_id_x()) + 1
-            @inbounds @atomic A[i, 1] += 1.0f0
+            @inbounds @atomic :monotonic A[i, 1] += 1.0f0
             return nothing
         end
         A2 = Lava.LavaDeviceArray{Float32, 2}

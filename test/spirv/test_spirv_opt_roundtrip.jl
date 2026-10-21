@@ -79,7 +79,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
 
     @testset "atomics" begin
         function atomic_kernel(counter)
-            Lava.Atomix.@atomic counter[1] += Int32(1)
+            Lava.Atomix.@atomic :monotonic counter[1] += Int32(1)
             return nothing
         end
         _, opt = compile_and_optimize(atomic_kernel, Tuple{Lava.LavaDeviceArray{Int32,1}})

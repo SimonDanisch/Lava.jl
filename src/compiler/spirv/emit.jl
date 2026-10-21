@@ -1094,6 +1094,8 @@ function emit_instruction!(state::SPIRVEmitterState, inst::LLVM.Instruction)
         emit_atomicrmw!(state, inst)
     elseif inst isa LLVM.AtomicCmpXchgInst
         emit_cmpxchg!(state, inst)
+    elseif inst isa LLVM.FenceInst
+        emit_fence!(state, inst)
     # Freeze — treat as no-op (pass through operand)
     elseif inst isa LLVM.FreezeInst
         ops = inst.operands
@@ -1415,6 +1417,7 @@ function finish_reconciled_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst, 
 end
 
 function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
+    LLVM.isatomic(inst) && return emit_atomic_load!(state, inst)
     ptr = inst.operands[1]
     load_ty = inst.value_type
 
@@ -2296,6 +2299,7 @@ function resolve_struct_field_store!(state::SPIRVEmitterState, ptr::LLVM.Value,
 end
 
 function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
+    LLVM.isatomic(inst) && return emit_atomic_store!(state, inst)
     ops = inst.operands
     value = ops[1]
     ptr = ops[2]
@@ -8269,63 +8273,143 @@ end
 # Atomics
 # ================================================================
 
-"""
-Map LLVM atomic ordering + pointer storage class to SPIR-V memory semantics.
+# LLVM acquire/release orders all shared memory, not just the flag's storage
+# class. A workgroup flag may protect buffer data (and conversely).
+const LLVM_ORDERED_MEMORY = MemSem.UniformMemory | MemSem.WorkgroupMemory | MemSem.ImageMemory
 
-With the Vulkan memory model (VulkanKHR), atomic operations need explicit
-MakeAvailableKHR/MakeVisibleKHR flags for writes to be visible across
-invocations. Without these, even seq_cst atomics provide only atomicity
-(correct counter values) but NOT memory visibility for non-atomic stores
-— which breaks cross-workgroup patterns like BVH refit where Thread A
-writes node data, atomics on a flag, and Thread B reads via the flag.
-"""
-function atomic_mem_semantics(inst::LLVM.Instruction, ptr::LLVM.Value)::UInt32
-    ord = atomic_ordering(inst)
-
-    # Determine storage class bit for the pointer's memory
-    sc = get_pointer_storage_class(ptr)
-    sc_bit = if sc == SC.Workgroup
-        MemSem.WorkgroupMemory   # 0x100
-    else
-        # StorageBuffer, PhysicalStorageBuffer, Uniform all use UniformMemory
-        MemSem.UniformMemory     # 0x40
-    end
-
+function atomic_mem_semantics(ord::LLVM.API.LLVMAtomicOrdering)::UInt32
     if ord == LLVM.API.LLVMAtomicOrderingMonotonic ||
        ord == LLVM.API.LLVMAtomicOrderingUnordered
-        # Relaxed — just atomicity, no ordering
         return MemSem.Relaxed
     elseif ord == LLVM.API.LLVMAtomicOrderingAcquire
-        return MemSem.Acquire | sc_bit | MemSem.MakeVisibleKHR
+        return MemSem.Acquire | LLVM_ORDERED_MEMORY | MemSem.MakeVisibleKHR
     elseif ord == LLVM.API.LLVMAtomicOrderingRelease
-        return MemSem.Release | sc_bit | MemSem.MakeAvailableKHR
-    else
-        # AcquireRelease or SequentiallyConsistent
-        # Vulkan memory model doesn't support SequentiallyConsistent;
-        # AcquireRelease + MakeAvailable + MakeVisible is the equivalent.
-        return MemSem.AcquireRelease | sc_bit | MemSem.MakeAvailableKHR | MemSem.MakeVisibleKHR
+        return MemSem.Release | LLVM_ORDERED_MEMORY | MemSem.MakeAvailableKHR
+    elseif ord == LLVM.API.LLVMAtomicOrderingAcquireRelease
+        return MemSem.AcquireRelease | LLVM_ORDERED_MEMORY | MemSem.MakeAvailableKHR | MemSem.MakeVisibleKHR
+    elseif ord == LLVM.API.LLVMAtomicOrderingSequentiallyConsistent
+        error("Lava cannot preserve sequentially consistent (seq_cst) atomic ordering under the Vulkan memory model; request an explicit supported ordering only when the algorithm permits it")
     end
+    error("Unsupported LLVM atomic ordering: $ord")
 end
 
-"""
-The ordering an atomic instruction's memory semantics come from. A `cmpxchg` has
-two, and LLVM.jl 10 refuses `ordering` on one: the semantics of the exchange are
-its success ordering's, and [`atomic_mem_semantics_acquire_only`](@ref) reads the
-failure ordering for the path where it writes nothing.
-"""
 atomic_ordering(inst::LLVM.AtomicCmpXchgInst) = inst.success_ordering
 atomic_ordering(inst::LLVM.Instruction) = inst.ordering
-
-"""Acquire-only variant for cmpxchg failure path (no release, a failed CAS writes nothing)."""
-function atomic_mem_semantics_acquire_only(inst::LLVM.AtomicCmpXchgInst, ptr::LLVM.Value)::UInt32
-    ord = inst.failure_ordering
-    if ord == LLVM.API.LLVMAtomicOrderingMonotonic ||
-       ord == LLVM.API.LLVMAtomicOrderingUnordered
-        return MemSem.Relaxed
+function atomic_mem_semantics(inst::LLVM.Instruction, ptr::LLVM.Value)::UInt32
+    order = atomic_ordering(inst)
+    # LLVM allows an acquire failure even with relaxed/release success. SPIR-V
+    # forbids that pair. Strengthening the success path preserves both LLVM
+    # contracts; weakening the failure path would not.
+    if inst isa LLVM.AtomicCmpXchgInst && inst.failure_ordering == LLVM.API.LLVMAtomicOrderingAcquire
+        if order == LLVM.API.LLVMAtomicOrderingMonotonic
+            order = LLVM.API.LLVMAtomicOrderingAcquire
+        elseif order == LLVM.API.LLVMAtomicOrderingRelease
+            order = LLVM.API.LLVMAtomicOrderingAcquireRelease
+        end
     end
+    semantics = atomic_mem_semantics(order)
+    inst.volatile && (semantics |= MemSem.Volatile)
+    return semantics
+end
+function atomic_mem_semantics_acquire_only(inst::LLVM.AtomicCmpXchgInst, ptr::LLVM.Value)::UInt32
+    semantics = atomic_mem_semantics(inst.failure_ordering)
+    inst.volatile && (semantics |= MemSem.Volatile)
+    return semantics
+end
+
+# Never silently narrow Device to QueueFamily: Mantle can use several families.
+# System includes host agents and has no equivalent shader atomic scope here.
+function atomic_scope!(state::SPIRVEmitterState, inst::LLVM.Instruction)
+    name = inst.syncscope.name
+    scope = if name == "device"
+        require_capability!(state.mod, Cap.VulkanMemoryModelDeviceScope)
+        Scope.Device
+    elseif name == "workgroup"
+        Scope.Workgroup
+    elseif name == "subgroup"
+        Scope.Subgroup
+    elseif name == "singlethread"
+        atomic_ordering(inst) in (LLVM.API.LLVMAtomicOrderingUnordered,
+            LLVM.API.LLVMAtomicOrderingMonotonic) ||
+            error("Unsupported ordered singlethread atomic: Vulkan Invocation scope requires relaxed semantics")
+        Scope.Invocation
+    elseif name == "queuefamily"
+        Scope.QueueFamily
+    else
+        error("Unsupported LLVM atomic syncscope $(repr(name)); Lava shader atomics require an explicit device, workgroup, subgroup, singlethread or queuefamily scope")
+    end
+    return emit_constant_u32!(state.mod, scope)
+end
+
+# Atomic accesses cannot use ordinary load/store decomposition or bit-punning:
+# it would split one indivisible operation into several non-atomic accesses.
+function atomic_pointer!(state::SPIRVEmitterState, ptr::LLVM.Value, ty::LLVM.LLVMType)
+    ty isa LLVM.IntegerType && ty.width in (32, 64) ||
+        error("Unsupported atomic access type $ty; Lava supports 32- and 64-bit integer atomics")
     sc = get_pointer_storage_class(ptr)
-    sc_bit = sc == SC.Workgroup ? MemSem.WorkgroupMemory : MemSem.UniformMemory
-    return MemSem.Acquire | sc_bit | MemSem.MakeVisibleKHR
+    sc in (SC.PhysicalStorageBuffer, SC.Workgroup, SC.StorageBuffer) ||
+        error("Unsupported atomic pointer storage class $sc")
+    ty.width == 64 && require_capability!(state.mod, Cap.Int64Atomics)
+    ptr_id = get_value_id!(state, ptr)
+    pointee = get_pointee_type(state.type_ctx.ptm, ptr)
+    if pointee !== nothing && pointee != ty
+        sc == SC.PhysicalStorageBuffer || error("Atomic pointer type mismatch: $pointee versus $ty")
+        ptr_ty = map_pointer_type!(state.type_ctx, map_type!(state.type_ctx, ty), sc)
+        ptr_id = emit_psb_ptr_reinterpret!(state, ptr_ty, ptr_id)
+    end
+    return ptr_id
+end
+
+# Floating-point loads/stores are bit-preserving integer atomics. Their bit
+# representation changes neither the stored value nor the ordering contract.
+function atomic_access_type(ty::LLVM.LLVMType)
+    ty isa LLVM.IntegerType && return ty
+    ty isa LLVM.FloatType && return LLVM.Int32Type()
+    ty isa LLVM.DoubleType && return LLVM.Int64Type()
+    error("Unsupported atomic access type $ty")
+end
+
+function emit_atomic_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
+    ptr = inst.operands[1]
+    scope = atomic_scope!(state, inst)
+    semantics = emit_constant_u32!(state.mod, atomic_mem_semantics(inst, ptr))
+    access_ty = atomic_access_type(inst.value_type)
+    inst.alignment >= access_ty.width ÷ 8 || error("Under-aligned atomic load")
+    ptr_id = atomic_pointer!(state, ptr, access_ty)
+    id = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpAtomicLoad,
+        map_type!(state.type_ctx, access_ty), id, ptr_id, scope, semantics)
+    if access_ty != inst.value_type
+        bits = id
+        id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpBitcast,
+            map_type!(state.type_ctx, inst.value_type), id, bits)
+    end
+    state.value_map[inst] = id
+end
+
+function emit_atomic_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
+    value, ptr = inst.operands
+    scope = atomic_scope!(state, inst)
+    semantics = emit_constant_u32!(state.mod, atomic_mem_semantics(inst, ptr))
+    access_ty = atomic_access_type(value.value_type)
+    inst.alignment >= access_ty.width ÷ 8 || error("Under-aligned atomic store")
+    ptr_id = atomic_pointer!(state, ptr, access_ty)
+    value_id = get_value_id!(state, value)
+    if access_ty != value.value_type
+        bits = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpBitcast,
+            map_type!(state.type_ctx, access_ty), bits, value_id)
+        value_id = bits
+    end
+    encode_instruction!(state.mod.functions, Op.OpAtomicStore,
+        ptr_id, scope, semantics, value_id)
+end
+
+function emit_fence!(state::SPIRVEmitterState, inst::LLVM.FenceInst)
+    scope = atomic_scope!(state, inst)
+    semantics = emit_constant_u32!(state.mod, atomic_mem_semantics(inst.ordering))
+    encode_instruction!(state.mod.functions, Op.OpMemoryBarrier, scope, semantics)
 end
 
 function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
@@ -8341,9 +8425,7 @@ function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
     result_ty = map_type!(state.type_ctx, result_llvm_ty)
     result_id = fresh_id!(state.mod)
 
-    # Determine scope: QueueFamily is equivalent to Device for single-queue Vulkan
-    # and doesn't require VulkanMemoryModelDeviceScopeKHR capability
-    scope_id = emit_constant_u32!(state.mod, Scope.QueueFamily)
+    scope_id = atomic_scope!(state, inst)
 
     # Memory semantics — derived from LLVM ordering + pointer storage class
     mem_sem_id = emit_constant_u32!(state.mod, atomic_mem_semantics(inst, ptr))
@@ -8406,10 +8488,9 @@ function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
         # variants need their own capability bits (not defined in Lava today).
         result_llvm_ty isa LLVM.FloatType ||
             error("OpAtomicFMin/FMax: only Float32 is wired up today")
-        # Capability numbers for the min/max variants live in the SPV_EXT spec;
-        # we gate the op on the same buffer-atomics device feature as FAdd,
-        # which is the common Vulkan arrangement on AMD/NVIDIA.
-        require_capability!(state.mod, Cap.AtomicFloat32AddEXT)
+        # SPV_EXT_shader_atomic_float_min_max has its own capability, not the
+        # FAdd capability from SPV_EXT_shader_atomic_float_add.
+        require_capability!(state.mod, Cap.AtomicFloat32MinMaxEXT)
         require_extension!(state.mod, "SPV_EXT_shader_atomic_float_min_max")
         is_min ? Op.OpAtomicFMinEXT : Op.OpAtomicFMaxEXT
     else
@@ -8467,8 +8548,7 @@ function emit_cmpxchg!(state::SPIRVEmitterState, inst::LLVM.AtomicCmpXchgInst)
         require_capability!(state.mod, Cap.Int64Atomics)
     end
 
-    # Scope — QueueFamily (equivalent to Device for single-queue, no extra capability)
-    scope_id = emit_constant_u32!(state.mod, Scope.QueueFamily)
+    scope_id = atomic_scope!(state, inst)
     # Memory semantics — derived from LLVM ordering + pointer storage class
     mem_sem = atomic_mem_semantics(inst, ptr)
     mem_sem_equal_id = emit_constant_u32!(state.mod, mem_sem)

@@ -409,6 +409,7 @@ module Cap
     const Int16                         = UInt32(22)
     const StorageBuffer16BitAccess      = UInt32(4433)
     const VulkanMemoryModel             = UInt32(5345)
+    const VulkanMemoryModelDeviceScope  = UInt32(5346)
     const PhysicalStorageBufferAddresses = UInt32(5347)
     const VariablePointers              = UInt32(4442)
     const VariablePointersStorageBuffer = UInt32(4441)
@@ -422,6 +423,7 @@ module Cap
     const WorkgroupMemoryExplicitLayout16BitAccessKHR = UInt32(4430)
     # Float atomic ops (VK_EXT_shader_atomic_float / SPV_EXT_shader_atomic_float_add)
     const AtomicFloat32AddEXT           = UInt32(6033)
+    const AtomicFloat32MinMaxEXT        = UInt32(5612)
     const AtomicFloat64AddEXT           = UInt32(6034)
     const AtomicFloat16AddEXT           = UInt32(6095)
     # Subgroup ops (Vulkan 1.1 core)
@@ -646,6 +648,7 @@ end
 
 # ---- Memory Semantics (for atomics) ----
 module MemSem
+    const Volatile          = UInt32(0x8000)
     const Relaxed           = UInt32(0x0)
     const Acquire           = UInt32(0x2)
     const Release           = UInt32(0x4)
