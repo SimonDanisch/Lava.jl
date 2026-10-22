@@ -70,6 +70,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         include(joinpath(@__DIR__, "test_pointee_type_map.jl"))
         include(joinpath(@__DIR__, "test_barrier_skipping_paths.jl"))
         include(joinpath(@__DIR__, "test_constexpr_phi_operand.jl"))
+        include(joinpath(@__DIR__, "test_pointer_table_phi.jl"))
         include(joinpath(@__DIR__, "test_exact_narrowing.jl"))
     end
 

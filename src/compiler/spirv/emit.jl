@@ -6697,7 +6697,10 @@ function defer_phi!(state::SPIRVEmitterState, inst::LLVM.PHIInst, block_label_id
         end
         sc = get_pointer_storage_class(inst)
         if pointee !== nothing
-            pointee_spirv = map_type!(state.type_ctx, pointee)
+            # A selected pointer-table address points to another pointer. Map
+            # that nested type through the PHI's consuming load, as for other
+            # pointer values; an opaque LLVM pointer has no standalone type.
+            pointee_spirv = map_pointee_type!(state.type_ctx, inst, pointee, sc, Set{LLVM.Value}())
             map_pointer_type!(state.type_ctx, pointee_spirv, sc)
         else
             # Fallback: byte pointer
@@ -6843,6 +6846,9 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
     # For pointer-type mismatches in PHI operands, we insert OpBitcast
     # in the predecessor block before its terminator instruction.
     pre_terminator_insertions = Dict{UInt32, Vector{UInt32}}()
+    # PHIs may feed other PHIs. Their actual emitted types are known here even
+    # when the LLVM pointee map has no entry for the intermediate value.
+    phi_types = Dict(result_id => type_id for (result_id,type_id,_,_) in state.deferred_phis)
 
     for (result_id, type_id, incoming, block_label_id) in state.deferred_phis
         operands = UInt32[]
@@ -6948,9 +6954,9 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
             # Check for pointer type mismatch: LLVM opaque ptrs may map to different
             # SPIR-V pointer types. PHI requires all operands match result type.
             # Insert OpBitcast in predecessor block if types differ.
-            # Skip PHI values themselves — their pointee types aren't in PTM.
-            if val.value_type isa LLVM.PointerType && !(val isa LLVM.UndefValue || val isa LLVM.PoisonValue) && !(val isa LLVM.PHIInst)
-                val_spirv_ty = map_pointer_type_for_value!(state.type_ctx, val)
+            if val.value_type isa LLVM.PointerType && !(val isa LLVM.UndefValue || val isa LLVM.PoisonValue)
+                val_spirv_ty = val isa LLVM.PHIInst ? phi_types[val_id] :
+                    map_pointer_type_for_value!(state.type_ctx, val)
                 if val_spirv_ty != type_id
                     # Check if this is a cross-storage-class mismatch by looking up
                     # the storage classes. Cross-SC bitcasts are INVALID in SPIR-V.
