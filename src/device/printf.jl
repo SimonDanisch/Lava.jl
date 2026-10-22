@@ -25,7 +25,7 @@
 export @lava_printf
 
 # Julia arg type → (LLVM type string, canonical Julia type passed to llvmcall).
-@inline function _lava_printf_canon(@nospecialize(T))
+@inline function lava_printf_canon(@nospecialize(T))
     T <: Bool                               && return ("i32", Int32)
     T <: Union{Int8, Int16, Int32}          && return ("i32", Int32)
     T <: Union{UInt8, UInt16, UInt32}       && return ("i32", UInt32)
@@ -42,7 +42,7 @@ end
     llvm_types = Vector{String}(undef, N)
     canon_types = Vector{Any}(undef, N)
     for i in 1:N
-        lty, cty = _lava_printf_canon(args[i])
+        lty, cty = lava_printf_canon(args[i])
         llvm_types[i] = lty
         canon_types[i] = cty
     end
@@ -109,7 +109,7 @@ end
 # override is in `device/kernelinterface.jl`, beside the rest of KI.
 
 # Runtime value type → printf specifier, matching _lava_printf_impl's canonical width.
-@inline function _ka_print_spec(@nospecialize(T))
+@inline function ka_print_spec(@nospecialize(T))
     T <: Bool                          && return "%d"
     T <: Union{Int8, Int16, Int32}     && return "%d"
     T <: Union{UInt8, UInt16, UInt32}  && return "%u"
@@ -139,7 +139,7 @@ Both portable spellings forward here rather than each generating their own, so
             lit = string(T.parameters[1])
             print(fmt, replace(lit, "%" => "%%"))
         else
-            print(fmt, _ka_print_spec(T))
+            print(fmt, ka_print_spec(T))
             push!(argexprs, :(items[$i]))
         end
     end

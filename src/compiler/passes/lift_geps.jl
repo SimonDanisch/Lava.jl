@@ -255,7 +255,7 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
                 is_inbounds = LLVM.API.LLVMIsInBounds(user)
 
                 # Helper to build a typed GEP from index path
-                function _build_typed_gep(builder, indices, name)
+                function build_typed_gep(builder, indices, name)
                     idx_vals = LLVM.Value[LLVM.ConstantInt(LLVM.Int32Type(), 0)]
                     for idx in indices
                         push!(idx_vals, LLVM.ConstantInt(LLVM.Int32Type(), idx))
@@ -316,7 +316,7 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
 
                         # Redirect all remaining uses (loads/stores) to leaf GEP
                         LLVM.position!(builder, insertion_point(user))
-                        leaf_gep = _build_typed_gep(builder, leaf_indices, "typed_gep_leaf")
+                        leaf_gep = build_typed_gep(builder, leaf_indices, "typed_gep_leaf")
                         LLVM.replace_uses!(user, leaf_gep)
                     end
                 else
@@ -328,7 +328,7 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
 
                     LLVM.@dispose builder=LLVM.IRBuilder() begin
                         LLVM.position!(builder, insertion_point(user))
-                        new_gep = _build_typed_gep(builder, indices, "typed_gep")
+                        new_gep = build_typed_gep(builder, indices, "typed_gep")
                         LLVM.replace_uses!(user, new_gep)
                     end
                 end

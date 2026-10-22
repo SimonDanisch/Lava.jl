@@ -167,7 +167,7 @@ end
 # `Base.mul_hi` and moved it to int.jl, generalised to `T<:Integer`. Both
 # spellings go through `widen`, so the override is needed on either version and
 # only the name to overlay differs -- the implementation below is shared.
-function _mul_high_u64(a::UInt64, b::UInt64)
+function mul_high_u64(a::UInt64, b::UInt64)
     shift = UInt64(32)
     mask = UInt64(0xFFFFFFFF)
     a1, a2 = a >>> shift, a & mask
@@ -180,21 +180,21 @@ function _mul_high_u64(a::UInt64, b::UInt64)
     a1b1 + (a1b2 >>> shift) + (a2b1 >>> shift) + carry
 end
 
-function _mul_high_i64(a::Int64, b::Int64)
+function mul_high_i64(a::Int64, b::Int64)
     # Signed mul_high from unsigned mul_high (same pattern as Julia's Int128 version)
     t1 = (a >> 63) & (b % UInt64)
     t2 = (b >> 63) & (a % UInt64)
-    (_mul_high_u64(a % UInt64, b % UInt64) - t1 - t2) % Int64
+    (mul_high_u64(a % UInt64, b % UInt64) - t1 - t2) % Int64
 end
 
 @static if isdefined(Base, :mul_hi)
-    @lava_device_override Base.mul_hi(a::UInt64, b::UInt64) = _mul_high_u64(a, b)
-    @lava_device_override Base.mul_hi(a::Int64, b::Int64) = _mul_high_i64(a, b)
+    @lava_device_override Base.mul_hi(a::UInt64, b::UInt64) = mul_high_u64(a, b)
+    @lava_device_override Base.mul_hi(a::Int64, b::Int64) = mul_high_i64(a, b)
 else
     @lava_device_override Base.MultiplicativeInverses._mul_high(a::UInt64, b::UInt64) =
-        _mul_high_u64(a, b)
+        mul_high_u64(a, b)
     @lava_device_override Base.MultiplicativeInverses._mul_high(a::Int64, b::Int64) =
-        _mul_high_i64(a, b)
+        mul_high_i64(a, b)
 end
 
 # No `Base.isless(::IEEEFloat,...)` override: a branchless version dodges the

@@ -2078,7 +2078,7 @@ function fix_shared_geps!(mod::LLVM.Module)
         # without being recognized as a constant by the IRBuilder's folder.
         nonconst_zero = Ref{Union{Nothing, LLVM.Value}}(nothing)
 
-        function _get_nonconst_zero!()
+        function get_nonconst_zero!()
             nonconst_zero[] !== nothing && return nonconst_zero[]::LLVM.Value
             entry_bb = first(f.blocks)
             # Find an existing i32 instruction in the entry block to derive zero from
@@ -2147,7 +2147,7 @@ function fix_shared_geps!(mod::LLVM.Module)
             end
 
             if !isempty(constexpr_fixes)
-                ncz = _get_nonconst_zero!()
+                ncz = get_nonconst_zero!()
                 zero_const = LLVM.ConstantInt(T_i64, 0)
                 LLVM.IRBuilder() do builder
                     for (gep, gv, arr_ty, offset) in constexpr_fixes
@@ -2238,20 +2238,20 @@ function fix_shared_geps!(mod::LLVM.Module)
             # ----------------------------------------------------------------
 
             # Helper: compute total leaf scalar elements in a (nested) array type.
-            function _flat_count(ty::LLVM.LLVMType, leaf_ty::LLVM.LLVMType)
+            function flat_count(ty::LLVM.LLVMType, leaf_ty::LLVM.LLVMType)
                 ty == leaf_ty && return 1
                 ty isa LLVM.ArrayType || return nothing
-                inner = _flat_count(ty.element_type, leaf_ty)
+                inner = flat_count(ty.element_type, leaf_ty)
                 inner === nothing && return nothing
                 return ty.length * inner
             end
 
             # Helper: compute flat index from nested indices on a (nested) array type.
-            function _compute_flat_index!(builder, src_ty, elem_ty, indices, T_i64)
+            function compute_flat_index!(builder, src_ty, elem_ty, indices, T_i64)
                 flat_idx = nothing
                 cur_ty = src_ty
                 for (k, idx) in enumerate(indices)
-                    stride_count = _flat_count(cur_ty, elem_ty)
+                    stride_count = flat_count(cur_ty, elem_ty)
                     stride = stride_count === nothing ? 1 : stride_count
 
                     idx_val = idx
@@ -2310,11 +2310,11 @@ function fix_shared_geps!(mod::LLVM.Module)
                         src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
                         elem_ty = arr_ty.element_type
 
-                        total = _flat_count(src_ty, elem_ty)
+                        total = flat_count(src_ty, elem_ty)
                         total === nothing && continue
 
                         indices = LLVM.Value[ops[i] for i in 2:length(ops)]
-                        flat_idx = _compute_flat_index!(builder, src_ty, elem_ty, indices, T_i64)
+                        flat_idx = compute_flat_index!(builder, src_ty, elem_ty, indices, T_i64)
                         flat_idx === nothing && continue
 
                         # If chained on a fixed GEP, add the base's flat index
@@ -2373,7 +2373,7 @@ function fix_shared_geps!(mod::LLVM.Module)
 
             isempty(const_fixes) && continue
 
-            ncz = _get_nonconst_zero!()
+            ncz = get_nonconst_zero!()
             zero_const = LLVM.ConstantInt(T_i64, 0)
 
             LLVM.IRBuilder() do builder

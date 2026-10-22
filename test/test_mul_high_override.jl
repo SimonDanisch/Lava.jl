@@ -30,29 +30,29 @@ using Random: MersenneTwister
     end
 
     # 2. The decomposition agrees with Base's widening version.
-    @test Lava._mul_high_u64(UInt64(0), UInt64(0)) == 0
-    @test Lava._mul_high_i64(Int64(0), Int64(0)) == 0
+    @test Lava.mul_high_u64(UInt64(0), UInt64(0)) == 0
+    @test Lava.mul_high_i64(Int64(0), Int64(0)) == 0
 
     edges_u = UInt64[0, 1, 0xFFFFFFFF, UInt64(1) << 32, UInt64(1) << 63,
                      typemax(UInt64) - 1, typemax(UInt64)]
     for a in edges_u, b in edges_u
-        @test Lava._mul_high_u64(a, b) == target(a, b)
+        @test Lava.mul_high_u64(a, b) == target(a, b)
     end
 
     edges_i = Int64[0, 1, -1, Int64(1) << 32, -(Int64(1) << 32),
                     typemin(Int64), typemax(Int64)]
     for a in edges_i, b in edges_i
-        @test Lava._mul_high_i64(a, b) == target(a, b)
+        @test Lava.mul_high_i64(a, b) == target(a, b)
     end
 
     rng = MersenneTwister(0xBEEF)
     @test all(1:20_000) do _
         a, b = rand(rng, UInt64), rand(rng, UInt64)
-        Lava._mul_high_u64(a, b) == target(a, b)
+        Lava.mul_high_u64(a, b) == target(a, b)
     end
     @test all(1:20_000) do _
         a, b = rand(rng, Int64), rand(rng, Int64)
-        Lava._mul_high_i64(a, b) == target(a, b)
+        Lava.mul_high_i64(a, b) == target(a, b)
     end
 
     # 3. End-to-end: `div` by a SignedMultiplicativeInverse is the Base path that

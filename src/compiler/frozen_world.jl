@@ -51,7 +51,7 @@ end
 #
 # DEVICE-FREE BY CONSTRUCTION: `lava_compile_gpu` only reaches `vk_context()`
 # when `enable_ray_query=true`. Precompilation must never touch the driver.
-function _precompile_warmup_kernel!(out::LavaDeviceArray{Float32, 1},
+function precompile_warmup_kernel!(out::LavaDeviceArray{Float32, 1},
                                     a::LavaDeviceArray{Float32, 1})
     i = Int(lava_global_invocation_id_x()) + 1
     if i <= length(out)
@@ -72,7 +72,7 @@ struct _PrecompileWarmupParams
     count::Int32
 end
 
-function _precompile_warmup_kernel2!(out::LavaDeviceArray{Float32, 1},
+function precompile_warmup_kernel2!(out::LavaDeviceArray{Float32, 1},
                                      idx::LavaDeviceArray{Int32, 1},
                                      p::_PrecompileWarmupParams)
     i = Int(lava_global_invocation_id_x()) + 1
@@ -89,10 +89,10 @@ PrecompileTools.@setup_workload begin
     PrecompileTools.@compile_workload begin
         # Through the cache, so the image also holds both kernels' SPIR-V with
         # their `CodeInstance`s, and a session that asks for them compiles nothing.
-        compile_or_lookup(lava_kernel_job(_precompile_warmup_kernel!,
+        compile_or_lookup(lava_kernel_job(precompile_warmup_kernel!,
                                           Tuple{LavaDeviceArray{Float32, 1}, LavaDeviceArray{Float32, 1}};
                                           workgroup_size = (64, 1, 1)))
-        compile_or_lookup(lava_kernel_job(_precompile_warmup_kernel2!,
+        compile_or_lookup(lava_kernel_job(precompile_warmup_kernel2!,
                                           Tuple{LavaDeviceArray{Float32, 1}, LavaDeviceArray{Int32, 1},
                                                 _PrecompileWarmupParams};
                                           workgroup_size = (64, 1, 1)))

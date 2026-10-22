@@ -60,7 +60,7 @@ cc_lookup() = Lava.compile_or_lookup(Lava.lava_kernel_job(cc_kernel!, CC_TT; wor
     @testset "the package image's kernels compile nothing" begin
         Lava.reset_compile_stats!()
         Lava.compile_or_lookup(Lava.lava_kernel_job(
-            Lava._precompile_warmup_kernel!,
+            Lava.precompile_warmup_kernel!,
             Tuple{Lava.LavaDeviceArray{Float32, 1}, Lava.LavaDeviceArray{Float32, 1}};
             workgroup_size = (64, 1, 1)))
         @test Lava.compile_stats() == (; hits = 1, misses = 0)
