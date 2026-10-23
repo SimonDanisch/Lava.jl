@@ -133,7 +133,7 @@ for T in KI_SHFL_TYPES
     end
 end
 
-# `KI.supports_shuffle(::LavaBackend, T)` reads this list but dispatches on a
+# Mantle's `KI.supports_shuffle(backend, T)` reads this list but dispatches on a
 # backend, which is a host handle — so it is in the host half, and this is the
 # one list both sides derive from.
 
