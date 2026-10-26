@@ -3,9 +3,10 @@
 #
 # NVIDIA miscompiles the code around its own 64-bit division (Mantle's
 # `test_shared_index_division.jl`, `test_int32_cartesian_miscompile.jl`), so
-# `lower_wide_divisions!` turns a constant divisor into a multiply-high sequence
-# and a runtime divisor into a 32-bit division with the 64-bit one kept for
-# magnitudes past 2^32. The values are checked on a device by Mantle's
+# `lower_wide_divisions!` turns a constant divisor into shifts (a power of two)
+# or a multiply-high sequence, and a runtime divisor into a 32-bit division with
+# the 64-bit one kept for magnitudes past 2^32. The values are checked on the
+# host by `test_exact_division.jl` and on a device by Mantle's
 # `test_integer_division.jl`; this checks the shape of the module.
 
 using Test

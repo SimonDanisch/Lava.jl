@@ -14,9 +14,10 @@
 # The divisor 96 above is a compile-time constant, so the driver's own handling
 # of constant divisors does not avoid it. So Lava divides in 64 bits nowhere:
 #
-#   - by a constant: the multiply-high sequence (Granlund and Montgomery; the
-#     constants are `Base.MultiplicativeInverses`'), straight-line, built from
-#     32-bit partial products in 64-bit registers;
+#   - by a power of two: shifts;
+#   - by another constant: the multiply-high sequence (Granlund and Montgomery;
+#     the constants are `Base.MultiplicativeInverses`'), straight-line, built
+#     from 32-bit partial products in 64-bit registers;
 #   - by a runtime value: an always-inline helper that divides in 32 bits when
 #     both magnitudes fit, which index arithmetic always does, and in 64 bits
 #     otherwise.
@@ -118,14 +119,27 @@ end
 """
     divide_by_constant!(builder, op, a, d) -> LLVM.Value
 
-`a op d` for a constant `d`, as `Base.div(a, ::MultiplicativeInverse)` computes
-it; a remainder is `a - (a ÷ d) * d`.
+`a op d` for a constant `d`: by a power of two with shifts, by anything else as
+`Base.div(a, ::MultiplicativeInverse)` computes it; a remainder is
+`a - (a ÷ d) * d`.
+
+Powers of two never take the multiply-high: their multipliers have a
+power-of-two half, InstCombine turns those partial products into
+`(a >> 32) + ((a << 31) & 0x7fffffff80000000)`, and NVIDIA (RTX 4000 Ada,
+driver 595.99) computes that sum's high word as `0x7fffffff & ~hi(a << 31)`:
+`(j - 4) ÷ 4` in DNNKernels' Q4_K scales came out 0x3fffffff for `j = 5`.
 """
 function divide_by_constant!(builder::LLVM.IRBuilder, op, a::LLVM.Value, d::LLVM.ConstantInt)
     v = convert(Int64, d)
     q = if issigned(op)
         if abs(v) == 1
             LLVM.mul!(builder, a, k64(v))
+        elseif ispow2(abs(v))
+            # Toward zero: a negative dividend is biased by `|d| - 1` first.
+            k = trailing_zeros(abs(v))
+            bias = LLVM.lshr!(builder, LLVM.ashr!(builder, a, k64(63)), k64(64 - k))
+            x = LLVM.ashr!(builder, LLVM.add!(builder, a, bias), k64(k))
+            v < 0 ? LLVM.sub!(builder, k64(0), x) : x
         else
             inv = Base.MultiplicativeInverses.SignedMultiplicativeInverse{Int64}(v)
             x = smulhi!(builder, a, inv.multiplier)
@@ -138,6 +152,8 @@ function divide_by_constant!(builder::LLVM.IRBuilder, op, a::LLVM.Value, d::LLVM
         u = reinterpret(UInt64, v)
         if u == 1
             a
+        elseif ispow2(u)
+            LLVM.lshr!(builder, a, k64(trailing_zeros(u)))
         else
             inv = Base.MultiplicativeInverses.UnsignedMultiplicativeInverse{UInt64}(u)
             x = mulhi!(builder, a, inv.multiplier)

@@ -78,6 +78,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         include(joinpath(@__DIR__, "test_memcpy_chunk_alignment.jl"))
         include(joinpath(@__DIR__, "test_pointer_table_phi.jl"))
         include(joinpath(@__DIR__, "test_exact_narrowing.jl"))
+        include(joinpath(@__DIR__, "test_exact_division.jl"))
         include(joinpath(@__DIR__, "test_odd_integers.jl"))
     end
 
