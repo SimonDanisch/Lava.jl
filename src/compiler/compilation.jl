@@ -719,6 +719,33 @@ function lava_compile_to_spirv(@nospecialize(f), @nospecialize(tt);
 end
 
 """
+    lava_llvm(job) -> (mod, meta)
+
+The LLVM module GPUCompiler makes of `job`: Julia's inference and code generation, which every
+stage starts from. Call inside a `GPUCompiler.JuliaContext`.
+"""
+function lava_llvm(job::GPUCompiler.CompilerJob)
+    try
+        return timed_phase("stage", "GPUCompiler.compile(:llvm)") do
+            GPUCompiler.compile(:llvm, job)
+        end
+    catch e
+        # The function's type and the argument types, as the other entry
+        # points pass a function and its argument tuple.
+        #
+        # Formatted in the latest world. A launch compiles in the world Lava
+        # was loaded in (`invoke_frozen`), where a kernel defined since has
+        # no binding yet, and printing the error names the kernel: Julia 1.12
+        # warns about that read ("access to binding ... in a world prior to
+        # its definition world") and `--depwarn=error` makes it an error that
+        # replaces this one.
+        sig = job.source.specTypes
+        Base.invokelatest(wrap_gpu_compiler_error, e, sig.parameters[1],
+                          Tuple{sig.parameters[2:end]...})
+    end
+end
+
+"""
     lava_compile_gpu_from_job(job::CompilerJob; validate=true) -> LavaGPUKernel
 
 Run the full LLVM → SPIR-V pipeline on a pre-built `CompilerJob`. Always
@@ -728,6 +755,22 @@ function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob;
                                     enable_ray_query::Bool = job.config.params.enable_ray_query,
                                     validate::Bool = true,
                                     force_inline_all::Bool = false)
+    GPUCompiler.JuliaContext() do ctx
+        mod, meta = lava_llvm(job)
+        return lava_gpu_kernel(mod, meta, job; enable_ray_query, validate, force_inline_all)
+    end
+end
+
+"""
+    lava_gpu_kernel(mod, meta, job; enable_ray_query, validate=true, force_inline_all=false) -> LavaGPUKernel
+
+The compute kernel of the module GPUCompiler made of `job` (`lava_llvm`): its entry wrapped for
+Vulkan, Lava's passes, SPIR-V emission, optimization and validation. Consumes `mod`.
+"""
+function lava_gpu_kernel(mod::LLVM.Module, meta, job::GPUCompiler.CompilerJob;
+                         enable_ray_query::Bool = job.config.params.enable_ray_query,
+                         validate::Bool = true,
+                         force_inline_all::Bool = false)
     workgroup_size = job.config.params.workgroup_size
     features = job.config.params.features
     # `enable_ray_query = true` is a claim about hardware. Refused here, where the
@@ -740,102 +783,79 @@ function lava_compile_gpu_from_job(job::GPUCompiler.CompilerJob;
               "a device that supports ray_query (e.g. RADV, lavapipe) or compile " *
               "without enable_ray_query.")
     end
-    GPUCompiler.JuliaContext() do ctx
-        local mod, meta
-        try
-            mod, meta = timed_phase("stage", "GPUCompiler.compile(:llvm)") do
-                GPUCompiler.compile(:llvm, job)
-            end
-        catch e
-            # The function's type and the argument types, as the other entry
-            # points pass a function and its argument tuple.
-            #
-            # Formatted in the latest world. A launch compiles in the world Lava
-            # was loaded in (`invoke_frozen`), where a kernel defined since has
-            # no binding yet, and printing the error names the kernel: Julia 1.12
-            # warns about that read ("access to binding ... in a world prior to
-            # its definition world") and `--depwarn=error` makes it an error that
-            # replaces this one.
-            sig = job.source.specTypes
-            Base.invokelatest(wrap_gpu_compiler_error, e, sig.parameters[1],
-                              Tuple{sig.parameters[2:end]...})
-        end
-        entry_fn = meta.entry
-        entry_name = entry_fn.name
-        phase_kernel!(entry_name)
+    entry_fn = meta.entry
+    entry_name = entry_fn.name
+    phase_kernel!(entry_name)
 
-        # ── Stage 0: BDA entry wrapper ──
-        # Must happen BEFORE passes — the wrapper becomes the new entry point
-        push_info = timed_phase("stage", "wrap_entry_for_vulkan!") do
-            wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size, exceptions = true)
-        end
-        wrapper_name = push_info.wrapper_name
-
-        # The wrapper function is now the entry point
-        wrapper_fn = mod.functions[wrapper_name]
-
-        # ── Stage 1: LLVM passes ──
-        timed_phase("stage", "run_llvm_passes!") do
-            run_llvm_passes!(mod, wrapper_fn; force_inline_all, kernelname = entry_name)
-        end
-
-        # Materialising the post-pass IR is not free: `string(mod)` is
-        # proportional to module size and is "seconds by itself" on a fat module
-        # (the RT path says so in its own comment), and the two writes below put
-        # a `.ll` and a `.spv` on disk for EVERY kernel — `dev/tmp_kernels` had
-        # grown to 5675 files / 275 MB. None of it is read unless somebody is
-        # debugging a compile, so none of it runs unless asked.
-        #
-        # `ir` is only consumed by `dump_spirv_to_disk` below and by
-        # `kernel_source_name` in profiling.jl. Both the frozen cache and the
-        # disk cache already store `""` here, so a cached kernel has always had
-        # an empty `ir` — leaving it empty by default matches what the cached
-        # path has always done rather than degrading something that worked.
-        want_ir = kernel_dump_wanted()
-        ir = want_ir ? timed_phase("stage", "string(mod)") do
-            string(mod)
-        end : ""
-        if want_ir
-            timed_phase("stage", "write .ll") do
-                KERNEL_DEBUG_COUNTER[] += 1
-                _dbg_dir = kernel_dump_dir()
-                mkpath(_dbg_dir)
-                write(joinpath(_dbg_dir, "kernel_$(KERNEL_DEBUG_COUNTER[])_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).ll"), ir)
-                record_subprocess!("write tmp_kernels/.ll", 0.0, sizeof(ir))
-            end
-        end
-
-        # ── Stage 2: Custom SPIR-V emission ──
-        spirv_bytes, source_map = timed_phase("stage", "emit_spirv_from_llvm") do
-            emit_spirv_from_llvm(mod, wrapper_name, workgroup_size; enable_ray_query)
-        end
-
-        # ── Stage 2.5: SPIR-V optimization (optional, helps NVIDIA) ──
-        if SPIRV_OPT_ENABLED[]
-            spirv_bytes = timed_phase("stage", "run_spirv_opt") do
-                run_spirv_opt(spirv_bytes)
-            end
-        end
-
-        # Save SPIR-V for debugging (same gate as the .ll above)
-        if want_ir
-            timed_phase("stage", "write .spv") do
-                write(joinpath(kernel_dump_dir(), "kernel_$(KERNEL_DEBUG_COUNTER[])_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).spv"), spirv_bytes)
-                record_subprocess!("write tmp_kernels/.spv", 0.0, length(spirv_bytes))
-            end
-        end
-        dump_spirv_to_disk(spirv_bytes, ir, wrapper_name; entry_name)
-
-        # ── Stage 3: Validation ──
-        if validate
-            timed_phase("stage", "validate_spirv") do
-                validate_spirv(spirv_bytes, ir, source_map)
-            end
-        end
-
-        return LavaGPUKernel(spirv_bytes, wrapper_name, workgroup_size, push_info, ir,
-                             enable_ray_query, entry_name)
+    # ── Stage 0: BDA entry wrapper ──
+    # Must happen BEFORE passes — the wrapper becomes the new entry point
+    push_info = timed_phase("stage", "wrap_entry_for_vulkan!") do
+        wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size, exceptions = true)
     end
+    wrapper_name = push_info.wrapper_name
+
+    # The wrapper function is now the entry point
+    wrapper_fn = mod.functions[wrapper_name]
+
+    # ── Stage 1: LLVM passes ──
+    timed_phase("stage", "run_llvm_passes!") do
+        run_llvm_passes!(mod, wrapper_fn; force_inline_all, kernelname = entry_name)
+    end
+
+    # Materialising the post-pass IR is not free: `string(mod)` is
+    # proportional to module size and is "seconds by itself" on a fat module
+    # (the RT path says so in its own comment), and the two writes below put
+    # a `.ll` and a `.spv` on disk for EVERY kernel — `dev/tmp_kernels` had
+    # grown to 5675 files / 275 MB. None of it is read unless somebody is
+    # debugging a compile, so none of it runs unless asked.
+    #
+    # `ir` is only consumed by `dump_spirv_to_disk` below and by
+    # `kernel_source_name` in profiling.jl. A kernel from a package image or
+    # from an earlier session has an empty `ir` too: neither keeps one.
+    want_ir = kernel_dump_wanted()
+    ir = want_ir ? timed_phase("stage", "string(mod)") do
+        string(mod)
+    end : ""
+    if want_ir
+        timed_phase("stage", "write .ll") do
+            KERNEL_DEBUG_COUNTER[] += 1
+            _dbg_dir = kernel_dump_dir()
+            mkpath(_dbg_dir)
+            write(joinpath(_dbg_dir, "kernel_$(KERNEL_DEBUG_COUNTER[])_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).ll"), ir)
+            record_subprocess!("write tmp_kernels/.ll", 0.0, sizeof(ir))
+        end
+    end
+
+    # ── Stage 2: Custom SPIR-V emission ──
+    spirv_bytes, source_map = timed_phase("stage", "emit_spirv_from_llvm") do
+        emit_spirv_from_llvm(mod, wrapper_name, workgroup_size; enable_ray_query)
+    end
+
+    # ── Stage 2.5: SPIR-V optimization (optional, helps NVIDIA) ──
+    if SPIRV_OPT_ENABLED[]
+        spirv_bytes = timed_phase("stage", "run_spirv_opt") do
+            run_spirv_opt(spirv_bytes)
+        end
+    end
+
+    # Save SPIR-V for debugging (same gate as the .ll above)
+    if want_ir
+        timed_phase("stage", "write .spv") do
+            write(joinpath(kernel_dump_dir(), "kernel_$(KERNEL_DEBUG_COUNTER[])_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).spv"), spirv_bytes)
+            record_subprocess!("write tmp_kernels/.spv", 0.0, length(spirv_bytes))
+        end
+    end
+    dump_spirv_to_disk(spirv_bytes, ir, wrapper_name; entry_name)
+
+    # ── Stage 3: Validation ──
+    if validate
+        timed_phase("stage", "validate_spirv") do
+            validate_spirv(spirv_bytes, ir, source_map)
+        end
+    end
+
+    return LavaGPUKernel(spirv_bytes, wrapper_name, workgroup_size, push_info, ir,
+                         enable_ray_query, entry_name)
 end
 
 """
@@ -973,58 +993,62 @@ function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
     # dead code).
 
     GPUCompiler.JuliaContext() do ctx
-        local mod, meta
-        checkpoint = PhaseTimer("[phase] "; threshold=1.0)
-        try
-            mod, meta = GPUCompiler.compile(:llvm, job)
-        catch e
-            wrap_gpu_compiler_error(e, f, tt)
-        end
-        checkpoint("GPUCompiler.compile(:llvm)")
-        entry_fn = meta.entry
-        entry_name = entry_fn.name
-        # Tag this compile's phases with the shader they belong to. Without it
-        # every RT phase inherits whatever `lava_compile_gpu_from_job` set last,
-        # so a per-shader breakdown bills all five RT shaders to some unrelated
-        # compute kernel — which is exactly how a 5-line counter-reset kernel
-        # came out "costing" 21.6 s against its real 0.4 s.
-        phase_kernel!(entry_name)
-
-        # BDA entry wrapper (same as compute — args via push constant buffer)
-        push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
-        wrapper_name = push_info.wrapper_name
-        wrapper_fn = mod.functions[wrapper_name]
-        checkpoint("wrap_entry_for_vulkan!")
-
-        # LLVM passes. The RT emitter now has the multi-OpFunction walker, so
-        # keep callees as separate OpFunctions (force_inline_all=false): a fat
-        # per-material chit stays one architecture but compiles as many small
-        # functions instead of one giant inlined one (minutes -> seconds).
-        run_llvm_passes!(mod, wrapper_fn; force_inline_all=false)
-        checkpoint("run_llvm_passes!")
-
-        ir = string(mod)
-        write(lava_debug_path("lava_last_rt.ll"), ir)
-        # Own checkpoint: on a fat chit `string(mod)` is seconds by itself, and
-        # folding it into the emitter's number would point the finger at the
-        # wrong phase.
-        checkpoint("string(mod) + IR dump")
-
-        # RT-specific SPIR-V emission
-        spirv_bytes, source_map = emit_spirv_from_llvm_rt(mod, wrapper_name, stage;
-                                                payload_type=payload_type, features)
-        checkpoint("emit_spirv_from_llvm_rt")
-
-        write(lava_debug_path("lava_last.spv"), spirv_bytes)
-        dump_spirv_to_disk(spirv_bytes, ir, wrapper_name; entry_name)
-
-        if validate
-            validate_spirv(spirv_bytes, ir, source_map)
-            checkpoint("validate_spirv")
-        end
-
-        return LavaRTShader(spirv_bytes, stage, push_info, ir)
+        mod, meta = lava_llvm(job)
+        return rt_shader(mod, meta; stage, payload_type, validate, features)
     end
+end
+
+"""
+    rt_shader(mod, meta; stage, payload_type, validate, features) -> LavaRTShader
+
+Ray-tracing stage `stage` of the module GPUCompiler made of its job (`lava_llvm`). Consumes `mod`.
+"""
+function rt_shader(mod::LLVM.Module, meta; stage::Symbol, payload_type::Symbol, validate::Bool,
+                   features::TargetFeatures)
+    checkpoint = PhaseTimer("[phase] "; threshold=1.0)
+    entry_fn = meta.entry
+    entry_name = entry_fn.name
+    # Tag this compile's phases with the shader they belong to. Without it
+    # every RT phase inherits whatever `lava_compile_gpu_from_job` set last,
+    # so a per-shader breakdown bills all five RT shaders to some unrelated
+    # compute kernel — which is exactly how a 5-line counter-reset kernel
+    # came out "costing" 21.6 s against its real 0.4 s.
+    phase_kernel!(entry_name)
+
+    # BDA entry wrapper (same as compute — args via push constant buffer)
+    push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
+    wrapper_name = push_info.wrapper_name
+    wrapper_fn = mod.functions[wrapper_name]
+    checkpoint("wrap_entry_for_vulkan!")
+
+    # LLVM passes. The RT emitter now has the multi-OpFunction walker, so
+    # keep callees as separate OpFunctions (force_inline_all=false): a fat
+    # per-material chit stays one architecture but compiles as many small
+    # functions instead of one giant inlined one (minutes -> seconds).
+    run_llvm_passes!(mod, wrapper_fn; force_inline_all=false)
+    checkpoint("run_llvm_passes!")
+
+    ir = string(mod)
+    write(lava_debug_path("lava_last_rt.ll"), ir)
+    # Own checkpoint: on a fat chit `string(mod)` is seconds by itself, and
+    # folding it into the emitter's number would point the finger at the
+    # wrong phase.
+    checkpoint("string(mod) + IR dump")
+
+    # RT-specific SPIR-V emission
+    spirv_bytes, source_map = emit_spirv_from_llvm_rt(mod, wrapper_name, stage;
+                                                      payload_type=payload_type, features)
+    checkpoint("emit_spirv_from_llvm_rt")
+
+    write(lava_debug_path("lava_last.spv"), spirv_bytes)
+    dump_spirv_to_disk(spirv_bytes, ir, wrapper_name; entry_name)
+
+    if validate
+        validate_spirv(spirv_bytes, ir, source_map)
+        checkpoint("validate_spirv")
+    end
+
+    return LavaRTShader(spirv_bytes, stage, push_info, ir)
 end
 
 # ── Graphics Shader Compilation ──
@@ -1076,38 +1100,42 @@ function lava_compile_gfx_shader(@nospecialize(f), @nospecialize(tt);
                                    validate::Bool=true,
                                    job::GPUCompiler.CompilerJob=lava_gfx_job(f, tt))
     GPUCompiler.JuliaContext() do ctx
-        local mod, meta
-        try
-            mod, meta = GPUCompiler.compile(:llvm, job)
-        catch e
-            wrap_gpu_compiler_error(e, f, tt)
-        end
-        entry_fn = meta.entry
-        entry_name = entry_fn.name
-
-        # BDA entry wrapper (same as compute — args via push constant buffer)
-        push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
-        wrapper_name = push_info.wrapper_name
-        wrapper_fn = mod.functions[wrapper_name]
-
-        # LLVM passes; GFX emit has no multi-OpFunction walker, so the module
-        # collapses into one.
-        run_llvm_passes!(mod, wrapper_fn; force_inline_all=true)
-
-        ir = string(mod)
-        write(lava_debug_path("lava_last_gfx_$(stage).ll"), ir)
-
-        # Graphics-specific SPIR-V emission
-        spirv_bytes, source_map = emit_spirv_from_llvm_gfx(mod, wrapper_name, stage; config=config)
-
-        write(lava_debug_path("lava_last_gfx_$(stage).spv"), spirv_bytes)
-
-        if validate
-            validate_spirv(spirv_bytes, ir, source_map)
-        end
-
-        return LavaGfxShader(spirv_bytes, stage, push_info, ir)
+        mod, meta = lava_llvm(job)
+        return gfx_shader(mod, meta; stage, config, validate)
     end
+end
+
+"""
+    gfx_shader(mod, meta; stage, config, validate) -> LavaGfxShader
+
+Graphics stage `stage` of the module GPUCompiler made of its job (`lava_llvm`). Consumes `mod`.
+"""
+function gfx_shader(mod::LLVM.Module, meta; stage::Symbol, config, validate::Bool)
+    entry_fn = meta.entry
+    entry_name = entry_fn.name
+
+    # BDA entry wrapper (same as compute — args via push constant buffer)
+    push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
+    wrapper_name = push_info.wrapper_name
+    wrapper_fn = mod.functions[wrapper_name]
+
+    # LLVM passes; GFX emit has no multi-OpFunction walker, so the module
+    # collapses into one.
+    run_llvm_passes!(mod, wrapper_fn; force_inline_all=true)
+
+    ir = string(mod)
+    write(lava_debug_path("lava_last_gfx_$(stage).ll"), ir)
+
+    # Graphics-specific SPIR-V emission
+    spirv_bytes, source_map = emit_spirv_from_llvm_gfx(mod, wrapper_name, stage; config=config)
+
+    write(lava_debug_path("lava_last_gfx_$(stage).spv"), spirv_bytes)
+
+    if validate
+        validate_spirv(spirv_bytes, ir, source_map)
+    end
+
+    return LavaGfxShader(spirv_bytes, stage, push_info, ir)
 end
 
 # ── Stage 1: LLVM Pass Pipeline ──
@@ -1368,6 +1396,12 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     verify_ir!("combine_geps")
     checkpoint("combine_chained_geps! #1")
 
+    # ── Loads through a select between private and device pointers ──
+    # No SPIR-V pointer is either, so each becomes a branch to two loads. Before
+    # structurization, which takes the diamond in.
+    branch_mixed_pointer_select_loads!(mod)
+    verify_ir!("branch_mixed_pointer_select_loads")
+
     # ── Retype uniformly-typed Function allocas ──
     # Run BEFORE structurize_cfg, while the IR is still simple — structurize
     # inserts pointer PHIs for cross-block dataflow that the conservative
@@ -1499,6 +1533,10 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # two-operand GEP, so these are the forms none of them sees.
     lower_constant_subelement_access!(mod)
 
+    # ── A narrow access at a constant byte offset into an integer alloca ─────
+    # A scalar variable has no byte inside it to point at: shifted and masked.
+    lower_subword_access_on_integer_allocas!(mod)
+
     # ── Lower PHI-chained typepunned loads on array allocas ──
     # When byte-offset GEPs flow through PHI chains (from StructurizeCFG) before being
     # loaded, lower_byte_gep_chain_on_allocas! can't handle them (it requires direct
@@ -1570,6 +1608,12 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # structurized.
     lower_wide_divisions!(mod; runtime = false)
     checkpoint("narrow_in_integers! + lower_wide_divisions!")
+
+    # ── No integer of a width SPIR-V has no type for ──
+    # SimplifyCFG's switch bitmaps are as wide as their tables, whatever the
+    # datalayout's native widths (see the pass). Last: nothing after it narrows.
+    widen_odd_integers!(mod)
+    checkpoint("widen_odd_integers!")
 
     return nothing
 end
@@ -3137,33 +3181,51 @@ function lower_memcpy!(inst::LLVM.CallInst, dl::LLVM.DataLayout; overlapping::Bo
             T_i64 = LLVM.Int64Type()
             T_i8 = LLVM.Int8Type()
             n_words = nbytes ÷ 4
-            # Words, then the tail bytes: (offset, type, alignment).
+            # Words, then the tail bytes: (offset, type, size). Each claims the alignment its
+            # pointer has (`chunk_alignment`), not its size: a word at an odd offset of a
+            # byte-aligned copy said `align 4`, and NVIDIA wrote it four-aligned, over the byte
+            # before it. AcceleratedKernels' chunk totals are `_Lane{Int64}`s, whose seven bytes
+            # of padding after the `valid` flag are copied this way; the flag read `false`.
             chunks = [[(i * 4, T_i32, 4) for i in 0:(n_words-1)];
                       [(i, T_i8, 1) for i in (n_words*4):(nbytes-1)]]
+            src_align, dst_align = memcpy_alignment(inst, 2), memcpy_alignment(inst, 1)
             at(ptr, off) = off == 0 ? ptr : LLVM.gep!(builder, T_i8, ptr, [LLVM.ConstantInt(T_i64, off)])
-            function load(off, ty, align)
+            function load(off, ty, size)
                 val = LLVM.load!(builder, ty, at(src, off))
-                val.alignment = align
+                val.alignment = chunk_alignment(src_align, off, size)
                 return val
             end
-            function store(off, val, align)
+            function store(off, val, size)
                 st = LLVM.store!(builder, val, at(dst, off))
-                st.alignment = align
+                st.alignment = chunk_alignment(dst_align, off, size)
                 return st
             end
             if overlapping
                 vals = [load(c...) for c in chunks]
-                for ((off, _, align), val) in zip(chunks, vals)
-                    store(off, val, align)
+                for ((off, _, size), val) in zip(chunks, vals)
+                    store(off, val, size)
                 end
             else
-                for (off, ty, align) in chunks
-                    store(off, load(off, ty, align), align)
+                for (off, ty, size) in chunks
+                    store(off, load(off, ty, size), size)
                 end
             end
         end
     end
 end
+
+"""The alignment a memcpy or memmove guarantees its pointer argument `i`: its `align`
+attribute, or one byte without it."""
+function memcpy_alignment(call::LLVM.CallInst, i::Integer)
+    for a in collect(LLVM.argument_attributes(call)[i])
+        a isa LLVM.EnumAttribute && LLVM.kind(a) == :align && return Int(LLVM.value(a))
+    end
+    return 1
+end
+
+"""The alignment of a `size`-byte chunk at byte `off` of a pointer aligned to `align`."""
+chunk_alignment(align::Integer, off::Integer, size::Integer) =
+    min(size, off == 0 ? align : min(align, 1 << trailing_zeros(off)))
 
 """
     addressed_type(ptr)

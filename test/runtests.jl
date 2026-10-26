@@ -70,8 +70,15 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         include(joinpath(@__DIR__, "test_pointee_type_map.jl"))
         include(joinpath(@__DIR__, "test_barrier_skipping_paths.jl"))
         include(joinpath(@__DIR__, "test_constexpr_phi_operand.jl"))
+        include(joinpath(@__DIR__, "test_constant_struct_operand.jl"))
+        include(joinpath(@__DIR__, "test_select_of_alloca_elements.jl"))
+        include(joinpath(@__DIR__, "test_punned_store_into_array.jl"))
+        include(joinpath(@__DIR__, "test_select_private_device_load.jl"))
+        include(joinpath(@__DIR__, "test_subword_integer_alloca.jl"))
+        include(joinpath(@__DIR__, "test_memcpy_chunk_alignment.jl"))
         include(joinpath(@__DIR__, "test_pointer_table_phi.jl"))
         include(joinpath(@__DIR__, "test_exact_narrowing.jl"))
+        include(joinpath(@__DIR__, "test_odd_integers.jl"))
     end
 
     # ── Tier 2: validation and structure ─────────────────────────────────────

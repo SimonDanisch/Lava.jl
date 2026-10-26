@@ -194,6 +194,7 @@ include("compiler/passes/prepare_vulkan.jl")
 include("compiler/passes/lower_intrinsics.jl")
 include("compiler/passes/exact_narrowing.jl")
 include("compiler/passes/wide_division.jl")
+include("compiler/passes/odd_integers.jl")
 # shared_memory.jl — consolidated into prepare_vulkan.jl
 
 # ---- Compiler (depends on emitter + passes) ----

@@ -9,15 +9,22 @@
 # (`relocation_lowering`, target.jl): a package's `@compile_workload` leaves its
 # kernels compiled for every session after.
 #
+# Kernels compiled at run time outlive the session too, kept by what they were
+# compiled from (`persisted`, below): Mantle guarantees of every backend that a
+# kernel compiled once is not compiled again in a later session.
+#
 # Only SPIR-V lives here. What a device builds from it, a `VkPipeline`, is the
 # runtime's, keyed on these objects by identity.
+
+using GPUCompiler.CompilerCaching: ObjCache
 
 """
     CompileStats
 
 Kernel and shader lookups since the last `reset_compile_stats!`: `hits` found
-SPIR-V compiled earlier, in this session or while a package precompiled;
-`misses` compiled it. The names and shape are Metal.jl's `compile_stats`.
+SPIR-V compiled earlier, in this session, in an earlier one or while a package
+precompiled; `misses` compiled it. The names and shape are Metal.jl's
+`compile_stats`.
 """
 mutable struct CompileStats
     hits::Int
@@ -47,6 +54,8 @@ IR, which only a debugging session reads and which is the largest field by far.
 """
 portable(s::LavaRTShader) = LavaRTShader(s.spirv_bytes, s.stage, s.push_info, "")
 portable(s::LavaGfxShader) = LavaGfxShader(s.spirv_bytes, s.stage, s.push_info, "")
+portable(k::LavaGPUKernel) = LavaGPUKernel(k.spirv_bytes, k.entry_name, k.workgroup_size, k.push_info, "",
+                                           k.enable_ray_query, k.source_name)
 
 """
 Before compiling anything in a package's precompilation: infer the job with the
@@ -95,9 +104,8 @@ cannot invalidate the compiler's own code.
         COMPILE_STATS.hits += 1
         return res.kernel
     end
-    COMPILE_STATS.misses += 1
     enroll!(job)
-    kernel = invoke_frozen(lava_compile_gpu_from_job, job)::LavaGPUKernel
+    kernel = invoke_frozen(persisted_kernel, job)::LavaGPUKernel
     # Compiling the job made its `CodeInstance`, so this finds one.
     res = @something res GPUCompiler.cached_results(LavaKernelResults, job)
     res.kernel = kernel
@@ -136,9 +144,8 @@ function cached_gfx_shader(@nospecialize(f), @nospecialize(tt), stage::Symbol; c
             return shader
         end
     end
-    COMPILE_STATS.misses += 1
     enroll!(job)
-    shader = lava_compile_gfx_shader(f, tt; stage, config, job)
+    shader = persisted_gfx_shader(job; stage, config)
     shaders = @something shaders GPUCompiler.cached_results(GfxShaders, job)
     shaders.stages[key] = generating_output() ? portable(shader) : shader
     return shader
@@ -180,11 +187,130 @@ function cached_rt_shader(@nospecialize(f), @nospecialize(tt); stage::Symbol,
             return shader
         end
     end
-    COMPILE_STATS.misses += 1
     enroll!(job)
-    shader = lava_compile_rt_shader(f, tt; stage, push_constant_size, payload_type,
-                                    validate = true, features, job)
+    shader = persisted_rt_shader(job; stage, payload_type, push_constant_size, features)
     shaders = @something shaders GPUCompiler.cached_results(RTShaders, job)
     shaders.stages[key] = generating_output() ? portable(shader) : shader
     return shader
+end
+
+# ── Across sessions ──────────────────────────────────────────────────────────
+#
+# A kernel compiled at run time has a `CodeInstance` of this session only, and no
+# other process can check that it is still the code the kernel was compiled from.
+# What another process can compare is the LLVM module GPUCompiler makes of it
+# (`lava_llvm`): everything Lava does from there, its passes, SPIR-V emission,
+# spirv-opt and spirv-val, four fifths of a compile, depends on that module, the
+# stage's settings and the compiler, and on nothing else. So a stage is kept in
+# CompilerCaching's object cache under those three, and a later session that makes
+# the same module finds it there.
+
+"""Bump to drop every stage kept under an earlier layout of what is stored."""
+const PERSISTED_SCHEMA = 1
+
+"""
+    canonical_ir(mod) -> Vector{UInt8}
+
+The text of `mod` without what differs between two sessions compiling the same code. Julia
+numbers the functions and constants it names in the order it compiles them (`julia_f_1234`), and
+the numbers reach the symbols, the names of inlined values, the debug info and the names of the
+alias scopes inlining makes (`!"julia_f_1234: %sret_return"`). A copy of `mod` without debug info
+and value names, its own symbols numbered in module order and the numbers dropped from metadata
+strings, prints the same in every session. A scope is `distinct`, so its name tells it from no
+other. No debug info reaches the SPIR-V Lava emits; the names that do, the entry's, are those of
+the session that compiled the stage, which keeps them with it.
+"""
+function canonical_ir(mod::LLVM.Module)
+    c = copy(mod)
+    LLVM.strip_debuginfo!(c)
+    i = 0
+    for f in LLVM.functions(c)
+        LLVM.isdeclaration(f) && continue
+        LLVM.name!(f, "f$(i += 1)")
+        foreach(a -> LLVM.name!(a, ""), LLVM.parameters(f))
+        for b in LLVM.blocks(f)
+            LLVM.name!(b, "")
+            foreach(ins -> LLVM.name!(ins, ""), LLVM.instructions(b))
+        end
+    end
+    for g in LLVM.globals(c)
+        LLVM.isdeclaration(g) || LLVM.name!(g, "g$(i += 1)")
+    end
+    text = replace(string(c), r"!\"[^\"]*\"" => name -> replace(name, r"_\d+" => ""))
+    # Bytes, not the `String`: SHA reads a `String` a thousand times slower.
+    text = Vector{UInt8}(text)
+    LLVM.dispose(c)
+    return text
+end
+
+"""
+What a stage depends on besides its LLVM module and its settings: Lava's build, Julia's, LLVM's
+and SPIRV-Tools' versions, and every switch that changes what the pipeline emits.
+"""
+compiler_identity() = (string(Base.module_build_id(@__MODULE__)), string(VERSION), string(LLVM.version()),
+                       string(pkgversion(SPIRV_Tools_jll)), string(SPIRV_OPT_ENABLED[]), string(LOOP_UNROLL[]),
+                       get(ENV, "LAVA_OUTLINE_ENABLED", "0"), get(ENV, "LAVA_OUTLINE_BB_THRESHOLD", "50"),
+                       get(ENV, "LAVA_SKIP_PASSES", ""))
+
+function serialized(x)
+    io = IOBuffer()
+    Serialization.serialize(io, x)
+    return take!(io)
+end
+
+"""
+    persisted(compile, ns, mod, settings...) -> stage
+
+The stage `compile()` makes of the module `mod` with `settings`: kept in namespace `ns` of
+CompilerCaching's object cache, under `mod`'s canonical text (`canonical_ir`), the settings and
+the compiler (`compiler_identity`), and found there when a session compiled it before. Counted in
+`compile_stats` either way. Nothing is kept while a package precompiles, whose image keeps it
+instead, nor while kernels are dumped for debugging, which only compiling does.
+"""
+function persisted(compile, ns::String, mod::LLVM.Module, settings...)
+    keep = !generating_output() && !kernel_dump_wanted()
+    key = keep ? ObjCache.keyhash(PERSISTED_SCHEMA, canonical_ir(mod),
+                                  Vector{UInt8}(join((compiler_identity()..., map(repr, settings)...), '\0'))) :
+                 UInt8[]
+    found = keep ? ObjCache.get(ns, key) : nothing
+    if found !== nothing
+        COMPILE_STATS.hits += 1
+        return Serialization.deserialize(IOBuffer(found))
+    end
+    COMPILE_STATS.misses += 1
+    stage = compile()
+    keep && ObjCache.put!(ns, key, serialized(portable(stage)))
+    return stage
+end
+
+"""The compute kernel of `job`, kept from an earlier session or compiled (`persisted`)."""
+function persisted_kernel(job::LavaCompilerJob)
+    GPUCompiler.JuliaContext() do ctx
+        mod, meta = lava_llvm(job)
+        p = job.config.params
+        return persisted("Lava/kernel", mod, p.workgroup_size, p.enable_ray_query, p.features) do
+            lava_gpu_kernel(mod, meta, job)
+        end
+    end
+end
+
+"""Ray-tracing stage `stage` of `job`, kept from an earlier session or compiled (`persisted`)."""
+function persisted_rt_shader(job::GPUCompiler.CompilerJob; stage::Symbol, payload_type::Symbol,
+                             push_constant_size::Integer, features::TargetFeatures)
+    GPUCompiler.JuliaContext() do ctx
+        mod, meta = lava_llvm(job)
+        return persisted("Lava/rt", mod, stage, payload_type, Int(push_constant_size), features) do
+            rt_shader(mod, meta; stage, payload_type, validate = true, features)
+        end
+    end
+end
+
+"""Graphics stage `stage` of `job`, kept from an earlier session or compiled (`persisted`)."""
+function persisted_gfx_shader(job::GPUCompiler.CompilerJob; stage::Symbol, config)
+    GPUCompiler.JuliaContext() do ctx
+        mod, meta = lava_llvm(job)
+        return persisted("Lava/gfx", mod, stage, config) do
+            gfx_shader(mod, meta; stage, config, validate = true)
+        end
+    end
 end
