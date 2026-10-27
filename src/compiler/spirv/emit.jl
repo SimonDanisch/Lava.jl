@@ -58,28 +58,9 @@ mutable struct SPIRVEmitterState
     # Used to detect when a load's expected result type differs from the pointer's declared
     # element type (e.g., same LLVM struct type used for ptr<i64> and ptr<i16> members).
     spirv_ptr_element_type::Dict{LLVM.Value, UInt32}
-    # ── RT shader state (set by emit_spirv_from_llvm_rt, unused for compute) ──
-    rt_payload_var_id::Union{Nothing, UInt32}
+    # ── Ray query (set by `rayquery.jl`, `nothing` until a query needs them) ──
     rt_tlas_var_id::Union{Nothing, UInt32}
     rt_accel_type_id::Union{Nothing, UInt32}
-    rt_payload_type::Symbol  # :f32, :struct, etc.
-    # Storage class of the payload variable for the current RT stage.
-    # Raygen: RayPayloadKHR. closesthit/miss/anyhit/intersection:
-    # IncomingRayPayloadKHR. Used by `payload_sc_for_state` so the access
-    # chain that loads/stores the payload picks the right storage class on
-    # every stage. Inferring it from `rt_tlas_var_id !== nothing` does not work:
-    # chit/miss/anyhit emit the TLAS descriptor too, for inline ray queries.
-    rt_payload_storage_class::UInt32
-    rt_hit_attrib_var_id::Union{Nothing, UInt32}  # HitAttributeKHR variable (vec2 barycentrics)
-    # SER: cached OpTypeHitObjectNV id + the Private-storage HitObject variable
-    # allocated lazily on first lava_rt_hit_object_* call.  Reused by every SER
-    # intrinsic in the same shader so we always reorder/execute against the same
-    # implicit hit-object slot (matches the GLSL `hitObjectNV hit;` pattern).
-    rt_hit_object_type_id::Union{Nothing, UInt32}
-    rt_hit_object_var_id::Union{Nothing, UInt32}
-    # Set true when OpIgnoreIntersectionKHR/OpTerminateRayKHR is emitted (block terminators).
-    # Suppresses the redundant OpReturn from the trailing `ret void`.
-    rt_block_terminated::Bool
     # ── Cooperative matrix (SPV_KHR_cooperative_matrix) ──
     # Cached OpTypeCooperativeMatrixKHR ids, keyed (dtype, rows, cols, use, scope).
     coopmat_type_ids::Dict{Tuple{String, Int, Int, UInt32, UInt32}, UInt32}
@@ -228,11 +209,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{Tuple{UInt32, UInt32}, UInt32}(),
         Dict{LLVM.Value, Tuple{UInt32, Vector{UInt32}, UInt32, LLVM.ArrayType}}(),
         Dict{LLVM.Value, UInt32}(),
-        nothing, nothing, nothing, :none,
-        UInt32(0),  # rt_payload_storage_class — filled in by emit_spirv_from_llvm_rt
-        nothing,
-        nothing, nothing,  # SER: rt_hit_object_type_id, rt_hit_object_var_id
-        false,
+        nothing, nothing,  # rt_tlas_var_id, rt_accel_type_id
         Dict{Tuple{String, Int, Int, UInt32, UInt32}, UInt32}(),  # coopmat types
         Dict{Tuple{Int, UInt32}, UInt32}(),               # tensor layout types
         Dict{Tuple{Int, Bool, Vector{UInt32}}, UInt32}(), # tensor view types
@@ -914,9 +891,6 @@ function emit_block!(state::SPIRVEmitterState, bb::LLVM.BasicBlock)
     # A new block may be reached from anywhere, so nothing is known about what
     # the cooperative-matrix component variables hold. See the field's comment.
     empty!(state.coopmat_var_contents)
-
-    # Reset RT block termination flag for this block
-    state.rt_block_terminated = false
 
     # PHI nodes: defer to after all blocks are emitted (operands may be forward references)
     # Their result IDs are already pre-allocated in value_map.
@@ -6097,8 +6071,6 @@ end
 # ================================================================
 
 function emit_ret!(state::SPIRVEmitterState, inst::LLVM.RetInst)
-    # Skip if block was already terminated by OpIgnoreIntersectionKHR/OpTerminateRayKHR
-    state.rt_block_terminated && return
     ops = inst.operands
     if isempty(ops)
         encode_instruction!(state.mod.functions, Op.OpReturn)
@@ -6109,9 +6081,6 @@ function emit_ret!(state::SPIRVEmitterState, inst::LLVM.RetInst)
 end
 
 function emit_br!(state::SPIRVEmitterState, inst::LLVM.BrInst)
-    # Skip if block was already terminated by OpIgnoreIntersectionKHR/OpTerminateRayKHR
-    state.rt_block_terminated && return
-
     current_bb = inst.parent
 
     if LLVM.isconditional(inst)
@@ -6699,8 +6668,14 @@ function defer_phi!(state::SPIRVEmitterState, inst::LLVM.PHIInst, block_label_id
 
     llvm_ty = inst.value_type
     result_ty = if llvm_ty isa LLVM.PointerType
-        # Opaque pointer — infer pointee type from uses or incoming values
-        pointee = infer_pointee_from_users(inst)
+        # Opaque pointer. The pointee type map first: the loads, stores and GEPs
+        # through the phi are emitted against it, so the phi's type cannot
+        # disagree with them. A search of the users took the first in use-list
+        # order, a byte-offset GEP read as `i32` 16 bytes in, and typed `uint*` a
+        # phi loaded as `float` at offset 0 (test_phi_pointee_agrees.jl). The
+        # search is for a phi only reached through byte offsets or other phis.
+        pointee = get_pointee_type(state.type_ctx.ptm, inst)
+        pointee === nothing && (pointee = infer_pointee_from_users(inst))
         if pointee === nothing
             # Try incoming values
             n_inc = LLVM.API.LLVMCountIncoming(inst)
@@ -7285,37 +7260,8 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return nothing
         end
 
-        # Check for RT intrinsics → OpTraceRayKHR, payload load/store
-        if fn_name == "lava_rt_trace_ray"
-            return emit_rt_trace_ray!(state, inst)
-        elseif fn_name == "lava_rt_payload_store_f32"
-            return emit_rt_payload_store!(state, inst)
-        elseif fn_name == "lava_rt_payload_load_f32"
-            return emit_rt_payload_load!(state, inst)
-        elseif fn_name == "lava_rt_payload_store_f32_at"
-            return emit_rt_payload_store_at!(state, inst)
-        elseif fn_name == "lava_rt_payload_load_f32_at"
-            return emit_rt_payload_load_at!(state, inst)
-        elseif fn_name == "lava_rt_hit_attrib_load_f32_at"
-            return emit_rt_hit_attrib_load_at!(state, inst)
-        elseif fn_name == "lava_rt_hit_attrib_store_f32_at"
-
-            return emit_rt_hit_attrib_store_at!(state, inst)
-
-        elseif fn_name == "lava_rt_report_intersection"
-
-            return emit_rt_report_intersection!(state, inst)
-        elseif fn_name == "lava_rt_ignore_intersection"
-            return emit_rt_ignore_intersection!(state, inst)
-        elseif fn_name == "lava_rt_terminate_ray"
-            return emit_rt_terminate_ray!(state, inst)
-        elseif fn_name == "lava_rt_hit_object_trace_ray"
-            return emit_rt_hit_object_trace_ray!(state, inst)
-        elseif fn_name == "lava_rt_reorder_thread"
-            return emit_rt_reorder_thread!(state, inst)
-        elseif fn_name == "lava_rt_hit_object_execute_shader"
-            return emit_rt_hit_object_execute_shader!(state, inst)
-        elseif fn_name == "lava_ray_query_init"
+        # Ray-query intrinsics → OpRayQuery*KHR
+        if fn_name == "lava_ray_query_init"
             return emit_ray_query_init!(state, inst)
         elseif fn_name == "lava_ray_query_proceed"
             return emit_ray_query_proceed!(state, inst)

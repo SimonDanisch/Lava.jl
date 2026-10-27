@@ -52,7 +52,6 @@ generating_output() = ccall(:jl_generating_output, Cint, ()) == 1
 What goes into a package image of a compiled stage: its SPIR-V without the LLVM
 IR, which only a debugging session reads and which is the largest field by far.
 """
-portable(s::LavaRTShader) = LavaRTShader(s.spirv_bytes, s.stage, s.push_info, "")
 portable(s::LavaGfxShader) = LavaGfxShader(s.spirv_bytes, s.stage, s.push_info, "")
 portable(k::LavaGPUKernel) = LavaGPUKernel(k.spirv_bytes, k.entry_name, k.workgroup_size, k.push_info, "",
                                            k.enable_ray_query, k.source_name)
@@ -147,49 +146,6 @@ function cached_gfx_shader(@nospecialize(f), @nospecialize(tt), stage::Symbol; c
     enroll!(job)
     shader = persisted_gfx_shader(job; stage, config)
     shaders = @something shaders GPUCompiler.cached_results(GfxShaders, job)
-    shaders.stages[key] = generating_output() ? portable(shader) : shader
-    return shader
-end
-
-# ── Ray-tracing stages ───────────────────────────────────────────────────────
-
-"""
-    RTShaders
-
-The ray-tracing stages compiled from one function at one point in its history,
-by `(stage, payload_type, push_constant_size)`, kept with its `CodeInstance`.
-"""
-mutable struct RTShaders
-    stages::Dict{Any,LavaRTShader}
-    RTShaders() = new(Dict{Any,LavaRTShader}())
-end
-
-"""
-    cached_rt_shader(f, tt; stage, push_constant_size, payload_type, features) -> LavaRTShader
-
-Ray-tracing stage `stage` of `f`, compiled for the code `f` has now. With
-`LAVA_CAPTURE_RT_JOBS=1` every lookup is recorded (`captured_rt_jobs`), found or
-compiled: the capture is about which stages a scene uses, not about timing them.
-"""
-function cached_rt_shader(@nospecialize(f), @nospecialize(tt); stage::Symbol,
-                          push_constant_size::Integer, payload_type::Symbol,
-                          features::TargetFeatures)
-    if get(ENV, "LAVA_CAPTURE_RT_JOBS", "") == "1"
-        push!(RT_JOB_CAPTURE, RTShaderJob(f, tt, stage, payload_type, Int(push_constant_size)))
-    end
-    job = lava_rt_job(f, tt, features)
-    key = (stage, payload_type, Int(push_constant_size))
-    shaders = GPUCompiler.cached_results(RTShaders, job)
-    if shaders !== nothing
-        shader = get(shaders.stages, key, nothing)
-        if shader !== nothing
-            COMPILE_STATS.hits += 1
-            return shader
-        end
-    end
-    enroll!(job)
-    shader = persisted_rt_shader(job; stage, payload_type, push_constant_size, features)
-    shaders = @something shaders GPUCompiler.cached_results(RTShaders, job)
     shaders.stages[key] = generating_output() ? portable(shader) : shader
     return shader
 end
@@ -290,17 +246,6 @@ function persisted_kernel(job::LavaCompilerJob)
         p = job.config.params
         return persisted("Lava/kernel", mod, p.workgroup_size, p.enable_ray_query, p.features) do
             lava_gpu_kernel(mod, meta, job)
-        end
-    end
-end
-
-"""Ray-tracing stage `stage` of `job`, kept from an earlier session or compiled (`persisted`)."""
-function persisted_rt_shader(job::GPUCompiler.CompilerJob; stage::Symbol, payload_type::Symbol,
-                             push_constant_size::Integer, features::TargetFeatures)
-    GPUCompiler.JuliaContext() do ctx
-        mod, meta = lava_llvm(job)
-        return persisted("Lava/rt", mod, stage, payload_type, Int(push_constant_size), features) do
-            rt_shader(mod, meta; stage, payload_type, validate = true, features)
         end
     end
 end

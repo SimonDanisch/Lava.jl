@@ -70,19 +70,17 @@ using .SPIRVTestUtils: compile_and_disasm
     end
 
     # Every COMPUTE builtin is covered above. `SPIRV_BUILTIN_MAP` is merged at
-    # load time with the graphics (`graphics.jl:31`) and ray-tracing
-    # (`raytracing.jl:37`) tables, and those are only legal in their own
-    # execution models — a compute kernel reading `FragCoord` or `LaunchIdKHR`
-    # would be rejected for the stage, not for the builtin. They want the same
-    # treatment in a test that compiles at `stage = :fragment` / `:raygen`,
-    # which `compile_and_disasm` supports; this file is the compute half.
+    # load time with the graphics table (`graphics.jl:31`), which is only legal
+    # in its own execution models: a compute kernel reading `FragCoord` would be
+    # rejected for the stage, not for the builtin. It wants the same treatment in
+    # a test that compiles at `stage = :fragment`, which `compile_and_disasm`
+    # supports; this file is the compute half.
     #
     # Asserted rather than trusted: a new compute builtin with no kernel above
     # is precisely the hole this file exists to close.
     @testset "every compute builtin is covered" begin
         compute = setdiff(Set(keys(Lava.SPIRV_BUILTIN_MAP)),
-                          Set(keys(Lava.SPIRV_GFX_BUILTIN_MAP)),
-                          Set(keys(Lava.SPIRV_RT_BUILTIN_MAP)))
+                          Set(keys(Lava.SPIRV_GFX_BUILTIN_MAP)))
         tabled  = Set(replace(k, "__spirv_BuiltIn" => "") for k in compute)
         covered = Set(first.(BUILTIN_KERNELS)) ∪ Set(["WorkgroupSize"])
         @test setdiff(tabled, covered) == Set{String}()

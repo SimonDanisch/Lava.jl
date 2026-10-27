@@ -439,7 +439,7 @@ struct CompilationResult
     spirv_bytes::Vector{UInt8}    # Raw SPIR-V binary
     spirv_disasm::String          # spirv-dis output
     entry_name::String
-    stage::Symbol                 # :compute, :vertex, :fragment, :raygen, etc.
+    stage::Symbol                 # :compute, :vertex, :fragment, etc.
     workgroup_size::NTuple{3,Int}
     push_info::Union{Nothing, PushConstantInfo}
     source_map::Dict{UInt32, Tuple{String, Int}}  # SPIR-V ID → (julia_file, julia_line)
@@ -447,28 +447,24 @@ end
 
 """
     lava_compile(f, tt; stage=:compute, workgroup_size=(64,1,1),
-                 config=nothing, payload_type=:f32, validate=true) -> CompilationResult
+                 config=nothing, validate=true) -> CompilationResult
 
 Compile a Julia function through the full Lava pipeline, returning a `CompilationResult`
 with IR at every stage for introspection and validation.
 
 Supports all shader stages: `:compute`, `:vertex`, `:fragment`, `:geometry`,
-`:tess_control`, `:tess_eval`, `:mesh`, `:task`, `:raygen`, `:closesthit`,
-`:miss`, `:anyhit`, `:intersection`, `:callable`.
+`:tess_control`, `:tess_eval`, `:mesh`, `:task`.
 """
 function lava_compile(@nospecialize(f), @nospecialize(tt);
                       stage::Symbol=:compute,
                       workgroup_size::NTuple{3,Int}=(64, 1, 1),
                       config=nothing,
-                      payload_type::Symbol=:f32,
                       validate::Bool=true)
     if stage == :compute
         result = lava_compile_full(f, tt; workgroup_size, validate)
         return result
     elseif stage in (:vertex, :fragment, :geometry, :tess_control, :tess_eval, :mesh, :task)
         return lava_compile_gfx_full(f, tt; stage, config, validate)
-    elseif stage in (:raygen, :closesthit, :miss, :anyhit, :intersection, :callable)
-        return lava_compile_rt_full(f, tt; stage, payload_type, validate)
     else
         error("Unknown stage: $stage")
     end
@@ -553,54 +549,6 @@ function lava_compile_gfx_full(@nospecialize(f), @nospecialize(tt);
         post_pass_ir = string(mod)
 
         spirv_bytes, source_map = emit_spirv_from_llvm_gfx(mod, wrapper_name, stage; config=config)
-
-        write(lava_debug_path("lava_last.spv"), spirv_bytes)
-        write(lava_debug_path("lava_last.ll"), post_pass_ir)
-        dump_spirv_to_disk(spirv_bytes, post_pass_ir, wrapper_name; entry_name)
-        if validate
-            validate_spirv(spirv_bytes, post_pass_ir, source_map)
-        end
-
-        spirv_disasm = disassemble_spirv(spirv_bytes)
-
-        return CompilationResult(pre_pass_ir, post_pass_ir, spirv_bytes, spirv_disasm,
-                                 wrapper_name, stage, (1, 1, 1), push_info, source_map)
-    end
-end
-
-"""Compile RT shader, capturing pre/post IR."""
-function lava_compile_rt_full(@nospecialize(f), @nospecialize(tt);
-                                stage::Symbol=:raygen,
-                                payload_type::Symbol=:f32,
-                                validate::Bool=true,
-                                features::TargetFeatures=TargetFeatures())
-    config = lava_compiler_config(; workgroup_size=(1, 1, 1), features)
-    source = GPUCompiler.methodinstance(typeof(f), tt)
-    job = GPUCompiler.CompilerJob(source, config)
-
-    GPUCompiler.JuliaContext() do ctx
-        local mod, meta
-        try
-            mod, meta = GPUCompiler.compile(:llvm, job)
-        catch e
-            wrap_gpu_compiler_error(e, f, tt)
-        end
-        entry_fn = meta.entry
-        entry_name = entry_fn.name
-
-        pre_pass_ir = string(mod)
-
-        push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
-        wrapper_name = push_info.wrapper_name
-        wrapper_fn = mod.functions[wrapper_name]
-
-        # RT shader emission has no multi-OpFunction walker, so this path
-        # collapses the module into one.
-        run_llvm_passes!(mod, wrapper_fn; force_inline_all=true)
-        post_pass_ir = string(mod)
-
-        spirv_bytes, source_map = emit_spirv_from_llvm_rt(mod, wrapper_name, stage;
-                                                payload_type=payload_type, features)
 
         write(lava_debug_path("lava_last.spv"), spirv_bytes)
         write(lava_debug_path("lava_last.ll"), post_pass_ir)
@@ -879,176 +827,6 @@ function lava_compile_gpu(@nospecialize(f), @nospecialize(tt);
     source = GPUCompiler.methodinstance(typeof(f), tt)
     job = GPUCompiler.CompilerJob(source, config)
     return lava_compile_gpu_from_job(job; enable_ray_query, validate, force_inline_all)
-end
-
-# ── RT Shader Compilation ──
-
-"""
-One `lava_compile_rt_shader` invocation, recorded so it can be replayed.
-
-The argument tuple for a chit is built at trace time from the adapted launch
-arguments (`trace_rays_indirect!`), so there is no way to reconstruct it by
-hand — the only way to compile one chit in isolation was to render a whole
-scene, ~80 s per attempt. Capturing the job once turns that into an in-session
-call that can be repeated as often as a measurement needs.
-"""
-struct RTShaderJob
-    f::Any
-    tt::Type
-    stage::Symbol
-    payload_type::Symbol
-    push_constant_size::Int
-end
-
-function Base.show(io::IO, j::RTShaderJob)
-    print(io, "RTShaderJob(", j.stage, ", ", nameof(typeof(j.f)), ")")
-end
-
-"""
-Captured RT compile jobs. Recording is off unless `LAVA_CAPTURE_RT_JOBS=1`;
-see [`captured_rt_jobs`](@ref) and [`replay_rt_job`](@ref).
-"""
-const RT_JOB_CAPTURE = RTShaderJob[]
-
-"""
-    captured_rt_jobs() -> Vector{RTShaderJob}
-
-Every RT shader compile seen since the last [`clear_rt_job_capture!`](@ref),
-when `LAVA_CAPTURE_RT_JOBS=1` was set. Render a scene once to populate it, then
-replay individual shaders without rendering again.
-"""
-captured_rt_jobs() = RT_JOB_CAPTURE
-
-clear_rt_job_capture!() = (empty!(RT_JOB_CAPTURE); nothing)
-
-"""
-    replay_rt_job(job; validate=true) -> LavaRTShader
-
-Recompile a captured shader, from scratch: `lava_compile_rt_shader` has no
-cache in front of it, so this re-runs the whole pipeline.
-"""
-replay_rt_job(job::RTShaderJob; validate::Bool=true) =
-    lava_compile_rt_shader(job.f, job.tt; stage=job.stage,
-                           push_constant_size=job.push_constant_size,
-                           payload_type=job.payload_type, validate)
-
-"""
-    LavaRTShader
-
-Compilation result for a ray tracing shader stage.
-"""
-struct LavaRTShader
-    spirv_bytes::Vector{UInt8}
-    stage::Symbol
-    push_info::PushConstantInfo
-    ir::String
-end
-
-"""
-    lava_rt_job(f, tt, features) -> CompilerJob
-
-The compile job of a ray-tracing stage `f` taking arguments of types `tt`, in
-the current world: what a cache of compiled stages looks its entries up by
-(`GPUCompiler.cached_results`), and what `lava_compile_rt_shader` compiles.
-"""
-lava_rt_job(@nospecialize(f), @nospecialize(tt), features::TargetFeatures) =
-    GPUCompiler.CompilerJob(GPUCompiler.methodinstance(typeof(f), tt),
-                            lava_compiler_config(; workgroup_size = (1, 1, 1),
-                                                 enable_ray_query = true, features))
-
-"""
-    lava_compile_rt_shader(f, tt; stage=:raygen, push_constant_size=8,
-                            payload_type=:f32, validate=true, features,
-                            job=lava_rt_job(f, tt, features)) -> LavaRTShader
-
-Compile a Julia function to a ray tracing shader stage (raygen, closesthit, miss).
-
-The function receives its arguments via a BDA push constant buffer (same as compute),
-except that RT-specific data (TLAS, payload, builtins) is handled automatically by
-the emitter.
-
-# Stages
-- `:raygen` — Ray generation shader. Can call `lava_rt_trace_ray!()`.
-- `:closesthit` — Closest hit shader. Can read hit builtins, write payload.
-- `:miss` — Miss shader. Can write payload.
-
-# Payload
-Currently only Float32 payload supported (`payload_type=:f32`).
-"""
-function lava_compile_rt_shader(@nospecialize(f), @nospecialize(tt);
-                                 stage::Symbol=:raygen,
-                                 push_constant_size::Integer=8,
-                                 payload_type::Symbol=:f32,
-                                 validate::Bool=true,
-                                 features::TargetFeatures=TargetFeatures(),
-                                 job::GPUCompiler.CompilerJob=lava_rt_job(f, tt, features))
-    # Always compiles; `cached_rt_shader` is the lookup in front of this, and
-    # records the capture (`LAVA_CAPTURE_RT_JOBS`).
-    #
-    # Per-material chit shaders may do inline shadow-ray traces via ray query
-    # (`surface_direct_lighting_inner_typed!`), so the chit shader needs
-    # `enable_ray_query=true` to bring in the TLAS variable + the rayQuery
-    # capability (`lava_rt_job`). The cost of enabling on RT shaders that don't
-    # actually use ray query is one unused descriptor binding (the driver strips
-    # dead code).
-
-    GPUCompiler.JuliaContext() do ctx
-        mod, meta = lava_llvm(job)
-        return rt_shader(mod, meta; stage, payload_type, validate, features)
-    end
-end
-
-"""
-    rt_shader(mod, meta; stage, payload_type, validate, features) -> LavaRTShader
-
-Ray-tracing stage `stage` of the module GPUCompiler made of its job (`lava_llvm`). Consumes `mod`.
-"""
-function rt_shader(mod::LLVM.Module, meta; stage::Symbol, payload_type::Symbol, validate::Bool,
-                   features::TargetFeatures)
-    checkpoint = PhaseTimer("[phase] "; threshold=1.0)
-    entry_fn = meta.entry
-    entry_name = entry_fn.name
-    # Tag this compile's phases with the shader they belong to. Without it
-    # every RT phase inherits whatever `lava_compile_gpu_from_job` set last,
-    # so a per-shader breakdown bills all five RT shaders to some unrelated
-    # compute kernel — which is exactly how a 5-line counter-reset kernel
-    # came out "costing" 21.6 s against its real 0.4 s.
-    phase_kernel!(entry_name)
-
-    # BDA entry wrapper (same as compute — args via push constant buffer)
-    push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
-    wrapper_name = push_info.wrapper_name
-    wrapper_fn = mod.functions[wrapper_name]
-    checkpoint("wrap_entry_for_vulkan!")
-
-    # LLVM passes. The RT emitter now has the multi-OpFunction walker, so
-    # keep callees as separate OpFunctions (force_inline_all=false): a fat
-    # per-material chit stays one architecture but compiles as many small
-    # functions instead of one giant inlined one (minutes -> seconds).
-    run_llvm_passes!(mod, wrapper_fn; force_inline_all=false)
-    checkpoint("run_llvm_passes!")
-
-    ir = string(mod)
-    write(lava_debug_path("lava_last_rt.ll"), ir)
-    # Own checkpoint: on a fat chit `string(mod)` is seconds by itself, and
-    # folding it into the emitter's number would point the finger at the
-    # wrong phase.
-    checkpoint("string(mod) + IR dump")
-
-    # RT-specific SPIR-V emission
-    spirv_bytes, source_map = emit_spirv_from_llvm_rt(mod, wrapper_name, stage;
-                                                      payload_type=payload_type, features)
-    checkpoint("emit_spirv_from_llvm_rt")
-
-    write(lava_debug_path("lava_last.spv"), spirv_bytes)
-    dump_spirv_to_disk(spirv_bytes, ir, wrapper_name; entry_name)
-
-    if validate
-        validate_spirv(spirv_bytes, ir, source_map)
-        checkpoint("validate_spirv")
-    end
-
-    return LavaRTShader(spirv_bytes, stage, push_info, ir)
 end
 
 # ── Graphics Shader Compilation ──

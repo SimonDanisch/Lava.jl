@@ -249,8 +249,6 @@ function GPUCompiler.isintrinsic(::LavaCompilerJob, fn::String)
     startswith(fn, "llvm.spv.") && return true
     # Custom _lava_glsl_* externals → SPIR-V emitter maps to GLSL.std.450
     startswith(fn, "_lava_glsl_") && return true
-    # RT intrinsics → SPIR-V emitter maps to OpTraceRayKHR, payload load/store
-    startswith(fn, "_lava_rt_") && return true
     # @lava_printf externals → SPIR-V emitter maps to NonSemantic.DebugPrintf
     startswith(fn, "_lava_debug_printf_") && return true
     # Cooperative-matrix and tensor-addressing intrinsics carry their shape in
