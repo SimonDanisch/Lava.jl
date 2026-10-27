@@ -233,6 +233,7 @@ include("runtime/intrinsics.jl")
 
 # ---- Array interface (before launch.jl because it references LavaArray) ----
 include("device/devicearray.jl")  # LavaDeviceArray: what a kernel receives
+include("device/constarray.jl")   # Const: a LavaDeviceArray nothing writes during the kernel
 include("device/atomics.jl")  # needs LavaDeviceArray from devicearray.jl
 include("device/subgroup.jl") # subgroup / group-non-uniform intrinsics
 # KI's DEVICE half: index queries, barriers, shuffles, printing. It needs the

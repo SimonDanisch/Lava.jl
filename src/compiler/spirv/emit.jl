@@ -452,6 +452,38 @@ function emit_psb_ptr_reinterpret!(state::SPIRVEmitterState, target_ptr_ty_id::U
 end
 
 """
+    nonwritable_pointer!(state, ptr_id, value_ty) -> UInt32
+
+The address of PSB pointer `ptr_id` as a pointer to member 0 of a struct whose only member,
+of type `value_ty`, is decorated `NonWritable`. A load through it is a read-only access for
+the driver. SPIR-V decorates memory objects and struct members, never pointer values, so
+this is the only way to say it about memory reached through a PSB pointer (glslang lowers
+a `readonly buffer_reference` block the same way). A driver may then serve a uniform
+address from its scalar cache: RADV only uses SMEM for global loads it knows are not
+written.
+
+The struct gets its own id rather than `emit_type_struct!`'s cached one, which other
+`{value_ty}` structs share: decorating that one would mark them read-only too.
+"""
+function nonwritable_pointer!(state::SPIRVEmitterState, ptr_id::UInt32, value_ty::UInt32)
+    mod = state.mod
+    block = get!(mod.type_cache, (:nonwritable_block, value_ty)) do
+        id = fresh_id!(mod)
+        encode_instruction!(mod.types_constants, Op.OpTypeStruct, id, value_ty)
+        emit_member_decorate!(mod, id, UInt32(0), Dec.Offset, UInt32(0))
+        emit_member_decorate!(mod, id, UInt32(0), Dec.NonWritable)
+        id
+    end
+    block_ptr = emit_psb_ptr_reinterpret!(
+        state, map_pointer_type!(state.type_ctx, block, SC.PhysicalStorageBuffer), ptr_id)
+    member_ptr = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpAccessChain,
+                        map_pointer_type!(state.type_ctx, value_ty, SC.PhysicalStorageBuffer),
+                        member_ptr, block_ptr, emit_constant_u32!(mod, UInt32(0)))
+    return member_ptr
+end
+
+"""
     get_value_id!(state, val) -> UInt32
 
 Get the SPIR-V ID for an LLVM Value. Creates constants on-the-fly for ConstantInt/ConstantFP.
@@ -1575,6 +1607,10 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                 # Convert i64 → typed PSB pointer
                 encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ty, load_id, raw_load_id)
             else
+                # `!invariant.load`: nothing writes this memory while the kernel runs.
+                if haskey(LLVM.metadata(inst), LLVM.MD_invariant_load)
+                    ptr_id = nonwritable_pointer!(state, ptr_id, spirv_load_ty)
+                end
                 # OpLoad: result_type, result_id, ptr, memory_operand, alignment
                 push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
                 push!(state.mod.functions, spirv_load_ty)
