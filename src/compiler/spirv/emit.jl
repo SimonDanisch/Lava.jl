@@ -1748,6 +1748,21 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                     # Must load as i64 first, then OpConvertUToPtr.
                     load_as_int_then_convert_to_ptr = true
                     spirv_load_ty = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+                elseif eff_load_ty isa LLVM.PointerType && pointee_ty isa LLVM.ArrayType &&
+                       pointee_ty.element_type isa LLVM.IntegerType &&
+                       pointee_ty.element_type.width == 64
+                    # A by-reference argument can be packed as [N x i64],
+                    # with a device address in its first slot. The opaque
+                    # LLVM pointer load names the array directly. Drill to
+                    # that slot, then convert its integer value to the PSB
+                    # pointer; a pointer-valued OpLoad from the array is invalid.
+                    spirv_load_ty = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+                    slot = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpAccessChain,
+                        map_pointer_type!(state.type_ctx, spirv_load_ty, sc), slot,
+                        ptr_id, emit_constant_u32!(state.mod, UInt32(0)))
+                    ptr_id = slot
+                    load_as_int_then_convert_to_ptr = true
                 elseif eff_load_ty != pointee_ty && pointee_ty isa LLVM.IntegerType &&
                        (eff_load_ty isa LLVM.IntegerType || eff_load_ty isa LLVM.FloatingPointType) &&
                        !needs_ptr_bitcast
