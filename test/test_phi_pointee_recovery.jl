@@ -1,6 +1,6 @@
 # Pointer operands arriving at a phi retain the aggregate type used after it.
 using Test, Lava
-const LLVM = Lava.LLVM
+import LLVM
 @testset "recover BDA aggregate pointees through pointer phis" begin
     LLVM.Context() do _
         mod = parse(LLVM.Module, """

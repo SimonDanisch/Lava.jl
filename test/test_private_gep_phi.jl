@@ -32,8 +32,12 @@ using Test,Lava,LLVM
             LLVM.verify(mod)
             text=string(mod)
             if conditional
-                @test occursin("phi ptr",text) # refuse speculative OOB load
-                @test !occursin("vmirror_leaf_load",text)
+                # An untaken edge may have an out-of-range index. Trunk's
+                # lowering clamps every speculative private load to its array.
+                @test !occursin("phi ptr",text)
+                @test occursin("phi i32",text)
+                @test count("icmp slt i64 %index, 0",text) == 2
+                @test count("icmp sgt i64",text) == 2
             else
                 @test !occursin("phi ptr",text)
                 @test occursin("phi i32",text)
@@ -45,6 +49,58 @@ using Test,Lava,LLVM
                 LLVM.verify(stored)
                 @test occursin("phi ptr",string(stored))
                 @test !occursin("vmirror_leaf_load",string(stored))
+                called=parse(LLVM.Module,"declare void @mutate(ptr)\n" *
+                    replace(ir,"%v = load"=>"call void @mutate(ptr %p)\n  %v = load"))
+                Lava.lower_phi_select_function_ptrs!(called)
+                LLVM.verify(called)
+                @test occursin("phi ptr",string(called))
+                @test !occursin("vmirror_leaf_load",string(called))
+                # StructurizeCFG may separate a pointer phi from its load by
+                # an unconditional edge. Reads can cross that edge, never a
+                # write in either block.
+                across_ir=replace(ir,"%v = load"=>"br label %read\nread:\n  %v = load")
+                across=parse(LLVM.Module,across_ir)
+                Lava.lower_phi_select_function_ptrs!(across)
+                LLVM.verify(across)
+                @test !occursin("phi ptr",string(across))
+                @test occursin("phi i32",string(across))
+                guarded_ir=replace(across_ir,"br label %read"=>
+                    "br i1 %take, label %read, label %exit")
+                guarded=parse(LLVM.Module,guarded_ir)
+                Lava.lower_phi_select_function_ptrs!(guarded)
+                LLVM.verify(guarded)
+                @test !occursin("phi ptr",string(guarded))
+                @test occursin("phi i32",string(guarded))
+                guarded_write=parse(LLVM.Module,replace(guarded_ir,"%v = load"=>
+                    "store i32 99, ptr %p\n  %v = load"))
+                Lava.lower_phi_select_function_ptrs!(guarded_write)
+                LLVM.verify(guarded_write)
+                @test occursin("phi ptr",string(guarded_write))
+                # A load in a separate loop can observe a write from its
+                # previous iteration. It must not become one predecessor
+                # read reused for every iteration (the final result is 99).
+                loop_ir=replace(across_ir,
+                    "read:\n"=>"read:\n  %iteration = phi i32 [0, %join], [%next, %read]\n",
+                    "ret i32 %v"=>"%next = add i32 %iteration, 1\n  store i32 99, ptr %p\n  %again = icmp ult i32 %next, 2\n  br i1 %again, label %read, label %exit",
+                    "ret i32 0"=>"ret i32 %v")
+                looped=parse(LLVM.Module,loop_ir)
+                Lava.lower_phi_select_function_ptrs!(looped)
+                LLVM.verify(looped)
+                @test occursin("phi ptr",string(looped))
+                @test !occursin("vmirror_leaf_load",string(looped))
+                for location in ("br label %read", "%v = load")
+                    changed=replace(across_ir,location=>"store i32 99, ptr %p\n  " * location)
+                    written=parse(LLVM.Module,changed)
+                    Lava.lower_phi_select_function_ptrs!(written)
+                    LLVM.verify(written)
+                    @test occursin("phi ptr",string(written))
+                    @test !occursin("vmirror_leaf_load",string(written))
+                end
+                volatile=parse(LLVM.Module,replace(ir,"%v = load"=>"%v = load volatile"))
+                Lava.lower_phi_select_function_ptrs!(volatile)
+                LLVM.verify(volatile)
+                @test occursin("load volatile i32",string(volatile))
+                @test !occursin("vmirror_leaf_load",string(volatile))
                 # The extension is local-storage only, never BDA pointers.
                 external=parse(LLVM.Module,replace(ir,"%a = alloca [3 x i32]"=>"%a = inttoptr i64 4096 to ptr"))
                 Lava.lower_phi_select_function_ptrs!(external)

@@ -1710,7 +1710,13 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                 encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ty, load_id, raw_load_id)
             else
                 # `!invariant.load`: nothing writes this memory while the kernel runs.
-                if haskey(LLVM.metadata(inst), LLVM.MD_invariant_load)
+                # RADV 26.2.4 corrupts Float64 matrix products when these
+                # loads use NonWritable members (12x12 StaticArrays, even
+                # without spirv-opt). Removing only that decoration from
+                # the same shader restores exact results. Keep the ordinary
+                # load for doubles; Const's read-only contract is unchanged.
+                if haskey(LLVM.metadata(inst), LLVM.MD_invariant_load) &&
+                   !(actual_load isa LLVM.DoubleType)
                     ptr_id = nonwritable_pointer!(state, ptr_id, spirv_load_ty)
                 end
                 # OpLoad: result_type, result_id, ptr, memory_operand, alignment
@@ -2543,7 +2549,12 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
             end
         else
             align = psb_access_alignment(store_ty, llvm_align)
-            ptr_id = fix_psb_ptr_type_for_store!(state, ptr, ptr_id, value)
+            # A resolved aggregate field already has the type of the bitcast
+            # value above. Recasting it to LLVM's original store type would
+            # pair (for example) a uint pointer with a float value.
+            if store_val_bitcast_to === nothing
+                ptr_id = fix_psb_ptr_type_for_store!(state, ptr, ptr_id, value)
+            end
             word_count = UInt32(5)  # opcode + ptr + val + mem_operand + alignment
             push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpStore))
             push!(state.mod.functions, ptr_id)

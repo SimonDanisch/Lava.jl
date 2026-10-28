@@ -1,6 +1,6 @@
 # Opaque pointer selects must retain the storage class of local arrays.
 using Test,Lava
-const LLVM=Lava.LLVM
+import LLVM
 
 @testset "local and device pointer-select storage" begin
     LLVM.Context() do ctx
@@ -31,15 +31,45 @@ const LLVM=Lava.LLVM
         @test Lava.trace_to_non_alloca(ptr)
         @test Lava.is_psb_pointer(ptr)
         @test Lava.get_pointer_storage_class(ptr)==Lava.SC.PhysicalStorageBuffer
-        Lava.fold_local_array_gep_selects!(mod)
+        Lava.lower_phi_select_function_ptrs!(mod)
         @test LLVM.verify(mod) === nothing
         folded=collect(LLVM.instructions(first(LLVM.blocks(LLVM.functions(mod)["choose"]))))
-        # Keep one selected load; do not speculate either array access.
-        @test count(i->i isa LLVM.LoadInst,folded)==1
+        # Trunk lowers nested pointer choices to values. Every speculative
+        # access using the dynamic index is clamped into its private array.
+        text=string(mod)
+        @test occursin("icmp slt i64 %index, 0",text)
+        @test occursin("icmp sgt i64",text)
         pointer_selects=filter(i->i isa LLVM.SelectInst && i.value_type isa LLVM.PointerType,folded)
         @test length(pointer_selects)==1
         @test only(pointer_selects).name=="device"
-        @test count(i->i isa LLVM.SelectInst && i.value_type isa LLVM.IntegerType,folded)==2
+        @test any(i->i isa LLVM.SelectInst && i.value_type == LLVM.Int32Type(),folded)
+    end
+end
+
+@testset "pointer-select reads stay after intervening writes" begin
+    LLVM.Context() do _
+        mod = parse(LLVM.Module, """
+        define i32 @choose(i1 %cond) {
+        entry:
+          %a = alloca i32
+          %b = alloca i32
+          store i32 1, ptr %a
+          store i32 2, ptr %b
+          %p = select i1 %cond, ptr %a, ptr %b
+          store i32 99, ptr %a
+          %v = load i32, ptr %p
+          ret i32 %v
+        }
+        """)
+        Lava.lower_phi_select_function_ptrs!(mod)
+        @test LLVM.verify(mod) === nothing
+        text = string(mod)
+        @test !occursin("select i1 %cond, ptr", text)
+        # Both reads must observe the final store, including the selected a.
+        storepos = first(findfirst("store i32 99", text))
+        for read in ("load i32, ptr %a", "load i32, ptr %b")
+            @test first(findfirst(read, text)) > storepos
+        end
     end
 end
 
@@ -61,16 +91,19 @@ end
               ret i32 %value
             }
             """)
-            Lava.lower_local_array_select_loads!(mod)
+            Lava.lower_phi_select_function_ptrs!(mod)
             @test LLVM.verify(mod) === nothing
             text=string(mod)
             if volatile
                 @test occursin("select i1 %cond, ptr",text)
-                @test !occursin("local_safe_true_index",text)
+                @test count("load volatile i32",text) == 1
+                @test !occursin("vmirror_leaf_load",text)
             else
                 @test !occursin("select i1 %cond, ptr",text)
-                @test occursin("select i1 %cond, i64 %index, i64 0",text)
-                @test occursin("local_selected_value = select i1",text)
+                @test occursin("icmp slt i64 %index, 0",text)
+                @test occursin("icmp sgt i64",text)
+                @test occursin("vmirror_sel = select i1",text)
+                @test count("load i32",text) == 2
             end
         end
     end

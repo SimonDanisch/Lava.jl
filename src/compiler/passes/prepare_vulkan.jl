@@ -5196,12 +5196,11 @@ This pass rewrites:
 
     %val  = load Ty, ptr (phi/select of Function-storage allocas)
 
-into a parallel value-level mirror — `phi`/`select` over `Ty` values
-loaded from each leaf alloca in the appropriate predecessor / select
-block.  The original load is replaced with the mirrored value and erased.
-The pointer-typed `phi`/`select` chain is left as dead code; later
-DCE / `lower_dead_lifetime!` / `LLVM.verify` are unaffected since the
-chain has no remaining uses.
+into a parallel value-level mirror — `phi`/`select` over `Ty` values.
+Select trees read their leaves at the original load, preserving intervening
+writes. Phi chains read in the appropriate predecessors only when no write
+is crossed. The original load is replaced and erased, along with unused
+pointer choices.
 
 Limitations / preconditions enforced before transforming:
 
@@ -5230,8 +5229,11 @@ function lower_phi_select_function_ptrs!(mod::LLVM.Module)
             for bb in fn.blocks
                 for inst in bb.instructions
                     inst isa LLVM.LoadInst || continue
+                    (LLVM.volatile(inst) || LLVM.isatomic(inst)) && continue
                     ptr = inst.operands[1]
                     ptr isa Union{LLVM.PHIInst, LLVM.SelectInst} || continue
+                    at_load = function_ptr_select_tree(ptr, Set{LLVM.Value}())
+                    at_load || function_ptr_mirror_safe(ptr, inst, Set{Tuple{LLVM.Value,LLVM.Value}}()) || continue
                     ptr_ty = ptr.value_type
                     ptr_ty isa LLVM.PointerType || continue
                     ptr_ty.addrspace == 0 || continue
@@ -5246,7 +5248,17 @@ function lower_phi_select_function_ptrs!(mod::LLVM.Module)
                     end
 
                     cache = Dict{LLVM.Value, LLVM.Value}()
-                    new_val = build_function_ptr_value_mirror!(ptr, access_ty, cache)
+                    new_val = if at_load
+                        # Every operand of a select tree dominates this load.
+                        # Read here, after any intervening stores, then select
+                        # values. Only phi chains need predecessor-local reads.
+                        LLVM.@dispose builder=LLVM.IRBuilder() begin
+                            LLVM.position!(builder, insertion_point(inst))
+                            build_function_ptr_select_mirror!(builder, ptr, access_ty, cache)
+                        end
+                    else
+                        build_function_ptr_value_mirror!(ptr, access_ty, cache)
+                    end
                     new_val === nothing && continue
 
                     LLVM.replace_uses!(inst, new_val)
@@ -5266,6 +5278,72 @@ function lower_phi_select_function_ptrs!(mod::LLVM.Module)
     end
 end
 
+function function_ptr_select_tree(ptr::LLVM.Value, visited::Set{LLVM.Value})
+    ptr in visited && return true
+    push!(visited, ptr)
+    ptr isa Union{LLVM.AllocaInst,LLVM.GetElementPtrInst} && return true
+    ptr isa LLVM.SelectInst || return false
+    return all(function_ptr_select_tree(value, visited) for value in ptr.operands[2:3])
+end
+
+function build_function_ptr_select_mirror!(builder::LLVM.IRBuilder, ptr::LLVM.Value,
+                                          access_ty::LLVM.LLVMType,
+                                          cache::Dict{LLVM.Value,LLVM.Value})
+    haskey(cache, ptr) && return cache[ptr]
+    value = if ptr isa LLVM.SelectInst
+        cond, left, right = ptr.operands
+        a = build_function_ptr_select_mirror!(builder, left, access_ty, cache)
+        b = build_function_ptr_select_mirror!(builder, right, access_ty, cache)
+        LLVM.select!(builder, cond, a, b, "vmirror_sel")
+    else
+        load_function_leaf!(builder, ptr, access_ty)
+    end
+    cache[ptr] = value
+    return value
+end
+
+# A value mirror reads at the pointer choice, before the original load. Never
+# move that read across a write, including a call that may modify a leaf. Check
+# every nested choice up to the point where its mirrored value would be used.
+function function_ptr_mirror_safe(ptr::LLVM.Value, endpoint::LLVM.Instruction,
+                                  visited::Set{Tuple{LLVM.Value,LLVM.Value}})
+    ptr isa Union{LLVM.PHIInst,LLVM.SelectInst} || return true
+    edge = (ptr, endpoint)
+    edge in visited && return true
+    push!(visited, edge)
+    instruction = LLVM.next(ptr)
+    blocks = Set{LLVM.BasicBlock}([ptr.parent])
+    while instruction != endpoint
+        instruction === nothing && return false
+        LLVM.may_write_to_memory(instruction) && return false
+        if instruction == instruction.parent.terminator
+            # StructurizeCFG can put the consuming load in a successor block,
+            # possibly behind a guard. Private reads may be speculated onto
+            # that guard's unused edge, but the read block must not be entered
+            # again without recomputing this pointer choice.
+            successors = instruction.successors
+            block = if length(successors) == 1
+                only(successors)
+            elseif endpoint.parent in successors
+                endpoint.parent
+            else
+                return false
+            end
+            count(pred -> block in pred.terminator.successors, block.parent.blocks) == 1 || return false
+            block in blocks && return false
+            push!(blocks, block)
+            instruction = first(block.instructions)
+        else
+            instruction = LLVM.next(instruction)
+        end
+    end
+    if ptr isa LLVM.PHIInst
+        return all(function_ptr_mirror_safe(value, predecessor.terminator, visited)
+                   for (value, predecessor) in ptr.incoming)
+    end
+    return all(function_ptr_mirror_safe(value, ptr, visited) for value in ptr.operands[2:3])
+end
+
 """
 Erase a now-dead pointer phi/select chain, recursively visiting operands
 that themselves become dead as parent uses are removed.  Allocas at the
@@ -5274,7 +5352,10 @@ before our rewrite still had stores into them) may legitimately keep
 them live, and a subsequent DCE/SROA cleanup pass owns deciding whether
 those allocas can go away.
 """
-function erase_dead_ptr_chain!(val::LLVM.Value)
+function erase_dead_ptr_chain!(val::LLVM.Value, erased::Set{LLVM.Value}=Set{LLVM.Value}())
+    # A shared descendant can be reached again after an earlier branch erased
+    # it. Check its identity before accessing the freed LLVM instruction.
+    val in erased && return
     val isa LLVM.Instruction || return
     val isa LLVM.AllocaInst && return   # leaves stay
     isempty(val.uses) || return  # still used elsewhere
@@ -5289,9 +5370,10 @@ function erase_dead_ptr_chain!(val::LLVM.Value)
         push!(children, ops[2])
         push!(children, ops[3])
     end
+    push!(erased, val)
     LLVM.erase!(val)
     for child in children
-        erase_dead_ptr_chain!(child)
+        erase_dead_ptr_chain!(child, erased)
     end
 end
 

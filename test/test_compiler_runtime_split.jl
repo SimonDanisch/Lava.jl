@@ -60,7 +60,7 @@ const LAVA_SOURCES = [
     "device/ray_query_intrinsics.jl", "device/gfx_intrinsics.jl", "device/printf.jl",
     "device/atomics.jl", "device/subgroup.jl", "device/acceleratedmatrix.jl",
     "device/coopmat_intrinsics.jl", "device/tensor_intrinsics.jl",
-    "device/kernelinterface.jl", "device/devicearray.jl",
+    "device/kernelinterface.jl", "device/devicearray.jl", "device/constarray.jl",
     "device/sharedmemory.jl", "device/ndrange.jl",
 ]
 

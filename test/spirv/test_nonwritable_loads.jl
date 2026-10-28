@@ -11,7 +11,7 @@
 # `{T}` in the module (the push-constant block is `{ulong}`), and decorating that one
 # would claim those are read-only too.
 
-using Test
+using Test, Lava
 if !@isdefined(SPIRVTestUtils)
     include(joinpath(@__DIR__, "..", "spirv_test_utils.jl"))
 end
@@ -141,6 +141,13 @@ nonwritable_structs(d) = [m[1] for m in eachmatch(r"OpMemberDecorate (%\S+) 0 No
         # carried field by field.
         d, _ = compile_and_disasm(nw_const_composite!,
                                   Tuple{Lava.LavaDeviceArray{Float32,1}, Lava.Const{NWPair,1}})
+        check_not(d, "NonWritable")
+    end
+
+    @testset "Float64 uses ordinary loads for RADV correctness" begin
+        d, _ = compile_and_disasm(nw_const_linear!,
+                                  Tuple{Lava.LavaDeviceArray{Float64,1}, Lava.Const{Float64,1}})
+        check(d, "OpLoad %double")
         check_not(d, "NonWritable")
     end
 
