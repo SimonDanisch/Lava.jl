@@ -194,6 +194,10 @@ mutable struct SPIRVEmitterState
     # from the compile job's `LavaCompilerParams`; all-false until then, which is
     # the module that is valid everywhere.
     features::TargetFeatures
+    # `narrow_index!`'s 32-bit copies of i64 index arithmetic, by (value, block):
+    # an index shares its subexpressions with others, and narrowing each anew
+    # repeated a shared DAG once per path through it.
+    narrowed_index::Dict{Tuple{LLVM.Value, UInt32}, UInt32}
 end
 
 function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
@@ -231,6 +235,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{LLVM.Value, LLVM.LLVMType}(),  # value_emitted_pointee
         Dict{LLVM.API.LLVMMetadataRef, Union{Nothing, Tuple{String, Int}}}(),  # source_loc_cache
         TargetFeatures(),  # features (set by the RT emitter from the job)
+        Dict{Tuple{LLVM.Value, UInt32}, UInt32}(),  # narrowed_index
     )
 end
 
@@ -429,6 +434,38 @@ function emit_psb_ptr_reinterpret!(state::SPIRVEmitterState, target_ptr_ty_id::U
 end
 
 """
+    nonwritable_pointer!(state, ptr_id, value_ty) -> UInt32
+
+The address of PSB pointer `ptr_id` as a pointer to member 0 of a struct whose only member,
+of type `value_ty`, is decorated `NonWritable`. A load through it is a read-only access for
+the driver. SPIR-V decorates memory objects and struct members, never pointer values, so
+this is the only way to say it about memory reached through a PSB pointer (glslang lowers
+a `readonly buffer_reference` block the same way). A driver may then serve a uniform
+address from its scalar cache: RADV only uses SMEM for global loads it knows are not
+written.
+
+The struct gets its own id rather than `emit_type_struct!`'s cached one, which other
+`{value_ty}` structs share: decorating that one would mark them read-only too.
+"""
+function nonwritable_pointer!(state::SPIRVEmitterState, ptr_id::UInt32, value_ty::UInt32)
+    mod = state.mod
+    block = get!(mod.type_cache, (:nonwritable_block, value_ty)) do
+        id = fresh_id!(mod)
+        encode_instruction!(mod.types_constants, Op.OpTypeStruct, id, value_ty)
+        emit_member_decorate!(mod, id, UInt32(0), Dec.Offset, UInt32(0))
+        emit_member_decorate!(mod, id, UInt32(0), Dec.NonWritable)
+        id
+    end
+    block_ptr = emit_psb_ptr_reinterpret!(
+        state, map_pointer_type!(state.type_ctx, block, SC.PhysicalStorageBuffer), ptr_id)
+    member_ptr = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpAccessChain,
+                        map_pointer_type!(state.type_ctx, value_ty, SC.PhysicalStorageBuffer),
+                        member_ptr, block_ptr, emit_constant_u32!(mod, UInt32(0)))
+    return member_ptr
+end
+
+"""
     get_value_id!(state, val) -> UInt32
 
 Get the SPIR-V ID for an LLVM Value. Creates constants on-the-fly for ConstantInt/ConstantFP.
@@ -493,16 +530,88 @@ function ensure_index_i32!(state::SPIRVEmitterState, val::LLVM.Value)
         return emit_constant_u32!(state.mod, UInt32(convert(Int64, val) & 0xFFFFFFFF))
     end
 
-    id = get_value_id!(state, val)
-    if ty isa LLVM.IntegerType && ty.width > 32
-        # Runtime index wider than i32 — truncate via OpUConvert.
-        u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
-        conv_id = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, id)
-        return conv_id
-    end
+    # Runtime index wider than i32: computed in 32 bits (see `narrow_index!`).
+    ty isa LLVM.IntegerType && ty.width > 32 && return narrow_index!(state, val)
 
+    return get_value_id!(state, val)
+end
+
+# i64 operations whose low 32 bits depend only on their operands' low 32 bits.
+const NARROW_INDEX_OPS = Dict(
+    LLVM.API.LLVMAdd => Op.OpIAdd, LLVM.API.LLVMSub => Op.OpISub, LLVM.API.LLVMMul => Op.OpIMul,
+    LLVM.API.LLVMAnd => Op.OpBitwiseAnd, LLVM.API.LLVMOr => Op.OpBitwiseOr,
+    LLVM.API.LLVMXor => Op.OpBitwiseXor)
+
+"""
+    narrow_index!(state, val) -> UInt32
+
+The i64 index `val` as a u32 computed in 32 bits: its adds, subtracts,
+multiplies, bitwise operations, left shifts by constants and selects are
+redone on the low halves of their operands, which is the same value modulo
+2^32; anything else is truncated where it enters. A right shift by at most 8
+is narrowed only as the index itself: an index in bounds of an array of fewer
+than 2^23 elements had an operand below 2^31, so its low half is all of it.
+
+NVIDIA (RTX 4000 Ada, driver 595) stores to the wrong element of a private
+array when the index is the i64 `(select(c, 0, 48) + 16) >> 2` — the element
+offset of a matrix column chosen by a comparison, retyped to 32-bit words — and
+to the right one when the same arithmetic is done in 32 bits. The access chain
+takes 32 bits of the index either way.
+"""
+function narrow_index!(state::SPIRVEmitterState, val::LLVM.Value, root::Bool = true, depth::Int = 0)
+    if val isa LLVM.ConstantInt
+        return emit_constant_u32!(state.mod, UInt32(convert(Int64, val) & 0xFFFFFFFF))
+    end
+    # A root right shift is narrowed and an inner one is not: memoised apart.
+    key = (val, root ? state.current_block_label : ~state.current_block_label)
+    cached = get(state.narrowed_index, key, nothing)
+    cached !== nothing && return cached
+    id = narrow_index_uncached!(state, val, root, depth)
+    state.narrowed_index[key] = id
     return id
+end
+
+function narrow_index_uncached!(state::SPIRVEmitterState, val::LLVM.Value, root::Bool, depth::Int)
+    u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+    if val isa LLVM.Instruction && depth < 16
+        opc = LLVM.opcode(val)
+        ops = LLVM.operands(val)
+        spv = get(NARROW_INDEX_OPS, opc, nothing)
+        shift = ops[end] isa LLVM.ConstantInt ? convert(Int64, ops[end]) : -1
+        if spv !== nothing || (opc == LLVM.API.LLVMShl && 0 <= shift < 32)
+            a = narrow_index!(state, ops[1], false, depth + 1)
+            b = narrow_index!(state, ops[2], false, depth + 1)
+            id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, something(spv, Op.OpShiftLeftLogical), u32_ty, id, a, b)
+            return id
+        elseif root && opc in (LLVM.API.LLVMLShr, LLVM.API.LLVMAShr) && 0 <= shift <= 8
+            a = narrow_index!(state, ops[1], false, depth + 1)
+            id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions,
+                                opc == LLVM.API.LLVMLShr ? Op.OpShiftRightLogical : Op.OpShiftRightArithmetic,
+                                u32_ty, id, a, emit_constant_u32!(state.mod, UInt32(shift)))
+            return id
+        elseif opc == LLVM.API.LLVMSelect
+            c = get_value_id!(state, ops[1])
+            a = narrow_index!(state, ops[2], root, depth + 1)
+            b = narrow_index!(state, ops[3], root, depth + 1)
+            id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpSelect, u32_ty, id, c, a, b)
+            return id
+        elseif opc in (LLVM.API.LLVMZExt, LLVM.API.LLVMSExt) && ops[1].value_type.width in (8, 16, 32)
+            src = get_value_id!(state, ops[1])
+            ops[1].value_type.width == 32 && return src
+            id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, opc == LLVM.API.LLVMZExt ? Op.OpUConvert : Op.OpSConvert,
+                                u32_ty, id, src)
+            return id
+        end
+    end
+    id = get_value_id!(state, val)
+    val.value_type.width <= 32 && return id
+    conv_id = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpUConvert, u32_ty, conv_id, id)
+    return conv_id
 end
 
 function get_block_id!(state::SPIRVEmitterState, bb::LLVM.BasicBlock)
@@ -664,6 +773,7 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
     # dicts are left alone — Values are unique per function so no collision.
     empty!(state.deferred_phis)
     empty!(state.psb_ptr_to_u64)
+    empty!(state.narrowed_index)
     state.current_ray_query_var = nothing
     # Same reasoning as the ray-query variable: the OpVariable lives in THIS
     # function's preamble, so carrying the id across functions would reference
@@ -936,16 +1046,22 @@ function emit_instruction!(state::SPIRVEmitterState, inst::LLVM.Instruction)
     # Arithmetic — Float
     elseif inst isa LLVM.FAddInst
         emit_binary_op!(state, inst, Op.OpFAdd)
+        exact!(state, inst)
     elseif inst isa LLVM.FSubInst
         emit_binary_op!(state, inst, Op.OpFSub)
+        exact!(state, inst)
     elseif inst isa LLVM.FMulInst
         emit_binary_op!(state, inst, Op.OpFMul)
+        exact!(state, inst)
     elseif inst isa LLVM.FDivInst
         emit_binary_op!(state, inst, Op.OpFDiv)
+        exact!(state, inst)
     elseif inst isa LLVM.FRemInst
         emit_binary_op!(state, inst, Op.OpFRem)
+        exact!(state, inst)
     elseif inst isa LLVM.FNegInst
         emit_unary_op!(state, inst, Op.OpFNegate)
+        exact!(state, inst)
     # Arithmetic — Integer
     elseif inst isa LLVM.AddInst
         emit_binary_op!(state, inst, Op.OpIAdd)
@@ -1107,6 +1223,24 @@ function emit_binary_op!(state::SPIRVEmitterState, inst::LLVM.Instruction, opcod
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, opcode, result_ty, result_id, lhs, rhs)
     state.value_map[inst] = result_id
+end
+
+"""
+    exact!(state, inst)
+
+Marks the float result of `inst` `NoContraction` unless LLVM's `contract` flag allows fusing
+it. That flag is how Julia says a result may be contracted (`muladd`, `@fastmath`); without it
+Julia means each operation rounded on its own. A driver may treat an instruction without
+`NoContraction` as inexact, and Mesa then reassociates and folds across it, which is fine for
+most arithmetic but turns the error terms of double-float arithmetic (TwoSum, TwoProd) into 0:
+on lavapipe always, on RADV unless an opaque factor sits between the operations
+(test/spirv/test_arith_exact.jl).
+"""
+function exact!(state::SPIRVEmitterState, inst::LLVM.Instruction)
+    if LLVM.API.LLVMGetFastMathFlags(inst) & LLVM.API.LLVMFastMathAllowContract == 0
+        emit_decorate!(state.mod, state.value_map[inst], Dec.NoContraction)
+    end
+    return
 end
 
 function emit_unary_op!(state::SPIRVEmitterState, inst::LLVM.Instruction, opcode::UInt16)
@@ -1549,6 +1683,16 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                 # Convert i64 → typed PSB pointer
                 encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ty, load_id, raw_load_id)
             else
+                # `!invariant.load`: nothing writes this memory while the kernel runs.
+                # RADV 26.2.4 corrupts Float64 matrix products when these
+                # loads use NonWritable members (12x12 StaticArrays, even
+                # without spirv-opt). Removing only that decoration from
+                # the same shader restores exact results. Keep the ordinary
+                # load for doubles; Const's read-only contract is unchanged.
+                if haskey(LLVM.metadata(inst), LLVM.MD_invariant_load) &&
+                   !(actual_load isa LLVM.DoubleType)
+                    ptr_id = nonwritable_pointer!(state, ptr_id, spirv_load_ty)
+                end
                 # OpLoad: result_type, result_id, ptr, memory_operand, alignment
                 push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
                 push!(state.mod.functions, spirv_load_ty)
@@ -1578,6 +1722,21 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                     # Must load as i64 first, then OpConvertUToPtr.
                     load_as_int_then_convert_to_ptr = true
                     spirv_load_ty = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+                elseif eff_load_ty isa LLVM.PointerType && pointee_ty isa LLVM.ArrayType &&
+                       pointee_ty.element_type isa LLVM.IntegerType &&
+                       pointee_ty.element_type.width == 64
+                    # A by-reference argument can be packed as [N x i64],
+                    # with a device address in its first slot. The opaque
+                    # LLVM pointer load names the array directly. Drill to
+                    # that slot, then convert its integer value to the PSB
+                    # pointer; a pointer-valued OpLoad from the array is invalid.
+                    spirv_load_ty = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+                    slot = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpAccessChain,
+                        map_pointer_type!(state.type_ctx, spirv_load_ty, sc), slot,
+                        ptr_id, emit_constant_u32!(state.mod, UInt32(0)))
+                    ptr_id = slot
+                    load_as_int_then_convert_to_ptr = true
                 elseif eff_load_ty != pointee_ty && pointee_ty isa LLVM.IntegerType &&
                        (eff_load_ty isa LLVM.IntegerType || eff_load_ty isa LLVM.FloatingPointType) &&
                        !needs_ptr_bitcast
@@ -2379,7 +2538,12 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
             end
         else
             align = psb_access_alignment(store_ty, llvm_align)
-            ptr_id = fix_psb_ptr_type_for_store!(state, ptr, ptr_id, value)
+            # A resolved aggregate field already has the type of the bitcast
+            # value above. Recasting it to LLVM's original store type would
+            # pair (for example) a uint pointer with a float value.
+            if store_val_bitcast_to === nothing
+                ptr_id = fix_psb_ptr_type_for_store!(state, ptr, ptr_id, value)
+            end
             word_count = UInt32(5)  # opcode + ptr + val + mem_operand + alignment
             push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpStore))
             push!(state.mod.functions, ptr_id)
@@ -2848,6 +3012,9 @@ function trace_to_non_alloca(ptr::LLVM.Value, visited::Set{LLVM.Value}=Set{LLVM.
         end
         # All incoming values are non-alloca → PSB
         return true
+    elseif ptr isa LLVM.SelectInst
+        return trace_to_non_alloca(ptr.operands[2], visited) &&
+               trace_to_non_alloca(ptr.operands[3], visited)
     end
     # Function parameter: the alloca lives in the CALLER. Check call sites —
     # if any caller passes an alloca-derived pointer, this param is
@@ -3419,6 +3586,42 @@ function emit_psb_decomposed_vector_store!(state::SPIRVEmitterState, ptr_id::UIn
     end
 end
 
+"""Whether a GEP index is the constant zero."""
+is_zero_index(v::LLVM.Value) = v isa LLVM.ConstantInt && convert(Int64, v) == 0
+
+"""
+    gep_last_indexed_array(source_ty, ops) -> Union{LLVM.ArrayType, Nothing}
+
+The array the LAST index of a multi-index GEP (operands `ops`) indexes into, or
+`nothing` when that is a struct or vector.
+"""
+function gep_last_indexed_array(source_ty::LLVM.LLVMType, ops)
+    ty = source_ty
+    for i in 3:(length(ops) - 1)
+        if ty isa LLVM.ArrayType
+            ty = ty.element_type
+        elseif ty isa LLVM.StructType && ops[i] isa LLVM.ConstantInt
+            ty = ty.elements[convert(Int, ops[i]) + 1]
+        else
+            return nothing
+        end
+    end
+    return ty isa LLVM.ArrayType ? ty : nothing
+end
+
+"""
+A GEP on a Function-storage pointer that no access chain can express. Logical
+pointers have no arithmetic: a step off one is only representable as an index of
+the array it points into. Emitting the base pointer instead (what this replaced)
+silently read and wrote the wrong element.
+"""
+function function_ptr_offset_error(inst::LLVM.Instruction, what::AbstractString)
+    loc = extract_source_location(inst)
+    where_ = loc === nothing ? "" : " at $(loc[1]):$(loc[2])"
+    error("Cannot lower $what in Function storage$where_: $inst. " *
+          "Logical pointers have no arithmetic; the step must fold into an array index.")
+end
+
 function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
     ops = inst.operands
     base_ptr = ops[1]
@@ -3552,20 +3755,43 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
         if haskey(state.array_element_origin, base_ptr) &&
            (sc == SC.Function || sc == SC.Private || sc == SC.Workgroup)
             arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
+            # The step is `sizeof(source_ty)` bytes, the array's is its element's:
+            # fold a whole number of elements, refuse anything else (a step into
+            # the middle of an element has no access chain).
+            arr_elem_ty = arr_type.element_type
+            elem_size = compute_type_size(arr_elem_ty, state.data_layout)
+            step_size = compute_type_size(source_ty, state.data_layout)
+            whole = elem_size > 0 && step_size % elem_size == 0
+            whole || is_zero_index(ops[2]) ||
+                function_ptr_offset_error(inst, "a step of $step_size bytes on an element of $arr_type")
             new_idx_i32 = ensure_index_i32!(state, ops[2])
             u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
+            if whole && step_size != elem_size
+                scaled = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpIMul, u32_ty, scaled, new_idx_i32,
+                                    emit_constant_u32!(state.mod, UInt32(step_size ÷ elem_size)))
+                new_idx_i32 = scaled
+            end
             combined_idx = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, combined_idx, prev_idx_id, new_idx_i32)
+            # The chain ends at an element of the array, whatever `source_ty` says.
+            elem_ptr_ty = if arr_elem_ty == source_ty
+                result_ptr_ty
+            else
+                elem_spirv = sc == SC.Workgroup ? map_workgroup_type!(state.type_ctx, arr_elem_ty) :
+                    map_type!(state.type_ctx, arr_elem_ty)
+                map_pointer_type!(state.type_ctx, elem_spirv, sc)
+            end
             result_id = fresh_id!(state.mod)
             all_indices = vcat(static_path, [combined_idx])
             word_count = UInt32(4 + length(all_indices))
             push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
-            push!(state.mod.functions, result_ptr_ty)
+            push!(state.mod.functions, elem_ptr_ty)
             push!(state.mod.functions, result_id)
             push!(state.mod.functions, arr_base_id)
             append!(state.mod.functions, all_indices)
             state.value_map[inst] = result_id
-            set_pointee_type!(state.type_ctx.ptm, inst, source_ty; priority=5)
+            set_pointee_type!(state.type_ctx.ptm, inst, arr_elem_ty; priority=5)
             state.array_element_origin[inst] = (arr_base_id, static_path, combined_idx, arr_type)
             if result_pointee isa LLVM.PointerType
                 state.spirv_ptr_element_type[inst] = result_pointee_spirv
@@ -3651,7 +3877,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                 # PSB pointer arithmetic: use manual byte-offset instead of OpPtrAccessChain
                 # (OpPtrAccessChain on PSB struct pointers is broken on AMD RADV)
                 result_id = emit_psb_ptr_arithmetic!(state, base_id, idx, result_ptr_ty, source_ty;
-                    idx_llvm_ty=ops[2].value_type, base_pointee=base_pointee)
+                    idx_llvm_ty=ops[2].value_type, base_pointee=base_pointee, idx_llvm=ops[2])
                 # Track pointer alignment from element stride.
                 # E.g., stride=6 (array of {i16,i16,i16}) → ptr alignment = gcd(base, 6) = 2
                 # Downstream stores of i32/float at these addresses need byte decomposition.
@@ -3713,8 +3939,12 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                         append!(state.mod.functions, ac_indices)
                     end
                 else
-                    # Simple scalar or no decomposition possible: use base pointer directly;
-                    # load/store handlers resolve type mismatches.
+                    # A step of zero is the base itself (load/store handlers resolve
+                    # type mismatches). Any other step off a pointer that is not
+                    # an array element has nowhere to go: dropping it read the
+                    # base element in its place.
+                    is_zero_index(ops[2]) ||
+                        function_ptr_offset_error(inst, "a step off a pointer to $(something(base_pointee, "an unknown type"))")
                     result_id = base_id
                 end
             elseif sc == SC.Private
@@ -3906,6 +4136,18 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
             state.value_map[inst] = result_id
             # Track pointee type for downstream GEPs (e.g. single-index array element access)
             set_pointee_type!(state.type_ctx.ptm, inst, result_pointee; priority=3)
+            # A pointer to an array element, `gep [N x T], %a, 0, %i`, is often
+            # stepped from with `gep T, %p, k` (an unrolled `M[r, k]` reads the
+            # column at `%i` that way). Logical pointers have no arithmetic, so
+            # that step is folded into this chain's last index; recorded here so
+            # the single-index branch above can.
+            if sc == SC.Function || sc == SC.Private
+                arr_ty = gep_last_indexed_array(source_ty, ops)
+                if arr_ty !== nothing
+                    state.array_element_origin[inst] =
+                        (base_id, index_ids[1:end-1], index_ids[end], arr_ty)
+                end
+            end
             end
         else
             # First index is non-zero.
@@ -3938,7 +4180,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     first_idx = get_value_id!(state, ops[2])
                     elem_ptr_id = emit_psb_ptr_arithmetic!(state, base_id, first_idx,
                         map_pointer_type!(state.type_ctx, map_type!(state.type_ctx, source_ty), sc),
-                        source_ty; idx_llvm_ty=ops[2].value_type, base_pointee=base_pointee)
+                        source_ty; idx_llvm_ty=ops[2].value_type, base_pointee=base_pointee, idx_llvm=ops[2])
                     # Track stride alignment on the result pointer (inherits from element)
                     elem_stride = compute_type_size(source_ty, state.data_layout)
                     if elem_stride > 0
@@ -3960,7 +4202,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     first_idx = get_value_id!(state, ops[2])
                     elem_ptr_id = emit_psb_ptr_arithmetic!(state, base_id, first_idx,
                         map_pointer_type!(state.type_ctx, map_type!(state.type_ctx, source_ty), sc),
-                        source_ty; idx_llvm_ty=ops[2].value_type, base_pointee=base_pointee)
+                        source_ty; idx_llvm_ty=ops[2].value_type, base_pointee=base_pointee, idx_llvm=ops[2])
                     elem_stride = compute_type_size(source_ty, state.data_layout)
                     if elem_stride > 0
                         stride_align = UInt32(1 << trailing_zeros(elem_stride))
@@ -3978,9 +4220,11 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                     push!(state.mod.functions, elem_ptr_id)
                     append!(state.mod.functions, remaining_ids)
                 elseif sc == SC.Function
-                    # Function storage class: OpPtrAccessChain is NOT valid.
-                    # Use base pointer directly; load/store handlers resolve type mismatches.
-                    result_id = base_id
+                    # Function storage class: OpPtrAccessChain is NOT valid, and
+                    # the base is not an array element the step could be folded
+                    # into (the branch above). Returning the base pointer dropped
+                    # the step and every index after it.
+                    function_ptr_offset_error(inst, "a step off a pointer to $(something(base_pointee, "an unknown type"))")
                 elseif sc == SC.Private
                     # Private storage class: OpPtrAccessChain is NOT valid.
                     # Use OpAccessChain with all indices for Private array globals.
@@ -4847,6 +5091,9 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
             # base was from OpAccessChain into an array, fold by adding the element index offset.
             # E.g., gep i8, ptr (AccessChain array[a]), -4  →  AccessChain array[a + (-4/elemsize)]
             arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
+            if ops[2] isa LLVM.ConstantInt && convert(Int64, ops[2]) % elem_size != 0
+                function_ptr_offset_error(inst, "a byte offset into the middle of an element of $arr_type")
+            end
             # idx_id is already byte_offset / elem_size (computed above as SDiv)
             # Convert idx_id to i32 for OpAccessChain
             new_idx_i32 = if idx_ty isa LLVM.IntegerType && idx_ty.width > 32
@@ -4871,7 +5118,11 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
             # Propagate origin for further chaining
             state.array_element_origin[inst] = (arr_base_id, static_path, combined_idx, arr_type)
         else
-            # Function: use base pointer directly, let load/store handlers resolve.
+            # Function: an offset of zero is the base pointer (load/store handlers
+            # resolve the type); any other offset off a non-element pointer has
+            # no access chain, and dropping it read the base in its place.
+            is_zero_index(ops[2]) ||
+                function_ptr_offset_error(inst, "a byte offset off a pointer to $base_pointee")
             result_id = base_id
         end
     else
@@ -5084,7 +5335,8 @@ function emit_psb_ptr_arithmetic!(state::SPIRVEmitterState, base_id::UInt32,
                                      idx_id::UInt32, result_ptr_ty::UInt32,
                                      element_ty::LLVM.LLVMType;
                                      idx_llvm_ty::Union{LLVM.LLVMType, Nothing}=nothing,
-                                     base_pointee::Union{LLVM.LLVMType, Nothing}=nothing)
+                                     base_pointee::Union{LLVM.LLVMType, Nothing}=nothing,
+                                     idx_llvm::Union{LLVM.Value, Nothing}=nothing)
     # Scalar (incl. vector / float / int) → OpPtrAccessChain.
     # Struct/array → byte arithmetic (original RADV-safe path).
     # OpPtrAccessChain is permitted in Vulkan with the PhysicalStorageBufferAddresses
@@ -5100,9 +5352,18 @@ function emit_psb_ptr_arithmetic!(state::SPIRVEmitterState, base_id::UInt32,
     # arithmetic (ConvertPtrToU/UToPtr is type-agnostic).
     type_mismatch = base_pointee !== nothing && base_pointee != element_ty
     is_scalar = !(element_ty isa LLVM.StructType) && !(element_ty isa LLVM.ArrayType)
+    is_i64 = idx_llvm_ty isa LLVM.IntegerType && idx_llvm_ty.width == 64
+    # A step by a NEGATIVE CONSTANT is address arithmetic, never an
+    # `OpPtrAccessChain`: NVIDIA (RTX 4000 Ada, driver 595) reads 0 through
+    # `OpPtrAccessChain %p <-1>` once it sees %p's own offset — another access
+    # chain, or a phi of them. `flag ? a[i] : b[i]` over two views whose
+    # `getindex` adds an offset is exactly that: a phi of `a + off_a + i` and
+    # `b + off_b + i`, stepped back by the -1 of 1-based indexing, and every
+    # lane read 0. The step is still recorded as a chain below, so a further
+    # step off it folds into one access chain from the base, as before.
+    neg_step = idx_llvm isa LLVM.ConstantInt && convert(Int64, idx_llvm) < 0
     if is_scalar && !type_mismatch
         ensure_array_stride_decoration!(state, result_ptr_ty, element_ty)
-        is_i64 = idx_llvm_ty isa LLVM.IntegerType && idx_llvm_ty.width == 64
         # Chain-fold: when the base is itself a tracked PSB access chain, combine the
         # indices and emit a fresh OpPtrAccessChain from the ROOT base. This guarantees
         # the loop-invariant intermediate (e.g. `base + (-1)` from 1-based indexing) is
@@ -5121,12 +5382,14 @@ function emit_psb_ptr_arithmetic!(state::SPIRVEmitterState, base_id::UInt32,
             state.psb_access_chain[result_id] = (root_id, combined)
             return result_id
         end
-        result_id = fresh_id!(state.mod)
-        # OpPtrAccessChain result_type result_id base element
-        encode_instruction!(state.mod.functions, Op.OpPtrAccessChain,
-                            result_ptr_ty, result_id, base_id, idx_id)
-        is_i64 && (state.psb_access_chain[result_id] = (base_id, idx_id))
-        return result_id
+        if !neg_step
+            result_id = fresh_id!(state.mod)
+            # OpPtrAccessChain result_type result_id base element
+            encode_instruction!(state.mod.functions, Op.OpPtrAccessChain,
+                                result_ptr_ty, result_id, base_id, idx_id)
+            is_i64 && (state.psb_access_chain[result_id] = (base_id, idx_id))
+            return result_id
+        end
     end
 
     stride = UInt64(compute_type_size(element_ty, state.data_layout))
@@ -5155,6 +5418,9 @@ function emit_psb_ptr_arithmetic!(state::SPIRVEmitterState, base_id::UInt32,
     # OpConvertUToPtr: u64 → ptr
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ptr_ty, result_id, elem_addr_id)
+    if neg_step && is_scalar && !type_mismatch && is_i64
+        state.psb_access_chain[result_id] = (base_id, idx_id)
+    end
 
     return result_id
 end
@@ -5806,8 +6072,8 @@ function emit_conversion!(state::SPIRVEmitterState, inst::LLVM.Instruction, opco
     # A float conversion is exact: `Float32(Float16(x))` means the rounding. A
     # driver may treat an instruction without `NoContraction` as inexact, and
     # Mesa then folds a narrowing and a widening back into `x`, which silently
-    # drops the rounding (test/spirv/test_fconvert_exact.jl). Arithmetic is not
-    # marked: fusing `a * b + c` is the contraction SPIR-V allows.
+    # drops the rounding (test/spirv/test_fconvert_exact.jl). Arithmetic is
+    # marked the same way unless LLVM's `contract` flag allows fusing (`exact!`).
     opcode == Op.OpFConvert && emit_decorate!(state.mod, result_id, Dec.NoContraction)
     state.value_map[inst] = result_id
 end
@@ -7617,7 +7883,10 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
 
     glsl_num = get(GLSL_STD_450_MAP, base_name, nothing)
     if glsl_num !== nothing
-        return emit_glsl_ext_inst!(state, inst, glsl_num)
+        id = emit_glsl_ext_inst!(state, inst, glsl_num)
+        # `fma` is one rounding; `fmuladd` (Julia's `muladd`) may be either.
+        base_name == "llvm.fma" && exact!(state, inst)
+        return id
     end
 
     # `llvm.copysign` has no GLSL.std.450 equivalent: the obvious
@@ -8654,12 +8923,45 @@ end
 # ConstantExpr handling
 # ================================================================
 
+function constexpr_null_pointer(value)
+    value isa LLVM.PointerNull && return true
+    if value isa LLVM.ConstantExpr && value.opcode in (LLVM.API.LLVMBitCast,LLVM.API.LLVMAddrSpaceCast)
+        return constexpr_null_pointer(only(value.operands))
+    end
+    return false
+end
+
+function constexpr_private_constant_pointer(value)
+    return value isa LLVM.GlobalVariable && value.value_type.addrspace==1 &&
+        value.constant && value.initializer!==nothing &&
+        value.linkage in (LLVM.API.LLVMPrivateLinkage,LLVM.API.LLVMInternalLinkage)
+end
+
+function constexpr_pointer_comparison(value::LLVM.ConstantExpr)
+    value.opcode==LLVM.API.LLVMICmp || return nothing
+    predicate=LLVM.API.LLVMGetICmpPredicate(value)
+    predicate in (LLVM.API.LLVMIntEQ,LLVM.API.LLVMIntNE) || return nothing
+    a,b=value.operands
+    # Address-space casts are identity mappings in this logical-pointer
+    # backend. A defined private constant table is an allocated, non-null
+    # OpVariable, including when LLVM retains a cast-null bounds guard.
+    unequal=(constexpr_null_pointer(a) && constexpr_private_constant_pointer(b)) ||
+        (constexpr_null_pointer(b) && constexpr_private_constant_pointer(a))
+    equal=constexpr_null_pointer(a) && constexpr_null_pointer(b)
+    (equal || unequal) || return nothing
+    return predicate==LLVM.API.LLVMIntEQ ? equal : unequal
+end
+
 function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
     # ConstantExpr is an LLVM value that represents a constant computation
     # Common cases: GEP on globals, bitcast, inttoptr
     op = val.opcode
 
-    if op == LLVM.API.LLVMGetElementPtr
+    if op == LLVM.API.LLVMICmp
+        folded=constexpr_pointer_comparison(val)
+        folded===nothing && error("Unsupported constant pointer comparison: ",string(val))
+        return emit_constant_bool!(state.mod,folded)
+    elseif op == LLVM.API.LLVMGetElementPtr
         # Constant GEP on a global variable (e.g., shared memory array)
         # Pattern: getelementptr [N x T], ptr addrspace(3) @global, i64 0, i64 0
         # → OpAccessChain into the global variable
@@ -8853,7 +9155,7 @@ function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
         encode_instruction!(state.mod.types_constants, answer ? UInt16(41) : UInt16(42), bool_ty, id)  # OpConstantTrue/False
         return id
     else
-        error("Unsupported ConstantExpr opcode: $op in $val")
+        error("Unsupported ConstantExpr opcode: $op in ",string(val))
     end
 end
 

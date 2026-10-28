@@ -1057,6 +1057,11 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # structurization: a runtime divisor becomes an inlined helper with a branch.
     lower_wide_divisions!(mod)
     verify_ir!("lower_wide_divisions")
+    # ── A memset of a runtime length is a loop again ──
+    # Loop idiom made it of a zeroing loop; it is a loop of typed stores now,
+    # before structurization, so it is structured like the loop it came from.
+    lower_dynamic_memsets!(mod)
+    verify_ir!("lower_dynamic_memsets")
     checkpoint("force_inline_all!")
 
     if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
@@ -3114,6 +3119,25 @@ function lower_memset!(inst::LLVM.CallInst)
     T_i32 = LLVM.Int32Type()
     T_i64 = LLVM.Int64Type()
 
+    # Into a private array or global of one scalar type, in that type: word
+    # stores into a `[9 x i64]` made `retype_uniform_typed_allocas!` split every
+    # other access of the array into 32-bit halves.
+    dl = LLVM.datalayout(LLVM.parent(LLVM.parent(LLVM.parent(inst))))
+    T = whole_element_memset_type(dst, fill_val, nbytes, dl)
+    if T !== nothing
+        s = Int(LLVM.API.LLVMABISizeOfType(dl, T))
+        LLVM.@dispose builder=LLVM.IRBuilder() begin
+            LLVM.position!(builder, insertion_point(inst))
+            v = memset_fill!(builder, fill_val, T)
+            for i in 0:(nbytes ÷ s - 1)
+                ptr = i == 0 ? dst : LLVM.gep!(builder, T, dst, [LLVM.ConstantInt(T_i64, i)])
+                st = LLVM.store!(builder, v, ptr)
+                st.alignment = s
+            end
+        end
+        return
+    end
+
     LLVM.@dispose builder=LLVM.IRBuilder() begin
         LLVM.position!(builder, insertion_point(inst))
 
@@ -3144,6 +3168,206 @@ function lower_memset!(inst::LLVM.CallInst)
             st.alignment = 1
         end
     end
+end
+
+# ── memset of a runtime length ───────────────────────────────────────────────
+#
+# LLVM's loop-idiom pass turns a loop storing one byte pattern over a range
+# whose bounds are not constants into `llvm.memset` with a runtime length: the
+# zeroing `for r in k+1:n; M[r, k] = 0; end` of a Householder sequence on an
+# `MMatrix`, once `n` is past what the unroller expands. `lower_memset!` writes
+# a constant length out store by store and could only refuse this one, so such
+# a kernel did not compile. It becomes the loop it came from again: stores of
+# the destination's own element type, so the private array keeps the access
+# pattern every later pass and the emitter expect.
+
+"""
+    lower_dynamic_memsets!(mod) -> Bool
+
+Replace every `llvm.memset` whose length is not a constant with a loop of
+stores, through a call to an always-inline helper per store type that is then
+inlined (as `lower_wide_divisions!` does). Before structurization, so the loop
+is structured like any other. Returns whether anything changed.
+"""
+function lower_dynamic_memsets!(mod::LLVM.Module)
+    found = LLVM.CallInst[]
+    for f in LLVM.functions(mod), bb in LLVM.blocks(f), inst in LLVM.instructions(bb)
+        inst isa LLVM.CallInst || continue
+        callee = LLVM.called_operand(inst)
+        callee isa LLVM.Function && startswith(LLVM.name(callee), "llvm.memset") || continue
+        LLVM.operands(inst)[3] isa LLVM.ConstantInt && continue
+        push!(found, inst)
+    end
+    isempty(found) && return false
+    dl = LLVM.datalayout(mod)
+    i64 = LLVM.IntType(64)
+    helpers = Dict{Tuple{String,Int,Int},LLVM.Function}()
+    LLVM.@dispose builder = LLVM.IRBuilder() begin
+        for inst in found
+            dst, fill, len = LLVM.operands(inst)[1:3]
+            T = memset_store_type(dst, fill, len, dl)
+            size = Int(LLVM.API.LLVMABISizeOfType(dl, T))
+            align = gcd(size, memset_dst_alignment(inst))
+            as = Int(dst.value_type.addrspace)
+            LLVM.position!(builder, LLVM.before(inst))
+            n = len.value_type == i64 ? len : LLVM.zext!(builder, len, i64)
+            count = size == 1 ? n : LLVM.lshr!(builder, n, LLVM.ConstantInt(i64, trailing_zeros(size)))
+            fn = get!(() -> memset_helper!(mod, T, as, align), helpers, (string(T), as, align))
+            LLVM.call!(builder, LLVM.function_type(fn), fn, [dst, memset_fill!(builder, fill, T), count])
+            LLVM.erase!(inst)
+        end
+    end
+    names = [LLVM.name(fn) for fn in values(helpers)]
+    LLVM.run!(LLVM.AlwaysInlinerPass(), mod)
+    fns = LLVM.functions(mod)
+    foreach(n -> haskey(fns, n) && LLVM.erase!(fns[n]), names)
+    for fn in collect(LLVM.functions(mod))
+        startswith(LLVM.name(fn), "llvm.memset") && isempty(LLVM.uses(fn)) && LLVM.erase!(fn)
+    end
+    return true
+end
+
+"""
+The type a runtime-length memset of `dst` stores: the one scalar type the
+private array or global it points into is made of, when its size divides every
+possible length; otherwise the widest integer (at most 8 bytes) that does.
+"""
+function memset_store_type(dst::LLVM.Value, fill::LLVM.Value, len::LLVM.Value, dl::LLVM.DataLayout)
+    m = known_multiple(len)
+    root = dst
+    while root isa LLVM.GetElementPtrInst || root isa LLVM.BitCastInst || root isa LLVM.AddrSpaceCastInst
+        root = LLVM.operands(root)[1]
+    end
+    leaf = if root isa LLVM.AllocaInst
+        uniform_leaf_type(LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(root)))
+    elseif root isa LLVM.GlobalVariable
+        uniform_leaf_type(LLVM.global_value_type(root))
+    else
+        nothing
+    end
+    # A pointer element is only written whole with its null value.
+    if leaf isa LLVM.PointerType && !(fill isa LLVM.ConstantInt && convert(Int, fill) == 0)
+        leaf = nothing
+    end
+    if leaf !== nothing
+        s = Int(LLVM.API.LLVMABISizeOfType(dl, leaf))
+        ispow2(s) && m % s == 0 && return leaf
+    end
+    for s in (8, 4, 2, 1)
+        m % s == 0 && return LLVM.IntType(8s)
+    end
+end
+
+"""
+The scalar type a constant-length memset of `nbytes` at `dst` is written in:
+the one type the private array or global under `dst` consists of, when `dst`
+is at a constant element boundary of it and `nbytes` is whole elements;
+`nothing` otherwise.
+"""
+function whole_element_memset_type(dst::LLVM.Value, fill::LLVM.Value, nbytes::Int, dl::LLVM.DataLayout)
+    root = dst
+    offset = 0
+    while root isa LLVM.GetElementPtrInst || root isa LLVM.BitCastInst || root isa LLVM.AddrSpaceCastInst
+        if root isa LLVM.GetElementPtrInst
+            ops = LLVM.operands(root)
+            (length(ops) == 2 && ops[2] isa LLVM.ConstantInt) || return nothing
+            src = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(root))
+            offset += convert(Int, ops[2]) * Int(LLVM.API.LLVMABISizeOfType(dl, src))
+        end
+        root = LLVM.operands(root)[1]
+    end
+    ty = root isa LLVM.AllocaInst ? LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(root)) :
+         root isa LLVM.GlobalVariable ? LLVM.global_value_type(root) : nothing
+    ty === nothing && return nothing
+    T = uniform_leaf_type(ty)
+    zero_fill = fill isa LLVM.ConstantInt && convert(Int, fill) == 0
+    T isa LLVM.IntegerType || T in (LLVM.HalfType(), LLVM.FloatType(), LLVM.DoubleType()) ||
+        (T isa LLVM.PointerType && zero_fill) || return nothing
+    s = Int(LLVM.API.LLVMABISizeOfType(dl, T))
+    return offset % s == 0 && nbytes % s == 0 ? T : nothing
+end
+
+"The one scalar type `ty` consists of, or `nothing` when it mixes several."
+function uniform_leaf_type(ty::LLVM.LLVMType)
+    ty isa Union{LLVM.ArrayType,LLVM.VectorType} && return uniform_leaf_type(ty.element_type)
+    if ty isa LLVM.StructType
+        leaves = [uniform_leaf_type(e) for e in LLVM.elements(ty)]
+        (isempty(leaves) || any(isnothing, leaves) || any(!=(leaves[1]), leaves)) && return nothing
+        return leaves[1]
+    end
+    return ty isa Union{LLVM.IntegerType,LLVM.FloatingPointType,LLVM.PointerType} ? ty : nothing
+end
+
+"""
+A number every value of the integer `v` is a multiple of: `v` itself for a
+constant, followed through shifts and multiplies by constants, extensions,
+sums and selects; 1 when nothing is known.
+"""
+function known_multiple(v::LLVM.Value)
+    v isa LLVM.ConstantInt && return max(abs(convert(Int, v)), 1)
+    v isa LLVM.Instruction || return 1
+    op = LLVM.opcode(v)
+    ops = LLVM.operands(v)
+    if op == LLVM.API.LLVMShl && ops[2] isa LLVM.ConstantInt
+        return known_multiple(ops[1]) << min(convert(Int, ops[2]), 32)
+    elseif op == LLVM.API.LLVMMul
+        return known_multiple(ops[1]) * known_multiple(ops[2])
+    elseif op in (LLVM.API.LLVMZExt, LLVM.API.LLVMSExt)
+        return known_multiple(ops[1])
+    elseif op in (LLVM.API.LLVMAdd, LLVM.API.LLVMSub)
+        return gcd(known_multiple(ops[1]), known_multiple(ops[2]))
+    elseif op == LLVM.API.LLVMSelect
+        return gcd(known_multiple(ops[2]), known_multiple(ops[3]))
+    end
+    return 1
+end
+
+"The `align` of a memset's destination operand, 1 when it carries none."
+function memset_dst_alignment(inst::LLVM.CallInst)
+    kind = LLVM.API.LLVMGetEnumAttributeKindForName("align", 5)
+    attr = LLVM.API.LLVMGetCallSiteEnumAttribute(inst, 1, kind)
+    attr == C_NULL && return 1
+    return Int(LLVM.API.LLVMGetEnumAttributeValue(attr))
+end
+
+"The memset byte `fill` repeated across a `T`."
+function memset_fill!(builder::LLVM.IRBuilder, fill::LLVM.Value, T::LLVM.LLVMType)
+    fill isa LLVM.ConstantInt && convert(Int, fill) == 0 && return LLVM.null(T)
+    w = T isa LLVM.IntegerType ? LLVM.width(T) :
+        T == LLVM.HalfType() ? 16 : T == LLVM.FloatType() ? 32 : T == LLVM.DoubleType() ? 64 :
+        error("Cannot fill a $T with a memset byte")
+    iw = LLVM.IntType(w)
+    ones = LLVM.ConstantInt(iw, sum(UInt64(1) << (8k) for k in 0:(w ÷ 8 - 1)))
+    word = LLVM.mul!(builder, LLVM.zext!(builder, fill, iw), ones)
+    return T isa LLVM.IntegerType ? word : LLVM.bitcast!(builder, word, T)
+end
+
+"""
+`void (ptr dst, T v, i64 n)` storing `v` to `dst[0:n-1]`, marked `alwaysinline`.
+"""
+function memset_helper!(mod::LLVM.Module, T::LLVM.LLVMType, as::Int, align::Int)
+    i64 = LLVM.IntType(64)
+    ft = LLVM.FunctionType(LLVM.VoidType(), [LLVM.PointerType(as), T, i64])
+    fn = LLVM.Function(mod, "lava.memset.$(string(T)).$as.$align", ft)
+    LLVM.linkage!(fn, LLVM.API.LLVMInternalLinkage)
+    push!(LLVM.function_attributes(fn), LLVM.EnumAttribute("alwaysinline"))
+    entry, loop, exit = (LLVM.BasicBlock(fn, n) for n in ("entry", "loop", "exit"))
+    dst, v, n = LLVM.parameters(fn)
+    zero64, one64 = LLVM.ConstantInt(i64, 0), LLVM.ConstantInt(i64, 1)
+    LLVM.@dispose builder = LLVM.IRBuilder() begin
+        LLVM.position!(builder, LLVM.at_end(entry))
+        LLVM.br!(builder, LLVM.icmp!(builder, LLVM.API.LLVMIntEQ, n, zero64), exit, loop)
+        LLVM.position!(builder, LLVM.at_end(loop))
+        i = LLVM.phi!(builder, i64)
+        st = LLVM.store!(builder, v, LLVM.gep!(builder, T, dst, [i]))
+        st.alignment = align
+        next = LLVM.add!(builder, i, one64)
+        append!(LLVM.incoming(i), [(zero64, entry), (next, loop)])
+        LLVM.br!(builder, LLVM.icmp!(builder, LLVM.API.LLVMIntEQ, next, n), exit, loop)
+        LLVM.position!(builder, LLVM.at_end(exit))
+        LLVM.ret!(builder)
+    end
+    return fn
 end
 
 # ── Naming a compiled kernel ────────────────────────────────────────────────

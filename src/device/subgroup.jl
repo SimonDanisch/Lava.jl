@@ -167,6 +167,32 @@ end
 end
 push!(KNOWN_INTRINSICS, "_lava_subgroup_all")
 
+# ── Ballot: the mask of lanes whose predicate is true ──
+#
+# `OpGroupNonUniformBallot` yields a uvec4 (up to 128 lanes). The low two words
+# are the mask of a sub-group of up to 64 lanes, which is what KernelInterface's
+# `sub_group_ballot` returns: on wave64 hardware lanes 32..63 are in `.y`, so
+# both words are read.
+@inline function subgroup_ballot(pred::Bool)
+    raw = pred ? UInt8(1) : UInt8(0)
+    Base.llvmcall(("""
+        declare <4 x i32> @_lava_subgroup_ballot(i1) #0
+        define i64 @entry(i8 %pi) #0 {
+            %p = trunc i8 %pi to i1
+            %b = call <4 x i32> @_lava_subgroup_ballot(i1 %p)
+            %x = extractelement <4 x i32> %b, i32 0
+            %y = extractelement <4 x i32> %b, i32 1
+            %xz = zext i32 %x to i64
+            %yz = zext i32 %y to i64
+            %ys = shl i64 %yz, 32
+            %r = or i64 %xz, %ys
+            ret i64 %r
+        }
+        attributes #0 = { alwaysinline convergent }
+    """, "entry"), UInt64, Tuple{UInt8}, raw)
+end
+push!(KNOWN_INTRINSICS, "_lava_subgroup_ballot")
+
 # ── Shuffle family: read another lane's value ──
 #
 # `subgroup_size()` and `subgroup_lane()` are the two halves you need to use

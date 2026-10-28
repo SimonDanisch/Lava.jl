@@ -209,6 +209,7 @@ include("compiler/spirv/graphics.jl")     # Graphics stages, I/O variables, emit
 # ---- Device functions ----
 # device/array.jl — LavaDeviceArray defined in array/lavaarray.jl
 include("device/math.jl")
+include("device/math_f64.jl")  # Float64 exp/log/asin/acos/atan in Float64
 include("device/quirks.jl")
 include("device/ray_query_intrinsics.jl")  # lava_ray_query_init
 include("device/gfx_intrinsics.jl")  # Graphics builtins + shader I/O intrinsics
@@ -228,6 +229,7 @@ include("runtime/intrinsics.jl")
 
 # ---- Array interface (before launch.jl because it references LavaArray) ----
 include("device/devicearray.jl")  # LavaDeviceArray: what a kernel receives
+include("device/constarray.jl")   # Const: a LavaDeviceArray nothing writes during the kernel
 include("device/atomics.jl")  # needs LavaDeviceArray from devicearray.jl
 include("device/subgroup.jl") # subgroup / group-non-uniform intrinsics
 # KI's DEVICE half: index queries, barriers, shuffles, printing. It needs the

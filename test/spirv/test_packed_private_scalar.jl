@@ -24,8 +24,15 @@
 # of the same width before packing and back after unpacking, and `emit_trunc!`
 # sizes its float from `scalar_bit_width` rather than from a two-way
 # `LLVMFloat ? 32 : 64` test that has no answer for `half`.
+#
+# Since 2026-10-23 these kernels no longer take that path: `retype_allocas.jl`
+# decomposes a wider access through integers for float elements too, so the
+# MVector becomes a typed `[12 x half]` private array with no packing at all.
+# The kernels below check that; the packed path, which allocas the retype pass
+# leaves alone still take, is pinned as IR in the last testset.
 
 using Test
+using LLVM
 if !@isdefined(SPIRVTestUtils)
     include(joinpath(@__DIR__, "..", "spirv_test_utils.jl"))
 end
@@ -71,19 +78,30 @@ function packed_private_float(A)
     return nothing
 end
 
+# What the packed path is handed: an i64-slotted alloca read and written as
+# `half` at an index the compiler cannot fold.
+const _IR_PACKED_HALF = """
+define void @main(ptr addrspace(1) %out, i64 %k, i64 %j, half %v) {
+entry:
+  %a = alloca [3 x i64], align 16
+  %base = getelementptr half, ptr %a, i64 0
+  %p = getelementptr half, ptr %base, i64 %k
+  store half %v, ptr %p, align 2
+  %q = getelementptr half, ptr %base, i64 %j
+  %x = load half, ptr %q, align 2
+  store half %x, ptr addrspace(1) %out, align 2
+  ret void
+}
+"""
+
 @testset "Packed private scalar" begin
     # `compile_and_disasm` validates, so the OpStore mismatch fails here on its
-    # own. The pattern checks say the narrowing is the RIGHT one rather than
-    # merely a well-typed one: 16 bits out of the word, then a bitcast.
+    # own. The private array is typed by its element: nothing is packed.
     @testset "Float16 element in an i64 slot" begin
         d, _ = compile_and_disasm(packed_private_half,
                                    Tuple{Lava.LavaDeviceArray{Float16,1}})
-        # The packed slot is what makes this test the test it is: if Julia ever
-        # allocas the MVector as `[10 x half]`, the path under test is gone and
-        # the assertions below would pass vacuously.
-        check(d, "_ptr_Function_ulong")
-        check(d, "OpUConvert %ushort")
-        check(d, "OpBitcast %half")
+        check(d, "_ptr_Function__arr_half_uint_12")
+        check_not(d, "_ptr_Function_ulong")
         # The defect, spelled out: a 32-bit integer where a 16-bit float goes.
         check_not(d, "OpStore %_ptr_Workgroup_half")
     end
@@ -91,7 +109,23 @@ end
     @testset "Float32 element in an i64 slot" begin
         d, _ = compile_and_disasm(packed_private_float,
                                    Tuple{Lava.LavaDeviceArray{Float32,1}})
-        check(d, "_ptr_Function_ulong")
-        check(d, "OpBitcast %float")
+        check(d, "_ptr_Function__arr_float_uint_10")
+        check_not(d, "_ptr_Function_ulong")
+    end
+
+    # The narrowing is the RIGHT one rather than merely a well-typed one: the
+    # half goes into and out of its 64-bit word as 16 bits, bitcast at either
+    # end, and no integer conversion has a float on one side.
+    @testset "the packed path, as IR" begin
+        LLVM.Context() do ctx
+            mod = parse(LLVM.Module, _IR_PACKED_HALF)
+            Lava.lower_chained_mismatched_geps!(mod)
+            @test LLVM.verify(mod) === nothing
+            ir = string(mod)
+            @test occursin("bitcast half %v to i16", ir)
+            @test occursin(r"bitcast i16 %\w+ to half", ir)
+            @test occursin(r"load i64, ptr %\w+", ir)
+            @test !occursin(r"zext half|trunc i64 %\w+ to half", ir)
+        end
     end
 end

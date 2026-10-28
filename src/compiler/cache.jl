@@ -16,7 +16,13 @@
 # Only SPIR-V lives here. What a device builds from it, a `VkPipeline`, is the
 # runtime's, keyed on these objects by identity.
 
-using GPUCompiler.CompilerCaching: ObjCache
+# CompilerCaching versions without the optional persistent-object API still
+# support CodeInstance and package-image caching. Do not make kernel execution
+# depend on an API that is absent from those versions.
+const HAS_OBJECT_CACHE = isdefined(GPUCompiler.CompilerCaching, :ObjCache)
+@static if HAS_OBJECT_CACHE
+    using GPUCompiler.CompilerCaching: ObjCache
+end
 
 """
     CompileStats
@@ -224,7 +230,7 @@ the compiler (`compiler_identity`), and found there when a session compiled it b
 instead, nor while kernels are dumped for debugging, which only compiling does.
 """
 function persisted(compile, ns::String, mod::LLVM.Module, settings...)
-    keep = !generating_output() && !kernel_dump_wanted()
+    keep = HAS_OBJECT_CACHE && !generating_output() && !kernel_dump_wanted()
     key = keep ? ObjCache.keyhash(PERSISTED_SCHEMA, canonical_ir(mod),
                                   Vector{UInt8}(join((compiler_identity()..., map(repr, settings)...), '\0'))) :
                  UInt8[]

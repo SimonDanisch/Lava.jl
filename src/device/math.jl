@@ -5,7 +5,8 @@
 # Three tiers:
 #   1. LLVM intrinsics → SPIR-V emitter maps to GLSL.std.450
 #   2. Custom _lava_glsl_* externals → SPIR-V emitter maps to GLSL.std.450 (for ops LLVM lacks)
-#   3. Float64 transcendentals: f64→f32 downcast, compute via f32 GLSL.std.450, upcast back
+#   3. Float64 transcendentals: exp, log, asin, acos, atan and atan2 in Float64 by
+#      fdlibm's table-free algorithms (`math_f64.jl`); the rest through Float32
 #
 # GLSL.std.450 Float64 support:
 #   - SUPPORTED (f64): Sqrt, FAbs, Floor, Ceil, Round, Trunc, FMin, FMax, Fma
@@ -153,7 +154,37 @@ end
 
 @_lava_glsl_unary  Base.tan  "_lava_glsl_tan_f32"  Float32 "float"
 @_lava_glsl_unary  Base.asin "_lava_glsl_asin_f32" Float32 "float"
-@_lava_glsl_unary  Base.acos "_lava_glsl_acos_f32" Float32 "float"
+# Native GLSL Acos permits implementation-dependent accuracy. Use the small
+# Float32 fdlibm rational approximation also used by Julia Base, keeping all
+# arithmetic in Float32 (no dependency on Float64 device support).
+# Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+# Developed at SunPro, a Sun Microsystems, Inc. business.
+# Permission to use, copy, modify, and distribute this software is freely
+# granted, provided that this notice is preserved.
+@inline function _f32_arc_tRt(t::Float32)
+    p = t * muladd(t, muladd(t, -8.6563630030f-03, -4.2743422091f-02), 1.6666586697f-01)
+    return p / muladd(t, -7.0662963390f-01, 1.0f0)
+end
+
+@inline function _f32_acos(x::Float32)
+    ax = abs(x)
+    if ax >= 1.0f0
+        return ax == 1.0f0 ? (x > 0.0f0 ? 0.0f0 : Float32(pi)) : NaN32
+    elseif ax < 0.5f0
+        ax < 1.4901161193847656f-08 && return Float32(pi)/2
+        return 1.5707962513f0 - (x - (7.5497894159f-08 - x * _f32_arc_tRt(x*x)))
+    end
+    z = (1.0f0 - ax) * 0.5f0
+    r, s = _f32_arc_tRt(z), sqrt(z)
+    if x < 0.0f0
+        return 3.1415925026f0 - 2.0f0 * (s + (r*s - 7.5497894159f-08))
+    end
+    hi = reinterpret(Float32, reinterpret(UInt32,s) & 0xfffff000)
+    correction = (z - hi*hi)/(s + hi)
+    return 2.0f0 * (hi + (r*s + correction))
+end
+
+@lava_device_override @inline Base.acos(x::Float32) = _f32_acos(x)
 @_lava_glsl_unary  Base.atan "_lava_glsl_atan_f32" Float32 "float"
 @_lava_glsl_unary  Base.sinh  "_lava_glsl_sinh_f32"  Float32 "float"
 @_lava_glsl_unary  Base.cosh  "_lava_glsl_cosh_f32"  Float32 "float"
@@ -169,26 +200,19 @@ end
 # Tier 3: Float64 transcendentals — downcast to Float32, compute, upcast
 # GLSL.std.450 does not support f64 for these operations.
 # This provides ~7 decimal digits of precision (Float32 mantissa).
-# For higher precision, add polynomial implementations later.
+# exp, exp2, log, log2, log10, asin, acos, atan and atan2 are computed in
+# Float64 instead, in `math_f64.jl`.
 # ══════════════════════════════════════════════════════════════════════
 
 @lava_device_override @inline Base.sin(x::Float64)  = Float64(sin(Float32(x)))
 @lava_device_override @inline Base.cos(x::Float64)  = Float64(cos(Float32(x)))
 @lava_device_override @inline Base.tan(x::Float64)  = Float64(tan(Float32(x)))
-@lava_device_override @inline Base.exp(x::Float64)  = Float64(exp(Float32(x)))
-@lava_device_override @inline Base.exp2(x::Float64) = Float64(exp2(Float32(x)))
-@lava_device_override @inline Base.log(x::Float64)  = Float64(log(Float32(x)))
-@lava_device_override @inline Base.log2(x::Float64) = Float64(log2(Float32(x)))
-@lava_device_override @inline Base.asin(x::Float64) = Float64(asin(Float32(x)))
-@lava_device_override @inline Base.acos(x::Float64) = Float64(acos(Float32(x)))
-@lava_device_override @inline Base.atan(x::Float64) = Float64(atan(Float32(x)))
 @lava_device_override @inline Base.sinh(x::Float64)  = Float64(sinh(Float32(x)))
 @lava_device_override @inline Base.cosh(x::Float64)  = Float64(cosh(Float32(x)))
 @lava_device_override @inline Base.tanh(x::Float64)  = Float64(tanh(Float32(x)))
 @lava_device_override @inline Base.asinh(x::Float64) = Float64(asinh(Float32(x)))
 @lava_device_override @inline Base.acosh(x::Float64) = Float64(acosh(Float32(x)))
 @lava_device_override @inline Base.atanh(x::Float64) = Float64(atanh(Float32(x)))
-@lava_device_override @inline Base.atan(y::Float64, x::Float64) = Float64(atan(Float32(y), Float32(x)))
 @lava_device_override @inline Base.:(^)(x::Float64, y::Float64) = Float64(Float32(x) ^ Float32(y))
 
 # ══════════════════════════════════════════════════════════════════════
@@ -238,7 +262,6 @@ end
 
 # log10 — composition from log2
 @lava_device_override @inline Base.log10(x::Float32) = log2(x) * Float32(0.30102999566398114)
-@lava_device_override @inline Base.log10(x::Float64) = Float64(log10(Float32(x)))
 
 # clamp — composition from min/max (works for all float types)
 @lava_device_override @inline Base.clamp(x::Float32, lo::Float32, hi::Float32) = min(max(x, lo), hi)
@@ -373,6 +396,7 @@ for T in (Float32, Float64)
     @eval begin
         @lava_device_override @inline Base.literal_pow(::typeof(^), x::$T, ::Val{2}) = x * x
         @lava_device_override @inline Base.literal_pow(::typeof(^), x::$T, ::Val{3}) = x * x * x
+        @lava_device_override @inline Base.literal_pow(::typeof(^), x::$T, ::Val{4}) = (x * x) * (x * x)
     end
 end
 

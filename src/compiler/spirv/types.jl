@@ -569,6 +569,12 @@ function collect_inttoptr!(ptm::PointeeTypeMap, inst::LLVM.IntToPtrInst)
             end
         end
     end
+    # An aggregate load may select its address with a pointer phi. Neither
+    # incoming inttoptr then has a direct load/GEP user, but the typed GEP
+    # after the phi still states its pointee exactly. Follow that use chain
+    # rather than losing the type at the control-flow merge.
+    pointee = infer_pointee_from_users(inst)
+    pointee === nothing || set_pointee_type!(ptm, inst, pointee; priority=1)
 end
 
 """Infer the pointee type by looking at loads/stores that use a GEP result.
@@ -1521,6 +1527,9 @@ function trace_pointer_to_alloca(ptr::LLVM.Value, visited::Set{LLVM.Value}=Set{L
             trace_pointer_to_alloca(val, visited) && return true
         end
         return false
+    elseif ptr isa LLVM.SelectInst
+        return trace_pointer_to_alloca(ptr.operands[2], visited) ||
+               trace_pointer_to_alloca(ptr.operands[3], visited)
     end
     return false
 end
