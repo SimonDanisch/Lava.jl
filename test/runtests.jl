@@ -80,6 +80,12 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         include(joinpath(@__DIR__, "test_exact_narrowing.jl"))
         include(joinpath(@__DIR__, "test_exact_division.jl"))
         include(joinpath(@__DIR__, "test_odd_integers.jl"))
+        include(joinpath(@__DIR__, "test_constexpr_null_global.jl"))
+        include(joinpath(@__DIR__, "test_private_gep_phi.jl"))
+        include(joinpath(@__DIR__, "test_phi_pointee_recovery.jl"))
+        include(joinpath(@__DIR__, "test_pointer_select_storage.jl"))
+        include(joinpath(@__DIR__, "test_retype_float_lanes.jl"))
+        include(joinpath(@__DIR__, "test_dynamic_memset.jl"))
     end
 
     # ── Tier 2: validation and structure ─────────────────────────────────────

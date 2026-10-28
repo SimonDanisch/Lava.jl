@@ -214,6 +214,7 @@ include("compiler/spirv/graphics.jl")     # Graphics stages, I/O variables, emit
 # ---- Device functions ----
 # device/array.jl — LavaDeviceArray defined in array/lavaarray.jl
 include("device/math.jl")
+include("device/math_f64.jl")  # Float64 exp/log/asin/acos/atan in Float64
 include("device/quirks.jl")
 include("device/rt_intrinsics.jl")  # RT builtins + trace_ray intrinsic
 include("device/ray_query_intrinsics.jl")  # lava_ray_query_init

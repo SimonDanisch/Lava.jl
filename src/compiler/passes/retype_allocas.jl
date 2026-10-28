@@ -269,14 +269,10 @@ function pick_uniform_type(accesses::Vector{AccessSite}, total_bytes::Int, dl::L
             debug && @info "retype: pick BAIL offset_not_aligned" off=a.byte_offset sz
             return nothing
         end
-        # Decomposition (a_sz > sz) is only implemented for int→int: the rewrite
-        # uses shift/or/trunc operations that require integer types.  If either the
-        # chosen element type T or the wider access type is a float/half/double,
-        # bail so the existing SPIR-V emitter fallback handles it instead.
-        if a_sz > sz && (!(smallest_T isa LLVM.IntegerType) || !(a.access_type isa LLVM.IntegerType))
-            debug && @info "retype: pick BAIL decomp_requires_int" a_ty=string(a.access_type) t_ty=string(smallest_T)
-            return nothing
-        end
+        # Wider accesses (a_sz > sz) decompose through integers: the wide value as an
+        # integer of its width, cut by shift/trunc into sz-wide integers, each bitcast
+        # to T. That covers float elements too: MVector{2, Float32} initialized by one
+        # i64 store of both lanes and read per float.
     end
 
     # We require sz to be a power of 2 so the byte-offset → element-idx divide
@@ -387,13 +383,15 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
                 ptr_op_idx = site.is_load ? 1 : 2
                 API.LLVMSetOperand(site.inst, UInt32(ptr_op_idx - 1), new_gep)
             else
-                # Wider access: decompose into n_parts T-sized accesses.
+                # Wider access: decompose into n_parts T-sized accesses, carried as
+                # integers of the access's and of T's width; floats are bitcast to
+                # and from those at either end.
                 @assert access_sz % sz == 0
                 n_parts = access_sz ÷ sz
-                t_bw = sz * 8   # bit width of T (only int handled for now)
-                @assert access_ty isa LLVM.IntegerType
-                @assert T isa LLVM.IntegerType   # decomposition currently only for int → int
-                t_ty = T
+                t_bw = sz * 8   # bit width of T
+                t_ty = LLVM.IntType(t_bw)
+                wide_int = LLVM.IntType(access_sz * 8)
+                recast(v, ty) = v.value_type == ty ? v : LLVM.bitcast!(builder, v, ty)
 
                 # Compute n_parts byte offsets and matching GEPs.
                 geps = LLVM.Value[]
@@ -408,11 +406,11 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
 
                 if site.is_load
                     # Load each T-sized chunk, zext + shift + or to assemble the wide value.
-                    wide_ty = access_ty
+                    wide_ty = wide_int
                     parts = LLVM.Value[]
                     for g in geps
-                        v = LLVM.load!(builder, t_ty, g)
-                        push!(parts, v)
+                        v = LLVM.load!(builder, T, g)
+                        push!(parts, recast(v, t_ty))
                     end
                     # Combine: result = sum(parts[i] zext to wide << (i*t_bw))
                     combined = LLVM.zext!(builder, parts[1], wide_ty)
@@ -422,20 +420,21 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
                         shifted = LLVM.shl!(builder, ext, shift_const)
                         combined = LLVM.or!(builder, combined, shifted)
                     end
-                    LLVM.replace_uses!(site.inst, combined)
+                    LLVM.replace_uses!(site.inst, recast(combined, access_ty))
                     LLVM.erase!(site.inst)
                 else
                     # Store: split the wide value into n_parts T-chunks, store each.
-                    val = site.inst.operands[1]   # value being stored
-                    wide_ty = access_ty
+                    stored = site.inst.operands[1]   # value being stored
                     # The shift constants and truncations below are built from
                     # `wide_ty`; if the value is not actually that type the pass
                     # emits `lshr i32 %v, i64 32` and `trunc i32 %v to i32`,
                     # which is invalid IR that only surfaces much later as a
                     # same-width OpUConvert out of the SPIR-V emitter.
-                    val.value_type == wide_ty || error(
-                        "retype_allocas: store value type $(string(val.value_type)) " *
-                        "disagrees with access type $(string(wide_ty)) for $(string(site.inst))")
+                    stored.value_type == access_ty || error(
+                        "retype_allocas: store value type $(string(stored.value_type)) " *
+                        "disagrees with access type $(string(access_ty)) for $(string(site.inst))")
+                    wide_ty = wide_int
+                    val = recast(stored, wide_ty)
                     for i in 1:n_parts
                         chunk = if i == 1 && t_bw == wide_ty.width
                             val   # no truncation needed
@@ -452,7 +451,7 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
                                 shifted
                             end
                         end
-                        LLVM.store!(builder, chunk, geps[i])
+                        LLVM.store!(builder, recast(chunk, T), geps[i])
                     end
                     LLVM.erase!(site.inst)
                 end

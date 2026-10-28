@@ -56,7 +56,7 @@ const LAVA_SOURCES = [
     "compiler/passes/prepare_vulkan.jl", "compiler/passes/lower_intrinsics.jl",
     "compiler/passes/exact_narrowing.jl", "compiler/passes/wide_division.jl",
     "compiler/passes/odd_integers.jl",
-    "device/math.jl", "device/quirks.jl", "device/rt_intrinsics.jl",
+    "device/math.jl", "device/math_f64.jl", "device/quirks.jl", "device/rt_intrinsics.jl",
     "device/ray_query_intrinsics.jl", "device/gfx_intrinsics.jl", "device/printf.jl",
     "device/atomics.jl", "device/subgroup.jl", "device/acceleratedmatrix.jl",
     "device/coopmat_intrinsics.jl", "device/tensor_intrinsics.jl",
