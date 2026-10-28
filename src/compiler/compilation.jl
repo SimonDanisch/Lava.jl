@@ -1714,6 +1714,22 @@ function has_alloca_type_mismatch_at_callsites(fn::LLVM.Function, mod::LLVM.Modu
     return false
 end
 
+function mark_pointer_mismatches!(mod::LLVM.Module, entry_fn::LLVM.Function)
+    marked = false
+    for fn in mod.functions
+        fn === entry_fn && continue
+        isempty(fn.blocks) && continue
+        startswith(fn.name, "llvm.") && continue
+        attrs = fn.function_attributes
+        LLVM.EnumAttribute("alwaysinline") in attrs && continue
+        has_alloca_type_mismatch_at_callsites(fn, mod) || continue
+        delete!(attrs, LLVM.EnumAttribute("noinline"))
+        push!(attrs, LLVM.EnumAttribute("alwaysinline"))
+        marked = true
+    end
+    return marked
+end
+
 """
 Debug knob: substrings of entry-function names that should be compiled
 with the `force_inline_all=true` escape hatch. When the entry_fn's name
@@ -1841,27 +1857,7 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
         # Logical addressing. Re-mark such helpers `alwaysinline` so the
         # type-pun stays inside one OpFunction where Lava's PTM resolves it
         # context-locally.
-        for fn in mod.functions
-            isempty(fn.blocks) && continue
-            startswith(fn.name, "llvm.") && continue
-            fname = fn.name
-            fn === entry_fn && continue
-            any(p -> occursin(p, fname), must_inline_prefixes) && continue
-            # NOTE: do NOT skip wrapper_direct_callees here. Even kernels called
-            # directly from the wrapper must be force-inlined when their callers
-            # disagree on pointer-arg alloca types — the SPIR-V type mismatch is
-            # a hard validation error.
-
-            has_ptr_param = any(p -> p.value_type isa LLVM.PointerType,
-                                fn.parameters)
-            has_ptr_param || continue
-
-            if has_alloca_type_mismatch_at_callsites(fn, mod)
-                attrs = fn.function_attributes
-                delete!(attrs, LLVM.EnumAttribute("noinline"))
-                push!(attrs, LLVM.EnumAttribute("alwaysinline"))
-            end
-        end
+        mark_pointer_mismatches!(mod, entry_fn)
     end
 
     # Force-inline functions whose ray-query state would otherwise cross a
@@ -1929,6 +1925,13 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
 
     # Remove now-dead internal functions
     LLVM.run!(LLVM.GlobalDCEPass(), mod)
+
+    # Inlining a relay exposes its callers' allocas to the next helper. A mismatch
+    # invisible through that relay's parameter must be handled before emission too.
+    while !force_inline_all && mark_pointer_mismatches!(mod, entry_fn)
+        LLVM.run!(LLVM.AlwaysInlinerPass(), mod)
+        LLVM.run!(LLVM.GlobalDCEPass(), mod)
+    end
 
     return nothing
 end
