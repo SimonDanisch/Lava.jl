@@ -105,7 +105,16 @@ function build_pointee_type_map(mod::LLVM.Module)
                 param = params[i]
                 param.value_type isa LLVM.PointerType || continue
                 arg_pointee = get_pointee_type(ptm, arg)
-                arg_pointee === nothing && continue
+                if arg_pointee === nothing
+                    # A pointer loaded from an array descriptor may only be
+                    # forwarded to a helper. Its typed loads/GEPs supply the
+                    # missing caller-side pointee; otherwise it becomes i8.
+                    param_pointee = get_pointee_type(ptm, param)
+                    param_pointee === nothing && continue
+                    set_pointee_type!(ptm, arg, param_pointee; priority=1)
+                    arg_pointee = param_pointee
+                    changed = true
+                end
                 existing = get(ptm.map, param, nothing)
                 # Don't overwrite a higher-priority entry (byval=4, alloca=5)
                 if existing === nothing || existing[2] < 3
@@ -2030,7 +2039,10 @@ function decorate_psb_struct_layouts!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Modu
 
     # Decorate ALL nested struct types with MemberOffset
     # Only DIRECT PSB pointees that are NOT nested inside any other struct get Block
-    for llvm_sty in all_psb_struct_types
+    # LLVM type hashes contain native addresses. Emit decorations in SPIR-V ID
+    # order so restoring identical LLVM from a cache produces identical bytes.
+    for llvm_sty in sort!(collect(all_psb_struct_types);
+                          by = ty -> get(ctx.llvm_to_spirv, ty, typemax(UInt32)))
         spirv_id = get(ctx.llvm_to_spirv, llvm_sty, nothing)
         spirv_id === nothing && continue
         spirv_id in decorated_structs && continue
@@ -2044,7 +2056,8 @@ function decorate_psb_struct_layouts!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Modu
     end
 
     # Decorate each array type with ArrayStride
-    for llvm_aty in all_psb_array_types
+    for llvm_aty in sort!(collect(all_psb_array_types);
+                          by = ty -> get(ctx.llvm_to_spirv, ty, typemax(UInt32)))
         spirv_id = get(ctx.llvm_to_spirv, llvm_aty, nothing)
         spirv_id === nothing && continue
         spirv_id in decorated_arrays && continue

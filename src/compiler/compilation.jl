@@ -1875,9 +1875,9 @@ function force_inline_all!(mod::LLVM.Module, entry_fn::LLVM.Function;
     #
     # The original Lava rule was "any function with any `lava_ray_query_*`
     # call gets `alwaysinline`". That is correct but overly conservative: it
-    # force-inlines self-contained helpers (e.g. `trace_shadow_transmittance`
-    # which runs a complete init+proceed+get+terminate session every call)
-    # into their callers, ballooning the caller's register pressure for no
+    # force-inlines self-contained helpers (a shadow trace that runs a
+    # complete init+proceed+get+terminate session every call) into their
+    # callers, ballooning the caller's register pressure for no
     # SPIR-V-correctness reason — the helper would get its own implicit
     # ray-query OpVariable if left alone, which is what it wants.
     #
@@ -1939,9 +1939,7 @@ end
 Emit SPIR-V binary from an LLVM module. Handles type mapping, instruction emission,
 entry point setup, and serialization.
 """
-function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
-                                workgroup_size::NTuple{3,Int};
-                                enable_ray_query::Bool=false)
+function compute_emitter(llvm_mod::LLVM.Module; enable_ray_query::Bool = false)
     emit_check = PhaseTimer("    [emit] "; group="emit")
 
     # Build pointee type map (opaque pointer → typed pointer recovery)
@@ -1973,9 +1971,6 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
     state = SPIRVEmitterState(spirv_mod, type_ctx)
     state.data_layout = llvm_mod.datalayout
 
-    # Find the entry function
-    entry_fn = llvm_mod.functions[entry_name]
-
     # Pre-allocate SPIR-V function IDs for every function with a body so that
     # OpFunctionCall can forward-reference callees regardless of emission order.
     # No effect today (single-function case after force_inline_all!), but enables
@@ -2002,28 +1997,31 @@ function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
         append!(interface_ids, state.entry_interface_ids)
     end
 
-    # Multi-OpFunction emission: walk the call graph from the entry function and
-    # emit every reachable helper as its own OpFunction BEFORE the entry. The
-    # function IDs were pre-allocated above so OpFunctionCall to forward
-    # references is well-defined; emission order here is for source-map locality.
-    # Surviving helpers exist only when force_inline_all=false (the default);
-    # with `force_inline_all=true` only the entry survives and this loop is a
-    # no-op.
-    let reachable = collect_reachable_callees(entry_fn),
-        sccs = strongly_connected_components(reachable)
-        for scc in sccs
-            if length(scc) > 1
-                names = join((f.name for f in scc), " -> ")
-                error("Mutual recursion is not supported in SPIR-V multi-OpFunction emission: cycle through $names")
-            end
-        end
-        emit_check("collect_reachable_callees+SCC")
-        for fn in reachable
-            fn === entry_fn && continue
-            isempty(fn.blocks) && continue
-            emit_function!(state, fn; is_entry=false)
-        end
-        emit_check("emit_function! (helpers)")
+    return state, interface_ids
+end
+
+function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
+                                workgroup_size::NTuple{3,Int};
+                                enable_ray_query::Bool=false,
+                                cache_functions::Bool=HAS_OBJECT_CACHE)
+    entry_fn = llvm_mod.functions[entry_name]
+    reachable = collect_reachable_callees(entry_fn)
+    if cache_functions && length(reachable) > 1
+        return emit_function_objects(llvm_mod, entry_fn, reachable, workgroup_size; enable_ray_query)
+    end
+    state, interface_ids = compute_emitter(llvm_mod; enable_ray_query)
+    spirv_mod, type_ctx = state.mod, state.type_ctx
+    emit_check = PhaseTimer("    [emit] "; group="emit")
+
+    # CodeInstance caching still works when CompilerCaching has no object-cache API.
+    # Emit helpers into this module directly on that path, as before linking was added.
+    for scc in strongly_connected_components(reachable)
+        length(scc) > 1 && error("Mutual recursion is not supported in SPIR-V: " *
+                                join((f.name for f in scc), " -> "))
+    end
+    for fn in reachable
+        fn === entry_fn && continue
+        emit_function!(state, fn; is_entry=false)
     end
 
     # Check if entry function has parameters
@@ -2839,27 +2837,24 @@ function lower_unsupported_intrinsics!(mod::LLVM.Module)
     to_erase = LLVM.Instruction[]
     dl = mod.datalayout
 
-    for fn in mod.functions
-        for bb in fn.blocks
-            for inst in bb.instructions
-                inst isa LLVM.CallInst || continue
-                called = inst.called_operand
-                called isa LLVM.Function || continue
-                fname = called.name
-
-                if startswith(fname, "llvm.memcpy")
-                    lower_memcpy!(inst, dl)
-                    push!(to_erase, inst)
-                elseif startswith(fname, "llvm.memmove")
-                    lower_memcpy!(inst, dl; overlapping = true)
-                    push!(to_erase, inst)
-                elseif startswith(fname, "llvm.memset")
-                    lower_memset!(inst)
-                    push!(to_erase, inst)
-                elseif startswith(fname, "llvm.lifetime")
-                    push!(to_erase, inst)
-                end
-            end
+    # The calls first, then the lowering: a memset of a run-time length splits its
+    # block (`memset_loop!`), and a walk over the blocks would meet it again in the
+    # tail it moved to.
+    calls = LLVM.CallInst[inst for fn in mod.functions for bb in fn.blocks for inst in bb.instructions
+                          if inst isa LLVM.CallInst && inst.called_operand isa LLVM.Function]
+    for inst in calls
+        fname = inst.called_operand.name
+        if startswith(fname, "llvm.memcpy")
+            lower_memcpy!(inst, dl)
+            push!(to_erase, inst)
+        elseif startswith(fname, "llvm.memmove")
+            lower_memcpy!(inst, dl; overlapping = true)
+            push!(to_erase, inst)
+        elseif startswith(fname, "llvm.memset")
+            lower_memset!(inst)
+            push!(to_erase, inst)
+        elseif startswith(fname, "llvm.lifetime")
+            push!(to_erase, inst)
         end
     end
 
@@ -3103,6 +3098,7 @@ end
 Lower a single memset call to explicit stores.
 SPIR-V has no memset intrinsic, so we replace with i32 stores (4-byte chunks)
 plus i8 tail stores. For addrspace 0 (allocas), uses GEP-based addressing.
+A length known only at run time becomes a loop (`memset_loop!`).
 """
 function lower_memset!(inst::LLVM.CallInst)
     ops = inst.operands
@@ -3110,9 +3106,7 @@ function lower_memset!(inst::LLVM.CallInst)
     fill_val = ops[2]  # i8
     len_val = ops[3]
 
-    if !(len_val isa LLVM.ConstantInt)
-        error("Cannot lower memset with non-constant length: $inst")
-    end
+    len_val isa LLVM.ConstantInt || return memset_loop!(inst)
     nbytes = convert(Int, len_val)
 
     T_i8 = LLVM.Int8Type()
@@ -3140,13 +3134,7 @@ function lower_memset!(inst::LLVM.CallInst)
 
     LLVM.@dispose builder=LLVM.IRBuilder() begin
         LLVM.position!(builder, insertion_point(inst))
-
-        # Build fill word: replicate i8 val to i32
-        val32 = LLVM.zext!(builder, fill_val, T_i32)
-        v1 = LLVM.shl!(builder, val32, LLVM.ConstantInt(T_i32, 8))
-        val32 = LLVM.or!(builder, val32, v1)
-        v2 = LLVM.shl!(builder, val32, LLVM.ConstantInt(T_i32, 16))
-        val32 = LLVM.or!(builder, val32, v2)
+        val32 = fill_word!(builder, fill_val)
 
         # Store i32 chunks via byte-offset GEPs
         n_words = nbytes ÷ 4
@@ -3368,6 +3356,81 @@ function memset_helper!(mod::LLVM.Module, T::LLVM.LLVMType, as::Int, align::Int)
         LLVM.ret!(builder)
     end
     return fn
+end
+
+"""The `i8` fill value of a memset replicated into an `i32` word."""
+function fill_word!(builder::LLVM.IRBuilder, fill_val::LLVM.Value)
+    T_i32 = LLVM.Int32Type()
+    val32 = LLVM.zext!(builder, fill_val, T_i32)
+    val32 = LLVM.or!(builder, val32, LLVM.shl!(builder, val32, LLVM.ConstantInt(T_i32, 8)))
+    return LLVM.or!(builder, val32, LLVM.shl!(builder, val32, LLVM.ConstantInt(T_i32, 16)))
+end
+
+"""
+    memset_words!(builder, len) -> Value or nothing
+
+The number of 4-byte words in a memset length that is a multiple of four by construction, a
+`shl` by two or more or a `mul` by a constant multiple of four, built at `builder`. `nothing`
+for any other length.
+"""
+function memset_words!(builder::LLVM.IRBuilder, len::LLVM.Value)
+    len isa LLVM.Instruction || return nothing
+    op = LLVM.opcode(len)
+    x, c = LLVM.operands(len)[1], LLVM.operands(len)[2]
+    T = LLVM.value_type(len)
+    if op == LLVM.API.LLVMShl && c isa LLVM.ConstantInt
+        k = convert(Int, c)
+        k >= 2 || return nothing
+        return k == 2 ? x : LLVM.shl!(builder, x, LLVM.ConstantInt(T, k - 2))
+    elseif op == LLVM.API.LLVMMul
+        c isa LLVM.ConstantInt || ((x, c) = (c, x))
+        c isa LLVM.ConstantInt || return nothing
+        m = convert(Int, c)
+        m % 4 == 0 || return nothing
+        return m == 4 ? x : LLVM.mul!(builder, x, LLVM.ConstantInt(T, m ÷ 4))
+    end
+    return nothing
+end
+
+"""
+    memset_loop!(memset)
+
+A memset whose length is known only at run time, as a loop of stores, which LLVM's
+loop-idiom pass makes of a loop zeroing an array of a run-time length. Words of the
+replicated fill byte when the destination is four-aligned and the length a multiple
+of four by construction (`memset_words!`), bytes otherwise. A length of zero skips the
+loop. Runs before structurization, which gives the loop its merge.
+"""
+function memset_loop!(inst::LLVM.CallInst)
+    ops = inst.operands
+    dst, fill_val, len = ops[1], ops[2], ops[3]
+    T_len = LLVM.value_type(len)
+    T_i8, T_i32 = LLVM.Int8Type(), LLVM.Int32Type()
+    head = LLVM.parent(inst)
+    LLVM.@dispose builder=LLVM.IRBuilder() begin
+        LLVM.position!(builder, insertion_point(inst))
+        words = memcpy_alignment(inst, 1) >= 4 ? memset_words!(builder, len) : nothing
+        n = something(words, len)
+        any_left = LLVM.icmp!(builder, LLVM.API.LLVMIntNE, n, LLVM.ConstantInt(T_len, 0))
+        branch = LLVM.split_block_and_insert_if_then!(any_left, inst)
+        body = LLVM.parent(branch)
+        tail = only(LLVM.successors(branch))
+        LLVM.position!(builder, insertion_point(branch))
+        i = LLVM.phi!(builder, T_len, "memset.i")
+        if words === nothing
+            st = LLVM.store!(builder, fill_val, LLVM.gep!(builder, T_i8, dst, [i]))
+            st.alignment = 1
+        else
+            st = LLVM.store!(builder, fill_word!(builder, fill_val), LLVM.gep!(builder, T_i32, dst, [i]))
+            st.alignment = 4
+        end
+        next = LLVM.add!(builder, i, LLVM.ConstantInt(T_len, 1))
+        more = LLVM.icmp!(builder, LLVM.API.LLVMIntULT, next, n)
+        LLVM.br!(builder, more, body, tail)
+        LLVM.erase!(branch)
+        append!(LLVM.incoming(i), [(LLVM.ConstantInt(T_len, 0), head), (next, body)])
+    end
+    return nothing
 end
 
 # ── Naming a compiled kernel ────────────────────────────────────────────────

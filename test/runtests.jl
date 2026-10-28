@@ -76,6 +76,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         include(joinpath(@__DIR__, "test_select_private_device_load.jl"))
         include(joinpath(@__DIR__, "test_subword_integer_alloca.jl"))
         include(joinpath(@__DIR__, "test_memcpy_chunk_alignment.jl"))
+        include(joinpath(@__DIR__, "test_memset_run_time_length.jl"))
         include(joinpath(@__DIR__, "test_pointer_table_phi.jl"))
         include(joinpath(@__DIR__, "test_phi_pointee_agrees.jl"))
         include(joinpath(@__DIR__, "test_exact_narrowing.jl"))

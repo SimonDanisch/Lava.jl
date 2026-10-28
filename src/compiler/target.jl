@@ -23,6 +23,14 @@ LavaCompilerParams(workgroup_size::NTuple{3,Int}) =
 const LavaCompilerConfig = GPUCompiler.CompilerConfig{GPUCompiler.SPIRVCompilerTarget, LavaCompilerParams}
 const LavaCompilerJob = GPUCompiler.CompilerJob{GPUCompiler.SPIRVCompilerTarget, LavaCompilerParams}
 
+# These parameters are read only after Julia inference: they select the entry wrapper and
+# SPIR-V capabilities. Keep one inference cache for them, so Mantle's access walk and the
+# launch reuse each other's CodeInstances. GPUCompiler keys compiled results separately on
+# the full CompilerConfig, so different workgroup sizes and capabilities keep their own code.
+GPUCompiler.cache_owner(target::GPUCompiler.SPIRVCompilerTarget, ::LavaCompilerParams,
+                        always_inline::Bool) =
+    GPUCompiler.GPUCompilerCacheToken(target, LavaCompilerParams(), always_inline)
+
 # ── Device runtime stubs ──
 #
 # GPUCompiler's lower_throw! pass converts `throw(...)` into calls to these
@@ -352,8 +360,8 @@ end
         # Lava's SPIR-V emitter could only handle single-OpFunction kernels, but
         # now that Lava's force_inline_all! supports multi-OpFunction output
         # (force_inline_all=false default), we want Julia/GPUCompiler to respect
-        # `@noinline` so callees like `trace_shadow_transmittance` (which has a
-        # self-contained ray-query lifecycle) can survive as a separate
+        # `@noinline` so callees with a self-contained ray-query lifecycle
+        # (a shadow trace) can survive as a separate
         # OpFunction and keep their state out of the caller's register frame.
         always_inline = false,
         workgroup_size::NTuple{3,Int} = (64, 1, 1),

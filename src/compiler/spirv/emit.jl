@@ -190,6 +190,10 @@ mutable struct SPIRVEmitterState
     # walks into one each. Keyed by the metadata ref: two Julia objects can wrap
     # the same underlying node.
     source_loc_cache::Dict{LLVM.API.LLVMMetadataRef, Union{Nothing, Tuple{String, Int}}}
+    # Function objects store instruction ordinals rather than file/line values.
+    # Linking relocates SPIR-V IDs; the current LLVM body supplies source lines
+    # again even when an unchanged helper is loaded from an earlier session.
+    source_instruction_indices::Union{Nothing, Dict{LLVM.Instruction, Int}}
     # What the device this module is for lets it declare. Set by the RT emitter
     # from the compile job's `LavaCompilerParams`; all-false until then, which is
     # the module that is valid everywhere.
@@ -234,6 +238,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{UInt32, Tuple{UInt32, UInt32}}(),  # psb_access_chain
         Dict{LLVM.Value, LLVM.LLVMType}(),  # value_emitted_pointee
         Dict{LLVM.API.LLVMMetadataRef, Union{Nothing, Tuple{String, Int}}}(),  # source_loc_cache
+        nothing,  # source_instruction_indices (function objects only)
         TargetFeatures(),  # features (set by the RT emitter from the job)
         Dict{Tuple{LLVM.Value, UInt32}, UInt32}(),  # narrowed_index
     )
@@ -407,9 +412,14 @@ Record the source location of `inst` for SPIR-V result ID `spirv_id`.
 Called after every `fresh_id!` during instruction emission.
 """
 function record_source_location!(state::SPIRVEmitterState, spirv_id::UInt32, inst::LLVM.Instruction)
-    loc = extract_source_location(state, inst)
+    loc = emitted_source_location(state, inst)
     loc === nothing && return
     state.mod.source_locations[spirv_id] = loc
+end
+
+function emitted_source_location(state::SPIRVEmitterState, inst::LLVM.Instruction)
+    indices = state.source_instruction_indices
+    indices === nothing ? extract_source_location(state, inst) : ("", indices[inst])
 end
 
 """
@@ -761,6 +771,19 @@ end
 # Main Emission Entry Point
 # ================================================================
 
+function function_parameter_type!(state::SPIRVEmitterState, param::LLVM.Argument)
+    ty = param.value_type
+    ty isa LLVM.PointerType || return map_type!(state.type_ctx, ty)
+    id = map_pointer_type_for_value!(state.type_ctx, param)
+    if get_pointer_storage_class(param) == SC.PhysicalStorageBuffer
+        # ArrayStride is part of a pointer type's linkage identity. Both the
+        # declaration and definition need it, even if only the callee indexes it.
+        pointee = @something get_pointee_type(state.type_ctx.ptm, param)
+        ensure_array_stride_decoration!(state, id, pointee)
+    end
+    return id
+end
+
 """
     emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::Bool=false)
 
@@ -810,15 +833,7 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
     ret_spirv = map_type!(state.type_ctx, ret_ty)
 
     # Map parameter types — use actual parameter values to resolve pointer types
-    param_spirv = UInt32[]
-    for param in fn.parameters
-        param_ty = param.value_type
-        if param_ty isa LLVM.PointerType
-            push!(param_spirv, map_pointer_type_for_value!(state.type_ctx, param))
-        else
-            push!(param_spirv, map_type!(state.type_ctx, param_ty))
-        end
-    end
+    param_spirv = UInt32[function_parameter_type!(state, param) for param in fn.parameters]
     func_type_id = emit_type_function!(state.mod, ret_spirv, param_spirv)
 
     # Function ID
@@ -1202,7 +1217,7 @@ function emit_instruction!(state::SPIRVEmitterState, inst::LLVM.Instruction)
     # decomposition). We map all of them to the same Julia source location.
     id_after = state.mod.next_id
     if id_after > id_before
-        loc = extract_source_location(state, inst)
+        loc = emitted_source_location(state, inst)
         if loc !== nothing
             for id in id_before:(id_after - UInt32(1))
                 state.mod.source_locations[id] = loc
@@ -8314,13 +8329,15 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
         result_ty = map_type!(state.type_ctx, inst.value_type)
         bitwidth = ops[1].value_type.width
         bw_id = map_constant!(state.type_ctx, LLVM.ConstantInt(ops[1].value_type, bitwidth))
-        # shift_mod = shift % bitwidth (SPIR-V shift is modulo, but be explicit)
+        # LLVM reduces the count modulo the width. Both SPIR-V shift counts
+        # must stay below it, including the complementary count when shift=0.
         shift_mod = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpUMod, result_ty, shift_mod, shift_id, bw_id)
-        # complement = bitwidth - shift_mod
+        difference = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpISub, result_ty, difference, bw_id, shift_mod)
         complement = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpISub, result_ty, complement, bw_id, shift_mod)
-        if name == "llvm.fshl"
+        encode_instruction!(state.mod.functions, Op.OpUMod, result_ty, complement, difference, bw_id)
+        if base_name == "llvm.fshl"
             hi = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpShiftLeftLogical, result_ty, hi, a_id, shift_mod)
             lo = fresh_id!(state.mod)
@@ -8331,8 +8348,15 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
             lo = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpShiftRightLogical, result_ty, lo, b_id, shift_mod)
         end
+        combined = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpBitwiseOr, result_ty, combined, hi, lo)
+        zero = map_constant!(state.type_ctx, LLVM.ConstantInt(ops[1].value_type, 0))
+        bool_ty = map_type!(state.type_ctx, LLVM.Int1Type())
+        is_zero = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpIEqual, bool_ty, is_zero, shift_mod, zero)
         result_id = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpBitwiseOr, result_ty, result_id, hi, lo)
+        unchanged = base_name == "llvm.fshl" ? a_id : b_id
+        encode_instruction!(state.mod.functions, Op.OpSelect, result_ty, result_id, is_zero, unchanged, combined)
         state.value_map[inst] = result_id
         return
     end

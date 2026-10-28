@@ -35,9 +35,13 @@ precompiled; `misses` compiled it. The names and shape are Metal.jl's
 mutable struct CompileStats
     hits::Int
     misses::Int
+    function_hits::Int
+    function_misses::Int
+    llvm_hits::Int
+    llvm_misses::Int
 end
 
-const COMPILE_STATS = CompileStats(0, 0)
+const COMPILE_STATS = CompileStats(0, 0, 0, 0, 0, 0)
 
 """
     compile_stats() -> (; hits, misses)
@@ -48,8 +52,19 @@ nothing to compile shows `misses == 0` when run again in a new session.
 """
 compile_stats() = (; hits = COMPILE_STATS.hits, misses = COMPILE_STATS.misses)
 
+"""The helper functions found in the object cache and emitted since `reset_compile_stats!`."""
+function_compile_stats() = (; hits = COMPILE_STATS.function_hits, misses = COMPILE_STATS.function_misses)
+
+"""Optimized LLVM modules found and optimized since `reset_compile_stats!`."""
+llvm_compile_stats() = (; hits = COMPILE_STATS.llvm_hits, misses = COMPILE_STATS.llvm_misses)
+
 """Reset what [`compile_stats`](@ref) counts."""
-reset_compile_stats!() = (COMPILE_STATS.hits = 0; COMPILE_STATS.misses = 0; nothing)
+function reset_compile_stats!()
+    COMPILE_STATS.hits = COMPILE_STATS.misses = 0
+    COMPILE_STATS.function_hits = COMPILE_STATS.function_misses = 0
+    COMPILE_STATS.llvm_hits = COMPILE_STATS.llvm_misses = 0
+    return nothing
+end
 
 """Whether this process is writing a package image."""
 generating_output() = ccall(:jl_generating_output, Cint, ()) == 1
@@ -162,7 +177,7 @@ end
 # other process can check that it is still the code the kernel was compiled from.
 # What another process can compare is the LLVM module GPUCompiler makes of it
 # (`lava_llvm`): everything Lava does from there, its passes, SPIR-V emission,
-# spirv-opt and spirv-val, four fifths of a compile, depends on that module, the
+# spirv-opt and spirv-val, depends on that module, the
 # stage's settings and the compiler, and on nothing else. So a stage is kept in
 # CompilerCaching's object cache under those three, and a later session that makes
 # the same module finds it there.

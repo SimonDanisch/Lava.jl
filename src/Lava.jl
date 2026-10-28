@@ -200,6 +200,8 @@ include("compiler/compilation.jl")
 # Compiled kernels and stages, kept with their `CodeInstance`s: the lookups in
 # front of `compilation.jl`'s compilers, and what a package image persists.
 include("compiler/cache.jl")
+include("compiler/optimization_cache.jl")
+include("compiler/function_cache.jl")
 # Planned files consolidated into emit.jl (4431 lines) and compilation.jl:
 #   sourcemap.jl, intrinsics.jl, control_flow.jl, decorations.jl, compute.jl
 include("compiler/spirv/rayquery.jl")     # VK_KHR_ray_query capabilities + emission
