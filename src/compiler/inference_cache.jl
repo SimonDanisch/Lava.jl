@@ -22,11 +22,12 @@ mutable struct IRKeyState
     types::IdDict{Any,Int}
     sources::IdDict{Core.CodeInstance,Core.CodeInfo}
     world::UInt
+    type_depth::Int
 end
 function IRKeyState(pairs, world)
     io = IOBuffer()
     IRKeyState(io, Serialization.Serializer(io), IdDict{Any,Int}(), IdDict{Any,Int}(),
-             IdDict{Core.CodeInstance,Core.CodeInfo}(pairs), world)
+             IdDict{Core.CodeInstance,Core.CodeInfo}(pairs), world, 0)
 end
 irkey_atom!(s, x) = Serialization.serialize(s.serializer, x)
 irkey_tag!(s, x::UInt8) = write(s.io, x)
@@ -54,25 +55,42 @@ function irkey!(s, x::Module)
     # instructions and type layouts, rather than that nonce, identify them.
     irkey_atom!(s, pkg.uuid === nothing && root !== Base && root !== Core ? nothing : Base.module_build_id(root))
 end
-function irkey!(s, x::DataType)
+Base.@nospecializeinfer function irkey!(s, @nospecialize(x::DataType))
     irkey_tag!(s, 0x03)
     id = get(s.types, x, 0)
     irkey_atom!(s, id)
     id != 0 && return
     s.types[x] = length(s.types) + 1
+    s.type_depth += 1
+    try
+        s.type_depth > 128 && throw(IRKeyUnsupported(DataType))
+        irkey_type!(s, x)
+    finally
+        s.type_depth -= 1
+    end
+end
+
+Base.@nospecializeinfer function irkey_type!(s, @nospecialize(x::DataType))
     irkey!(s, parentmodule(x))
     irkey_atom!(s, nameof(x))
     irkey!(s, x.parameters)
+    irkey!(s, supertype(x))
     irkey_atom!(s, isconcretetype(x))
+    irkey_atom!(s, isabstracttype(x))
     irkey_atom!(s, isprimitivetype(x))
     irkey_atom!(s, ismutabletype(x))
     irkey_atom!(s, isbitstype(x))
-    if isconcretetype(x) && parentmodule(x) !== Core
-        irkey_atom!(s, sizeof(x))
-        irkey_atom!(s, Base.datatype_alignment(x))
+    if !isabstracttype(x) && parentmodule(x) !== Core
+        concrete = isconcretetype(x)
+        if concrete
+            irkey_atom!(s, sizeof(x))
+            irkey_atom!(s, Base.datatype_alignment(x))
+        end
         irkey_atom!(s, fieldnames(x))
         for i in 1:fieldcount(x)
-            irkey_atom!(s, fieldoffset(x, i))
+            concrete && irkey_atom!(s, fieldoffset(x, i))
+            irkey_atom!(s, Base.isconst(x, i))
+            irkey_atom!(s, Base.isfieldatomic(x, i))
             irkey!(s, fieldtype(x, i))
         end
     end
@@ -164,6 +182,8 @@ function irkey!(s, x::Method)
     irkey_atom!(s, x.nospecializeinfer)
     irkey_atom!(s, x.nkw)
     irkey_atom!(s, x.nospecialize)
+    irkey_atom!(s, x.called)
+    irkey_atom!(s, x.max_varargs)
     irkey_atom!(s, isdefined(x, :ccallable))
     isdefined(x, :ccallable) && irkey!(s, x.ccallable)
 end
@@ -172,8 +192,12 @@ function irkey!(s, x::Core.CodeInstance)
     irkey_reference!(s, x) && return
     irkey!(s, x.def)
     irkey!(s, x.rettype)
-    irkey_atom!(s, isdefined(x, :rettype_const))
-    isdefined(x, :rettype_const) && irkey!(s, x.rettype_const)
+    for name in (:exctype, :rettype_const, :debuginfo)
+        assigned = isdefined(x, name)
+        irkey_atom!(s, assigned)
+        assigned && irkey!(s, getfield(x, name))
+    end
+    irkey_atom!(s, x.ipo_purity_bits)
     irkey_atom!(s, Core.Compiler.use_const_api(x))
     source = get(s.sources, x, nothing)
     source === nothing && throw(IRKeyUnsupported(Core.CodeInstance))
@@ -247,7 +271,7 @@ function inferred_kernel_key(job)
         irkey_atom!(s, (options.opt_level, options.opt_level_min, options.debug_level,
                        options.check_bounds, options.can_inline, options.fast_math,
                        options.polly, options.image_codegen, options.strip_metadata))
-        return ObjCache.keyhash(1, take!(s.io))
+        return ObjCache.keyhash(3, take!(s.io))
     catch err
         err isa IRKeyUnsupported || rethrow()
         return nothing

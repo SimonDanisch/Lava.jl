@@ -4,6 +4,9 @@ using Test, Lava, GPUCompiler
 const FACTOR = Float32(rand(10_000:99_999))
 const TABLE = Float32[2, 3, 5]
 const OPAQUE = Ref(2f0)
+struct Nested{T}
+    value::T
+end
 @noinline helper(x::Float32) = x*x + FACTOR
 function kernel!(out)
     i = Int(Lava.lava_global_invocation_id_x()) + 1
@@ -69,6 +72,11 @@ end
         a, b = Float32[2, 3], Float32[2, 3]
         @test valuekey((a,a)) != valuekey((a,b))
         @test_throws Lava.IRKeyUnsupported valuekey(Ptr{Int}(UInt(0x1234)))
+        nested = Float32
+        for _ in 1:160
+            nested = Nested{nested}
+        end
+        @test_throws Lava.IRKeyUnsupported valuekey(nested)
     end
 
     @testset "type layouts with the same qualified name" begin
@@ -80,6 +88,22 @@ end
         Core.eval(c, :(struct Record; x::Float64; y::Int32; end))
         @test valuekey(a.Record) == valuekey(b.Record)
         @test valuekey(a.Record) != valuekey(c.Record)
+
+        plain, constant, atomic = Module(:FieldProbe), Module(:FieldProbe), Module(:FieldProbe)
+        Core.eval(plain, :(mutable struct Record; x::Float32; y::Int32; end))
+        Core.eval(constant, :(mutable struct Record; const x::Float32; y::Int32; end))
+        Core.eval(atomic, :(mutable struct Record; @atomic x::Float32; y::Int32; end))
+        @test valuekey(plain.Record) != valuekey(constant.Record)
+        @test valuekey(plain.Record) != valuekey(atomic.Record)
+
+        left, right = Module(:HierarchyProbe), Module(:HierarchyProbe)
+        for m in (left, right)
+            Core.eval(m, :(abstract type ParentA end))
+            Core.eval(m, :(abstract type ParentB end))
+        end
+        Core.eval(left, :(struct Record <: ParentA; x::Float32; end))
+        Core.eval(right, :(struct Record <: ParentB; x::Float32; end))
+        @test valuekey(left.Record) != valuekey(right.Record)
     end
 
     if Lava.ObjCache.enabled()
