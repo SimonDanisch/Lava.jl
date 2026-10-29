@@ -136,6 +136,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
     # new world and from the package image, compiled again after an edit.
     @testset "compile cache" begin
         include(joinpath(@__DIR__, "test_compile_cache.jl"))
+        include(joinpath(@__DIR__, "test_inferred_cache.jl"))
     end
 
     # SPV_NV_tensor_addressing layout emission.

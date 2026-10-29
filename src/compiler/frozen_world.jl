@@ -96,5 +96,11 @@ PrecompileTools.@setup_workload begin
                                           Tuple{LavaDeviceArray{Float32, 1}, LavaDeviceArray{Int32, 1},
                                                 _PrecompileWarmupParams};
                                           workgroup_size = (64, 1, 1)))
+        # Exercise the portable key walk without opening the object store.
+        # The ordinary workload above keeps its kernels in the package image
+        # and intentionally bypasses all persistent lookups while precompiling.
+        inferred_kernel_key(lava_kernel_job(precompile_warmup_kernel!,
+                                             Tuple{LavaDeviceArray{Float32, 1}, LavaDeviceArray{Float32, 1}};
+                                             workgroup_size = (64, 1, 1)))
     end
 end

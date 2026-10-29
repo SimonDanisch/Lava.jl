@@ -175,12 +175,12 @@ end
 #
 # A kernel compiled at run time has a `CodeInstance` of this session only, and no
 # other process can check that it is still the code the kernel was compiled from.
-# What another process can compare is the LLVM module GPUCompiler makes of it
-# (`lava_llvm`): everything Lava does from there, its passes, SPIR-V emission,
-# spirv-opt and spirv-val, depends on that module, the
-# stage's settings and the compiler, and on nothing else. So a stage is kept in
-# CompilerCaching's object cache under those three, and a later session that makes
-# the same module finds it there.
+# Compute kernels first compare the inferred inputs to LLVM emission (see
+# inference_cache.jl). A hit avoids emitting LLVM at all. Unsupported inputs and
+# graphics stages still compare the LLVM module GPUCompiler makes (`lava_llvm`):
+# the later passes, SPIR-V emission, spirv-opt and spirv-val depend on that module,
+# the stage's settings and the compiler. This tier also deduplicates distinct
+# Julia source that generates the same LLVM.
 
 """Bump to drop every stage kept under an earlier layout of what is stored."""
 const PERSISTED_SCHEMA = 1
@@ -260,8 +260,25 @@ function persisted(compile, ns::String, mod::LLVM.Module, settings...)
     return stage
 end
 
-"""The compute kernel of `job`, kept from an earlier session or compiled (`persisted`)."""
+"""The compute kernel of `job`, looked up before LLVM emission when its inferred inputs are portable."""
 function persisted_kernel(job::LavaCompilerJob)
+    keep = HAS_OBJECT_CACHE && !generating_output() && !kernel_dump_wanted() &&
+           Base.JLOptions().code_coverage == 0 && Base.JLOptions().malloc_log == 0 && ObjCache.enabled()
+    key = keep ? inferred_kernel_key(job) : nothing
+    if key !== nothing
+        found = ObjCache.get("Lava/inferred-kernel", key)
+        if found !== nothing
+            COMPILE_STATS.hits += 1
+            return Serialization.deserialize(IOBuffer(found))::LavaGPUKernel
+        end
+    end
+    kernel = persisted_kernel_from_llvm(job)
+    key === nothing || ObjCache.put!("Lava/inferred-kernel", key, serialized(portable(kernel)))
+    return kernel
+end
+
+"""The LLVM-keyed lookup, also used when the inferred inputs cannot be fingerprinted."""
+function persisted_kernel_from_llvm(job::LavaCompilerJob)
     GPUCompiler.JuliaContext() do ctx
         mod, meta = lava_llvm(job)
         p = job.config.params
