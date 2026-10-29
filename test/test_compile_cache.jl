@@ -408,4 +408,53 @@ end
         end
     end
 
+    @testset "optimization relocation keys follow canonical symbols" begin
+        GPUCompiler.JuliaContext() do _
+            function fixture(a, b; reverse = false, values = (17, 29))
+                globals = ["@$a = global i64 0", "@$b = global i64 0"]
+                reverse && reverse!(globals)
+                body = "define i64 @main() {\n %a = load i64, ptr @$a\n %b = load i64, ptr @$b\n %r = sub i64 %a, %b\n ret i64 %r\n}"
+                mod = parse(LLVM.Module, join(globals, "\n") * "\n" * body)
+                records = [GPUCompiler.Relocation(GPUCompiler.SlotSite, name, 0,
+                                                  GPUCompiler.JuliaValueRef(Int32(value)))
+                           for (name, value) in zip((a, b), values)]
+                sort!(records; by = record -> (record.name, record.offset))
+                return mod, GPUCompiler.Relocations(records)
+            end
+            first, relocs = fixture("alpha_111", "beta_111")
+            renamed, renamed_relocs = fixture("zeta_222", "gamma_222"; reverse = true)
+            changed, changed_relocs = fixture("zeta_222", "gamma_222"; values = (18, 29))
+            swapped, swapped_relocs = fixture("zeta_222", "gamma_222"; values = (29, 17))
+            @test Lava.optimization_input(first) == Lava.optimization_input(renamed)
+            key = Lava.serialized(Lava.optimization_relocations(first, relocs))
+            @test key == Lava.serialized(Lava.optimization_relocations(renamed, renamed_relocs))
+            @test key != Lava.serialized(Lava.optimization_relocations(changed, changed_relocs))
+            @test key != Lava.serialized(Lava.optimization_relocations(swapped, swapped_relocs))
+            @test Lava.optimization_relocations(first, GPUCompiler.Relocations()) == ()
+            foreach(LLVM.dispose, (first, renamed, changed, swapped))
+        end
+    end
+
+    @testset "optimized modules restore current relocation targets after renaming" begin
+        job = Lava.lava_kernel_job(cc_optimization!, CC_TT; workgroup_size = (64, 1, 1))
+        GPUCompiler.JuliaContext() do _
+            Lava.reset_compile_stats!()
+            initial = nothing
+            for name in ("relocation_slot_111", "relocation_slot_222")
+                ir = "@$name = global i64 0\ndefine i64 @main() {\n %x = load i64, ptr @$name\n ret i64 %x\n}"
+                mod = parse(LLVM.Module, ir)
+                value = Ref(Int32(17))
+                relocs = GPUCompiler.Relocations([GPUCompiler.Relocation(GPUCompiler.SlotSite, name, 0,
+                                                                          GPUCompiler.JuliaValueRef(value))])
+                GPUCompiler.optimize!(job, mod, relocs)
+                LLVM.verify(mod)
+                @test only(relocs.records).name == name
+                @test only(relocs.records).target.value === value
+                initial === nothing && (initial = Lava.llvm_compile_stats())
+                LLVM.dispose(mod)
+            end
+            @test Lava.llvm_compile_stats() == (; hits = initial.hits + 1, misses = initial.misses)
+        end
+    end
+
 end

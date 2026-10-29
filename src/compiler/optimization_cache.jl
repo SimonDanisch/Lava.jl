@@ -46,6 +46,21 @@ end
 optimization_symbols(mod::LLVM.Module) =
     [String[f.name for f in mod.functions]; String[g.name for g in optimization_globals(mod)]]
 
+# Relocation sites use job-local symbols. Key them by the same symbol order as
+# the canonical IR; their generated names and manifest order carry no semantics.
+function optimization_relocations(names::Vector{String}, relocs::GPUCompiler.Relocations)
+    isempty(relocs) && return ()
+    symbols = Dict(name => i for (i, name) in enumerate(names))
+    records = map(relocs.records) do record
+        site = get(symbols, record.name, 0)
+        (; kind = record.kind, site, name = site == 0 ? record.name : "",
+           offset = record.offset, target = record.target)
+    end
+    return sort!(records; by = record -> (record.site, record.name, record.offset, Int(record.kind)))
+end
+optimization_relocations(mod::LLVM.Module, relocs::GPUCompiler.Relocations) =
+    optimization_relocations(optimization_symbols(mod), relocs)
+
 function restore_optimization_symbols!(mod::LLVM.Module, old, current)
     names = Dict(zip(old, current))
     renames = Tuple{LLVM.GlobalValue,String}[]
@@ -99,10 +114,10 @@ function GPUCompiler.optimize!(job::LavaCompilerJob, mod::LLVM.Module,
     keep || return optimize_uncached!(job, mod, relocs; opt_level)
     config = job.config
     settings = [(name, getfield(config, name)) for name in fieldnames(typeof(config)) if name !== :cache_owner]
-    key = ObjCache.keyhash(1, optimization_input(mod),
-                          serialized((compiler_identity(), Base.module_build_id(GPUCompiler), settings,
-                                      opt_level, optimization_debug_locations(mod), relocs.records)))
     current = optimization_symbols(mod)
+    key = ObjCache.keyhash(2, optimization_input(mod),
+                          serialized((compiler_identity(), Base.module_build_id(GPUCompiler), settings,
+                                      opt_level, optimization_debug_locations(mod), optimization_relocations(current, relocs))))
     found = ObjCache.get("Lava/optimized-llvm", key)
     if found === nothing
         COMPILE_STATS.llvm_misses += 1
