@@ -76,6 +76,10 @@ than silent. It still lowers it (the SPIR-V emitter cannot represent
 `unreachable` at all, and a non-inlined helper has no way to exit the thread),
 but the warning flags that the throw path now returns `undef`.
 
+A non-entry function that NOTHING calls is not such a helper: it is dead code, and
+it is removed instead. Nothing can reach its throw path, so there is nothing to
+warn about and nothing to emit.
+
 Note (GPUCompiler 1.13.x): in practice GPUCompiler already lowers all
 throws/`unreachable` upstream, so this pass is a no-op on the normal compile
 path — it is kept (and hardened) as vendored defensive code for the day a
@@ -84,7 +88,8 @@ GPUCompiler version stops doing so. It is exercised directly by
 """
 function replace_unreachable!(mod::LLVM.Module, entry::Union{LLVM.Function,Nothing}=nothing;
                               kernelname::AbstractString="")
-    for f in LLVM.functions(mod)
+    # Collected: a dead helper is erased inside the loop.
+    for f in collect(LLVM.functions(mod))
         isempty(LLVM.blocks(f)) && continue
 
         # Find unreachable instructions and exit blocks
@@ -99,6 +104,16 @@ function replace_unreachable!(mod::LLVM.Module, entry::Union{LLVM.Function,Nothi
             end
         end
         isempty(unreachables) && continue
+
+        # Dead, not surviving. The ray-tracing shader path does not force-inline, so
+        # GPUCompiler's runtime stays in the module after every call into it was
+        # optimized away — `gpu_gc_pool_alloc`, whose out-of-memory path throws, in
+        # Hikari's closest-hit shader. Lowered, it raised the warning below: a GPU
+        # heap allocation in a shader that makes none.
+        if entry !== nothing && f !== entry && isempty(LLVM.uses(f))
+            LLVM.erase!(f)
+            continue
+        end
 
         # Surviving throwing helper: lowering its `unreachable` makes it return
         # `undef` and the caller resume with garbage (a pointer/index return is
