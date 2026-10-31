@@ -34,9 +34,12 @@ end
                                   stage=:compute, enable_ray_query=true)
     end
     check(d, "OpCapability RayQueryKHR")
-    check(d, "OpCapability RayTracingKHR")
     check(d, "OpExtension \"SPV_KHR_ray_query\"")
-    check(d, "OpExtension \"SPV_KHR_ray_tracing\"")
+    # A ray query is all a kernel traces with. `RayTracingKHR` needs the device's
+    # ray-tracing pipeline feature, which Mantle does not ask for, so declaring
+    # it would make every tracing kernel invalid for the device it runs on.
+    check_not(d, "OpCapability RayTracingKHR")
+    check_not(d, "SPV_KHR_ray_tracing")
 end
 
 @testset "Ray Query - Phase A2 errors loudly without device support" begin

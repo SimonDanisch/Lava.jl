@@ -841,23 +841,29 @@ of interpolating them. It is a type parameter and not a field for the reason the
 whole wrapper is `@generated`: the location of each varying is a constant, and a
 stage that decided one at runtime could not be a stage.
 """
-struct VertexWrapper{F, Flats} end
+# `VID` is whether the body takes a leading `KernelInterface.VertexIndex`, decided on
+# the host (`KernelInterface.wantsvertexindex`): a `@generated` body may not call
+# `hasmethod`. A portable body takes one so it also runs where it is lowered onto a
+# mesh stage, which has no `vertex_index()`.
+struct VertexWrapper{F, Flats, VID} end
 
-VertexWrapper{F}() where {F} = VertexWrapper{F, ()}()
+VertexWrapper{F}() where {F} = VertexWrapper{F, (), false}()
+VertexWrapper{F, Flats}() where {F, Flats} = VertexWrapper{F, Flats, false}()
 
 # Every wrapper hands the body its arguments WRITTEN OUT, never as `args...`:
 # inference resolves a splat of at most 32 elements, and past that the call
 # stays a dynamic `_apply_iterate`, which does not compile to SPIR-V. RayMakie's
 # mesh shader takes 51. A comprehension over `args`, not a helper function: a
 # generator runs in the world its method was defined in.
-@generated function (::VertexWrapper{F, Flats})(args...) where {F, Flats}
+@generated function (::VertexWrapper{F, Flats, VID})(args...) where {F, Flats, VID}
     # `Val{Flats}()` and not `Val($Flats)`: splicing a tuple of SYMBOLS into an
     # expression puts each symbol in value position, where it reads as a
     # variable — ten undefined names, and a `MethodError` thrown from inside a
     # vertex shader. The parameter is already a type parameter here; using it
     # directly is both correct and one less thing to evaluate.
+    lead = VID ? (:(KernelInterface.VertexIndex(KernelInterface.vertex_index())),) : ()
     quote
-        result = F.instance($((:(args[$i]) for i in 1:length(args))...))
+        result = F.instance($(lead...), $((:(args[$i]) for i in 1:length(args))...))
         emit_vertex_outputs(result, Val{Flats}())
     end
 end

@@ -1770,9 +1770,27 @@ function map_constant!(ctx::SPIRVTypeContext, val::LLVM.Constant)
         # A constant vector is the same `OpConstantComposite` as an array's:
         # `fsub <2 x half> %x, <half 1152.0, half 1152.0>` needs one.
         return map_constant_array!(ctx, val, ty)
+    elseif val isa LLVM.ConstantStruct
+        return map_constant_struct!(ctx, val, ty)
     else
         error("Unsupported constant type: $(typeof(val))")
     end
+end
+
+"""
+    map_constant_struct!(ctx, val, ty) -> UInt32
+
+A constant struct as the `OpConstantComposite` of its members' constants: an
+LLVM struct maps to a SPIR-V struct member for member (`emit_llvm_type!`). LLVM
+folds a struct built from constants into one, as the closure tuples Hikari's
+shader materials start from.
+"""
+function map_constant_struct!(ctx::SPIRVTypeContext, val::LLVM.ConstantStruct, ty::LLVM.StructType)
+    type_id = map_type!(ctx, ty)
+    member_ids = UInt32[map_constant!(ctx, m) for m in val.operands]
+    id = fresh_id!(ctx.mod)
+    encode_instruction!(ctx.mod.types_constants, Op.OpConstantComposite, type_id, id, member_ids...)
+    return id
 end
 
 function map_constant_int!(ctx::SPIRVTypeContext, val::LLVM.ConstantInt, ty::LLVM.IntegerType)

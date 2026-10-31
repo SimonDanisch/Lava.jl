@@ -10,16 +10,16 @@ Require the SPIR-V capabilities and extensions for inline ray queries.
 Idempotent.
 """
 function setup_ray_query_capabilities!(spirv_mod::SPIRVModule)
+    # `RayQueryKHR` alone: `RayTracingKHR` would need the ray-tracing pipeline
+    # feature, which a device is not asked for.
     require_capability!(spirv_mod, Cap.RayQueryKHR)
-    require_capability!(spirv_mod, Cap.RayTracingKHR)
     require_extension!(spirv_mod, "SPV_KHR_ray_query")
-    require_extension!(spirv_mod, "SPV_KHR_ray_tracing")
     return nothing
 end
 
 """
 Emit OpTypeAccelerationStructureKHR once per module. Caches the result id in
-`state.rt_accel_type_id` (reusing the existing RT-shader field).
+`state.rt_accel_type_id`.
 """
 function emit_acceleration_structure_type!(state::SPIRVEmitterState)
     state.rt_accel_type_id !== nothing && return state.rt_accel_type_id
@@ -152,7 +152,7 @@ function emit_ray_query_init!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     dz_id    = get_value_id!(state, args[9])
     tmax_id  = get_value_id!(state, args[10])
 
-    # Construct origin and direction vec3 (same pattern as emit_rt_trace_ray!)
+    # Construct origin and direction vec3.
     f32_ty  = emit_type_float!(mod, UInt32(32))
     vec3_ty = emit_type_vector!(mod, f32_ty, UInt32(3))
 

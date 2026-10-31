@@ -9,6 +9,8 @@
 #     world age but leaves the kernel's code valid;
 #   * an edit to a function the kernel inlines compiles it again, from the new
 #     code;
+#   * code compiled before, in this process or an earlier one, is found in the
+#     object cache when its `CodeInstance` is new: an edit undone compiles nothing;
 #   * the kernels Lava's own precompile workload compiled are found in this
 #     process without compiling, because they went into the package image.
 #
@@ -16,7 +18,10 @@
 
 using Test, Lava
 
-cc_scale(x) = x * 2f0
+# Drawn per run: kernels outlive the process, so code an earlier run compiled is
+# found, not compiled, and only code no run has seen is a compile.
+const CC_FACTOR = Float32(rand(10_000:99_999))
+cc_scale(x) = x * CC_FACTOR
 
 function cc_kernel!(out)
     i = Int(Lava.lava_global_invocation_id_x()) + 1
@@ -50,11 +55,29 @@ cc_lookup() = Lava.compile_or_lookup(Lava.lava_kernel_job(cc_kernel!, CC_TT; wor
     @testset "an edit to an inlined callee compiles again" begin
         before = cc_lookup()
         Lava.reset_compile_stats!()
-        @eval cc_scale(x) = x * 3f0
+        @eval cc_scale(x) = x * $(CC_FACTOR + 1f0)
         after = Base.invokelatest(cc_lookup)
         @test Lava.compile_stats() == (; hits = 0, misses = 1)
         @test after !== before
         @test after.spirv_bytes != before.spirv_bytes
+    end
+
+    # The edit undone makes a new `CodeInstance` of code compiled before, which
+    # Julia numbers differently: only the object cache, keyed by the module without
+    # those numbers (`canonical_ir`), knows it.
+    @testset "code compiled before is not compiled again" begin
+        @eval cc_scale(x) = x * $(CC_FACTOR + 2f0)
+        first = Base.invokelatest(cc_lookup)
+        @eval cc_unrelated_2() = 2
+        @eval cc_scale(x) = x * $(CC_FACTOR + 3f0)
+        Base.invokelatest(cc_lookup)
+        Lava.reset_compile_stats!()
+        @eval cc_scale(x) = x * $(CC_FACTOR + 2f0)
+        again = Base.invokelatest(cc_lookup)
+        @test Lava.compile_stats() == (; hits = 1, misses = 0)
+        @test again !== first
+        @test again.spirv_bytes == first.spirv_bytes
+        @test again.push_info.arg_layout == first.push_info.arg_layout
     end
 
     @testset "the package image's kernels compile nothing" begin
