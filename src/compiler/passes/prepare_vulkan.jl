@@ -3946,6 +3946,13 @@ This pass decomposes such loads into properly-typed field loads + pack:
 For narrower loads (e.g., load i8 from i32*), loads the full type and truncates.
 """
 function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
+    # Layouts are immutable throughout this pass and share one DataLayout.
+    # Rebuilding every scalar path for every load, and again after each rewrite,
+    # made large BSDF arrays allocate billions of temporary path vectors.
+    layouts = Dict{LLVM.LLVMType, Vector{Tuple{Vector{Int}, LLVM.LLVMType, Int}}}()
+    fields(ty) = get!(layouts, ty) do
+        flatten_type_with_offsets(ty; dl)
+    end
     for fn in mod.functions
         isempty(fn.blocks) && continue
         changed = true
@@ -4026,7 +4033,7 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                     flat = !is_byte_gep && ops[1] == alloca
                     containing = nothing
                     if aggregate && (is_byte_gep || flat)
-                        for (path, fty, foff) in flatten_type_with_offsets(alloca_ty; dl)
+                        for (path, fty, foff) in fields(alloca_ty)
                             fsz = llvm_type_size(fty)
                             if gep_byte_off >= foff && gep_byte_off < foff + fsz
                                 containing = (path, fty, foff)
@@ -4119,7 +4126,7 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
 
                     if load_size > elem_size
                         # Wider load: select scalar fields within [gep_byte_off, gep_byte_off + load_size)
-                        all_fields = flatten_type_with_offsets(alloca_ty; dl)
+                        all_fields = fields(alloca_ty)
                         selected = filter(all_fields) do (path, fty, foff)
                             fsz = llvm_type_size(fty)
                             foff >= gep_byte_off && foff + fsz <= gep_byte_off + load_size
@@ -4197,7 +4204,7 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                             # field of Hikari's `MediumInterfaceIdx` in its work items) came
                             # through as `load [2 x i32]` + `bitcast to i64` before.
                             if elem_ty isa LLVM.StructType || elem_ty isa LLVM.ArrayType
-                                subfields = flatten_type_with_offsets(elem_ty; dl)
+                                subfields = fields(elem_ty)
                                 selected = filter(subfields) do (_, fty, foff)
                                     fsz = llvm_type_size(fty)
                                     foff >= 0 && foff + fsz <= load_size
@@ -4318,7 +4325,7 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                     if src_ty isa LLVM.IntegerType && src_ty.width == 8 &&
                        (alloca_ty isa LLVM.StructType || alloca_ty isa LLVM.ArrayType) &&
                        elem_size == store_size
-                        all_fields = flatten_type_with_offsets(alloca_ty; dl)
+                        all_fields = fields(alloca_ty)
                         containing = nothing
                         for (path, fty, foff) in all_fields
                             fsz = llvm_type_size(fty)
@@ -4379,7 +4386,7 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
 
                     if store_size > elem_size
                         # Wider store: decompose into per-field stores
-                        all_fields = flatten_type_with_offsets(alloca_ty; dl)
+                        all_fields = fields(alloca_ty)
                         selected = filter(all_fields) do (path, fty, foff)
                             fsz = llvm_type_size(fty)
                             foff >= gep_byte_off && foff + fsz <= gep_byte_off + store_size
@@ -4428,7 +4435,7 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                     elseif store_size < elem_size
                         # Narrower store to wider field: find the containing scalar and
                         # do read-modify-write at the scalar level
-                        all_fields = flatten_type_with_offsets(alloca_ty; dl)
+                        all_fields = fields(alloca_ty)
 
                         # First check: exact size match (store directly)
                         target_field = nothing
