@@ -203,14 +203,18 @@ mutable struct BatchQueue{C}
     # Non-`nothing` inside `concurrent_indirect_group`: dispatches append here
     # instead of recording, and the group's flush fuses them.
     deferred_indirect::Union{Nothing,Vector{Any}}
-    # The `CapturedSequence` being recorded on THIS queue, or `nothing`. It was a
-    # module-level `Ref`, so every site that used it had to re-check `cap.bq ===
-    # bq` to find out whether the capture was even this queue's — and
-    # `cb_begin_flags` had no queue to check with, so a capture running on one
-    # queue silently made every OTHER queue's command buffers reusable.
-    # `Any` because `CapturedSequence` is declared in `command.jl`; use sites
-    # assert it, the same shape as `ctx`.
-    capturing::Any
+    # Where THIS queue's commands are going: `LiveTarget()` normally, the
+    # `CapturedSequence` being recorded while one is open. It was a module-level
+    # `Ref`, so every site that used it had to re-check `cap.bq === bq` to find
+    # out whether the capture was even this queue's — and `cb_begin_flags` had no
+    # queue to check with, so a capture running on one queue silently made every
+    # OTHER queue's command buffers reusable.
+    #
+    # It was then a nullable `Any`, which is the same fact in a shape that made
+    # every reader re-derive the policy from it. See [`RecordTarget`](@ref): the
+    # five things that differ between recording-to-submit and recording-to-keep
+    # are methods on this field now, so the readers ask instead of testing.
+    target::RecordTarget
     # Highest timeline value signalled by a replay on this queue. `flush!` has to
     # wait on it: a replay puts no `CommandBatch` in `in_flight`, so the in-flight
     # scan alone would return before the GPU had run any of it. Was an
@@ -273,7 +277,7 @@ function BatchQueue(device::Vulkan.Device, queue::Vulkan.Queue, qf_idx::UInt32, 
                     64, 3000, UInt64(120) * 1_000_000_000,  # auto-submit, CB split, flush timeout
                     :memory, false, false,                  # barrier mode / elision / one-shot skip
                     false, UInt64[], UInt64[],              # ranges_declared + elision tracker
-                    nothing, nothing, UInt64(0),            # deferred indirect, capture, replay watermark
+                    nothing, LIVE_TARGET, UInt64(0),        # deferred indirect, record target, replay watermark
                     "", "",                                 # last / prev dispatch info
                     queue_index)
     # Plug the back-reference into every pre-allocated batch so `batch.bq`
@@ -975,6 +979,69 @@ function vk_reset_device!(; select = pick_physical_device,
     return nothing
 end
 
+# ── The open batch ────────────────────────────────────────────────────────────
+#
+# `bq.active_batch` is where a queue's commands land, and it used to be read and
+# WRITTEN by name from twelve files — graphics, the array layer, memory, the
+# launch path. Two things went wrong with that. A caller that assumed a batch was
+# open got `nothing` and a `MethodError` several frames later instead of a message
+# saying no batch was open; and four places outside the batch lifecycle set the
+# field to `nothing` directly, which is a queue state transition written as a
+# field poke, so nothing could be added to it.
+#
+# The field is the lifecycle's now. Everything else asks:
+#
+#   openbatch(bq)    -> the batch or `nothing`, for code that handles both
+#   activebatch(bq)  -> the batch, erroring by name when there is none
+#   isrecording(bq)  -> is one open AND still recording
+#   attach!/detach!  -> the two state transitions, spelled out
+#
+# `ensure_active_batch!` remains the way to GET one; these are for code that
+# already knows the answer or must not create one.
+
+"""The batch `bq` is recording into, or `nothing`. For callers that handle both."""
+@inline openbatch(bq::BatchQueue) = bq.active_batch
+
+"""
+    activebatch(bq::BatchQueue) -> CommandBatch
+
+The batch `bq` is recording into, erroring if none is open.
+
+For the callers that cannot proceed without one — a draw inside a render pass, a
+dispatch whose arguments are already packed. They read the field directly and
+carried a `::CommandBatch` assertion or nothing at all, so the failure surfaced
+as a `MethodError` on `nothing` wherever the value was next touched.
+"""
+@inline function activebatch(bq::BatchQueue)
+    batch = bq.active_batch
+    batch === nothing && throw(LavaError("activebatch",
+        "no command batch is open on this queue",
+        "call `ensure_active_batch!(bq)` before recording, or `vk_begin_pass!` for a draw"))
+    return batch
+end
+
+"""Whether a batch is open on `bq` AND still recording into its command buffer.
+The pair of checks that four call sites spelled out by hand."""
+@inline function isrecording(bq::BatchQueue)
+    batch = bq.active_batch
+    return batch !== nothing && batch.recording
+end
+
+"""Make `batch` the one `bq` records into."""
+@inline attach!(bq::BatchQueue, batch::CommandBatch) = (bq.active_batch = batch)
+
+"""
+    detach!(bq::BatchQueue) -> nothing
+
+Stop treating any batch as open on `bq`.
+
+The batch itself is NOT recycled here: `submit!` has already handed it to
+`in_flight`, and `present_frame!` to the window's per-frame slot, both of which
+own it until the GPU is done. This only says the queue is no longer recording
+into it, which is the part every caller of `bq.active_batch = nothing` meant.
+"""
+@inline detach!(bq::BatchQueue) = (bq.active_batch = nothing; nothing)
+
 """
     has_active_recording(bq::BatchQueue) -> Bool
 
@@ -982,7 +1049,7 @@ Whether `bq` has an open/recording CommandBatch.  Used by transfer paths
 to decide "should I flush `bq` before doing my own submit/CPU write?"
 Always takes the queue explicitly — no implicit default_bq lookup.
 """
-has_active_recording(bq::BatchQueue) = bq.active_batch !== nothing
+has_active_recording(bq::BatchQueue) = openbatch(bq) !== nothing
 
 """
     VkContext(; select = pick_physical_device, debug = DebugConfig()) -> VkContext

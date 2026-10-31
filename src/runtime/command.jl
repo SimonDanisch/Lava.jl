@@ -152,7 +152,7 @@ const STAGE2_ALL_COMMANDS = Vulkan.PipelineStageFlag2(Vulkan.PIPELINE_STAGE_2_AL
 # queue between replays — which is why `capture` reserves the slab range it used
 # instead of letting `reset_arg_buffer_pool!` hand it out again.
 
-mutable struct CapturedSequence
+mutable struct CapturedSequence <: RecordTarget
     bq::BatchQueue
     cmd_bufs::Vector{Vulkan.CommandBuffer}
     pinned::Vector{Any}          # keeps every referenced GPU object alive
@@ -230,10 +230,51 @@ that anything since the last barrier touched (`ka_backend.jl`), and consumed by
 `CONCURRENT_GROUP_ACTIVE` is: a `BatchQueue` is single-writer by construction.
 """
 
-"""Begin-flags for a command buffer: reusable while capturing, one-shot otherwise."""
-@inline cb_begin_flags(bq::BatchQueue) = bq.capturing === nothing ?
-    Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT :
-    Vulkan.COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT
+# ── The RecordTarget interface ──
+#
+# Four questions a queue asks about where it is recording. `LiveTarget` answers
+# them the way an ordinary submit-and-forget queue needs; `CapturedSequence`
+# answers them the way a recording that outlives its batch needs. Nothing else
+# in Lava tests which mode it is in.
+
+"""
+    begin_flags(target) -> Vulkan.CommandBufferUsageFlag
+
+How `vkBeginCommandBuffer` is told this buffer will be used.
+"""
+@inline begin_flags(::LiveTarget) = Vulkan.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+"""A captured buffer is submitted again on every replay, so it may not claim
+ONE_TIME_SUBMIT — that is a promise the replay breaks."""
+@inline begin_flags(::CapturedSequence) = Vulkan.COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT
+
+"""
+    retain!(target, bq, batch, cmd_bufs) -> nothing
+
+Called from `submit!` with the batch's command buffers already ended, before they
+are handed to the queue. This is where a target that outlives its batch takes
+ownership of them.
+"""
+@inline retain!(::LiveTarget, bq::BatchQueue, batch::CommandBatch, cmd_bufs) = nothing
+
+"""
+    retains(target) -> Bool
+
+Whether anything this target holds is still reading the queue's shared argument
+pool, so the pool may not be rewound even when the queue looks completely idle.
+"""
+@inline retains(::LiveTarget) = false
+@inline retains(::CapturedSequence) = true
+
+"""
+    argbuffer!(target, bq, aligned_size) -> ArgBufferAlloc
+
+Where a dispatch's packed arguments go. Defined in `launch.jl`, beside the slab
+allocator it is the policy for.
+"""
+function argbuffer! end
+
+"""Begin-flags for the command buffer this queue is recording into."""
+@inline cb_begin_flags(bq::BatchQueue) = begin_flags(bq.target)
 
 """
     capture(f, bq) -> CapturedSequence
@@ -243,18 +284,34 @@ for `replay!`. `f` must not allocate device memory whose address it then
 dispatches against, or the replay will point at freed storage.
 """
 function capture(f, bq::BatchQueue)
-    bq.capturing === nothing || throw(LavaError("capture", "already capturing", "nested capture is not supported"))
+    bq.target isa LiveTarget || throw(LavaError("capture", "already capturing", "nested capture is not supported"))
     flush!(bq, bq.device)                       # start from a drained queue
     seq = CapturedSequence(bq, Vulkan.CommandBuffer[], Any[], 0)
-    bq.capturing = seq
+    bq.target = seq
     try
         f()
         submit!(bq)                             # close and collect the trailing batch
     finally
-        bq.capturing = nothing
+        bq.target = LIVE_TARGET
     end
     flush!(bq, bq.device)
     seq
+end
+
+# Capture takes ownership of the batch's command buffers. Clearing
+# `sealed_cmd_bufs` keeps `reclaim_batch!` from handing them back to the free
+# pool, and swapping in a fresh `cmd_buf` keeps the batch itself from re-recording
+# over the one we just took — either would silently rewrite a sequence `replay!`
+# still points at.
+function retain!(cap::CapturedSequence, bq::BatchQueue, batch::CommandBatch, cmd_bufs)
+    append!(cap.cmd_bufs, cmd_bufs)
+    for obj in batch.pinned
+        push!(cap.pinned, obj)
+    end
+    empty!(batch.sealed_cmd_bufs)
+    batch.cmd_buf = alloc_cmd_buf(bq)
+    cap.submissions += 1
+    return nothing
 end
 
 """
@@ -278,7 +335,7 @@ function replay!(seq::CapturedSequence)
     # (a replay after a drained queue) and it is the only thing that makes
     # replaying *interleaved* with ordinary recording legal, which is exactly
     # what a decoder replaying per click inside a live editor does.
-    bq.active_batch !== nothing && bq.active_batch.recording && submit!(bq)
+    isrecording(bq) && submit!(bq)
     bq.next_timeline += 1
     v = bq.next_timeline
     prev = bq.replay_watermark
@@ -323,7 +380,7 @@ function ensure_active_batch!(bq::BatchQueue)
     # their errors surface before we start new work.
     sweep_retired_batches!(bq)
 
-    batch = bq.active_batch
+    batch = openbatch(bq)
     if batch !== nothing
         if !batch.recording
             throw_if_error(bq, "vkBeginCommandBuffer",
@@ -351,7 +408,7 @@ function ensure_active_batch!(bq::BatchQueue)
         batch = allocate_batch(bq)
     end
 
-    bq.active_batch = batch
+    attach!(bq, batch)
 
     throw_if_error(bq, "vkBeginCommandBuffer",
         Vulkan.begin_command_buffer(batch.cmd_buf, Vulkan.CommandBufferBeginInfo(
@@ -1058,7 +1115,7 @@ completion before returning.
 """
 function submit!(bq::BatchQueue)
     @assert Threads.threadid() == bq.owning_thread  "BatchQueue is single-writer; cross-thread submit forbidden"
-    batch = bq.active_batch
+    batch = openbatch(bq)
     batch === nothing && return nothing
     !batch.recording && return nothing
     @assert batch.bq === bq "batch.bq desync: batch was not bound to this BatchQueue"
@@ -1073,21 +1130,9 @@ function submit!(bq::BatchQueue)
     end
     all_cmd_bufs[n_sealed + 1] = batch.cmd_buf
 
-    # Capture takes ownership of these command buffers. Clearing `sealed_cmd_bufs`
-    # keeps `reclaim_batch!` from handing them back to the free pool, and swapping
-    # in a fresh `cmd_buf` keeps the batch itself from re-recording over the one we
-    # just captured — either would silently rewrite a sequence `replay!` still points at.
-    let cap = bq.capturing
-        if cap !== nothing
-            append!(cap.cmd_bufs, all_cmd_bufs)
-            for obj in batch.pinned
-                push!(cap.pinned, obj)
-            end
-            empty!(batch.sealed_cmd_bufs)
-            batch.cmd_buf = alloc_cmd_buf(bq)
-            cap.submissions += 1
-        end
-    end
+    # Hand the closed buffers to whatever this queue is recording into, before
+    # they reach the queue. A live target wants nothing; a capture takes them.
+    retain!(bq.target, bq, batch, all_cmd_bufs)
 
     saved_dispatch_count = batch.dispatch_count
     saved_last_was_rt = batch.last_was_rt
@@ -1103,8 +1148,8 @@ function submit!(bq::BatchQueue)
     # (bq, signal_value) into buf.last_write.  Runs ONCE per batch, not per
     # dispatch — the IdSet dedupes multi-dispatch reuse for free.
     # `vkEndCommandBuffer` has already run, so the command buffer is no longer
-    # recording — but `batch.recording` still says it is and `bq.active_batch`
-    # still points here. Anything that throws in between leaves the queue in a
+    # recording — but `batch.recording` still says it is and the queue still has it
+    # open. Anything that throws in between leaves the queue in a
     # state where the next `ensure_active_batch!` hands this batch straight back
     # and the caller records into an ENDED command buffer: undefined behaviour
     # that NVIDIA takes as a SIGSEGV inside the driver, with no Julia frame to
@@ -1130,7 +1175,7 @@ function submit!(bq::BatchQueue)
         empty!(batch.pinned)
         release_pinned_refs!(batch)
         empty!(batch.wait_semaphores)
-        bq.active_batch = nothing
+        detach!(bq)
         # `bq.next_timeline` is deliberately NOT rolled back. `sync_access!` has
         # already stamped `buf.last_write` on the buffers it reached with this
         # batch's signal value, which nothing will now signal — but timeline
@@ -1198,13 +1243,13 @@ function submit!(bq::BatchQueue)
         empty!(batch.pinned)
         release_pinned_refs!(batch)
         empty!(batch.wait_semaphores)
-        bq.active_batch = nothing
+        detach!(bq)
         throw_with_validation_context("vkQueueSubmit2", submit_result,
             saved_dispatch_count, saved_last_was_rt, bq)
     end
 
     push!(bq.in_flight, batch)
-    bq.active_batch = nothing
+    detach!(bq)
     # Everything handed out of the arg pool so far is read by this batch, and the
     # pool may rewind once the timeline passes it. Recorded here rather than only
     # in `present_frame!`, because a compute-only queue never presents and would
@@ -1305,10 +1350,9 @@ function sweep_retired_batches!(bq::BatchQueue)
     # packs its arguments and only then records the draw. `arg_alloc_count` is
     # the handouts since the last submit, which is what "someone is still holding
     # pool memory" actually means.
-    capturing_here = bq.capturing !== nothing
-    active = bq.active_batch
+    active = openbatch(bq)
     active_has_commands = active !== nothing && active.dispatch_count > 0
-    if isempty(bq.in_flight) && !active_has_commands && !capturing_here &&
+    if isempty(bq.in_flight) && !active_has_commands && !retains(bq.target) &&
        bq.arg_alloc_count == 0
         reset_arg_buffer_pool!(bq)
         reset_indirect_buffer_pool!(bq)
@@ -1610,7 +1654,7 @@ function wait_for_write(buf::VkManagedBuffer)
     # If the target signal value hasn't been submitted yet (there's still an
     # active recording on that bq whose signal_value >= val), the semaphore
     # would never reach it.  Flush that bq first to force the submit.
-    active = bq.active_batch
+    active = openbatch(bq)
     if active !== nothing && active.signal_value <= val
         flush!(bq, bq.device)
     end

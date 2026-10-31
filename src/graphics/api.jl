@@ -444,8 +444,7 @@ end
 Submit recorded draw commands and present to screen.
 """
 function present_frame!(bq::BatchQueue, win::RenderWindow)
-    batch = bq.active_batch
-    batch === nothing && error("present_frame! called without an active recording batch")
+    batch = activebatch(bq)
     cmd = batch.cmd_buf
 
     # Transition swapchain image to PRESENT_SRC before presenting
@@ -511,7 +510,7 @@ function present_frame!(bq::BatchQueue, win::RenderWindow)
     # Store batch in window's per-frame slot — it will be reclaimed in
     # acquire_next_image! after the fence wait confirms GPU completion.
     # Do NOT push to free_batches here: the GPU is still using this command buffer.
-    bq.active_batch = nothing
+    detach!(bq)
     win.frame_batches[fi] = batch
     empty!(batch.wait_semaphores)
 

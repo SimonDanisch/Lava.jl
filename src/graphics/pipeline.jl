@@ -685,7 +685,7 @@ function vk_draw_in_pass!(bq::BatchQueue,
                            # A caller that owns the pipeline for longer than the
                            # frame does not need it pinned into every batch.
                            pin::Bool=true)
-    batch = bq.active_batch
+    batch = activebatch(bq)
     batch === nothing && error("vk_draw_in_pass! called without an active rendering pass")
     cmd = batch.cmd_buf
 
@@ -777,7 +777,7 @@ function vk_draw_indirect_in_pass!(bq::BatchQueue,
                                    count::Integer=1,
                                    push_bda::UInt64=UInt64(0),
                                    pin::Bool=true)
-    batch = bq.active_batch
+    batch = activebatch(bq)
     batch === nothing && error("vk_draw_indirect_in_pass! called without an active rendering pass")
     cmd = batch.cmd_buf
 
@@ -814,7 +814,7 @@ function vk_draw_indexed_in_pass!(bq::BatchQueue,
                                    push_data::Vector{UInt8}=UInt8[],
                                    indices_buffer::Vulkan.Buffer,
                                    instances::Integer=1)
-    batch = bq.active_batch
+    batch = activebatch(bq)
     batch === nothing && error("vk_draw_indexed_in_pass! called without an active rendering pass")
     cmd = batch.cmd_buf
 
@@ -847,7 +847,7 @@ frame — at a hundred plots, a third of the frame's garbage for a value that do
 not change.
 """
 function vk_set_viewport!(bq::BatchQueue, viewport::Vulkan.Viewport, scissor::Vulkan.Rect2D)
-    batch = bq.active_batch
+    batch = activebatch(bq)
     batch === nothing && error("vk_set_viewport! called without an active rendering pass")
     Vulkan.cmd_set_viewport(batch.cmd_buf, [viewport])
     Vulkan.cmd_set_scissor(batch.cmd_buf, [scissor])
@@ -860,7 +860,7 @@ end
 End the current dynamic rendering pass on the given batch queue.
 """
 function vk_end_pass!(bq::BatchQueue)
-    batch = bq.active_batch
+    batch = activebatch(bq)
     batch === nothing && error("vk_end_pass! called without an active rendering pass")
     Vulkan.cmd_end_rendering(batch.cmd_buf)
 end

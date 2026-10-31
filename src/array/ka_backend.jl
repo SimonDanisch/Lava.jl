@@ -1070,7 +1070,7 @@ function ka_launch_indirect!(obj, args, ndrange_buf::LavaArray, workgroupsize, o
     GC.@preserve original_args begin
 
     arg_buf = get_arg_buffer(bq, total_size)
-    @assert batch === bq.active_batch  "adaptor batch diverged from active bq batch"
+    @assert batch === openbatch(bq)  "adaptor batch diverged from active bq batch"
     pack_args_direct!(bq, arg_buf.mapped_ptr, arg_buf.address, offsets,
                        compiled.push_info.arg_buffer_size, byval_sizes, all_args)
 

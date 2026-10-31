@@ -267,8 +267,8 @@ end
 
 Write kernel arguments directly into mapped GPU memory via per-type
 `pack_arg!` dispatch.  Zero heap allocations for the arg packing itself.
-`bq.active_batch` must already exist (callers call `ensure_active_batch!`
-before us).
+A batch must already be open (callers call `ensure_active_batch!` before us);
+`activebatch` is what says so by name if one is not.
 """
 @generated function pack_args_direct!(bq::BatchQueue,
                                         mapped_ptr::Ptr{UInt8}, arg_buf_bda::UInt64,
@@ -295,7 +295,7 @@ before us).
             inline_offset, batch)))
     end
     quote
-        batch = bq.active_batch::CommandBatch
+        batch = activebatch(bq)
         inline_offset = base_size
         $(exprs...)
         return nothing
@@ -614,15 +614,12 @@ end
 function get_arg_buffer(bq::BatchQueue, nbytes::Integer)
     @assert Threads.threadid() == bq.owning_thread  "BatchQueue is single-writer; cross-thread arg-buf alloc forbidden"
     aligned_size = (max(Int(nbytes), 16) + ARG_SLAB_ALIGN - 1) & ~(ARG_SLAB_ALIGN - 1)
-    # A capture allocates from its OWN slabs. The address is baked into the
-    # command buffer as a push constant, so a replay reads whatever those bytes
-    # hold at replay time — which means nothing else may ever be given them. That
-    # used to be arranged by pushing the shared pool's high-water mark past them
-    # for good; owning them says the same thing and can also be undone. See
-    # `CapturedSequence`.
-    let cap = bq.capturing
-        cap === nothing || return capture_arg_buffer!(cap, bq, aligned_size)
-    end
+    return argbuffer!(bq.target, bq, aligned_size)
+end
+
+"""Bump-allocate from the queue's shared pool, which every ordinary recording
+draws on and `reset_arg_buffer_pool!` rewinds once the GPU is past it."""
+function argbuffer!(::LiveTarget, bq::BatchQueue, aligned_size::Int)
     # Rewind here rather than at end-of-frame: safe exactly when the GPU has
     # passed every batch that allocated from the pool (see `arg_pool_in_use!`).
     reclaim_arg_buffer_pool!(bq)
@@ -641,8 +638,14 @@ end
 
 """Bump-allocate `aligned_size` bytes from a capture's own slabs, growing them
 as needed. No reclaim and no frontier: a capture's slabs are never rewound,
-which is the whole point of them being its own."""
-function capture_arg_buffer!(cap, bq::BatchQueue, aligned_size::Int)
+which is the whole point of them being its own.
+
+The address is baked into the command buffer as a push constant, so a replay
+reads whatever those bytes hold at replay time — which means nothing else may
+ever be given them. That used to be arranged by pushing the shared pool's
+high-water mark past them for good; owning them says the same thing and can also
+be undone. See `CapturedSequence`."""
+function argbuffer!(cap::CapturedSequence, bq::BatchQueue, aligned_size::Int)
     while length(cap.slabs) < cap.slab_idx
         push!(cap.slabs, LavaArray{UInt8,1}(undef, (max(ARG_SLAB_SIZE, aligned_size),);
                                             bq = bq, unified = true))

@@ -24,6 +24,45 @@ the buffer). Those are genuine cycles; the rest were only ordering.
 """
 
 """
+    RecordTarget
+
+Where a `BatchQueue`'s commands are going, and what becomes of the command
+buffers once they are closed.
+
+A queue has always had two modes, but they were spelled as a nullable field
+(`capturing`) that five unrelated places tested for `nothing` — the begin-flags,
+`submit!`, the pool-reset predicate in `flush!`, the argument allocator and
+`capture` itself. Each of those is a genuine policy difference between recording
+to submit and recording to keep, and each was written as a branch, so adding a
+third mode meant finding all five. They are methods now, and the mode is a value:
+[`LiveTarget`](@ref) and `CapturedSequence` (in `command.jl`, where the capture
+machinery lives).
+
+The interface is [`begin_flags`](@ref), [`retain!`](@ref), [`retains`](@ref) and
+[`argbuffer!`](@ref).
+
+The field this replaces was typed `Any`, because `CapturedSequence` is declared
+in a later file. `RecordTarget` is declared here, ahead of `BatchQueue`, so the
+field can name it — which matters beyond tidiness: `begin_flags` and `argbuffer!`
+run per dispatch.
+"""
+abstract type RecordTarget end
+
+"""
+    LiveTarget()
+
+Ordinary recording: every batch is submitted and its command buffer goes back to
+the pool to be recorded over. The default for every queue, and what a queue
+returns to when a `capture` ends.
+
+Stateless, so the single instance below is the only one that ever exists.
+"""
+struct LiveTarget <: RecordTarget end
+
+"""The `LiveTarget` every queue starts on. Stateless, so one is enough."""
+const LIVE_TARGET = LiveTarget()
+
+"""
     LavaComputePipeline
 
 A compiled compute pipeline ready for dispatch.

@@ -676,7 +676,7 @@ function vk_free!(buf::VkManagedBuffer)
 
     if (buf.ctx::VkContext).diag.free_debug
         bqd = buf.ctx.default_bq
-        active_dbg = (bqd.active_batch !== nothing) && bqd.active_batch.recording
+        active_dbg = isrecording(bqd)
         push!(buf.ctx.diag.free_log,
               (addr=buf.address, size=buf.size,
                pool=buf.pool_block !== nothing,
@@ -717,7 +717,7 @@ function vk_free!(buf::VkManagedBuffer)
     # open batch through something `pins` does not count either.
     let bqa = (buf.ctx::VkContext).default_bq
         if (@atomic :acquire buf.last_write) === nothing &&
-           bqa.active_batch !== nothing && bqa.active_batch.recording
+           isrecording(bqa)
             lock(bqa.deferred_frees_lock) do
                 push!(bqa.deferred_frees, buf)
             end
@@ -747,7 +747,7 @@ function vk_free!(buf::VkManagedBuffer)
             #       The window from finalizer-pause to next batch retirement is
             #       short, so deferring is cheap; reclaiming the buffer happens
             #       via `drain_deferred_frees!` at the next flush/submit boundary.
-            active = (bq.active_batch !== nothing) && bq.active_batch.recording
+            active = isrecording(bq)
             if current < val || active
                 # Finalizer-thread push into the deferred list — SpinLock so
                 # the main thread's drain doesn't race.
@@ -1664,7 +1664,7 @@ function copy_buffer!(direction::Symbol, managed::VkManagedBuffer,
         # we memcpy. (wait_for_write still matters for cross-queue writers
         # and already-in-flight batches.)
         bq = (managed.ctx::VkContext).default_bq
-        if bq.active_batch !== nothing
+        if openbatch(bq) !== nothing
             flush!(bq, bq.device)
         end
         wait_for_write(managed)
