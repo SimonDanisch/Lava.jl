@@ -4840,6 +4840,7 @@ function lower_phi_typepunned_loads!(mod::LLVM.Module)
                     ptr isa LLVM.PHIInst || continue
 
                     access_ty = inst.value_type
+
                     access_size = llvm_type_size(access_ty)
                     access_size > 0 || continue
 
@@ -5092,12 +5093,13 @@ chain has no remaining uses.
 
 Limitations / preconditions enforced before transforming:
 
-* All leaves of the phi/select chain must be `LLVM.AllocaInst` in
-  addrspace 0 (Function storage).  Leaves of other kinds (GEPs,
-  parameters, BDA pointers) are out of scope and skipped.
-* The alloca's allocated type must equal `access_ty` — we don't
-  decompose larger types here (that's `lower_phi_typepunned_loads!`'s
-  job for byte-pun chains).
+* Leaves are Function-storage allocas, or GEPs rooted in such allocas.
+  A GEP leaf is supported only on a phi edge whose predecessor has one
+  successor: its load is not speculated onto any previously unexecuted edge.
+  The consuming load must immediately follow that join's phis, so no write
+  can intervene. GEPs under selects, parameters and BDA pointers are skipped.
+* A direct alloca leaf must have at least `sizeof(access_ty)` bytes. Existing
+  byte-pun lowering owns the representation of any differently typed load.
 * `UndefValue` incoming on a phi is allowed (becomes `UndefValue` on
   the value mirror).
 
@@ -5122,6 +5124,19 @@ function lower_phi_select_function_ptrs!(mod::LLVM.Module)
                     ptr_ty.addrspace == 0 || continue
 
                     access_ty = inst.value_type
+
+                    if function_ptr_chain_has_gep(ptr,Set{LLVM.Value}())
+                        # New GEP support must not move a load across stores
+                        # in the join block (or across another block). Accept
+                        # only a load immediately after the join's phis.
+                        ptr isa LLVM.PHIInst && ptr.parent==bb || continue
+                        immediate=true
+                        for before in bb.instructions
+                            before==inst && break
+                            before isa LLVM.PHIInst || (immediate=false;break)
+                        end
+                        immediate || continue
+                    end
 
                     # Verify ALL leaves of the chain are Function-storage allocas
                     # with the matching allocated type.  Bail otherwise — handling
@@ -5207,8 +5222,17 @@ function validate_function_alloca_chain(val::LLVM.Value, access_ty::LLVM.LLVMTyp
             Int(LLVM.API.LLVMABISizeOfType(dl, access_ty)) || return false
         return true
     elseif val isa LLVM.PHIInst
-        for (v, _) in val.incoming
+        for (v, pred) in val.incoming
             v isa LLVM.UndefValue && continue
+            if v isa LLVM.GetElementPtrInst
+                # Load at the incoming edge's terminator, never speculatively
+                # on a conditional predecessor where the pointer may be OOB.
+                term=pred.terminator
+                term===nothing && return false
+                LLVM.API.LLVMGetNumSuccessors(term)==1 || return false
+                function_alloca_gep_leaf(v) || return false
+                continue
+            end
             validate_function_alloca_chain(v, access_ty, visited) || return false
         end
         return true
@@ -5221,6 +5245,26 @@ function validate_function_alloca_chain(val::LLVM.Value, access_ty::LLVM.LLVMTyp
         # Anything else (GEP, parameter, BDA pointer, constant) — out of scope
         return false
     end
+end
+
+function function_alloca_gep_leaf(val::LLVM.Value)
+    while val isa LLVM.GetElementPtrInst
+        val.value_type.addrspace==0 || return false
+        val=val.operands[1]
+    end
+    return val isa LLVM.AllocaInst && val.value_type.addrspace==0
+end
+
+function function_ptr_chain_has_gep(val::LLVM.Value,seen::Set{LLVM.Value})
+    val in seen && return false
+    push!(seen,val)
+    val isa LLVM.GetElementPtrInst && return true
+    if val isa LLVM.PHIInst
+        return any(function_ptr_chain_has_gep(v,seen) for (v,_) in val.incoming)
+    elseif val isa LLVM.SelectInst
+        return any(function_ptr_chain_has_gep(v,seen) for v in val.operands[2:3])
+    end
+    return false
 end
 
 """
@@ -5257,7 +5301,7 @@ function build_function_ptr_value_mirror!(val::LLVM.Value, access_ty::LLVM.LLVMT
         for (incoming_val, pred_bb) in val.incoming
             if incoming_val isa LLVM.UndefValue
                 push!(new_phi.incoming, (LLVM.UndefValue(access_ty), pred_bb))
-            elseif incoming_val isa LLVM.AllocaInst
+            elseif incoming_val isa Union{LLVM.AllocaInst,LLVM.GetElementPtrInst}
                 # Emit `load access_ty, ptr alloca` right before pred_bb's terminator
                 # so the value is available when control transfers into phi_bb.
                 term = pred_bb.terminator

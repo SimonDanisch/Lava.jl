@@ -5,7 +5,8 @@
 # Three tiers:
 #   1. LLVM intrinsics → SPIR-V emitter maps to GLSL.std.450
 #   2. Custom _lava_glsl_* externals → SPIR-V emitter maps to GLSL.std.450 (for ops LLVM lacks)
-#   3. Float64 transcendentals: f64→f32 downcast, compute via f32 GLSL.std.450, upcast back
+#   3. Float64 transcendentals: exp, log, asin, acos, atan and atan2 in Float64 by
+#      fdlibm's table-free algorithms (`math_f64.jl`); the rest through Float32
 #
 # GLSL.std.450 Float64 support:
 #   - SUPPORTED (f64): Sqrt, FAbs, Floor, Ceil, Round, Trunc, FMin, FMax, Fma
@@ -169,26 +170,19 @@ end
 # Tier 3: Float64 transcendentals — downcast to Float32, compute, upcast
 # GLSL.std.450 does not support f64 for these operations.
 # This provides ~7 decimal digits of precision (Float32 mantissa).
-# For higher precision, add polynomial implementations later.
+# exp, exp2, log, log2, log10, asin, acos, atan and atan2 are computed in
+# Float64 instead, in `math_f64.jl`.
 # ══════════════════════════════════════════════════════════════════════
 
 @lava_device_override @inline Base.sin(x::Float64)  = Float64(sin(Float32(x)))
 @lava_device_override @inline Base.cos(x::Float64)  = Float64(cos(Float32(x)))
 @lava_device_override @inline Base.tan(x::Float64)  = Float64(tan(Float32(x)))
-@lava_device_override @inline Base.exp(x::Float64)  = Float64(exp(Float32(x)))
-@lava_device_override @inline Base.exp2(x::Float64) = Float64(exp2(Float32(x)))
-@lava_device_override @inline Base.log(x::Float64)  = Float64(log(Float32(x)))
-@lava_device_override @inline Base.log2(x::Float64) = Float64(log2(Float32(x)))
-@lava_device_override @inline Base.asin(x::Float64) = Float64(asin(Float32(x)))
-@lava_device_override @inline Base.acos(x::Float64) = Float64(acos(Float32(x)))
-@lava_device_override @inline Base.atan(x::Float64) = Float64(atan(Float32(x)))
 @lava_device_override @inline Base.sinh(x::Float64)  = Float64(sinh(Float32(x)))
 @lava_device_override @inline Base.cosh(x::Float64)  = Float64(cosh(Float32(x)))
 @lava_device_override @inline Base.tanh(x::Float64)  = Float64(tanh(Float32(x)))
 @lava_device_override @inline Base.asinh(x::Float64) = Float64(asinh(Float32(x)))
 @lava_device_override @inline Base.acosh(x::Float64) = Float64(acosh(Float32(x)))
 @lava_device_override @inline Base.atanh(x::Float64) = Float64(atanh(Float32(x)))
-@lava_device_override @inline Base.atan(y::Float64, x::Float64) = Float64(atan(Float32(y), Float32(x)))
 @lava_device_override @inline Base.:(^)(x::Float64, y::Float64) = Float64(Float32(x) ^ Float32(y))
 
 # ══════════════════════════════════════════════════════════════════════
@@ -238,7 +232,6 @@ end
 
 # log10 — composition from log2
 @lava_device_override @inline Base.log10(x::Float32) = log2(x) * Float32(0.30102999566398114)
-@lava_device_override @inline Base.log10(x::Float64) = Float64(log10(Float32(x)))
 
 # clamp — composition from min/max (works for all float types)
 @lava_device_override @inline Base.clamp(x::Float32, lo::Float32, hi::Float32) = min(max(x, lo), hi)

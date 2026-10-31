@@ -151,6 +151,10 @@ for T in KI_REDUCE_ADD_TYPES
     @eval @lava_device_override @inline KI.sub_group_reduce_add(val::$T) = subgroup_add(val)
 end
 
+# `sub_group_ballot`: the mask of the sub-group's lanes whose `pred` is true, lane
+# `i` (1-based) at bit `i - 1`, as `OpGroupNonUniformBallot`'s low two words.
+@lava_device_override @inline KI.sub_group_ballot(pred::Bool) = subgroup_ballot(pred)
+
 # ── Integer dot product ─────────────────────────────────────────────────────
 #
 # `OpSDotKHR` on two packed words (see `emit_lava_sdot4x8!`). KI's reference
