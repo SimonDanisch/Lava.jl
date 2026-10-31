@@ -31,3 +31,33 @@ using Lava, LLVM, Test
         @test all(==(first(types)), types)
     end
 end
+
+@testset "Typepun rewrites retain interleaved accesses" begin
+    LLVM.Context() do ctx
+        # Each wide access causes an iterator restart. Earlier correctly typed
+        # loads/stores stay valid while all later wide accesses must be lowered.
+        body = IOBuffer()
+        println(body, "target datalayout = \"e-p:64:64-i64:64\"")
+        println(body, "define void @interleaved() {\nentry:\n %a = alloca [64 x float]")
+        for i in 0:15
+            println(body, " %p$i = getelementptr [64 x float], ptr %a, i32 0, i32 $(4i)")
+            println(body, " store float 1.0, ptr %p$i\n %f$i = load float, ptr %p$i")
+            println(body, " store i64 0, ptr %p$i\n %v$i = load i64, ptr %p$i")
+        end
+        println(body, " ret void\n}")
+        mod = parse(LLVM.Module, String(take!(body)))
+        try
+            Lava.decompose_typepun_gep_loads!(mod, mod.datalayout)
+            @test LLVM.verify(mod) === nothing
+            lowered = string(mod)
+            @test !occursin("load i64", lowered)
+            @test !occursin("store i64", lowered)
+            @test count("load float", lowered) == 48
+            @test count("store float", lowered) == 48
+            Lava.decompose_typepun_gep_loads!(mod, mod.datalayout)
+            @test string(mod) == lowered
+        finally
+            LLVM.dispose(mod)
+        end
+    end
+end

@@ -3955,12 +3955,18 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
     end
     for fn in mod.functions
         isempty(fn.blocks) && continue
+        # Rewrites insert only correctly typed field accesses. Previously checked
+        # operations cannot become type puns later in this pass. Keep the restart
+        # for iterator safety after erasure, without reanalyzing the same loads.
+        examined = Set{LLVM.API.LLVMValueRef}()
         changed = true
         while changed
             changed = false
             for bb in fn.blocks
                 for inst in bb.instructions
                     inst isa LLVM.LoadInst || continue
+                    inst.ref in examined && continue
+                    push!(examined, inst.ref)
                     load_ty = inst.value_type
                     is_int_load = load_ty isa LLVM.IntegerType
                     is_float_load = (load_ty == LLVM.FloatType() ||
@@ -4286,12 +4292,15 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
     # Pattern: store i64 %packed, ptr %gep_to_float_field
     for fn in mod.functions
         isempty(fn.blocks) && continue
+        examined = Set{LLVM.API.LLVMValueRef}()
         changed = true
         while changed
             changed = false
             for bb in fn.blocks
                 for inst in bb.instructions
                     inst isa LLVM.StoreInst || continue
+                    inst.ref in examined && continue
+                    push!(examined, inst.ref)
 
                     store_val = inst.operands[1]
                     store_ty = store_val.value_type
