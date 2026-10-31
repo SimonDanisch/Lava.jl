@@ -4057,7 +4057,9 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                                (containing[2] != load_ty || gep_byte_off != containing[3]) &&
                                gep_byte_off - containing[3] + load_size <=
                                    llvm_type_size(containing[2])
-                    if containing !== nothing && (is_byte_gep || flat_pun)
+                    within_field = containing !== nothing &&
+                        gep_byte_off - containing[3] + load_size <= llvm_type_size(containing[2])
+                    if within_field && (is_byte_gep || flat_pun)
                         cpath, cfty, cfoff = containing
                         byte_within_field = gep_byte_off - cfoff
 
@@ -4124,6 +4126,10 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                         end
 
                         isempty(selected) && continue
+
+                        # Every byte must be represented. A wider load spanning
+                        # partial fields or padding cannot use whole-field joins.
+                        sum(f -> llvm_type_size(f[2]), selected; init=0) == load_size || continue
 
                         # Verify all fields are standard sizes
                         all(f -> llvm_type_size(f[2]) in (1, 2, 4, 8), selected) || continue

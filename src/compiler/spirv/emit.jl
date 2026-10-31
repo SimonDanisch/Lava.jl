@@ -790,6 +790,7 @@ end
 Emit a single LLVM function as a SPIR-V function.
 """
 function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::Bool=false)
+    checkpoint = PhaseTimer("        [function] "; group = "emitfn")
     # Reset per-function caches that would otherwise leak between functions in
     # multi-OpFunction emission. Defensive when only one function is emitted; load-
     # bearing when more than one runs through here. Fields with LLVM-Value-keyed
@@ -884,9 +885,11 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
 
     # Pre-analyze loops to identify headers and their merge/continue targets
     state.loop_info = analyze_loops(fn)
+    checkpoint("analyze_loops")
 
     # Compute immediate post-dominator tree for merge block finding
     state.ipdom = compute_ipostdom(fn)
+    checkpoint("compute_ipostdom")
 
     # Pre-register loop merge blocks as claimed (loop merges are emitted first)
     empty!(state.used_merge_blocks)
@@ -935,11 +938,13 @@ function emit_function!(state::SPIRVEmitterState, fn::LLVM.Function; is_entry::B
     entry_label_emitted = false
     entry_label_pos = 0
     t_blocks = time()
-    for bb in rpo_blocks
+    checkpoint("prepare blocks")
+    for (block_index, bb) in enumerate(rpo_blocks)
         if !entry_label_emitted
             entry_label_pos = length(state.mod.functions) + 1  # OpLabel will be emitted here
         end
         emit_block!(state, bb)
+        block_index % 1000 == 0 && checkpoint("emit blocks through $block_index")
         # After the entry block is emitted (first block), inject OpVariable preamble
         # right after the OpLabel (which is the first instruction emitted by emit_block!).
         # Also append any function-local OpVariables accumulated during block emission
@@ -1580,6 +1585,24 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
         map_pointer_type_for_value!(state.type_ctx, inst)
     else
         map_type!(state.type_ctx, load_ty)
+    end
+
+    # LLVM also reads an address field as its i64 bits. The struct definition
+    # still declares a PSB pointer there, even when PTM inferred i64 from this
+    # load. Load the declared pointer value, then convert the value to bits.
+    declared = get(state.spirv_ptr_element_type, ptr, UInt32(0))
+    sc = get_pointer_storage_class(ptr)
+    if load_ty isa LLVM.IntegerType && load_ty.width == 64 &&
+       sc in (SC.Function, SC.Workgroup) && declared != UInt32(0) &&
+       any(p -> p.first[1] == SC.PhysicalStorageBuffer && p.second == declared,
+           state.type_ctx.pointer_types)
+        address = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpLoad, declared, address, ptr_id,
+                            MemOp.Aligned | nonprivate(sc), UInt32(8))
+        result = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpConvertPtrToU, result_ty, result, address)
+        state.value_map[inst] = result
+        return
     end
 
     # Record the pointee this pointer-load is ACTUALLY emitted with (the i8 fallback in

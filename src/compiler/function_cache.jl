@@ -277,6 +277,7 @@ function function_fingerprint(mod::LLVM.Module, fn::LLVM.Function, skeleton, sym
 end
 
 function emit_function_objects(llvm_mod, entry, reachable, workgroup_size; enable_ray_query)
+    checkpoint = PhaseTimer("    [objects] "; group = "objects")
     for scc in strongly_connected_components(reachable)
         length(scc) > 1 && error("Mutual recursion is not supported in SPIR-V: " * join((f.name for f in scc), " -> "))
     end
@@ -290,11 +291,14 @@ function emit_function_objects(llvm_mod, entry, reachable, workgroup_size; enabl
     # helpers get independent copies of the prepared buffers and maps. The entry,
     # emitted last, can consume the original state directly.
     template, interfaces = compute_emitter(llvm_mod; enable_ray_query)
+    checkpoint("compute_emitter")
     # Copying the complete LLVM body once per tiny helper dwarfs emitting it.
     # Keep the declarations and globals once, then clone only the helper's body.
     skeleton = function_module_skeleton(llvm_mod)
+    checkpoint("function_module_skeleton")
     try
         global_interface = function_global_interface(llvm_mod, skeleton)
+        checkpoint("function_global_interface")
         for fn in reachable
             key = if fn === entry
                 UInt8[]
@@ -304,6 +308,7 @@ function emit_function_objects(llvm_mod, entry, reachable, workgroup_size; enabl
                                  serialized((compiler_identity(), workgroup_size, enable_ray_query)))
             end
             symbols[fn] = fn === entry ? "main" : "lava_function_" * bytes2hex(key)
+            checkpoint("fingerprint " * fn.name)
             if fn !== entry
                 if symbols[fn] in emitted
                     COMPILE_STATS.function_hits += 1
@@ -320,6 +325,7 @@ function emit_function_objects(llvm_mod, entry, reachable, workgroup_size; enabl
                 state = fn === entry ? template : copy_compute_emitter(template)
                 code, data = function_object(llvm_mod, fn, symbols, state, interfaces;
                                              entry = fn === entry, wg = workgroup_size)
+                checkpoint("function_object " * fn.name)
                 fn === entry && (globals = data)
                 keep && fn !== entry && ObjCache.put!("Lava/function", key, code)
             end
