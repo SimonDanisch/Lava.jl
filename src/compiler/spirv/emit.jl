@@ -962,16 +962,22 @@ function emit_instruction!(state::SPIRVEmitterState, inst::LLVM.Instruction)
     # Arithmetic — Float
     elseif inst isa LLVM.FAddInst
         emit_binary_op!(state, inst, Op.OpFAdd)
+        exact!(state, inst)
     elseif inst isa LLVM.FSubInst
         emit_binary_op!(state, inst, Op.OpFSub)
+        exact!(state, inst)
     elseif inst isa LLVM.FMulInst
         emit_binary_op!(state, inst, Op.OpFMul)
+        exact!(state, inst)
     elseif inst isa LLVM.FDivInst
         emit_binary_op!(state, inst, Op.OpFDiv)
+        exact!(state, inst)
     elseif inst isa LLVM.FRemInst
         emit_binary_op!(state, inst, Op.OpFRem)
+        exact!(state, inst)
     elseif inst isa LLVM.FNegInst
         emit_unary_op!(state, inst, Op.OpFNegate)
+        exact!(state, inst)
     # Arithmetic — Integer
     elseif inst isa LLVM.AddInst
         emit_binary_op!(state, inst, Op.OpIAdd)
@@ -1131,6 +1137,24 @@ function emit_binary_op!(state::SPIRVEmitterState, inst::LLVM.Instruction, opcod
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, opcode, result_ty, result_id, lhs, rhs)
     state.value_map[inst] = result_id
+end
+
+"""
+    exact!(state, inst)
+
+Marks the float result of `inst` `NoContraction` unless LLVM's `contract` flag allows fusing
+it. That flag is how Julia says a result may be contracted (`muladd`, `@fastmath`); without it
+Julia means each operation rounded on its own. A driver may treat an instruction without
+`NoContraction` as inexact, and Mesa then reassociates and folds across it, which is fine for
+most arithmetic but turns the error terms of double-float arithmetic (TwoSum, TwoProd) into 0:
+on lavapipe always, on RADV unless an opaque factor sits between the operations
+(test/spirv/test_arith_exact.jl).
+"""
+function exact!(state::SPIRVEmitterState, inst::LLVM.Instruction)
+    if LLVM.API.LLVMGetFastMathFlags(inst) & LLVM.API.LLVMFastMathAllowContract == 0
+        emit_decorate!(state.mod, state.value_map[inst], Dec.NoContraction)
+    end
+    return
 end
 
 function emit_unary_op!(state::SPIRVEmitterState, inst::LLVM.Instruction, opcode::UInt16)
@@ -5779,8 +5803,8 @@ function emit_conversion!(state::SPIRVEmitterState, inst::LLVM.Instruction, opco
     # A float conversion is exact: `Float32(Float16(x))` means the rounding. A
     # driver may treat an instruction without `NoContraction` as inexact, and
     # Mesa then folds a narrowing and a widening back into `x`, which silently
-    # drops the rounding (test/spirv/test_fconvert_exact.jl). Arithmetic is not
-    # marked: fusing `a * b + c` is the contraction SPIR-V allows.
+    # drops the rounding (test/spirv/test_fconvert_exact.jl). Arithmetic is
+    # marked the same way unless LLVM's `contract` flag allows fusing (`exact!`).
     opcode == Op.OpFConvert && emit_decorate!(state.mod, result_id, Dec.NoContraction)
     state.value_map[inst] = result_id
 end
@@ -7612,7 +7636,10 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
 
     glsl_num = get(GLSL_STD_450_MAP, base_name, nothing)
     if glsl_num !== nothing
-        return emit_glsl_ext_inst!(state, inst, glsl_num)
+        id = emit_glsl_ext_inst!(state, inst, glsl_num)
+        # `fma` is one rounding; `fmuladd` (Julia's `muladd`) may be either.
+        base_name == "llvm.fma" && exact!(state, inst)
+        return id
     end
 
     # `llvm.copysign` has no GLSL.std.450 equivalent: the obvious
@@ -8520,12 +8547,45 @@ end
 # ConstantExpr handling
 # ================================================================
 
+function constexpr_null_pointer(value)
+    value isa LLVM.PointerNull && return true
+    if value isa LLVM.ConstantExpr && value.opcode in (LLVM.API.LLVMBitCast,LLVM.API.LLVMAddrSpaceCast)
+        return constexpr_null_pointer(only(value.operands))
+    end
+    return false
+end
+
+function constexpr_private_constant_pointer(value)
+    return value isa LLVM.GlobalVariable && value.value_type.addrspace==1 &&
+        value.constant && value.initializer!==nothing &&
+        value.linkage in (LLVM.API.LLVMPrivateLinkage,LLVM.API.LLVMInternalLinkage)
+end
+
+function constexpr_pointer_comparison(value::LLVM.ConstantExpr)
+    value.opcode==LLVM.API.LLVMICmp || return nothing
+    predicate=LLVM.API.LLVMGetICmpPredicate(value)
+    predicate in (LLVM.API.LLVMIntEQ,LLVM.API.LLVMIntNE) || return nothing
+    a,b=value.operands
+    # Address-space casts are identity mappings in this logical-pointer
+    # backend. A defined private constant table is an allocated, non-null
+    # OpVariable, including when LLVM retains a cast-null bounds guard.
+    unequal=(constexpr_null_pointer(a) && constexpr_private_constant_pointer(b)) ||
+        (constexpr_null_pointer(b) && constexpr_private_constant_pointer(a))
+    equal=constexpr_null_pointer(a) && constexpr_null_pointer(b)
+    (equal || unequal) || return nothing
+    return predicate==LLVM.API.LLVMIntEQ ? equal : unequal
+end
+
 function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
     # ConstantExpr is an LLVM value that represents a constant computation
     # Common cases: GEP on globals, bitcast, inttoptr
     op = val.opcode
 
-    if op == LLVM.API.LLVMGetElementPtr
+    if op == LLVM.API.LLVMICmp
+        folded=constexpr_pointer_comparison(val)
+        folded===nothing && error("Unsupported constant pointer comparison: ",string(val))
+        return emit_constant_bool!(state.mod,folded)
+    elseif op == LLVM.API.LLVMGetElementPtr
         # Constant GEP on a global variable (e.g., shared memory array)
         # Pattern: getelementptr [N x T], ptr addrspace(3) @global, i64 0, i64 0
         # → OpAccessChain into the global variable
@@ -8709,6 +8769,6 @@ function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
         encode_instruction!(state.mod.types_constants, Op.OpConstantNull, spirv_ty, null_id)
         return null_id
     else
-        error("Unsupported ConstantExpr opcode: $op in $val")
+        error("Unsupported ConstantExpr opcode: $op in ",string(val))
     end
 end
