@@ -80,7 +80,9 @@ end
 # metadata and the data layout, rather than returning a different module.
 function replace_optimization_ir!(mod::LLVM.Module, restored::LLVM.Module)
     for name in collect(keys(mod.metadata))
-        delete!(mod.metadata, name)
+        # LLVM 10.3 supports clearing operands, but not deleting named nodes.
+        # The linker fills these now-empty nodes from the restored module.
+        empty!(mod.metadata[name].operands)
     end
     functions = collect(mod.functions)
     globals = collect(LLVM.globals(mod))
