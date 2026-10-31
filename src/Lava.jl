@@ -18,7 +18,14 @@ export LavaDeviceArray
 
 # Compilation.
 export CompilationResult, lava_compile, optimize_spirv, LavaGfxShader
-export dump_state, gpu_memory_usage
+
+# `export dump_state, gpu_memory_usage` was here, and both went to Mantle with
+# the runtime — they read a `VkContext`. Exporting a name this module does not
+# define is legal and silent, and worse than useless: `using Lava` then brings an
+# undefined binding into scope which SHADOWS Mantle's real export, so
+# `gpu_memory_usage()` in a file that had loaded both was an UndefVarError with
+# no indication that the working definition was one `using` away. Pinned by
+# `test_no_stale_exports.jl`.
 
 # `@setup_workload` is PrecompileTools', re-exported. `@compile_workload` is NOT
 # here any more: the version-taking one freezes kernels into the on-disk cache,
@@ -183,6 +190,11 @@ include("device/subgroup.jl") # subgroup / group-non-uniform intrinsics
 # half is `array/kernelinterface_host.jl`, further down with the runtime it
 # depends on, and the two are split along exactly that line.
 include("device/kernelinterface.jl")
+# KA's device half, the counterpart of the above: how `@index` recovers a global
+# index from the dispatch builtins, plus `@synchronize` and `@private`. After
+# `device/subgroup.jl` for the builtins and after `devicearray.jl` because
+# `__index_Global_Linear` indexes a `LinearIndices` over the ndrange.
+include("device/ndrange.jl")
 include("device/acceleratedmatrix.jl")     # AcceleratedMatrix: the user-facing type
 include("device/coopmat_intrinsics.jl")    # its llvmcall stubs
 # `@localmem`: addrspace(3) globals and `LavaSharedArray`. AFTER the two above,

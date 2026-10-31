@@ -52,6 +52,7 @@ const LAVA_SOURCES = [
     "device/atomics.jl", "device/subgroup.jl", "device/acceleratedmatrix.jl",
     "device/coopmat_intrinsics.jl", "device/tensor_intrinsics.jl",
     "device/kernelinterface.jl", "device/devicearray.jl",
+    "device/sharedmemory.jl", "device/ndrange.jl",
 ]
 
 # `Vulkan` is the package; the other three are the runtime's entry points into it.
@@ -123,5 +124,101 @@ end
         for pkg in ("LLVM", "GPUCompiler", "SPIRV_Tools_jll", "KernelInterface")
             @test occursin(Regex("^$pkg = ", "m"), deps)
         end
+    end
+end
+
+# ── The other direction ───────────────────────────────────────────────────────
+#
+# Everything above asks whether Lava still names the runtime. Nothing above asks
+# whether the runtime still holds something LAVA needs, and that is the direction
+# the split actually broke in.
+#
+# `getindex`, `setindex!` and `linear_index` on a `LavaDeviceArray` stayed in
+# `array/ka_backend.jl` when it moved to Mantle, so with Lava alone every kernel
+# body inferred to `Union{}`. That is not a compile error at any stage:
+# `replace_unreachable` rewrites the unreachable body to `ret void`, the emitter
+# produces a well-formed entry point, and `spirv-val` accepts it. A kernel that
+# does nothing is valid SPIR-V.
+#
+# So the check is on the BODY, not on the compile succeeding. Two ways to be
+# wrong and both are covered: the instruction that should be there (`OpFAdd`),
+# and the shape that says nothing is there at all.
+#
+# `Base.return_types` is no use here and it is worth saying why: these are
+# `@lava_device_override` methods in GPUCompiler's overlay table, invisible to
+# host inference. It answered `Union{}` while this was broken and answers
+# `Union{}` now that it works.
+
+"""The entry point's body, as instruction mnemonics."""
+function main_body(disasm::AbstractString)
+    body = String[]
+    inmain = false
+    for line in split(disasm, '\n')
+        s = strip(line)
+        if occursin("= OpFunction ", s) || startswith(s, "%main = OpFunction")
+            inmain = occursin("%main", s)
+            continue
+        end
+        inmain || continue
+        s == "OpFunctionEnd" && (inmain = false; continue)
+        m = match(r"\bOp[A-Za-z]+", s)
+        m === nothing || push!(body, m.match)
+    end
+    return body
+end
+
+@testset "Lava compiles a kernel body without the runtime" begin
+    @testset "an indexing kernel is not empty" begin
+        function split_vadd(A, B, C)
+            i = Lava.lava_global_invocation_id_x() + UInt32(1)
+            @inbounds C[i] = A[i] + B[i]
+            return nothing
+        end
+        V = Lava.LavaDeviceArray{Float32, 1}
+        d = Lava.disassemble_spirv(
+            Lava.lava_compile_gpu(split_vadd, Tuple{V, V, V}).spirv_bytes)
+        body = main_body(d)
+
+        # The exact shape the missing methods produced: label in, return out,
+        # nothing between. Asserted by name so the failure says what happened
+        # rather than "OpFAdd not found".
+        @test body != ["OpLabel", "OpReturn"]
+        @test "OpFAdd" in body
+        @test "OpLoad" in body
+        @test "OpStore" in body
+    end
+
+    # `linear_index`, which the multi-index and atomic paths share. Its Horner
+    # form is load-bearing — see the comment on it — so a kernel that indexes
+    # `a[i, j, k]` must reach it rather than Base's `_sub2ind` fallback.
+    @testset "multi-dimensional indexing is not empty" begin
+        function split_index3(A, B)
+            i = Int(Lava.lava_global_invocation_id_x()) + 1
+            @inbounds B[i, 1, 1] = A[i, 1, 1] * 2.0f0
+            return nothing
+        end
+        A3 = Lava.LavaDeviceArray{Float32, 3}
+        d = Lava.disassemble_spirv(
+            Lava.lava_compile_gpu(split_index3, Tuple{A3, A3}).spirv_bytes)
+        body = main_body(d)
+        @test body != ["OpLabel", "OpReturn"]
+        @test "OpFMul" in body
+    end
+
+    # `device/atomics.jl` reaches `linear_index` across a file boundary now that
+    # its own copy is gone. If the include order ever puts it first, this is
+    # where that shows up.
+    @testset "atomics reach linear_index" begin
+        function split_atomic(A)
+            i = Int(Lava.lava_global_invocation_id_x()) + 1
+            @inbounds @atomic A[i, 1] += 1.0f0
+            return nothing
+        end
+        A2 = Lava.LavaDeviceArray{Float32, 2}
+        d = Lava.disassemble_spirv(
+            Lava.lava_compile_gpu(split_atomic, Tuple{A2}).spirv_bytes)
+        body = main_body(d)
+        @test body != ["OpLabel", "OpReturn"]
+        @test any(startswith("OpAtomic"), body)
     end
 end
