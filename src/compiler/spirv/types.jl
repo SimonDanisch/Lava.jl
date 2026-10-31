@@ -1510,6 +1510,9 @@ function trace_pointer_to_alloca(ptr::LLVM.Value, visited::Set{LLVM.Value}=Set{L
             trace_pointer_to_alloca(val, visited) && return true
         end
         return false
+    elseif ptr isa LLVM.SelectInst
+        return trace_pointer_to_alloca(ptr.operands[2], visited) ||
+               trace_pointer_to_alloca(ptr.operands[3], visited)
     end
     return false
 end

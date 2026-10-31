@@ -4840,6 +4840,7 @@ function lower_phi_typepunned_loads!(mod::LLVM.Module)
                     ptr isa LLVM.PHIInst || continue
 
                     access_ty = inst.value_type
+
                     access_size = llvm_type_size(access_ty)
                     access_size > 0 || continue
 
@@ -5092,12 +5093,13 @@ chain has no remaining uses.
 
 Limitations / preconditions enforced before transforming:
 
-* All leaves of the phi/select chain must be `LLVM.AllocaInst` in
-  addrspace 0 (Function storage).  Leaves of other kinds (GEPs,
-  parameters, BDA pointers) are out of scope and skipped.
-* The alloca's allocated type must equal `access_ty` — we don't
-  decompose larger types here (that's `lower_phi_typepunned_loads!`'s
-  job for byte-pun chains).
+* Leaves are Function-storage allocas, or GEPs rooted in such allocas.
+  A GEP leaf is supported only on a phi edge whose predecessor has one
+  successor: its load is not speculated onto any previously unexecuted edge.
+  The consuming load must immediately follow that join's phis, so no write
+  can intervene. GEPs under selects, parameters and BDA pointers are skipped.
+* A direct alloca leaf must have at least `sizeof(access_ty)` bytes. Existing
+  byte-pun lowering owns the representation of any differently typed load.
 * `UndefValue` incoming on a phi is allowed (becomes `UndefValue` on
   the value mirror).
 
@@ -5107,6 +5109,8 @@ already promoted everything it can, so the only remaining
 cannot handle.
 """
 function lower_phi_select_function_ptrs!(mod::LLVM.Module)
+    fold_local_array_gep_selects!(mod)
+    lower_local_array_select_loads!(mod)
     for fn in mod.functions
         isempty(fn.blocks) && continue
         changed = true
@@ -5122,6 +5126,19 @@ function lower_phi_select_function_ptrs!(mod::LLVM.Module)
                     ptr_ty.addrspace == 0 || continue
 
                     access_ty = inst.value_type
+
+                    if function_ptr_chain_has_gep(ptr,Set{LLVM.Value}())
+                        # New GEP support must not move a load across stores
+                        # in the join block (or across another block). Accept
+                        # only a load immediately after the join's phis.
+                        ptr isa LLVM.PHIInst && ptr.parent==bb || continue
+                        immediate=true
+                        for before in bb.instructions
+                            before==inst && break
+                            before isa LLVM.PHIInst || (immediate=false;break)
+                        end
+                        immediate || continue
+                    end
 
                     # Verify ALL leaves of the chain are Function-storage allocas
                     # with the matching allocated type.  Bail otherwise — handling
@@ -5207,8 +5224,17 @@ function validate_function_alloca_chain(val::LLVM.Value, access_ty::LLVM.LLVMTyp
             Int(LLVM.API.LLVMABISizeOfType(dl, access_ty)) || return false
         return true
     elseif val isa LLVM.PHIInst
-        for (v, _) in val.incoming
+        for (v, pred) in val.incoming
             v isa LLVM.UndefValue && continue
+            if v isa LLVM.GetElementPtrInst
+                # Load at the incoming edge's terminator, never speculatively
+                # on a conditional predecessor where the pointer may be OOB.
+                term=pred.terminator
+                term===nothing && return false
+                LLVM.API.LLVMGetNumSuccessors(term)==1 || return false
+                function_alloca_gep_leaf(v) || return false
+                continue
+            end
             validate_function_alloca_chain(v, access_ty, visited) || return false
         end
         return true
@@ -5221,6 +5247,26 @@ function validate_function_alloca_chain(val::LLVM.Value, access_ty::LLVM.LLVMTyp
         # Anything else (GEP, parameter, BDA pointer, constant) — out of scope
         return false
     end
+end
+
+function function_alloca_gep_leaf(val::LLVM.Value)
+    while val isa LLVM.GetElementPtrInst
+        val.value_type.addrspace==0 || return false
+        val=val.operands[1]
+    end
+    return val isa LLVM.AllocaInst && val.value_type.addrspace==0
+end
+
+function function_ptr_chain_has_gep(val::LLVM.Value,seen::Set{LLVM.Value})
+    val in seen && return false
+    push!(seen,val)
+    val isa LLVM.GetElementPtrInst && return true
+    if val isa LLVM.PHIInst
+        return any(function_ptr_chain_has_gep(v,seen) for (v,_) in val.incoming)
+    elseif val isa LLVM.SelectInst
+        return any(function_ptr_chain_has_gep(v,seen) for v in val.operands[2:3])
+    end
+    return false
 end
 
 """
@@ -5257,7 +5303,7 @@ function build_function_ptr_value_mirror!(val::LLVM.Value, access_ty::LLVM.LLVMT
         for (incoming_val, pred_bb) in val.incoming
             if incoming_val isa LLVM.UndefValue
                 push!(new_phi.incoming, (LLVM.UndefValue(access_ty), pred_bb))
-            elseif incoming_val isa LLVM.AllocaInst
+            elseif incoming_val isa Union{LLVM.AllocaInst,LLVM.GetElementPtrInst}
                 # Emit `load access_ty, ptr alloca` right before pred_bb's terminator
                 # so the value is available when control transfers into phi_bb.
                 term = pred_bb.terminator
@@ -5706,4 +5752,75 @@ function propagate_psb_alignment!(mod::LLVM.Module, dl::LLVM.DataLayout)
             end
         end
     end
+end
+
+
+# A select between two elements of the same local array is an index select,
+# not a generic pointer. Keep the one selected load, including when the other
+# index would be out of bounds; speculating both loads is incorrect.
+function fold_local_array_gep_selects!(mod::LLVM.Module)
+    for fn in mod.functions, bb in fn.blocks, inst in collect(bb.instructions)
+        inst isa LLVM.SelectInst || continue
+        ops=inst.operands
+        a,b=ops[2],ops[3]
+        a isa LLVM.GetElementPtrInst && b isa LLVM.GetElementPtrInst || continue
+        function_alloca_gep_leaf(a) && function_alloca_gep_leaf(b) || continue
+        ao,bo=a.operands,b.operands
+        length(ao)==length(bo)==3 || continue
+        ao[1]==bo[1] && ao[2]==bo[2] || continue
+        at=LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(a))
+        bt=LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(b))
+        at isa LLVM.ArrayType && at==bt || continue
+        ao[3].value_type==bo[3].value_type || continue
+        LLVM.IRBuilder() do builder
+            LLVM.position!(builder,LLVM.before(inst))
+            index=LLVM.select!(builder,ops[1],ao[3],bo[3],"local_selected_index")
+            ptr=LLVM.gep!(builder,at,ao[1],[ao[2],index],"local_selected_element")
+            LLVM.replace_uses!(inst,ptr)
+        end
+        LLVM.erase!(inst)
+    end
+    return nothing
+end
+
+
+# Two distinct local array copies cannot share one GEP. Read a safe element of
+# the unselected copy (index zero), then select values. Unlike speculating both
+# original loads this never dereferences an unselected out-of-bounds index.
+function lower_local_array_select_loads!(mod::LLVM.Module)
+    for fn in mod.functions, bb in fn.blocks, load in collect(bb.instructions)
+        load isa LLVM.LoadInst || continue
+        (LLVM.volatile(load) || LLVM.isatomic(load)) && continue
+        ptr=load.operands[1]
+        ptr isa LLVM.SelectInst || continue
+        ops=ptr.operands
+        a,b=ops[2],ops[3]
+        a isa LLVM.GetElementPtrInst && b isa LLVM.GetElementPtrInst || continue
+        ao,bo=a.operands,b.operands
+        length(ao)==length(bo)==3 || continue
+        ao[1] isa LLVM.AllocaInst && bo[1] isa LLVM.AllocaInst || continue
+        ao[2] isa LLVM.ConstantInt && bo[2] isa LLVM.ConstantInt || continue
+        convert(Int64,ao[2])==convert(Int64,bo[2])==0 || continue
+        at=LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(a))
+        bt=LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(b))
+        at isa LLVM.ArrayType && bt isa LLVM.ArrayType || continue
+        at.length>0 && bt.length>0 || continue
+        at.element_type==bt.element_type==load.value_type || continue
+        LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(ao[1]))==at || continue
+        LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(bo[1]))==bt || continue
+        LLVM.IRBuilder() do builder
+            LLVM.position!(builder,LLVM.before(load))
+            ai=LLVM.select!(builder,ops[1],ao[3],LLVM.ConstantInt(ao[3].value_type,0),"local_safe_true_index")
+            bi=LLVM.select!(builder,ops[1],LLVM.ConstantInt(bo[3].value_type,0),bo[3],"local_safe_false_index")
+            ap=LLVM.gep!(builder,at,ao[1],[ao[2],ai],"local_safe_true_element")
+            bp=LLVM.gep!(builder,bt,bo[1],[bo[2],bi],"local_safe_false_element")
+            av=LLVM.load!(builder,load.value_type,ap,"local_true_value")
+            bv=LLVM.load!(builder,load.value_type,bp,"local_false_value")
+            value=LLVM.select!(builder,ops[1],av,bv,"local_selected_value")
+            LLVM.replace_uses!(load,value)
+        end
+        LLVM.erase!(load)
+        erase_dead_ptr_chain!(ptr)
+    end
+    return nothing
 end
