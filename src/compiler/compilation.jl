@@ -1363,6 +1363,8 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # wrong type (e.g., load i32 from a double*). Run the typepun GEP load decomposition
     # one more time to fix these.
     decompose_typepun_gep_loads!(mod, dl)
+    index_private_array_choices!(mod, dl)
+    materialize_private_numeric_arguments!(mod)
     verify_ir!("final")
     checkpoint("final lift+decompose block")
 
@@ -1675,6 +1677,8 @@ function has_alloca_type_mismatch_at_callsites(fn::LLVM.Function, mod::LLVM.Modu
     # allocated type (no array unwrapping), since SPIR-V requires exact
     # match at OpFunctionCall.
     caller_types_per_param = Dict{Int, Set{LLVM.LLVMType}}()
+    whole_allocas = Dict(i => true for (i, _) in ptr_params)
+    plain_accesses = private_numeric_helper(fn)
     for (i, _) in ptr_params
         caller_types_per_param[i] = Set{LLVM.LLVMType}()
     end
@@ -1692,6 +1696,7 @@ function has_alloca_type_mismatch_at_callsites(fn::LLVM.Function, mod::LLVM.Modu
                 i <= n_args || continue
                 t = trace_alloca_allocated_type(ops[i])
                 t === nothing && continue
+                whole_allocas[i] &= ops[i] isa LLVM.AllocaInst
                 push!(caller_types_per_param[i], t)
             end
         end
@@ -1708,6 +1713,25 @@ function has_alloca_type_mismatch_at_callsites(fn::LLVM.Function, mod::LLVM.Modu
         length(caller_set) > 1 && return true
         isempty(helper_set) && continue
         for ct in caller_set
+            # A whole private object can retain the caller's container type.
+            # Byte GEPs and scalar accesses describe offsets within it, not a
+            # competing pointee shape. PTM propagates that container to the
+            # parameter and the emitter lowers these accesses inside the helper.
+            # A subobject address or differing caller layouts still needs the
+            # original context-local handling.
+            byte_accesses = all(bb -> all(inst ->
+                !(inst isa LLVM.GetElementPtrInst && inst.operands[1] === params[i]) ||
+                LLVM.LLVMType(API.LLVMGetGEPSourceElementType(inst)) == LLVM.Int8Type(),
+                bb.instructions), fn.blocks)
+            scalar_accesses = all(ty -> ty isa Union{LLVM.IntegerType, LLVM.FloatingPointType}, helper_set)
+            element = ct
+            while element isa LLVM.ArrayType
+                element = element.element_type
+            end
+            container = ct isa LLVM.ArrayType && element isa Union{LLVM.IntegerType, LLVM.FloatingPointType}
+            if container && plain_accesses && whole_allocas[i] && byte_accesses && scalar_accesses
+                continue
+            end
             ct in helper_set || return true
         end
     end

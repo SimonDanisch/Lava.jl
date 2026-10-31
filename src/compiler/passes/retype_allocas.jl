@@ -71,6 +71,182 @@ struct AllocaInfo
     geps::Vector{LLVM.GetElementPtrInst}   # all GEPs to be erased after rewrite
 end
 
+"""
+Replace pointer choices within one private array by choices of its index.
+
+SROA may store a homogeneous tuple of structs in an integer array, and merge
+element addresses before their field loads. The following struct GEP can step
+back from that choice (Julia's one-based tuple access). Logical SPIR-V pointers
+cannot express this arithmetic. Keep the choice and every derived GEP rooted in
+the original array instead. Loads and stores remain at their original sites.
+
+Only acyclic choices within a single array, with element-aligned offsets,
+are handled. Other pointer representations are left for the existing lowerings.
+"""
+function index_private_array_choices!(mod::LLVM.Module, dl::LLVM.DataLayout)
+    for fn in mod.functions
+        choices = LLVM.Instruction[inst for bb in fn.blocks for inst in bb.instructions if
+            inst.value_type isa LLVM.PointerType && inst.value_type.addrspace == 0 &&
+            (inst isa Union{LLVM.PHIInst, LLVM.SelectInst} ||
+             (inst isa LLVM.GetElementPtrInst && inst.operands[1] isa LLVM.AllocaInst &&
+              LLVM.LLVMType(API.LLVMGetGEPSourceElementType(inst)) isa LLVM.StructType))]
+        processed = Set{LLVM.Value}()
+        for choice in choices
+            choice in processed && continue
+            isempty(LLVM.uses(choice)) && continue
+            roots = Dict{LLVM.Value, Union{LLVM.Value, Nothing}}()
+            root = private_array_choice_root(choice, dl, Set{LLVM.Value}(), roots)
+            root === nothing && continue
+            # Include GEPs and choices derived from this choice, so no struct
+            # arithmetic remains on the reconstructed scalar element pointer.
+            pending = LLVM.Value[choice]
+            seen = Set{LLVM.Value}()
+            derived = LLVM.Value[]
+            while !isempty(pending)
+                ptr = pop!(pending)
+                ptr in seen && continue
+                push!(seen, ptr)
+                push!(derived, ptr)
+                for use in LLVM.uses(ptr)
+                    user = use.user
+                    user isa Union{LLVM.GetElementPtrInst, LLVM.PHIInst, LLVM.SelectInst} || continue
+                    private_array_choice_root(user, dl, Set{LLVM.Value}(), roots) == root || continue
+                    push!(pending, user)
+                end
+            end
+            ty = LLVM.LLVMType(API.LLVMGetAllocatedType(root))
+            stride = Int(API.LLVMABISizeOfType(dl, ty.element_type))
+            indices = Dict{LLVM.Value, LLVM.Value}()
+            replacements = Pair{LLVM.Value,LLVM.Value}[]
+            LLVM.@dispose builder = LLVM.IRBuilder() begin
+                for ptr in derived
+                    index = private_array_choice_index!(builder, ptr, root, stride, dl, indices)
+                    at = ptr isa LLVM.PHIInst ? first(inst for inst in ptr.parent.instructions if !(inst isa LLVM.PHIInst)) : ptr
+                    LLVM.position!(builder, LLVM.before(at))
+                    address = LLVM.gep!(builder, ty, root,
+                        LLVM.Value[LLVM.ConstantInt(LLVM.Int64Type(), 0), index], "private_choice_address")
+                    push!(replacements, ptr => address)
+                end
+            end
+            for (ptr, address) in replacements
+                LLVM.replace_uses!(ptr, address)
+                push!(processed, ptr)
+            end
+            # No pointer can be cyclic under private_array_choice_root's check.
+            for (ptr, _) in reverse(replacements)
+                isempty(LLVM.uses(ptr)) && LLVM.erase!(ptr)
+            end
+        end
+    end
+    index_private_struct_steps!(mod, dl)
+    return nothing
+end
+
+# An aggregate array's field need not lie on an element boundary. Move only
+# the leading struct step into the enclosing array index, then retain the
+# field projection as a zero-step GEP. This also handles direct field loads
+# from a pointer choice, without flattening or type-punning the aggregate.
+function index_private_struct_steps!(mod::LLVM.Module, dl::LLVM.DataLayout)
+    for fn in mod.functions
+        geps = [i for b in fn.blocks for i in b.instructions if i isa LLVM.GetElementPtrInst]
+        for inst in geps
+            ops = collect(inst.operands)
+            source = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(inst))
+            source isa LLVM.StructType || continue
+            length(ops) >= 3 || continue
+            is_zero_index(ops[2]) && continue
+            root = private_array_choice_root(ops[1], dl, Set{LLVM.Value}())
+            root === nothing && continue
+            array = LLVM.LLVMType(API.LLVMGetAllocatedType(root))
+            source == array.element_type || continue
+            stride = Int(API.LLVMABISizeOfType(dl, source))
+            LLVM.@dispose builder = LLVM.IRBuilder() begin
+                index = private_array_choice_index!(builder, ops[1], root, stride, dl,
+                                                     Dict{LLVM.Value, LLVM.Value}())
+                LLVM.position!(builder, LLVM.before(inst))
+                i64 = LLVM.Int64Type()
+                step = ops[2].value_type == i64 ? ops[2] : LLVM.sext!(builder, ops[2], i64)
+                adjusted = LLVM.add!(builder, index, step, "private_struct_index")
+                zero = LLVM.ConstantInt(i64, 0)
+                element = LLVM.gep!(builder, array, root, LLVM.Value[zero, adjusted], "private_struct_element")
+                field = LLVM.gep!(builder, source, element, LLVM.Value[zero; ops[3:end]], "private_struct_field")
+                LLVM.replace_uses!(inst, field)
+            end
+            LLVM.erase!(inst)
+        end
+    end
+    return nothing
+end
+
+function private_array_choice_root(ptr::LLVM.Value, dl, visiting,
+                                   cache=Dict{LLVM.Value, Union{LLVM.Value, Nothing}}())
+    ptr in visiting && return nothing
+    haskey(cache, ptr) && return cache[ptr]
+    if ptr isa LLVM.AllocaInst
+        ty = LLVM.LLVMType(API.LLVMGetAllocatedType(ptr))
+        ty isa LLVM.ArrayType || return nothing
+        Int(API.LLVMABISizeOfType(dl, ty.element_type)) > 0 || return nothing
+        return ptr
+    end
+    push!(visiting, ptr)
+    root = if ptr isa LLVM.GetElementPtrInst
+        base = private_array_choice_root(ptr.operands[1], dl, visiting, cache)
+        if base !== nothing
+            ty = LLVM.LLVMType(API.LLVMGetAllocatedType(base))
+            stride = Int(API.LLVMABISizeOfType(dl, ty.element_type))
+            offset, dynamic = analyze_gep_offset(ptr, dl)
+            offset !== nothing && offset % stride == 0 && all(x -> x[2] % stride == 0, dynamic) ? base : nothing
+        else
+            nothing
+        end
+    elseif ptr isa Union{LLVM.PHIInst, LLVM.SelectInst}
+        values = ptr isa LLVM.PHIInst ? [v for (v, _) in ptr.incoming] : collect(ptr.operands[2:3])
+        roots = [private_array_choice_root(v, dl, visiting, cache) for v in values if
+            !(v isa Union{LLVM.UndefValue, LLVM.PoisonValue})]
+        !isempty(roots) && first(roots) !== nothing && all(==(first(roots)), roots) ? first(roots) : nothing
+    else
+        nothing
+    end
+    delete!(visiting, ptr)
+    cache[ptr] = root
+    return root
+end
+
+function private_array_choice_index!(builder, ptr, root, stride, dl, cache)
+    haskey(cache, ptr) && return cache[ptr]
+    i64 = LLVM.Int64Type()
+    ptr isa LLVM.UndefValue && return LLVM.UndefValue(i64)
+    ptr isa LLVM.PoisonValue && return LLVM.PoisonValue(i64)
+    ptr == root && return LLVM.ConstantInt(i64, 0)
+    index = if ptr isa LLVM.PHIInst
+        LLVM.position!(builder, LLVM.before(ptr))
+        phi = LLVM.phi!(builder, i64, "private_choice_index")
+        for (value, block) in ptr.incoming
+            incoming = private_array_choice_index!(builder, value, root, stride, dl, cache)
+            push!(phi.incoming, (incoming, block))
+        end
+        phi
+    elseif ptr isa LLVM.SelectInst
+        left = private_array_choice_index!(builder, ptr.operands[2], root, stride, dl, cache)
+        right = private_array_choice_index!(builder, ptr.operands[3], root, stride, dl, cache)
+        LLVM.position!(builder, LLVM.before(ptr))
+        LLVM.select!(builder, ptr.operands[1], left, right, "private_choice_index")
+    else
+        base = private_array_choice_index!(builder, ptr.operands[1], root, stride, dl, cache)
+        offset, dynamic = analyze_gep_offset(ptr, dl)
+        LLVM.position!(builder, LLVM.before(ptr))
+        result = LLVM.add!(builder, base, LLVM.ConstantInt(i64, offset ÷ stride), "private_choice_offset")
+        for (value, bytes) in dynamic
+            wide = value.value_type == i64 ? value : LLVM.sext!(builder, value, i64)
+            step = LLVM.mul!(builder, wide, LLVM.ConstantInt(i64, bytes ÷ stride))
+            result = LLVM.add!(builder, result, step, "private_choice_offset")
+        end
+        result
+    end
+    cache[ptr] = index
+    return index
+end
+
 # Collect uses transitively.  Each pointer-typed instruction in the use chain
 # must be a GEP we can interpret.  Returns AllocaInfo or nothing.
 function analyze_alloca_uses(alloca::LLVM.AllocaInst, dl::LLVM.DataLayout)
