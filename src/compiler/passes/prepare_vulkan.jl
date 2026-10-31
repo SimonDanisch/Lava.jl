@@ -3400,6 +3400,92 @@ function unpack_from_int!(builder, value, ty, name)
 end
 
 """
+    lower_subword_access_on_integer_allocas!(mod::LLVM.Module)
+
+A load or store narrower than an integer alloca, at a constant byte offset into it
+(`subword_offset`): the value shifted into place and spliced in with a read-modify-write,
+or shifted out.
+
+    %a = alloca i16
+    store i8 %lo, ptr %a
+    store i8 %hi, ptr (gep i8, ptr %a, 1)
+    %v = load i16, ptr %a
+
+SROA leaves this of a pair of `Bool`s that is also read whole: the lanes of GPUArrays'
+`mapreduce` in `istril`. A SPIR-V variable of a scalar type has no byte inside it to point
+at, and the emitter spliced both stores into the low byte, so the reduction read `false`.
+"""
+function lower_subword_access_on_integer_allocas!(mod::LLVM.Module)
+    for fn in mod.functions
+        isempty(fn.blocks) && continue
+        accesses = Tuple{LLVM.Instruction,LLVM.AllocaInst,Int}[]
+        for bb in fn.blocks, inst in bb.instructions
+            (inst isa LLVM.StoreInst || inst isa LLVM.LoadInst) || continue
+            found = subword_offset(inst isa LLVM.StoreInst ? inst.operands[2] : inst.operands[1])
+            found === nothing && continue
+            alloca, off = found
+            slot = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(alloca))
+            (slot isa LLVM.IntegerType && slot.width <= 64) || continue
+            access_ty = inst isa LLVM.StoreInst ? inst.operands[1].value_type : inst.value_type
+            bits = llvm_type_size(access_ty) * 8
+            (0 < bits < slot.width && 0 <= off && 8 * off + bits <= slot.width) || continue
+            push!(accesses, (inst, alloca, off))
+        end
+        isempty(accesses) && continue
+        LLVM.@dispose builder = LLVM.IRBuilder() begin
+            for (inst, alloca, off) in accesses
+                ptr = inst isa LLVM.StoreInst ? inst.operands[2] : inst.operands[1]
+                slot = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(alloca))
+                LLVM.position!(builder, insertion_point(inst))
+                shift = LLVM.ConstantInt(slot, 8 * off)
+                full = LLVM.load!(builder, slot, alloca, "subword_slot")
+                if inst isa LLVM.StoreInst
+                    v = inst.operands[1]
+                    bits = llvm_type_size(v.value_type) * 8
+                    wide = LLVM.zext!(builder, pack_as_int!(builder, v, "subword_bits"), slot, "subword_wide")
+                    ones = slot.width == 64 ? ~UInt64(0) : (UInt64(1) << slot.width) - UInt64(1)
+                    keep = LLVM.ConstantInt(slot, ones & ~(((UInt64(1) << bits) - UInt64(1)) << (8 * off)))
+                    kept = LLVM.and!(builder, full, keep, "subword_kept")
+                    placed = off == 0 ? wide : LLVM.shl!(builder, wide, shift, "subword_placed")
+                    LLVM.store!(builder, LLVM.or!(builder, kept, placed, "subword_merged"), alloca)
+                else
+                    bits = llvm_type_size(inst.value_type) * 8
+                    low = off == 0 ? full : LLVM.lshr!(builder, full, shift, "subword_shr")
+                    part = LLVM.trunc!(builder, low, LLVM.IntType(bits), "subword_part")
+                    LLVM.replace_uses!(inst, unpack_from_int!(builder, part, inst.value_type, "subword_value"))
+                end
+                LLVM.erase!(inst)
+                erase_dead_geps!(ptr)
+            end
+        end
+    end
+    return nothing
+end
+
+"""The alloca `ptr` points into and the constant byte offset, through `gep i8` with a
+constant index; `nothing` for any other pointer."""
+subword_offset(@nospecialize(ptr)) = nothing
+subword_offset(a::LLVM.AllocaInst) = (a, 0)
+function subword_offset(gep::LLVM.GetElementPtrInst)
+    src = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
+    (src isa LLVM.IntegerType && src.width == 8 && length(gep.operands) == 2) || return nothing
+    idx = gep.operands[2]
+    idx isa LLVM.ConstantInt || return nothing
+    base = subword_offset(gep.operands[1])
+    base === nothing && return nothing
+    return (base[1], base[2] + convert(Int, idx))
+end
+
+"""Erase `ptr` and the GEPs under it that nothing uses any more."""
+erase_dead_geps!(@nospecialize(ptr)) = nothing
+function erase_dead_geps!(gep::LLVM.GetElementPtrInst)
+    isempty(LLVM.uses(gep)) || return nothing
+    base = gep.operands[1]
+    LLVM.erase!(gep)
+    return erase_dead_geps!(base)
+end
+
+"""
 Lower a direct access (constant index only) through the base mismatched GEP.
 """
 function lower_direct_mismatched_access!(fn, alloca, alloca_ty, alloca_elem_ty,
@@ -3763,28 +3849,29 @@ function resolve_const_gep_index(v::LLVM.Value)
 end
 
 """
-    gep_element_type_and_offset(src_ty, indices) → (element_type, byte_offset)
+    gep_element_type_and_offset(src_ty, indices, dl) → (element_type, byte_offset)
 
 Walk GEP indices through a type hierarchy to find the pointed-to element type
-and its byte offset from the base. The first index is a pointer-level array
-offset; subsequent indices drill into struct members / array elements.
+and its byte offset from the base, as `dl` lays the types out. The first index is
+a pointer-level array offset; subsequent indices drill into struct members /
+array elements. The offsets were the fields' sizes added up, which put the third
+field of `{ float, i64, float }` at 12, inside the `i64`, where the datalayout
+(and `flatten_type_with_offsets`) has it at 16: `fill!` with such a struct wrote
+the `i64`'s high half where the last `Float32` belongs.
 """
-function gep_element_type_and_offset(src_ty::LLVM.LLVMType, indices::Vector{Int})
+function gep_element_type_and_offset(src_ty::LLVM.LLVMType, indices::Vector{Int}, dl::LLVM.DataLayout)
     offset = 0
     current_ty = src_ty
     for (j, idx) in enumerate(indices)
         if j == 1
             # First index: array offset from pointer base
-            offset += idx * llvm_type_size(src_ty)
+            offset += idx * Int(LLVM.abi_size(dl, src_ty))
         elseif current_ty isa LLVM.StructType
-            elems = current_ty.elements
-            for i in 0:(idx-1)
-                offset += llvm_type_size(elems[i+1])
-            end
-            current_ty = elems[idx+1]
+            offset += Int(LLVM.API.LLVMOffsetOfElement(dl, current_ty, UInt32(idx)))
+            current_ty = current_ty.elements[idx+1]
         elseif current_ty isa LLVM.ArrayType
             elem_ty = current_ty.element_type
-            offset += idx * llvm_type_size(elem_ty)
+            offset += idx * Int(LLVM.abi_size(dl, elem_ty))
             current_ty = elem_ty
         else
             return nothing, 0
@@ -3904,7 +3991,7 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                         push!(indices, idx)
                     end
 
-                    elem_ty, gep_byte_off = gep_element_type_and_offset(src_ty, indices)
+                    elem_ty, gep_byte_off = gep_element_type_and_offset(src_ty, indices, dl)
                     elem_ty === nothing && continue
 
                     elem_size = llvm_type_size(elem_ty)
@@ -4215,7 +4302,7 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
                         push!(indices, idx)
                     end
 
-                    elem_ty, gep_byte_off = gep_element_type_and_offset(src_ty, indices)
+                    elem_ty, gep_byte_off = gep_element_type_and_offset(src_ty, indices, dl)
                     elem_ty === nothing && continue
 
                     elem_size = llvm_type_size(elem_ty)
@@ -5119,8 +5206,10 @@ chain has no remaining uses.
 Limitations / preconditions enforced before transforming:
 
 * All leaves of the phi/select chain must be `LLVM.AllocaInst` in
-  addrspace 0 (Function storage).  Leaves of other kinds (GEPs,
-  parameters, BDA pointers) are out of scope and skipped.
+  addrspace 0 (Function storage), or GEPs straight off one, which are
+  loaded with their indices clamped into the alloca (`alloca_gep_bounds`).
+  Leaves of other kinds (parameters, BDA pointers) are out of scope and
+  skipped.
 * The alloca's allocated type must equal `access_ty` — we don't
   decompose larger types here (that's `lower_phi_typepunned_loads!`'s
   job for byte-pun chains).
@@ -5243,10 +5332,88 @@ function validate_function_alloca_chain(val::LLVM.Value, access_ty::LLVM.LLVMTyp
         validate_function_alloca_chain(ops[2], access_ty, visited) || return false
         validate_function_alloca_chain(ops[3], access_ty, visited) || return false
         return true
+    elseif val isa LLVM.GetElementPtrInst
+        # An element of an alloca, read where it is: see `alloca_gep_bounds`.
+        return alloca_gep_bounds(val, access_ty) !== nothing
     else
-        # Anything else (GEP, parameter, BDA pointer, constant) — out of scope
+        # Anything else (parameter, BDA pointer, constant) — out of scope
         return false
     end
+end
+
+"""
+    alloca_gep_bounds(gep, access_ty) -> Union{Nothing, Vector{Union{Nothing, Int}}}
+
+For a GEP straight off an addrspace-0 alloca, the largest value each of its dynamic
+indices can take for an access of `access_ty` to stay inside the alloca (`nothing`
+for a constant index). `nothing` for any other pointer, or where an index cannot be
+bounded.
+
+The value mirror loads at EVERY leaf of a phi/select chain, not only at the one the
+condition picks, and the leaves it does not pick may hold an index out of bounds: a
+select between two element pointers stands for "read this one or that one", and the
+index of the one not read is whatever it is. Hikari's node interpreter reads an input
+as `o == NO_SLOT ? ins.k[i] : stack[o]`, which LLVM makes one load of a select between
+`ins.k[i]` and `stack[o]`, and at `o == NO_SLOT` the stack element is at byte -4.
+Clamped to these bounds the load stays inside its alloca and its value is discarded;
+the leaf that is picked is in bounds already, and the clamp leaves it as it is.
+"""
+function alloca_gep_bounds(gep::LLVM.Value, access_ty::LLVM.LLVMType)
+    gep isa LLVM.GetElementPtrInst || return nothing
+    alloca = gep.operands[1]
+    alloca isa LLVM.AllocaInst || return nothing
+    alloca.value_type.addrspace == 0 || return nothing
+    count = alloca.operands[1]
+    count isa LLVM.ConstantInt || return nothing
+    dl = gep.parent.parent.parent.datalayout
+    allocated = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(alloca))
+    room = Int(LLVM.API.LLVMABISizeOfType(dl, allocated)) * convert(Int, count) -
+           Int(LLVM.API.LLVMABISizeOfType(dl, access_ty))
+    room >= 0 || return nothing
+    src = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
+    bounds = Union{Nothing, Int}[]
+    indexed = src
+    for (k, idx) in enumerate(gep.operands[2:end])
+        if k == 1
+            # Steps over whole elements of the source type from the alloca's start.
+            step = Int(LLVM.API.LLVMABISizeOfType(dl, src))
+            step > 0 || return nothing
+            push!(bounds, idx isa LLVM.ConstantInt ? nothing : room ÷ step)
+        elseif indexed isa LLVM.StructType
+            idx isa LLVM.ConstantInt || return nothing
+            push!(bounds, nothing)
+            indexed = indexed.elements[convert(Int, idx) + 1]
+        elseif indexed isa LLVM.ArrayType || indexed isa LLVM.VectorType
+            push!(bounds, idx isa LLVM.ConstantInt ? nothing : indexed.length - 1)
+            indexed = indexed.element_type
+        else
+            return nothing
+        end
+    end
+    return bounds
+end
+
+"""
+    clamped_alloca_gep!(builder, gep, access_ty) -> LLVM.Value
+
+`gep` rebuilt at the builder's position with each dynamic index clamped to
+`alloca_gep_bounds(gep, access_ty)`.
+"""
+function clamped_alloca_gep!(builder::LLVM.IRBuilder, gep::LLVM.GetElementPtrInst, access_ty::LLVM.LLVMType)
+    bounds = alloca_gep_bounds(gep, access_ty)
+    idxs = LLVM.Value[]
+    for (idx, top) in zip(gep.operands[2:end], bounds)
+        if top === nothing
+            push!(idxs, idx)
+            continue
+        end
+        ty = idx.value_type
+        zero, hi = LLVM.ConstantInt(ty, 0), LLVM.ConstantInt(ty, top)
+        low = LLVM.select!(builder, LLVM.icmp!(builder, LLVM.API.LLVMIntSLT, idx, zero), zero, idx)
+        push!(idxs, LLVM.select!(builder, LLVM.icmp!(builder, LLVM.API.LLVMIntSGT, low, hi), hi, low))
+    end
+    src = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
+    return LLVM.inbounds_gep!(builder, src, gep.operands[1], idxs)
 end
 
 """
@@ -5283,14 +5450,14 @@ function build_function_ptr_value_mirror!(val::LLVM.Value, access_ty::LLVM.LLVMT
         for (incoming_val, pred_bb) in val.incoming
             if incoming_val isa LLVM.UndefValue
                 push!(new_phi.incoming, (LLVM.UndefValue(access_ty), pred_bb))
-            elseif incoming_val isa LLVM.AllocaInst
-                # Emit `load access_ty, ptr alloca` right before pred_bb's terminator
-                # so the value is available when control transfers into phi_bb.
+            elseif incoming_val isa Union{LLVM.AllocaInst, LLVM.GetElementPtrInst}
+                # Emit the leaf's load right before pred_bb's terminator so the value
+                # is available when control transfers into phi_bb.
                 term = pred_bb.terminator
                 term === nothing && return nothing
                 loaded = LLVM.@dispose builder=LLVM.IRBuilder() begin
                     LLVM.position!(builder, insertion_point(term))
-                    LLVM.load!(builder, access_ty, incoming_val, "vmirror_leaf_load")
+                    load_function_leaf!(builder, incoming_val, access_ty)
                 end
                 push!(new_phi.incoming, (loaded, pred_bb))
             else
@@ -5310,10 +5477,10 @@ function build_function_ptr_value_mirror!(val::LLVM.Value, access_ty::LLVM.LLVMT
         # the load is inserted right before the select itself — that's the
         # closest dominating point where both source pointers are known live.
         function operand_value(op)
-            if op isa LLVM.AllocaInst
+            if op isa Union{LLVM.AllocaInst, LLVM.GetElementPtrInst}
                 return LLVM.@dispose builder=LLVM.IRBuilder() begin
                     LLVM.position!(builder, insertion_point(val))
-                    LLVM.load!(builder, access_ty, op, "vmirror_sel_load")
+                    load_function_leaf!(builder, op, access_ty)
                 end
             else
                 return build_function_ptr_value_mirror!(op, access_ty, cache)
@@ -5333,6 +5500,12 @@ function build_function_ptr_value_mirror!(val::LLVM.Value, access_ty::LLVM.LLVMT
     end
     return nothing
 end
+
+"""The load of `access_ty` at a leaf of a phi/select chain: at an alloca, or at an element of one with its indices clamped (`alloca_gep_bounds`)."""
+load_function_leaf!(builder::LLVM.IRBuilder, leaf::LLVM.AllocaInst, access_ty::LLVM.LLVMType) =
+    LLVM.load!(builder, access_ty, leaf, "vmirror_leaf_load")
+load_function_leaf!(builder::LLVM.IRBuilder, leaf::LLVM.GetElementPtrInst, access_ty::LLVM.LLVMType) =
+    LLVM.load!(builder, access_ty, clamped_alloca_gep!(builder, leaf, access_ty), "vmirror_leaf_load")
 
 """
     flatten_chained_geps_on_allocas!(mod::LLVM.Module)
@@ -5732,4 +5905,149 @@ function propagate_psb_alignment!(mod::LLVM.Module, dl::LLVM.DataLayout)
             end
         end
     end
+end
+
+"""
+    branch_mixed_pointer_select_loads!(mod::LLVM.Module)
+
+A load through a select between a Function pointer and a PhysicalStorageBuffer one
+becomes a branch to two loads, merged by a phi. SPIR-V has no pointer that is either:
+the two storage classes are two pointer types, and nothing converts one into the other.
+
+LLVM makes such a select from `c ? a[i] : b[j]` with one array private and the other
+in device memory: a load in each arm, merged into one load through the select. That is
+right because one load runs, and so is the branch; loading both would read the other
+address, which may not be valid (device memory can fault). Hikari's node interpreter
+reads an input as `o == NO_SLOT ? ins.k[i] : stack[o]`, and in a closest-hit shader the
+instruction is read from device memory while the stack is private.
+
+A select of two Function pointers is `lower_phi_select_function_ptrs!`'s, which reads
+both: in private memory that is safe once the indices are clamped, and cheaper than a
+branch. Runs before structurization; what it adds is a diamond.
+
+A phi of both kinds is the same choice made by the edge that came in, and structurization
+makes it a select: GPUArrays' `generic_trimatmul!` reads `unit ? oA : A[i, i]` for a
+complex matrix, `oA` an argument copied to a private alloca. It becomes a select on that
+edge (`select_of_mixed_phi!`) and is branched the same way.
+"""
+function branch_mixed_pointer_select_loads!(mod::LLVM.Module)
+    for fn in mod.functions
+        isempty(fn.blocks) && continue
+        loads = LLVM.LoadInst[]
+        for bb in fn.blocks, inst in bb.instructions
+            inst isa LLVM.LoadInst || continue
+            LLVM.API.LLVMGetVolatile(inst) == 0 || continue
+            LLVM.API.LLVMGetOrdering(inst) == LLVM.API.LLVMAtomicOrderingNotAtomic || continue
+            mixed_pointer_choice(inst.operands[1]) || continue
+            push!(loads, inst)
+        end
+        isempty(loads) && continue
+        LLVM.@dispose builder = LLVM.IRBuilder() begin
+            selects = IdDict{LLVM.PHIInst,LLVM.Value}()
+            for load in loads
+                ptr = load.operands[1]
+                if ptr isa LLVM.PHIInst
+                    LLVM.API.LLVMSetOperand(load, 0, get!(() -> select_of_mixed_phi!(builder, ptr), selects, ptr))
+                end
+                branch_select_load!(builder, load)
+            end
+            for phi in keys(selects)
+                isempty(LLVM.uses(phi)) && LLVM.erase!(phi)
+            end
+        end
+    end
+    return nothing
+end
+
+"""Whether `ptr` chooses between a device pointer and a private one, by a select or a phi
+whose private choices are each an alloca or an element of one (`private_root`)."""
+mixed_pointer_choice(@nospecialize(ptr)) = false
+mixed_pointer_choice(sel::LLVM.SelectInst) =
+    is_psb_pointer(sel.operands[2]) != is_psb_pointer(sel.operands[3])
+function mixed_pointer_choice(phi::LLVM.PHIInst)
+    phi.value_type isa LLVM.PointerType || return false
+    device = [is_psb_pointer(v) for (v, _) in phi.incoming]
+    any(device) && !all(device) || return false
+    return all(private_root(v) !== nothing for (v, _) in phi.incoming if !is_psb_pointer(v))
+end
+
+"""The alloca a private pointer is, or is an element of; `nothing` for any other."""
+private_root(@nospecialize(v)) = nothing
+private_root(a::LLVM.AllocaInst) = a
+private_root(gep::LLVM.GetElementPtrInst) = private_root(gep.operands[1])
+
+"""
+    select_of_mixed_phi!(builder, phi) -> LLVM.Value
+
+`phi`, a choice between device and private pointers (`mixed_pointer_choice`), as a select
+on which kind its edge brought, between a phi of the device pointers and one of the
+private ones. Where an edge brings the other kind, the device phi takes poison and the
+private one an alloca the phi chooses elsewhere, which dominates every edge; the select
+never picks either there.
+"""
+function select_of_mixed_phi!(builder::LLVM.IRBuilder, phi::LLVM.PHIInst)
+    ty = phi.value_type
+    filler = first(private_root(v) for (v, _) in phi.incoming if !is_psb_pointer(v))
+    LLVM.position!(builder, LLVM.before(phi))
+    device = LLVM.phi!(builder, LLVM.Int1Type(), "$(phi.name).device")
+    devptr = LLVM.phi!(builder, ty, "$(phi.name).devptr")
+    privptr = LLVM.phi!(builder, ty, "$(phi.name).privptr")
+    for (v, bb) in phi.incoming
+        d = is_psb_pointer(v)
+        push!(device.incoming, (LLVM.ConstantInt(LLVM.Int1Type(), d), bb))
+        push!(devptr.incoming, (d ? v : LLVM.PoisonValue(ty), bb))
+        push!(privptr.incoming, (d ? filler : v, bb))
+    end
+    first_nonphi = phi
+    while first_nonphi isa LLVM.PHIInst
+        first_nonphi = LLVM.next(first_nonphi)
+    end
+    LLVM.position!(builder, LLVM.before(first_nonphi))
+    return LLVM.select!(builder, device, devptr, privptr, "$(phi.name).sel")
+end
+
+"""
+Split the block of `load`, a load through a select, so that the select's condition
+branches to a block loading the one pointer and a block loading the other. The rest of
+the block continues in a third, which merges the two values; its successors' phis are
+retargeted to it.
+"""
+function branch_select_load!(builder::LLVM.IRBuilder, load::LLVM.LoadInst)
+    sel = load.operands[1]
+    cond, a, b = sel.operands[1], sel.operands[2], sel.operands[3]
+    blk = LLVM.parent(load)
+    left = LLVM.BasicBlock(LLVM.after(blk), "$(blk.name).sel.a")
+    right = LLVM.BasicBlock(LLVM.after(left), "$(blk.name).sel.b")
+    rest = LLVM.BasicBlock(LLVM.after(right), "$(blk.name).sel.rest")
+    tail = LLVM.Instruction[]
+    let next = LLVM.next(load)
+        while next !== nothing
+            push!(tail, next)
+            next = LLVM.next(next)
+        end
+    end
+    for t in tail
+        LLVM.move!(t, LLVM.at_end(rest))
+    end
+    for s in rest.terminator.successors, phi in [i for i in s.instructions if i isa LLVM.PHIInst]
+        retarget_incoming!(phi, blk, rest)
+    end
+    ty, align = load.value_type, LLVM.alignment(load)
+    function arm(block, ptr)
+        LLVM.position!(builder, LLVM.at_end(block))
+        value = LLVM.load!(builder, ty, ptr)
+        LLVM.alignment!(value, align)
+        LLVM.br!(builder, rest)
+        return value
+    end
+    va, vb = arm(left, a), arm(right, b)
+    LLVM.position!(builder, LLVM.at_end(blk))
+    LLVM.br!(builder, cond, left, right)
+    LLVM.position!(builder, LLVM.at_begin(rest))
+    merged = LLVM.phi!(builder, ty, "$(load.name).sel")
+    append!(merged.incoming, [(va, left), (vb, right)])
+    LLVM.replace_uses!(load, merged)
+    LLVM.erase!(load)
+    isempty(LLVM.uses(sel)) && LLVM.erase!(sel)
+    return nothing
 end

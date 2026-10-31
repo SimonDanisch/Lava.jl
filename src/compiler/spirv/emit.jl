@@ -58,28 +58,9 @@ mutable struct SPIRVEmitterState
     # Used to detect when a load's expected result type differs from the pointer's declared
     # element type (e.g., same LLVM struct type used for ptr<i64> and ptr<i16> members).
     spirv_ptr_element_type::Dict{LLVM.Value, UInt32}
-    # ── RT shader state (set by emit_spirv_from_llvm_rt, unused for compute) ──
-    rt_payload_var_id::Union{Nothing, UInt32}
+    # ── Ray query (set by `rayquery.jl`, `nothing` until a query needs them) ──
     rt_tlas_var_id::Union{Nothing, UInt32}
     rt_accel_type_id::Union{Nothing, UInt32}
-    rt_payload_type::Symbol  # :f32, :struct, etc.
-    # Storage class of the payload variable for the current RT stage.
-    # Raygen: RayPayloadKHR. closesthit/miss/anyhit/intersection:
-    # IncomingRayPayloadKHR. Used by `payload_sc_for_state` so the access
-    # chain that loads/stores the payload picks the right storage class on
-    # every stage. Inferring it from `rt_tlas_var_id !== nothing` does not work:
-    # chit/miss/anyhit emit the TLAS descriptor too, for inline ray queries.
-    rt_payload_storage_class::UInt32
-    rt_hit_attrib_var_id::Union{Nothing, UInt32}  # HitAttributeKHR variable (vec2 barycentrics)
-    # SER: cached OpTypeHitObjectNV id + the Private-storage HitObject variable
-    # allocated lazily on first lava_rt_hit_object_* call.  Reused by every SER
-    # intrinsic in the same shader so we always reorder/execute against the same
-    # implicit hit-object slot (matches the GLSL `hitObjectNV hit;` pattern).
-    rt_hit_object_type_id::Union{Nothing, UInt32}
-    rt_hit_object_var_id::Union{Nothing, UInt32}
-    # Set true when OpIgnoreIntersectionKHR/OpTerminateRayKHR is emitted (block terminators).
-    # Suppresses the redundant OpReturn from the trailing `ret void`.
-    rt_block_terminated::Bool
     # ── Cooperative matrix (SPV_KHR_cooperative_matrix) ──
     # Cached OpTypeCooperativeMatrixKHR ids, keyed (dtype, rows, cols, use, scope).
     coopmat_type_ids::Dict{Tuple{String, Int, Int, UInt32, UInt32}, UInt32}
@@ -228,11 +209,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{Tuple{UInt32, UInt32}, UInt32}(),
         Dict{LLVM.Value, Tuple{UInt32, Vector{UInt32}, UInt32, LLVM.ArrayType}}(),
         Dict{LLVM.Value, UInt32}(),
-        nothing, nothing, nothing, :none,
-        UInt32(0),  # rt_payload_storage_class — filled in by emit_spirv_from_llvm_rt
-        nothing,
-        nothing, nothing,  # SER: rt_hit_object_type_id, rt_hit_object_var_id
-        false,
+        nothing, nothing,  # rt_tlas_var_id, rt_accel_type_id
         Dict{Tuple{String, Int, Int, UInt32, UInt32}, UInt32}(),  # coopmat types
         Dict{Tuple{Int, UInt32}, UInt32}(),               # tensor layout types
         Dict{Tuple{Int, Bool, Vector{UInt32}}, UInt32}(), # tensor view types
@@ -465,7 +442,7 @@ function get_value_id!(state::SPIRVEmitterState, val::LLVM.Value)
        val isa LLVM.UndefValue || val isa LLVM.PoisonValue ||
        val isa LLVM.ConstantAggregateZero || val isa LLVM.ConstantArray ||
        val isa LLVM.ConstantDataArray || val isa LLVM.ConstantVector ||
-       val isa LLVM.ConstantDataVector
+       val isa LLVM.ConstantDataVector || val isa LLVM.ConstantStruct
         id = map_constant!(state.type_ctx, val)
         state.value_map[val] = id
         return id
@@ -914,9 +891,6 @@ function emit_block!(state::SPIRVEmitterState, bb::LLVM.BasicBlock)
     # A new block may be reached from anywhere, so nothing is known about what
     # the cooperative-matrix component variables hold. See the field's comment.
     empty!(state.coopmat_var_contents)
-
-    # Reset RT block termination flag for this block
-    state.rt_block_terminated = false
 
     # PHI nodes: defer to after all blocks are emitted (operands may be forward references)
     # Their result IDs are already pre-allocated in value_map.
@@ -2252,9 +2226,12 @@ function resolve_struct_field_store!(state::SPIRVEmitterState, ptr::LLVM.Value,
     # LLVM may also type-pun constants (e.g. `store i32 0` instead of `store float 0.0`).
     # In that case the store type (i32) differs from field 0's type (float) but has the
     # same bit width, so we drill down to field 0 via AccessChain and bitcast the value.
+    # Into any aggregate, as `resolve_struct_field_load!` reads one: an array's leaf is
+    # reached the same way, and a `store i32 0` into the second `[1 x [4 x float]]` of a
+    # struct, at a byte offset that resolves to the array, stored the integer into it.
     need_field_bitcast = false
     target_field_ty = nothing
-    if index_path === nothing && pointee_ty isa LLVM.StructType && !(store_ty isa LLVM.PointerType)
+    if index_path === nothing && !(store_ty isa LLVM.PointerType)
         leaf_path, leaf_ty = find_zero_index_path_to_leaf(pointee_ty)
         if leaf_path !== nothing && leaf_ty !== nothing
             store_bw = llvm_type_bit_width(store_ty)
@@ -2352,6 +2329,10 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
     store_ty = value.value_type
     orig_ptr_id = ptr_id
     ptr_id, store_val_bitcast_to = resolve_struct_field_store!(state, ptr, ptr_id, store_ty, value)
+    # The value as LLVM types it, which a store decomposed into bytes takes apart: the
+    # bitcast below makes it the field's type (an `i32` into a float field is a float),
+    # and the byte stores would truncate a float.
+    llvm_val_id = val_id
 
     # If storing a pointer with a type that differs from the struct's declared member type,
     # bitcast the value to match the struct definition.
@@ -2386,15 +2367,15 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
         if psb_needs_decomposition(state, ptr, store_ty; llvm_align)
             access_align = get_alignment_for_type(store_ty)
             if store_ty isa LLVM.VectorType
-                emit_psb_decomposed_vector_store!(state, ptr_id, val_id, store_ty)
+                emit_psb_decomposed_vector_store!(state, ptr_id, llvm_val_id, store_ty)
             elseif access_align <= 4
                 # Small type (i32/float/i16) at potentially non-4-aligned address:
                 # decompose into individual byte stores with Aligned 1
-                emit_psb_decomposed_small_store!(state, ptr_id, val_id, store_ty)
+                emit_psb_decomposed_small_store!(state, ptr_id, llvm_val_id, store_ty)
             else
                 # Wide type (i64/double) at non-8-aligned address:
                 # decompose into two i32 stores with Aligned 4
-                emit_psb_decomposed_store!(state, ptr_id, val_id, store_ty)
+                emit_psb_decomposed_store!(state, ptr_id, llvm_val_id, store_ty)
             end
         else
             align = psb_access_alignment(store_ty, llvm_align)
@@ -2477,8 +2458,7 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
                         encode_instruction!(state.mod.functions, Op.OpUConvert, pointee_spirv, wide, vint)
                         old = fresh_id!(state.mod)
                         encode_instruction!(state.mod.functions, Op.OpLoad, pointee_spirv, old, ptr_id)
-                        keep = pw >= 64 ? emit_constant_u64!(state.mod, ~UInt64(0) << vw) :
-                                          emit_constant_u32!(state.mod, UInt32(~UInt32(0) << vw))
+                        keep = high_bits_mask!(state, pw, vw)
                         hi = fresh_id!(state.mod)
                         encode_instruction!(state.mod.functions, Op.OpBitwiseAnd, pointee_spirv, hi, old, keep)
                         merged = fresh_id!(state.mod)
@@ -2518,13 +2498,15 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
                     # type; bitcasting it is not (see the branch above). If the element
                     # is still wider than the value — a uint into [2 x ulong], which is
                     # what the Complex sliced-setindex reproducer produces — splice it
-                    # in with a read-modify-write so the high bits survive.
-                    elem_ty = pointee_ty.element_type
+                    # in with a read-modify-write so the high bits survive. Drilled to
+                    # the leaf: the element of a nested array is still an array.
+                    leaf_path, elem_ty = find_zero_index_path_to_leaf(pointee_ty)
                     elem_spirv = map_type!(state.type_ctx, elem_ty)
                     elem_ptr_ty = map_pointer_type!(state.type_ctx, elem_spirv, sc)
                     zero_id = emit_constant_u32!(state.mod, UInt32(0))
                     drill = fresh_id!(state.mod)
-                    encode_instruction!(state.mod.functions, Op.OpAccessChain, elem_ptr_ty, drill, ptr_id, zero_id)
+                    encode_instruction!(state.mod.functions, Op.OpAccessChain, elem_ptr_ty, drill, ptr_id,
+                                        ntuple(_ -> zero_id, length(leaf_path))...)
                     ptr_id = drill
                     if elem_ty isa LLVM.IntegerType && val_ty != elem_ty
                         ew = elem_ty.width
@@ -2547,8 +2529,7 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
                             encode_instruction!(state.mod.functions, Op.OpUConvert, elem_spirv, wide, vint)
                             old = fresh_id!(state.mod)
                             encode_instruction!(state.mod.functions, Op.OpLoad, elem_spirv, old, ptr_id)
-                            keep = ew >= 64 ? emit_constant_u64!(state.mod, ~UInt64(0) << vw) :
-                                              emit_constant_u32!(state.mod, UInt32(~UInt32(0) << vw))
+                            keep = high_bits_mask!(state, ew, vw)
                             hi = fresh_id!(state.mod)
                             encode_instruction!(state.mod.functions, Op.OpBitwiseAnd, elem_spirv, hi, old, keep)
                             merged = fresh_id!(state.mod)
@@ -2580,6 +2561,20 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
             encode_instruction!(state.mod.functions, Op.OpStore, ptr_id, val_id)
         end
     end
+end
+
+"""
+    high_bits_mask!(state, slot, low) -> UInt32
+
+The constant keeping the bits of a `slot`-bit integer above its low `low`, of the slot's
+SPIR-V width: a read-modify-write splices a narrower value into the low bits. It was a
+32-bit constant for any slot below 64 bits, which a `ushort` slot rejects (a `Bool`
+written into a 16-bit one, in GPUArrays' `istril`).
+"""
+function high_bits_mask!(state::SPIRVEmitterState, slot::Integer, low::Integer)
+    w = spirv_int_width(slot)
+    mask = (w >= 64 ? ~UInt64(0) : (UInt64(1) << w) - UInt64(1)) & (~UInt64(0) << low)
+    return map_constant!(state.type_ctx, LLVM.ConstantInt(LLVM.IntType(w), mask))
 end
 
 """
@@ -6076,8 +6071,6 @@ end
 # ================================================================
 
 function emit_ret!(state::SPIRVEmitterState, inst::LLVM.RetInst)
-    # Skip if block was already terminated by OpIgnoreIntersectionKHR/OpTerminateRayKHR
-    state.rt_block_terminated && return
     ops = inst.operands
     if isempty(ops)
         encode_instruction!(state.mod.functions, Op.OpReturn)
@@ -6088,9 +6081,6 @@ function emit_ret!(state::SPIRVEmitterState, inst::LLVM.RetInst)
 end
 
 function emit_br!(state::SPIRVEmitterState, inst::LLVM.BrInst)
-    # Skip if block was already terminated by OpIgnoreIntersectionKHR/OpTerminateRayKHR
-    state.rt_block_terminated && return
-
     current_bb = inst.parent
 
     if LLVM.isconditional(inst)
@@ -6678,8 +6668,14 @@ function defer_phi!(state::SPIRVEmitterState, inst::LLVM.PHIInst, block_label_id
 
     llvm_ty = inst.value_type
     result_ty = if llvm_ty isa LLVM.PointerType
-        # Opaque pointer — infer pointee type from uses or incoming values
-        pointee = infer_pointee_from_users(inst)
+        # Opaque pointer. The pointee type map first: the loads, stores and GEPs
+        # through the phi are emitted against it, so the phi's type cannot
+        # disagree with them. A search of the users took the first in use-list
+        # order, a byte-offset GEP read as `i32` 16 bytes in, and typed `uint*` a
+        # phi loaded as `float` at offset 0 (test_phi_pointee_agrees.jl). The
+        # search is for a phi only reached through byte offsets or other phis.
+        pointee = get_pointee_type(state.type_ctx.ptm, inst)
+        pointee === nothing && (pointee = infer_pointee_from_users(inst))
         if pointee === nothing
             # Try incoming values
             n_inc = LLVM.API.LLVMCountIncoming(inst)
@@ -7264,37 +7260,8 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             return nothing
         end
 
-        # Check for RT intrinsics → OpTraceRayKHR, payload load/store
-        if fn_name == "lava_rt_trace_ray"
-            return emit_rt_trace_ray!(state, inst)
-        elseif fn_name == "lava_rt_payload_store_f32"
-            return emit_rt_payload_store!(state, inst)
-        elseif fn_name == "lava_rt_payload_load_f32"
-            return emit_rt_payload_load!(state, inst)
-        elseif fn_name == "lava_rt_payload_store_f32_at"
-            return emit_rt_payload_store_at!(state, inst)
-        elseif fn_name == "lava_rt_payload_load_f32_at"
-            return emit_rt_payload_load_at!(state, inst)
-        elseif fn_name == "lava_rt_hit_attrib_load_f32_at"
-            return emit_rt_hit_attrib_load_at!(state, inst)
-        elseif fn_name == "lava_rt_hit_attrib_store_f32_at"
-
-            return emit_rt_hit_attrib_store_at!(state, inst)
-
-        elseif fn_name == "lava_rt_report_intersection"
-
-            return emit_rt_report_intersection!(state, inst)
-        elseif fn_name == "lava_rt_ignore_intersection"
-            return emit_rt_ignore_intersection!(state, inst)
-        elseif fn_name == "lava_rt_terminate_ray"
-            return emit_rt_terminate_ray!(state, inst)
-        elseif fn_name == "lava_rt_hit_object_trace_ray"
-            return emit_rt_hit_object_trace_ray!(state, inst)
-        elseif fn_name == "lava_rt_reorder_thread"
-            return emit_rt_reorder_thread!(state, inst)
-        elseif fn_name == "lava_rt_hit_object_execute_shader"
-            return emit_rt_hit_object_execute_shader!(state, inst)
-        elseif fn_name == "lava_ray_query_init"
+        # Ray-query intrinsics → OpRayQuery*KHR
+        if fn_name == "lava_ray_query_init"
             return emit_ray_query_init!(state, inst)
         elseif fn_name == "lava_ray_query_proceed"
             return emit_ray_query_proceed!(state, inst)
@@ -7888,17 +7855,70 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
         state.value_map[inst] = result_id
         return
     elseif startswith(base_name, "llvm.bitreverse")
-        # Bit reverse → OpBitReverse
+        # Bit reverse → OpBitReverse, which Vulkan allows on 32-bit integers only, as
+        # OpBitCount (VUID-RuntimeSpirv-None-10824). A narrower value is reversed in
+        # the high bits of a 32-bit one and shifted down; a 64-bit one is its two
+        # halves reversed and swapped.
         val_id = get_value_id!(state, inst.operands[1])
-        result_ty = map_type!(state.type_ctx, inst.value_type)
-        result_id = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpBitReverse, result_ty, result_id, val_id)
+        result_llvm_ty = inst.value_type
+        result_llvm_ty isa LLVM.IntegerType ||
+            error("llvm.bitreverse on $(result_llvm_ty) is not supported")
+        result_ty = map_type!(state.type_ctx, result_llvm_ty)
+        bw = result_llvm_ty.width
+        u32_llvm = LLVM.IntType(32)
+        u32_ty = map_type!(state.type_ctx, u32_llvm)
+        function emit_op(op, ty, args...)
+            id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, op, ty, id, args...)
+            return id
+        end
+        reverse32(v) = emit_op(Op.OpBitReverse, u32_ty, v)
+        result_id = if bw == 32
+            reverse32(val_id)
+        elseif bw < 32
+            wide = emit_op(Op.OpUConvert, u32_ty, val_id)
+            shift = map_constant!(state.type_ctx, LLVM.ConstantInt(u32_llvm, 32 - bw))
+            down = emit_op(Op.OpShiftRightLogical, u32_ty, reverse32(wide), shift)
+            emit_op(Op.OpUConvert, result_ty, down)
+        elseif bw == 64
+            c32 = map_constant!(state.type_ctx, LLVM.ConstantInt(result_llvm_ty, 32))
+            lo = emit_op(Op.OpUConvert, u32_ty, val_id)
+            hi = emit_op(Op.OpUConvert, u32_ty, emit_op(Op.OpShiftRightLogical, result_ty, val_id, c32))
+            # The low half reversed is the high half of the result, and the other way round.
+            new_hi = emit_op(Op.OpShiftLeftLogical, result_ty, emit_op(Op.OpUConvert, result_ty, reverse32(lo)), c32)
+            new_lo = emit_op(Op.OpUConvert, result_ty, reverse32(hi))
+            emit_op(Op.OpBitwiseOr, result_ty, new_hi, new_lo)
+        else
+            error("llvm.bitreverse on a $bw-bit integer is not supported")
+        end
         state.value_map[inst] = result_id
         return
     elseif startswith(base_name, "llvm.bswap")
-        # Byte swap — not available in SPIR-V, implement with shifts
-        # For now, error with clear message
-        error("llvm.bswap not yet implemented in SPIR-V emitter")
+        # Byte swap: SPIR-V has no instruction for it, so byte `i` of the value is
+        # shifted to byte `n - 1 - i` and masked there. LLVM forms a bswap from
+        # byte-shuffling code of its own accord.
+        val_id = get_value_id!(state, inst.operands[1])
+        llvm_ty = inst.value_type
+        (llvm_ty isa LLVM.IntegerType && llvm_ty.width % 16 == 0) ||
+            error("llvm.bswap on $(llvm_ty) is not supported")
+        ty = map_type!(state.type_ctx, llvm_ty)
+        n = llvm_ty.width ÷ 8
+        constant(v) = map_constant!(state.type_ctx, LLVM.ConstantInt(llvm_ty, v))
+        function emit_bin(op, a, b)
+            id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, op, ty, id, a, b)
+            return id
+        end
+        result_id = nothing
+        for i in 0:(n - 1)
+            j = n - 1 - i
+            moved = j > i ? emit_bin(Op.OpShiftLeftLogical, val_id, constant(8 * (j - i))) :
+                    emit_bin(Op.OpShiftRightLogical, val_id, constant(8 * (i - j)))
+            byte = emit_bin(Op.OpBitwiseAnd, moved, constant(UInt64(0xff) << (8 * j)))
+            result_id = result_id === nothing ? byte : emit_bin(Op.OpBitwiseOr, result_id, byte)
+        end
+        state.value_map[inst] = result_id
+        return
     elseif name == "llvm.spv.group.memory.barrier.with.group.sync"
         # Workgroup barrier: OpControlBarrier Workgroup Workgroup
         # Vulkan memory model requires MakeAvailableKHR + MakeVisibleKHR for writes

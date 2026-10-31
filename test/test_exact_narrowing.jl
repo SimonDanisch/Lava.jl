@@ -8,7 +8,7 @@
 # being NaN. The device side, the same sequence after SPIR-V, is Mantle's
 # `test_float_conversion_exact.jl`.
 
-using Test
+using Test, Random
 using Lava
 import LLVM
 
@@ -54,4 +54,47 @@ end
     end
     @test isnan(reinterpret(Float16, narrowed(NaN32)))
     @test narrowing_errors() == 0
+end
+
+# Half arithmetic used for more than storing is computed in Float32 and narrowed
+# by the same sequence (`narrowed!`): one rounding of the Float32 result is the
+# correctly rounded half result, which is what Julia's Float16 operations
+# compute. The edges against each other, then random pairs.
+"The pass's half `op` as LLVM IR: `define i16 @halfop(i16, i16)`, the result's bits."
+function half_arithmetic_ir(op)
+    LLVM.@dispose ctx = LLVM.Context() begin
+        mod = LLVM.Module("halfop")
+        i16, half = LLVM.IntType(16), LLVM.HalfType()
+        fn = LLVM.Function(mod, "halfop", LLVM.FunctionType(i16, [i16, i16]))
+        push!(LLVM.function_attributes(fn), LLVM.EnumAttribute("alwaysinline"))
+        entry = LLVM.BasicBlock(fn, "entry")
+        LLVM.@dispose builder = LLVM.IRBuilder() begin
+            LLVM.position!(builder, LLVM.at_end(entry))
+            a, b = (LLVM.bitcast!(builder, p, half) for p in LLVM.parameters(fn))
+            t = LLVM.binop!(builder, op, a, b)
+            h = Lava.narrowed!(builder, t)
+            LLVM.erase!(t)
+            LLVM.ret!(builder, LLVM.bitcast!(builder, h, i16))
+        end
+        string(mod)
+    end
+end
+
+const HALF_OPS = ((+, LLVM.API.LLVMFAdd), (-, LLVM.API.LLVMFSub), (*, LLVM.API.LLVMFMul), (/, LLVM.API.LLVMFDiv))
+for (f, op) in HALF_OPS
+    @eval halfop(::typeof($f), a::Float16, b::Float16) = reinterpret(Float16,
+        Base.llvmcall(($(half_arithmetic_ir(op)), "halfop"), UInt16, Tuple{UInt16, UInt16},
+                      reinterpret(UInt16, a), reinterpret(UInt16, b)))
+end
+
+@testset "half arithmetic is narrowed like Julia's Float16 operations" begin
+    same(a, b) = isnan(a) ? isnan(b) : a === b
+    edges = Float16[0, -0.0, 1, -1, 0.5, 3, 65504, -65504, floatmin(Float16), nextfloat(Float16(0)),
+                    prevfloat(floatmin(Float16)), 1 + eps(Float16), Inf16, -Inf16, NaN16, 2049, 0.1]
+    rng = Random.MersenneTwister(16)
+    as = reinterpret(Float16, rand(rng, UInt16, 1 << 20)); bs = reinterpret(Float16, rand(rng, UInt16, 1 << 20))
+    for (f, _) in HALF_OPS
+        @test all(same(halfop(f, a, b), f(a, b)) for a in edges, b in edges)
+        @test count(i -> !same(halfop(f, as[i], bs[i]), f(as[i], bs[i])), eachindex(as)) == 0
+    end
 end

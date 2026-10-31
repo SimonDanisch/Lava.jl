@@ -47,10 +47,6 @@ export @setup_workload
 # shader author writes directly when instantiating a tile against this compiler.
 export MatrixA, MatrixB, Accumulator
 
-# Ray-tracing device intrinsics. The pipeline that dispatches them is Mantle's;
-# these are what a shader body calls.
-# SER (SPV_NV_shader_invocation_reorder)
-
 # Re-export Raycore.Ray so `using Lava` users get Ray without ambiguity
 export Ray
 
@@ -151,8 +147,8 @@ using GeometryBasics
 # that a field inserted anywhere but the end would misalign it silently. Both
 # copies are deleted: there is one type, and Mantle's `caps(ctx::VkContext)` is
 # the method that fills it in.
-# The module itself, not only names from it: `device/gfx_intrinsics.jl` and
-# `device/rt_intrinsics.jl` write `@lava_device_override KernelInterface.<name>`,
+# The module itself, not only names from it: `device/gfx_intrinsics.jl` writes
+# `@lava_device_override KernelInterface.<name>`,
 # which needs the module binding. A bare `using KernelInterface: a, b` brings in
 # the names and NOT the module.
 import KernelInterface
@@ -194,6 +190,7 @@ include("compiler/passes/prepare_vulkan.jl")
 include("compiler/passes/lower_intrinsics.jl")
 include("compiler/passes/exact_narrowing.jl")
 include("compiler/passes/wide_division.jl")
+include("compiler/passes/odd_integers.jl")
 # shared_memory.jl — consolidated into prepare_vulkan.jl
 
 # ---- Compiler (depends on emitter + passes) ----
@@ -203,9 +200,9 @@ include("compiler/compilation.jl")
 # Compiled kernels and stages, kept with their `CodeInstance`s: the lookups in
 # front of `compilation.jl`'s compilers, and what a package image persists.
 include("compiler/cache.jl")
+include("compiler/function_cache.jl")
 # Planned files consolidated into emit.jl (4431 lines) and compilation.jl:
 #   sourcemap.jl, intrinsics.jl, control_flow.jl, decorations.jl, compute.jl
-include("compiler/spirv/raytracing.jl")    # RT stages, OpTraceRayKHR, payload handling
 include("compiler/spirv/rayquery.jl")     # VK_KHR_ray_query capabilities + emission
 include("compiler/spirv/coopmat.jl")      # SPV_KHR_cooperative_matrix emission
 include("compiler/spirv/graphics.jl")     # Graphics stages, I/O variables, emit_vertex
@@ -214,7 +211,6 @@ include("compiler/spirv/graphics.jl")     # Graphics stages, I/O variables, emit
 # device/array.jl — LavaDeviceArray defined in array/lavaarray.jl
 include("device/math.jl")
 include("device/quirks.jl")
-include("device/rt_intrinsics.jl")  # RT builtins + trace_ray intrinsic
 include("device/ray_query_intrinsics.jl")  # lava_ray_query_init
 include("device/gfx_intrinsics.jl")  # Graphics builtins + shader I/O intrinsics
 include("device/printf.jl")          # @lava_printf → NonSemantic.DebugPrintf

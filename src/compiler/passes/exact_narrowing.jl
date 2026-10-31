@@ -18,6 +18,15 @@
 #     Float16 (Radeon 8060S, Mesa 26.x: 68 of 2^20 random products differ from
 #     Julia, 0 from the single rounding), with `NoContraction` on the multiply and
 #     on the conversion.
+#   - The same NVIDIA fold reaches half arithmetic. InstCombine turns
+#     `Float16(Float32(a) * Float32(b))` of two halves into `fmul half a, b` (the
+#     product is exact in Float32, so that is the same value), and the widened
+#     product, added to anything, came back unrounded on the Ada: 65166 of 65536
+#     elements, and DNNKernels' SwiGLU fused into a ConvRot pass. So half
+#     arithmetic used for more than storing is computed in Float32 and narrowed
+#     here as well: one rounding of the Float32 result is the correctly rounded
+#     half sum, difference and product, since 24 >= 2 * 11 + 2 bits; a quotient
+#     is as exact as the device's Float32 division.
 #
 # What neither compiler sees through is a half built from integer operations: it
 # is a 16-bit pattern like one loaded from memory. So a narrowing is spelled as
@@ -41,27 +50,46 @@
 
 Replace every `fptrunc float to half` (scalar or vector) that is used for more
 than storing, or whose input is float arithmetic, with the same rounding written
-in integer operations on the float's bits. Returns whether anything changed.
+in integer operations on the float's bits; and every half add, subtract,
+multiply or divide used for more than storing with the operation in Float32,
+narrowed the same way. Returns whether anything changed.
 """
 function narrow_in_integers!(mod::LLVM.Module)
-    found = LLVM.FPTruncInst[]
+    found = LLVM.Instruction[]
     for f in LLVM.functions(mod), bb in LLVM.blocks(f), inst in LLVM.instructions(bb)
-        inst isa LLVM.FPTruncInst || continue
-        scalartype(LLVM.value_type(inst)) isa LLVM.HalfType || continue
-        x = LLVM.operands(inst)[1]
-        scalartype(LLVM.value_type(x)) isa LLVM.FloatType || continue
-        (absorbable(x) || !onlystored(inst)) && push!(found, inst)
+        narrowable(inst) && push!(found, inst)
     end
     isempty(found) && return false
     LLVM.@dispose builder = LLVM.IRBuilder() begin
         for t in found
             LLVM.position!(builder, LLVM.before(t))
-            h = narrow_bits!(builder, LLVM.operands(t)[1])
+            h = narrowed!(builder, t)
             LLVM.replace_uses!(t, h)
             LLVM.erase!(t)
         end
     end
     return true
+end
+
+const HalfArithmetic = Union{LLVM.FAddInst, LLVM.FSubInst, LLVM.FMulInst, LLVM.FDivInst}
+
+"Whether `narrow_in_integers!` replaces `inst`."
+narrowable(::LLVM.Instruction) = false
+function narrowable(inst::LLVM.FPTruncInst)
+    scalartype(LLVM.value_type(inst)) isa LLVM.HalfType || return false
+    x = LLVM.operands(inst)[1]
+    scalartype(LLVM.value_type(x)) isa LLVM.FloatType || return false
+    return absorbable(x) || !onlystored(inst)
+end
+narrowable(inst::HalfArithmetic) =
+    scalartype(LLVM.value_type(inst)) isa LLVM.HalfType && !onlystored(inst)
+
+"`inst`'s half result, rounded in integer operations."
+narrowed!(builder::LLVM.IRBuilder, t::LLVM.FPTruncInst) = narrow_bits!(builder, LLVM.operands(t)[1])
+function narrowed!(builder::LLVM.IRBuilder, t::HalfArithmetic)
+    F = shaped(LLVM.FloatType(), LLVM.value_type(t))
+    a, b = (LLVM.fpext!(builder, x, F) for x in LLVM.operands(t))
+    return narrow_bits!(builder, LLVM.binop!(builder, LLVM.opcode(t), a, b))
 end
 
 """

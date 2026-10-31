@@ -3,7 +3,7 @@
 # Extends the compute SPIR-V emitter to support all 5 graphics shader stages:
 # - Vertex, Fragment, Geometry, TessellationControl, TessellationEvaluation
 #
-# Follows the same pattern as raytracing.jl:
+# Follows the compute emitter's pattern:
 # 1. Same LLVM passes + BDA entry wrapper
 # 2. Stage-specific execution model, capabilities, execution modes
 # 3. Stage-specific builtin globals (VertexIndex, FragCoord, TessCoord, etc.)
@@ -121,7 +121,7 @@ GfxIOState() = GfxIOState(
     emit_spirv_from_llvm_gfx(llvm_mod, entry_name, stage; config=nothing)
 
 Emit SPIR-V from LLVM IR for a graphics shader stage.
-Same skeleton as `emit_spirv_from_llvm` (compute) and `emit_spirv_from_llvm_rt` but:
+Same skeleton as `emit_spirv_from_llvm` (compute) but:
 1. Execution model = graphics stage (Vertex, Fragment, Geometry, etc.)
 2. No LocalSize execution mode (except geometry/tessellation have stage-specific modes)
 3. Geometry capability for geometry stage, Tessellation for tess stages

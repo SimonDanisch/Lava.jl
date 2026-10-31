@@ -143,31 +143,38 @@ whether it did. LLVM merges a pair of `UInt32` fields into one `i64` like this, 
 `Raycore.SetKey` that a `phi` picks. The alloca retyping pass splits these too, but it
 leaves alone an alloca that is also passed to a call, and indexing such an alloca in `i64`
 gives a pointer whose type differs from the stored object's, which SPIR-V rejects.
+
+Floating-point elements are split the same way, each part bitcast to and from the
+element: a `ComplexF32` argument lands in a `[2 x float]` alloca as one `i64` store.
 """
 function split_wide_access!(access::LLVM.Instruction, alloca::LLVM.Instruction, array_type::LLVM.ArrayType)
     elem = array_type.element_type
-    elem isa LLVM.IntegerType || return false
+    (elem isa LLVM.IntegerType || elem isa LLVM.FloatingPointType) || return false
     wide = access isa LLVM.StoreInst ? access.operands[1].value_type : access.value_type
     wide isa LLVM.IntegerType || return false
-    bits = elem.width
+    bits = llvm_type_bit_width(elem)
+    bits > 0 || return false
     (wide.width > bits && wide.width % bits == 0) || return false
     parts = wide.width ÷ bits
     parts <= array_type.length || return false
     i64 = LLVM.Int64Type()
+    part_ty = LLVM.IntType(bits)
     LLVM.@dispose builder=LLVM.IRBuilder() begin
         LLVM.position!(builder, insertion_point(access))
         slot(p) = LLVM.gep!(builder, array_type, alloca,
                             LLVM.Value[LLVM.ConstantInt(i64, 0), LLVM.ConstantInt(i64, p)], "wide_part")
+        as_elem(v) = elem == part_ty ? v : LLVM.bitcast!(builder, v, elem)
+        as_part(v) = elem == part_ty ? v : LLVM.bitcast!(builder, v, part_ty)
         if access isa LLVM.StoreInst
             v = access.operands[1]
             for p in 0:(parts - 1)
                 shifted = p == 0 ? v : LLVM.lshr!(builder, v, LLVM.ConstantInt(wide, p * bits))
-                LLVM.store!(builder, LLVM.trunc!(builder, shifted, elem), slot(p))
+                LLVM.store!(builder, as_elem(LLVM.trunc!(builder, shifted, part_ty)), slot(p))
             end
         else
             combined = nothing
             for p in 0:(parts - 1)
-                part = LLVM.zext!(builder, LLVM.load!(builder, elem, slot(p)), wide)
+                part = LLVM.zext!(builder, as_part(LLVM.load!(builder, elem, slot(p))), wide)
                 part = p == 0 ? part : LLVM.shl!(builder, part, LLVM.ConstantInt(wide, p * bits))
                 combined = combined === nothing ? part : LLVM.or!(builder, combined, part)
             end
