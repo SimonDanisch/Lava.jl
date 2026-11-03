@@ -61,6 +61,28 @@ end
     end
 end
 
+@testset "A wide read across padding joins the fields" begin
+    LLVM.Context() do ctx
+        mod = parse(
+            LLVM.Module, """
+            define i64 @pair() {
+            entry:
+              %a = alloca { float, i8 }
+              %p = getelementptr { float, i8 }, ptr %a, i32 0, i32 0
+              %v = load i64, ptr %p, align 8
+              ret i64 %v
+            }
+            """
+        )
+        Lava.decompose_typepun_gep_loads!(mod, mod.datalayout)
+        @test LLVM.verify(mod) === nothing
+        ir = string(mod)
+        @test !occursin("load i64", ir)
+        # The `i8` keeps its place in the integer, past the float and not next to it.
+        @test occursin(r"shl i64 %[^,]+, 32", ir)
+    end
+end
+
 @testset "Owned result fields exclude unspecified padding" begin
     LLVM.Context() do ctx
         mod = parse(

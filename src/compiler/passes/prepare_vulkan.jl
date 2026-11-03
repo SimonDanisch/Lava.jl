@@ -4140,9 +4140,14 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
 
                         isempty(selected) && continue
 
-                        # Every byte must be represented. A wider load spanning
-                        # partial fields or padding cannot use whole-field joins.
-                        sum(f -> llvm_type_size(f[2]), selected; init=0) == load_size || continue
+                        # A field the load covers only in part has no whole-field join.
+                        # A gap between the selected fields is padding, whose bytes have
+                        # no value: `{ float, i8 }` is copied as one `i64`, and leaving
+                        # that load to the emitter lost the `i8` or failed validation.
+                        overlapping = count(all_fields) do (_, fty, foff)
+                            foff < gep_byte_off + load_size && foff + llvm_type_size(fty) > gep_byte_off
+                        end
+                        overlapping == length(selected) || continue
 
                         # Verify all fields are standard sizes
                         all(f -> llvm_type_size(f[2]) in (1, 2, 4, 8), selected) || continue
