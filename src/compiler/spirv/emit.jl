@@ -775,7 +775,7 @@ function function_parameter_type!(state::SPIRVEmitterState, param::LLVM.Argument
     ty = param.value_type
     ty isa LLVM.PointerType || return map_type!(state.type_ctx, ty)
     id = map_pointer_type_for_value!(state.type_ctx, param)
-    if get_pointer_storage_class(param) == SC.PhysicalStorageBuffer
+    if get_pointer_storage_class(param) in (SC.PhysicalStorageBuffer, SC.Workgroup)
         # ArrayStride is part of a pointer type's linkage identity. Both the
         # declaration and definition need it, even if only the callee indexes it.
         pointee = @something get_pointee_type(state.type_ctx.ptm, param)

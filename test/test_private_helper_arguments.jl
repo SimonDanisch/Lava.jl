@@ -146,3 +146,29 @@ end
         @test Lava.has_alloca_type_mismatch_at_callsites(mod.functions["relay"], mod)
     end
 end
+@testset "A helper indexing a Workgroup pointer links against its caller" begin
+    # Only the helper indexes, so only its object would carry the pointer's ArrayStride,
+    # and spirv-link refuses a declaration whose pointer type lacks the decoration.
+    LLVM.Context() do ctx
+        mod = parse(
+            LLVM.Module, """
+            @shared = internal addrspace(3) global [64 x float] undef
+            define internal float @second(ptr addrspace(3) nocapture readonly %p) noinline {
+            entry:
+              %q = getelementptr float, ptr addrspace(3) %p, i64 1
+              %v = load float, ptr addrspace(3) %q
+              ret float %v
+            }
+            define void @main() {
+            entry:
+              %first = getelementptr [64 x float], ptr addrspace(3) @shared, i64 0, i64 0
+              %v = call float @second(ptr addrspace(3) %first)
+              store float %v, ptr addrspace(3) %first
+              ret void
+            }
+            """
+        )
+        bytes, _ = Lava.emit_spirv_from_llvm(mod, "main", (64, 1, 1); cache_functions = true)
+        @test Lava.validate_spirv(bytes) === nothing
+    end
+end
