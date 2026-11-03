@@ -8662,20 +8662,37 @@ function atomic_mem_semantics(ord::LLVM.API.LLVMAtomicOrdering)::UInt32
         return MemSem.Release | LLVM_ORDERED_MEMORY | MemSem.MakeAvailableKHR
     elseif ord == LLVM.API.LLVMAtomicOrderingAcquireRelease
         return MemSem.AcquireRelease | LLVM_ORDERED_MEMORY | MemSem.MakeAvailableKHR | MemSem.MakeVisibleKHR
-    elseif ord == LLVM.API.LLVMAtomicOrderingSequentiallyConsistent
-        error("Lava cannot preserve sequentially consistent (seq_cst) atomic ordering under the Vulkan memory model; request an explicit supported ordering only when the algorithm permits it")
     end
     error("Unsupported LLVM atomic ordering: $ord")
 end
 
 atomic_ordering(inst::LLVM.AtomicCmpXchgInst) = inst.success_ordering
 atomic_ordering(inst::LLVM.Instruction) = inst.ordering
-function atomic_mem_semantics(inst::LLVM.Instruction, ptr::LLVM.Value)::UInt32
+
+# The Vulkan memory model has no sequentially consistent ordering, but a plain
+# `Atomix.@atomic` asks for it, so portable KernelAbstractions kernels must compile with it.
+# They get the strongest ordering Vulkan has for the operation. The single total order
+# across locations is lost, which kernels relying on it (Dekker-style mutual exclusion)
+# cannot survive and this compiler cannot detect.
+strongest_ordering(::LLVM.LoadInst) = LLVM.API.LLVMAtomicOrderingAcquire
+strongest_ordering(::LLVM.StoreInst) = LLVM.API.LLVMAtomicOrderingRelease
+strongest_ordering(::LLVM.Instruction) = LLVM.API.LLVMAtomicOrderingAcquireRelease
+
+function vulkan_ordering(inst::LLVM.Instruction)
     order = atomic_ordering(inst)
+    return order == LLVM.API.LLVMAtomicOrderingSequentiallyConsistent ? strongest_ordering(inst) : order
+end
+function vulkan_failure_ordering(inst::LLVM.AtomicCmpXchgInst)
+    order = inst.failure_ordering
+    return order == LLVM.API.LLVMAtomicOrderingSequentiallyConsistent ? LLVM.API.LLVMAtomicOrderingAcquire : order
+end
+
+function atomic_mem_semantics(inst::LLVM.Instruction, ptr::LLVM.Value)::UInt32
+    order = vulkan_ordering(inst)
     # LLVM allows an acquire failure even with relaxed/release success. SPIR-V
     # forbids that pair. Strengthening the success path preserves both LLVM
     # contracts; weakening the failure path would not.
-    if inst isa LLVM.AtomicCmpXchgInst && inst.failure_ordering == LLVM.API.LLVMAtomicOrderingAcquire
+    if inst isa LLVM.AtomicCmpXchgInst && vulkan_failure_ordering(inst) == LLVM.API.LLVMAtomicOrderingAcquire
         if order == LLVM.API.LLVMAtomicOrderingMonotonic
             order = LLVM.API.LLVMAtomicOrderingAcquire
         elseif order == LLVM.API.LLVMAtomicOrderingRelease
@@ -8687,7 +8704,7 @@ function atomic_mem_semantics(inst::LLVM.Instruction, ptr::LLVM.Value)::UInt32
     return semantics
 end
 function atomic_mem_semantics_acquire_only(inst::LLVM.AtomicCmpXchgInst, ptr::LLVM.Value)::UInt32
-    semantics = atomic_mem_semantics(inst.failure_ordering)
+    semantics = atomic_mem_semantics(vulkan_failure_ordering(inst))
     inst.volatile && (semantics |= MemSem.Volatile)
     return semantics
 end
@@ -8783,7 +8800,7 @@ end
 
 function emit_fence!(state::SPIRVEmitterState, inst::LLVM.FenceInst)
     scope = atomic_scope!(state, inst)
-    semantics = emit_constant_u32!(state.mod, atomic_mem_semantics(inst.ordering))
+    semantics = emit_constant_u32!(state.mod, atomic_mem_semantics(vulkan_ordering(inst)))
     encode_instruction!(state.mod.functions, Op.OpMemoryBarrier, scope, semantics)
 end
 

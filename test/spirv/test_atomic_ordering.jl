@@ -169,16 +169,29 @@ end
         bytes=emit("store atomic volatile i32 1, ptr %p syncscope(\"device\") release, align 4")
         @test semantics(bytes,Lava.Op.OpAtomicStore;scopeindex=2,semindex=3) == [(1,release|0x8000)]
     end
-    @testset "unsupported requests fail at compilation" begin
-        for body in (
-            "%v = load atomic i32, ptr %p syncscope(\"device\") seq_cst, align 4",
-            "store atomic i32 1, ptr %p syncscope(\"device\") seq_cst, align 4",
-            "%v = atomicrmw add ptr %p, i32 1 syncscope(\"device\") seq_cst",
-            "%v = cmpxchg ptr %p, i32 0, i32 1 syncscope(\"device\") seq_cst acquire",
-            "%v = cmpxchg ptr %p, i32 0, i32 1 syncscope(\"device\") acq_rel seq_cst",
-            "fence syncscope(\"device\") seq_cst")
-            @test_throws r"cannot preserve sequentially consistent" emit(body)
+    @testset "sequential consistency uses the strongest Vulkan ordering" begin
+        bytes=emit("%v = load atomic i32, ptr %p syncscope(\"device\") seq_cst, align 4")
+        @test semantics(bytes,Lava.Op.OpAtomicLoad) == [(1,acquire)]
+        bytes=emit("store atomic i32 1, ptr %p syncscope(\"device\") seq_cst, align 4")
+        @test semantics(bytes,Lava.Op.OpAtomicStore;scopeindex=2,semindex=3) == [(1,release)]
+        bytes=emit("%v = atomicrmw add ptr %p, i32 1 syncscope(\"device\") seq_cst")
+        @test semantics(bytes,Lava.Op.OpAtomicIAdd) == [(1,acqrel)]
+        bytes=emit("fence syncscope(\"device\") seq_cst")
+        @test semantics(bytes,Lava.Op.OpMemoryBarrier;scopeindex=1,semindex=2) == [(1,acqrel)]
+        for (order,failure,successsem,failsem) in (
+            ("seq_cst","seq_cst",acqrel,acquire),
+            ("seq_cst","acquire",acqrel,acquire),
+            ("seq_cst","monotonic",acqrel,0),
+            ("acq_rel","seq_cst",acqrel,acquire),
+            ("release","seq_cst",acqrel,acquire),
+            ("monotonic","seq_cst",acquire,acquire))
+            bytes=emit("%v = cmpxchg ptr %p, i32 0, i32 1 syncscope(\"device\") $order $failure")
+            @test semantics(bytes,Lava.Op.OpAtomicCompareExchange) == [(1,successsem)]
+            @test semantics(bytes,Lava.Op.OpAtomicCompareExchange;semindex=6) == [(1,failsem)]
         end
+        @test_throws r"Unsupported ordered singlethread" emit("%v = load atomic i32, ptr %p syncscope(\"singlethread\") seq_cst, align 4")
+    end
+    @testset "unsupported requests fail at compilation" begin
         @test_throws r"Unsupported ordered singlethread" emit("%v = load atomic i32, ptr %p syncscope(\"singlethread\") acquire, align 4")
         @test_throws r"Under-aligned atomic load" emit("%v = load atomic i32, ptr %p syncscope(\"device\") acquire, align 2")
         for scope in ("system","agent","unknown")
@@ -202,13 +215,13 @@ end
         @test isempty(first(instructions(r.spirv_bytes,Lava.Op.OpAtomicFAddEXT)))
         r=Lava.lava_compile_gpu(array_release,Tuple{Lava.LavaDeviceArray{Int32,1}})
         @test semantics(r.spirv_bytes,Lava.Op.OpAtomicIAdd) == [(1,release)]
-        @test_throws r"cannot preserve sequentially consistent" Lava.lava_compile_gpu(array_default,Tuple{Lava.LavaDeviceArray{Int32,1}})
-        for (f,expected) in ((local_add,0),(local_release,release))
+        r=Lava.lava_compile_gpu(array_default,Tuple{Lava.LavaDeviceArray{Int32,1}})
+        @test semantics(r.spirv_bytes,Lava.Op.OpAtomicIAdd) == [(1,acqrel)]
+        for (f,expected) in ((local_add,0),(local_release,release),(local_default,acqrel))
             r=Lava.lava_compile_gpu(f,Tuple{Lava.LavaDeviceArray{Int32,1}})
             @test semantics(r.spirv_bytes,Lava.Op.OpAtomicIAdd) == [(1,expected)]
             @test occursin("OpVariable %_ptr_Workgroup", Lava.disassemble_spirv(r.spirv_bytes))
         end
-        @test_throws r"cannot preserve sequentially consistent" Lava.lava_compile_gpu(local_default,Tuple{Lava.LavaDeviceArray{Int32,1}})
     end
 end
 end # module

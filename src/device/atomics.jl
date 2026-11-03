@@ -92,8 +92,8 @@ end
 end
 
 # UnsafeAtomics emits order- and scope-correct LLVM atomics. Do not replace
-# its explicit ordering with a hard-coded LLVM constant. Vulkan's emitter
-# rejects sequential consistency rather than silently reducing it to acq_rel.
+# its explicit ordering with a hard-coded LLVM constant. The emitter decides how
+# sequential consistency, which Vulkan lacks, lowers (`vulkan_ordering`).
 # Float64 add/sub uses integer CAS: these devices do not enable native
 # Float64 atomic add.
 @lava_device_override @inline function UnsafeAtomics.modify!(
