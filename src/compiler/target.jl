@@ -81,6 +81,13 @@ end
 # @lava_device_override puts methods on this table, which GPUCompiler uses
 # instead of the regular method table during compilation. This lets us
 # replace CPU functions with GPU-safe versions (e.g., intrinsics, math).
+#
+# Two overlays must not overlap. When a package image loads, Julia accepts an edge to an
+# overlay only because nothing else can answer its signature (`METHOD_SIG_LATEST_ONLY`). With
+# an overlapping sibling it looks the call up in the host's table instead, does not find the
+# overlay there, and drops the kernel from the image, so it compiles again in every session.
+# Where two shapes overlap, the second is an ordinary method on our own type, or both are one
+# overlay calling an ordinary function that tells them apart.
 
 Base.Experimental.@MethodTable lava_method_table
 

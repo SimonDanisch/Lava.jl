@@ -63,7 +63,8 @@ end
     load_invariant(c.a.ptr, 1)
 end
 
-@lava_device_override @inline function Base.getindex(c::Const{T,0}, I::CartesianIndex) where T
+# Not an overlay: it would overlap `CartesianIndex{N}` below, see `@lava_device_override`.
+@inline function Base.getindex(c::Const{T,0}, I::CartesianIndex) where T
     load_invariant(c.a.ptr, 1)
 end
 

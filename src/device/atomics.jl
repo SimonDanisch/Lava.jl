@@ -39,7 +39,9 @@ end
     LavaAtomicRef{T,N}(a.ptr, a.dims)
 end
 
-@lava_device_override function Base.getindex(r::LavaAtomicRef{T}, i::Integer) where T
+# Not an overlay: it would overlap the one-index-per-dimension form below at N = 1, see
+# `@lava_device_override`.
+function Base.getindex(r::LavaAtomicRef{T}, i::Integer) where T
     PtrIndexableRef{T}(r.ptr, Int(i))
 end
 
@@ -118,7 +120,9 @@ end
 # Atomix 1.1.2+ @atomic macro expands to Base.modifyindex_atomic! on Julia 1.12+.
 # Without this override, the kernel tries to call jl_f_throw_methoderror on GPU.
 
-@lava_device_override @inline function Base.modifyindex_atomic!(
+# Not an overlay: it would overlap the one-index-per-dimension form below at N = 1, see
+# `@lava_device_override`.
+@inline function Base.modifyindex_atomic!(
     arr::LavaDeviceArray{T,N}, order::Symbol, op::OP, val, i::Integer
 ) where {T, N, OP}
     v = convert(T, val)

@@ -28,10 +28,6 @@ end
     return nothing
 end
 
-@lava_device_override function Base.throw_domerr_powbysq(::Integer, p)
-    return nothing
-end
-
 @lava_device_override function Base.Checked.throw_overflowerr_binaryop(op, x, y)
     return nothing
 end
@@ -75,16 +71,18 @@ end
 
 # ── CartesianIndices indexing ──
 # CartesianIndices{N}[Int] for N>1 calls _ind2sub which has throw paths.
-# Override to avoid the dynamic dispatch.
-@lava_device_override function Base.getindex(iter::CartesianIndices{N,R}, I::Vararg{Int, N}) where {N,R}
-    CartesianIndex(I...)
+# Override to avoid the dynamic dispatch. One overlay for both shapes, which would overlap at
+# N = 1 as two, see `@lava_device_override`.
+@lava_device_override function Base.getindex(iter::CartesianIndices{N,R}, I::Vararg{Int,M}) where {N,R,M}
+    cartesian_at(iter, I...)
 end
+
+cartesian_at(iter::CartesianIndices{N}, I::Vararg{Int,N}) where {N} = CartesianIndex(I...)
 
 # Linear indexing: CartesianIndices{N}[linear_idx::Int] → CartesianIndex{N}
 # Computes _ind2sub without throws. Required for KA's expand() on 2D+ dispatch.
-@lava_device_override function Base.getindex(iter::CartesianIndices{N,R}, i::Int) where {N,R}
-    @inbounds gpu_ind2sub(iter, i)
-end
+cartesian_at(iter::CartesianIndices, i::Int) = @inbounds gpu_ind2sub(iter, i)
+cartesian_at(iter::CartesianIndices{1}, i::Int) = @inbounds gpu_ind2sub(iter, i)
 
 # Convert 1-based linear index to CartesianIndex over CartesianIndices ranges
 @inline function gpu_ind2sub(iter::CartesianIndices{0}, i::Int)
