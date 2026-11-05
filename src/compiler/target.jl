@@ -151,7 +151,29 @@ end
 function GPUCompiler.finish_linked_module!(job::LavaCompilerJob, mod::LLVM.Module)
     native!(mod)
     inline_managed_arguments!(mod)
+    uninitialized_allocations!(mod)
     return nothing
+end
+
+# Julia's allocation optimizer zero-fills an object it moves to the stack unless
+# the allocation is marked uninitialized, which codegen does only when the
+# constructor writes every field. `MArray(undef)`, and `@private` with it, get a
+# fill of the whole array each time the allocation runs; for a 1.7 KB array of
+# BSDF records that was every store of every shading hit. Julia leaves undefined
+# isbits fields undefined, and device code has no GC to see an uninitialized
+# reference, so every allocation here is uninitialized.
+function uninitialized_allocations!(mod::LLVM.Module)
+    alloc = get(LLVM.functions(mod), "julia.gc_alloc_obj", nothing)
+    alloc === nothing && return mod
+    kind = LLVM.EnumAttribute("allockind", UInt64(1 | 8))  # alloc | uninitialized
+    for use in collect(LLVM.uses(alloc))
+        call = LLVM.user(use)
+        call isa LLVM.CallInst || continue
+        attributes = LLVM.function_attributes(call)
+        delete!(attributes, LLVM.EnumAttribute("allockind"))
+        push!(attributes, kind)
+    end
+    return mod
 end
 
 # Inline only helpers reached by a newly allocated Julia object. Allocation
