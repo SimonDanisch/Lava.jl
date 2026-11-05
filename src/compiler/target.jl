@@ -148,7 +148,69 @@ end
 # width it proves enough: a switch over `1:6` on a counter became a switch on an
 # `i63`, for which SPIR-V has no type. With them it keeps to the native widths. Set
 # once the run-time library is linked in (its layout has to match), before optimizing.
-GPUCompiler.finish_linked_module!(job::LavaCompilerJob, mod::LLVM.Module) = (native!(mod); nothing)
+function GPUCompiler.finish_linked_module!(job::LavaCompilerJob, mod::LLVM.Module)
+    native!(mod)
+    inline_managed_arguments!(mod)
+    return nothing
+end
+
+# Inline only helpers reached by a newly allocated Julia object. Allocation
+# optimization needs to see their uses before GPU GC lowering replaces an
+# unpromoted heap allocation with the unsupported allocator. A derived argument
+# can instead be an immutable by-reference value, so its address space alone is
+# not a reason to override inlining. Follow stack-held wrappers as well.
+function inline_managed_arguments!(mod::LLVM.Module)
+    alloc = get(mod.functions, "julia.gc_alloc_obj", nothing)
+    alloc === nothing && return nothing
+    todo = LLVM.Value[u.user for u in alloc.uses]
+    seen = Set{LLVM.Value}()
+    function enqueue(value)
+        value in seen || push!(todo, value)
+    end
+    function carrier(value)
+        while value isa Union{LLVM.GetElementPtrInst, LLVM.BitCastInst, LLVM.AddrSpaceCastInst}
+            value = value.operands[1]
+        end
+        value isa LLVM.AllocaInst && enqueue(value)
+    end
+    while !isempty(todo)
+        value = pop!(todo)
+        value in seen && continue
+        push!(seen, value)
+        for use in value.uses
+            user = use.user
+            if user isa LLVM.CallInst
+                fn = user.called_operand
+                fn isa LLVM.Function || continue
+                if isempty(fn.blocks)
+                    user.value_type isa LLVM.PointerType && enqueue(user)
+                    if startswith(fn.name, "llvm.memcpy") && user.arguments[2] == value
+                        carrier(user.arguments[1])
+                    end
+                    continue
+                end
+                for (argument, parameter) in zip(user.arguments, fn.parameters)
+                    argument == value || continue
+                    delete!(fn.function_attributes, LLVM.EnumAttribute("noinline"))
+                    push!(fn.function_attributes, LLVM.EnumAttribute("alwaysinline"))
+                    enqueue(parameter)
+                end
+            elseif user isa LLVM.StoreInst
+                user.operands[1] == value && carrier(user.operands[2])
+            elseif user isa LLVM.RetInst
+                fn = user.parent.parent
+                delete!(fn.function_attributes, LLVM.EnumAttribute("noinline"))
+                push!(fn.function_attributes, LLVM.EnumAttribute("alwaysinline"))
+                for call in fn.uses
+                    call.user isa LLVM.CallInst && enqueue(call.user)
+                end
+            elseif user isa LLVM.Instruction && user.value_type isa Union{LLVM.PointerType, LLVM.StructType, LLVM.ArrayType}
+                enqueue(user)
+            end
+        end
+    end
+    return nothing
+end
 
 "Declare SPIR-V's native integer widths in `mod`'s datalayout, unless it declares some (`n32:64`, not Julia's `ni:10:11`)."
 function native!(mod::LLVM.Module)

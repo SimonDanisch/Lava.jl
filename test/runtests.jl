@@ -85,6 +85,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         include(joinpath(@__DIR__, "test_odd_integers.jl"))
         include(joinpath(@__DIR__, "test_constexpr_null_global.jl"))
         include(joinpath(@__DIR__, "test_private_gep_phi.jl"))
+        include(joinpath(@__DIR__, "test_managed_argument_inlining.jl"))
         include(joinpath(@__DIR__, "test_private_array_choices.jl"))
         include(joinpath(@__DIR__, "test_private_helper_arguments.jl"))
         include(joinpath(@__DIR__, "test_private_argument_copies.jl"))
