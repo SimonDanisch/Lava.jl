@@ -8979,6 +8979,15 @@ function constexpr_null_pointer(value)
 end
 
 function constexpr_private_constant_pointer(value)
+    if value isa LLVM.ConstantExpr
+        if value.opcode in (LLVM.API.LLVMBitCast, LLVM.API.LLVMAddrSpaceCast)
+            return constexpr_private_constant_pointer(only(value.operands))
+        elseif value.opcode == LLVM.API.LLVMGetElementPtr && LLVM.API.LLVMIsInBounds(value) != 0
+            # An inbounds subobject of a defined local table is non-null too.
+            # Unbounded address arithmetic and extern-weak bases keep refusing.
+            return constexpr_private_constant_pointer(first(value.operands))
+        end
+    end
     return value isa LLVM.GlobalVariable && value.value_type.addrspace==1 &&
         value.constant && value.initializer!==nothing &&
         value.linkage in (LLVM.API.LLVMPrivateLinkage,LLVM.API.LLVMInternalLinkage)

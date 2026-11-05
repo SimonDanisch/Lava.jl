@@ -24,6 +24,26 @@ using Test,Lava,LLVM
             bytes,_=Lava.emit_spirv_from_llvm(mod,"main",(1,1,1))
             @test Lava.validate_spirv(bytes)===nothing
         end
+        for (predicate, expected) in (("ne", true), ("eq", false)), reverse in (false, true)
+            table = "ptr addrspace(1) getelementptr inbounds ([4 x i32], ptr addrspace(1) @table, i64 0, i64 2)"
+            null = "ptr addrspace(1) addrspacecast (ptr null to ptr addrspace(1))"
+            operands = reverse ? "$null, $table" : "$table, $null"
+            mod = parse(LLVM.Module, """
+            @table = private unnamed_addr addrspace(1) constant [4 x i32] [i32 1, i32 2, i32 3, i32 4]
+            define void @main() {
+            entry:
+              br i1 icmp $predicate ($operands), label %yes, label %join
+            yes:
+              br label %join
+            join:
+              ret void
+            }
+            """)
+            comparison = first(first(LLVM.instructions(first(LLVM.blocks(mod.functions["main"])))).operands)
+            @test Lava.constexpr_pointer_comparison(comparison) === expected
+            bytes, _ = Lava.emit_spirv_from_llvm(mod, "main", (1, 1, 1))
+            @test Lava.validate_spirv(bytes) === nothing
+        end
         # An extern-weak address can resolve to null: never fold it as an
         # allocated local table, and never translate unknown comparisons to a
         # guessed boolean or physical host address.
@@ -40,5 +60,22 @@ using Test,Lava,LLVM
         """)
         comparison=first(first(LLVM.instructions(first(LLVM.blocks(mod.functions["main"])))).operands)
         @test Lava.constexpr_pointer_comparison(comparison)===nothing
+        for (declaration, gep) in (
+                ("extern_weak addrspace(1) constant [4 x i32]", "getelementptr inbounds ([4 x i32], ptr addrspace(1) @table, i64 0, i64 2)"),
+                ("private addrspace(1) constant [4 x i32] zeroinitializer", "getelementptr ([4 x i32], ptr addrspace(1) @table, i64 0, i64 -2)"))
+            mod = parse(LLVM.Module, """
+            @table = $declaration
+            define void @main() {
+            entry:
+              br i1 icmp ne (ptr addrspace(1) $gep, ptr addrspace(1) addrspacecast (ptr null to ptr addrspace(1))), label %yes, label %join
+            yes:
+              br label %join
+            join:
+              ret void
+            }
+            """)
+            comparison = first(first(LLVM.instructions(first(LLVM.blocks(mod.functions["main"])))).operands)
+            @test Lava.constexpr_pointer_comparison(comparison) === nothing
+        end
     end
 end
