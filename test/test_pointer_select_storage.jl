@@ -37,7 +37,7 @@ import LLVM
         # Trunk lowers nested pointer choices to values. Every speculative
         # access using the dynamic index is clamped into its private array.
         text=string(mod)
-        @test occursin("icmp slt i64 %index, 0",text)
+        @test occursin("icmp slt i64",text)
         @test occursin("icmp sgt i64",text)
         pointer_selects=filter(i->i isa LLVM.SelectInst && i.value_type isa LLVM.PointerType,folded)
         @test length(pointer_selects)==1
@@ -100,7 +100,7 @@ end
                 @test !occursin("vmirror_leaf_load",text)
             else
                 @test !occursin("select i1 %cond, ptr",text)
-                @test occursin("icmp slt i64 %index, 0",text)
+                @test occursin("icmp slt i64",text)
                 @test occursin("icmp sgt i64",text)
                 @test occursin("vmirror_sel = select i1",text)
                 @test count("load i32",text) == 2

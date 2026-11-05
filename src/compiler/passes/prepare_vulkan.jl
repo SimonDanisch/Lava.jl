@@ -5451,12 +5451,11 @@ function validate_function_alloca_chain(val::LLVM.Value, access_ty::LLVM.LLVMTyp
 end
 
 """
-    alloca_gep_bounds(gep, access_ty) -> Union{Nothing, Vector{Union{Nothing, Int}}}
+    alloca_gep_bounds(gep, access_ty) -> Union{Nothing, NamedTuple}
 
-For a GEP straight off an addrspace-0 alloca, the largest value each of its dynamic
-indices can take for an access of `access_ty` to stay inside the alloca (`nothing`
-for a constant index). `nothing` for any other pointer, or where an index cannot be
-bounded.
+The byte offset and largest valid offset for an access of `access_ty` in an
+addrspace-0 alloca. Bounds belong to the allocation, not the temporary GEP
+source type: SROA can index a one-element view over a larger allocation.
 
 The value mirror loads at EVERY leaf of a phi/select chain, not only at the one the
 condition picks, and the leaves it does not pick may hold an index out of bounds: a
@@ -5479,50 +5478,32 @@ function alloca_gep_bounds(gep::LLVM.Value, access_ty::LLVM.LLVMType)
     room = Int(LLVM.API.LLVMABISizeOfType(dl, allocated)) * convert(Int, count) -
            Int(LLVM.API.LLVMABISizeOfType(dl, access_ty))
     room >= 0 || return nothing
-    src = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
-    bounds = Union{Nothing, Int}[]
-    indexed = src
-    for (k, idx) in enumerate(gep.operands[2:end])
-        if k == 1
-            # Steps over whole elements of the source type from the alloca's start.
-            step = Int(LLVM.API.LLVMABISizeOfType(dl, src))
-            step > 0 || return nothing
-            push!(bounds, idx isa LLVM.ConstantInt ? nothing : room ÷ step)
-        elseif indexed isa LLVM.StructType
-            idx isa LLVM.ConstantInt || return nothing
-            push!(bounds, nothing)
-            indexed = indexed.elements[convert(Int, idx) + 1]
-        elseif indexed isa LLVM.ArrayType || indexed isa LLVM.VectorType
-            push!(bounds, idx isa LLVM.ConstantInt ? nothing : indexed.length - 1)
-            indexed = indexed.element_type
-        else
-            return nothing
-        end
-    end
-    return bounds
+    offset, dynamic = analyze_gep_offset(gep, dl)
+    offset === nothing && return nothing
+    return (; offset, dynamic, room)
 end
 
 """
     clamped_alloca_gep!(builder, gep, access_ty) -> LLVM.Value
 
-`gep` rebuilt at the builder's position with each dynamic index clamped to
-`alloca_gep_bounds(gep, access_ty)`.
+Rebuild `gep` with its complete byte offset clamped to the allocation. Clamping
+individual indices can change valid addresses or leave a multi-index access
+past the end; the access width and every index contribute to the bound.
 """
 function clamped_alloca_gep!(builder::LLVM.IRBuilder, gep::LLVM.GetElementPtrInst, access_ty::LLVM.LLVMType)
     bounds = alloca_gep_bounds(gep, access_ty)
-    idxs = LLVM.Value[]
-    for (idx, top) in zip(gep.operands[2:end], bounds)
-        if top === nothing
-            push!(idxs, idx)
-            continue
-        end
-        ty = idx.value_type
-        zero, hi = LLVM.ConstantInt(ty, 0), LLVM.ConstantInt(ty, top)
-        low = LLVM.select!(builder, LLVM.icmp!(builder, LLVM.API.LLVMIntSLT, idx, zero), zero, idx)
-        push!(idxs, LLVM.select!(builder, LLVM.icmp!(builder, LLVM.API.LLVMIntSGT, low, hi), hi, low))
+    i64 = LLVM.Int64Type()
+    offset = LLVM.ConstantInt(i64, bounds.offset)
+    for (index, stride) in bounds.dynamic
+        width = LLVM.API.LLVMGetIntTypeWidth(index.value_type)
+        wide = width == 64 ? index : width < 64 ? LLVM.sext!(builder, index, i64) : LLVM.trunc!(builder, index, i64)
+        term = LLVM.mul!(builder, wide, LLVM.ConstantInt(i64, stride))
+        offset = LLVM.add!(builder, offset, term, "private_byte_offset")
     end
-    src = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
-    return LLVM.inbounds_gep!(builder, src, gep.operands[1], idxs)
+    zero, hi = LLVM.ConstantInt(i64, 0), LLVM.ConstantInt(i64, bounds.room)
+    low = LLVM.select!(builder, LLVM.icmp!(builder, LLVM.API.LLVMIntSLT, offset, zero), zero, offset)
+    safe = LLVM.select!(builder, LLVM.icmp!(builder, LLVM.API.LLVMIntSGT, low, hi), hi, low)
+    return LLVM.inbounds_gep!(builder, LLVM.Int8Type(), gep.operands[1], LLVM.Value[safe])
 end
 
 """
@@ -5611,10 +5592,15 @@ function build_function_ptr_value_mirror!(val::LLVM.Value, access_ty::LLVM.LLVMT
 end
 
 """The load of `access_ty` at a leaf of a phi/select chain: at an alloca, or at an element of one with its indices clamped (`alloca_gep_bounds`)."""
-load_function_leaf!(builder::LLVM.IRBuilder, leaf::LLVM.AllocaInst, access_ty::LLVM.LLVMType) =
-    LLVM.load!(builder, access_ty, leaf, "vmirror_leaf_load")
-load_function_leaf!(builder::LLVM.IRBuilder, leaf::LLVM.GetElementPtrInst, access_ty::LLVM.LLVMType) =
-    LLVM.load!(builder, access_ty, clamped_alloca_gep!(builder, leaf, access_ty), "vmirror_leaf_load")
+function load_function_leaf!(builder::LLVM.IRBuilder, leaf::Union{LLVM.AllocaInst, LLVM.GetElementPtrInst}, access_ty::LLVM.LLVMType)
+    ptr = leaf isa LLVM.GetElementPtrInst ? clamped_alloca_gep!(builder, leaf, access_ty) : leaf
+    loaded = LLVM.load!(builder, access_ty, ptr, "vmirror_leaf_load")
+    # A type-punned access need not have ABI alignment, and a speculative
+    # address clamped at the end of an allocation can be less aligned still.
+    # LLVM can recover stronger alignment from the alloca and offset.
+    LLVM.alignment!(loaded, 1)
+    return loaded
+end
 
 """
     flatten_chained_geps_on_allocas!(mod::LLVM.Module)

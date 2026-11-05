@@ -36,13 +36,13 @@ using Test,Lava,LLVM
                 # lowering clamps every speculative private load to its array.
                 @test !occursin("phi ptr",text)
                 @test occursin("phi i32",text)
-                @test count("icmp slt i64 %index, 0",text) == 2
+                @test count("icmp slt i64",text) == 2
                 @test count("icmp sgt i64",text) == 2
             else
                 @test !occursin("phi ptr",text)
                 @test occursin("phi i32",text)
                 @test count("vmirror_leaf_load = load i32",text)==1
-                @test occursin("vmirror_leaf_load1 = load i32",text)
+                @test count(r"vmirror_leaf_load\d* = load i32",text) == 2
                 # Do not hoist across a write in the join block.
                 stored=parse(LLVM.Module,replace(ir,"%v = load"=>"store i32 99, ptr %p\n  %v = load"))
                 Lava.lower_phi_select_function_ptrs!(stored)

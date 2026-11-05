@@ -346,7 +346,7 @@ function analyze_gep_offset(gep::LLVM.GetElementPtrInst, dl::LLVM.DataLayout)
                 member_off = Int(API.LLVMOffsetOfElement(dl, current_ty, fi - 1))
                 const_off += member_off
                 current_ty = elems[fi]
-            elseif current_ty isa LLVM.ArrayType
+            elseif current_ty isa Union{LLVM.ArrayType, LLVM.VectorType}
                 stride = Int(API.LLVMABISizeOfType(dl, current_ty.element_type))
                 if idx isa LLVM.ConstantInt
                     const_off += Int(convert(Int64, idx)) * stride

@@ -72,6 +72,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         include(joinpath(@__DIR__, "test_constexpr_phi_operand.jl"))
         include(joinpath(@__DIR__, "test_constant_struct_operand.jl"))
         include(joinpath(@__DIR__, "test_select_of_alloca_elements.jl"))
+        include(joinpath(@__DIR__, "test_private_alias_bounds.jl"))
         include(joinpath(@__DIR__, "test_punned_store_into_array.jl"))
         include(joinpath(@__DIR__, "test_select_private_device_load.jl"))
         include(joinpath(@__DIR__, "test_subword_integer_alloca.jl"))
@@ -92,6 +93,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         include(joinpath(@__DIR__, "test_phi_pointee_recovery.jl"))
         include(joinpath(@__DIR__, "test_pointer_select_storage.jl"))
         include(joinpath(@__DIR__, "test_retype_float_lanes.jl"))
+        include(joinpath(@__DIR__, "test_retype_word_lanes.jl"))
         include(joinpath(@__DIR__, "test_dynamic_memset.jl"))
     end
 
