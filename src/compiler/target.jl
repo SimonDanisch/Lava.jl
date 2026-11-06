@@ -181,6 +181,13 @@ end
 # unpromoted heap allocation with the unsupported allocator. A derived argument
 # can instead be an immutable by-reference value, so its address space alone is
 # not a reason to override inlining. Follow stack-held wrappers as well.
+#
+# Julia never inlines at the LLVM level, so it tags each function's memory
+# accesses as if compiled alone: a load through a by-reference argument claims
+# (`!noalias`, TBAA, `!invariant.load`) that it reads no stack memory of the
+# caller. Inlined into a caller that passes its own stack object, the claim is
+# false, and GVN folded such loads to `undef` (the pbrt CoatedDiffuse guide
+# lost every return). Force-inlined functions drop those claims.
 function inline_managed_arguments!(mod::LLVM.Module)
     alloc = get(mod.functions, "julia.gc_alloc_obj", nothing)
     alloc === nothing && return nothing
@@ -213,16 +220,14 @@ function inline_managed_arguments!(mod::LLVM.Module)
                 end
                 for (argument, parameter) in zip(user.arguments, fn.parameters)
                     argument == value || continue
-                    delete!(fn.function_attributes, LLVM.EnumAttribute("noinline"))
-                    push!(fn.function_attributes, LLVM.EnumAttribute("alwaysinline"))
+                    force_inline!(fn)
                     enqueue(parameter)
                 end
             elseif user isa LLVM.StoreInst
                 user.operands[1] == value && carrier(user.operands[2])
             elseif user isa LLVM.RetInst
                 fn = user.parent.parent
-                delete!(fn.function_attributes, LLVM.EnumAttribute("noinline"))
-                push!(fn.function_attributes, LLVM.EnumAttribute("alwaysinline"))
+                force_inline!(fn)
                 for call in fn.uses
                     call.user isa LLVM.CallInst && enqueue(call.user)
                 end
@@ -232,6 +237,18 @@ function inline_managed_arguments!(mod::LLVM.Module)
         end
     end
     return nothing
+end
+
+function force_inline!(fn::LLVM.Function)
+    delete!(fn.function_attributes, LLVM.EnumAttribute("noinline"))
+    push!(fn.function_attributes, LLVM.EnumAttribute("alwaysinline"))
+    for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+        md = LLVM.metadata(inst)
+        for kind in (LLVM.MD_alias_scope, LLVM.MD_noalias, LLVM.MD_tbaa, LLVM.MD_tbaa_struct, LLVM.MD_invariant_load)
+            haskey(md, kind) && delete!(md, kind)
+        end
+    end
+    return fn
 end
 
 "Declare SPIR-V's native integer widths in `mod`'s datalayout, unless it declares some (`n32:64`, not Julia's `ni:10:11`)."
