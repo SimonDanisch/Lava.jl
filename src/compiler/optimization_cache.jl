@@ -102,6 +102,20 @@ function replace_optimization_ir!(mod::LLVM.Module, restored::LLVM.Module)
     return nothing
 end
 
+# A relocation whose target is one of the input's is stored by its position there,
+# and restored from the current input. Storing every value broke the hit: a value
+# from a module nobody can name (a script `include`d into a `Module()`, as RayDemo's
+# benchmark runs its scenes) serializes, but `deserialize` fails on it with
+# "`anonymous` not defined in `Main`", which replaced the kernel's real compile
+# error on every retry. Optimization can also introduce a target (the llvmcall IR
+# string behind an interpolated `error` message), and only its value names it.
+function relocation_entry(inputs, record::GPUCompiler.Relocation)
+    i = findfirst(input -> GPUCompiler.same_relocation_target(input.target, record.target), inputs)
+    i === nothing && return (; record.kind, record.name, record.offset, input = 0, target = record.target)
+    return (; record.kind, record.name, record.offset, input = i, target = nothing)
+end
+restored_target(inputs, record) = record.input == 0 ? record.target : inputs[record.input].target
+
 function optimize_uncached!(job::LavaCompilerJob, mod::LLVM.Module, relocs::GPUCompiler.Relocations; opt_level)
     return invoke(GPUCompiler.optimize!, Tuple{GPUCompiler.CompilerJob,LLVM.Module,GPUCompiler.Relocations},
                   job, mod, relocs; opt_level)
@@ -115,9 +129,10 @@ function GPUCompiler.optimize!(job::LavaCompilerJob, mod::LLVM.Module,
     config = job.config
     settings = [(name, getfield(config, name)) for name in fieldnames(typeof(config)) if name !== :cache_owner]
     current = optimization_symbols(mod)
-    key = ObjCache.keyhash(2, optimization_input(mod),
+    inputs = optimization_relocations(current, relocs)
+    key = ObjCache.keyhash(4, optimization_input(mod),
                           serialized((compiler_identity(), Base.module_build_id(GPUCompiler), settings,
-                                      opt_level, optimization_debug_locations(mod), optimization_relocations(current, relocs))))
+                                      opt_level, optimization_debug_locations(mod), inputs)))
     found = ObjCache.get("Lava/optimized-llvm", key)
     if found === nothing
         COMPILE_STATS.llvm_misses += 1
@@ -132,7 +147,8 @@ function GPUCompiler.optimize!(job::LavaCompilerJob, mod::LLVM.Module,
             replace_optimization_ir!(mod, parse(LLVM.Module, take!(io)))
             io = IOBuffer()
             write(io, mod)
-            entry = (; bitcode = take!(io), symbols = current, relocations = copy(relocs.records))
+            relocations = [relocation_entry(inputs, record) for record in relocs.records]
+            entry = (; bitcode = take!(io), symbols = current, relocations)
             ObjCache.put!("Lava/optimized-llvm", key, serialized(entry))
         end
     else
@@ -141,13 +157,11 @@ function GPUCompiler.optimize!(job::LavaCompilerJob, mod::LLVM.Module,
         restored = parse(LLVM.Module, entry.bitcode)
         names = restore_optimization_symbols!(restored, entry.symbols, current)
         replace_optimization_ir!(mod, restored)
-        originals = Dict((r.name, r.offset) => r for r in relocs.records)
         GPUCompiler.check_mutable(relocs, "restore")
         empty!(relocs.records)
         for record in entry.relocations
             name = get(names, record.name, record.name)
-            original = get(originals, (name, record.offset), nothing)
-            target = original === nothing ? record.target : original.target
+            target = restored_target(inputs, record)
             GPUCompiler.add_relocation!(relocs, GPUCompiler.Relocation(record.kind, name, record.offset, target))
         end
         GPUCompiler.prune_dead_relocations!(mod, relocs)

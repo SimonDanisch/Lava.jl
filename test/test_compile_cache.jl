@@ -457,4 +457,35 @@ end
         end
     end
 
+    # RayDemo's benchmark runs each scene script in a `Module()`. An entry that
+    # kept a relocation target from such a module failed to deserialize on the
+    # next compile of the same code ("`anonymous` not defined in `Main`").
+    @testset "optimized modules restore targets from a module without a name" begin
+        job = Lava.lava_kernel_job(cc_optimization!, CC_TT; workgroup_size = (64, 1, 1))
+        scene = Module()
+        Core.eval(scene, :(struct SceneValue
+            x::Int32
+        end))
+        value = Base.invokelatest(getproperty, scene, :SceneValue)
+        name = "relocation_slot_333"
+        ir = "@$name = global i64 0\ndefine i64 @main() {\n %x = load i64, ptr @$name\n" *
+             " %y = add i64 %x, $(Int(CC_FACTOR))\n ret i64 %y\n}"
+        GPUCompiler.JuliaContext() do _
+            Lava.reset_compile_stats!()
+            initial = nothing
+            for _ in 1:2
+                mod = parse(LLVM.Module, ir)
+                relocs = GPUCompiler.Relocations([GPUCompiler.Relocation(GPUCompiler.SlotSite, name, 0,
+                                                                          GPUCompiler.JuliaValueRef(value))])
+                GPUCompiler.optimize!(job, mod, relocs)
+                LLVM.verify(mod)
+                @test only(relocs.records).target.value === value
+                initial === nothing && (initial = Lava.llvm_compile_stats())
+                LLVM.dispose(mod)
+            end
+            @test initial == (; hits = 0, misses = 1)
+            @test Lava.llvm_compile_stats() == (; hits = 1, misses = 1)
+        end
+    end
+
 end
