@@ -1716,7 +1716,7 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                 push!(state.mod.functions, i64_spirv)
                 push!(state.mod.functions, raw_load_id)
                 push!(state.mod.functions, ptr_id)
-                push!(state.mod.functions, UInt32(0x02))  # Aligned
+                push!(state.mod.functions, MemOp.Aligned | nonprivate(SC.PhysicalStorageBuffer))  # Aligned
                 push!(state.mod.functions, align)
                 # Convert i64 → typed PSB pointer
                 encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ty, load_id, raw_load_id)
@@ -1736,7 +1736,7 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                 push!(state.mod.functions, spirv_load_ty)
                 push!(state.mod.functions, load_id)
                 push!(state.mod.functions, ptr_id)
-                push!(state.mod.functions, UInt32(0x02))  # Aligned
+                push!(state.mod.functions, MemOp.Aligned | nonprivate(SC.PhysicalStorageBuffer))  # Aligned
                 push!(state.mod.functions, align)
             end
         end
@@ -2586,7 +2586,7 @@ function emit_store!(state::SPIRVEmitterState, inst::LLVM.StoreInst)
             push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpStore))
             push!(state.mod.functions, ptr_id)
             push!(state.mod.functions, val_id)
-            push!(state.mod.functions, UInt32(0x02))  # Aligned
+            push!(state.mod.functions, MemOp.Aligned | nonprivate(SC.PhysicalStorageBuffer))  # Aligned
             push!(state.mod.functions, align)
         end
     else
@@ -3339,7 +3339,7 @@ function emit_psb_decomposed_store!(state::SPIRVEmitterState, ptr_id::UInt32, va
     push!(state.mod.functions, (UInt32(5) << 16) | UInt32(Op.OpStore))
     push!(state.mod.functions, lo_ptr)
     push!(state.mod.functions, lo_id)
-    push!(state.mod.functions, UInt32(0x02))  # Aligned
+    push!(state.mod.functions, MemOp.Aligned | nonprivate(SC.PhysicalStorageBuffer))  # Aligned
     push!(state.mod.functions, UInt32(4))
 
     # High store: (ptr + 4) → ptr<u32,PSB>, store high 32 bits
@@ -3351,7 +3351,7 @@ function emit_psb_decomposed_store!(state::SPIRVEmitterState, ptr_id::UInt32, va
     push!(state.mod.functions, (UInt32(5) << 16) | UInt32(Op.OpStore))
     push!(state.mod.functions, hi_ptr)
     push!(state.mod.functions, hi_id)
-    push!(state.mod.functions, UInt32(0x02))  # Aligned
+    push!(state.mod.functions, MemOp.Aligned | nonprivate(SC.PhysicalStorageBuffer))  # Aligned
     push!(state.mod.functions, UInt32(4))
 end
 
@@ -3380,7 +3380,7 @@ function emit_psb_decomposed_load!(state::SPIRVEmitterState, ptr_id::UInt32,
     push!(state.mod.functions, u32_spirv)
     push!(state.mod.functions, lo_id)
     push!(state.mod.functions, lo_ptr)
-    push!(state.mod.functions, UInt32(0x02))  # Aligned
+    push!(state.mod.functions, MemOp.Aligned | nonprivate(SC.PhysicalStorageBuffer))  # Aligned
     push!(state.mod.functions, UInt32(4))
 
     # High load: (ptr + 4) → ptr<u32,PSB>, load high 32 bits
@@ -3394,7 +3394,7 @@ function emit_psb_decomposed_load!(state::SPIRVEmitterState, ptr_id::UInt32,
     push!(state.mod.functions, u32_spirv)
     push!(state.mod.functions, hi_id)
     push!(state.mod.functions, hi_ptr)
-    push!(state.mod.functions, UInt32(0x02))  # Aligned
+    push!(state.mod.functions, MemOp.Aligned | nonprivate(SC.PhysicalStorageBuffer))  # Aligned
     push!(state.mod.functions, UInt32(4))
 
     # Combine: lo | (hi << 32)
@@ -3476,7 +3476,7 @@ function emit_psb_decomposed_small_store!(state::SPIRVEmitterState, ptr_id::UInt
         push!(state.mod.functions, (UInt32(5) << 16) | UInt32(Op.OpStore))
         push!(state.mod.functions, byte_ptr)
         push!(state.mod.functions, byte_val)
-        push!(state.mod.functions, UInt32(0x02))  # Aligned
+        push!(state.mod.functions, MemOp.Aligned | nonprivate(SC.PhysicalStorageBuffer))  # Aligned
         push!(state.mod.functions, UInt32(1))
     end
 end
@@ -3517,7 +3517,7 @@ function emit_psb_decomposed_small_load!(state::SPIRVEmitterState, ptr_id::UInt3
         push!(state.mod.functions, u8_spirv)
         push!(state.mod.functions, byte_val)
         push!(state.mod.functions, byte_ptr)
-        push!(state.mod.functions, UInt32(0x02))  # Aligned
+        push!(state.mod.functions, MemOp.Aligned | nonprivate(SC.PhysicalStorageBuffer))  # Aligned
         push!(state.mod.functions, UInt32(1))
 
         # Zero-extend byte to u32 and shift into position
@@ -5642,7 +5642,7 @@ function emit_memset!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             elem_id = fresh_id!(state.mod)
             encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, dest_ptr_ty, elem_id, addr_u64)
             if is_dest_psb
-                encode_instruction!(state.mod.functions, Op.OpStore, elem_id, fill_const, UInt32(0x02), UInt32(1))
+                encode_instruction!(state.mod.functions, Op.OpStore, elem_id, fill_const, MemOp.Aligned | nonprivate(SC.PhysicalStorageBuffer), UInt32(1))
             else
                 encode_instruction!(state.mod.functions, Op.OpStore, elem_id, fill_const)
             end
@@ -5767,7 +5767,7 @@ function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
         load_id = fresh_id!(state.mod)
         if is_src_psb
             encode_instruction!(state.mod.functions, Op.OpLoad, u32_ty, load_id, src_elem_id,
-                                UInt32(0x02), UInt32(chunk))
+                                MemOp.Aligned | nonprivate(SC.PhysicalStorageBuffer), UInt32(chunk))
         else
             encode_instruction!(state.mod.functions, Op.OpLoad, u32_ty, load_id, src_elem_id)
         end
@@ -5794,7 +5794,7 @@ function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
         # Store i32 to dest
         if is_dest_psb
             encode_instruction!(state.mod.functions, Op.OpStore, dest_elem_id, load_id,
-                                UInt32(0x02), UInt32(chunk))
+                                MemOp.Aligned | nonprivate(SC.PhysicalStorageBuffer), UInt32(chunk))
         else
             encode_instruction!(state.mod.functions, Op.OpStore, dest_elem_id, load_id)
         end
@@ -5821,7 +5821,7 @@ function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             load_id = fresh_id!(state.mod)
             if is_src_psb
                 encode_instruction!(state.mod.functions, Op.OpLoad, u8_ty, load_id, src_byte_ptr,
-                                    UInt32(0x02), UInt32(1))
+                                    MemOp.Aligned | nonprivate(SC.PhysicalStorageBuffer), UInt32(1))
             else
                 encode_instruction!(state.mod.functions, Op.OpLoad, u8_ty, load_id, src_byte_ptr)
             end
@@ -5834,7 +5834,7 @@ function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
 
             if is_dest_psb
                 encode_instruction!(state.mod.functions, Op.OpStore, dest_byte_ptr, load_id,
-                                    UInt32(0x02), UInt32(1))
+                                    MemOp.Aligned | nonprivate(SC.PhysicalStorageBuffer), UInt32(1))
             else
                 encode_instruction!(state.mod.functions, Op.OpStore, dest_byte_ptr, load_id)
             end

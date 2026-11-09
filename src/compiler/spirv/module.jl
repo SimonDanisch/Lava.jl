@@ -648,10 +648,12 @@ The `NonPrivatePointer` bit for an access in storage class `sc`.
 `Workgroup` is the storage every invocation in a group can see, so an access to
 it has to say so; `Function` is per-invocation by construction and tagging it
 would claim a sharing that does not exist. Global (`PhysicalStorageBuffer`)
-accesses are left alone: they are made visible across *dispatches* by the API's
-own barriers, which sit outside the shader memory model entirely.
+accesses are tagged too: acquire/release atomics and device fences only make
+non-private accesses available and visible, and kernels publish data between
+workgroups of one dispatch that way, as Raycore's bottom-up BVH refit does.
 """
-@inline nonprivate(sc::UInt32) = sc == SC.Workgroup ? MemOp.NonPrivatePointer : MemOp.None
+@inline nonprivate(sc::UInt32) =
+    sc == SC.Workgroup || sc == SC.PhysicalStorageBuffer ? MemOp.NonPrivatePointer : MemOp.None
 
 # ---- Function Control ----
 module FuncControl
