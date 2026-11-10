@@ -5988,9 +5988,14 @@ function decompose_flat_index_for_composite!(state::SPIRVEmitterState,
             elem_ty = current_ty.element_type
             elem_count = count_scalar_elements(elem_ty, leaf_ty)
             if elem_count == 1
-                # Leaf array: index directly
+                # One leaf per element: this level takes the whole index. An element
+                # that still wraps the leaf (a tuple of device arrays is
+                # `[7 x [1 x {ptr, [1 x i64]}]]`) is descended at index 0, or the
+                # chain stops one level above the leaf type it claims.
                 push!(indices, remaining)
-                return indices
+                elem_ty == leaf_ty && return indices
+                remaining = emit_constant_u32!(state.mod, UInt32(0))
+                current_ty = elem_ty
             else
                 # Divide to get this level's index, mod for remaining
                 divisor = emit_constant_u32!(state.mod, UInt32(elem_count))
