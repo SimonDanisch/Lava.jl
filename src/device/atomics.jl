@@ -20,20 +20,25 @@ struct PtrRef{T}
     ptr::Ptr{T}
 end
 
-struct PtrIndexableRef{T}
-    ptr::Ptr{T}
+# `P` is the pointer: `Ptr{T}` for device arrays, `Core.LLVMPtr{T,3}` for
+# workgroup memory (`device/sharedmemory.jl`). Both step in bytes with `+`, and
+# UnsafeAtomics takes both.
+struct PtrIndexableRef{T,P}
+    ptr::P
     index::Int
 end
+PtrIndexableRef{T}(ptr::P, index::Int) where {T,P} = PtrIndexableRef{T,P}(ptr, index)
 
 @lava_device_override function Atomix.Internal.referenceable(ptr::Ptr{T}) where T
     PtrRef{T}(ptr)
 end
 
 # LavaDeviceArray atomics: wrap with LavaAtomicRef to preserve dims for CartesianIndex
-struct LavaAtomicRef{T, N}
-    ptr::Ptr{T}
+struct LavaAtomicRef{T, N, P}
+    ptr::P
     dims::NTuple{N, Int}
 end
+LavaAtomicRef{T,N}(ptr::P, dims::NTuple{N,Int}) where {T,N,P} = LavaAtomicRef{T,N,P}(ptr, dims)
 
 @lava_device_override function Atomix.Internal.referenceable(a::LavaDeviceArray{T,N}) where {T,N}
     LavaAtomicRef{T,N}(a.ptr, a.dims)

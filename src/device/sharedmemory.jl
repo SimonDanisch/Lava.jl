@@ -167,6 +167,14 @@ Base.length(a::LavaSharedArray) = a.len
 Base.size(::LavaSharedArray{T, Dims}) where {T, Dims} = Dims
 Base.eltype(::LavaSharedArray{T}) where T = T
 
+# `Atomix.@atomic h[i] += x` on `@localmem`: Atomix asks `referenceable(h)`, and
+# its own method takes an `AbstractArray`, which this is not. The reference is
+# the device array's (`device/atomics.jl`) over the workgroup pointer, so the
+# atomic is an `atomicrmw` on addrspace(3) with the caller's ordering.
+@lava_device_override function Atomix.Internal.referenceable(a::LavaSharedArray{T, Dims}) where {T, Dims}
+    LavaAtomicRef{T, length(Dims)}(a.ptr, Dims)
+end
+
 # The same block as another element type, as `LavaDeviceArray` has it: a kernel
 # that stages Float32s reads them back four at a time without a second block.
 # Without it `reinterpret` fell to Base's `ReinterpretArray`, whose field-offset

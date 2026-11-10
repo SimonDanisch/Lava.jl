@@ -73,6 +73,22 @@ function array_default(a)
     Lava.Atomix.@atomic a[1] += Int32(1)
     nothing
 end
+# The same entry point on `@localmem`, which is not an AbstractArray: Atomix's
+# own `referenceable` has no method for it.
+for (name, order) in ((:local_add, QuoteNode(:monotonic)), (:local_release, QuoteNode(:release)))
+    @eval function $name(a)
+        h = Lava.KI.localmemory(Int32, Val((4,)), Val($(QuoteNode(name))))
+        Lava.Atomix.@atomic $order h[2] += Int32(1)
+        @inbounds a[1] = h[2]
+        nothing
+    end
+end
+function local_default(a)
+    h = Lava.KI.localmemory(Int32, Val((4,)), Val(:local_default))
+    Lava.Atomix.@atomic h[2] += Int32(1)
+    @inbounds a[1] = h[2]
+    nothing
+end
 
 function float_min(p::Ptr{Float32}, x::Float32)
     UA.modify!(p,min,x,UA.acq_rel,UA.device)
@@ -187,6 +203,12 @@ end
         r=Lava.lava_compile_gpu(array_release,Tuple{Lava.LavaDeviceArray{Int32,1}})
         @test semantics(r.spirv_bytes,Lava.Op.OpAtomicIAdd) == [(1,release)]
         @test_throws r"cannot preserve sequentially consistent" Lava.lava_compile_gpu(array_default,Tuple{Lava.LavaDeviceArray{Int32,1}})
+        for (f,expected) in ((local_add,0),(local_release,release))
+            r=Lava.lava_compile_gpu(f,Tuple{Lava.LavaDeviceArray{Int32,1}})
+            @test semantics(r.spirv_bytes,Lava.Op.OpAtomicIAdd) == [(1,expected)]
+            @test occursin("OpVariable %_ptr_Workgroup", Lava.disassemble_spirv(r.spirv_bytes))
+        end
+        @test_throws r"cannot preserve sequentially consistent" Lava.lava_compile_gpu(local_default,Tuple{Lava.LavaDeviceArray{Int32,1}})
     end
 end
 end # module
