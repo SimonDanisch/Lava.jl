@@ -39,7 +39,7 @@ function set_pointee_type!(ptm::PointeeTypeMap, ptr::LLVM.Value, ty::LLVM.LLVMTy
     end
 end
 
-function get_pointee_type(ptm::PointeeTypeMap, ptr::LLVM.Value)
+function get_pointee_type(ptm::PointeeTypeMap, @nospecialize(ptr::LLVM.Value))
     entry = get(ptm.map, ptr, nothing)
     entry === nothing ? nothing : entry[1]
 end
@@ -2187,7 +2187,7 @@ function collect_module_types!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Module)
     end
 end
 
-function collect_value_type!(ctx::SPIRVTypeContext, val::LLVM.Value)
+function collect_value_type!(ctx::SPIRVTypeContext, @nospecialize(val::LLVM.Value))
     ty = val.value_type
     if ty isa LLVM.PointerType
         # Pointer type — don't map directly, handled per-use via PointeeTypeMap

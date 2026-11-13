@@ -55,11 +55,15 @@ channel back to the caller that asked for the measurement.
 struct PhaseLog
     records::Vector{PhaseRecord}
     subprocesses::Dict{String, SubprocessStat}
-    kernel::Base.RefValue{String}
+    # Scoped, and the log locked: kernels compile on several threads (Mantle
+    # compiles a plan's at once), and each record names the compile it ran in.
+    kernel::ScopedValue{String}
     capturing::Base.RefValue{Bool}
+    lock::ReentrantLock
 end
 
-const PHASE_LOG = PhaseLog(PhaseRecord[], Dict{String, SubprocessStat}(), Ref(""), Ref(false))
+const PHASE_LOG = PhaseLog(PhaseRecord[], Dict{String, SubprocessStat}(), ScopedValue(""), Ref(false),
+                           ReentrantLock())
 
 """
     enable_phase_capture!(on::Bool = true)
@@ -80,21 +84,19 @@ end
 Drop all accumulated records and subprocess stats.
 """
 function reset_phase_log!()
-    empty!(PHASE_LOG.records)
-    empty!(PHASE_LOG.subprocesses)
-    PHASE_LOG.kernel[] = ""
+    @lock PHASE_LOG.lock begin
+        empty!(PHASE_LOG.records)
+        empty!(PHASE_LOG.subprocesses)
+    end
     return nothing
 end
 
 """
-    phase_kernel!(name)
+    phase_kernel(f, name)
 
-Tag subsequent phase records as belonging to the compile of `name`.
+`f()`, its phase records tagged as belonging to the compile of `name`.
 """
-function phase_kernel!(name::AbstractString)
-    PHASE_LOG.kernel[] = String(name)
-    return nothing
-end
+phase_kernel(f, name::AbstractString) = with(f, PHASE_LOG.kernel => String(name))
 
 phase_records() = PHASE_LOG.records
 phase_subprocesses() = PHASE_LOG.subprocesses
@@ -106,7 +108,8 @@ Append one phase measurement. Cheap no-op when capture is off.
 """
 function record_phase!(group::AbstractString, label::AbstractString, seconds::Float64)
     PHASE_LOG.capturing[] || return nothing
-    push!(PHASE_LOG.records, PhaseRecord(String(group), String(label), seconds, PHASE_LOG.kernel[]))
+    record = PhaseRecord(String(group), String(label), seconds, PHASE_LOG.kernel[])
+    @lock PHASE_LOG.lock push!(PHASE_LOG.records, record)
     return nothing
 end
 
@@ -119,8 +122,10 @@ zero-byte spawns, so the *count* stays trustworthy.
 function record_subprocess!(tool::AbstractString, seconds::Float64, bytes::Integer = 0)
     PHASE_LOG.capturing[] || return nothing
     key = String(tool)
-    prev = get(PHASE_LOG.subprocesses, key, SubprocessStat())
-    PHASE_LOG.subprocesses[key] = prev + SubprocessStat(1, seconds, Int(bytes))
+    @lock PHASE_LOG.lock begin
+        prev = get(PHASE_LOG.subprocesses, key, SubprocessStat())
+        PHASE_LOG.subprocesses[key] = prev + SubprocessStat(1, seconds, Int(bytes))
+    end
     return nothing
 end
 
@@ -146,7 +151,7 @@ Filter to one `group` (`"pass"`, `"emit"`, `"stage"`) or one `kernel` first.
 """
 function phase_table(; group = nothing, kernel = nothing)
     totals = Dict{Tuple{String, String}, Tuple{Float64, Int}}()
-    for r in PHASE_LOG.records
+    for r in @lock(PHASE_LOG.lock, copy(PHASE_LOG.records))
         group === nothing || r.group == group || continue
         kernel === nothing || r.kernel == kernel || continue
         key = (r.group, r.label)

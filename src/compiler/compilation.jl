@@ -10,7 +10,7 @@
 # Genuinely process-level, and staying: it indexes the numbered IR files the
 # compiler writes to `tmp_kernels/`, and compilation happens before a device is
 # chosen — there is no context to hang it on. Not device state.
-const KERNEL_DEBUG_COUNTER = Ref(0)
+const KERNEL_DEBUG_COUNTER = Threads.Atomic{Int}(0)  # kernels compile on several threads
 
 """
     kernel_display_name(f) -> Symbol
@@ -733,77 +733,80 @@ function lava_gpu_kernel(mod::LLVM.Module, meta, job::GPUCompiler.CompilerJob;
     end
     entry_fn = meta.entry
     entry_name = entry_fn.name
-    phase_kernel!(entry_name)
-
-    # ── Stage 0: BDA entry wrapper ──
-    # Must happen BEFORE passes — the wrapper becomes the new entry point
-    push_info = timed_phase("stage", "wrap_entry_for_vulkan!") do
-        wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size, exceptions = true)
-    end
-    wrapper_name = push_info.wrapper_name
-
-    # The wrapper function is now the entry point
-    wrapper_fn = mod.functions[wrapper_name]
-
-    # ── Stage 1: LLVM passes ──
-    timed_phase("stage", "run_llvm_passes!") do
-        run_llvm_passes!(mod, wrapper_fn; force_inline_all, kernelname = entry_name)
-    end
-
-    # Materialising the post-pass IR is not free: `string(mod)` is
-    # proportional to module size and is "seconds by itself" on a fat module
-    # (the RT path says so in its own comment), and the two writes below put
-    # a `.ll` and a `.spv` on disk for EVERY kernel — `dev/tmp_kernels` had
-    # grown to 5675 files / 275 MB. None of it is read unless somebody is
-    # debugging a compile, so none of it runs unless asked.
-    #
-    # `ir` is only consumed by `dump_spirv_to_disk` below and by
-    # `kernel_source_name` in profiling.jl. A kernel from a package image or
-    # from an earlier session has an empty `ir` too: neither keeps one.
-    want_ir = kernel_dump_wanted()
-    ir = want_ir ? timed_phase("stage", "string(mod)") do
-        string(mod)
-    end : ""
-    if want_ir
-        timed_phase("stage", "write .ll") do
-            KERNEL_DEBUG_COUNTER[] += 1
-            _dbg_dir = kernel_dump_dir()
-            mkpath(_dbg_dir)
-            write(joinpath(_dbg_dir, "kernel_$(KERNEL_DEBUG_COUNTER[])_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).ll"), ir)
-            record_subprocess!("write tmp_kernels/.ll", 0.0, sizeof(ir))
+    return phase_kernel(entry_name) do
+        # ── Stage 0: BDA entry wrapper ──
+        # Must happen BEFORE passes — the wrapper becomes the new entry point
+        push_info = timed_phase("stage", "wrap_entry_for_vulkan!") do
+            wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size, exceptions = true)
         end
-    end
+        wrapper_name = push_info.wrapper_name
 
-    # ── Stage 2: Custom SPIR-V emission ──
-    spirv_bytes, source_map = timed_phase("stage", "emit_spirv_from_llvm") do
-        emit_spirv_from_llvm(mod, wrapper_name, workgroup_size; enable_ray_query)
-    end
+        # The wrapper function is now the entry point
+        wrapper_fn = mod.functions[wrapper_name]
+        # Before the passes inline the kernel into the wrapper and its parameters go.
+        readonly = readonly_slots(job, entry_fn, push_info)
 
-    # ── Stage 2.5: SPIR-V optimization (optional, helps NVIDIA) ──
-    if SPIRV_OPT_ENABLED[]
-        spirv_bytes = timed_phase("stage", "run_spirv_opt") do
-            run_spirv_opt(spirv_bytes)
+        # ── Stage 1: LLVM passes ──
+        timed_phase("stage", "run_llvm_passes!") do
+            run_llvm_passes!(mod, wrapper_fn; force_inline_all, kernelname = entry_name, readonly)
         end
-    end
 
-    # Save SPIR-V for debugging (same gate as the .ll above)
-    if want_ir
-        timed_phase("stage", "write .spv") do
-            write(joinpath(kernel_dump_dir(), "kernel_$(KERNEL_DEBUG_COUNTER[])_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).spv"), spirv_bytes)
-            record_subprocess!("write tmp_kernels/.spv", 0.0, length(spirv_bytes))
+        # Materialising the post-pass IR is not free: `string(mod)` is
+        # proportional to module size and is "seconds by itself" on a fat module
+        # (the RT path says so in its own comment), and the two writes below put
+        # a `.ll` and a `.spv` on disk for EVERY kernel — `dev/tmp_kernels` had
+        # grown to 5675 files / 275 MB. None of it is read unless somebody is
+        # debugging a compile, so none of it runs unless asked.
+        #
+        # `ir` is only consumed by `dump_spirv_to_disk` below and by
+        # `kernel_source_name` in profiling.jl. A kernel from a package image or
+        # from an earlier session has an empty `ir` too: neither keeps one.
+        want_ir = kernel_dump_wanted()
+        # One number for this kernel's .ll and .spv, taken once: kernels compile on several threads.
+        dump_index = want_ir ? Threads.atomic_add!(KERNEL_DEBUG_COUNTER, 1) + 1 : 0
+        ir = want_ir ? timed_phase("stage", "string(mod)") do
+            string(mod)
+        end : ""
+        if want_ir
+            timed_phase("stage", "write .ll") do
+                _dbg_dir = kernel_dump_dir()
+                mkpath(_dbg_dir)
+                write(joinpath(_dbg_dir, "kernel_$(dump_index)_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).ll"), ir)
+                record_subprocess!("write tmp_kernels/.ll", 0.0, sizeof(ir))
+            end
         end
-    end
-    dump_spirv_to_disk(spirv_bytes, ir, wrapper_name; entry_name)
 
-    # ── Stage 3: Validation ──
-    if validate
-        timed_phase("stage", "validate_spirv") do
-            validate_spirv(spirv_bytes, ir, source_map)
+        # ── Stage 2: Custom SPIR-V emission ──
+        spirv_bytes, source_map = timed_phase("stage", "emit_spirv_from_llvm") do
+            emit_spirv_from_llvm(mod, wrapper_name, workgroup_size; enable_ray_query)
         end
-    end
 
-    return LavaGPUKernel(spirv_bytes, wrapper_name, workgroup_size, push_info, ir,
-                         enable_ray_query, entry_name)
+        # ── Stage 2.5: SPIR-V optimization (optional, helps NVIDIA) ──
+        if SPIRV_OPT_ENABLED[]
+            spirv_bytes = timed_phase("stage", "run_spirv_opt") do
+                run_spirv_opt(spirv_bytes)
+            end
+        end
+
+        # Save SPIR-V for debugging (same gate as the .ll above)
+        if want_ir
+            timed_phase("stage", "write .spv") do
+                write(joinpath(kernel_dump_dir(), "kernel_$(dump_index)_$(replace(wrapper_name, r"[^a-zA-Z0-9_]" => "_")).spv"), spirv_bytes)
+                record_subprocess!("write tmp_kernels/.spv", 0.0, length(spirv_bytes))
+            end
+        end
+        dump_spirv_to_disk(spirv_bytes, ir, wrapper_name; entry_name)
+
+        # ── Stage 3: Validation ──
+        if validate
+            timed_phase("stage", "validate_spirv") do
+                validate_spirv(spirv_bytes, ir, source_map)
+            end
+        end
+
+        return LavaGPUKernel(spirv_bytes, wrapper_name, workgroup_size, push_info, ir,
+                             enable_ray_query, entry_name)
+    end
 end
 
 """
@@ -1004,7 +1007,8 @@ end
 
 function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
                            force_inline_all::Bool=false,
-                           kernelname::AbstractString="")
+                           kernelname::AbstractString="",
+                           readonly::Vector{ReadonlySlot}=ReadonlySlot[])
     # ── CFG cleanup ──
     # Verify IR after each custom pass to catch corruption early.
     # Only in debug mode — verify is cheap but adds up across 30+ passes.
@@ -1097,6 +1101,12 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     LLVM.run!(LLVM.SROAPass(), mod)
     LLVM.run!(LLVM.InstCombinePass(), mod)
     checkpoint("InstCombine+SROA+InstCombine")
+
+    # The kernel is one function with its accesses promoted out of allocas: follow each
+    # read-only argument from the argument buffer to its loads.
+    mark_readonly_loads!(mod, entry_fn, readonly)
+    verify_ir!("mark_readonly_loads")
+    checkpoint("mark_readonly_loads!")
 
     # ── Loop optimisation ──
     # Without unrolling here there is a flat ~2.5x deficit against the same

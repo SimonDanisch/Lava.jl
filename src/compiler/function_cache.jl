@@ -311,17 +311,17 @@ function emit_function_objects(llvm_mod, entry, reachable, workgroup_size; enabl
             checkpoint("fingerprint " * fn.name)
             if fn !== entry
                 if symbols[fn] in emitted
-                    COMPILE_STATS.function_hits += 1
+                    @atomic COMPILE_STATS.function_hits += 1
                     continue
                 end
                 push!(emitted, symbols[fn])
             end
             found = keep && fn !== entry ? ObjCache.get("Lava/function", key) : nothing
             if found !== nothing
-                COMPILE_STATS.function_hits += 1
+                @atomic COMPILE_STATS.function_hits += 1
                 code = found
             else
-                fn !== entry && (COMPILE_STATS.function_misses += 1)
+                fn !== entry && (@atomic COMPILE_STATS.function_misses += 1)
                 state = fn === entry ? template : copy_compute_emitter(template)
                 code, data = function_object(llvm_mod, fn, symbols, state, interfaces;
                                              entry = fn === entry, wg = workgroup_size)

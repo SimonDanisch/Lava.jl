@@ -26,7 +26,7 @@
 # division every GPU emulates in software. Vector divisions are left alone;
 # nothing in Lava's kernels produces them.
 
-iswidedivision(inst::LLVM.Instruction) =
+iswidedivision(@nospecialize(inst::LLVM.Instruction)) =
     LLVM.opcode(inst) in (LLVM.API.LLVMUDiv, LLVM.API.LLVMSDiv, LLVM.API.LLVMURem, LLVM.API.LLVMSRem) &&
     LLVM.value_type(inst) == LLVM.IntType(64)
 

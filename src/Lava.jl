@@ -96,6 +96,7 @@ export VertexWrapper, FragmentWrapper, GeometryWrapper
 public caps, DeviceCaps
 
 import Serialization
+using Base.ScopedValues: ScopedValue, with
 import PrecompileTools
 using PrecompileTools: @setup_workload
 # `import`, and the ONLY line in this package that names Vulkan.
@@ -197,6 +198,7 @@ include("compiler/passes/odd_integers.jl")
 # ---- Compiler (depends on emitter + passes) ----
 include("compiler/target.jl")
 include("compiler/entry_wrapper.jl")
+include("compiler/passes/readonly_loads.jl")  # loads of read-only arguments, by provenance
 include("compiler/compilation.jl")
 # Compiled kernels and stages, kept with their `CodeInstance`s: the lookups in
 # front of `compilation.jl`'s compilers, and what a package image persists.
@@ -300,6 +302,18 @@ function __init__()
     # defining methods can invalidate it, and then the first compile re-JITs the
     # compiler. Freezing here keeps that precompiled code live.
     _initialization_world[] = Base.get_world_counter()
+
+    # Every LLVM target, registered here, on one thread, before the first compile.
+    # GPUCompiler registers them in its first `emit_llvm` behind a plain flag (its
+    # `@locked` is a no-op from Julia 1.12 on), and LLVM's target registry is a linked
+    # list it prepends to: two threads' first compiles both prepended the SPIR-V
+    # target, it became its own successor, and every target lookup after that, Julia's
+    # own JIT included, looped forever. A target already registered is left alone.
+    LLVM.InitializeAllTargets()
+    LLVM.InitializeAllTargetInfos()
+    LLVM.InitializeAllAsmPrinters()
+    LLVM.InitializeAllAsmParsers()
+    LLVM.InitializeAllTargetMCs()
 
     # No `init_pipeline_thread!` and no `atexit` hook here any more. Both were
     # about a live device — a background thread that builds pipelines, and

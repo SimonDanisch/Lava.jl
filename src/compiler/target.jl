@@ -15,16 +15,23 @@ struct LavaCompilerParams <: GPUCompiler.AbstractCompilerParams
     # two devices with different feature sets compile the same kernel twice, as
     # they must.
     features::TargetFeatures
+    # Bit `k - 1` set for each argument `k` of the kernel's signature whose memory nothing
+    # writes while the kernel runs (Mantle's access walk decides). Its loads are marked
+    # invariant (`mark_readonly_loads!`). A flag rather than a `Lava.Const` argument type, so
+    # the compile infers the signature the walk inferred. Bits, not a vector: the params are
+    # in the inference cache's owner token, which Julia compares with `===`, so a vector
+    # (even an empty one) gave every job a cache of its own.
+    readonly::UInt64
 end
-LavaCompilerParams() = LavaCompilerParams((64, 1, 1), false, TargetFeatures())
+LavaCompilerParams() = LavaCompilerParams((64, 1, 1), false, TargetFeatures(), UInt64(0))
 LavaCompilerParams(workgroup_size::NTuple{3,Int}) =
-    LavaCompilerParams(workgroup_size, false, TargetFeatures())
+    LavaCompilerParams(workgroup_size, false, TargetFeatures(), UInt64(0))
 
 const LavaCompilerConfig = GPUCompiler.CompilerConfig{GPUCompiler.SPIRVCompilerTarget, LavaCompilerParams}
 const LavaCompilerJob = GPUCompiler.CompilerJob{GPUCompiler.SPIRVCompilerTarget, LavaCompilerParams}
 
-# These parameters are read only after Julia inference: they select the entry wrapper and
-# SPIR-V capabilities. Keep one inference cache for them, so Mantle's access walk and the
+# These parameters are read only after Julia inference: they select the entry wrapper,
+# SPIR-V capabilities and which loads are invariant. Keep one inference cache for them, so Mantle's access walk and the
 # launch reuse each other's CodeInstances. GPUCompiler keys compiled results separately on
 # the full CompilerConfig, so different workgroup sizes and capabilities keep their own code.
 GPUCompiler.cache_owner(target::GPUCompiler.SPIRVCompilerTarget, ::LavaCompilerParams,
@@ -432,7 +439,8 @@ end
 
 # ── Compiler configuration cache ──
 
-const COMPILER_CONFIGS = Dict{UInt, LavaCompilerConfig}()
+# Locked: kernels compile on several threads (Mantle compiles a plan's at once).
+const COMPILER_CONFIGS = Base.Lockable(Dict{UInt, LavaCompilerConfig}())
 
 """
     lava_compiler_config(; workgroup_size=(64,1,1)) -> LavaCompilerConfig
@@ -450,13 +458,11 @@ function lava_compiler_config(; workgroup_size::NTuple{3,Int} = (64, 1, 1),
                                features::TargetFeatures = TargetFeatures(),
                                kwargs...)
     h = hash((workgroup_size, enable_ray_query, features, kwargs))
-    config = get(COMPILER_CONFIGS, h, nothing)
-    if config !== nothing
-        return config
+    return lock(COMPILER_CONFIGS) do configs
+        get!(configs, h) do
+            lava_full_compiler_config(; workgroup_size, enable_ray_query, features, kwargs...)
+        end
     end
-    config = lava_full_compiler_config(; workgroup_size, enable_ray_query, features, kwargs...)
-    COMPILER_CONFIGS[h] = config
-    return config
 end
 
 @noinline function lava_full_compiler_config(;
@@ -475,12 +481,13 @@ end
         workgroup_size::NTuple{3,Int} = (64, 1, 1),
         enable_ray_query::Bool = false,
         features::TargetFeatures = TargetFeatures(),
+        readonly::UInt64 = UInt64(0),
         kwargs...)
     target = GPUCompiler.SPIRVCompilerTarget(;
         backend = :llvm,       # gives spirv64-unknown-unknown-unknown triple
         validate = false,      # we validate after our custom SPIR-V emitter
         supports_fp64 = true,  # AMD RX 7900 XTX supports Float64
     )
-    params = LavaCompilerParams(workgroup_size, enable_ray_query, features)
+    params = LavaCompilerParams(workgroup_size, enable_ray_query, features, readonly)
     GPUCompiler.CompilerConfig(target, params; kernel, name, always_inline)
 end

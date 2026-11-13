@@ -475,12 +475,20 @@ function nonwritable_pointer!(state::SPIRVEmitterState, ptr_id::UInt32, value_ty
     return member_ptr
 end
 
+# What one piece of a decomposed PSB load reads through: the access the whole load has.
+piecepointer!(state::SPIRVEmitterState, ptr_id::UInt32, value_ty::UInt32, nonwritable::Bool) =
+    nonwritable ? nonwritable_pointer!(state, ptr_id, value_ty) : ptr_id
+
 """
     get_value_id!(state, val) -> UInt32
 
 Get the SPIR-V ID for an LLVM Value. Creates constants on-the-fly for ConstantInt/ConstantFP.
 """
-function get_value_id!(state::SPIRVEmitterState, val::LLVM.Value)
+# `@nospecialize` on LLVM values here and in the emitter's other helpers: a value
+# arrives as its concrete wrapper (`MulInst`, `IntToPtrInst`, ...), and these are
+# written against `LLVM.Value` with `isa` checks. Specialised, each was compiled again
+# per wrapper type it met, at run time, every session: about a thousand methods.
+function get_value_id!(state::SPIRVEmitterState, @nospecialize(val::LLVM.Value))
     cached = get(state.value_map, val, nothing)
     cached !== nothing && return cached
 
@@ -527,7 +535,7 @@ Get the SPIR-V ID for an LLVM index value, ensuring it's 32-bit.
 Vulkan SPIR-V requires OpAccessChain indices to be 32-bit integers.
 If the source value is i64, inserts an OpUConvert to truncate to i32.
 """
-function ensure_index_i32!(state::SPIRVEmitterState, val::LLVM.Value)
+function ensure_index_i32!(state::SPIRVEmitterState, @nospecialize(val::LLVM.Value))
     ty = val.value_type
     # Compile-time literal: emit a fresh u32 OpConstant directly.  Going
     # through `get_value_id! + OpUConvert` would produce a runtime UConvert,
@@ -568,7 +576,7 @@ offset of a matrix column chosen by a comparison, retyped to 32-bit words — an
 to the right one when the same arithmetic is done in 32 bits. The access chain
 takes 32 bits of the index either way.
 """
-function narrow_index!(state::SPIRVEmitterState, val::LLVM.Value, root::Bool = true, depth::Int = 0)
+function narrow_index!(state::SPIRVEmitterState, @nospecialize(val::LLVM.Value), root::Bool = true, depth::Int = 0)
     if val isa LLVM.ConstantInt
         return emit_constant_u32!(state.mod, UInt32(convert(Int64, val) & 0xFFFFFFFF))
     end
@@ -1054,7 +1062,7 @@ end
 # Instruction Dispatch
 # ================================================================
 
-function emit_instruction!(state::SPIRVEmitterState, inst::LLVM.Instruction)
+function emit_instruction!(state::SPIRVEmitterState, @nospecialize(inst::LLVM.Instruction))
     # Track SPIR-V ID before/after to record source mapping
     id_before = state.mod.next_id
 
@@ -1376,7 +1384,7 @@ The id an integer comparison takes for `val`: its value, or for a pointer its
 address as a u64. Null is the constant 0. Any other pointer has to be a
 physical-storage-buffer pointer, the only kind SPIR-V converts to an integer.
 """
-operand_id!(state::SPIRVEmitterState, val::LLVM.Value) =
+operand_id!(state::SPIRVEmitterState, @nospecialize(val::LLVM.Value)) =
     val.value_type isa LLVM.PointerType ? pointer_address!(state, val) : get_value_id!(state, val)
 
 pointer_address!(state::SPIRVEmitterState, ::LLVM.PointerNull) =
@@ -1667,18 +1675,29 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                      psb_access_alignment(actual_load, llvm_align), decompose)
             ptr_id = unfoldedaddress!(state, ptr, ptr_id, spirv_load_ty)
         end
+        # `!invariant.load`: nothing writes this memory while the kernel runs, so every
+        # access this load becomes reads through a NonWritable member. Every one: RADV
+        # merges neighbouring loads only when their access flags agree, and a read-only
+        # first field next to plain byte loads of the rest split a 28-byte element into
+        # fifteen loads and cost a trace kernel half its occupancy.
+        # RADV 26.2.4 corrupts Float64 matrix products when these loads use NonWritable
+        # members (12x12 StaticArrays, even without spirv-opt). Removing only that
+        # decoration from the same shader restores exact results. Keep the ordinary load
+        # for doubles; Const's read-only contract is unchanged.
+        nonwritable = haskey(LLVM.metadata(inst), LLVM.MD_invariant_load) &&
+                      !(actual_load isa LLVM.DoubleType)
         if decompose
             access_align = get_alignment_for_type(actual_load)
             if actual_load isa LLVM.VectorType
-                load_id = emit_psb_decomposed_vector_load!(state, ptr_id, actual_load, spirv_load_ty)
+                load_id = emit_psb_decomposed_vector_load!(state, ptr_id, actual_load, spirv_load_ty; nonwritable)
             elseif access_align <= 4
                 # Small type (i32/float/i16) at potentially non-4-aligned address:
                 # decompose into individual byte loads with Aligned 1
-                load_id = emit_psb_decomposed_small_load!(state, ptr_id, actual_load, spirv_load_ty)
+                load_id = emit_psb_decomposed_small_load!(state, ptr_id, actual_load, spirv_load_ty; nonwritable)
             else
                 # Wide type (i64/double) at non-8-aligned address:
                 # decompose into two i32 loads with Aligned 4
-                load_id = emit_psb_decomposed_load!(state, ptr_id, actual_load, spirv_load_ty)
+                load_id = emit_psb_decomposed_load!(state, ptr_id, actual_load, spirv_load_ty; nonwritable)
                 if actual_load isa LLVM.IntegerType && actual_load.width == 64
                     decomposed_raw_value_ty = actual_load
                 end
@@ -1711,6 +1730,7 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
             if psb_ptr_as_i64
                 # Load as i64, then convert to typed pointer
                 i64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
+                nonwritable && (ptr_id = nonwritable_pointer!(state, ptr_id, i64_spirv))
                 raw_load_id = fresh_id!(state.mod)
                 push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
                 push!(state.mod.functions, i64_spirv)
@@ -1721,16 +1741,7 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                 # Convert i64 → typed PSB pointer
                 encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, result_ty, load_id, raw_load_id)
             else
-                # `!invariant.load`: nothing writes this memory while the kernel runs.
-                # RADV 26.2.4 corrupts Float64 matrix products when these
-                # loads use NonWritable members (12x12 StaticArrays, even
-                # without spirv-opt). Removing only that decoration from
-                # the same shader restores exact results. Keep the ordinary
-                # load for doubles; Const's read-only contract is unchanged.
-                if haskey(LLVM.metadata(inst), LLVM.MD_invariant_load) &&
-                   !(actual_load isa LLVM.DoubleType)
-                    ptr_id = nonwritable_pointer!(state, ptr_id, spirv_load_ty)
-                end
+                nonwritable && (ptr_id = nonwritable_pointer!(state, ptr_id, spirv_load_ty))
                 # OpLoad: result_type, result_id, ptr, memory_operand, alignment
                 push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
                 push!(state.mod.functions, spirv_load_ty)
@@ -1899,8 +1910,8 @@ Returns `(ptr_id, actual_load_ty)` where `actual_load_ty` is the type at the
 resolved pointer (may differ from `load_ty` if a bitcast is needed, e.g.,
 float vs i32). Returns `(ptr_id, nothing)` if no type resolution was done.
 """
-function resolve_struct_field_load!(state::SPIRVEmitterState, ptr::LLVM.Value,
-                                      ptr_id::UInt32, load_ty::LLVM.LLVMType,
+function resolve_struct_field_load!(state::SPIRVEmitterState, @nospecialize(ptr::LLVM.Value),
+                                      ptr_id::UInt32, @nospecialize(load_ty::LLVM.LLVMType),
                                       result_spirv_ty::UInt32=UInt32(0))
     pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
     pointee_ty === nothing && return (ptr_id, nothing, nothing)
@@ -2407,9 +2418,9 @@ function rederive_store_ptr_at_parent_level!(state::SPIRVEmitterState,
     end
 end
 
-function resolve_struct_field_store!(state::SPIRVEmitterState, ptr::LLVM.Value,
-                                       ptr_id::UInt32, store_ty::LLVM.LLVMType,
-                                       store_value::LLVM.Value)
+function resolve_struct_field_store!(state::SPIRVEmitterState, @nospecialize(ptr::LLVM.Value),
+                                       ptr_id::UInt32, @nospecialize(store_ty::LLVM.LLVMType),
+                                       @nospecialize(store_value::LLVM.Value))
     pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
     pointee_ty === nothing && return (ptr_id, nothing)
     pointee_ty == store_ty && return (ptr_id, nothing)
@@ -2889,8 +2900,8 @@ Bitcast a store value if its LLVM type doesn't match the pointer's declared poin
 This happens when LLVM optimizes e.g. `store float 0.0` → `store i32 0` (same bit pattern).
 Returns the (possibly new) value ID to use for the store.
 """
-function bitcast_store_value_if_needed!(state::SPIRVEmitterState, ptr::LLVM.Value,
-                                          value::LLVM.Value, val_id::UInt32)
+function bitcast_store_value_if_needed!(state::SPIRVEmitterState, @nospecialize(ptr::LLVM.Value),
+                                          @nospecialize(value::LLVM.Value), val_id::UInt32)
     val_ty = value.value_type
     pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
     pointee_ty === nothing && return val_id
@@ -2947,8 +2958,8 @@ Fix PSB pointer type mismatch for stores. When storing a value whose type differ
 bit width from the pointer's PTM-inferred pointee type, bitcast the pointer to match
 the value type. E.g. storing i8 (Bool) into ptr<i64,PSB> → bitcast ptr to ptr<i8,PSB>.
 """
-function fix_psb_ptr_type_for_store!(state::SPIRVEmitterState, ptr::LLVM.Value,
-                                       ptr_id::UInt32, value::LLVM.Value)
+function fix_psb_ptr_type_for_store!(state::SPIRVEmitterState, @nospecialize(ptr::LLVM.Value),
+                                       ptr_id::UInt32, @nospecialize(value::LLVM.Value))
     val_ty = value.value_type
     pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
     pointee_ty === nothing && return ptr_id
@@ -3363,7 +3374,8 @@ pointer types which can crash NVIDIA's SPIR-V compiler).
 Returns the SPIR-V result ID of the combined value.
 """
 function emit_psb_decomposed_load!(state::SPIRVEmitterState, ptr_id::UInt32,
-                                     load_ty::LLVM.LLVMType, result_spirv_ty::UInt32)
+                                     load_ty::LLVM.LLVMType, result_spirv_ty::UInt32;
+                                     nonwritable::Bool = false)
     u32_spirv = emit_type_int!(state.mod, UInt32(32), UInt32(0))
     u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
     u32_ptr_ty = map_pointer_type!(state.type_ctx, u32_spirv, SC.PhysicalStorageBuffer)
@@ -3375,6 +3387,7 @@ function emit_psb_decomposed_load!(state::SPIRVEmitterState, ptr_id::UInt32,
     # Low load: ptr → ptr<u32,PSB>, load low 32 bits
     lo_ptr = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, u32_ptr_ty, lo_ptr, base_u64)
+    lo_ptr = piecepointer!(state, lo_ptr, u32_spirv, nonwritable)
     lo_id = fresh_id!(state.mod)
     push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
     push!(state.mod.functions, u32_spirv)
@@ -3389,6 +3402,7 @@ function emit_psb_decomposed_load!(state::SPIRVEmitterState, ptr_id::UInt32,
     encode_instruction!(state.mod.functions, Op.OpIAdd, u64_spirv, hi_addr, base_u64, const_4)
     hi_ptr = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, u32_ptr_ty, hi_ptr, hi_addr)
+    hi_ptr = piecepointer!(state, hi_ptr, u32_spirv, nonwritable)
     hi_id = fresh_id!(state.mod)
     push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
     push!(state.mod.functions, u32_spirv)
@@ -3487,7 +3501,8 @@ Used when the PSB pointer might not be 4-byte aligned.
 Returns the SPIR-V result ID of the combined value.
 """
 function emit_psb_decomposed_small_load!(state::SPIRVEmitterState, ptr_id::UInt32,
-                                           load_ty::LLVM.LLVMType, result_spirv_ty::UInt32)
+                                           load_ty::LLVM.LLVMType, result_spirv_ty::UInt32;
+                                           nonwritable::Bool = false)
     u8_spirv = emit_type_int!(state.mod, UInt32(8), UInt32(0))
     u32_spirv = emit_type_int!(state.mod, UInt32(32), UInt32(0))
     u64_spirv = emit_type_int!(state.mod, UInt32(64), UInt32(0))
@@ -3511,6 +3526,7 @@ function emit_psb_decomposed_small_load!(state::SPIRVEmitterState, ptr_id::UInt3
 
         byte_ptr = fresh_id!(state.mod)
         encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, u8_ptr_ty, byte_ptr, byte_addr)
+        byte_ptr = piecepointer!(state, byte_ptr, u8_spirv, nonwritable)
 
         byte_val = fresh_id!(state.mod)
         push!(state.mod.functions, (UInt32(6) << 16) | UInt32(Op.OpLoad))
@@ -3585,7 +3601,8 @@ The scalar helpers size their byte loop by the type they are handed, and handed
 a vector they read one component's worth and returned it as the whole value.
 """
 function emit_psb_decomposed_vector_load!(state::SPIRVEmitterState, ptr_id::UInt32,
-                                          vec_ty::LLVM.VectorType, result_spirv_ty::UInt32)
+                                          vec_ty::LLVM.VectorType, result_spirv_ty::UInt32;
+                                          nonwritable::Bool = false)
     el = vec_ty.element_type
     elsize = compute_type_size(el, state.data_layout)
     el_spirv = map_type!(state.type_ctx, el)
@@ -3595,8 +3612,8 @@ function emit_psb_decomposed_vector_load!(state::SPIRVEmitterState, ptr_id::UInt
     comps = map(0:(vec_ty.length - 1)) do i
         cptr = psb_component_pointer!(state, base_u64, i * elsize)
         get_alignment_for_type(el) <= 4 ?
-            emit_psb_decomposed_small_load!(state, cptr, el, el_spirv) :
-            emit_psb_decomposed_load!(state, cptr, el, el_spirv)
+            emit_psb_decomposed_small_load!(state, cptr, el, el_spirv; nonwritable) :
+            emit_psb_decomposed_load!(state, cptr, el, el_spirv; nonwritable)
     end
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, Op.OpCompositeConstruct, result_spirv_ty,
@@ -4419,8 +4436,8 @@ using the base pointer's actual element type: idx = byte_offset / sizeof(element
 Also updates the PTM so downstream stores/loads see the correct pointee type.
 """
 function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst,
-                                 base_ptr::LLVM.Value, base_id::UInt32,
-                                 base_pointee::LLVM.LLVMType)
+                                 @nospecialize(base_ptr::LLVM.Value), base_id::UInt32,
+                                 @nospecialize(base_pointee::LLVM.LLVMType))
     ops = inst.operands
     byte_offset_id = get_value_id!(state, ops[2])
 

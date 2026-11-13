@@ -32,7 +32,7 @@ end
 irkey_atom!(s, x) = Serialization.serialize(s.serializer, x)
 irkey_tag!(s, x::UInt8) = write(s.io, x)
 
-function irkey_reference!(s, x)
+function irkey_reference!(s, @nospecialize(x))
     id = get(s.objects, x, 0)
     if id != 0
         irkey_tag!(s, 0x00)
@@ -250,9 +250,12 @@ end
 """Portable identity of the inferred inputs to LLVM emission, or `nothing` for an unsupported input."""
 function inferred_kernel_key(job)
     interp = GPUCompiler.get_interpreter(job)
-    root = GPUCompiler.drive_inference!(interp, job.source)
+    # `get_codeinfos` too, under the lock: a source it has to infer again is inference.
+    root, pairs = @lock INFERENCE_LOCK begin
+        root = inferkernel!(job)
+        root, (root === nothing ? nothing : GPUCompiler.CompilerCaching.get_codeinfos(interp, root))
+    end
     root === nothing && return nothing
-    pairs = GPUCompiler.CompilerCaching.get_codeinfos(interp, root)
     s = IRKeyState(pairs, job.world)
     try
         # A compilable/vararg-widened CI may be shared by distinct concrete

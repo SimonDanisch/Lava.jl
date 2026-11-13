@@ -33,12 +33,13 @@ precompiled; `misses` compiled it. The names and shape are Metal.jl's
 `compile_stats`.
 """
 mutable struct CompileStats
-    hits::Int
-    misses::Int
-    function_hits::Int
-    function_misses::Int
-    llvm_hits::Int
-    llvm_misses::Int
+    # Atomic: kernels compile on several threads (Mantle compiles a plan's at once).
+    @atomic hits::Int
+    @atomic misses::Int
+    @atomic function_hits::Int
+    @atomic function_misses::Int
+    @atomic llvm_hits::Int
+    @atomic llvm_misses::Int
 end
 
 const COMPILE_STATS = CompileStats(0, 0, 0, 0, 0, 0)
@@ -50,19 +51,19 @@ How many kernel and shader lookups found compiled SPIR-V, and how many compiled
 it, since the last [`reset_compile_stats!`](@ref). A workload that leaves
 nothing to compile shows `misses == 0` when run again in a new session.
 """
-compile_stats() = (; hits = COMPILE_STATS.hits, misses = COMPILE_STATS.misses)
+compile_stats() = (; hits = @atomic(COMPILE_STATS.hits), misses = @atomic(COMPILE_STATS.misses))
 
 """The helper functions found in the object cache and emitted since `reset_compile_stats!`."""
-function_compile_stats() = (; hits = COMPILE_STATS.function_hits, misses = COMPILE_STATS.function_misses)
+function_compile_stats() = (; hits = @atomic(COMPILE_STATS.function_hits), misses = @atomic(COMPILE_STATS.function_misses))
 
 """Optimized LLVM modules found and optimized since `reset_compile_stats!`."""
-llvm_compile_stats() = (; hits = COMPILE_STATS.llvm_hits, misses = COMPILE_STATS.llvm_misses)
+llvm_compile_stats() = (; hits = @atomic(COMPILE_STATS.llvm_hits), misses = @atomic(COMPILE_STATS.llvm_misses))
 
 """Reset what [`compile_stats`](@ref) counts."""
 function reset_compile_stats!()
-    COMPILE_STATS.hits = COMPILE_STATS.misses = 0
-    COMPILE_STATS.function_hits = COMPILE_STATS.function_misses = 0
-    COMPILE_STATS.llvm_hits = COMPILE_STATS.llvm_misses = 0
+    for f in fieldnames(CompileStats)
+        setfield!(COMPILE_STATS, f, 0, :sequentially_consistent)
+    end
     return nothing
 end
 
@@ -98,15 +99,19 @@ mutable struct LavaKernelResults
 end
 
 """
-    lava_kernel_job(f, tt; workgroup_size, enable_ray_query=false, features=TargetFeatures()) -> CompilerJob
+    lava_kernel_job(f, tt; workgroup_size, enable_ray_query=false, features=TargetFeatures(),
+                    readonly=0) -> CompilerJob
 
 The compile job of compute kernel `f` taking arguments of types `tt`, in the
-current world.
+current world. `readonly` has bit `k - 1` set for each argument `k` whose memory
+nothing writes while the kernel runs (`LavaCompilerParams`).
 """
 lava_kernel_job(@nospecialize(f), @nospecialize(tt); workgroup_size::NTuple{3,Int},
-                enable_ray_query::Bool = false, features::TargetFeatures = TargetFeatures()) =
+                enable_ray_query::Bool = false, features::TargetFeatures = TargetFeatures(),
+                readonly::Integer = 0) =
     GPUCompiler.CompilerJob(GPUCompiler.methodinstance(typeof(f), tt),
-                            lava_compiler_config(; workgroup_size, enable_ray_query, features))
+                            lava_compiler_config(; workgroup_size, enable_ray_query, features,
+                                                 readonly = UInt64(readonly)))
 
 """
     compile_or_lookup(job) -> LavaGPUKernel
@@ -121,7 +126,7 @@ cannot invalidate the compiler's own code.
     GPUCompiler.run_compile_hook(job)
     res = GPUCompiler.cached_results(LavaKernelResults, job)
     if res !== nothing && res.kernel !== nothing
-        COMPILE_STATS.hits += 1
+        @atomic COMPILE_STATS.hits += 1
         return res.kernel
     end
     enroll!(job)
@@ -160,7 +165,7 @@ function cached_gfx_shader(@nospecialize(f), @nospecialize(tt), stage::Symbol; c
     if shaders !== nothing
         shader = get(shaders.stages, key, nothing)
         if shader !== nothing
-            COMPILE_STATS.hits += 1
+            @atomic COMPILE_STATS.hits += 1
             return shader
         end
     end
@@ -251,24 +256,43 @@ function persisted(compile, ns::String, mod::LLVM.Module, settings...)
                  UInt8[]
     found = keep ? ObjCache.get(ns, key) : nothing
     if found !== nothing
-        COMPILE_STATS.hits += 1
+        @atomic COMPILE_STATS.hits += 1
         return Serialization.deserialize(IOBuffer(found))
     end
-    COMPILE_STATS.misses += 1
+    @atomic COMPILE_STATS.misses += 1
     stage = compile()
     keep && ObjCache.put!(ns, key, serialized(portable(stage)))
     return stage
 end
 
+"""
+Held while a kernel is inferred: kernels are inferred one at a time. On the docs build,
+kernels with callees in common inferred on several threads at once gave a shading
+kernel dynamic dispatches it does not have inferred alone, and the imprecise result
+stayed cached for the session. Code generation only reads what inference cached, so it,
+LLVM's optimization, Lava's back end and the driver's compile still run alongside
+other compiles (Mantle's `compilekernels!`).
+"""
+const INFERENCE_LOCK = ReentrantLock()
+
+"""
+    inferkernel!(job) -> CodeInstance or nothing
+
+`job`'s kernel inferred, its call graph cached, holding [`INFERENCE_LOCK`](@ref).
+"""
+inferkernel!(job) =
+    @lock INFERENCE_LOCK GPUCompiler.drive_inference!(GPUCompiler.get_interpreter(job), job.source)
+
 """The compute kernel of `job`, looked up before LLVM emission when its inferred inputs are portable."""
 function persisted_kernel(job::LavaCompilerJob)
     keep = HAS_OBJECT_CACHE && !generating_output() && !kernel_dump_wanted() &&
            Base.JLOptions().code_coverage == 0 && Base.JLOptions().malloc_log == 0 && ObjCache.enabled()
-    key = keep ? inferred_kernel_key(job) : nothing
+    # Inferred first, alone: `GPUCompiler.compile` then finds the whole call graph cached.
+    key = keep ? inferred_kernel_key(job) : (inferkernel!(job); nothing)
     if key !== nothing
         found = ObjCache.get("Lava/inferred-kernel", key)
         if found !== nothing
-            COMPILE_STATS.hits += 1
+            @atomic COMPILE_STATS.hits += 1
             return Serialization.deserialize(IOBuffer(found))::LavaGPUKernel
         end
     end
@@ -282,7 +306,8 @@ function persisted_kernel_from_llvm(job::LavaCompilerJob)
     GPUCompiler.JuliaContext() do ctx
         mod, meta = lava_llvm(job)
         p = job.config.params
-        return persisted("Lava/kernel", mod, p.workgroup_size, p.enable_ray_query, p.features) do
+        # `readonly` too: its loads are marked after this module was optimized.
+        return persisted("Lava/kernel", mod, p.workgroup_size, p.enable_ray_query, p.features, p.readonly) do
             lava_gpu_kernel(mod, meta, job)
         end
     end

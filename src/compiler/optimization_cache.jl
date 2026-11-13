@@ -135,7 +135,7 @@ function GPUCompiler.optimize!(job::LavaCompilerJob, mod::LLVM.Module,
                                       opt_level, optimization_debug_locations(mod), inputs)))
     found = ObjCache.get("Lava/optimized-llvm", key)
     if found === nothing
-        COMPILE_STATS.llvm_misses += 1
+        @atomic COMPILE_STATS.llvm_misses += 1
         optimize_uncached!(job, mod, relocs; opt_level)
         GPUCompiler.prune_dead_relocations!(mod, relocs)
         if isempty(LLVM.aliases(mod)) && isempty(LLVM.ifuncs(mod))
@@ -152,7 +152,7 @@ function GPUCompiler.optimize!(job::LavaCompilerJob, mod::LLVM.Module,
             ObjCache.put!("Lava/optimized-llvm", key, serialized(entry))
         end
     else
-        COMPILE_STATS.llvm_hits += 1
+        @atomic COMPILE_STATS.llvm_hits += 1
         entry = Serialization.deserialize(IOBuffer(found))
         restored = parse(LLVM.Module, entry.bitcode)
         names = restore_optimization_symbols!(restored, entry.symbols, current)
