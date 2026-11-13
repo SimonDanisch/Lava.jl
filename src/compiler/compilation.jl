@@ -569,33 +569,6 @@ end
 Return the SPIR-V disassembly text."""
 disassemble(r::CompilationResult) = r.spirv_disasm
 
-"""
-    optimize_spirv(spirv_bytes::Vector{UInt8}; passes="-O") -> Vector{UInt8}
-
-Run spirv-opt on SPIR-V binary. Returns optimized bytes.
-Validates output with spirv-val.
-"""
-function optimize_spirv(spirv_bytes::Vector{UInt8}; passes::String="-O")
-    spirv_opt = SPIRV_Tools_jll.spirv_opt()
-    spirv_val_cmd = SPIRV_Tools_jll.spirv_val()
-
-    in_path = tempname() * ".spv"
-    out_path = tempname() * ".spv"
-    try
-        write(in_path, spirv_bytes)
-        po = lava_run(`$spirv_opt --target-env=vulkan1.3 --scalar-block-layout $passes $in_path -o $out_path`; label="spirv-opt")
-        (process_exited(po) && po.exitcode == 0) || error("spirv-opt failed (exit $(process_exited(po) ? po.exitcode : "timeout"))")
-        optimized = read(out_path)
-        # Validate optimized output
-        pv = lava_run(`$spirv_val_cmd --target-env vulkan1.3 --scalar-block-layout $out_path`; label="spirv-val")
-        (process_exited(pv) && pv.exitcode == 0) || error("spirv-val failed on optimized SPIR-V")
-        return optimized
-    finally
-        rm(in_path; force=true)
-        rm(out_path; force=true)
-    end
-end
-
 # ── LLVM IR compilation (GPUCompiler → LLVM Module) ──
 
 """
@@ -3060,10 +3033,9 @@ indexes to, a global's value type. `nothing` for anything else.
 addressed_type(a::LLVM.AllocaInst) = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(a))
 addressed_type(gv::LLVM.GlobalVariable) = gv.global_value_type
 addressed_type(arg::LLVM.Argument) = param_type(arg)
-addressed_type(gep::LLVM.GetElementPtrInst) = indexed_type(gep.source_element_type, gep.operands[3:end])
+addressed_type(gep::LLVM.GetElementPtrInst) = compute_gep_result_type(gep.source_element_type, gep)
 addressed_type(ce::LLVM.ConstantExpr) =
-    ce.opcode == LLVM.API.LLVMGetElementPtr ?
-        indexed_type(ce.source_element_type, ce.operands[3:end]) : nothing
+    ce.opcode == LLVM.API.LLVMGetElementPtr ? compute_gep_result_type(ce.source_element_type, ce) : nothing
 addressed_type(::LLVM.Value) = nothing
 
 """
@@ -3113,14 +3085,6 @@ function type_sret_boxes!(mod::LLVM.Module, dl::LLVM.DataLayout)
         end
     end
     return mod
-end
-
-"""The type GEP indices after the first select inside `ty`."""
-function indexed_type(ty::LLVM.LLVMType, idxs)
-    for idx in idxs
-        ty = ty isa LLVM.StructType ? ty.elements[convert(Int, idx) + 1] : ty.element_type
-    end
-    return ty
 end
 
 """

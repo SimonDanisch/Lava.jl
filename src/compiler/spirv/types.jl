@@ -214,7 +214,7 @@ function infer_param_composite_pointee(param::LLVM.Argument)
     types = unique(values(by_offset))
     length(types) == 1 || return nothing
     elem_ty = types[1]
-    elem_size = Int64(approx_sizeof(elem_ty))
+    elem_size = Int64(llvm_type_size(elem_ty))
     elem_size > 0 || return nothing
 
     # Offsets must be multiples of element size and form a contiguous run
@@ -376,8 +376,7 @@ function compute_gep_byte_offset(src_ty::LLVM.LLVMType, indices::Vector{<:LLVM.V
 
         if i == 1
             # First index: scales by sizeof(src_ty)
-            sz = approx_sizeof(current_ty)
-            sz === nothing && return nothing
+            sz = llvm_type_size(current_ty)
             offset += idx * sz
         else
             # Subsequent indices index into the current type
@@ -385,15 +384,13 @@ function compute_gep_byte_offset(src_ty::LLVM.LLVMType, indices::Vector{<:LLVM.V
                 # Struct: sum field sizes up to idx
                 for f in 0:(idx-1)
                     ft = current_ty.elements[f+1]
-                    sz = approx_sizeof(ft)
-                    sz === nothing && return nothing
+                    sz = llvm_type_size(ft)
                     offset += sz
                 end
                 current_ty = current_ty.elements[idx+1]
             elseif current_ty isa LLVM.ArrayType
                 elem_ty = current_ty.element_type
-                sz = approx_sizeof(elem_ty)
-                sz === nothing && return nothing
+                sz = llvm_type_size(elem_ty)
                 offset += idx * sz
                 current_ty = elem_ty
             else
@@ -402,41 +399,6 @@ function compute_gep_byte_offset(src_ty::LLVM.LLVMType, indices::Vector{<:LLVM.V
         end
     end
     return offset
-end
-
-"""Approximate sizeof for LLVM types (no padding/alignment — good enough for offset matching)."""
-function approx_sizeof(ty::LLVM.LLVMType)
-    if ty isa LLVM.IntegerType
-        return div(ty.width + 7, 8)
-    elseif ty isa LLVM.HalfType
-        return 2
-    elseif ty isa LLVM.FloatType
-        return 4
-    elseif ty isa LLVM.DoubleType
-        return 8
-    elseif ty isa LLVM.PointerType
-        return 8  # 64-bit pointers
-    elseif ty isa LLVM.StructType
-        total = 0
-        for elem in ty.elements
-            sz = approx_sizeof(elem)
-            sz === nothing && return nothing
-            total += sz
-        end
-        return total
-    elseif ty isa LLVM.ArrayType
-        n = ty.length
-        elem_sz = approx_sizeof(ty.element_type)
-        elem_sz === nothing && return nothing
-        return n * elem_sz
-    elseif ty isa LLVM.VectorType
-        n = ty.length
-        elem_sz = approx_sizeof(ty.element_type)
-        elem_sz === nothing && return nothing
-        return n * elem_sz
-    else
-        return nothing
-    end
 end
 
 """Find all ptr-type loads from an alloca at a specific byte offset,
@@ -1511,60 +1473,41 @@ function find_ptr_member_type_in_hierarchy(ctx::SPIRVTypeContext, ty::LLVM.LLVMT
 end
 
 """
-    trace_pointer_to_alloca(ptr) -> Bool
+    traces_to_alloca(ptr) -> Bool
 
-Recursively check whether a pointer value ultimately comes from an alloca
-(i.e. should retain Function storage class).  Walks through GEPs, BitCasts,
-and PHIs.  PHIs with a mix of alloca and non-alloca incoming values return
-true if at least one path reaches an alloca (Function-class wins — matches
-`is_psb_pointer`'s "any alloca → not PSB" rule).
+Whether `ptr` may point into an alloca, and so has Function storage class rather
+than PhysicalStorageBuffer: an alloca, a GEP or bitcast of one, a phi or select
+with any such operand, or a parameter some call site passes one (the alloca lives
+in the caller). A cycle that meets no alloca is not one. This one answer is what
+the storage class, the pointer type and the function cache all read.
 """
-function trace_pointer_to_alloca(ptr::LLVM.Value, visited::Set{LLVM.Value}=Set{LLVM.Value}())
-    ptr in visited && return false   # cycle without alloca → not Function
+function traces_to_alloca(ptr::LLVM.Value, visited::Set{LLVM.Value}=Set{LLVM.Value}())
+    ptr in visited && return false
     push!(visited, ptr)
     ptr isa LLVM.AllocaInst && return true
-    if ptr isa LLVM.GetElementPtrInst
-        base = ptr.operands[1]
-        return trace_pointer_to_alloca(base, visited)
-    end
-    if ptr isa LLVM.BitCastInst
-        src = ptr.operands[1]
-        return trace_pointer_to_alloca(src, visited)
-    end
-    if ptr isa LLVM.PHIInst
-        for (val, _) in ptr.incoming
-            trace_pointer_to_alloca(val, visited) && return true
-        end
-        return false
-    elseif ptr isa LLVM.SelectInst
-        return trace_pointer_to_alloca(ptr.operands[2], visited) ||
-               trace_pointer_to_alloca(ptr.operands[3], visited)
-    end
+    ptr isa Union{LLVM.GetElementPtrInst,LLVM.BitCastInst} && return traces_to_alloca(ptr.operands[1], visited)
+    ptr isa LLVM.PHIInst && return any(((val, _),) -> traces_to_alloca(val, visited), ptr.incoming)
+    ptr isa LLVM.SelectInst &&
+        return traces_to_alloca(ptr.operands[2], visited) || traces_to_alloca(ptr.operands[3], visited)
+    ptr isa LLVM.Argument && return param_called_with_alloca_arg(ptr, visited)
     return false
 end
 
-function param_called_with_alloca_arg(param::LLVM.Argument)
+"""Whether a call site of `param`'s function passes an alloca-derived pointer for it."""
+function param_called_with_alloca_arg(param::LLVM.Argument, visited::Set{LLVM.Value}=Set{LLVM.Value}())
     fn = LLVM.Function(LLVM.API.LLVMGetParamParent(param))
-    param_idx = nothing
-    for (i, p) in enumerate(fn.parameters)
-        if p === param
-            param_idx = i
-            break
-        end
-    end
+    param_idx = findfirst(p -> p === param, collect(fn.parameters))
     param_idx === nothing && return false
-    mod = fn.parent
-    for caller in mod.functions
+    for caller in fn.parent.functions
         isempty(caller.blocks) && continue
         for bb in caller.blocks, inst in bb.instructions
             inst isa LLVM.CallInst || continue
-            callee = inst.called_operand
-            callee === fn || continue
+            inst.called_operand === fn || continue
             ops = inst.operands
             param_idx <= length(ops) - 1 || continue
             arg = ops[param_idx]
             arg.value_type isa LLVM.PointerType || continue
-            trace_pointer_to_alloca(arg) && return true
+            traces_to_alloca(arg, visited) && return true
         end
     end
     return false
@@ -1647,16 +1590,8 @@ function map_pointer_type_for_value!(ctx::SPIRVTypeContext, ptr_value::LLVM.Valu
     # `is_psb_pointer`'s alloca trace).  The mismatch triggers an invalid
     # cross-SC OpBitcast at the PHI emit site.
     if sc == SC.Function && !(ptr_value isa LLVM.AllocaInst)
-        keeps_function = trace_pointer_to_alloca(ptr_value)
-        # For function PARAMETERS: alloca lives in the caller, so the trace
-        # can't reach it. Check call sites — if any caller passes an
-        # alloca-derived pointer, the param itself stays Function class.
-        if !keeps_function && ptr_value isa LLVM.Argument
-            keeps_function = param_called_with_alloca_arg(ptr_value)
-        end
-        if !keeps_function
-            sc = SC.PhysicalStorageBuffer
-        end
+        # A parameter's alloca lives in a caller; `traces_to_alloca` asks the call sites.
+        traces_to_alloca(ptr_value) || (sc = SC.PhysicalStorageBuffer)
     end
 
     # Map pointee type and create pointer type. Workgroup pointees MUST go through
@@ -1813,45 +1748,9 @@ end
 
 function map_constant_int!(ctx::SPIRVTypeContext, val::LLVM.ConstantInt, ty::LLVM.IntegerType)
     w = ty.width
-    type_id = map_type!(ctx, ty)
-    int_val = convert(Int64, val)
-
-    if w == 1
-        # Boolean constant
-        # OpConstantTrue (opcode 41) / OpConstantFalse (opcode 42)
-        id = fresh_id!(ctx.mod)
-        if int_val != 0
-            encode_instruction!(ctx.mod.types_constants, UInt16(41), type_id, id)  # OpConstantTrue
-        else
-            encode_instruction!(ctx.mod.types_constants, UInt16(42), type_id, id)  # OpConstantFalse
-        end
-        return id
-    elseif w <= 32
-        # Create constant with the CORRECT type (not always i32).
-        # SPIR-V requires type-matched operands in comparisons.
-        # Mask to actual bit width — SPIR-V requires high bits to be 0 for unsigned
-        # integer types (Signedness=0), which is what we emit.
-        bits = UInt32(int_val & ((UInt64(1) << w) - 1))
-        key = (:const, type_id, bits)
-        return get!(ctx.mod.constant_cache, key) do
-            id = fresh_id!(ctx.mod)
-            encode_instruction!(ctx.mod.types_constants, Op.OpConstant, type_id, id, bits)
-            id
-        end
-    elseif w == 64
-        # 64-bit constant: two UInt32 words (little-endian)
-        bits = reinterpret(UInt64, Int64(int_val))
-        lo = UInt32(bits & 0xFFFFFFFF)
-        hi = UInt32((bits >> 32) & 0xFFFFFFFF)
-        key = (:const, type_id, bits)
-        get!(ctx.mod.constant_cache, key) do
-            id = fresh_id!(ctx.mod)
-            encode_instruction!(ctx.mod.types_constants, Op.OpConstant, type_id, id, lo, hi)
-            id
-        end
-    else
-        error("Unsupported integer width: $w")
-    end
+    w == 1 && return emit_constant_bool!(ctx.mod, convert(Int64, val) != 0)
+    w <= 64 || error("Unsupported integer width: $w")
+    return emit_constant_int!(ctx.mod, map_type!(ctx, ty), w, convert(Int64, val) % UInt64)
 end
 
 function map_constant_fp!(ctx::SPIRVTypeContext, val::LLVM.ConstantFP, ty::LLVM.FloatType)
@@ -1909,16 +1808,7 @@ function map_undef!(ctx::SPIRVTypeContext, ty::LLVM.LLVMType)
     return map_null_constant!(ctx, ty)
 end
 
-function map_null_constant!(ctx::SPIRVTypeContext, ty::LLVM.LLVMType)
-    type_id = map_type!(ctx, ty)
-    # OpConstantNull (opcode 46)
-    key = (:null, type_id)
-    get!(ctx.mod.constant_cache, key) do
-        id = fresh_id!(ctx.mod)
-        encode_instruction!(ctx.mod.types_constants, UInt16(46), type_id, id)
-        id
-    end
-end
+map_null_constant!(ctx::SPIRVTypeContext, ty::LLVM.LLVMType) = emit_constant_null!(ctx.mod, map_type!(ctx, ty))
 
 function map_constant_array!(ctx::SPIRVTypeContext,
                              val::Union{LLVM.ConstantArray, LLVM.ConstantDataArray,
@@ -1997,8 +1887,8 @@ Add Block + MemberOffset decorations to ALL struct types (and nested struct type
 that are accessed via PhysicalStorageBuffer pointers. Required by Vulkan SPIR-V
 scalar block layout rules.
 
-Scans the PTM for pointer values in addrspace 1 (PSB) or addrspace 0 non-allocas
-(which map to PSB), collects their struct pointee types, and recursively decorates
+Scans the PTM for the pointer values that may be PhysicalStorageBuffer
+(`may_be_psb`), collects their struct pointee types, and recursively decorates
 them and all nested structs.
 """
 function decorate_psb_struct_layouts!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Module)
@@ -2013,7 +1903,7 @@ function decorate_psb_struct_layouts!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Modu
     all_psb_array_types = Set{LLVM.ArrayType}()          # All nested → get ArrayStride
 
     for (ptr_val, (pointee_ty, _priority)) in ctx.ptm.map
-        is_psb_value(ptr_val) || continue
+        may_be_psb(ptr_val) || continue
         # Top-level pointee struct gets Block
         if pointee_ty isa LLVM.StructType
             push!(direct_psb_struct_types, pointee_ty)
@@ -2070,15 +1960,19 @@ function decorate_psb_struct_layouts!(ctx::SPIRVTypeContext, llvm_mod::LLVM.Modu
     end
 end
 
-"""Check if an LLVM value is a PSB pointer (addrspace 1, or addrspace 0 non-alloca)."""
-function is_psb_value(val::LLVM.Value)
+"""
+Whether `val` could be a PhysicalStorageBuffer pointer in some module: one in
+addrspace 1, or any non-alloca in addrspace 0. Deliberately broader than
+`is_psb_pointer`, which answers for this module. The struct layout decorations go
+by it because a helper's object is cached and linked into other kernels, and its
+struct types must carry the same decorations there: decorating a struct only a
+Function pointer reaches is valid, while a struct decorated in one module and not
+in another fails at link time ("Type mismatch on symbol").
+"""
+function may_be_psb(val::LLVM.Value)
     ty = val.value_type
     ty isa LLVM.PointerType || return false
-    as = ty.addrspace
-    as == 1 && return true
-    # addrspace 0 non-allocas map to PSB in our convention
-    as == 0 && !(val isa LLVM.AllocaInst) && return true
-    return false
+    return ty.addrspace == 1 || (ty.addrspace == 0 && !(val isa LLVM.AllocaInst))
 end
 
 """Collect all struct types that are members of `sty` (directly or via arrays)."""
@@ -2115,34 +2009,6 @@ function collect_nested_types_for_psb!(structs::Set{LLVM.StructType},
             push!(arrays, ty)
             collect_nested_types_for_psb!(structs, arrays, ty.element_type)
         end
-    end
-end
-
-"""Compute byte size of an LLVM type using DataLayout for accurate struct sizes."""
-function compute_type_size_with_dl(ty::LLVM.LLVMType, dl::LLVM.DataLayout)
-    # See `compute_type_size`: a vector is sized as LLVM allocates it.
-    ty isa LLVM.VectorType && return UInt32(API.LLVMABISizeOfType(dl, ty))
-    if ty isa LLVM.StructType
-        # Use DataLayout for accurate struct size (includes padding)
-        n = length(ty.elements)
-        n == 0 && return UInt32(0)
-        last_offset = API.LLVMOffsetOfElement(dl, ty, UInt32(n - 1))
-        last_elem = collect(ty.elements)[n]
-        return UInt32(last_offset + compute_type_size_with_dl(last_elem, dl))
-    elseif ty isa LLVM.ArrayType
-        return UInt32(ty.length) * compute_type_size_with_dl(ty.element_type, dl)
-    elseif ty isa LLVM.IntegerType
-        return UInt32(max(1, ty.width ÷ 8))
-    elseif ty isa LLVM.FloatType
-        return UInt32(4)
-    elseif ty isa LLVM.DoubleType
-        return UInt32(8)
-    elseif ty isa LLVM.HalfType
-        return UInt32(2)
-    elseif ty isa LLVM.PointerType
-        return UInt32(8)
-    else
-        return UInt32(4)
     end
 end
 

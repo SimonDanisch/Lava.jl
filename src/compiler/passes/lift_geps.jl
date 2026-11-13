@@ -152,8 +152,8 @@ function split_wide_access!(access::LLVM.Instruction, alloca::LLVM.Instruction, 
     (elem isa LLVM.IntegerType || elem isa LLVM.FloatingPointType) || return false
     wide = access isa LLVM.StoreInst ? access.operands[1].value_type : access.value_type
     wide isa LLVM.IntegerType || return false
-    bits = llvm_type_bit_width(elem)
-    bits > 0 || return false
+    bits = scalar_bit_width(elem)
+    bits === nothing && return false
     (wide.width > bits && wide.width % bits == 0) || return false
     parts = wide.width ÷ bits
     parts <= array_type.length || return false

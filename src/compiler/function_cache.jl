@@ -267,8 +267,7 @@ end
 function function_fingerprint(mod::LLVM.Module, fn::LLVM.Function, skeleton, symbols, state, globals)
     ptm = state.type_ctx.ptm
     vals = [collect(LLVM.parameters(fn)); [i for b in fn.blocks for i in b.instructions]]
-    pointees = [(string(get(ptm.map, v, nothing)), trace_pointer_to_alloca(v),
-                 v isa LLVM.Argument && param_called_with_alloca_arg(v))
+    pointees = [(string(get(ptm.map, v, nothing)), traces_to_alloca(v))
                 for v in vals if v.value_type isa LLVM.PointerType]
     ctx = state.type_ctx
     members = sort!([(string(t),i,string(p),a) for ((t,i),(p,a)) in ctx.struct_ptr_members])

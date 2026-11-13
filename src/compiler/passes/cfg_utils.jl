@@ -26,16 +26,18 @@ insertion_point(bb::LLVM.BasicBlock) = LLVM.at_end(bb)
 insertion_point(inst::LLVM.Instruction) = LLVM.before(inst)
 
 """
-    compute_rpo(f::LLVM.Function) -> Vector{LLVM.BasicBlock}
+    reverse_postorder(f::LLVM.Function) -> Vector{LLVM.BasicBlock}
 
 Reverse post-order of `f`'s basic blocks. The DFS starts at the function's
 first block (the entry) and appends unreachable blocks at the end so every
 block in `f` appears exactly once.
 
 RPO is the canonical ordering for identifying natural loops: block `A` has a
-back-edge to block `B` iff `B` precedes `A` in RPO.
+back-edge to block `B` iff `B` precedes `A` in RPO. The emitter writes blocks in
+this order, so dominators come before the blocks they dominate and no non-phi
+instruction references a value ahead of it.
 """
-function compute_rpo(f::LLVM.Function)
+function reverse_postorder(f::LLVM.Function)
     blocks = collect(f.blocks)
     isempty(blocks) && return blocks
 

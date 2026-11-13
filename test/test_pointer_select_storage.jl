@@ -21,14 +21,12 @@ import LLVM
         selects=filter(i->i isa LLVM.SelectInst,insts)
         @test length(selects)==3
         for ptr in selects[1:2]
-            @test Lava.trace_pointer_to_alloca(ptr)
-            @test !Lava.trace_to_non_alloca(ptr)
+            @test Lava.traces_to_alloca(ptr)
             @test !Lava.is_psb_pointer(ptr)
             @test Lava.get_pointer_storage_class(ptr)==Lava.SC.Function
         end
         ptr=selects[3]
-        @test !Lava.trace_pointer_to_alloca(ptr)
-        @test Lava.trace_to_non_alloca(ptr)
+        @test !Lava.traces_to_alloca(ptr)
         @test Lava.is_psb_pointer(ptr)
         @test Lava.get_pointer_storage_class(ptr)==Lava.SC.PhysicalStorageBuffer
         Lava.lower_phi_select_function_ptrs!(mod)
@@ -106,5 +104,45 @@ end
                 @test count("load i32",text) == 2
             end
         end
+    end
+end
+
+# The storage class read only one call level: a parameter whose caller passed its
+# own parameter on was device memory, though two levels up it was an alloca. The
+# function cache asked a second trace, which never looked at callers at all.
+@testset "an alloca passed down two calls keeps Function storage" begin
+    LLVM.Context() do ctx
+        mod=parse(LLVM.Module,"""
+        define void @inner(ptr %p) {
+          store i32 1, ptr %p
+          ret void
+        }
+        define void @middle(ptr %q) {
+          call void @inner(ptr %q)
+          ret void
+        }
+        define void @outer() {
+          %a = alloca i32
+          call void @middle(ptr %a)
+          ret void
+        }
+        define void @recursive(ptr %r, i1 %c) {
+        entry:
+          br i1 %c, label %again, label %done
+        again:
+          call void @recursive(ptr %r, i1 false)
+          br label %done
+        done:
+          ret void
+        }
+        """)
+        p=first(LLVM.parameters(LLVM.functions(mod)["inner"]))
+        @test Lava.traces_to_alloca(p)
+        @test !Lava.is_psb_pointer(p)
+        @test Lava.get_pointer_storage_class(p)==Lava.SC.Function
+        # A call cycle that meets no alloca ends, as device memory.
+        r=first(LLVM.parameters(LLVM.functions(mod)["recursive"]))
+        @test !Lava.traces_to_alloca(r)
+        @test Lava.is_psb_pointer(r)
     end
 end

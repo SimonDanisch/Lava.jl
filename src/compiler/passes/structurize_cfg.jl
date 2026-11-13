@@ -530,38 +530,10 @@ function fixup_continue_merge_conflicts!(f::LLVM.Function)
     blocks = collect(f.blocks)
     length(blocks) <= 1 && return
 
-    # Compute RPO
-    rpo = compute_rpo(f)
-    rpo_pos = Dict{LLVM.BasicBlock, Int}()
-    for (i, bb) in enumerate(rpo)
-        rpo_pos[bb] = i
-    end
-
-    # Find loops: back-edges A→B where B appears before A in RPO
-    loops = Dict{LLVM.BasicBlock, Tuple{LLVM.BasicBlock, LLVM.BasicBlock}}()
-    for bb in blocks
-        term = bb.terminator
-        bb_pos = get(rpo_pos, bb, 0)
-        for succ in term.successors
-            succ_pos = get(rpo_pos, succ, 0)
-            if succ_pos > 0 && succ_pos <= bb_pos
-                header = succ
-                latch = bb
-                haskey(loops, header) && continue
-                # Find merge: first successor of a loop block that's outside the loop
-                merge_bb = find_loop_merge_llvm(header, latch, rpo, rpo_pos)
-                loops[header] = (merge_bb, latch)
-            end
-        end
-    end
-
+    # The loops as the emitter will see them: header => (merge, latch).
+    loops = analyze_loops(f).loops
     isempty(loops) && return
-
-    # Collect all continue targets
-    continue_targets = Set{LLVM.BasicBlock}()
-    for (_, (_, latch)) in loops
-        push!(continue_targets, latch)
-    end
+    continue_targets = Set(latch for (_, latch) in values(loops))
 
     # Fix 1: For each conditional branch inside a loop, check if both branches
     # converge at a continue target. If so, insert a trampoline.
@@ -598,31 +570,9 @@ function fixup_continue_merge_conflicts!(f::LLVM.Function)
     # merge (= continue target) or the loop body. We redirect the merge-bound
     # branch through a trampoline.
     # Recompute loops since CFG may have changed.
-    rpo = compute_rpo(f)
-    rpo_pos = Dict{LLVM.BasicBlock, Int}()
-    for (i, bb) in enumerate(rpo)
-        rpo_pos[bb] = i
-    end
-    loops = Dict{LLVM.BasicBlock, Tuple{LLVM.BasicBlock, LLVM.BasicBlock}}()
-    for bb in collect(f.blocks)
-        term = bb.terminator
-        bb_pos = get(rpo_pos, bb, 0)
-        for succ in term.successors
-            succ_pos = get(rpo_pos, succ, 0)
-            if succ_pos > 0 && succ_pos <= bb_pos
-                header = succ
-                latch = bb
-                haskey(loops, header) && continue
-                merge_bb = find_loop_merge_llvm(header, latch, rpo, rpo_pos)
-                loops[header] = (merge_bb, latch)
-            end
-        end
-    end
-
-    continue_targets = Set{LLVM.BasicBlock}()
-    for (_, (_, latch)) in loops
-        push!(continue_targets, latch)
-    end
+    rpo = reverse_postorder(f)
+    loops = analyze_loops(f).loops
+    continue_targets = Set(latch for (_, latch) in values(loops))
 
     for _iter2 in 1:100  # Safety limit to prevent infinite loops
         found2 = false
@@ -641,63 +591,10 @@ function fixup_continue_merge_conflicts!(f::LLVM.Function)
         found2 || break
 
         # Recompute since CFG changed
-        begin
-            # Recompute RPO and loops
-            rpo = compute_rpo(f)
-            rpo_pos = Dict{LLVM.BasicBlock, Int}()
-            for (i, bb) in enumerate(rpo)
-                rpo_pos[bb] = i
-            end
-            loops = Dict{LLVM.BasicBlock, Tuple{LLVM.BasicBlock, LLVM.BasicBlock}}()
-            for bb in collect(f.blocks)
-                term = bb.terminator
-                bb_pos = get(rpo_pos, bb, 0)
-                for succ in term.successors
-                    succ_pos = get(rpo_pos, succ, 0)
-                    if succ_pos > 0 && succ_pos <= bb_pos
-                        h = succ
-                        l = bb
-                        haskey(loops, h) && continue
-                        m = find_loop_merge_llvm(h, l, rpo, rpo_pos)
-                        loops[h] = (m, l)
-                    end
-                end
-            end
-            continue_targets = Set{LLVM.BasicBlock}()
-            for (_, (_, l)) in loops
-                push!(continue_targets, l)
-            end
-        end
+        rpo = reverse_postorder(f)
+        loops = analyze_loops(f).loops
+        continue_targets = Set(latch for (_, latch) in values(loops))
     end
-end
-
-# Find the merge block for a loop (first successor outside the loop body).
-function find_loop_merge_llvm(header::LLVM.BasicBlock, latch::LLVM.BasicBlock,
-                                rpo::Vector{LLVM.BasicBlock},
-                                rpo_pos::Dict{LLVM.BasicBlock, Int})
-    header_pos = rpo_pos[header]
-    latch_pos = rpo_pos[latch]
-
-    loop_blocks = Set{LLVM.BasicBlock}()
-    for bb in rpo
-        pos = rpo_pos[bb]
-        if pos >= header_pos && pos <= latch_pos
-            push!(loop_blocks, bb)
-        end
-    end
-
-    # Find first successor (in RPO order) that's outside the loop
-    for bb in rpo
-        bb in loop_blocks || continue
-        term = bb.terminator
-        for succ in term.successors
-            if !(succ in loop_blocks)
-                return succ
-            end
-        end
-    end
-
-    return latch  # Fallback
 end
 
 # Find where two branches converge (shallow: checks direct + 1-hop successors).

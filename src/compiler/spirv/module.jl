@@ -1031,16 +1031,6 @@ function emit_type_pointer!(mod::SPIRVModule, storage_class::UInt32, pointee_typ
     end
 end
 
-function emit_type_acceleration_structure!(mod::SPIRVModule)
-    key = :acceleration_structure
-    get!(mod.type_cache, key) do
-        id = fresh_id!(mod)
-        encode_instruction!(mod.types_constants, Op.OpTypeAccelerationStructureKHR, id)
-        require_capability!(mod, Cap.RayQueryKHR)
-        id
-    end
-end
-
 function emit_type_function!(mod::SPIRVModule, return_type_id::UInt32, param_type_ids::Vector{UInt32}=UInt32[])
     key = (:function, return_type_id, Tuple(param_type_ids))
     get!(mod.type_cache, key) do
@@ -1056,25 +1046,34 @@ end
 
 # ---- Constants (deduplicated) ----
 
-function emit_constant_u32!(mod::SPIRVModule, value::UInt32)
-    type_id = emit_type_int!(mod, UInt32(32), UInt32(0))
-    key = (:const, type_id, value)
-    get!(mod.constant_cache, key) do
+"""
+    emit_constant_int!(mod, type_id, width, value) -> id
+
+The constant `value` of the integer type `type_id`, `width` bits wide, emitted
+once per module: one word up to 32 bits, the value masked to `width` (unsigned
+types need their high bits zero), and two little-endian words above. Every
+integer constant is made here, so one value reached by different paths is one
+`OpConstant`.
+"""
+function emit_constant_int!(mod::SPIRVModule, type_id::UInt32, width::Integer, value::UInt64)
+    if width <= 32
+        word = UInt32(value & ((UInt64(1) << width) - 1))
+        return get!(mod.constant_cache, (:const, type_id, word)) do
+            id = fresh_id!(mod)
+            encode_instruction!(mod.types_constants, Op.OpConstant, type_id, id, word)
+            id
+        end
+    end
+    return get!(mod.constant_cache, (:const, type_id, value)) do
         id = fresh_id!(mod)
-        encode_instruction!(mod.types_constants, Op.OpConstant, type_id, id, value)
+        encode_instruction!(mod.types_constants, Op.OpConstant, type_id, id,
+                            UInt32(value & 0xFFFFFFFF), UInt32(value >> 32))
         id
     end
 end
 
-function emit_constant_i32!(mod::SPIRVModule, value::Int32)
-    type_id = emit_type_int!(mod, UInt32(32), UInt32(1))
-    key = (:const, type_id, reinterpret(UInt32, value))
-    get!(mod.constant_cache, key) do
-        id = fresh_id!(mod)
-        encode_instruction!(mod.types_constants, Op.OpConstant, type_id, id, reinterpret(UInt32, value))
-        id
-    end
-end
+emit_constant_u32!(mod::SPIRVModule, value::UInt32) =
+    emit_constant_int!(mod, emit_type_int!(mod, UInt32(32), UInt32(0)), 32, UInt64(value))
 
 function emit_constant_f32!(mod::SPIRVModule, value::Float32)
     type_id = emit_type_float!(mod, UInt32(32))
@@ -1086,17 +1085,8 @@ function emit_constant_f32!(mod::SPIRVModule, value::Float32)
     end
 end
 
-function emit_constant_u64!(mod::SPIRVModule, value::UInt64)
-    type_id = emit_type_int!(mod, UInt32(64), UInt32(0))
-    lo = UInt32(value & 0xFFFFFFFF)
-    hi = UInt32((value >> 32) & 0xFFFFFFFF)
-    key = (:const, type_id, lo, hi)
-    get!(mod.constant_cache, key) do
-        id = fresh_id!(mod)
-        encode_instruction!(mod.types_constants, Op.OpConstant, type_id, id, lo, hi)
-        id
-    end
-end
+emit_constant_u64!(mod::SPIRVModule, value::UInt64) =
+    emit_constant_int!(mod, emit_type_int!(mod, UInt32(64), UInt32(0)), 64, value)
 
 """
     emit_constant_uint!(mod, spirv_w, value) -> id
@@ -1110,30 +1100,11 @@ an integer comparison, and of a bitwise op, to have the same component width,
 and `spirv_int_width` keeps 8- and 16-bit integers at their own width instead of
 promoting to 32 -- so a `Bool` slot loads as `%uchar` and needs a `%uchar` zero.
 
-Cache keys match the two fixed-width helpers exactly, so a constant emitted
-through either path is shared rather than duplicated.
+All three go through [`emit_constant_int!`](@ref), so a constant emitted through
+any of them is shared rather than duplicated.
 """
-function emit_constant_uint!(mod::SPIRVModule, spirv_w::UInt32, value::UInt64)
-    type_id = emit_type_int!(mod, spirv_w, UInt32(0))
-    if spirv_w >= UInt32(64)
-        lo = UInt32(value & 0xFFFFFFFF)
-        hi = UInt32((value >> 32) & 0xFFFFFFFF)
-        key = (:const, type_id, lo, hi)
-        return get!(mod.constant_cache, key) do
-            id = fresh_id!(mod)
-            encode_instruction!(mod.types_constants, Op.OpConstant, type_id, id, lo, hi)
-            id
-        end
-    else
-        word = UInt32(value)
-        key = (:const, type_id, word)
-        return get!(mod.constant_cache, key) do
-            id = fresh_id!(mod)
-            encode_instruction!(mod.types_constants, Op.OpConstant, type_id, id, word)
-            id
-        end
-    end
-end
+emit_constant_uint!(mod::SPIRVModule, spirv_w::UInt32, value::UInt64) =
+    emit_constant_int!(mod, emit_type_int!(mod, spirv_w, UInt32(0)), spirv_w, value)
 
 function emit_constant_null!(mod::SPIRVModule, type_id::UInt32)
     key = (:const_null, type_id)

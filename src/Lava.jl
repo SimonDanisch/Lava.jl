@@ -17,7 +17,7 @@ module Lava
 export LavaDeviceArray
 
 # Compilation.
-export CompilationResult, lava_compile, optimize_spirv, LavaGfxShader
+export CompilationResult, lava_compile, LavaGfxShader
 
 # `export dump_state, gpu_memory_usage` was here, and both went to Mantle with
 # the runtime — they read a `VkContext`. Exporting a name this module does not

@@ -78,7 +78,7 @@ function wrap_entry_for_vulkan!(mod::LLVM.Module, entry::LLVM.Function;
     arg_layout = Pair{Int,Int}[]
     offset = 0
     for pt in param_types
-        sz = llvm_sizeof(pt)
+        sz = llvm_type_size(pt)
         align = max(4, sz)  # Natural alignment, minimum 4
         offset = (offset + align - 1) & ~(align - 1)
         push!(arg_layout, offset => sz)
@@ -87,9 +87,9 @@ function wrap_entry_for_vulkan!(mod::LLVM.Module, entry::LLVM.Function;
     arg_buffer_size = offset
 
     # Extract byval type sizes using LLVM DataLayout for accurate struct sizes.
-    # llvm_sizeof sums field sizes WITHOUT alignment padding, undercounting for
+    # llvm_type_size sums field sizes WITHOUT alignment padding, undercounting for
     # structs with mixed-size fields (e.g., WorkQueue{T} has {DevArr, DevArr, i32}
-    # → llvm_sizeof=36 but ABI size=40 due to trailing padding).
+    # → llvm_type_size=36 but ABI size=40 due to trailing padding).
     # Multiple byval args with padding gaps cause inline data overlap in the arg buffer.
     dl = mod.datalayout
     byval_llvm_sizes = zeros(Int, length(param_types))
@@ -162,7 +162,7 @@ function wrap_entry_for_vulkan!(mod::LLVM.Module, entry::LLVM.Function;
                                  "arg$(i)_addr")
                 field_ptr = LLVM.inttoptr!(builder, addr, T_ptr_as1, "arg$(i)_ptr")
                 val = LLVM.load!(builder, pt, field_ptr, "arg$(i)")
-                align = max(4, llvm_sizeof(pt))
+                align = max(4, llvm_type_size(pt))
                 val.alignment = align
                 push!(args, val)
             end
@@ -215,53 +215,3 @@ function lowersignals!(calls::Vector{LLVM.CallInst}, push)
     return nothing
 end
 
-"""
-    pack_kernel_args(args::Tuple, layout::Vector{Pair{Int,Int}}) -> Vector{UInt8}
-
-Pack kernel arguments into a byte buffer matching the BDA argument buffer layout.
-Pointers are stored as UInt64 BDA addresses; scalars as their natural representation.
-"""
-function pack_kernel_args(args::Tuple, layout::Vector{Pair{Int,Int}}, total_size::Int)
-    buf = zeros(UInt8, total_size)
-    for (i, arg) in enumerate(args)
-        offset = layout[i].first
-        sz = layout[i].second
-        if arg isa UInt64
-            # BDA address
-            unsafe_store!(Ptr{UInt64}(pointer(buf, offset + 1)), arg)
-        elseif arg isa Ptr
-            # Julia pointer → UInt64
-            unsafe_store!(Ptr{UInt64}(pointer(buf, offset + 1)), UInt64(arg))
-        else
-            # Scalar — copy bytes directly
-            ptr = Ptr{typeof(arg)}(pointer(buf, offset + 1))
-            unsafe_store!(ptr, arg)
-        end
-    end
-    return buf
-end
-
-"""Size of an LLVM type in bytes."""
-function llvm_sizeof(t::LLVM.LLVMType)
-    if t isa LLVM.IntegerType
-        return max(1, t.width ÷ 8)
-    elseif t isa LLVM.FloatType
-        return 4
-    elseif t isa LLVM.DoubleType
-        return 8
-    elseif t isa LLVM.HalfType
-        return 2
-    elseif t isa LLVM.PointerType
-        return 8  # 64-bit pointers → stored as i64 BDA
-    elseif t isa LLVM.ArrayType
-        return t.length * llvm_sizeof(t.element_type)
-    elseif t isa LLVM.StructType
-        total = 0
-        for m in t.elements
-            total += llvm_sizeof(m)
-        end
-        return total
-    else
-        return 8  # Fallback
-    end
-end

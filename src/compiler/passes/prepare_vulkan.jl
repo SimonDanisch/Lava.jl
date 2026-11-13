@@ -19,38 +19,36 @@
 # Utility functions
 # ============================================================================
 
-"""Get the size in bytes of an LLVM type (packed, no padding between fields)."""
+"""
+    llvm_type_size(t) -> Int
+
+The size in bytes of `t` laid out packed: no padding between fields or after the
+last, an integer in whole bytes, a pointer 8 (a 64-bit device address). An
+error for a type without a size.
+
+This is the layout Lava's own packing uses (the kernel argument buffer, the
+packed-alloca passes); the device's data layout is `LLVM.abi_size`.
+"""
 function llvm_type_size(t::LLVM.LLVMType)
     if t isa LLVM.IntegerType
         return div(t.width + 7, 8)
-    elseif t == LLVM.FloatType()
-        return 4
-    elseif t == LLVM.DoubleType()
-        return 8
-    elseif t == LLVM.HalfType()
+    elseif t isa LLVM.HalfType
         return 2
-    elseif t isa LLVM.ArrayType
-        return t.length * llvm_type_size(t.element_type)
-    elseif t isa LLVM.VectorType
-        # Without this, a vector fell through to the 8-byte fallback below, and
-        # every size test in the packed-alloca passes read `<2 x half>` as the
-        # same width as the `i64` element it is packed into. The typepunned-GEP
-        # conversion is gated on the access being STRICTLY smaller, so it left
-        # `gep <2 x half>, ptr %arr_i64, i64 %r` alone, the emitter had no
-        # lowering for it and dropped the access chain, and the module failed
-        # validation with the store's pointer and object types disagreeing.
-        # `scalar_size` right below has always had this branch.
+    elseif t isa LLVM.FloatType
+        return 4
+    elseif t isa LLVM.DoubleType
+        return 8
+    elseif t isa LLVM.PointerType
+        return 8
+    elseif t isa LLVM.ArrayType || t isa LLVM.VectorType
+        # Vectors too: without them a `<2 x half>` read as the 8 bytes of the `i64`
+        # it is packed into, and the typepunned-GEP conversion (gated on the access
+        # being strictly smaller) left the access for an emitter that had no lowering.
         return t.length * llvm_type_size(t.element_type)
     elseif t isa LLVM.StructType
-        total = 0
-        for m in t.elements
-            total += llvm_type_size(m)
-        end
-        return total
-    else
-        # Fallback: assume 8 bytes (pointer-sized)
-        return 8
+        return sum(llvm_type_size, t.elements; init = 0)
     end
+    error("llvm_type_size: $t has no size")
 end
 
 """Return the size in bytes of the largest scalar component in a type.
@@ -1300,35 +1298,6 @@ function count_uses(val::LLVM.Value)
     return count
 end
 
-"""Get the first scalar field type from a struct/array type, recursing into nested types."""
-function get_first_scalar_field(ty::LLVM.LLVMType)
-    if ty isa LLVM.StructType
-        elems = ty.elements
-        isempty(elems) && return nothing
-        return get_first_scalar_field(first(elems))
-    elseif ty isa LLVM.ArrayType
-        ty.length == 0 && return nothing
-        return get_first_scalar_field(ty.element_type)
-    else
-        return ty  # scalar
-    end
-end
-
-"""Get GEP index path to first scalar field (e.g., { { i8, i64 } } → [0, 0])."""
-function gep_path_to_first_scalar(ty::LLVM.LLVMType)
-    path = Int[]
-    current = ty
-    while current isa LLVM.StructType || current isa LLVM.ArrayType
-        push!(path, 0)
-        if current isa LLVM.StructType
-            current = first(current.elements)
-        else
-            current = current.element_type
-        end
-    end
-    return path
-end
-
 # ============================================================================
 # Sub-pass: Flatten nested workgroup array globals
 # ============================================================================
@@ -2400,34 +2369,6 @@ end
 # ============================================================================
 
 """
-    gep_byte_offset(dl, src_ty, indices) -> Int or nothing
-
-Compute the total byte offset for a sequence of constant GEP indices starting
-from `src_ty`. Returns `nothing` if any index is non-constant.
-"""
-function gep_byte_offset(dl::LLVM.DataLayout, src_ty::LLVM.LLVMType,
-                          indices::AbstractVector)
-    offset = 0
-    cur_ty = src_ty
-    for idx_val in indices
-        idx_val isa LLVM.ConstantInt || return nothing
-        idx = convert(Int, idx_val)
-        if cur_ty isa LLVM.ArrayType
-            elem_ty = cur_ty.element_type
-            elem_size = Int(LLVM.storage_size(dl, elem_ty))
-            offset += idx * elem_size
-            cur_ty = elem_ty
-        elseif cur_ty isa LLVM.StructType
-            offset += Int(LLVM.API.LLVMOffsetOfElement(dl, cur_ty, idx))
-            cur_ty = LLVM.LLVMType(LLVM.API.LLVMStructGetTypeAtIndex(cur_ty, idx))
-        else
-            return nothing
-        end
-    end
-    return offset
-end
-
-"""
     flatten_bda_array_geps!(mod::LLVM.Module)
 
 Replace composite-typed GEPs in addrspace(1) with explicit pointer arithmetic
@@ -2467,10 +2408,8 @@ function flatten_bda_array_geps!(mod::LLVM.Module)
                 idx0 isa LLVM.ConstantInt || continue
                 convert(Int, idx0) == 0 || continue
 
-                # All remaining indices must be constant for compile-time offset
-                remaining = @view ops[3:end]
-                byte_off = gep_byte_offset(dl, src_ty, remaining)
-                byte_off === nothing && continue
+                # All indices constant, for a compile-time offset
+                constant_gep_offset(inst, dl) === nothing && continue
 
                 push!(to_fix, inst)
             end
@@ -2481,9 +2420,7 @@ function flatten_bda_array_geps!(mod::LLVM.Module)
                 for gep in to_fix
                     ops = gep.operands
                     ptr_op = ops[1]
-                    src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
-                    remaining = @view ops[3:end]
-                    byte_off = gep_byte_offset(dl, src_ty, remaining)
+                    byte_off = constant_gep_offset(gep, dl)
 
                     LLVM.position!(builder, insertion_point(gep))
                     # ptrtoint -> add byte offset -> inttoptr
@@ -2527,129 +2464,6 @@ function warn_constant_globals!(mod::LLVM.Module)
         name = gv.name
         @warn "Lava: constant global '$name' in addrspace(1) -- needs device function override" maxlog=1
     end
-end
-
-# ============================================================================
-# Main pass: prepare_module_for_vulkan!
-# ============================================================================
-
-"""
-    prepare_module_for_vulkan!(mod::LLVM.Module, entry_name::String)
-
-Final LLVM-level preparation pass before the custom SPIR-V emitter runs.
-
-Applies 6 targeted sub-passes:
-1. Strip lifetime intrinsics + set internal linkage + fix PSB alignment
-2. Fix shared memory GEPs (addrspace 3)
-3. Flatten BDA array GEPs (addrspace 1) to pointer arithmetic
-4. Lower memset/memcpy on PSB pointers to explicit stores/loads
-5. Decompose composite loads/stores on PSB to scalar operations
-6. Warn about invalid constant globals in addrspace(1)
-
-NOTE: Unlike Abacus, we do NOT:
-- Call _hoist_push_constant_loads! (that was an llc workaround)
-- Strip debug info (we KEEP it for source mapping in the custom emitter)
-"""
-function prepare_module_for_vulkan!(mod::LLVM.Module, entry_name::String;
-                                     dl::LLVM.DataLayout=mod.datalayout)
-    # 1. Strip llvm.lifetime.start/end intrinsics, set internal linkage,
-    #    and fix alignment for PhysicalStorageBuffer accesses.
-    for f in mod.functions
-        fname = f.name
-
-        # Set non-entry function definitions to internal linkage.
-        # This prevents the SPIR-V emitter from needing Linkage capability (illegal in Vulkan).
-        # Skip declarations (no basic blocks) -- they must keep external linkage.
-        is_declaration = LLVM.API.LLVMIsDeclaration(f) != 0
-        if fname != entry_name && !startswith(fname, "llvm.") && !is_declaration
-            f.linkage = LLVM.API.LLVMInternalLinkage
-        end
-
-        # Walk instructions: erase lifetime intrinsics + fix alignment
-        for bb in f.blocks
-            to_erase = LLVM.Instruction[]
-            for inst in bb.instructions
-                if inst isa LLVM.CallInst
-                    callee = inst.called_operand
-                    if callee isa LLVM.Function
-                        cname = callee.name
-                        if startswith(cname, "llvm.lifetime.")
-                            push!(to_erase, inst)
-                        end
-                    end
-                elseif inst isa LLVM.LoadInst || inst isa LLVM.StoreInst
-                    # Fix alignment: Vulkan PhysicalStorageBuffer requires
-                    # alignment >= natural size of the largest scalar in the type
-                    # (VUID-StandaloneSpirv-PhysicalStorageBuffer64-06314).
-                    align = inst.alignment
-                    if align > 0
-                        ty = if inst isa LLVM.LoadInst
-                            inst.value_type
-                        else
-                            inst.operands[1].value_type
-                        end
-                        min_align = max(4, scalar_size(ty))
-                        if align < min_align
-                            inst.alignment = min_align
-                        end
-                    end
-                end
-            end
-            for inst in to_erase
-                LLVM.erase!(inst)
-            end
-        end
-    end
-
-    # 2. Remove declarations of lifetime intrinsics (now unused)
-    for f in collect(mod.functions)
-        fname = f.name
-        if startswith(fname, "llvm.lifetime.") && isempty(f.blocks)
-            LLVM.erase!(f)
-        end
-    end
-
-    # 3b. Fix flat GEPs on addrspace(3) array globals
-    fix_shared_geps!(mod)
-
-    # 4. Flatten array-typed GEPs in addrspace(1) (BDA / PhysicalStorageBuffer)
-    flatten_bda_array_geps!(mod)
-
-    # 5. Lower llvm.memset/memcpy on addrspace(1) to explicit stores/loads
-    lower_psb_memops!(mod)
-
-    # 6. Decompose composite loads/stores on addrspace(1)
-    decompose_composite_psb_accesses!(mod, dl)
-
-    # 6b. Decompose composite loads/stores on addrspace(3) (shared memory)
-    decompose_composite_workgroup_accesses!(mod, dl)
-
-    # 6c. Decompose type-punned alloca loads (partial reads from struct allocas)
-    decompose_typepun_alloca_loads!(mod, dl)
-
-    # 7. Warn about invalid constant globals in addrspace(1)
-    warn_constant_globals!(mod)
-
-    # 8. Fix type-mismatched loads from allocas
-    # LLVM may optimize loads where the loaded scalar type differs from the alloca's
-    # type (e.g., `load i16, ptr %alloca_of_{[2 x i8]}`). SPIR-V requires strict
-    # type matching for loads, so we rewrite these to load the alloca type instead.
-    fix_alloca_type_mismatched_loads!(mod)
-
-    # 9. Fix type-mismatched stores to allocas
-    # LLVM SROA/memcpy lowering creates `store i32, ptr %alloca_of_[16 x i64]` etc.
-    # SPIR-V requires the stored value type to match the pointer's pointee type.
-    # Rewrite these stores to drill into the alloca type via GEP.
-    fix_alloca_type_mismatched_stores!(mod, dl)
-
-    # 10. Lower chained mismatched-type GEPs on allocas.
-    # Julia's MArray/StaticArray patterns create chains like:
-    #   %base = getelementptr i32, ptr %alloca_[16 x i64], i64 -1
-    #   %elem = getelementptr i32, ptr %base, i64 %var
-    #   store i32 %val, ptr %elem
-    # The i32-typed GEP on an i64-element alloca can't be represented in SPIR-V.
-    # Lower these to proper element-level access with runtime index computation.
-    lower_chained_mismatched_geps!(mod)
 end
 
 """
@@ -3780,27 +3594,6 @@ function find_element_at_offset(ty::LLVM.LLVMType, byte_offset::Int)
     end
 end
 
-"""Get the first scalar field type and its GEP index path for a composite type."""
-function first_scalar_field(ty::LLVM.LLVMType)
-    indices = Int[]
-    current = ty
-    while true
-        if current isa LLVM.StructType
-            elems = current.elements
-            isempty(elems) && return nothing, Int[]
-            push!(indices, 0)
-            current = elems[1]
-        elseif current isa LLVM.ArrayType
-            current.length == 0 && return nothing, Int[]
-            push!(indices, 0)
-            current = current.element_type
-        else
-            # Reached a scalar
-            return current, indices
-        end
-    end
-end
-
 """Trace a pointer through GEPs back to its alloca, if any."""
 # Check if a GEP chain from ptr to its alloca contains any GEP with dynamic indices.
 function gep_chain_has_dynamic_indices(ptr::LLVM.Value)
@@ -3878,6 +3671,25 @@ function gep_element_type_and_offset(src_ty::LLVM.LLVMType, indices::Vector{Int}
         end
     end
     return current_ty, offset
+end
+
+"""
+    constant_gep_offset(gep, dl) -> Int or nothing
+
+The byte offset `gep` adds to its pointer as `dl` lays the types out, when all its
+indices are constants ([`gep_element_type_and_offset`](@ref)); `nothing` when one
+is not, or when they index into a type without members.
+"""
+function constant_gep_offset(gep::LLVM.GetElementPtrInst, dl::LLVM.DataLayout)
+    ops = gep.operands
+    indices = Int[]
+    for i in 2:length(ops)
+        ops[i] isa LLVM.ConstantInt || return nothing
+        push!(indices, convert(Int, ops[i]))
+    end
+    src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
+    ty, offset = gep_element_type_and_offset(src_ty, indices, dl)
+    return ty === nothing ? nothing : offset
 end
 
 """
@@ -4666,23 +4478,9 @@ function fix_gep_alloca_type_mismatches!(mod::LLVM.Module)
             # Skip if GEP source type is i8 (already a byte-offset GEP)
             gep_src_ty isa LLVM.IntegerType && gep_src_ty.width == 8 && continue
 
-            # Compute byte offset of this GEP using the GEP's source element type
-            ops = inst.operands
-            n_indices = length(ops) - 1  # operands = [ptr, idx0, idx1, ...]
-            n_indices == 0 && continue
-
-            # Only handle all-constant indices (the common case for struct accesses)
-            all_const = true
-            for i in 2:length(ops)
-                if !(ops[i] isa LLVM.ConstantInt)
-                    all_const = false
-                    break
-                end
-            end
-            all_const || continue
-
-            # Compute byte offset through the GEP's source element type
-            offset = compute_gep_byte_offset(gep_src_ty, ops, dl)
+            length(inst.operands) > 1 || continue
+            # Only all-constant indices (the common case for struct accesses).
+            offset = constant_gep_offset(inst, dl)
             offset === nothing && continue
 
             push!(to_replace, inst => offset)
@@ -5707,42 +5505,6 @@ function flatten_chained_geps_on_allocas!(mod::LLVM.Module)
             end
         end
     end
-end
-
-"""
-Compute the byte offset of a constant-index GEP given its source element type.
-Returns the offset as Int64, or nothing if computation fails.
-"""
-function compute_gep_byte_offset(src_ty::LLVM.LLVMType, operands, dl::LLVM.DataLayout)
-    offset = Int64(0)
-    n_indices = length(operands) - 1
-    n_indices == 0 && return offset
-
-    # First index: scales by sizeof(src_ty)
-    idx0 = convert(Int64, operands[2])
-    type_size = Int64(LLVM.API.LLVMABISizeOfType(dl, src_ty))
-    offset += idx0 * type_size
-
-    # Remaining indices: drill into the type
-    current_ty = src_ty
-    for i in 3:length(operands)
-        idx = convert(Int64, operands[i])
-        if current_ty isa LLVM.StructType
-            # Struct: use LLVM's struct layout for correct padding/alignment
-            offset += Int64(LLVM.API.LLVMOffsetOfElement(dl, current_ty, UInt32(idx)))
-            current_ty = current_ty.elements[idx+1]
-        elseif current_ty isa LLVM.ArrayType
-            # Array: offset = idx * element_size
-            elem_ty = current_ty.element_type
-            elem_size = Int64(LLVM.API.LLVMABISizeOfType(dl, elem_ty))
-            offset += idx * elem_size
-            current_ty = elem_ty
-        else
-            # Scalar or unknown type — can't drill further
-            return nothing
-        end
-    end
-    return offset
 end
 
 """

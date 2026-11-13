@@ -520,7 +520,7 @@ function get_value_id!(state::SPIRVEmitterState, @nospecialize(val::LLVM.Value))
     if val isa LLVM.Function && LLVM.isintrinsic(val) == false && isempty(val.blocks)
         # This is a declaration (no body) used as a value — Julia runtime type tag
         u64_ty = emit_type_int!(state.mod, UInt32(64), UInt32(0))
-        zero_id = emit_u64_constant!(state.mod, UInt64(0))
+        zero_id = emit_constant_u64!(state.mod, UInt64(0))
         state.value_map[val] = zero_id
         return zero_id
     end
@@ -636,46 +636,6 @@ function get_block_id!(state::SPIRVEmitterState, bb::LLVM.BasicBlock)
     get!(state.block_map, bb) do
         fresh_id!(state.mod)
     end
-end
-
-# ================================================================
-# Block Ordering
-# ================================================================
-
-"""
-    reverse_postorder(fn::LLVM.Function) -> Vector{LLVM.BasicBlock}
-
-Compute reverse post-order traversal of the function's CFG.
-This ensures dominators are emitted before dominated blocks in SPIR-V,
-preventing forward references in non-PHI instructions.
-"""
-function reverse_postorder(fn::LLVM.Function)
-    blocks = collect(fn.blocks)
-    isempty(blocks) && return blocks
-
-    visited = Set{LLVM.BasicBlock}()
-    postorder = LLVM.BasicBlock[]
-
-    function dfs(bb)
-        bb in visited && return
-        push!(visited, bb)
-        term = bb.terminator
-        for succ in term.successors
-            dfs(succ)
-        end
-        push!(postorder, bb)
-    end
-
-    dfs(first(blocks))  # Start from entry block
-
-    # Add any unreachable blocks not visited by DFS
-    for bb in blocks
-        if !(bb in visited)
-            push!(postorder, bb)
-        end
-    end
-
-    return reverse(postorder)
 end
 
 # ================================================================
@@ -2019,84 +1979,6 @@ function get_struct_member_ptr_spirv_type(state::SPIRVEmitterState, pointee_ty::
 end
 
 """
-Recursively find the member index path to reach a given byte offset in a (possibly nested) struct.
-Returns `(index_path, leaf_type)` where index_path is a Vector{Int} of 0-based member indices,
-or `(nothing, nothing)` if the offset falls in padding or can't be decomposed.
-
-Example: `{ { float, i64 } }` at offset 8 → ([0, 1], i64)
-  - outer member 0: { float, i64 } at offset 0 → recurse with remaining offset 8
-  - inner member 1: i64 at offset 8 → match!
-"""
-function find_struct_member_path_by_offset(struct_ty::LLVM.StructType, target_offset::Int, dl)
-    path = Int[]
-    find_struct_member_path_recursive!(path, struct_ty, target_offset, dl) || return (nothing, nothing)
-    # Walk the path to find the leaf type
-    leaf_ty = struct_ty
-    for idx in path
-        if leaf_ty isa LLVM.StructType
-            leaf_ty = leaf_ty.elements[idx + 1]
-        elseif leaf_ty isa LLVM.ArrayType
-            leaf_ty = leaf_ty.element_type  # array index selects an element
-        else
-            return (nothing, nothing)
-        end
-    end
-    return (path, leaf_ty)
-end
-
-function find_struct_member_path_recursive!(path::Vector{Int}, struct_ty::LLVM.StructType, target_offset::Int, dl)
-    member_types = struct_ty.elements
-    for (i, mt) in enumerate(member_types)
-        field_offset = Int(compute_struct_field_offset(struct_ty, i - 1; dl))
-        member_size = Int(compute_type_size(mt, dl))
-        if field_offset == target_offset
-            push!(path, i - 1)
-            return true
-        elseif field_offset < target_offset && target_offset < field_offset + member_size
-            remaining = target_offset - field_offset
-            if mt isa LLVM.StructType
-                push!(path, i - 1)
-                if find_struct_member_path_recursive!(path, mt, remaining, dl)
-                    return true
-                end
-                pop!(path)
-            elseif mt isa LLVM.ArrayType
-                push!(path, i - 1)
-                find_array_member_path_recursive!(path, mt, remaining, dl) && return true
-                pop!(path)
-            end
-            return false
-        end
-    end
-    return false
-end
-
-"""
-The element path to `target_offset` bytes into an array: the element index, then,
-for an offset inside the element, the path into it. Elements may be arrays
-themselves: a `Point3f` is `[1 x [3 x float]]`, and its second float sits 4 bytes
-into element 0 of the outer array.
-"""
-function find_array_member_path_recursive!(path::Vector{Int}, arr_ty::LLVM.ArrayType, target_offset::Int, dl)
-    elem_ty = arr_ty.element_type
-    elem_size = Int(compute_type_size(elem_ty, dl))
-    elem_size > 0 || return false
-    elem_idx, sub_remaining = divrem(target_offset, elem_size)
-    elem_idx < arr_ty.length || return false
-    push!(path, elem_idx)
-    sub_remaining == 0 && return true
-    found = if elem_ty isa LLVM.StructType
-        find_struct_member_path_recursive!(path, elem_ty, sub_remaining, dl)
-    elseif elem_ty isa LLVM.ArrayType
-        find_array_member_path_recursive!(path, elem_ty, sub_remaining, dl)
-    else
-        false
-    end
-    found || pop!(path)
-    return found
-end
-
-"""
 Find array fields within a (possibly nested) struct that match a given element stride.
 Returns `(path, byte_offset, array_type)` or `nothing`.
 
@@ -2160,18 +2042,22 @@ function collect_array_fields!(results::Vector{Tuple{Vector{Int}, Int, LLVM.Arra
 end
 
 """
-Decompose a byte offset into a multi-level index path through nested arrays/structs.
-E.g., `[1 x [2 x i64]]` at offset 8 → [0, 1] (first outer element, second inner element),
-leaf_type = i64.
+    member_path_at_offset(ty, offset, dl) -> (path, leaf_type) or (nothing, nothing)
+
+The 0-based member and element indices that reach `offset` bytes into the struct or
+array `ty`, and the type there; `(nothing, nothing)` when `offset` falls in padding
+or inside a scalar. A member that starts exactly at `offset` ends the path.
+
+`{ { float, i64 } }` at 8 is `([0, 1], i64)`; `[1 x [2 x i64]]` at 8 is `([0, 1], i64)`.
 """
-function find_array_nested_path(ty::LLVM.LLVMType, target_offset::Int, dl)
+function member_path_at_offset(ty::LLVM.LLVMType, target_offset::Int, dl)
     path = Int[]
-    leaf = find_array_nested_path_recursive!(path, ty, target_offset, dl)
+    leaf = member_path_at_offset!(path, ty, target_offset, dl)
     leaf === nothing && return (nothing, nothing)
     return (path, leaf)
 end
 
-function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.ArrayType, target_offset::Int, dl)
+function member_path_at_offset!(path::Vector{Int}, ty::LLVM.ArrayType, target_offset::Int, dl)
     elem_ty = ty.element_type
     elem_size = compute_type_size(elem_ty, dl)
     elem_size == 0 && return nothing
@@ -2182,7 +2068,7 @@ function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.ArrayType
     if remainder == 0
         return elem_ty
     else
-        result = find_array_nested_path_recursive!(path, elem_ty, remainder, dl)
+        result = member_path_at_offset!(path, elem_ty, remainder, dl)
         if result !== nothing
             return result
         end
@@ -2191,7 +2077,7 @@ function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.ArrayType
     end
 end
 
-function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.StructType, target_offset::Int, dl)
+function member_path_at_offset!(path::Vector{Int}, ty::LLVM.StructType, target_offset::Int, dl)
     member_types = ty.elements
     for (i, mt) in enumerate(member_types)
         field_offset = Int(compute_struct_field_offset(ty, i - 1; dl))
@@ -2202,7 +2088,7 @@ function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.StructTyp
         elseif field_offset < target_offset && target_offset < field_offset + member_size
             push!(path, i - 1)
             remaining = target_offset - field_offset
-            result = find_array_nested_path_recursive!(path, mt, remaining, dl)
+            result = member_path_at_offset!(path, mt, remaining, dl)
             if result !== nothing
                 return result
             end
@@ -2213,7 +2099,7 @@ function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.StructTyp
     return nothing
 end
 
-function find_array_nested_path_recursive!(path::Vector{Int}, ty::LLVM.LLVMType, target_offset::Int, dl)
+function member_path_at_offset!(path::Vector{Int}, ty::LLVM.LLVMType, target_offset::Int, dl)
     return nothing
 end
 
@@ -2309,21 +2195,8 @@ end
 
 """Check if two LLVM types have the same bit width (for bitcast compatibility)."""
 function types_same_size(a::LLVM.LLVMType, b::LLVM.LLVMType)
-    llvm_type_bit_width(a) == llvm_type_bit_width(b)
-end
-
-function llvm_type_bit_width(ty::LLVM.LLVMType)
-    if ty isa LLVM.IntegerType
-        return ty.width
-    elseif ty isa LLVM.FloatType
-        return 32
-    elseif ty isa LLVM.DoubleType
-        return 64
-    elseif ty isa LLVM.HalfType
-        return 16
-    else
-        return -1  # Unknown
-    end
+    w = scalar_bit_width(a)
+    return w !== nothing && w == scalar_bit_width(b)
 end
 
 """
@@ -2442,9 +2315,8 @@ function resolve_struct_field_store!(state::SPIRVEmitterState, @nospecialize(ptr
     if index_path === nothing && !(store_ty isa LLVM.PointerType)
         leaf_path, leaf_ty = find_zero_index_path_to_leaf(pointee_ty)
         if leaf_path !== nothing && leaf_ty !== nothing
-            store_bw = llvm_type_bit_width(store_ty)
-            leaf_bw = llvm_type_bit_width(leaf_ty)
-            if store_bw > 0 && store_bw == leaf_bw
+            store_bw = scalar_bit_width(store_ty)
+            if store_bw !== nothing && store_bw == scalar_bit_width(leaf_ty)
                 index_path = leaf_path
                 need_field_bitcast = true
                 target_field_ty = leaf_ty
@@ -2798,9 +2670,9 @@ function try_decomposed_struct_store!(state::SPIRVEmitterState, ptr_id::UInt32, 
                                       val_ty::LLVM.LLVMType, struct_ty::LLVM.StructType)
     leaf_path, leaf_ty = find_zero_index_path_to_leaf(struct_ty)
     (leaf_path === nothing || leaf_ty === nothing) && return false
-    leaf_bits = llvm_type_bit_width(leaf_ty)
+    leaf_bits = scalar_bit_width(leaf_ty)
     store_width = val_ty isa LLVM.IntegerType ? val_ty.width : 64
-    (leaf_bits <= 0 || store_width < leaf_bits || store_width % leaf_bits != 0) && return false
+    (leaf_bits === nothing || store_width < leaf_bits || store_width % leaf_bits != 0) && return false
     emit_decomposed_struct_store!(state, ptr_id, val_id, val_ty, leaf_path, leaf_ty, leaf_bits, store_width)
     return true
 end
@@ -2930,11 +2802,11 @@ function bitcast_store_value_if_needed!(state::SPIRVEmitterState, @nospecialize(
     if val_ty isa LLVM.PointerType || pointee_ty isa LLVM.PointerType
         return val_id
     end
-    val_bw = llvm_type_bit_width(val_ty)
-    pointee_bw = llvm_type_bit_width(pointee_ty)
+    val_bw = scalar_bit_width(val_ty)
+    pointee_bw = scalar_bit_width(pointee_ty)
 
     # If either type is non-scalar (struct, array, unknown), skip
-    if val_bw < 0 || pointee_bw < 0
+    if val_bw === nothing || pointee_bw === nothing
         return val_id
     end
 
@@ -3014,7 +2886,7 @@ function is_psb_pointer(ptr::LLVM.Value)
     # Addrspace 1: PSB unless it's a constant global (Julia _j_const lookup tables → Private SC)
     as == 1 && return !is_constant_global_ptr(ptr)
     # Addrspace 0: PSB unless it's an alloca (which is genuinely Function storage)
-    as == 0 && !(ptr isa LLVM.AllocaInst) && return trace_to_non_alloca(ptr)
+    as == 0 && !(ptr isa LLVM.AllocaInst) && return !traces_to_alloca(ptr)
     return false
 end
 
@@ -3037,44 +2909,6 @@ function is_constant_global_ptr(ptr::LLVM.Value)
         end
     end
     return false
-end
-
-"""
-Trace a pointer value back to determine if it originates from an alloca.
-GEPs on allocas produce Function pointers; GEPs on parameters produce PSB pointers.
-"""
-function trace_to_non_alloca(ptr::LLVM.Value, visited::Set{LLVM.Value}=Set{LLVM.Value}())
-    ptr in visited && return true  # Cycle → assume PSB (allocas don't form cycles, PSB loop ptrs do)
-    push!(visited, ptr)
-    ptr isa LLVM.AllocaInst && return false
-    if ptr isa LLVM.GetElementPtrInst
-        base = ptr.operands[1]
-        return trace_to_non_alloca(base, visited)
-    end
-    # PHI nodes: trace all incoming values. If ANY traces to an alloca,
-    # the pointer may be Function-space — return false (not PSB).
-    if ptr isa LLVM.PHIInst
-        for (val, _) in ptr.incoming
-            if !trace_to_non_alloca(val, visited)
-                return false
-            end
-        end
-        # All incoming values are non-alloca → PSB
-        return true
-    elseif ptr isa LLVM.SelectInst
-        return trace_to_non_alloca(ptr.operands[2], visited) &&
-               trace_to_non_alloca(ptr.operands[3], visited)
-    end
-    # Function parameter: the alloca lives in the CALLER. Check call sites —
-    # if any caller passes an alloca-derived pointer, this param is
-    # Function-class (not PSB). Without this, helpers emitted via the
-    # multi-OpFunction walker would classify alloca-derived params as PSB
-    # and emit invalid byte-arithmetic on them.
-    if ptr isa LLVM.Argument
-        return !param_called_with_alloca_arg(ptr)
-    end
-    # inttoptr, etc. → PSB
-    return true
 end
 
 """Get alignment for a type (for PhysicalStorageBuffer Aligned operand).
@@ -4138,7 +3972,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                 end
 
                 if all_const
-                    byte_offset_id = emit_u64_constant!(state.mod, UInt64(total_byte_offset))
+                    byte_offset_id = emit_constant_u64!(state.mod, UInt64(total_byte_offset))
                 else
                     # Fallback: compute byte offset dynamically (rare, only if non-const index)
                     # For now, just handle the simple [N x T] single-index case
@@ -4153,7 +3987,7 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
                             idx_u64 = fresh_id!(state.mod)
                             encode_instruction!(state.mod.functions, Op.OpSConvert, u64_spirv, idx_u64, idx_id)
                         end
-                        stride_const = emit_u64_constant!(state.mod, UInt64(elem_size))
+                        stride_const = emit_constant_u64!(state.mod, UInt64(elem_size))
                         byte_offset_id = fresh_id!(state.mod)
                         encode_instruction!(state.mod.functions, Op.OpIMul, u64_spirv, byte_offset_id, idx_u64, stride_const)
                     else
@@ -4426,7 +4260,7 @@ function is_padding_gep(gep::LLVM.GetElementPtrInst, dl::Union{Nothing, LLVM.Dat
     offset >= struct_size && return false  # past end of struct, not padding
 
     # Try to find a field at this offset
-    index_path, _ = find_struct_member_path_by_offset(alloca_ty, offset, dl)
+    index_path, _ = member_path_at_offset(alloca_ty, offset, dl)
     return index_path === nothing
 end
 
@@ -4503,7 +4337,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                     return
                 elseif elem_ty isa LLVM.ArrayType || elem_ty isa LLVM.StructType
                     # Sub-element access: decompose recursively through nested types
-                    index_path, leaf_ty = find_array_nested_path(base_pointee, const_offset, state.data_layout)
+                    index_path, leaf_ty = member_path_at_offset(base_pointee, const_offset, state.data_layout)
                     if index_path !== nothing
                         leaf_spirv = if sc == SC.Workgroup
                             map_workgroup_type!(state.type_ctx, leaf_ty)
@@ -4565,7 +4399,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
 
             if const_part >= 0 && dynamic_part !== nothing
                 # Find which struct field the constant part maps to
-                sub_path, sub_leaf = find_struct_member_path_by_offset(elem_ty, Int(const_part), state.data_layout)
+                sub_path, sub_leaf = member_path_at_offset(elem_ty, Int(const_part), state.data_layout)
                 if sub_path !== nothing && sub_leaf isa LLVM.IntegerType
                     # Constant part selects a scalar field. Dynamic part must be zero
                     # (or this pattern doesn't apply). Emit AccessChain with index 0 + field path.
@@ -4696,7 +4530,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
         if byte_offset_val isa LLVM.ConstantInt
             offset = convert(Int64, byte_offset_val)
             # Recursively find the member index path for this byte offset
-            index_path, leaf_ty = find_struct_member_path_by_offset(base_pointee, offset, state.data_layout)
+            index_path, leaf_ty = member_path_at_offset(base_pointee, offset, state.data_layout)
 
             if index_path !== nothing
                 member_spirv = if sc == SC.Workgroup
@@ -4758,7 +4592,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                         return
                     elseif arr_elem_ty isa LLVM.StructType
                         # Sub-element offset: access array element then struct field
-                        sub_path, sub_leaf = find_struct_member_path_by_offset(arr_elem_ty, sub_offset, state.data_layout)
+                        sub_path, sub_leaf = member_path_at_offset(arr_elem_ty, sub_offset, state.data_layout)
                         if sub_path !== nothing
                             sub_leaf_spirv = map_type!(state.type_ctx, sub_leaf)
                             result_ptr_ty = map_pointer_type!(state.type_ctx, sub_leaf_spirv, sc)
@@ -4874,7 +4708,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                 if const_part > 0 && dynamic_part_val !== nothing
                     # Recursively find the struct member at the constant offset
                     # (handles nested structs like { {ptr, [4xi64]}, [3xi64] })
-                    sub_path, sub_leaf = find_struct_member_path_by_offset(base_pointee, Int(const_part), state.data_layout)
+                    sub_path, sub_leaf = member_path_at_offset(base_pointee, Int(const_part), state.data_layout)
                     if sub_path !== nothing && sub_leaf isa LLVM.ArrayType
                         inner_elem_ty = sub_leaf.element_type
                         inner_elem_size = Int(compute_type_size(inner_elem_ty, state.data_layout))
@@ -5192,27 +5026,6 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
 end
 
 """
-Emit an integer constant of the given LLVM integer type.
-"""
-function emit_int_constant!(state::SPIRVEmitterState, ty::LLVM.LLVMType, value::Int64)
-    type_id = map_type!(state.type_ctx, ty)
-    w = ty isa LLVM.IntegerType ? ty.width : 64
-    if w <= 32
-        return emit_constant_u32!(state.mod, UInt32(value & 0xFFFFFFFF))
-    else
-        bits = reinterpret(UInt64, value)
-        lo = UInt32(bits & 0xFFFFFFFF)
-        hi = UInt32((bits >> 32) & 0xFFFFFFFF)
-        key = (:const, type_id, bits)
-        get!(state.mod.constant_cache, key) do
-            id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.types_constants, Op.OpConstant, type_id, id, lo, hi)
-            id
-        end
-    end
-end
-
-"""
     cached_psb_ptr_to_u64!(state, base_id) -> UInt32
 
 Emit OpConvertPtrToU for a PSB pointer, with block-local caching.
@@ -5462,7 +5275,7 @@ function emit_psb_ptr_arithmetic!(state::SPIRVEmitterState, base_id::UInt32,
 
     # byte_offset = idx * stride
     # Emit stride as u64 constant directly via SPIR-V
-    stride_const = emit_u64_constant!(state.mod, stride)
+    stride_const = emit_constant_u64!(state.mod, stride)
     byte_offset_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, Op.OpIMul, u64_spirv, byte_offset_id, idx_u64, stride_const)
 
@@ -5478,19 +5291,6 @@ function emit_psb_ptr_arithmetic!(state::SPIRVEmitterState, base_id::UInt32,
     end
 
     return result_id
-end
-
-"""Emit a u64 constant directly via SPIR-V type system (no LLVM type needed)."""
-function emit_u64_constant!(mod::SPIRVModule, value::UInt64)
-    type_id = emit_type_int!(mod, UInt32(64), UInt32(0))
-    lo = UInt32(value & 0xFFFFFFFF)
-    hi = UInt32((value >> 32) & 0xFFFFFFFF)
-    key = (:const, type_id, value)
-    get!(mod.constant_cache, key) do
-        id = fresh_id!(mod)
-        encode_instruction!(mod.types_constants, Op.OpConstant, type_id, id, lo, hi)
-        id
-    end
 end
 
 """
@@ -5513,12 +5313,11 @@ function emit_function_ptr_word!(state::SPIRVEmitterState, llvm_val::LLVM.Value,
         if current isa LLVM.AllocaInst
             break
         elseif current isa LLVM.GetElementPtrInst
-            # Compute byte offset from this GEP's indices
-            gep_ops = current.operands
-            source_ty_gep = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(current))
-            byte_offset = compute_gep_constant_byte_offset(source_ty_gep, gep_ops; dl=state.data_layout)
+            byte_offset = constant_gep_offset(current, state.data_layout::LLVM.DataLayout)
+            byte_offset === nothing && error("a memset/memcpy through a GEP with a dynamic index into a " *
+                                             "Function-class alloca has no constant word offset: $current")
             total_byte_offset += byte_offset
-            current = gep_ops[1]  # walk up to base pointer
+            current = current.operands[1]  # walk up to base pointer
         elseif current isa LLVM.BitCastInst
             current = current.operands[1]
         else
@@ -5554,40 +5353,6 @@ function emit_function_ptr_word!(state::SPIRVEmitterState, llvm_val::LLVM.Value,
     encode_instruction!(state.mod.functions, Op.OpAccessChain, ptr_ty,
                         result_id, alloca_id, word_const)
     return result_id
-end
-
-"""
-Compute the constant byte offset of a GEP from its source type and operands.
-Used by `emit_function_ptr_word!` to resolve alloca offsets through GEP chains.
-"""
-function compute_gep_constant_byte_offset(source_ty::LLVM.LLVMType, ops; dl::Union{Nothing, LLVM.DataLayout}=nothing)
-    total = 0
-    # First index (ops[2]) is the base element offset: offset = idx * sizeof(source_ty)
-    first_idx = ops[2]
-    if first_idx isa LLVM.ConstantInt
-        idx_val = convert(Int64, first_idx)
-        if idx_val != 0
-            total += idx_val * compute_type_size(source_ty, dl)
-        end
-    end
-
-    # Remaining indices drill into the type hierarchy
-    current_ty = source_ty
-    for i in 3:length(ops)
-        idx_op = ops[i]
-        idx_val = idx_op isa LLVM.ConstantInt ? convert(Int64, idx_op) : 0
-        if current_ty isa LLVM.StructType
-            total += compute_struct_field_offset(current_ty, idx_val; dl)
-            current_ty = current_ty.elements[idx_val + 1]
-        elseif current_ty isa LLVM.ArrayType
-            elem_ty = current_ty.element_type
-            total += idx_val * compute_type_size(elem_ty, dl)
-            current_ty = elem_ty
-        else
-            total += idx_val * compute_type_size(current_ty, dl)
-        end
-    end
-    return total
 end
 
 """
@@ -5651,7 +5416,7 @@ function emit_memset!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             addr_u64 = if offset == 0
                 dest_u64
             else
-                offset_const = emit_u64_constant!(state.mod, offset)
+                offset_const = emit_constant_u64!(state.mod, offset)
                 addr_id = fresh_id!(state.mod)
                 encode_instruction!(state.mod.functions, Op.OpIAdd, u64_ty, addr_id, dest_u64, offset_const)
                 addr_id
@@ -5770,7 +5535,7 @@ function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             src_addr_u64 = if offset == 0
                 src_u64
             else
-                offset_const = emit_u64_constant!(state.mod, offset)
+                offset_const = emit_constant_u64!(state.mod, offset)
                 addr_id = fresh_id!(state.mod)
                 encode_instruction!(state.mod.functions, Op.OpIAdd, u64_ty, addr_id, src_u64, offset_const)
                 addr_id
@@ -5798,7 +5563,7 @@ function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
             dest_addr_u64 = if offset == 0
                 dest_u64
             else
-                offset_const = emit_u64_constant!(state.mod, offset)
+                offset_const = emit_constant_u64!(state.mod, offset)
                 addr_id = fresh_id!(state.mod)
                 encode_instruction!(state.mod.functions, Op.OpIAdd, u64_ty, addr_id, dest_u64, offset_const)
                 addr_id
@@ -5827,7 +5592,7 @@ function emit_memcpy!(state::SPIRVEmitterState, inst::LLVM.CallInst)
 
         for i in 0:(remainder - 1)
             offset = UInt64(nwords * chunk + i)
-            offset_const = emit_u64_constant!(state.mod, offset)
+            offset_const = emit_constant_u64!(state.mod, offset)
 
             # Source byte
             addr_id = fresh_id!(state.mod)
@@ -6271,29 +6036,9 @@ function emit_zext!(state::SPIRVEmitterState, inst::LLVM.ZExtInst)
     end
 end
 
-"""Create an integer constant with the given type and value."""
-function emit_int_constant!(state::SPIRVEmitterState, ty::LLVM.IntegerType, val::UInt64)
-    type_id = map_type!(state.type_ctx, ty)
-    w = ty.width
-    if w <= 32
-        bits = UInt32(val & 0xFFFFFFFF)
-        key = (:const, type_id, bits)
-        return get!(state.mod.constant_cache, key) do
-            id = fresh_id!(state.mod)
-            encode_instruction!(state.mod.types_constants, Op.OpConstant, type_id, id, bits)
-            id
-        end
-    else
-        key = (:const, type_id, val)
-        return get!(state.mod.constant_cache, key) do
-            id = fresh_id!(state.mod)
-            lo = UInt32(val & 0xFFFFFFFF)
-            hi = UInt32((val >> 32) & 0xFFFFFFFF)
-            encode_instruction!(state.mod.types_constants, Op.OpConstant, type_id, id, lo, hi)
-            id
-        end
-    end
-end
+"""The constant `value` of the LLVM integer type `ty`, taken modulo 2^width."""
+emit_int_constant!(state::SPIRVEmitterState, ty::LLVM.IntegerType, value::Integer) =
+    emit_constant_int!(state.mod, map_type!(state.type_ctx, ty), ty.width, value % UInt64)
 
 function emit_inttoptr!(state::SPIRVEmitterState, inst::LLVM.IntToPtrInst)
     # inttoptr i64 %val to ptr addrspace(N)
@@ -6596,9 +6341,8 @@ function find_merge_block(state::SPIRVEmitterState, inst::LLVM.BrInst)
 end
 
 """
-Check if `target` is reachable from `start` following forward edges only,
-without going through `avoid` (the header block). Uses BFS.
-Only blocks back-edges: edges from a loop's continue block back to its header.
+Whether `target` is reachable from `start` without passing through `avoid` and
+without taking a back-edge (a loop's continue block back to its header). BFS.
 """
 function is_forward_reachable(start::LLVM.BasicBlock, target::LLVM.BasicBlock,
                                 avoid::LLVM.BasicBlock, state::SPIRVEmitterState)
@@ -6704,52 +6448,18 @@ function find_inner_selection_merge(state::SPIRVEmitterState,
 
     # Check pattern 1: true does work, false is merge
     # (true_bb eventually reaches false_bb without back-edges)
-    if is_forward_reachable_inner(true_bb, false_bb, loop_merge_bb, state)
+    if is_forward_reachable(true_bb, false_bb, loop_merge_bb, state)
         return get_block_id!(state, false_bb)
     end
 
     # Check pattern 2: false does work, true is merge
     # (false_bb eventually reaches true_bb without back-edges)
-    if is_forward_reachable_inner(false_bb, true_bb, loop_merge_bb, state)
+    if is_forward_reachable(false_bb, true_bb, loop_merge_bb, state)
         return get_block_id!(state, true_bb)
     end
 
     # Fallback: use false_bb as merge (most common after StructurizeCFG)
     return get_block_id!(state, false_bb)
-end
-
-"""
-BFS reachability check that stops at `avoid` blocks and doesn't follow
-back-edges to loop headers. Used by find_inner_selection_merge.
-"""
-function is_forward_reachable_inner(start::LLVM.BasicBlock, target::LLVM.BasicBlock,
-                                      loop_merge_bb::LLVM.BasicBlock,
-                                      state::SPIRVEmitterState)
-    visited = Set{LLVM.BasicBlock}()
-    queue = LLVM.BasicBlock[start]
-    push!(visited, start)
-
-    while !isempty(queue)
-        bb = popfirst!(queue)
-        term = bb.terminator
-        for succ in term.successors
-            succ === target && return true
-            succ === loop_merge_bb && continue
-            if succ ∉ visited
-                # Don't follow back-edges to loop headers
-                is_backedge = false
-                if haskey(state.loop_info.loops, succ)
-                    _, continue_bb = state.loop_info.loops[succ]
-                    is_backedge = (bb === continue_bb)
-                end
-                if !is_backedge
-                    push!(visited, succ)
-                    push!(queue, succ)
-                end
-            end
-        end
-    end
-    return false
 end
 
 # Get or create a trampoline block that branches from current_block to target_id.
@@ -7190,7 +6900,7 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
                              state.type_ctx.pointer_types)
                 if is_psb
                     pred_block_id = phipredecessor(state, bb, block_label_id)
-                    zero_id = emit_u64_constant!(state.mod, UInt64(0))
+                    zero_id = emit_constant_u64!(state.mod, UInt64(0))
                     null_ptr_id = fresh_id!(state.mod)
                     conv_words = UInt32[]
                     push!(conv_words, (UInt32(4) << 16) | UInt32(Op.OpConvertUToPtr))
@@ -7203,12 +6913,7 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
                     append!(pre_terminator_insertions[pred_block_id], conv_words)
                     null_ptr_id
                 else
-                    key = (:null, type_id)
-                    get!(state.type_ctx.mod.constant_cache, key) do
-                        uid = fresh_id!(state.type_ctx.mod)
-                        encode_instruction!(state.type_ctx.mod.types_constants, UInt16(46), type_id, uid)  # OpConstantNull
-                        uid
-                    end
+                    emit_constant_null!(state.type_ctx.mod, type_id)
                 end
             elseif val isa LLVM.Constant && is_tensor_layout_type_id(state, type_id) &&
                    get(state.tensor_value_types, val, nothing) !== type_id
@@ -7245,13 +6950,7 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
                 # `OpConstantNull` rather than a workaround: the edge is only
                 # taken where the value is unused, which is the same reasoning
                 # the `UndefValue` branch above already applies.
-                key = (:null, type_id)
-                get!(state.type_ctx.mod.constant_cache, key) do
-                    uid = fresh_id!(state.type_ctx.mod)
-                    encode_instruction!(state.type_ctx.mod.types_constants,
-                                        UInt16(46), type_id, uid)  # OpConstantNull
-                    uid
-                end
+                emit_constant_null!(state.type_ctx.mod, type_id)
             elseif val isa LLVM.ConstantExpr
                 # A constant expression is emitted where it is asked for, and every
                 # block is closed by now: its `OpAccessChain` would land after the
@@ -7297,7 +6996,7 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
                         # Cross-storage-class mismatch in PHI.
                         # OpConvertUToPtr only works for PhysicalStorageBuffer targets.
                         # If target is Function, we can't convert — this indicates a bug
-                        # in trace_to_non_alloca or type inference. Log warning and
+                        # in traces_to_alloca or type inference. Log warning and
                         # use OpBitcast as fallback (may fail validation but won't crash).
                         if target_sc != 5348 # StoragePhysicalStorageBuffer = 5348
                             @warn "Cross-SC PHI: target SC=$target_sc is not PSB, cannot ConvertUToPtr. Using OpBitcast fallback."
@@ -9235,20 +8934,14 @@ function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
         # or just return a null/zero constant since this is dead error code.
         result_ty = val.value_type
         # Create a null pointer — these paths never execute on GPU
-        spirv_ty = map_type!(state.type_ctx, result_ty)
-        null_id = fresh_id!(state.mod)
-        encode_instruction!(state.mod.types_constants, Op.OpConstantNull, spirv_ty, null_id)
-        return null_id
+        return emit_constant_null!(state.mod, map_type!(state.type_ctx, result_ty))
     elseif op == LLVM.API.LLVMICmp
         # A pointer comparison LLVM left unfolded: Julia guards a constant global (a
         # tuple a loop iterates over, say) with `icmp ne (addrspacecast (ptr null),
         # @_j_const_1)`. A global's address is never null, so the answer is known.
         answer = folded_pointer_icmp(val)
         answer === nothing && error("Unsupported ConstantExpr icmp (operands not null or globals): $val")
-        id = fresh_id!(state.mod)
-        bool_ty = map_type!(state.type_ctx, LLVM.Int1Type())
-        encode_instruction!(state.mod.types_constants, answer ? UInt16(41) : UInt16(42), bool_ty, id)  # OpConstantTrue/False
-        return id
+        return emit_constant_bool!(state.mod, answer)
     else
         error("Unsupported ConstantExpr opcode: $op in ",string(val))
     end
