@@ -2986,8 +2986,7 @@ function psb_needs_decomposition(state::SPIRVEmitterState, ptr::LLVM.Value, acce
     # align 4` at a byte offset whose lowest two bits are non-zero (typical
     # pattern: byte-array-typed alloca followed by typepun-pack into i32 stored
     # back to an unaligned spot in the parent struct, e.g. `ptr +i64 -186` in
-    # `gpu_workqueue_map_kernel` — see investigation notes at
-    # docs/specs/2026-04-25-unaligned-bda-investigation.md).
+    # `gpu_workqueue_map_kernel`).
     access_align <= 1 && return false
 
     # Check 0: LLVM's own alignment on the load/store instruction.
@@ -5892,6 +5891,27 @@ function emit_conversion!(state::SPIRVEmitterState, inst::LLVM.Instruction, opco
             src = bitcast_id
         end
     end
+    # OpConvertSToF reads its operand as signed whatever the operand's type says, but
+    # spirv-opt folds a constant one by the type's signedness. Every integer type here is
+    # unsigned, so once spirv-opt had inlined a call passing -3, `Float32(n)` became
+    # 4.2949673e9. A signed operand type gives the same reading to both.
+    if opcode == Op.OpConvertSToF
+        src_llvm_ty = ops[1].value_type
+        signed_ty = if src_llvm_ty isa LLVM.IntegerType
+            emit_type_int!(state.mod, spirv_int_width(src_llvm_ty.width), UInt32(1))
+        elseif src_llvm_ty isa LLVM.VectorType && eltype(src_llvm_ty) isa LLVM.IntegerType
+            emit_type_vector!(state.mod,
+                              emit_type_int!(state.mod, spirv_int_width(eltype(src_llvm_ty).width), UInt32(1)),
+                              UInt32(length(src_llvm_ty)))
+        else
+            nothing
+        end
+        if signed_ty !== nothing
+            signed_id = fresh_id!(state.mod)
+            encode_instruction!(state.mod.functions, Op.OpBitcast, signed_ty, signed_id, src)
+            src = signed_id
+        end
+    end
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, opcode, result_ty, result_id, src)
     # A float conversion is exact: `Float32(Float16(x))` means the rounding. A
@@ -7155,9 +7175,10 @@ const GLSL_STD_450_MAP = Dict{String, UInt32}(
     # exactly one operand is NaN). That matches SPIR-V GLSL.std.450 NMin/NMax
     # exactly. FMin/FMax (opcodes 37/40) have undefined NaN behavior per
     # SPIR-V spec — do not use them. `llvm.minimum`/`llvm.maximum` (IEEE
-    # 754-2019 propagating) are NOT in this map: Base.min/max overlay in
-    # device/math.jl routes callers through llvm.minnum, and the emitter
-    # errors on any `llvm.minimum`/`maximum` that slips through.
+    # 754-2019 propagating) are NOT in this map: device/math.jl builds Julia's
+    # `Base.min`/`max` from NMin/NMax plus NaN and signed-zero selects, and
+    # `@fastmath min` is NMin alone. The emitter errors on any
+    # `llvm.minimum`/`maximum` that slips through.
     "llvm.minnum"   => UInt32(79),  # NMin
     "llvm.maxnum"   => UInt32(80),  # NMax
     "llvm.smin"     => UInt32(39),  # SMin (signed integer min)
@@ -7426,7 +7447,7 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
 end
 
 # `OpSDotKHR` of two 32-bit words, each four signed bytes: the packed form, which
-# is what `KI.dot4x8` takes and what the hardware instruction (`v_dot4` on AMD)
+# is what `dot4x8` takes and what the hardware instruction (`v_dot4` on AMD)
 # reads. SPIR-V 1.4 needs the extension; the operation is core in 1.6.
 function emit_lava_sdot4x8!(state::SPIRVEmitterState, inst::LLVM.CallInst)
     require_capability!(state.mod, Cap.DotProduct)
@@ -7661,11 +7682,10 @@ function emit_llvm_intrinsic!(state::SPIRVEmitterState, inst::LLVM.CallInst, nam
     end
 
     # `llvm.minimum` / `llvm.maximum` (IEEE 754-2019 NaN-propagating) have no
-    # GLSL.std.450 equivalent. `Base.min`/`Base.max` are overlay-overridden in
-    # `device/math.jl` to lower to `llvm.minnum`/`maxnum` (non-propagating,
-    # matches GPU industry convention). If these propagating variants leak
-    # through, silently mapping them to NMin/NMax (non-propagating) would hide
-    # a CPU/GPU semantic divergence — fail loudly.
+    # GLSL.std.450 equivalent. `device/math.jl` overrides `Base.min`/`Base.max`
+    # (NMin/NMax plus NaN and signed-zero selects) and `Base.FastMath.min_fast`/
+    # `max_fast` (NMin/NMax). If these intrinsics leak through, silently mapping
+    # them to NMin/NMax would hide a CPU/GPU semantic divergence — fail loudly.
     if base_name == "llvm.minimum" || base_name == "llvm.maximum"
         error("$base_name reached SPIR-V emitter — this means some code path " *
               "is bypassing the `Base.min`/`Base.max` overlay in " *

@@ -272,3 +272,47 @@ end
     m == 2 && return 3.141592653589793 - (z - pi_lo)
     return (z - pi_lo) - 3.141592653589793
 end
+
+# ── pow: Base's special cases, in Float64 ─────────────────────────────────────
+# Integer exponents in Base's range use Base's own compensated power by squaring
+# (`Base.Math.pow_body(::Float64, ::Integer)`, table-free). Other exponents use
+# `exp(y * log(x))` from the fdlibm `exp`/`log` above. That is accurate to about
+# |y log x| ulp, where Base's double-double logarithm reads `t_log_table_compact`.
+
+# x > 0, finite
+@inline native_pow(x::Float64, y::Float64) = exp(y * log(x))
+
+@lava_device_override @inline function Base.:^(x::Float64, n::Integer)
+    n = clamp(n, Int64)
+    n == 0 && return 1.0
+    # Base's arithmetic carries the NaN; a driver that does not preserve NaN breaks it
+    # (RADV divides 1.0 by NaN to 0.0), `OpIsNan` it does not
+    isnan(x) && return x
+    Base.Math.use_power_by_squaring(n) && return Base.Math.pow_body(x, n)
+    r = x == 0.0 ? (n > 0 ? 0.0 : Inf) : native_pow(abs(x), Float64(n))
+    return ifelse(isodd(n), copysign(r, x), r)
+end
+
+@lava_device_override @inline function Base.:^(x::Float64, y::Float64)
+    x == 1.0 && return 1.0
+    # beyond this every result over- or underflows, and the integer test below stays exact
+    if !(abs(y) < 0x1.8p62)
+        isnan(y) && return y
+        y = copysign(0x1.8p62, y)
+    end
+    yint = unsafe_trunc(Int64, y)
+    yisint = y == yint
+    if yisint
+        yint == 0 && return 1.0
+        isnan(x) && return x   # see `^(::Float64, ::Integer)`
+        Base.Math.use_power_by_squaring(yint) && return Base.Math.pow_body(x, yint)
+    end
+    x == 0.0 && return abs(y) * Inf * !(y > 0.0)
+    s = 1.0
+    if x < 0.0
+        yisint || return NaN   # a domain error on the host
+        s = ifelse(isodd(yint), -1.0, 1.0)
+    end
+    isfinite(x) || return copysign(x, s) * (y > 0.0 || isnan(x))
+    return copysign(native_pow(abs(x), y), s)
+end

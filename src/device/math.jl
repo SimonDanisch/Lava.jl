@@ -18,7 +18,7 @@
 # ── Helpers: create llvmcall for LLVM intrinsics ──
 
 macro _lava_unary_intrinsic(jl_func, llvm_base, T, llvm_ty)
-    suffix = T == Float32 ? "f32" : "f64"
+    suffix = T == Float32 ? "f32" : T == Float16 ? "f16" : "f64"
     intrinsic = "$llvm_base.$suffix"
     ir = """
         declare $llvm_ty @$intrinsic($llvm_ty)
@@ -36,7 +36,7 @@ macro _lava_unary_intrinsic(jl_func, llvm_base, T, llvm_ty)
 end
 
 macro _lava_binary_intrinsic(jl_func, llvm_base, T, llvm_ty)
-    suffix = T == Float32 ? "f32" : "f64"
+    suffix = T == Float32 ? "f32" : T == Float16 ? "f16" : "f64"
     intrinsic = "$llvm_base.$suffix"
     ir = """
         declare $llvm_ty @$intrinsic($llvm_ty, $llvm_ty)
@@ -54,7 +54,7 @@ macro _lava_binary_intrinsic(jl_func, llvm_base, T, llvm_ty)
 end
 
 macro _lava_ternary_intrinsic(jl_func, llvm_base, T, llvm_ty)
-    suffix = T == Float32 ? "f32" : "f64"
+    suffix = T == Float32 ? "f32" : T == Float16 ? "f16" : "f64"
     intrinsic = "$llvm_base.$suffix"
     ir = """
         declare $llvm_ty @$intrinsic($llvm_ty, $llvm_ty, $llvm_ty)
@@ -116,21 +116,38 @@ for (T, llvm_ty) in ((Float32, "float"), (Float64, "double"))
         @_lava_unary_intrinsic  Base.abs   "llvm.fabs"  $T $llvm_ty
         @_lava_unary_intrinsic  Base.floor "llvm.floor" $T $llvm_ty
         @_lava_unary_intrinsic  Base.ceil  "llvm.ceil"  $T $llvm_ty
-        @_lava_unary_intrinsic  Base.round "llvm.round" $T $llvm_ty
+        # No `Base.round` here: Base's `round(x)` is `llvm.rint`, which the emitter maps to
+        # RoundEven, Julia's ties-to-even. `llvm.round` is GLSL Round, whose ties go in a
+        # direction the implementation chooses.
         @_lava_unary_intrinsic  Base.trunc "llvm.trunc" $T $llvm_ty
-        @_lava_binary_intrinsic Base.min   "llvm.minnum" $T $llvm_ty
-        @_lava_binary_intrinsic Base.max   "llvm.maxnum" $T $llvm_ty
         @_lava_ternary_intrinsic Base.fma    "llvm.fma"     $T $llvm_ty
         @_lava_ternary_intrinsic Base.muladd "llvm.fma"     $T $llvm_ty
     end
 end
 
-# Float16: overlay Base.min/max onto llvm.minnum/maxnum so reductions +
-# generic numeric code don't hit the emitter's `llvm.minimum`/`maximum`
-# error. GLSL.std.450 NMin/NMax works for f16 when the Float16 capability
-# is enabled.
-@_lava_binary_intrinsic Base.min "llvm.minnum" Float16 "half"
-@_lava_binary_intrinsic Base.max "llvm.maxnum" Float16 "half"
+# ── min / max ──
+#
+# `@fastmath min` (`Base.FastMath.min_fast`) is GLSL.std.450 NMin/NMax: IEEE minNum,
+# where a NaN operand loses to a number. `Base.min`/`max` are Julia's: a NaN operand
+# gives NaN and -0.0 < 0.0. GLSL.std.450 has no instruction for that, so they are
+# NMin/NMax plus two selects; the emitter rejects `llvm.minimum`/`maximum`.
+for (T, U, llvm_ty) in ((Float16, UInt16, "half"), (Float32, UInt32, "float"), (Float64, UInt64, "double"))
+    @eval begin
+        @_lava_binary_intrinsic Base.FastMath.min_fast "llvm.minnum" $T $llvm_ty
+        @_lava_binary_intrinsic Base.FastMath.max_fast "llvm.maxnum" $T $llvm_ty
+        @lava_device_override @inline function Base.min(x::$T, y::$T)
+            r = Base.FastMath.min_fast(x, y)
+            # equal operands are identical or ±0, where the negative one is the minimum
+            r = ifelse(x == y, reinterpret($T, reinterpret($U, x) | reinterpret($U, y)), r)
+            return ifelse(isnan(x) | isnan(y), ifelse(isnan(x), x, y), r)
+        end
+        @lava_device_override @inline function Base.max(x::$T, y::$T)
+            r = Base.FastMath.max_fast(x, y)
+            r = ifelse(x == y, reinterpret($T, reinterpret($U, x) & reinterpret($U, y)), r)
+            return ifelse(isnan(x) | isnan(y), ifelse(isnan(x), x, y), r)
+        end
+    end
+end
 
 # ══════════════════════════════════════════════════════════════════════
 # Tier 1b: LLVM intrinsics for transcendentals — Float32 ONLY
@@ -143,7 +160,68 @@ end
 @_lava_unary_intrinsic  Base.exp2  "llvm.exp2"  Float32 "float"
 @_lava_unary_intrinsic  Base.log   "llvm.log"   Float32 "float"
 @_lava_unary_intrinsic  Base.log2  "llvm.log2"  Float32 "float"
-@_lava_binary_intrinsic Base.:(^)  "llvm.pow"   Float32 "float"
+
+# ── Powers ──
+#
+# `Base.:^` keeps Julia's results; only `Base.FastMath.pow_fast` (`@fastmath x^y`) is the
+# native GLSL.std.450 Pow, which is undefined for x < 0 and for x = 0, y <= 0. The special
+# cases follow Base's `^(::Float32, ::Float32)`. A domain error (negative base, non-integer
+# exponent) is NaN, since a kernel cannot throw.
+
+# GLSL.std.450 Pow, defined for x > 0
+@inline native_pow(x::Float32, y::Float32) = Base.llvmcall(("""
+        declare float @llvm.pow.f32(float, float)
+        define float @entry(float %x, float %y) #0 {
+            %r = call float @llvm.pow.f32(float %x, float %y)
+            ret float %r
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Float32, Tuple{Float32, Float32}, x, y)
+
+# Small integer exponents by multiplication, the rest as |x|^n with the sign of x for odd
+# n, as CUDA.jl's `^(::Float32, ::Integer)`: Base squares in Float64, which runs at a
+# fraction of the Float32 rate on GPUs. The parity comes from the integer, since Float32(n)
+# may round to an even number.
+@lava_device_override @inline function Base.:^(x::Float32, n::Integer)
+    n == 0 && return 1.0f0
+    n == 1 && return x
+    n == 2 && return x * x
+    n == 3 && return x * x * x   # Base: compatible with literal_pow
+    n == -1 && return inv(x)
+    n == -2 && return (i = inv(x); i * i)
+    r = x == 0.0f0 ? (n > 0 ? 0.0f0 : Inf32) : native_pow(abs(x), Float32(n))
+    return ifelse(isodd(n), copysign(r, x), r)
+end
+
+@lava_device_override @inline function Base.:^(x::Float32, y::Float32)
+    x == 1.0f0 && return 1.0f0
+    # beyond this every result over- or underflows, and the integer test below stays exact
+    if !(abs(y) < 0x1.Ap30)
+        isnan(y) && return y
+        y = copysign(Float32(0x1.Ap30), y)
+    end
+    n = unsafe_trunc(Int32, y)
+    if y == n
+        # Base answers an integral exponent with `x^n`; small ones multiply, as there
+        n == 0 && return 1.0f0
+        n == 1 && return x
+        n == 2 && return x * x
+        n == 3 && return x * x * x
+        n == -1 && return inv(x)
+        n == -2 && return (i = inv(x); i * i)
+        r = x == 0.0f0 ? (n > 0 ? 0.0f0 : Inf32) : native_pow(abs(x), y)
+        return ifelse(isodd(n), copysign(r, x), r)
+    end
+    x < 0.0f0 && return NaN32
+    isfinite(x) || return x * (y > 0.0f0 || isnan(x))
+    x == 0.0f0 && return abs(y) * Inf32 * !(y > 0.0f0)
+    return native_pow(x, y)
+end
+
+@lava_device_override @inline Base.FastMath.pow_fast(x::Float32, y::Float32) = native_pow(x, y)
+# Base lowers these to `llvm.powi`, which SPIR-V has no instruction for
+@lava_device_override @inline Base.FastMath.pow_fast(x::Float32, n::Integer) = x^n
+@lava_device_override @inline Base.FastMath.pow_fast(x::Float64, n::Integer) = x^n
 
 # ══════════════════════════════════════════════════════════════════════
 # Tier 2: GLSL.std.450 ops via custom _lava_glsl_* function names
@@ -213,7 +291,7 @@ end
 @lava_device_override @inline Base.asinh(x::Float64) = Float64(asinh(Float32(x)))
 @lava_device_override @inline Base.acosh(x::Float64) = Float64(acosh(Float32(x)))
 @lava_device_override @inline Base.atanh(x::Float64) = Float64(atanh(Float32(x)))
-@lava_device_override @inline Base.:(^)(x::Float64, y::Float64) = Float64(Float32(x) ^ Float32(y))
+# `^(::Float64, ...)` is in Float64, in `math_f64.jl`
 
 # ══════════════════════════════════════════════════════════════════════
 # Tier 3b: Float16 transcendentals — same downcast as Float64
@@ -254,7 +332,6 @@ end
 @lava_device_override @inline Base.atan(y::Float16, x::Float16) = Float16(atan(Float32(y), Float32(x)))
 @lava_device_override @inline Base.:(^)(x::Float16, y::Float16) = Float16(Float32(x) ^ Float32(y))
 @lava_device_override @inline Base.sincos(x::Float16) = (sin(x), cos(x))
-@lava_device_override @inline Base.clamp(x::Float16, lo::Float16, hi::Float16) = min(max(x, lo), hi)
 
 # sincos — composition
 @lava_device_override @inline Base.sincos(x::Float32) = (sin(x), cos(x))
@@ -263,9 +340,7 @@ end
 # log10 — composition from log2
 @lava_device_override @inline Base.log10(x::Float32) = log2(x) * Float32(0.30102999566398114)
 
-# clamp — composition from min/max (works for all float types)
-@lava_device_override @inline Base.clamp(x::Float32, lo::Float32, hi::Float32) = min(max(x, lo), hi)
-@lava_device_override @inline Base.clamp(x::Float64, lo::Float64, hi::Float64) = min(max(x, lo), hi)
+# No `clamp` override: Base's comparisons pass a NaN through, `min(max(x, lo), hi)` did not.
 
 # copysign — IEEE bitwise sign-copy. Base's default lowers to `llvm.copysign`,
 # which the SPIR-V emitter cannot answer as `FAbs(x) * FSign(y)`: GLSL.std.450
@@ -285,20 +360,8 @@ end
         (reinterpret(UInt16, x) & UInt16(0x7FFF)) | (reinterpret(UInt16, y) & UInt16(0x8000)))
 end
 
-# min/max — `Base.min`/`Base.max` on Float32/Float64 are already overlaid
-# above (via `@_lava_binary_intrinsic Base.min "llvm.minnum"`), which lowers
-# to NMin/NMax (non-propagating, IEEE 754-2008 minNum — matches CUDA fminf,
-# ROCm ocml_fmin, OpenCL fmin, SPIRVIntrinsics).
-#
-# Julia 1.12 additionally lowers `@fastmath min(x, y)` and the internal
-# `Base.FastMath.min_fast` to `llvm.minimum`/`llvm.maximum` (NaN-propagating,
-# IEEE 754-2019) with a fast-math flag. The SPIR-V emitter errors on those
-# intrinsics — so re-route the fast variants through `Base.min`/`Base.max`.
-# Same workaround as JuliaGPU/AMDGPU.jl#756.
-@lava_device_override @inline Base.FastMath.min_fast(x::T, y::T) where {T<:Union{Float16,Float32,Float64}} = min(x, y)
-@lava_device_override @inline Base.FastMath.max_fast(x::T, y::T) where {T<:Union{Float16,Float32,Float64}} = max(x, y)
 
-# isfinite / isinf — MEASURED WRONG on device before these overrides, 2026-09-22.
+# isfinite / isinf: Base's definitions are wrong on device, so these override them.
 #
 # `isfinite(NaN32)`, `isfinite(Inf32)` and `isfinite(-Inf32)` all returned
 # `true` inside a kernel on RADV. Base writes it as
@@ -366,31 +429,7 @@ end
     """, "entry"), Int64, Tuple{Int64}, x)
 end
 
-# ── Power with integer exponent ──
-
-@lava_device_override @inline function Base.:^(x::Float32, n::Int64)
-    Base.llvmcall(("""
-        declare float @llvm.pow.f32(float, float)
-        define float @entry(float %x, i64 %n) #0 {
-            %nf = sitofp i64 %n to float
-            %r = call float @llvm.pow.f32(float %x, float %nf)
-            ret float %r
-        }
-        attributes #0 = { alwaysinline }
-    """, "entry"), Float32, Tuple{Float32, Int64}, x, n)
-end
-
-@lava_device_override @inline function Base.:^(x::Float64, n::Int64)
-    Base.llvmcall(("""
-        declare double @llvm.pow.f64(double, double)
-        define double @entry(double %x, i64 %n) #0 {
-            %nf = sitofp i64 %n to double
-            %r = call double @llvm.pow.f64(double %x, double %nf)
-            ret double %r
-        }
-        attributes #0 = { alwaysinline }
-    """, "entry"), Float64, Tuple{Float64, Int64}, x, n)
-end
+# ── Literal powers ──
 
 for T in (Float32, Float64)
     @eval begin
@@ -400,30 +439,8 @@ for T in (Float32, Float64)
     end
 end
 
-# ══════════════════════════════════════════════════════════════════════
-# Complex abs (simplified, branchless)
-# ══════════════════════════════════════════════════════════════════════
-
-@lava_device_override @inline function Base.abs(z::ComplexF32)
-    re = Float64(real(z))
-    im = Float64(imag(z))
-    Float32(sqrt(muladd(re, re, im * im)))
-end
-
-@lava_device_override @inline function Base.abs(z::ComplexF64)
-    re = abs(real(z))
-    im = abs(imag(z))
-    mx = max(re, im)
-    mn = min(re, im)
-    r = ifelse(mx > 0.0, mn / mx, 0.0)
-    mx * sqrt(muladd(r, r, 1.0))
-end
-
-@lava_device_override @inline function Base.abs(z::Complex{Float16})
-    re = Float32(real(z))
-    im = Float32(imag(z))
-    Float16(sqrt(muladd(re, re, im * im)))
-end
+# No complex `abs` override: Base's `hypot(real(z), imag(z))` scales, so large and
+# small moduli neither overflow nor underflow.
 
 # ── Functions that ccall libm and must be overridden to avoid GPU crashes ──
 
@@ -496,9 +513,5 @@ end
     Float64(Float32(s) * Float32(abs(x))^(1.0f0 / 3.0f0))
 end
 
-@lava_device_override @inline function Base.Math.hypot(x::Float32, y::Float32)
-    sqrt(muladd(x, x, y * y))
-end
-@lava_device_override @inline function Base.Math.hypot(x::Float64, y::Float64)
-    Float64(hypot(Float32(x), Float32(y)))
-end
+# No `hypot` override: Base's neither overflows (Float32 is computed in Float64, Float64
+# scaled). `Base.FastMath.hypot_fast` is the unscaled `sqrt(x*x + y*y)`.
