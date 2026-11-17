@@ -283,10 +283,20 @@ const INFERENCE_LOCK = ReentrantLock()
 inferkernel!(job) =
     @lock INFERENCE_LOCK GPUCompiler.drive_inference!(GPUCompiler.get_interpreter(job), job.source)
 
+"""
+    persists_inferred_kernels() -> Bool
+
+Whether compute kernels are kept across sessions by their inferred inputs: there is an
+object cache, nothing is being precompiled or dumped, and neither code coverage nor
+allocation logging instruments the code the kernel was inferred from.
+"""
+persists_inferred_kernels() =
+    HAS_OBJECT_CACHE && !generating_output() && !kernel_dump_wanted() &&
+    Base.JLOptions().code_coverage == 0 && Base.JLOptions().malloc_log == 0 && ObjCache.enabled()
+
 """The compute kernel of `job`, looked up before LLVM emission when its inferred inputs are portable."""
 function persisted_kernel(job::LavaCompilerJob)
-    keep = HAS_OBJECT_CACHE && !generating_output() && !kernel_dump_wanted() &&
-           Base.JLOptions().code_coverage == 0 && Base.JLOptions().malloc_log == 0 && ObjCache.enabled()
+    keep = persists_inferred_kernels()
     # Inferred first, alone: `GPUCompiler.compile` then finds the whole call graph cached.
     key = keep ? inferred_kernel_key(job) : (inferkernel!(job); nothing)
     if key !== nothing

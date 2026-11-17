@@ -2832,7 +2832,9 @@ function disassemble_spirv(spirv_bytes::Vector{UInt8})
         write(tmpfile, spirv_bytes)
         # `read(cmd, String)` blocks on the deadlock-prone wait; spawn + poll.
         p = lava_run(pipeline(`$spirv_dis --no-color $tmpfile`; stdout=out_path); label="spirv-dis")
-        return (process_exited(p) && p.exitcode == 0 && isfile(out_path)) ? read(out_path, String) : ""
+        process_exited(p) && p.exitcode == 0 && isfile(out_path) || return ""
+        # spirv-dis ends lines with CRLF on Windows; the disassembly is the same text everywhere.
+        return replace(read(out_path, String), "\r\n" => "\n")
     finally
         rm(tmpfile; force=true)
         rm(out_path; force=true)

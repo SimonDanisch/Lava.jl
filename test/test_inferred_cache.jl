@@ -106,7 +106,7 @@ end
         @test valuekey(left.Record) != valuekey(right.Record)
     end
 
-    if Lava.ObjCache.enabled()
+    if Lava.persists_inferred_kernels()
         original = Lava.persisted_kernel(original_job)
         # Bypass the session-tier kernel result: a persistent hit must skip
         # LLVM emission itself, not merely the optimization and SPIR-V stages.
