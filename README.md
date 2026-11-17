@@ -20,7 +20,7 @@ Pkg.add("Lava")       # the compiler
 Pkg.add("Mantle")     # to run what it compiles
 ```
 
-Requires Julia 1.12. Compiling needs no GPU and no driver. Running needs a Vulkan 1.2+
+Requires Julia 1.12 or newer. Compiling needs no GPU and no driver. Running needs a Vulkan 1.2+
 driver with `bufferDeviceAddress` and `variablePointers`: NVIDIA, AMD (RADV, AMDVLK,
 Windows), Intel, or lavapipe (`Lavapipe_jll`) as a CPU device.
 

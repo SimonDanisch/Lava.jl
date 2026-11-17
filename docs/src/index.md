@@ -17,7 +17,7 @@ Pkg.add("Lava")       # the compiler
 Pkg.add("Mantle")     # to run what it compiles
 ```
 
-Lava requires Julia 1.12. Compiling needs no GPU and no driver, only a Vulkan loader,
+Lava requires Julia 1.12 or newer. Compiling needs no GPU and no driver, only a Vulkan loader,
 which `Vulkan_Loader_jll` provides where the system has none. Running compiled code needs a Vulkan 1.2+ driver
 with `bufferDeviceAddress` and `variablePointers`: NVIDIA, AMD, Intel, or lavapipe
 (`Lavapipe_jll`) as a CPU device.
