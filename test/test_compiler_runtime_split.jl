@@ -19,8 +19,8 @@ What had to be untangled before the move was possible, each of which would put a
   * `DeviceCaps` was written twice, field for field, in Lava and in Mantle, and
     bridged by a POSITIONAL copy — both definitions carried a comment warning
     that a field inserted anywhere but the end would misalign it silently. It is
-    `KernelInterface`'s now, and `caps` is one function with a method on each
-    side.
+    the vocabulary's now (`vocabulary/caps.jl`), and `caps` is one function with
+    a method on each side.
   * The emitter read `VK_CONTEXT_REF[]` for two booleans (SER, ray-query). It
     reads `TargetFeatures` now, which the runtime pushes from `bind_context!`.
   * `spirv_content_hash` lived with the pipeline code; both sides reached for it.
@@ -44,6 +44,10 @@ const LAVA_SOURCES = [
     "graphics/types.jl",
     "runtime/errors.jl",
     "runtime/intrinsics.jl",
+    # the device vocabulary, which every backend implements
+    "vocabulary/vocabulary.jl", "vocabulary/matrix.jl", "vocabulary/caps.jl",
+    "vocabulary/coopmat.jl", "vocabulary/tensor.jl", "vocabulary/topology.jl",
+    "vocabulary/graphics.jl", "vocabulary/mesh.jl",
     "compiler/phase_timer.jl", "compiler/target.jl", "compiler/entry_wrapper.jl",
     "compiler/compilation.jl", "compiler/target_features.jl", "compiler/cache.jl",
     "compiler/frozen_world.jl", "compiler/function_cache.jl", "compiler/optimization_cache.jl",
@@ -60,7 +64,7 @@ const LAVA_SOURCES = [
     "compiler/passes/readonly_loads.jl",
     "device/math.jl", "device/math_f64.jl", "device/quirks.jl",
     "device/ray_query_intrinsics.jl", "device/gfx_intrinsics.jl", "device/printf.jl",
-    "device/atomics.jl", "device/subgroup.jl", "device/acceleratedmatrix.jl",
+    "device/atomics.jl", "device/subgroup.jl",
     "device/coopmat_intrinsics.jl", "device/tensor_intrinsics.jl",
     "device/kernelinterface.jl", "device/devicearray.jl", "device/constarray.jl",
     "device/sharedmemory.jl", "device/ndrange.jl",
@@ -306,7 +310,7 @@ end
         # `lava_compile_gpu` validates, so compiling at all is the check.
         function shared_vec4(out, x)
             i = Lava.lava_global_invocation_id_x() + UInt32(1)
-            sh = Lava.KernelInterface.localmemory(Float32, Val((64,)), Val(1))
+            sh = Lava.KernelInterface.localmemory(Float32, Val((64,)))
             @inbounds sh[i] = x[i]
             Lava.KernelInterface.barrier()
             v = @inbounds reinterpret(NTuple{4, VecElement{Float32}}, sh)[(i - UInt32(1)) ÷ UInt32(4) + UInt32(1)]

@@ -77,14 +77,14 @@ end
 # own `referenceable` has no method for it.
 for (name, order) in ((:local_add, QuoteNode(:monotonic)), (:local_release, QuoteNode(:release)))
     @eval function $name(a)
-        h = Lava.KI.localmemory(Int32, Val((4,)), Val($(QuoteNode(name))))
+        h = Lava.KI.localmemory(Int32, Val((4,)))
         Lava.Atomix.@atomic $order h[2] += Int32(1)
         @inbounds a[1] = h[2]
         nothing
     end
 end
 function local_default(a)
-    h = Lava.KI.localmemory(Int32, Val((4,)), Val(:local_default))
+    h = Lava.KI.localmemory(Int32, Val((4,)))
     Lava.Atomix.@atomic h[2] += Int32(1)
     @inbounds a[1] = h[2]
     nothing

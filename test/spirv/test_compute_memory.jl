@@ -11,7 +11,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
 
     @testset "shared memory" begin
         function shared_mem_kernel(A)
-            ptr = Lava.lava_alloc_shared(Val(:test_shared), Float32, Val(64))
+            ptr = Lava.lava_alloc_shared(Float32, Val(64))
             shared = Lava.LavaSharedArray{Float32}(ptr, 64)
             lid = Lava.lava_local_invocation_id_x()
             gid = Lava.lava_global_invocation_id_x()
@@ -100,7 +100,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         # inner array and fell back to dividing by the struct's size, an
         # `OpPtrAccessChain` spirv-val rejects (`compile_and_disasm` validates).
         function lane_kernel(out, src)
-            ptr = Lava.lava_alloc_shared(Val(:test_lanes), Tuple{NTuple{1,NTuple{3,Float32}}, Bool}, Val(64))
+            ptr = Lava.lava_alloc_shared(Tuple{NTuple{1,NTuple{3,Float32}}, Bool}, Val(64))
             shared = Lava.LavaSharedArray{Tuple{NTuple{1,NTuple{3,Float32}}, Bool}}(ptr, 64)
             lid = Lava.lava_local_invocation_id_x() + 1
             @inbounds shared[lid] = (((src[lid], 2f0 * src[lid], 3f0 * src[lid]),), true)

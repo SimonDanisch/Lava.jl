@@ -41,7 +41,7 @@ using GeometryBasics
 # directly never materialises one. The same body compiled bare passes either
 # way, which is what makes a test written that way worthless.
 function partial_copy_body(xs::Lava.LavaDeviceArray{Vec3f,1}, u::Vec3f)
-    i = KernelInterface.vertex_index()
+    i = Lava.vertex_index()
     v = xs[i]
     return (position = Vec4f(v[1], v[2], v[3], 1f0), out = Vec3f(u[i], u[i], u[i]))
 end

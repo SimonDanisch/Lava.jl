@@ -77,8 +77,7 @@ end
     local d
     let
         function init_kernel(out)
-            ray = Ray(o=Point3f(0, 0, 0), d=Vec3f(0, 0, 1), t_min=0f0, t_max=1f3)
-            Lava.lava_ray_query_init(ray; mask=UInt32(0xFF))
+            Lava.lava_ray_query_init(Point3f(0, 0, 0), Vec3f(0, 0, 1), 0f0, 1f3; mask=UInt32(0xFF))
             @inbounds out[1] = 1f0
             return nothing
         end
@@ -92,7 +91,7 @@ end
     local d
     let
         function full_kernel(out)
-            Lava.lava_ray_query_init(Ray(o=Point3f(0, 0, 0), d=Vec3f(0, 0, 1), t_min=0f0, t_max=1f3))
+            Lava.lava_ray_query_init(Point3f(0, 0, 0), Vec3f(0, 0, 1), 0f0, 1f3)
             while Lava.lava_ray_query_proceed()
                 kind = Lava.lava_ray_query_get_type(false)  # candidate
                 if kind == UInt32(0)  # candidate triangle
@@ -130,7 +129,7 @@ end
     local d
     let
         function term_kernel(out)
-            Lava.lava_ray_query_init(Ray(o=Point3f(0, 0, 0), d=Vec3f(0, 0, 1), t_min=0f0, t_max=1f3))
+            Lava.lava_ray_query_init(Point3f(0, 0, 0), Vec3f(0, 0, 1), 0f0, 1f3)
             Lava.lava_ray_query_terminate()
             @inbounds out[1] = 1f0
             return nothing
@@ -147,8 +146,7 @@ end
         function conditional_init_kernel(out)
             i = Lava.lava_global_invocation_id_x()
             if i > UInt32(0)  # always true at runtime, but optimizer may not know
-                ray = Ray(o=Point3f(0, 0, 0), d=Vec3f(0, 0, 1), t_min=0f0, t_max=1f3)
-                Lava.lava_ray_query_init(ray)
+                Lava.lava_ray_query_init(Point3f(0, 0, 0), Vec3f(0, 0, 1), 0f0, 1f3)
                 while Lava.lava_ray_query_proceed()
                     Lava.lava_ray_query_confirm()
                 end

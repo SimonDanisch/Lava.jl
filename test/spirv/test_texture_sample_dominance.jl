@@ -18,7 +18,7 @@ using GeometryBasics
 
 function tsd_frag()
     tex = Lava.GfxTexture2D(UInt32(0))
-    uv = Vec2f(KernelInterface.frag_coord_x() / 64f0, KernelInterface.frag_coord_y() / 64f0)
+    uv = Vec2f(Lava.frag_coord_x() / 64f0, Lava.frag_coord_y() / 64f0)
     c = Vec4f(0f0, 0f0, 0f0, 1f0)
     if uv[1] > 0.5f0
         c = tex[uv]

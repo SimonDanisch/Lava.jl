@@ -5,38 +5,26 @@
 # Nothing here touches a queue, a pool or a context — the shared block is part of
 # the SPIR-V module, allocated by the driver when the workgroup launches.
 #
-# It travelled to Mantle with `array/ka_backend.jl` in the 2026-08-27 move and
-# came straight back: a test that only compiles a kernel had to import it from
-# the runtime, which is how the misplacement showed up.
-#
 # The `CoopMatrix` constructors that load a matrix out of a shared tile are here
-# too — they are device code over a device type, and keeping them beside the
-# array they read is why this file is included after `acceleratedmatrix.jl`.
-#
-# `KA` is aliased here rather than at the top of `Lava.jl`: this is the only file
-# in the compiler that overrides a KernelAbstractions function, and the alias
-# came with the code from `array/ka_backend.jl`, which is Mantle's now.
+# too: device code over the array they read, so this file is included after the
+# cooperative-matrix intrinsics.
 import KernelAbstractions as KA
 
-# Allocate shared memory (Workgroup storage class) for GPU kernels.
-# Follows AMDGPU's pattern: create an LLVM global variable in addrspace(3),
-# return a typed LLVMPtr. Each call site gets a unique global via Val{Id}.
+# Workgroup memory: an `[N x T]` global in addrspace(3), as Metal.jl's
+# `emit_threadgroup_memory` makes it. The global is INTERNAL and made where the call is
+# inlined, so every call site in a kernel has its own memory: two tiles of one type and
+# shape are two tiles. A call inside a helper that is not inlined is one tile for all of
+# that helper's callers, which is what KernelInterface's `localmemory` promises.
+# `KA.@localmem` lowers to `KI.localmemory` (`device/kernelinterface.jl`).
 LLVM.Interop.@llvmgenerated builder function lava_alloc_shared(
-        ::Val{Id}, ::Type{T}, ::Val{N})::Core.LLVMPtr{T, 3} where {Id, T, N}
-    # [N x T] in addrspace(3), named by the call-site Id
+        ::Type{T}, ::Val{N})::Core.LLVMPtr{T, 3} where {T, N}
     gv_typ = LLVM.ArrayType(convert(LLVM.LLVMType, T), N)
-    gv = LLVM.GlobalVariable(LLVM.Interop.current_module(builder), gv_typ, "lava_shared_$Id", 3)
-    gv.linkage = LLVM.Linkage.External
+    gv = LLVM.GlobalVariable(LLVM.Interop.current_module(builder), gv_typ, "lava_shared", 3)
+    gv.linkage = LLVM.Linkage.Internal
+    gv.initializer = LLVM.UndefValue(gv_typ)
     gv.alignment = max(16, Base.datatype_alignment(T))
     # the pointer to its first element
     LLVM.gep!(builder, gv_typ, gv, [LLVM.ConstantInt(0), LLVM.ConstantInt(0)])
-end
-
-# KA SharedMemory override: allocate workgroup-shared array, return indexable wrapper
-@lava_device_override @inline function KA.SharedMemory(::Type{T}, ::Val{Dims}, ::Val{Id}) where {T, Dims, Id}
-    N = prod(Dims)
-    ptr = lava_alloc_shared(Val(Id), T, Val(N))
-    LavaSharedArray{T, Dims}(ptr, N)
 end
 
 # Shared array backed by LLVMPtr in addrspace(3). `Dims` (a tuple type parameter)

@@ -25,9 +25,9 @@ import .SPIRVTestUtils: check, check_not, check_regex, compile_and_disasm
 @testset "Cooperative matrix, 8-bit" begin
     # int8 x int8 -> int32 out of shared memory, which is where the mismatch was.
     function i8_coopmat(C)
-        pa = Lava.lava_alloc_shared(Val(:i8a), Int8, Val(256))
-        pb = Lava.lava_alloc_shared(Val(:i8b), Int8, Val(256))
-        pc = Lava.lava_alloc_shared(Val(:i32c), Int32, Val(256))
+        pa = Lava.lava_alloc_shared(Int8, Val(256))
+        pb = Lava.lava_alloc_shared(Int8, Val(256))
+        pc = Lava.lava_alloc_shared(Int32, Val(256))
         sa = Lava.LavaSharedArray{Int8}(pa, 256)
         sb = Lava.LavaSharedArray{Int8}(pb, 256)
         sc = Lava.LavaSharedArray{Int32}(pc, 256)
@@ -72,9 +72,9 @@ end
     # The same product over unsigned components emits no signed bits, which is
     # what says the flags come from the dtype rather than from being an integer.
     function u8_coopmat(C)
-        pa = Lava.lava_alloc_shared(Val(:u8a), UInt8, Val(256))
-        pb = Lava.lava_alloc_shared(Val(:u8b), UInt8, Val(256))
-        pc = Lava.lava_alloc_shared(Val(:u32c), UInt32, Val(256))
+        pa = Lava.lava_alloc_shared(UInt8, Val(256))
+        pb = Lava.lava_alloc_shared(UInt8, Val(256))
+        pc = Lava.lava_alloc_shared(UInt32, Val(256))
         sa = Lava.LavaSharedArray{UInt8}(pa, 256)
         sb = Lava.LavaSharedArray{UInt8}(pb, 256)
         sc = Lava.LavaSharedArray{UInt32}(pc, 256)

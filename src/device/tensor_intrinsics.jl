@@ -23,9 +23,6 @@
 # without naming this compiler. What follows is Lava's lowering of each, and the
 # overlays at the end of the file that make KernelInterface's functions reach it.
 # A layout's storage here is the `Int32` handle the emitter maps to a result id.
-import KernelInterface: TensorLayout, TensorView, tensor_layout, tensor_setdim,
-                        tensor_setstride, tensor_setclampvalue, tensor_clampbits,
-                        tensor_slice, tensor_view, tensor_load, tensor_store
 
 tensor_intrinsic_name(op::AbstractString, dim::Integer, clamp::UInt32) =
     "_lava_tensor_$(op)_$(dim)_$(clamp)"

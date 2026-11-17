@@ -21,29 +21,29 @@ import KernelInterface
 # `Flat` names, its topology — the way `MeshWrapper` builds it from Mantle's
 # `MeshShader`. A stage that writes only `position` declares nothing else.
 const POSITION_ONLY = NamedTuple{(:position,), Tuple{Vec4f}}
-const MESHOUT = Lava.LavaMeshOut{POSITION_ONLY, (), KernelInterface.TriangleList}()
-const POINTOUT = Lava.LavaMeshOut{POSITION_ONLY, (), KernelInterface.PointList}()
+const MESHOUT = Lava.LavaMeshOut{POSITION_ONLY, (), Lava.TriangleList}()
+const POINTOUT = Lava.LavaMeshOut{POSITION_ONLY, (), Lava.PointList}()
 
 # `uv` smooth and `colour` flat, in that order: Location 0 and 1, `colour` in
 # the primitive plane. Mantle's portable MeshPipeline test declares exactly this.
 const UV_COLOUR = NamedTuple{(:position, :uv, :colour),
                              Tuple{Vec4f, NTuple{2,Float32}, NTuple{4,Float32}}}
-const PRIMOUT = Lava.LavaMeshOut{UV_COLOUR, (:colour,), KernelInterface.TriangleList}()
+const PRIMOUT = Lava.LavaMeshOut{UV_COLOUR, (:colour,), Lava.TriangleList}()
 const GREEN = (0f0, 1f0, 0f0, 1f0)
 
 @testset "Mesh Shaders" begin
 
     @testset "a triangle-emitting mesh stage" begin
         function one_triangle()
-            KernelInterface.set_mesh_outputs!(MESHOUT, 3, 1)
-            KernelInterface.set_mesh_vertex!(MESHOUT, 1, (position = Vec4f(-1, -1, 0, 1),))
-            KernelInterface.set_mesh_vertex!(MESHOUT, 2, (position = Vec4f( 1, -1, 0, 1),))
-            KernelInterface.set_mesh_vertex!(MESHOUT, 3, (position = Vec4f( 0,  1, 0, 1),))
-            KernelInterface.set_mesh_triangle!(MESHOUT, 1, 1, 2, 3)
+            Lava.set_mesh_outputs!(MESHOUT, 3, 1)
+            Lava.set_mesh_vertex!(MESHOUT, 1, (position = Vec4f(-1, -1, 0, 1),))
+            Lava.set_mesh_vertex!(MESHOUT, 2, (position = Vec4f( 1, -1, 0, 1),))
+            Lava.set_mesh_vertex!(MESHOUT, 3, (position = Vec4f( 0,  1, 0, 1),))
+            Lava.set_mesh_triangle!(MESHOUT, 1, 1, 2, 3)
             return nothing
         end
-        config = KernelInterface.MeshConfig(; max_vertices = 3, max_primitives = 1,
-                                             topology = KernelInterface.TriangleList(),
+        config = Lava.MeshConfig(; max_vertices = 3, max_primitives = 1,
+                                             topology = Lava.TriangleList(),
                                              threads = 1)
         d, bytes = compile_and_disasm(one_triangle, Tuple{}; stage = :mesh, config)
 
@@ -95,15 +95,15 @@ const GREEN = (0f0, 1f0, 0f0, 1f0)
 
     @testset "topology decides the index builtin" begin
         function two_points()
-            KernelInterface.set_mesh_outputs!(POINTOUT, 2, 2)
-            KernelInterface.set_mesh_vertex!(POINTOUT, 1, (position = Vec4f(0, 0, 0, 1),))
-            KernelInterface.set_mesh_vertex!(POINTOUT, 2, (position = Vec4f(1, 1, 0, 1),))
-            KernelInterface.set_mesh_point!(POINTOUT, 1, 1)
-            KernelInterface.set_mesh_point!(POINTOUT, 2, 2)
+            Lava.set_mesh_outputs!(POINTOUT, 2, 2)
+            Lava.set_mesh_vertex!(POINTOUT, 1, (position = Vec4f(0, 0, 0, 1),))
+            Lava.set_mesh_vertex!(POINTOUT, 2, (position = Vec4f(1, 1, 0, 1),))
+            Lava.set_mesh_point!(POINTOUT, 1, 1)
+            Lava.set_mesh_point!(POINTOUT, 2, 2)
             return nothing
         end
-        config = KernelInterface.MeshConfig(; max_vertices = 2, max_primitives = 2,
-                                             topology = KernelInterface.PointList(),
+        config = Lava.MeshConfig(; max_vertices = 2, max_primitives = 2,
+                                             topology = Lava.PointList(),
                                              threads = 1)
         d, _ = compile_and_disasm(two_points, Tuple{}; stage = :mesh, config)
         check_regex(d, "OpExecutionMode %\\S+ OutputPoints")
@@ -114,13 +114,13 @@ const GREEN = (0f0, 1f0, 0f0, 1f0)
 
     @testset "a wider workgroup keeps its LocalSize" begin
         function wide()
-            KernelInterface.set_mesh_outputs!(MESHOUT, 3, 1)
-            KernelInterface.set_mesh_vertex!(MESHOUT, 1, (position = Vec4f(0, 0, 0, 1),))
-            KernelInterface.set_mesh_triangle!(MESHOUT, 1, 1, 1, 1)
+            Lava.set_mesh_outputs!(MESHOUT, 3, 1)
+            Lava.set_mesh_vertex!(MESHOUT, 1, (position = Vec4f(0, 0, 0, 1),))
+            Lava.set_mesh_triangle!(MESHOUT, 1, 1, 1, 1)
             return nothing
         end
-        config = KernelInterface.MeshConfig(; max_vertices = 64, max_primitives = 32,
-                                             topology = KernelInterface.TriangleList(),
+        config = Lava.MeshConfig(; max_vertices = 64, max_primitives = 32,
+                                             topology = Lava.TriangleList(),
                                              threads = 32)
         d, _ = compile_and_disasm(wide, Tuple{}; stage = :mesh, config)
         check_regex(d, "OpExecutionMode %\\S+ LocalSize 32 1 1")
@@ -129,18 +129,18 @@ const GREEN = (0f0, 1f0, 0f0, 1f0)
     end
 
     # Two maxima that differ, so an array sized by the wrong one shows.
-    primconfig = KernelInterface.MeshConfig(; max_vertices = 4, max_primitives = 2,
-                                             topology = KernelInterface.TriangleList(),
+    primconfig = Lava.MeshConfig(; max_vertices = 4, max_primitives = 2,
+                                             topology = Lava.TriangleList(),
                                              threads = 1)
 
     @testset "per-primitive data is a PerPrimitiveEXT array" begin
         function by_primitive()
-            KernelInterface.set_mesh_outputs!(PRIMOUT, 3, 1)
-            KernelInterface.set_mesh_vertex!(PRIMOUT, 1, (position = Vec4f(-1, -1, 0, 1), uv = (0f0, 0f0)))
-            KernelInterface.set_mesh_vertex!(PRIMOUT, 2, (position = Vec4f( 3, -1, 0, 1), uv = (2f0, 0f0)))
-            KernelInterface.set_mesh_vertex!(PRIMOUT, 3, (position = Vec4f(-1,  3, 0, 1), uv = (0f0, 2f0)))
-            KernelInterface.set_mesh_triangle!(PRIMOUT, 1, 1, 2, 3)
-            KernelInterface.set_mesh_primitive_data!(PRIMOUT, 1, (colour = GREEN,))
+            Lava.set_mesh_outputs!(PRIMOUT, 3, 1)
+            Lava.set_mesh_vertex!(PRIMOUT, 1, (position = Vec4f(-1, -1, 0, 1), uv = (0f0, 0f0)))
+            Lava.set_mesh_vertex!(PRIMOUT, 2, (position = Vec4f( 3, -1, 0, 1), uv = (2f0, 0f0)))
+            Lava.set_mesh_vertex!(PRIMOUT, 3, (position = Vec4f(-1,  3, 0, 1), uv = (0f0, 2f0)))
+            Lava.set_mesh_triangle!(PRIMOUT, 1, 1, 2, 3)
+            Lava.set_mesh_primitive_data!(PRIMOUT, 1, (colour = GREEN,))
             return nothing
         end
         d, _ = compile_and_disasm(by_primitive, Tuple{}; stage = :mesh, config = primconfig)
@@ -163,11 +163,11 @@ const GREEN = (0f0, 1f0, 0f0, 1f0)
         # the triangle) writes it, so there is one store into the primitive
         # array, not three.
         function by_vertex()
-            KernelInterface.set_mesh_outputs!(PRIMOUT, 3, 1)
-            KernelInterface.set_mesh_vertex!(PRIMOUT, 1, (position = Vec4f(-1, -1, 0, 1), colour = GREEN, uv = (0f0, 0f0)))
-            KernelInterface.set_mesh_vertex!(PRIMOUT, 2, (position = Vec4f( 3, -1, 0, 1), colour = GREEN, uv = (2f0, 0f0)))
-            KernelInterface.set_mesh_vertex!(PRIMOUT, 3, (position = Vec4f(-1,  3, 0, 1), colour = GREEN, uv = (0f0, 2f0)))
-            KernelInterface.set_mesh_triangle!(PRIMOUT, 1, 1, 2, 3)
+            Lava.set_mesh_outputs!(PRIMOUT, 3, 1)
+            Lava.set_mesh_vertex!(PRIMOUT, 1, (position = Vec4f(-1, -1, 0, 1), colour = GREEN, uv = (0f0, 0f0)))
+            Lava.set_mesh_vertex!(PRIMOUT, 2, (position = Vec4f( 3, -1, 0, 1), colour = GREEN, uv = (2f0, 0f0)))
+            Lava.set_mesh_vertex!(PRIMOUT, 3, (position = Vec4f(-1,  3, 0, 1), colour = GREEN, uv = (0f0, 2f0)))
+            Lava.set_mesh_triangle!(PRIMOUT, 1, 1, 2, 3)
             return nothing
         end
         d, _ = compile_and_disasm(by_vertex, Tuple{}; stage = :mesh, config = primconfig)
@@ -202,6 +202,6 @@ const GREEN = (0f0, 1f0, 0f0, 1f0)
         # The primitive index array gives every primitive its own vertices, so a
         # strip has nothing to express and mapping it onto a list would silently
         # change what the shader draws.
-        @test_throws ErrorException Lava.mesh_output_mode(KernelInterface.TriangleStrip())
+        @test_throws ErrorException Lava.mesh_output_mode(Lava.TriangleStrip())
     end
 end

@@ -1,24 +1,19 @@
-# Lava - Julia intrinsics for VK_KHR_ray_query.
+# Julia intrinsics for VK_KHR_ray_query.
 #
-# Two layers:
-#   1. Typed wrappers (Ray, Vec3f, etc.) -- what user kernels call.
-#   2. Scalar `llvmcall` stubs -- what the SPIR-V emitter recognizes by name.
-# Multiple dispatch picks the wrapper for `::Ray` and the wrapper destructures
-# into scalars for the stub.
+# Two layers: a method on GeometryBasics' point and vector, which kernels call, and
+# the scalar `llvmcall` stub the SPIR-V emitter recognizes by name.
 
 """
-    lava_ray_query_init(ray::Ray; flags=UInt32(0), mask=UInt32(0xFF))
+    lava_ray_query_init(origin::Point3f, direction::Vec3f, tmin::Float32, tmax::Float32;
+                        flags = UInt32(0), mask = UInt32(0xFF))
 
-Initialize the implicit per-function ray-query variable. Lowers to
-`OpRayQueryInitializeKHR` over the bound TLAS descriptor. `ray` is a
-`Raycore.Ray` (re-exported by Lava).
+Start a ray query against the bound top-level acceleration structure. Lowers to
+`OpRayQueryInitializeKHR` on the function's implicit ray-query variable.
 """
-@inline function lava_ray_query_init(ray::Ray;
+@inline function lava_ray_query_init(o::Point3f, d::Vec3f, tmin::Float32, tmax::Float32;
                                      flags::UInt32 = UInt32(0),
                                      mask::UInt32  = UInt32(0xFF))
-    o = ray.o; d = ray.d
-    lava_ray_query_init(flags, mask, o[1], o[2], o[3], ray.t_min,
-                        d[1], d[2], d[3], ray.t_max)
+    lava_ray_query_init(flags, mask, o[1], o[2], o[3], tmin, d[1], d[2], d[3], tmax)
 end
 
 # Scalar method -- the symbol `lava_ray_query_init` from this `llvmcall` is

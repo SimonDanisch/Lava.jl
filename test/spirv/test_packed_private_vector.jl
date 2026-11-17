@@ -66,7 +66,7 @@ function packed_private_vec2(A)
     for r in 1:10
         @inbounds stage[r] = (VecElement(A[gid + 2r - 1]), VecElement(A[gid + 2r]))
     end
-    ptr = Lava.lava_alloc_shared(Val(:packed_vec2_stage), Float16, Val(64))
+    ptr = Lava.lava_alloc_shared(Float16, Val(64))
     shared = Lava.LavaSharedArray{Float16}(ptr, 64)
     @inbounds v = stage[1 + (gid % 10)]
     @inbounds shared[1 + (gid % 64)] = v[1].value + v[2].value
@@ -86,7 +86,7 @@ function packed_private_vec4(A)
             (VecElement(A[gid + 4r - 3]), VecElement(A[gid + 4r - 2]),
              VecElement(A[gid + 4r - 1]), VecElement(A[gid + 4r]))
     end
-    ptr = Lava.lava_alloc_shared(Val(:packed_vec4_stage), Float16, Val(64))
+    ptr = Lava.lava_alloc_shared(Float16, Val(64))
     shared = Lava.LavaSharedArray{Float16}(ptr, 64)
     @inbounds v = stage[1 + (gid % 10)]
     @inbounds shared[1 + (gid % 64)] = v[1].value + v[4].value

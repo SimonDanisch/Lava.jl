@@ -1,55 +1,40 @@
-# Graphics pipeline configuration types for Lava.jl
-#
-# Pure Julia types — no Vulkan dependency, used for dispatch everywhere.
-# Pipeline state encoded in type parameters for zero-cost dispatch.
+# Tessellation stage configuration. `Topology` and `GeometryConfig` are the
+# vocabulary's (`vocabulary/topology.jl`, `vocabulary/graphics.jl`); blend, cull,
+# depth and render-target state are the runtime's.
 
-# ── Shader stage types: not here any more ──
-#
-# `ShaderStage` and its five tags were this compiler's spelling of "which stage
-# am I compiling", and nothing here dispatched on one — the compiler takes a
-# `stage::Symbol`. Mantle has a `ShaderStage` of its own, the supertype of
-# `VertexShader`/`FragmentShader`/`GeometryShader`, and that one IS dispatched
-# on. Two modules exporting one name that resolves to two different types leaves
-# the bare name unbound in any scope that loads both, which is the trap
-# `test_no_stale_exports.jl` exists for.
-
-# ── Pipeline state: not here any more ──
-#
-# `BlendMode`, `CullFace` and `DepthMode` are Mantle's, in
-# `Mantle/src/graphics/state.jl`. They are fixed-function rasterizer state, and
-# this compiler never dispatched on any of them — the only use outside this file
-# was the `export` line.
-#
-# `Topology` IS dispatched on here, by `geometry_input_vertex_count` and
-# `geometry_input_mode` in `compiler/spirv/graphics.jl`, and a backend dispatches
-# on it too when it creates a pipeline. Two owners means neither, so it is
-# `KernelInterface`'s now, beside `MatrixShape` and `DeviceCaps` — a Metal
-# backend can name `TriangleList` without importing a SPIR-V compiler.
-using KernelInterface: Topology, TriangleList, TriangleStrip, LineList,
-                       LineStrip, PointList, PatchList, LineListAdjacency,
-                       LineStripAdjacency
-# `GeometryConfig` followed `Topology` there, and for the same reason: a compiler
-# reads every field of it to emit the stage's execution modes, and a portable
-# pipeline description has to be able to hold one without depending on a SPIR-V
-# compiler.
-using KernelInterface: GeometryConfig
-
-# ── Tessellation Config ──
-
+"""How a tessellation evaluation stage spaces the generated vertices along an edge."""
 abstract type TessSpacing end
+"""Equal spacing: the tessellation level is rounded up to an integer."""
 struct EqualSpacing          <: TessSpacing end
+"""Fractional spacing with an even number of segments."""
 struct FractionalEvenSpacing <: TessSpacing end
+"""Fractional spacing with an odd number of segments."""
 struct FractionalOddSpacing  <: TessSpacing end
 
+"""The winding order of the triangles a tessellation evaluation stage generates."""
 abstract type TessWinding end
+"""Clockwise winding."""
 struct WindingCW  <: TessWinding end
+"""Counter-clockwise winding."""
 struct WindingCCW <: TessWinding end
 
+"""The domain a tessellation evaluation stage subdivides."""
 abstract type TessDomain end
+"""Triangle domain: `tess_coord_uvw` is barycentric."""
 struct TessTriangles <: TessDomain end
+"""Quad domain: `tess_coord` is a point in the unit square."""
 struct TessQuads     <: TessDomain end
+"""Isoline domain: sets of lines across the unit square."""
 struct TessIsolines  <: TessDomain end
 
+"""
+    TessConfig(; vertices = 3, spacing = EqualSpacing(), winding = WindingCCW(),
+                 domain = TessTriangles())
+
+The execution modes of a tessellation stage pair: `vertices` per input patch and how
+the evaluation stage spaces, winds and parameterizes what it generates. Passed as
+`config` to [`lava_compile`](@ref) for `:tess_control` and `:tess_eval`.
+"""
 struct TessConfig
     patch_vertices::Int
     spacing::TessSpacing
@@ -61,10 +46,3 @@ function TessConfig(; vertices::Integer=3, spacing::TessSpacing=EqualSpacing(),
                       winding::TessWinding=WindingCCW(), domain::TessDomain=TessTriangles())
     TessConfig(vertices, spacing, winding, domain)
 end
-
-# ── Render Target ──
-#
-# `RenderTarget` is Mantle's, in `graphics/state.jl`. It had no use anywhere in
-# this package — what a pipeline renders INTO is the runtime's concern, and the
-# concrete targets (a window's swapchain image, an offscreen framebuffer) are
-# each a backend's.

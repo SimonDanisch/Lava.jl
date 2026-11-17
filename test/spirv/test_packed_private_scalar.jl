@@ -50,7 +50,7 @@ function packed_private_half(A)
     for r in 1:10
         @inbounds stage[r] = A[gid + r]
     end
-    ptr = Lava.lava_alloc_shared(Val(:packed_half_stage), Float16, Val(64))
+    ptr = Lava.lava_alloc_shared(Float16, Val(64))
     shared = Lava.LavaSharedArray{Float16}(ptr, 64)
     @inbounds shared[1 + (gid % 64)] = stage[1 + (gid % 10)]
     Lava.lava_workgroup_barrier()
@@ -70,7 +70,7 @@ function packed_private_float(A)
     for r in 1:10
         @inbounds stage[r] = A[gid + r]
     end
-    ptr = Lava.lava_alloc_shared(Val(:packed_float_stage), Float32, Val(64))
+    ptr = Lava.lava_alloc_shared(Float32, Val(64))
     shared = Lava.LavaSharedArray{Float32}(ptr, 64)
     @inbounds shared[1 + (gid % 64)] = stage[1 + (gid % 10)]
     Lava.lava_workgroup_barrier()

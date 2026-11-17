@@ -115,12 +115,11 @@ always sees the same shape and always emits exactly one `OpAccessChain`.
 # function it documents, and two adjacent string literals make `@doc` try to
 # document the second one.
 #
-# Generalised from a 2-only predicate on 2026-08-12. The width is whatever the
-# `@localmem` element is, and SPIR-V vectors are 2, 3 or 4 components — so 4-wide
-# (64-bit) shared accesses are reachable and 8-wide are not. That matters: the
-# staged GEMM's scalar -> vec2 step is worth **+45% to +54%** per shape on this
-# card, measured against cuBLAS beside it, so the width is on the critical path
-# and the next notch is worth having.
+# The width is whatever the `@localmem` element is, and SPIR-V vectors are 2, 3 or 4
+# components — so 4-wide (64-bit) shared accesses are reachable and 8-wide are not.
+# That matters: the staged GEMM's scalar -> vec2 step is worth **+45% to +54%** per
+# shape on this card, measured against cuBLAS beside it, so the width is on the
+# critical path and the next notch is worth having.
 #
 # (A separate, earlier experiment that widened only the GLOBAL load while leaving
 # `@localmem` as `Float16` lost monotonically — 2-wide 0.80-0.92x, 4-wide
@@ -682,7 +681,6 @@ end
 # bits, so `RowAndColumn` is their union — which `flash_attn_cm2.comp` uses as
 # `gl_CooperativeMatrixReduceRowAndColumnNV`, and which is how `Column = 2` is known
 # without the extension spec to hand.
-import KernelInterface: CoopMatReduce, coopmat_perelement, coopmat_reduce
 
 """
 The combiner the instruction actually names, wrapping the user's `f`.

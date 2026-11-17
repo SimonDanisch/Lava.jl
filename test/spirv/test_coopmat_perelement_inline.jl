@@ -1,6 +1,6 @@
 # Tier 1: a per-element callback compiles INLINABLE.
 #
-# `KernelInterface.coopmat_perelement` lowers to `OpCooperativeMatrixPerElementOpNV`,
+# `Lava.coopmat_perelement` lowers to `OpCooperativeMatrixPerElementOpNV`,
 # which names a function: `coopmat_perelement_thunk`, into which the user's callback
 # must melt. A callback that stays out of line is a separate `OpFunction` with
 # `DontInline` control, the driver honours that and calls it once per element —
@@ -22,7 +22,7 @@ perelement_rowcol(row::UInt32, col::UInt32, e::Float32) = e * Float32(row + 1) +
 @testset "a per-element callback is inlinable, not DontInline" begin
     function peplain(out, inp)
         m = Lava.AcceleratedMatrix{Float32,16,16,Lava.Accumulator}(pointer(inp), 1, 16)
-        copyto!(pointer(out), 1, 16, KernelInterface.coopmat_perelement(perelement_rowcol, m))
+        copyto!(pointer(out), 1, 16, Lava.coopmat_perelement(perelement_rowcol, m))
         return
     end
     d = first(compile_and_disasm(peplain,

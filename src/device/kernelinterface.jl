@@ -6,10 +6,9 @@
 # kernels written against it compile on all of them — that is the whole point,
 # and it is why these names, not Lava's own, are what Lava uses internally.
 #
-# The cooperative-matrix vocabulary is part of KI, not a second package of its
-# own; `Lava.jl` imports those names at the top. `matrix_shapes` below is the
-# backend hook it
-# gained in the move.
+# The device vocabulary KI does not have yet (cooperative matrices, tensors,
+# graphics and mesh stages, `DeviceCaps`) is in `src/vocabulary/`, generic
+# functions every backend overlays; `matrix_shapes` below is its backend hook.
 #
 # ── Conventions this file reconciles ────────────────────────────────────────
 #
@@ -84,13 +83,10 @@ import KernelInterface as KI
 # ── Subgroups ───────────────────────────────────────────────────────────────
 
 # Every method in this section is `@lava_device_override`, in Lava's own method
-# table. They were plain methods on KernelInterface's functions until 2026-09-26,
-# which made them the methods EVERY backend's compiler found wherever it had no
-# override of its own: ROCm compiled `Mantle.gemv!`'s `sub_group_reduce_add` to
-# `_lava_subgroup_reduce_add_f32`, an unknown function in a GCN module, and AMDGPU
-# had grown an override of `shfl` only to keep `_lava_subgroup_shuffle_f32` out.
-# KernelInterface's contract is `@device_override`, and a backend without the
-# capability has a missing method, not Lava's.
+# table. A plain method on a KernelInterface function would be what every other
+# backend's compiler finds where it has no override of its own (ROCm would compile
+# a subgroup reduction to `_lava_subgroup_reduce_add_f32`, an unknown function in a
+# GCN module). A backend without the capability has a missing method, not Lava's.
 #
 # Typed, as KI defines them, and the zero-argument forms kept in `UInt32` beside
 # them: KI's own zero-argument forms answer `Int`, and the kernels here do their
@@ -137,18 +133,18 @@ end
 # backend, which is a host handle — so it is in the host half, and this is the
 # one list both sides derive from.
 
-# `sub_group_reduce_add` is KI's name for the reduce-add, and Lava's
-# `subgroup_add` is the SPIR-V `OpGroupNonUniformFAdd`/`IAdd` behind it.
+# `KI.sub_group_reduce(+, x)` of these types is one SPIR-V
+# `OpGroupNonUniformFAdd`/`IAdd` with a `Reduce` group operation (`subgroup_add`),
+# where KI's fallback is a butterfly of shuffles; KI allows a native `+` to combine in
+# another order. Over the active invocations, which is KI's sub-group in a partial one.
 #
 # Its own type list rather than a reuse of `KI_SHFL_TYPES`, even though the six
 # coincide today: the shuffle family and the reductions are separate SPIR-V
-# capabilities, and a backend can have one without the other — Metal's
-# `simd_sum` has no `Float64` at all. Tying them to one tuple would make that
-# divergence unrepresentable.
+# capabilities, and a backend can have one without the other.
 const KI_REDUCE_ADD_TYPES = (Float32, Float64, Int32, UInt32, Int64, UInt64)
 
 for T in KI_REDUCE_ADD_TYPES
-    @eval @lava_device_override @inline KI.sub_group_reduce_add(val::$T) = subgroup_add(val)
+    @eval @lava_device_override @inline KI.sub_group_reduce(::typeof(+), val::$T) = subgroup_add(val)
 end
 
 # `sub_group_ballot`: the mask of the sub-group's lanes whose `pred` is true, lane
@@ -157,7 +153,7 @@ end
 
 # ── Integer dot product ─────────────────────────────────────────────────────
 #
-# `OpSDotKHR` on two packed words (see `emit_lava_sdot4x8!`). KI's reference
+# `OpSDotKHR` on two packed words (see `emit_lava_sdot4x8!`). The vocabulary's reference
 # definition is four sign extensions and multiply-adds, which RADV does not turn
 # back into `v_dot4`.
 @inline lava_sdot4x8(a::UInt32, b::UInt32) = Base.llvmcall(("""
@@ -170,7 +166,7 @@ end
     """, "entry"), Int32, Tuple{UInt32, UInt32}, a, b)
 push!(KNOWN_INTRINSICS, "_lava_sdot4x8")
 
-@lava_device_override @inline KI.dot4x8(a::UInt32, b::UInt32) = lava_sdot4x8(a, b)
+@lava_device_override @inline dot4x8(a::UInt32, b::UInt32) = lava_sdot4x8(a, b)
 
 # ── Barriers ────────────────────────────────────────────────────────────────
 #
@@ -195,23 +191,11 @@ push!(KNOWN_INTRINSICS, "_lava_sdot4x8")
 
 # ── Workgroup memory ────────────────────────────────────────────────────────
 #
-# One line, and it was blocked on KI's signature rather than on anything about
-# Vulkan. Lava's workgroup memory is an LLVM global in addrspace(3) NAMED
-# `lava_shared_$Id`, so the id is the only thing that makes two buffers two
-# buffers; `KI.localmemory(T, Val(Dims))` had no such parameter, and the only
-# key available was `(T, Dims)`. Two `localmemory(Float32, (16, 16))` calls in
-# one kernel would have been ONE buffer, with the second write landing silently
-# on the first tile, so this method was left missing rather than implemented
-# wrong.
-#
-# `KI.localmemory` takes the id now (KernelInterface `device.jl`), which is
-# where it belongs: every backend keys its global on something, and the ones
-# that were already implemented were keying it on a constant. So this is the
-# same override `KA.SharedMemory` has had all along, spelled portably.
-@lava_device_override @inline function KI.localmemory(::Type{T}, ::Val{Dims},
-                                                      ::Val{Id}) where {T, Dims, Id}
+# Its own memory per call site (`lava_alloc_shared`), which is KI's contract and what
+# `KA.@localmem` lowers to.
+@lava_device_override @inline function KI.localmemory(::Type{T}, ::Val{Dims}) where {T, Dims}
     N = prod(Dims)
-    LavaSharedArray{T, Dims}(lava_alloc_shared(Val(Id), T, Val(N)), N)
+    LavaSharedArray{T, Dims}(lava_alloc_shared(T, Val(N)), N)
 end
 
 # ── Printing ────────────────────────────────────────────────────────────────

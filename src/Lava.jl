@@ -1,84 +1,33 @@
 module Lava
 
-# ── what a Julia→SPIR-V compiler exposes ─────────────────────────────────────
-#
-# 115 names left this list on 2026-08-27 when the runtime moved to Mantle:
-# `LavaArray`, `LavaBackend`, `BatchQueue`, every graphics pipeline and texture
-# type, all of ray tracing, `fft`/`gemv`, `vk_reset_device!`. They are Mantle's
-# exports now. What is left is the compiler, the code a kernel is compiled
-# against, and the vocabulary both sides name.
-#
-# `CoopMat`, `Scalar` and `matriximpl` went too, and are not in Mantle either:
-# they were exported here and defined nowhere, left over from an earlier
-# refactor. Checking which of 208 exports still resolved is what surfaced them.
+# A Julia to SPIR-V compiler for Vulkan. Devices, memory, launches and pipelines
+# are Mantle's; its Vulkan backend calls into this module to compile.
 
-# The device-side array — a `(pointer, dims)` pair, which is what a kernel gets.
-# The host-side `LavaArray` that fills one in is Mantle's.
+# The device-side array: a `(pointer, dims)` pair, which is what a kernel receives.
 export LavaDeviceArray
 
 # Compilation.
 export CompilationResult, lava_compile, LavaGfxShader
 
-# `export dump_state, gpu_memory_usage` was here, and both went to Mantle with
-# the runtime — they read a `VkContext`. Exporting a name this module does not
-# define is legal and silent, and worse than useless: `using Lava` then brings an
-# undefined binding into scope which SHADOWS Mantle's real export, so
-# `gpu_memory_usage()` in a file that had loaded both was an UndefVarError with
-# no indication that the working definition was one `using` away. Pinned by
-# `test_no_stale_exports.jl`.
-
-# `@setup_workload` is PrecompileTools', re-exported. `@compile_workload` is NOT
-# here: the version-taking one freezes kernels into the on-disk cache, which
-# needs a device to compile them for, so it is Mantle's, in
-# `runtime/workload.jl`. Exporting a macro this package does not define is how a
-# name stays dead and reachable.
+# PrecompileTools' macro, for packages that precompile kernels through Lava.
 export @setup_workload
 
-# Cooperative matrices: the TYPE a kernel is compiled against, and the operand
-# positions. `MatrixUse`/`MatrixScope`/`MatrixShape`/`DeviceCaps` come from
-# `KernelInterface` and are re-exported so a kernel library needs one import.
-# `AcceleratedMatrix`, `WorkgroupMatrix` and `CoopMatrix` are NOT exported here.
-# They are `KernelInterface`'s, and Mantle — the user-facing, cross-platform API
-# — is what re-exports them. This package is a Julia→SPIR-V compiler: it
-# implements the eleven `coopmat_*` operations on them and uses the type
-# internally, which needs no export.
-#
-# `MatrixA`/`MatrixB`/`Accumulator` stay: they are the operand-position tags a
-# shader author writes directly when instantiating a tile against this compiler.
+# Operand positions of a cooperative matrix, written directly when a tile is
+# instantiated. The matrix types themselves are re-exported by Mantle.
 export MatrixA, MatrixB, Accumulator
 
-# Re-export Raycore.Ray so `using Lava` users get Ray without ambiguity
-export Ray
-
-# Graphics: the configuration types a pipeline is described with, and the
-# shader-stage intrinsics. Pure Julia — `graphics/types.jl` has no Vulkan in it,
-# which is why it stayed when the pipeline that consumes it left.
-# `BlendMode`, `CullFace`, `DepthMode` and `RenderTarget` are NOT here: they are
-# fixed-function pipeline state, which this compiler never dispatches on, so
-# they are Mantle's.
-#
-# `Topology` stays exported, but it is re-exported rather than defined —
-# `KernelInterface` owns it, because the geometry stage's execution mode is
-# emitted from it HERE and a pipeline is created from it in every backend. A
-# name re-exported from a common source is exactly the case
-# `test_no_stale_exports.jl` allows, alongside `MatrixA` and `DeviceCaps`.
+# Stage configuration: topologies, geometry and tessellation settings.
 export Topology, TriangleList, TriangleStrip, LineList, LineStrip, PointList, PatchList
 export LineListAdjacency, LineStripAdjacency
 export GeometryConfig, TessConfig
 export TessSpacing, EqualSpacing, FractionalEvenSpacing, FractionalOddSpacing
 export TessWinding, WindingCW, WindingCCW
 export TessDomain, TessTriangles, TessQuads, TessIsolines
-# The shader builtins a person WRITES — `vertex_index`, `instance_index`, the
-# `frag_coord` family, `dFdx`/`dFdy`, `set_point_size!`, `sample_texture_2d`,
-# `emit_vertex!`/`end_primitive!`/`primitive_id_in` — are KernelInterface's and
-# are not exported here. This package OVERRIDES them for its target
-# (`device/gfx_intrinsics.jl`); exporting them again is what left the bare name
-# ambiguous under `using Mantle, Lava`, so every shader that wrote
-# `vertex_index()` in such a scope inferred `Any` and failed to compile.
-#
-# What is exported is the lowering language nobody types by hand: stage I/O by
-# location, the geometry-stage arrayed inputs, the tessellation levels. The
-# Vulkan backend's stage wrappers are the only caller.
+
+# The stage lowering: interface variables by location, geometry-stage inputs,
+# tessellation levels and the stage wrappers. The builtins a shader author writes
+# (`vertex_index`, `frag_coord`, `discard`, ...) are the vocabulary's and are
+# exported by Mantle, so `using Mantle, Lava` binds each name once.
 export front_facing
 export set_position!
 export gfx_output, gfx_input, gfx_output_flat, gfx_input_flat
@@ -88,48 +37,22 @@ export tess_coord, tess_coord_uvw, set_tess_level_outer!, set_tess_level_inner!
 export GfxTexture2D
 export VertexWrapper, FragmentWrapper, GeometryWrapper
 
-# Device capability vocabulary, not exported — a kernel library reaches these as
-# `Lava.caps(backend)`. `caps` is the one to reach for: a kernel deciding a
-# tiling wants several of these and they must all describe the same device.
-# `DeviceCaps` and `caps` are `KernelInterface`'s; the METHOD that fills one in
-# from a `VkContext` is Mantle's.
-public caps, DeviceCaps
-
 import Serialization
 using Base.ScopedValues: ScopedValue, with
 import PrecompileTools
 using PrecompileTools: @setup_workload
-# `import`, and the ONLY line in this package that names Vulkan.
-#
-# The 2026-08-27 split moved the Vulkan RUNTIME out — GLFW, GPUArraysCore and
-# LinearAlgebra left with it, because windows, host array machinery and `mul!`
-# are the runtime's, and the runtime is `Mantle/src/vulkan/` now. It also dropped
-# the dependency, which was a step too far: `Mantle`'s backend is an extension
-# triggered on `["Lava", "Vulkan"]`, and Lava is the only one of that pair anyone
-# downstream names. Hikari, RayMakie and Mantle's own test suite all loaded Lava,
-# got no extension, and reported "no GPU backend is available" on a machine with
-# a working driver.
-#
-# So the driver is loaded and nothing here uses it: `test_compiler_runtime_split.jl`
-# still asserts, file by file, that no source names `VkContext`, `vk_context` or
-# `VK_CONTEXT_REF`, and that `Vulkan` itself appears in no file but this one.
+
+# The device vocabulary: functions and types every backend implements by overlay.
+# Outside the gate below, so it loads on a machine without a Vulkan loader.
+import KernelInterface as KI
+include("vocabulary/vocabulary.jl")
+
 import Vulkan
 
-# ── Everything below is gated on Vulkan having bindings to compile against ───
-#
-# A Julia→SPIR-V compiler for a driver that is not here can do nothing, and
-# `Mantle` — the only thing downstream that loads it — imports it only under
-# `@static if !Sys.isapple()`. Compiling it anyway is what made every Mac in
-# this tree pay for a Vulkan backend it never uses, and latterly what made it
-# FAIL: the body below is written against a `KernelInterface.NativeEmitter{Out,
-# Flats}` that this KernelAbstractions checkout does not have.
-#
-# The inner text is unchanged, so with a loader present this is the module it
-# always was.
+# The compiler, built only where a Vulkan loader exists.
 @static if Vulkan.HAS_LOADER
 
 using GPUCompiler
-using Raycore: Ray
 using LLVM
 using LLVM: API
 using GPUArrays
@@ -139,50 +62,23 @@ using Atomix
 using SPIRV_Tools_jll
 using StaticArrays
 using GeometryBasics
-# The device vocabulary, shared with Mantle. It lives in `KernelInterface`
-# alongside the rest of the backend contract; names are listed one by one because
-# that module exports nothing on purpose.
-#
-# `DeviceCaps` and the matrix types were each written twice, here and in Mantle,
-# and bridged by a POSITIONAL copy — both definitions carried a comment warning
-# that a field inserted anywhere but the end would misalign it silently. Both
-# copies are deleted: there is one type, and Mantle's `caps(ctx::VkContext)` is
-# the method that fills it in.
-# The module itself, not only names from it: `device/gfx_intrinsics.jl` writes
-# `@lava_device_override KernelInterface.<name>`,
-# which needs the module binding. A bare `using KernelInterface: a, b` brings in
-# the names and NOT the module.
+# The module binding itself: the device files add methods to `KernelInterface.<name>`.
 import KernelInterface
-using KernelInterface: MatrixUse, MatrixA, MatrixB, Accumulator,
-                       MatrixScope, SubgroupScope, WorkgroupScope, MatrixShape,
-                       DeviceCaps
-# `import`, not `using ... :` — `device/acceleratedmatrix.jl` and the emitter
-# read these. The METHODS that fill a `DeviceCaps` in from a device are Mantle's;
-# what is here is the vocabulary a kernel is compiled against.
-import KernelInterface: supports, bestshape, caps
 
-# ---- Graphics types (pure Julia, no Vulkan dependency) ----
-include("graphics/types.jl")
+include("graphics/types.jl")                # stage configuration types
+include("runtime/errors.jl")                # LavaCompilationError and its report
 
-# ---- Error infrastructure ----
-include("runtime/errors.jl")
-
-# ---- SPIR-V module builder ----
+# SPIR-V module builder and emitter.
 include("compiler/spirv/module.jl")
 include("compiler/spirv/content_hash.jl")   # a module's identity: every byte
-# What the bound device lets a module declare. The runtime pushes it; the
-# emitter reads it, and so names no Vulkan type.
-include("compiler/target_features.jl")
-
-# ---- SPIR-V emitter stages ----
+include("compiler/target_features.jl")      # what the bound device lets a module declare
 include("compiler/spirv/types.jl")
 include("compiler/spirv/emit.jl")
-include("compiler/spirv/foldedoffset.jl")   # keeps negative constants off loads RADV splits
+include("compiler/spirv/foldedoffset.jl")   # keeps negative constant offsets off loads
 
-# ---- Compiler phase timing ----
 include("compiler/phase_timer.jl")
 
-# ---- LLVM passes ----
+# LLVM passes run ahead of the emitter.
 include("compiler/passes/lift_geps.jl")
 include("compiler/passes/retype_allocas.jl")
 include("compiler/passes/cfg_utils.jl")
@@ -193,133 +89,56 @@ include("compiler/passes/lower_intrinsics.jl")
 include("compiler/passes/exact_narrowing.jl")
 include("compiler/passes/wide_division.jl")
 include("compiler/passes/odd_integers.jl")
-# shared_memory.jl — consolidated into prepare_vulkan.jl
 
-# ---- Compiler (depends on emitter + passes) ----
+# The GPUCompiler target, the entry wrapper and the compilation pipeline.
 include("compiler/target.jl")
 include("compiler/entry_wrapper.jl")
 include("compiler/passes/readonly_loads.jl")  # loads of read-only arguments, by provenance
 include("compiler/compilation.jl")
-# Compiled kernels and stages, kept with their `CodeInstance`s: the lookups in
-# front of `compilation.jl`'s compilers, and what a package image persists.
+# Compiled kernels and stages, kept with their `CodeInstance`s.
 include("compiler/cache.jl")
 include("compiler/optimization_cache.jl")
 include("compiler/inference_cache.jl")
 include("compiler/function_cache.jl")
-# Planned files consolidated into emit.jl (4431 lines) and compilation.jl:
-#   sourcemap.jl, intrinsics.jl, control_flow.jl, decorations.jl, compute.jl
-include("compiler/spirv/rayquery.jl")     # VK_KHR_ray_query capabilities + emission
-include("compiler/spirv/coopmat.jl")      # SPV_KHR_cooperative_matrix emission
-include("compiler/spirv/graphics.jl")     # Graphics stages, I/O variables, emit_vertex
+include("compiler/spirv/rayquery.jl")       # VK_KHR_ray_query
+include("compiler/spirv/coopmat.jl")        # cooperative matrices
+include("compiler/spirv/graphics.jl")       # graphics stages and their interface variables
 
-# ---- Device functions ----
-# device/array.jl — LavaDeviceArray defined in array/lavaarray.jl
+# Device functions.
 include("device/math.jl")
-include("device/math_f64.jl")  # Float64 exp/log/asin/acos/atan in Float64
+include("device/math_f64.jl")
 include("device/quirks.jl")
-include("device/ray_query_intrinsics.jl")  # lava_ray_query_init
-include("device/gfx_intrinsics.jl")  # Graphics builtins + shader I/O intrinsics
-include("device/printf.jl")          # @lava_printf → NonSemantic.DebugPrintf
-# atomics.jl is included after lavaarray.jl (needs LavaDeviceArray)
-
-# ---- Vulkan runtime ----
-# Types before the context that names them. `VkContext` holds its per-device
-# state in concrete fields, so every struct in those fields has to exist first —
-# and only the `struct` blocks moved, because include order constrains types and
-# not methods.
-# The driver's cooperative-matrix table, read by `caps(ctx)` to fill
-# `DeviceCaps.shapes`. AFTER device.jl, which is where `VkContext` is defined —
-# these are type ANNOTATIONS, evaluated at load, while `caps` calling
-# `matrixshapes` resolves at call time and so does not constrain the order.
+include("device/ray_query_intrinsics.jl")
+include("device/gfx_intrinsics.jl")         # graphics builtins and stage I/O
+include("device/printf.jl")                 # @lava_printf through NonSemantic.DebugPrintf
 include("runtime/intrinsics.jl")
+include("device/devicearray.jl")            # LavaDeviceArray
+include("device/constarray.jl")             # Const: a LavaDeviceArray the kernel only reads
+include("device/atomics.jl")
+include("device/subgroup.jl")
+include("device/kernelinterface.jl")        # KernelInterface's device half
+include("device/ndrange.jl")                # KernelAbstractions' index and barrier lowering
+include("device/coopmat_intrinsics.jl")     # the vocabulary's matrices on OpCooperativeMatrix*
+include("device/sharedmemory.jl")           # workgroup memory
+include("device/tensor_intrinsics.jl")      # coopmat2 tensor layouts
 
-# ---- Array interface (before launch.jl because it references LavaArray) ----
-include("device/devicearray.jl")  # LavaDeviceArray: what a kernel receives
-include("device/constarray.jl")   # Const: a LavaDeviceArray nothing writes during the kernel
-include("device/atomics.jl")  # needs LavaDeviceArray from devicearray.jl
-include("device/subgroup.jl") # subgroup / group-non-uniform intrinsics
-# KI's DEVICE half: index queries, barriers, shuffles, printing. It needs the
-# intrinsics above and nothing else — no queue, no pool, no context. The HOST
-# half is `array/kernelinterface_host.jl`, further down with the runtime it
-# depends on, and the two are split along exactly that line.
-include("device/kernelinterface.jl")
-# KA's device half, the counterpart of the above: how `@index` recovers a global
-# index from the dispatch builtins, plus `@synchronize` and `@private`. After
-# `device/subgroup.jl` for the builtins and after `devicearray.jl` because
-# `__index_Global_Linear` indexes a `LinearIndices` over the ndrange.
-include("device/ndrange.jl")
-include("device/acceleratedmatrix.jl")     # AcceleratedMatrix: the user-facing type
-include("device/coopmat_intrinsics.jl")    # its llvmcall stubs
-# `@localmem`: addrspace(3) globals and `LavaSharedArray`. AFTER the two above,
-# because it also carries the `CoopMatrix` constructors that load a matrix
-# straight out of a shared tile — the type has to exist first.
-include("device/sharedmemory.jl")
-include("device/tensor_intrinsics.jl")     # SPV_NV_tensor_addressing layouts
-
-# LAST. The frozen WORLD (not the frozen cache): `invoke_frozen`, which runs the
-# compilation pipeline in the world captured at `__init__` so a later-loaded
-# package cannot invalidate its precompiled native code — and the workload that
-# puts that code in the package image.
-#
-# Last because the workload COMPILES A KERNEL at precompile time, so it needs
-# `LavaDeviceArray` and the intrinsics that kernel calls to already exist. That
-# is a load-order constraint, not tidiness: it fails with an `UndefVarError`
-# anywhere earlier.
+# Last: the precompile workload in it compiles a kernel, which needs everything above.
 include("compiler/frozen_world.jl")
 
-# ---- Launch API (depends on LavaArray / LavaDeviceArray) ----
-# runtime/sync.jl — sync handled via vk_flush!() in launch.jl
-
-# ---- KernelAbstractions backend ----
-# KI's HOST half: `synchronize`, `allocate`, the device queries and the launch.
-# After ka_backend.jl because it needs `LavaBackend`, `caps`, `ka_launch!` and
-# `vk_context(::LavaBackend)`.
-
-# ---- Debug / validation API (needs LavaArray + KA backend) ----
-
-# ---- Hardware video decode ----
-#
-# `decode_h264_gpu`, `decode_h264_nv12` and `decode_h264_luma` moved to
-# `Mantle/src/vulkan/runtime/videoapi.jl` on 2026-08-27. Each one supplies
-# `vk_context()` so its caller does not have to hold one, which is precisely the
-# thing a compiler cannot do.
-# ---- Runtime diagnostics ----
-#
-# `gpu_memory_usage`, `dump_state`, `verify_gpu_av` and the rest moved to
-# `Mantle/src/vulkan/runtime/diagnostics.jl` on 2026-08-27, with
-# `GPUArraysCore.allowscalar(false)`. Every one read a `VkContext`.
-
-
 function __init__()
-    # Device state lives in `ctx.diag` fields, built fresh with the context, so
-    # a device crash during precompilation leaves nothing in the image. The one
-    # module-level counter is the compile statistics, whose image value is
-    # whatever the precompile workload counted.
     reset_compile_stats!()
 
-    # Capture BEFORE any other package loads. The precompile workload above put
-    # the pipeline's native code in THIS package image; a later-loaded package
-    # defining methods can invalidate it, and then the first compile re-JITs the
-    # compiler. Freezing here keeps that precompiled code live.
+    # Compile in the world of this point, before later-loaded packages can
+    # invalidate the compiler's precompiled native code.
     _initialization_world[] = Base.get_world_counter()
 
-    # Every LLVM target, registered here, on one thread, before the first compile.
-    # GPUCompiler registers them in its first `emit_llvm` behind a plain flag (its
-    # `@locked` is a no-op from Julia 1.12 on), and LLVM's target registry is a linked
-    # list it prepends to: two threads' first compiles both prepended the SPIR-V
-    # target, it became its own successor, and every target lookup after that, Julia's
-    # own JIT included, looped forever. A target already registered is left alone.
+    # Register every LLVM target on one thread before the first compile: two
+    # threads registering concurrently corrupt LLVM's target registry list.
     LLVM.InitializeAllTargets()
     LLVM.InitializeAllTargetInfos()
     LLVM.InitializeAllAsmPrinters()
     LLVM.InitializeAllAsmParsers()
     LLVM.InitializeAllTargetMCs()
-
-    # No `init_pipeline_thread!` and no `atexit` hook here any more. Both were
-    # about a live device — a background thread that builds pipelines, and
-    # marking the device lost before Julia's finalizer sweep so a finalizer
-    # cannot call into a torn-down driver. A compiler has no device to lose, so
-    # they moved with `runtime/device.jl` and run from Mantle's `__init__`.
 end
 
 end # @static if Vulkan.HAS_LOADER

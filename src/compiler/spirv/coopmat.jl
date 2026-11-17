@@ -11,14 +11,14 @@
 # built from literal constants -- component type, rows, columns, use -- and none
 # of those can be a runtime operand.
 
-"""`Use` operand of OpTypeCooperativeMatrixKHR."""
+# `Use` operand of OpTypeCooperativeMatrixKHR.
 module CoopMatUse
 const MatrixA           = UInt32(0)
 const MatrixB           = UInt32(1)
 const MatrixAccumulator = UInt32(2)
 end
 
-"""`MemoryLayout` operand of OpCooperativeMatrix{Load,Store}KHR."""
+# `MemoryLayout` operand of OpCooperativeMatrix{Load,Store}KHR.
 module CoopMatLayout
 const RowMajor    = UInt32(0)
 const ColumnMajor = UInt32(1)
@@ -42,7 +42,6 @@ const COOPMAT_SCOPE_SUBGROUP  = UInt32(3)
 # which is what makes an unpadded extent legal — i.e. what would retire
 # `gemm_padn`, the `GEMM_BLOCK` pad on M and `padtile`/`crsextent` on K.
 # KernelInterface's, so a kernel names them without naming this compiler.
-import KernelInterface: TENSOR_CLAMP_UNDEFINED, TENSOR_CLAMP_CONSTANT, TENSOR_CLAMP_TO_EDGE
 
 """
     parse_coopmat_name(fn_name) -> (op, T, M, N, use, rowmajor, scope) | nothing

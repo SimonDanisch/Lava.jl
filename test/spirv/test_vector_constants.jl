@@ -41,7 +41,7 @@ end
     ret <4 x half> %r""", _VC_H4, Tuple{_VC_H4}, x)
 
 function vc_store_bitcast!(dst, src)
-    sh = KernelInterface.localmemory(_VC_H4, Val((64,)), Val(1))
+    sh = KernelInterface.localmemory(_VC_H4, Val((64,)))
     t = Int(KernelInterface.get_local_id().x)
     x = Core.Intrinsics.pointerref(reinterpret(Ptr{_VC_U4}, pointer(src)), t, 16)
     @inbounds sh[t] = _vc_lo(x)

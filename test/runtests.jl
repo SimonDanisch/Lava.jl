@@ -22,7 +22,7 @@
 using Test
 using Lava
 # The portable shader vocabulary is KernelInterface's: the stage tests name
-# `KernelInterface.vertex_index`, not `Lava.vertex_index`.
+# `Lava.vertex_index`, not `Lava.vertex_index`.
 import KernelInterface
 
 # "No Vulkan driver" means no GPU, not no loader. `src/Lava.jl` builds the
