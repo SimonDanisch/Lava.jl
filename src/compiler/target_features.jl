@@ -1,0 +1,40 @@
+# What the target device lets a SPIR-V module declare.
+#
+# The emitter has to know a few things about the hardware it is emitting for,
+# because a capability declared on a device that lacks it is a validation error
+# rather than a slow path. A process-global record pushed by the runtime when it
+# binds a device answers for the BOUND device and not for the one a kernel is
+# being compiled for: a shader compiled for a second device while an NVIDIA card
+# was bound declared an NVIDIA-only capability on hardware without it, and the
+# frozen SPIR-V it produced was served to any device afterwards, because the key
+# knew nothing about features either.
+#
+# So there is no global. The record is a field of `LavaCompilerParams`: part of
+# the compile job, part of every cache key derived from the job, and filled by
+# the runtime from the context it is compiling for. An emitter test with no
+# device passes `TargetFeatures()`, which is the module that is valid everywhere.
+#
+# NOT `DeviceCaps`. That is `KernelInterface`'s and is deliberately portable:
+# subgroups, workgroups, matrix shapes, things every GPU reports. These are
+# Vulkan extensions that gate SPIR-V emission, so they are Lava's.
+
+"""
+    TargetFeatures(; ray_query = false)
+
+Vulkan extensions the emitter may declare capabilities for.
+
+    ray_query   VK_KHR_ray_query: `OpRayQueryInitializeKHR` and friends, for
+                tracing from an ordinary shader.
+
+Defaults to `false`: an emitter test with no device running gets the
+conservative module, which is the one that is valid everywhere. A compile for a
+device passes the device's record through `lava_compiler_config(; features)` or
+the `features` keyword of `lava_compile_gpu`; the Vulkan runtime keeps it on the
+context as `ctx.features`.
+"""
+Base.@kwdef struct TargetFeatures
+    ray_query::Bool = false
+end
+
+# Content-hashed, so a frozen key that mixes it in is the same across sessions.
+Base.hash(f::TargetFeatures, h::UInt) = hash(f.ray_query, hash(:TargetFeatures, h))

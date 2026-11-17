@@ -1,0 +1,43 @@
+// Source of truth for WORKGROUP-SCOPE cooperative matrices, the third coopmat2
+// capability the flash port needs. Not run — COMPILED, and its binary read for
+// what a workgroup-scope module must contain, the same way the tensor opcodes
+// next door were obtained.
+//
+// The question it answers: at `gl_ScopeWorkgroup` a single matrix spans all 256
+// invocations instead of one subgroup, so a `32 x 64` accumulator costs 8
+// registers a lane rather than 64. That is the whole reason `flash_attn_cm2.comp`
+// can hold `O`, `L` and `M` at once where our subgroup-scope kernel cannot.
+//
+// Build (what `test_workgroup_scope_opcodes.jl` does):
+//   glslangValidator -V --target-env vulkan1.3 -S comp workgroup_scope_coopmat.comp -o /tmp/x.spv
+//
+// Shapes follow this device's flexible-dimensions table at 256 invocations:
+// M granularity 32, N granularity 32, K granularity 16 for fp16 x fp16 -> fp32.
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_NV_cooperative_matrix2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer A { float16_t a[]; };
+layout(binding = 1) buffer B { float16_t b[]; };
+layout(binding = 2) buffer O { float o[]; };
+
+void main() {
+    tensorLayoutNV<2, gl_CooperativeMatrixClampModeConstantNV> tl =
+        createTensorLayoutNV(2, gl_CooperativeMatrixClampModeConstantNV);
+    tl = setTensorLayoutDimensionNV(tl, 64, 64);
+
+    coopmat<float16_t, gl_ScopeWorkgroup, 32, 16, gl_MatrixUseA> ma;
+    coopmat<float16_t, gl_ScopeWorkgroup, 16, 32, gl_MatrixUseB> mb;
+    coopmat<float, gl_ScopeWorkgroup, 32, 32, gl_MatrixUseAccumulator> mc =
+        coopmat<float, gl_ScopeWorkgroup, 32, 32, gl_MatrixUseAccumulator>(0.0);
+
+    coopMatLoadTensorNV(ma, a, 0, sliceTensorLayoutNV(tl, 0, 32, 0, 16));
+    coopMatLoadTensorNV(mb, b, 0, sliceTensorLayoutNV(tl, 0, 16, 0, 32));
+
+    mc = coopMatMulAdd(ma, mb, mc);
+
+    o[gl_LocalInvocationIndex] = float(mc[0]);
+}

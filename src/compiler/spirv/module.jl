@@ -64,6 +64,11 @@ module Op
     const OpUConvert                = UInt16(113)
     const OpSConvert                = UInt16(114)
     const OpFConvert                = UInt16(115)
+    # Use-CHANGING cooperative-matrix conversion (`SPV_NV_cooperative_matrix2`).
+    # `OpFConvert` is only legal between matrix types agreeing on scope, rows,
+    # cols AND use; turning an fp32 Accumulator into an fp16 MatrixA — which is
+    # what `flash_attn_cm2.comp` does twice, for `Qf16` and `P_A` — is this one.
+    const OpCooperativeMatrixConvertNV = UInt16(5293)
     const OpBitcast                 = UInt16(124)
     const OpSNegate                 = UInt16(126)
     const OpFNegate                 = UInt16(127)
@@ -130,6 +135,10 @@ module Op
     const OpDPdx                    = UInt16(207)
     const OpDPdy                    = UInt16(208)
     const OpFwidth                  = UInt16(209)
+    # Not a block terminator, unlike `OpKill`: the invocation carries on and its
+    # stores are thrown away. That is what lets a `discard` sit in the middle of
+    # inlined straight-line code without the CFG having to end there.
+    const OpDemoteToHelperInvocation = UInt16(5380)
     const OpControlBarrier          = UInt16(224)
     const OpMemoryBarrier           = UInt16(225)
     const OpAtomicLoad              = UInt16(227)
@@ -186,6 +195,7 @@ module Op
     const OpConvertUToPtr           = UInt16(120)
     const OpCompositeExtract        = UInt16(81)
     const OpVectorExtractDynamic    = UInt16(77)
+    const OpVectorShuffle           = UInt16(79)
     const OpCompositeConstruct      = UInt16(80)
     # `emit.jl` has always *used* `Op.OpCompositeInsert` — it was simply never
     # declared here, so every kernel that reached that path died with
@@ -202,6 +212,25 @@ module Op
     const OpReportIntersectionKHR   = UInt16(5334)
     const OpTypeAccelerationStructureKHR = UInt16(5341)
     const OpConstantNull            = UInt16(46)
+    # `OpUndef` where `OpConstantNull` is illegal. An opaque handle type such as
+    # `OpTypeTensorLayoutNV` has no null value — spirv-val says so directly,
+    # "OpConstantNull Result Type cannot have a null value" — so a phi edge on
+    # which a layout is dead needs an undef rather than a null.
+    #
+    # **1, not 52.** 52 is `OpSpecConstantOp`, and using it produced "End of
+    # input reached while decoding OpSpecConstantOp: expected more operands"
+    # — a decoder error nowhere near the mistake. Read out of a module that
+    # `spirv-as` assembled from text containing an `OpUndef`, which is the same
+    # method the tensor opcodes above use and the reason they were right first
+    # time. This one was guessed and was not.
+    const OpUndef                   = UInt16(1)
+    # Bool constants are their own opcodes, not `OpConstant` with a 0/1 operand.
+    # Needed by `OpTypeTensorViewNV`, whose `HasDimensions` parameter is a Bool
+    # constant <id>. Observed, not assumed: a shader declaring both a
+    # `tensorViewNV<2, true, …>` and a `<2, false, …>` emits 41 and 42 — and two
+    # DISTINCT view types, which is why `HasDimensions` is part of the type key.
+    const OpConstantTrue            = UInt16(41)
+    const OpConstantFalse           = UInt16(42)
     # Image/sampler instructions
     const OpTypeImage               = UInt16(25)
     const OpTypeSampler             = UInt16(26)
@@ -211,6 +240,11 @@ module Op
     # Geometry shader
     const OpEmitVertex              = UInt16(218)
     const OpEndPrimitive            = UInt16(219)
+    # SPV_KHR_integer_dot_product: the dot product of two vectors of integers,
+    # here always two 32-bit words of four packed bytes (PackedVectorFormat4x8Bit).
+    const OpSDotKHR                                       = UInt16(4450)
+    const OpUDotKHR                                       = UInt16(4451)
+    const OpSUDotKHR                                      = UInt16(4452)
     # SPV_KHR_cooperative_matrix — subgroup-scope matrix multiply-accumulate.
     # The matrix is an opaque type whose value is distributed across the lanes of
     # a subgroup; only these ops may produce or consume one.
@@ -226,6 +260,75 @@ module Op
     # `coopMatReduceNV`, not from a remembered table.
     const OpCooperativeMatrixReduceNV                     = UInt16(5366)
     const OpCooperativeMatrixPerElementOpNV               = UInt16(5369)
+    # Tensor addressing — the operand-staging half of coopmat2, and it is TWO
+    # extensions, not one. The layout/view types and everything that builds them
+    # come from `SPV_NV_tensor_addressing` (capability `TensorAddressingNV`);
+    # only the load itself is `SPV_NV_cooperative_matrix2` (capability
+    # `CooperativeMatrixTensorAddressingNV`). Requiring just the latter produces a
+    # module the driver rejects.
+    #
+    #   %l  = OpCreateTensorLayoutNV                       (no operands)
+    #   %l' = OpTensorLayoutSetDimensionNV %l %d0 %d1 …
+    #   %s  = OpTensorLayoutSliceNV %l' %off0 %sz0 %off1 %sz1 …   (offset/size PAIRS)
+    #   %v  = OpCreateTensorViewNV                         (no operands)
+    #   %m  = OpCooperativeMatrixLoadTensorNV %ptr %object %s <memop> <tensorop>
+    #
+    # Three things the operand list does not advertise, all read off the binary:
+    #
+    #  * the TYPES take constant <id>s, not literals. `OpTypeTensorLayoutNV` is
+    #    `%Dim %ClampMode` and `OpTypeTensorViewNV` is
+    #    `%Dim %HasDimensions %p0 %p1 …`, every one of them an `OpConstant`.
+    #  * `%object` on the load is **the matrix's existing value**, not a
+    #    destination pointer — glslang emits an `OpLoad` of the target matrix and
+    #    passes it in. It is what out-of-range elements keep, which is the whole
+    #    point under a clamping layout; pass an `OpUndef` only where every element
+    #    is known in range.
+    #  * `%ptr` is an ordinary pointer (glslang emits `OpAccessChain`), so the
+    #    GLSL element offset is folded into the pointer rather than passed on.
+    #
+    # Numbers read out of a SPIR-V binary that glslang produced for
+    # `test/glsl/tensor_addressing_opcodes.comp`, matched to the disassembly by
+    # result id — same method as the two above, not a remembered table.
+    # `test/test_tensor_opcodes.jl` re-derives them from that shader and fails if
+    # any constant here disagrees.
+    const OpTypeTensorLayoutNV                            = UInt16(5370)
+    const OpTypeTensorViewNV                              = UInt16(5371)
+    const OpCreateTensorLayoutNV                          = UInt16(5372)
+    const OpTensorLayoutSetDimensionNV                    = UInt16(5373)
+    # The STRIDE between successive indices of each dimension, in elements. Without
+    # it a layout describes a PACKED tensor, and attention's operands are not: `q`,
+    # `k` and `v` arrive as a permuted view of one packed `(E, L, H, B)` block, so
+    # the extent alone does not say where the next row is. `mul_mm_cm2.comp` and
+    # `flash_attn_cm2.comp` both set it on every layout they build.
+    const OpTensorLayoutSetStrideNV                       = UInt16(5374)
+    const OpTensorLayoutSliceNV                           = UInt16(5375)
+    # What a `TENSOR_CLAMP_CONSTANT` load substitutes OUT OF RANGE. The default
+    # is zero, and zero is not always the useful identity: filling `V`'s padding
+    # columns with ONE makes a row sum fall out of the `P x V` product's padding
+    # columns, which is a per-key-block row reduction removed rather than made
+    # cheaper. The operand is a single 32-bit <id> whatever the component type.
+    const OpTensorLayoutSetClampValueNV                   = UInt16(5376)
+    const OpCreateTensorViewNV                            = UInt16(5377)
+    const OpCooperativeMatrixLoadTensorNV                 = UInt16(5367)
+    # `TensorAddressingOperands` — the mask that trails a tensor load. Read off
+    # `/usr/include/glslang/SPIRV/spirv.hpp11` (`TensorAddressingOperandsMask`)
+    # rather than guessed: a wrong bit here does not fail to compile, it loads
+    # the wrong elements and still returns finite numbers.
+    const TENSOR_ADDR_NONE                                = UInt32(0x0)
+    const TENSOR_ADDR_TENSORVIEW                          = UInt32(0x1)
+    const TENSOR_ADDR_DECODEFUNC                          = UInt32(0x2)
+    # The STORE, which is what makes a ragged OUTPUT legal — the clamping layout
+    # bounds-checks writes exactly as it bounds-checks reads, so an edge tile
+    # writes only its in-range elements instead of running off the end. Read off
+    # a glslang binary for `coopMatStoreTensorNV`, not guessed from the load:
+    #
+    #   OpCooperativeMatrixStoreTensorNV %ptr %object %layout <memop> <tensorop>
+    #
+    # NO result type and NO result id — it is a store — so it is the load's
+    # operand list minus its first two words. `%object` here IS the matrix being
+    # written, the same operand position that on the load carries the value
+    # out-of-range elements keep.
+    const OpCooperativeMatrixStoreTensorNV                = UInt16(5368)
     # VK_KHR_ray_query opcodes (SPV_KHR_ray_query)
     const OpTypeRayQueryKHR                               = UInt16(4472)
     const OpRayQueryInitializeKHR                         = UInt16(4473)
@@ -238,54 +341,27 @@ module Op
     const OpRayQueryGetIntersectionInstanceCustomIndexKHR = UInt16(6019)
     const OpRayQueryGetIntersectionInstanceIdKHR          = UInt16(6020)
     const OpRayQueryGetIntersectionPrimitiveIndexKHR      = UInt16(6023)
+    # Needed for PROCEDURAL geometry on the inline path: an AABB candidate has
+    # to be solved in OBJECT space, so the shader asks the query for the ray it
+    # is currently testing rather than transforming one itself.
+    const OpRayQueryGetRayTMinKHR                         = UInt16(6016)
+    const OpRayQueryGetIntersectionObjectRayDirectionKHR  = UInt16(6027)
+    const OpRayQueryGetIntersectionObjectRayOriginKHR     = UInt16(6028)
     const OpRayQueryGetIntersectionBarycentricsKHR        = UInt16(6024)
     # Intersection-kind operand to GetIntersection* (and related ops)
     const RayQueryCandidateIntersectionKHR = UInt32(0)
     const RayQueryCommittedIntersectionKHR = UInt32(1)
-    # ── SER (SPV_NV_shader_invocation_reorder) ──
-    # The opaque HitObject type carries the result of a hitObjectTraceRayNV
-    # call.  reorderThreadNV uses it (optionally) to coherently rebin warp
-    # lanes, then hitObjectExecuteShaderNV invokes the closest-hit / miss
-    # shader for the reordered thread.  This is what makes per-material
-    # closesthit shaders deliver coherent warps under divergent rays.
-    const OpHitObjectRecordHitMotionNV                = UInt16(5249)
-    const OpHitObjectRecordHitWithIndexMotionNV       = UInt16(5250)
-    const OpHitObjectRecordMissMotionNV               = UInt16(5251)
-    const OpHitObjectGetWorldToObjectNV               = UInt16(5252)
-    const OpHitObjectGetObjectToWorldNV               = UInt16(5253)
-    const OpHitObjectGetObjectRayDirectionNV          = UInt16(5254)
-    const OpHitObjectGetObjectRayOriginNV             = UInt16(5255)
-    const OpHitObjectTraceRayMotionNV                 = UInt16(5256)
-    const OpHitObjectGetShaderRecordBufferHandleNV    = UInt16(5257)
-    const OpHitObjectGetShaderBindingTableRecordIndexNV = UInt16(5258)
-    const OpHitObjectRecordEmptyNV                    = UInt16(5259)
-    const OpHitObjectTraceRayNV                       = UInt16(5260)
-    const OpHitObjectRecordHitNV                      = UInt16(5261)
-    const OpHitObjectRecordHitWithIndexNV             = UInt16(5262)
-    const OpHitObjectRecordMissNV                     = UInt16(5263)
-    const OpHitObjectExecuteShaderNV                  = UInt16(5264)
-    const OpHitObjectGetCurrentTimeNV                 = UInt16(5265)
-    const OpHitObjectGetAttributesNV                  = UInt16(5266)
-    const OpHitObjectGetHitKindNV                     = UInt16(5267)
-    const OpHitObjectGetPrimitiveIndexNV              = UInt16(5268)
-    const OpHitObjectGetGeometryIndexNV               = UInt16(5269)
-    const OpHitObjectGetInstanceIdNV                  = UInt16(5270)
-    const OpHitObjectGetInstanceCustomIndexNV         = UInt16(5271)
-    const OpHitObjectGetWorldRayDirectionNV           = UInt16(5272)
-    const OpHitObjectGetWorldRayOriginNV              = UInt16(5273)
-    const OpHitObjectGetRayTMaxNV                     = UInt16(5274)
-    const OpHitObjectGetRayTMinNV                     = UInt16(5275)
-    const OpHitObjectIsEmptyNV                        = UInt16(5276)
-    const OpHitObjectIsHitNV                          = UInt16(5277)
-    const OpHitObjectIsMissNV                         = UInt16(5278)
-    const OpReorderThreadWithHitObjectNV              = UInt16(5279)
-    const OpReorderThreadWithHintNV                   = UInt16(5280)
-    const OpTypeHitObjectNV                           = UInt16(5281)
+    # SPV_EXT_mesh_shader. Both take only operands, no result id: the mesh
+    # stage's outputs are variables, so these two just say HOW MUCH of them the
+    # workgroup filled, and (from a task stage) how many mesh workgroups to run.
+    const OpEmitMeshTasksEXT                          = UInt16(5294)
+    const OpSetMeshOutputsEXT                         = UInt16(5295)
 end
 
 # ---- Capabilities ----
 module Cap
     const Shader                        = UInt32(1)
+    const DemoteToHelperInvocation      = UInt32(5379)
     const Float16                       = UInt32(9)
     const Float64                       = UInt32(10)
     const Int8                          = UInt32(39)
@@ -294,11 +370,13 @@ module Cap
     const Int16                         = UInt32(22)
     const StorageBuffer16BitAccess      = UInt32(4433)
     const VulkanMemoryModel             = UInt32(5345)
+    const VulkanMemoryModelDeviceScope  = UInt32(5346)
     const PhysicalStorageBufferAddresses = UInt32(5347)
     const VariablePointers              = UInt32(4442)
     const VariablePointersStorageBuffer = UInt32(4441)
     const Geometry                  = UInt32(2)
     const Tessellation              = UInt32(3)
+    const MeshShadingEXT            = UInt32(5283)
     const InputAttachment           = UInt32(40)
     const RayTracingKHR             = UInt32(4479)
     const WorkgroupMemoryExplicitLayoutKHR = UInt32(4428)
@@ -306,6 +384,7 @@ module Cap
     const WorkgroupMemoryExplicitLayout16BitAccessKHR = UInt32(4430)
     # Float atomic ops (VK_EXT_shader_atomic_float / SPV_EXT_shader_atomic_float_add)
     const AtomicFloat32AddEXT           = UInt32(6033)
+    const AtomicFloat32MinMaxEXT        = UInt32(5612)
     const AtomicFloat64AddEXT           = UInt32(6034)
     const AtomicFloat16AddEXT           = UInt32(6095)
     # Subgroup ops (Vulkan 1.1 core)
@@ -324,13 +403,22 @@ module Cap
     # each has its own VkPhysicalDeviceCooperativeMatrix2FeaturesNV bit; see
     # `CoopMat2Caps` in runtime/device.jl. NVIDIA-only.
     const CooperativeMatrixReductionsNV            = UInt32(5430)
+    # Value from /usr/include/glslang/SPIRV/spirv.hpp11, not inferred from the
+    # neighbouring 5430 — adjacency is a coincidence, not a rule.
+    const CooperativeMatrixConversionsNV           = UInt32(5431)
     const CooperativeMatrixPerElementOperationsNV  = UInt32(5432)
+    # Tensor addressing needs BOTH of these, from two different extensions:
+    # `TensorAddressingNV` (SPV_NV_tensor_addressing) for the layout/view types
+    # and their builders, `CooperativeMatrixTensorAddressingNV`
+    # (SPV_NV_cooperative_matrix2) for `OpCooperativeMatrixLoadTensorNV` itself.
+    # Read off a glslang-produced binary, same as the opcodes.
+    const CooperativeMatrixTensorAddressingNV      = UInt32(5433)
+    const TensorAddressingNV                       = UInt32(5439)
     const RayQueryKHR                   = UInt32(4472)
+    # SPV_KHR_integer_dot_product
+    const DotProductInput4x8BitPacked   = UInt32(6018)
+    const DotProduct                    = UInt32(6019)
     const CooperativeMatrixKHR          = UInt32(6022)
-    # SER (SPV_NV_shader_invocation_reorder).  Value per the SPIR-V unified1
-    # grammar (5383).  Earlier guesses (5288 / 5247) collided with
-    # ComputeDerivativeGroupQuadsKHR and were invalid respectively.
-    const ShaderInvocationReorderNV     = UInt32(5383)
 end
 
 # ---- Storage Classes ----
@@ -368,11 +456,18 @@ module Dec
     const NonWritable       = UInt32(24)
     const NonReadable       = UInt32(25)
     const Location          = UInt32(30)
+    # SPV_EXT_mesh_shader: marks an output as belonging to the PER-PRIMITIVE
+    # plane rather than the per-vertex one. The two are separate arrays, indexed
+    # by primitive slot and vertex slot respectively.
+    const PerPrimitiveEXT   = UInt32(5271)
     const Binding           = UInt32(33)
     const DescriptorSet     = UInt32(34)
     const Offset            = UInt32(35)
-    const Restrict          = UInt32(42)
+    # 19, not 42: 42 is NoContraction. Nothing emitted Restrict while it had
+    # the wrong number, so no module carried the mix-up.
+    const Restrict          = UInt32(19)
     const Aliased           = UInt32(20)
+    const NoContraction     = UInt32(42)
 end
 
 # ---- Built-in Variables ----
@@ -389,6 +484,11 @@ module BuiltIn
     const GlobalInvocationId        = UInt32(28)
     const LocalInvocationIndex      = UInt32(29)
     const SubgroupSize              = UInt32(36)
+    # 37 is SubgroupMaxSize, deliberately absent: spirv-val rejects it under the
+    # Kernel (OpenCL) capability, so no Vulkan module may carry it. The value
+    # lives host-side in `subgroup_size_control(ctx).max`.
+    const NumSubgroups              = UInt32(38)
+    const SubgroupId                = UInt32(40)
     const SubgroupLocalInvocationId = UInt32(41)
     # Ray tracing built-ins
     const LaunchIdKHR               = UInt32(5319)
@@ -419,6 +519,13 @@ module BuiltIn
     const SampleId                  = UInt32(18)
     const SamplePosition            = UInt32(19)
     const SampleMask                = UInt32(20)
+    # Mesh shading (SPV_EXT_mesh_shader). The index arrays are the primitive
+    # plane's topology: one entry per primitive slot, holding indices INTO the
+    # vertices this workgroup wrote.
+    const PrimitivePointIndicesEXT    = UInt32(5294)
+    const PrimitiveLineIndicesEXT     = UInt32(5295)
+    const PrimitiveTriangleIndicesEXT = UInt32(5296)
+    const CullPrimitiveEXT            = UInt32(5299)
 end
 
 # ---- Execution Models ----
@@ -435,6 +542,10 @@ module ExecModel
     const ClosestHitKHR             = UInt32(5316)
     const MissKHR                   = UInt32(5317)
     const CallableKHR               = UInt32(5318)
+    # Mesh shading. NOT 5267/5268 — those are the NV models, which take a
+    # different set of builtins and a different Op for the output counts.
+    const TaskEXT                   = UInt32(5364)
+    const MeshEXT                   = UInt32(5365)
 end
 
 # ---- Execution Modes ----
@@ -461,6 +572,12 @@ module ExecMode
     const OutputPoints          = UInt32(27)
     const OutputLineStrip       = UInt32(28)
     const OutputTriangleStrip   = UInt32(29)
+    # Mesh shading output topology. `OutputVertices` and `OutputPrimitivesEXT`
+    # give the MAXIMA the stage may emit — the pipeline allocates for them — and
+    # one of the three below says what a primitive is.
+    const OutputLinesEXT        = UInt32(5269)
+    const OutputPrimitivesEXT   = UInt32(5270)
+    const OutputTrianglesEXT    = UInt32(5298)
 end
 
 # ---- Addressing / Memory Models ----
@@ -488,6 +605,7 @@ end
 
 # ---- Memory Semantics (for atomics) ----
 module MemSem
+    const Volatile          = UInt32(0x8000)
     const Relaxed           = UInt32(0x0)
     const Acquire           = UInt32(0x2)
     const Release           = UInt32(0x4)
@@ -530,10 +648,12 @@ The `NonPrivatePointer` bit for an access in storage class `sc`.
 `Workgroup` is the storage every invocation in a group can see, so an access to
 it has to say so; `Function` is per-invocation by construction and tagging it
 would claim a sharing that does not exist. Global (`PhysicalStorageBuffer`)
-accesses are left alone: they are made visible across *dispatches* by the API's
-own barriers, which sit outside the shader memory model entirely.
+accesses are tagged too: acquire/release atomics and device fences only make
+non-private accesses available and visible, and kernels publish data between
+workgroups of one dispatch that way, as Raycore's bottom-up BVH refit does.
 """
-@inline nonprivate(sc::UInt32) = sc == SC.Workgroup ? MemOp.NonPrivatePointer : MemOp.None
+@inline nonprivate(sc::UInt32) =
+    sc == SC.Workgroup || sc == SC.PhysicalStorageBuffer ? MemOp.NonPrivatePointer : MemOp.None
 
 # ---- Function Control ----
 module FuncControl
@@ -823,6 +943,25 @@ function emit_type_bool!(mod::SPIRVModule)
     end
 end
 
+"""
+    emit_constant_bool!(mod, value) -> UInt32
+
+`OpConstantTrue`/`OpConstantFalse`, deduplicated. A Bool constant is a distinct
+opcode with no operand rather than an `OpConstant` carrying 0 or 1, so it cannot
+go through `emit_constant_u32!`.
+"""
+function emit_constant_bool!(mod::SPIRVModule, value::Bool)
+    type_id = emit_type_bool!(mod)
+    key = (:constbool, type_id, value)
+    get!(mod.constant_cache, key) do
+        id = fresh_id!(mod)
+        encode_instruction!(mod.types_constants,
+                            value ? Op.OpConstantTrue : Op.OpConstantFalse,
+                            type_id, id)
+        id
+    end
+end
+
 function emit_type_int!(mod::SPIRVModule, width::UInt32, signedness::UInt32)
     key = (:int, width, signedness)
     get!(mod.type_cache, key) do
@@ -892,16 +1031,6 @@ function emit_type_pointer!(mod::SPIRVModule, storage_class::UInt32, pointee_typ
     end
 end
 
-function emit_type_acceleration_structure!(mod::SPIRVModule)
-    key = :acceleration_structure
-    get!(mod.type_cache, key) do
-        id = fresh_id!(mod)
-        encode_instruction!(mod.types_constants, Op.OpTypeAccelerationStructureKHR, id)
-        require_capability!(mod, Cap.RayTracingKHR)
-        id
-    end
-end
-
 function emit_type_function!(mod::SPIRVModule, return_type_id::UInt32, param_type_ids::Vector{UInt32}=UInt32[])
     key = (:function, return_type_id, Tuple(param_type_ids))
     get!(mod.type_cache, key) do
@@ -917,25 +1046,34 @@ end
 
 # ---- Constants (deduplicated) ----
 
-function emit_constant_u32!(mod::SPIRVModule, value::UInt32)
-    type_id = emit_type_int!(mod, UInt32(32), UInt32(0))
-    key = (:const, type_id, value)
-    get!(mod.constant_cache, key) do
+"""
+    emit_constant_int!(mod, type_id, width, value) -> id
+
+The constant `value` of the integer type `type_id`, `width` bits wide, emitted
+once per module: one word up to 32 bits, the value masked to `width` (unsigned
+types need their high bits zero), and two little-endian words above. Every
+integer constant is made here, so one value reached by different paths is one
+`OpConstant`.
+"""
+function emit_constant_int!(mod::SPIRVModule, type_id::UInt32, width::Integer, value::UInt64)
+    if width <= 32
+        word = UInt32(value & ((UInt64(1) << width) - 1))
+        return get!(mod.constant_cache, (:const, type_id, word)) do
+            id = fresh_id!(mod)
+            encode_instruction!(mod.types_constants, Op.OpConstant, type_id, id, word)
+            id
+        end
+    end
+    return get!(mod.constant_cache, (:const, type_id, value)) do
         id = fresh_id!(mod)
-        encode_instruction!(mod.types_constants, Op.OpConstant, type_id, id, value)
+        encode_instruction!(mod.types_constants, Op.OpConstant, type_id, id,
+                            UInt32(value & 0xFFFFFFFF), UInt32(value >> 32))
         id
     end
 end
 
-function emit_constant_i32!(mod::SPIRVModule, value::Int32)
-    type_id = emit_type_int!(mod, UInt32(32), UInt32(1))
-    key = (:const, type_id, reinterpret(UInt32, value))
-    get!(mod.constant_cache, key) do
-        id = fresh_id!(mod)
-        encode_instruction!(mod.types_constants, Op.OpConstant, type_id, id, reinterpret(UInt32, value))
-        id
-    end
-end
+emit_constant_u32!(mod::SPIRVModule, value::UInt32) =
+    emit_constant_int!(mod, emit_type_int!(mod, UInt32(32), UInt32(0)), 32, UInt64(value))
 
 function emit_constant_f32!(mod::SPIRVModule, value::Float32)
     type_id = emit_type_float!(mod, UInt32(32))
@@ -947,17 +1085,26 @@ function emit_constant_f32!(mod::SPIRVModule, value::Float32)
     end
 end
 
-function emit_constant_u64!(mod::SPIRVModule, value::UInt64)
-    type_id = emit_type_int!(mod, UInt32(64), UInt32(0))
-    lo = UInt32(value & 0xFFFFFFFF)
-    hi = UInt32((value >> 32) & 0xFFFFFFFF)
-    key = (:const, type_id, lo, hi)
-    get!(mod.constant_cache, key) do
-        id = fresh_id!(mod)
-        encode_instruction!(mod.types_constants, Op.OpConstant, type_id, id, lo, hi)
-        id
-    end
-end
+emit_constant_u64!(mod::SPIRVModule, value::UInt64) =
+    emit_constant_int!(mod, emit_type_int!(mod, UInt32(64), UInt32(0)), 64, value)
+
+"""
+    emit_constant_uint!(mod, spirv_w, value) -> id
+
+An unsigned integer constant at an explicit SPIR-V width.
+
+`emit_constant_u32!` and `emit_constant_u64!` hardcode their width, which is
+fine for the operand of an index computation but not for anything paired with a
+value whose width the emitter did not choose. SPIR-V requires both operands of
+an integer comparison, and of a bitwise op, to have the same component width,
+and `spirv_int_width` keeps 8- and 16-bit integers at their own width instead of
+promoting to 32 -- so a `Bool` slot loads as `%uchar` and needs a `%uchar` zero.
+
+All three go through [`emit_constant_int!`](@ref), so a constant emitted through
+any of them is shared rather than duplicated.
+"""
+emit_constant_uint!(mod::SPIRVModule, spirv_w::UInt32, value::UInt64) =
+    emit_constant_int!(mod, emit_type_int!(mod, spirv_w, UInt32(0)), spirv_w, value)
 
 function emit_constant_null!(mod::SPIRVModule, type_id::UInt32)
     key = (:const_null, type_id)

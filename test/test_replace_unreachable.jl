@@ -17,6 +17,10 @@
 #      miscompile that motivated the hardening).
 #   3. Lowering an `unreachable` in the *entry/kernel* itself is silent (there
 #      it is a legitimate early thread-exit, the best a GPU can do).
+#   4. A helper NOTHING calls is dead code: removed, and silent. GPUCompiler's
+#      runtime (`gpu_gc_pool_alloc`) stays in a ray-tracing shader's module after
+#      its last caller is optimized away, and warning about it reported a GPU
+#      allocation no shader made.
 
 using Test
 using Lava
@@ -26,20 +30,22 @@ using Logging
 # Count `unreachable` terminators across every defined function in a module.
 function count_unreachable(mod::LLVM.Module)
     total = 0
-    for f in LLVM.functions(mod)
-        isempty(LLVM.blocks(f)) && continue
-        for bb in LLVM.blocks(f), inst in LLVM.instructions(bb)
+    for f in mod.functions
+        isempty(f.blocks) && continue
+        for bb in f.blocks, inst in bb.instructions
             inst isa LLVM.UnreachableInst && (total += 1)
         end
     end
     return total
 end
 
-# An entry kernel + two value-returning helpers, each with a throw path that
-# ends in `unreachable`. The pointer-returning helper is the dangerous case.
+# An entry kernel + two value-returning helpers it CALLS, each with a throw path
+# that ends in `unreachable`. The pointer-returning helper is the dangerous case.
 const _IR_KERNEL_AND_HELPERS = """
 define void @kernel(i1 %c) {
 entry:
+  %a = call i32 @helper_i32(i1 %c)
+  %p = call ptr @helper_ptr(i1 %c)
   br i1 %c, label %bad, label %ok
 bad:
   unreachable
@@ -66,6 +72,25 @@ ok:
 }
 """
 
+# The shape of the ray-tracing shader that raised a false warning: the runtime's
+# allocator, defined, throwing on its failure path, and called by nobody.
+const _IR_KERNEL_AND_DEAD_HELPER = """
+define void @kernel(i1 %c) {
+entry:
+  ret void
+}
+
+define ptr @gpu_gc_pool_alloc(i64 %sz) {
+entry:
+  %fail = icmp eq i64 %sz, 0
+  br i1 %fail, label %bad, label %ok
+bad:
+  unreachable
+ok:
+  ret ptr null
+}
+"""
+
 const _IR_KERNEL_ONLY = """
 define void @kernel(i1 %c) {
 entry:
@@ -81,7 +106,7 @@ ok:
     @testset "lowers every unreachable to valid IR" begin
         LLVM.Context() do ctx
             mod = parse(LLVM.Module, _IR_KERNEL_AND_HELPERS)
-            entry = LLVM.functions(mod)["kernel"]
+            entry = mod.functions["kernel"]
             @test count_unreachable(mod) == 3
             # Suppress the (expected) warnings here; correctness is the focus.
             Logging.with_logger(Logging.NullLogger()) do
@@ -96,7 +121,7 @@ ok:
     @testset "warns for non-entry helpers, loud for pointer return" begin
         LLVM.Context() do ctx
             mod = parse(LLVM.Module, _IR_KERNEL_AND_HELPERS)
-            entry = LLVM.functions(mod)["kernel"]
+            entry = mod.functions["kernel"]
             # A warning naming each helper must fire; the pointer helper's
             # warning must additionally flag the POINTER hazard. match_mode=:any
             # ignores ordering and any non-matching logs.
@@ -110,10 +135,21 @@ ok:
         end
     end
 
+    @testset "a helper nothing calls is removed, silently" begin
+        LLVM.Context() do ctx
+            mod = parse(LLVM.Module, _IR_KERNEL_AND_DEAD_HELPER)
+            entry = mod.functions["kernel"]
+            @test_logs min_level = Logging.Warn Lava.replace_unreachable!(mod, entry)
+            @test !haskey(mod.functions, "gpu_gc_pool_alloc")
+            @test count_unreachable(mod) == 0
+            @test (LLVM.verify(mod); true)
+        end
+    end
+
     @testset "entry/kernel lowering is silent" begin
         LLVM.Context() do ctx
             mod = parse(LLVM.Module, _IR_KERNEL_ONLY)
-            entry = LLVM.functions(mod)["kernel"]
+            entry = mod.functions["kernel"]
             # No warn/error-level logs when the only lowered unreachable is in
             # the entry kernel itself.
             @test_logs min_level = Logging.Warn Lava.replace_unreachable!(mod, entry)

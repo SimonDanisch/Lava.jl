@@ -47,8 +47,8 @@ pointer phis, etc.) are left untouched — the existing byte-pun handling
 in prepare_vulkan.jl serves as the fallback.
 """
 function retype_uniform_typed_allocas!(mod::LLVM.Module, dl::LLVM.DataLayout)
-    for fn in LLVM.functions(mod)
-        isempty(LLVM.blocks(fn)) && continue
+    for fn in mod.functions
+        isempty(fn.blocks) && continue
         retype_function_allocas!(fn, dl)
     end
 end
@@ -69,6 +69,182 @@ struct AllocaInfo
     total_bytes::Int
     accesses::Vector{AccessSite}
     geps::Vector{LLVM.GetElementPtrInst}   # all GEPs to be erased after rewrite
+end
+
+"""
+Replace pointer choices within one private array by choices of its index.
+
+SROA may store a homogeneous tuple of structs in an integer array, and merge
+element addresses before their field loads. The following struct GEP can step
+back from that choice (Julia's one-based tuple access). Logical SPIR-V pointers
+cannot express this arithmetic. Keep the choice and every derived GEP rooted in
+the original array instead. Loads and stores remain at their original sites.
+
+Only acyclic choices within a single array, with element-aligned offsets,
+are handled. Other pointer representations are left for the existing lowerings.
+"""
+function index_private_array_choices!(mod::LLVM.Module, dl::LLVM.DataLayout)
+    for fn in mod.functions
+        choices = LLVM.Instruction[inst for bb in fn.blocks for inst in bb.instructions if
+            inst.value_type isa LLVM.PointerType && inst.value_type.addrspace == 0 &&
+            (inst isa Union{LLVM.PHIInst, LLVM.SelectInst} ||
+             (inst isa LLVM.GetElementPtrInst && inst.operands[1] isa LLVM.AllocaInst &&
+              LLVM.LLVMType(API.LLVMGetGEPSourceElementType(inst)) isa LLVM.StructType))]
+        processed = Set{LLVM.Value}()
+        for choice in choices
+            choice in processed && continue
+            isempty(LLVM.uses(choice)) && continue
+            roots = Dict{LLVM.Value, Union{LLVM.Value, Nothing}}()
+            root = private_array_choice_root(choice, dl, Set{LLVM.Value}(), roots)
+            root === nothing && continue
+            # Include GEPs and choices derived from this choice, so no struct
+            # arithmetic remains on the reconstructed scalar element pointer.
+            pending = LLVM.Value[choice]
+            seen = Set{LLVM.Value}()
+            derived = LLVM.Value[]
+            while !isempty(pending)
+                ptr = pop!(pending)
+                ptr in seen && continue
+                push!(seen, ptr)
+                push!(derived, ptr)
+                for use in LLVM.uses(ptr)
+                    user = use.user
+                    user isa Union{LLVM.GetElementPtrInst, LLVM.PHIInst, LLVM.SelectInst} || continue
+                    private_array_choice_root(user, dl, Set{LLVM.Value}(), roots) == root || continue
+                    push!(pending, user)
+                end
+            end
+            ty = LLVM.LLVMType(API.LLVMGetAllocatedType(root))
+            stride = Int(API.LLVMABISizeOfType(dl, ty.element_type))
+            indices = Dict{LLVM.Value, LLVM.Value}()
+            replacements = Pair{LLVM.Value,LLVM.Value}[]
+            LLVM.@dispose builder = LLVM.IRBuilder() begin
+                for ptr in derived
+                    index = private_array_choice_index!(builder, ptr, root, stride, dl, indices)
+                    at = ptr isa LLVM.PHIInst ? first(inst for inst in ptr.parent.instructions if !(inst isa LLVM.PHIInst)) : ptr
+                    LLVM.position!(builder, LLVM.before(at))
+                    address = LLVM.gep!(builder, ty, root,
+                        LLVM.Value[LLVM.ConstantInt(LLVM.Int64Type(), 0), index], "private_choice_address")
+                    push!(replacements, ptr => address)
+                end
+            end
+            for (ptr, address) in replacements
+                LLVM.replace_uses!(ptr, address)
+                push!(processed, ptr)
+            end
+            # No pointer can be cyclic under private_array_choice_root's check.
+            for (ptr, _) in reverse(replacements)
+                isempty(LLVM.uses(ptr)) && LLVM.erase!(ptr)
+            end
+        end
+    end
+    index_private_struct_steps!(mod, dl)
+    return nothing
+end
+
+# An aggregate array's field need not lie on an element boundary. Move only
+# the leading struct step into the enclosing array index, then retain the
+# field projection as a zero-step GEP. This also handles direct field loads
+# from a pointer choice, without flattening or type-punning the aggregate.
+function index_private_struct_steps!(mod::LLVM.Module, dl::LLVM.DataLayout)
+    for fn in mod.functions
+        geps = [i for b in fn.blocks for i in b.instructions if i isa LLVM.GetElementPtrInst]
+        for inst in geps
+            ops = collect(inst.operands)
+            source = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(inst))
+            source isa LLVM.StructType || continue
+            length(ops) >= 3 || continue
+            is_zero_index(ops[2]) && continue
+            root = private_array_choice_root(ops[1], dl, Set{LLVM.Value}())
+            root === nothing && continue
+            array = LLVM.LLVMType(API.LLVMGetAllocatedType(root))
+            source == array.element_type || continue
+            stride = Int(API.LLVMABISizeOfType(dl, source))
+            LLVM.@dispose builder = LLVM.IRBuilder() begin
+                index = private_array_choice_index!(builder, ops[1], root, stride, dl,
+                                                     Dict{LLVM.Value, LLVM.Value}())
+                LLVM.position!(builder, LLVM.before(inst))
+                i64 = LLVM.Int64Type()
+                step = ops[2].value_type == i64 ? ops[2] : LLVM.sext!(builder, ops[2], i64)
+                adjusted = LLVM.add!(builder, index, step, "private_struct_index")
+                zero = LLVM.ConstantInt(i64, 0)
+                element = LLVM.gep!(builder, array, root, LLVM.Value[zero, adjusted], "private_struct_element")
+                field = LLVM.gep!(builder, source, element, LLVM.Value[zero; ops[3:end]], "private_struct_field")
+                LLVM.replace_uses!(inst, field)
+            end
+            LLVM.erase!(inst)
+        end
+    end
+    return nothing
+end
+
+function private_array_choice_root(ptr::LLVM.Value, dl, visiting,
+                                   cache=Dict{LLVM.Value, Union{LLVM.Value, Nothing}}())
+    ptr in visiting && return nothing
+    haskey(cache, ptr) && return cache[ptr]
+    if ptr isa LLVM.AllocaInst
+        ty = LLVM.LLVMType(API.LLVMGetAllocatedType(ptr))
+        ty isa LLVM.ArrayType || return nothing
+        Int(API.LLVMABISizeOfType(dl, ty.element_type)) > 0 || return nothing
+        return ptr
+    end
+    push!(visiting, ptr)
+    root = if ptr isa LLVM.GetElementPtrInst
+        base = private_array_choice_root(ptr.operands[1], dl, visiting, cache)
+        if base !== nothing
+            ty = LLVM.LLVMType(API.LLVMGetAllocatedType(base))
+            stride = Int(API.LLVMABISizeOfType(dl, ty.element_type))
+            offset, dynamic = analyze_gep_offset(ptr, dl)
+            offset !== nothing && offset % stride == 0 && all(x -> x[2] % stride == 0, dynamic) ? base : nothing
+        else
+            nothing
+        end
+    elseif ptr isa Union{LLVM.PHIInst, LLVM.SelectInst}
+        values = ptr isa LLVM.PHIInst ? [v for (v, _) in ptr.incoming] : collect(ptr.operands[2:3])
+        roots = [private_array_choice_root(v, dl, visiting, cache) for v in values if
+            !(v isa Union{LLVM.UndefValue, LLVM.PoisonValue})]
+        !isempty(roots) && first(roots) !== nothing && all(==(first(roots)), roots) ? first(roots) : nothing
+    else
+        nothing
+    end
+    delete!(visiting, ptr)
+    cache[ptr] = root
+    return root
+end
+
+function private_array_choice_index!(builder, ptr, root, stride, dl, cache)
+    haskey(cache, ptr) && return cache[ptr]
+    i64 = LLVM.Int64Type()
+    ptr isa LLVM.UndefValue && return LLVM.UndefValue(i64)
+    ptr isa LLVM.PoisonValue && return LLVM.PoisonValue(i64)
+    ptr == root && return LLVM.ConstantInt(i64, 0)
+    index = if ptr isa LLVM.PHIInst
+        LLVM.position!(builder, LLVM.before(ptr))
+        phi = LLVM.phi!(builder, i64, "private_choice_index")
+        for (value, block) in ptr.incoming
+            incoming = private_array_choice_index!(builder, value, root, stride, dl, cache)
+            push!(phi.incoming, (incoming, block))
+        end
+        phi
+    elseif ptr isa LLVM.SelectInst
+        left = private_array_choice_index!(builder, ptr.operands[2], root, stride, dl, cache)
+        right = private_array_choice_index!(builder, ptr.operands[3], root, stride, dl, cache)
+        LLVM.position!(builder, LLVM.before(ptr))
+        LLVM.select!(builder, ptr.operands[1], left, right, "private_choice_index")
+    else
+        base = private_array_choice_index!(builder, ptr.operands[1], root, stride, dl, cache)
+        offset, dynamic = analyze_gep_offset(ptr, dl)
+        LLVM.position!(builder, LLVM.before(ptr))
+        result = LLVM.add!(builder, base, LLVM.ConstantInt(i64, offset ÷ stride), "private_choice_offset")
+        for (value, bytes) in dynamic
+            wide = value.value_type == i64 ? value : LLVM.sext!(builder, value, i64)
+            step = LLVM.mul!(builder, wide, LLVM.ConstantInt(i64, bytes ÷ stride))
+            result = LLVM.add!(builder, result, step, "private_choice_offset")
+        end
+        result
+    end
+    cache[ptr] = index
+    return index
 end
 
 # Collect uses transitively.  Each pointer-typed instruction in the use chain
@@ -94,19 +270,19 @@ function analyze_alloca_uses(alloca::LLVM.AllocaInst, dl::LLVM.DataLayout)
         ptr in visited && continue
         push!(visited, ptr)
 
-        for use in LLVM.uses(ptr)
-            user = LLVM.user(use)
+        for use in ptr.uses
+            user = use.user
             if user isa LLVM.LoadInst
                 # Pointer must be the use's operand 0
-                LLVM.operands(user)[1] === ptr || return nothing
+                user.operands[1] === ptr || return nothing
                 push!(accesses, AccessSite(user, true, ptr, base_off, copy(dyn_chain),
-                                            LLVM.value_type(user)))
+                                            user.value_type))
             elseif user isa LLVM.StoreInst
                 # Pointer is operand 1, value is operand 0
-                ops = LLVM.operands(user)
+                ops = user.operands
                 ops[2] === ptr || continue   # value-operand use, not a pointer use
                 push!(accesses, AccessSite(user, false, ptr, base_off, copy(dyn_chain),
-                                            LLVM.value_type(ops[1])))
+                                            ops[1].value_type))
             elseif user isa LLVM.GetElementPtrInst
                 # Compute the GEP's offset relative to current ptr
                 gep_const_off, gep_dyn = analyze_gep_offset(user, dl)
@@ -119,9 +295,9 @@ function analyze_alloca_uses(alloca::LLVM.AllocaInst, dl::LLVM.DataLayout)
                 # Allow llvm.lifetime.{start,end} and llvm.memset/memcpy intrinsics
                 # only if they don't create new pointer aliases we can't follow.
                 # llvm.lifetime.* is a no-op for our purposes.
-                fn = LLVM.called_operand(user)
+                fn = user.called_operand
                 if fn isa LLVM.Function
-                    name = LLVM.name(fn)
+                    name = fn.name
                     if startswith(name, "llvm.lifetime.")
                         continue   # ignore lifetime markers
                     end
@@ -140,7 +316,7 @@ end
 # Returns (Int, Vector{(Value, Int)}) on success, (nothing, _) on bail.
 function analyze_gep_offset(gep::LLVM.GetElementPtrInst, dl::LLVM.DataLayout)
     src_ty = LLVM.LLVMType(API.LLVMGetGEPSourceElementType(gep))
-    ops = LLVM.operands(gep)
+    ops = gep.operands
     n_ops = length(ops)
     n_ops >= 2 || return (nothing, Tuple{LLVM.Value,Int}[])
 
@@ -164,20 +340,20 @@ function analyze_gep_offset(gep::LLVM.GetElementPtrInst, dl::LLVM.DataLayout)
             if current_ty isa LLVM.StructType
                 idx isa LLVM.ConstantInt || return (nothing, dyn_chain)
                 fi = Int(convert(Int64, idx)) + 1
-                elems = LLVM.elements(current_ty)
+                elems = current_ty.elements
                 1 <= fi <= length(elems) || return (nothing, dyn_chain)
                 # Compute member offset
                 member_off = Int(API.LLVMOffsetOfElement(dl, current_ty, fi - 1))
                 const_off += member_off
                 current_ty = elems[fi]
-            elseif current_ty isa LLVM.ArrayType
-                stride = Int(API.LLVMABISizeOfType(dl, LLVM.eltype(current_ty)))
+            elseif current_ty isa Union{LLVM.ArrayType, LLVM.VectorType}
+                stride = Int(API.LLVMABISizeOfType(dl, current_ty.element_type))
                 if idx isa LLVM.ConstantInt
                     const_off += Int(convert(Int64, idx)) * stride
                 else
                     push!(dyn_chain, (idx, stride))
                 end
-                current_ty = LLVM.eltype(current_ty)
+                current_ty = current_ty.element_type
             else
                 return (nothing, dyn_chain)   # can't drill into scalar
             end
@@ -190,9 +366,9 @@ end
 # Helper: is this LLVM type a scalar we can use as the alloca's element type?
 @inline function is_retypeable_scalar(T::LLVM.LLVMType)
     T isa LLVM.IntegerType ||
-    T isa LLVM.LLVMFloat ||
-    T isa LLVM.LLVMDouble ||
-    T isa LLVM.LLVMHalf
+    T isa LLVM.FloatType ||
+    T isa LLVM.DoubleType ||
+    T isa LLVM.HalfType
 end
 
 # Pick a scalar type T satisfying:
@@ -241,9 +417,12 @@ function pick_uniform_type(accesses::Vector{AccessSite}, total_bytes::Int, dl::L
     end
     if !isempty(type_counts)
         best_count = maximum(values(type_counts))
-        for (T, cnt) in type_counts
-            if cnt == best_count
-                smallest_T = T
+        # A tie goes to the type accessed first. Not the `Dict`'s first: types are
+        # keyed by their address, so the pick, and the alloca's type with it,
+        # changed from one process to the next.
+        for a in accesses
+            if get(type_counts, a.access_type, 0) == best_count
+                smallest_T = a.access_type
                 break
             end
         end
@@ -266,14 +445,10 @@ function pick_uniform_type(accesses::Vector{AccessSite}, total_bytes::Int, dl::L
             debug && @info "retype: pick BAIL offset_not_aligned" off=a.byte_offset sz
             return nothing
         end
-        # Decomposition (a_sz > sz) is only implemented for int→int: the rewrite
-        # uses shift/or/trunc operations that require integer types.  If either the
-        # chosen element type T or the wider access type is a float/half/double,
-        # bail so the existing SPIR-V emitter fallback handles it instead.
-        if a_sz > sz && (!(smallest_T isa LLVM.IntegerType) || !(a.access_type isa LLVM.IntegerType))
-            debug && @info "retype: pick BAIL decomp_requires_int" a_ty=string(a.access_type) t_ty=string(smallest_T)
-            return nothing
-        end
+        # Wider accesses (a_sz > sz) decompose through integers: the wide value as an
+        # integer of its width, cut by shift/trunc into sz-wide integers, each bitcast
+        # to T. That covers float elements too: MVector{2, Float32} initialized by one
+        # i64 store of both lanes and read per float.
     end
 
     # We require sz to be a power of 2 so the byte-offset → element-idx divide
@@ -299,15 +474,15 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
 
     # Insert new alloca right before the old one
     LLVM.@dispose builder=LLVM.IRBuilder() begin
-        LLVM.position!(builder, info.alloca)
+        LLVM.position!(builder, insertion_point(info.alloca))
         # Inherit alignment from old alloca
-        old_align = LLVM.alignment(info.alloca)
+        old_align = info.alloca.alignment
         new_alloca = LLVM.alloca!(builder, new_arr_ty)
-        LLVM.alignment!(new_alloca, old_align)
+        new_alloca.alignment = old_align
         # Copy over name for debug readability
-        old_name = LLVM.name(info.alloca)
+        old_name = info.alloca.name
         if !isempty(old_name)
-            LLVM.name!(new_alloca, old_name * "_retyped")
+            new_alloca.name =  old_name * "_retyped"
         end
 
         # For each access, build a fresh GEP from new_alloca and rewrite the pointer.
@@ -324,11 +499,11 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
         function build_byte_offset(site::AccessSite)
             byte_offset_expr = LLVM.ConstantInt(i64, site.byte_offset)
             for (dyn, stride) in site.dyn_index_chain
-                dyn_i64 = if LLVM.value_type(dyn) isa LLVM.IntegerType &&
-                             LLVM.width(LLVM.value_type(dyn)) < 64
+                dyn_i64 = if dyn.value_type isa LLVM.IntegerType &&
+                             dyn.value_type.width < 64
                     LLVM.sext!(builder, dyn, i64)
-                elseif LLVM.value_type(dyn) isa LLVM.IntegerType &&
-                       LLVM.width(LLVM.value_type(dyn)) > 64
+                elseif dyn.value_type isa LLVM.IntegerType &&
+                       dyn.value_type.width > 64
                     LLVM.trunc!(builder, dyn, i64)
                 else
                     dyn
@@ -363,8 +538,19 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
         #   on Function-storage pointers, which is invalid SPIR-V under logical
         #   addressing.
         for site in info.accesses
-            LLVM.position!(builder, site.inst)
-            access_sz = Int(API.LLVMABISizeOfType(dl, site.access_type))
+            LLVM.position!(builder, insertion_point(site.inst))
+            # `site.access_type` is a snapshot taken when the uses were walked.
+            # For a LOAD it cannot go stale — it is the instruction's own result
+            # type. For a STORE it is the type of the value OPERAND, and that
+            # operand can be replaced between collection and here (by an earlier
+            # site in this very loop, or by a prior pass). Trusting the snapshot
+            # then decomposes a 32-bit store as if it were 64-bit and emits
+            # `trunc i32 %v to i32` plus `lshr i32 %v, i64 32` — IR whose operand
+            # types disagree, which survives to the emitter as a same-width
+            # `OpUConvert` and is rejected by spirv-val. Re-read it.
+            access_ty = site.is_load ? site.access_type :
+                                       site.inst.operands[1].value_type
+            access_sz = Int(API.LLVMABISizeOfType(dl, access_ty))
             byte_offset_expr = build_byte_offset(site)
 
             if access_sz == sz
@@ -373,13 +559,15 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
                 ptr_op_idx = site.is_load ? 1 : 2
                 API.LLVMSetOperand(site.inst, UInt32(ptr_op_idx - 1), new_gep)
             else
-                # Wider access: decompose into n_parts T-sized accesses.
+                # Wider access: decompose into n_parts T-sized accesses, carried as
+                # integers of the access's and of T's width; floats are bitcast to
+                # and from those at either end.
                 @assert access_sz % sz == 0
                 n_parts = access_sz ÷ sz
-                t_bw = sz * 8   # bit width of T (only int handled for now)
-                @assert site.access_type isa LLVM.IntegerType
-                @assert T isa LLVM.IntegerType   # decomposition currently only for int → int
-                t_ty = T
+                t_bw = sz * 8   # bit width of T
+                t_ty = LLVM.IntType(t_bw)
+                wide_int = LLVM.IntType(access_sz * 8)
+                recast(v, ty) = v.value_type == ty ? v : LLVM.bitcast!(builder, v, ty)
 
                 # Compute n_parts byte offsets and matching GEPs.
                 geps = LLVM.Value[]
@@ -394,11 +582,11 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
 
                 if site.is_load
                     # Load each T-sized chunk, zext + shift + or to assemble the wide value.
-                    wide_ty = site.access_type
+                    wide_ty = wide_int
                     parts = LLVM.Value[]
                     for g in geps
-                        v = LLVM.load!(builder, t_ty, g)
-                        push!(parts, v)
+                        v = LLVM.load!(builder, T, g)
+                        push!(parts, recast(v, t_ty))
                     end
                     # Combine: result = sum(parts[i] zext to wide << (i*t_bw))
                     combined = LLVM.zext!(builder, parts[1], wide_ty)
@@ -408,14 +596,23 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
                         shifted = LLVM.shl!(builder, ext, shift_const)
                         combined = LLVM.or!(builder, combined, shifted)
                     end
-                    LLVM.replace_uses!(site.inst, combined)
+                    LLVM.replace_uses!(site.inst, recast(combined, access_ty))
                     LLVM.erase!(site.inst)
                 else
                     # Store: split the wide value into n_parts T-chunks, store each.
-                    val = LLVM.operands(site.inst)[1]   # value being stored
-                    wide_ty = site.access_type
+                    stored = site.inst.operands[1]   # value being stored
+                    # The shift constants and truncations below are built from
+                    # `wide_ty`; if the value is not actually that type the pass
+                    # emits `lshr i32 %v, i64 32` and `trunc i32 %v to i32`,
+                    # which is invalid IR that only surfaces much later as a
+                    # same-width OpUConvert out of the SPIR-V emitter.
+                    stored.value_type == access_ty || error(
+                        "retype_allocas: store value type $(string(stored.value_type)) " *
+                        "disagrees with access type $(string(access_ty)) for $(string(site.inst))")
+                    wide_ty = wide_int
+                    val = recast(stored, wide_ty)
                     for i in 1:n_parts
-                        chunk = if i == 1 && t_bw == LLVM.width(wide_ty)
+                        chunk = if i == 1 && t_bw == wide_ty.width
                             val   # no truncation needed
                         else
                             shifted = if i == 1
@@ -424,13 +621,13 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
                                 shift_const = LLVM.ConstantInt(wide_ty, (i - 1) * t_bw)
                                 LLVM.lshr!(builder, val, shift_const)
                             end
-                            if LLVM.width(wide_ty) > t_bw
+                            if wide_ty.width > t_bw
                                 LLVM.trunc!(builder, shifted, t_ty)
                             else
                                 shifted
                             end
                         end
-                        LLVM.store!(builder, chunk, geps[i])
+                        LLVM.store!(builder, recast(chunk, T), geps[i])
                     end
                     LLVM.erase!(site.inst)
                 end
@@ -443,11 +640,11 @@ function rewrite_alloca!(info::AllocaInfo, T::LLVM.LLVMType, dl::LLVM.DataLayout
     # so parents never reach `isempty(uses)` and stay in the IR — leaving the
     # OLD alloca live with zombie users that confuse downstream analysis.
     for gep in reverse(info.geps)
-        if isempty(LLVM.uses(gep))
+        if isempty(gep.uses)
             LLVM.erase!(gep)
         end
     end
-    if isempty(LLVM.uses(info.alloca))
+    if isempty(info.alloca.uses)
         LLVM.erase!(info.alloca)
     end
 
@@ -456,9 +653,9 @@ end
 
 function retype_function_allocas!(fn::LLVM.Function, dl::LLVM.DataLayout)
     # Allocas live in the entry block by Julia/LLVM convention
-    entry = first(LLVM.blocks(fn))
+    entry = first(fn.blocks)
     candidates = LLVM.AllocaInst[]
-    for inst in LLVM.instructions(entry)
+    for inst in entry.instructions
         inst isa LLVM.AllocaInst || continue
         push!(candidates, inst)
     end
@@ -467,19 +664,19 @@ function retype_function_allocas!(fn::LLVM.Function, dl::LLVM.DataLayout)
     for alloca in candidates
         info = analyze_alloca_uses(alloca, dl)
         if info === nothing
-            debug && @info "retype: BAIL analyze_uses" name=LLVM.name(alloca)
+            debug && @info "retype: BAIL analyze_uses" name=alloca.name
             continue
         end
         T = pick_uniform_type(info.accesses, info.total_bytes, dl)
         if T === nothing
             if debug
                 type_strings = unique(string(a.access_type) for a in info.accesses)
-                @info "retype: BAIL non-uniform" name=LLVM.name(alloca) type_strings n=length(info.accesses)
+                @info "retype: BAIL non-uniform" name=alloca.name type_strings n=length(info.accesses)
             end
             continue
         end
         if rewrite_alloca!(info, T, dl)
-            debug && @info "retype: REWROTE" name=LLVM.name(alloca) T
+            debug && @info "retype: REWROTE" name=alloca.name T
         end
     end
 end

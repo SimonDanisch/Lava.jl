@@ -2,16 +2,36 @@
 #
 # Graphics builtins via llvmcall, following the same addrspace(7) pattern
 # as compute and RT builtins. The SPIR-V emitter recognizes the internal
-# LLVM function names and creates Input/Output variables with BuiltIn decorations.
+# LLVM function names and creates Input/Output variables with BuiltIn
+# decorations.
 #
-# The public Julia API uses clean names (vertex_index, gfx_output, etc.)
-# with dispatch on GeometryBasics Vec types.
+# ── Two kinds of name, and the line between them ─────────────────────────────
+#
+# **What a shader body writes** is KernelInterface's: `vertex_index`,
+# `instance_index`, the `frag_coord` family, `dFdx`/`dFdy`, `set_point_size!`,
+# `sample_texture_2d`, `emit_vertex!`/`end_primitive!`/`primitive_id_in`. Those
+# are DECLARED there — one name, from one place, for a shader that must run on
+# either backend — and every definition below is an `@lava_device_override` on
+# the declaration rather than a Lava function of the same name, so nothing needs
+# a `Mantle.f() = Lava.f()` bridge to reach them.
+#
+# **What the COMPILER lowers stage I/O through** is Lava's own and stays
+# unqualified: `set_position!`, `gfx_output`/`gfx_input` and their flat
+# variants, `geom_input*`, the tessellation levels, `front_facing`,
+# `invocation_id`. KernelInterface deliberately does not declare these — a
+# shader author never writes a location number, because a vertex stage RETURNS
+# `(position = …, varyings…)` and a fragment stage receives them by name. The
+# numbered form is what that declaration is COMPILED to, and `VertexWrapper` /
+# `FragmentWrapper` at the bottom of this file are the translation.
+#
+# So: a name a person types is KernelInterface's; a name only this compiler
+# types is Lava's.
 
 using GeometryBasics: Vec2f, Vec3f, Vec4f
 
 # ── Vertex Builtins ──
 
-@inline function vertex_index()
+@lava_device_override @inline function vertex_index()
     raw = Base.llvmcall(("""
         @__spirv_BuiltInVertexIndex = external addrspace(7) global i32
         define i32 @entry() #0 {
@@ -23,7 +43,7 @@ using GeometryBasics: Vec2f, Vec3f, Vec4f
     return Int32(raw) + Int32(1)
 end
 
-@inline function instance_index()
+@lava_device_override @inline function instance_index()
     raw = Base.llvmcall(("""
         @__spirv_BuiltInInstanceIndex = external addrspace(7) global i32
         define i32 @entry() #0 {
@@ -37,7 +57,7 @@ end
 
 # ── Fragment Builtins ──
 
-@inline function frag_coord(dim::Integer=1)
+@lava_device_override @inline function frag_coord(dim::Integer=1)
     Base.llvmcall(("""
         @__spirv_BuiltInFragCoord = external addrspace(7) global <4 x float>
         define float @entry(i32 %dim) #0 {
@@ -49,12 +69,18 @@ end
     """, "entry"), Float32, Tuple{UInt32}, UInt32(dim - 1))
 end
 
-@inline frag_coord_x() = frag_coord(1)
-@inline frag_coord_y() = frag_coord(2)
-@inline frag_coord_z() = frag_coord(3)
-@inline frag_coord_w() = frag_coord(4)
-@inline frag_coord_xy() = Vec2f(frag_coord(1), frag_coord(2))
+@lava_device_override @inline frag_coord_x() = frag_coord(1)
+@lava_device_override @inline frag_coord_y() = frag_coord(2)
+@lava_device_override @inline frag_coord_z() = frag_coord(3)
+@lava_device_override @inline frag_coord_w() = frag_coord(4)
+@lava_device_override @inline frag_coord_xy() =
+    Vec2f(frag_coord(1), frag_coord(2))
 
+"""
+    front_facing() -> Bool
+
+Whether the fragment belongs to a front-facing primitive (`FrontFacing`).
+"""
 @inline function front_facing()
     # Return UInt8 (not Bool/i1) to match Julia's ABI convention.
     # Julia passes Bool as i8 at call sites, so returning i1 creates a type
@@ -74,6 +100,13 @@ end
 # ── Output Builtins (Vertex/Geometry/TessEval) ──
 
 # Low-level: 4 scalars
+"""
+    set_position!(v::Vec4f)
+    set_position!(x, y, z, w)
+
+Write the clip-space position of a vertex, geometry, tessellation evaluation or mesh
+stage (`Position`).
+"""
 @inline function set_position!(x::Float32, y::Float32, z::Float32, w::Float32)
     Base.llvmcall(("""
         declare void @_lava_gfx_set_position(float, float, float, float) #0
@@ -87,8 +120,12 @@ end
 
 # High-level: Vec4f
 @inline set_position!(v::Vec4f) = set_position!(v[1], v[2], v[3], v[4])
+# The tuple spelling of a position, as a varying has (`FloatTuple` below): a vertex
+# body that returns `position = verts[i]` from a buffer of `NTuple{4,Float32}` had no
+# method, inferred to `Union{}`, and the stage did not compile.
+@inline set_position!(v::NTuple{4,Float32}) = set_position!(v[1], v[2], v[3], v[4])
 
-@inline function set_point_size!(s::Float32)
+@lava_device_override @inline function set_point_size!(s::Float32)
     Base.llvmcall(("""
         declare void @_lava_gfx_set_point_size(float) #0
         define void @entry(float %s) #0 {
@@ -112,6 +149,27 @@ end
         }
         attributes #0 = { alwaysinline }
     """, "entry"), Cvoid, Tuple{UInt32, Float32}, location, val)
+end
+
+"""
+    gfx_discard()
+
+Throw this fragment's writes away — colour AND depth.
+
+The depth part is the point. A blended overlay draws quads whose corners are
+transparent; with depth writes on, those corners claim depth and occlude
+whatever should have shown through. Discarding them is what lets an overlay pass
+use a depth buffer at all.
+"""
+@inline function gfx_discard()
+    Base.llvmcall(("""
+        declare void @_lava_gfx_discard() #0
+        define void @entry() #0 {
+            call void @_lava_gfx_discard()
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{})
 end
 
 @inline function gfx_output_vec4(location::UInt32,
@@ -152,6 +210,36 @@ end
 end
 
 # High-level dispatch: gfx_output(location, value)
+@inline function gfx_output_uvec2(location::UInt32, x::UInt32, y::UInt32)
+    Base.llvmcall(("""
+        declare void @_lava_gfx_output_uvec2(i32, i32, i32) #0
+        define void @entry(i32 %loc, i32 %x, i32 %y) #0 {
+            call void @_lava_gfx_output_uvec2(i32 %loc, i32 %x, i32 %y)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32,UInt32,UInt32}, location,x,y)
+end
+
+@inline function gfx_output_u32(location::UInt32, value::UInt32)
+    Base.llvmcall(("""
+        declare void @_lava_gfx_output_u32(i32, i32) #0
+        define void @entry(i32 %loc, i32 %value) #0 {
+            call void @_lava_gfx_output_u32(i32 %loc, i32 %value)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32,UInt32}, location,value)
+end
+
+"""
+    gfx_output(location, value)
+
+Write the stage output at `location`. `value` is a `Float32`, `Vec2f`, `Vec3f`,
+`Vec4f`, `UInt32` or `Vec{2,UInt32}`; the next stage interpolates it.
+"""
+@inline gfx_output(loc::Integer, v::Vec{2,UInt32}) = gfx_output_uvec2(UInt32(loc),v[1],v[2])
+@inline gfx_output(loc::Integer, v::UInt32) = gfx_output_u32(UInt32(loc),v)
 @inline gfx_output(loc::Integer, v::Vec4f) = gfx_output_vec4(UInt32(loc), v[1], v[2], v[3], v[4])
 @inline gfx_output(loc::Integer, v::Vec3f) = gfx_output_vec3(UInt32(loc), v[1], v[2], v[3])
 @inline gfx_output(loc::Integer, v::Vec2f) = gfx_output_vec2(UInt32(loc), v[1], v[2])
@@ -208,6 +296,12 @@ end
 end
 
 # High-level dispatch: gfx_output_flat(location, value)
+"""
+    gfx_output_flat(location, value)
+
+[`gfx_output`](@ref) with the `Flat` decoration: the next stage receives the value of
+the provoking vertex, not an interpolation.
+"""
 @inline gfx_output_flat(loc::Integer, v::Vec4f) = gfx_output_flat_vec4(UInt32(loc), v[1], v[2], v[3], v[4])
 @inline gfx_output_flat(loc::Integer, v::Vec3f) = gfx_output_flat_vec3(UInt32(loc), v[1], v[2], v[3])
 @inline gfx_output_flat(loc::Integer, v::Vec2f) = gfx_output_flat_vec2(UInt32(loc), v[1], v[2])
@@ -260,6 +354,11 @@ end
 end
 
 # High-level dispatch: gfx_input(Type, location) → Vec
+"""
+    gfx_input(T, location) -> T
+
+Read the interpolated stage input of type `T` at `location`.
+"""
 @inline gfx_input(::Type{Vec4f}, loc::Integer) = Vec4f(
     gfx_input_vec4(UInt32(loc), UInt32(0)),
     gfx_input_vec4(UInt32(loc), UInt32(1)),
@@ -277,9 +376,11 @@ end
 )
 @inline gfx_input(::Type{Float32}, loc::Integer) = gfx_input_f32(UInt32(loc))
 
+@lava_device_override @inline discard() = gfx_discard()
+
 # ── Fragment Derivatives (dFdx, dFdy) ──
 
-@inline function dFdx(v::Float32)
+@lava_device_override @inline function dFdx(v::Float32)
     Base.llvmcall(("""
         declare float @_lava_gfx_dFdx_f32(float) #0
         define float @entry(float %v) #0 {
@@ -290,7 +391,7 @@ end
     """, "entry"), Float32, Tuple{Float32}, v)
 end
 
-@inline function dFdy(v::Float32)
+@lava_device_override @inline function dFdy(v::Float32)
     Base.llvmcall(("""
         declare float @_lava_gfx_dFdy_f32(float) #0
         define float @entry(float %v) #0 {
@@ -301,12 +402,14 @@ end
     """, "entry"), Float32, Tuple{Float32}, v)
 end
 
-@inline dFdx(v::Vec2f) = Vec2f(dFdx(v[1]), dFdx(v[2]))
-@inline dFdy(v::Vec2f) = Vec2f(dFdy(v[1]), dFdy(v[2]))
+@lava_device_override @inline dFdx(v::Vec2f) =
+    Vec2f(dFdx(v[1]), dFdx(v[2]))
+@lava_device_override @inline dFdy(v::Vec2f) =
+    Vec2f(dFdy(v[1]), dFdy(v[2]))
 
 # ── Geometry Shader ──
 
-@inline function emit_vertex!()
+@lava_device_override @inline function emit_vertex!()
     Base.llvmcall(("""
         declare void @_lava_gfx_emit_vertex() #0
         define void @entry() #0 {
@@ -317,7 +420,7 @@ end
     """, "entry"), Cvoid, Tuple{})
 end
 
-@inline function end_primitive!()
+@lava_device_override @inline function end_primitive!()
     Base.llvmcall(("""
         declare void @_lava_gfx_end_primitive() #0
         define void @entry() #0 {
@@ -328,6 +431,12 @@ end
     """, "entry"), Cvoid, Tuple{})
 end
 
+"""
+    invocation_id() -> UInt32
+
+The invocation index of a geometry or tessellation control stage, from zero
+(`InvocationId`).
+"""
 @inline function invocation_id()
     Base.llvmcall(("""
         @__spirv_BuiltInInvocationId = external addrspace(7) global i32
@@ -339,7 +448,7 @@ end
     """, "entry"), UInt32, Tuple{})
 end
 
-@inline function primitive_id_in()
+@lava_device_override @inline function primitive_id_in()
     Base.llvmcall(("""
         @__spirv_BuiltInPrimitiveId = external addrspace(7) global i32
         define i32 @entry() #0 {
@@ -352,6 +461,11 @@ end
 
 # ── Tessellation ──
 
+"""
+    tess_coord(dim = 1) -> Float32
+
+Component `dim` (1, 2 or 3) of the tessellation evaluation stage's `TessCoord`.
+"""
 @inline function tess_coord(dim::Integer=1)
     Base.llvmcall(("""
         @__spirv_BuiltInTessCoord = external addrspace(7) global <3 x float>
@@ -367,8 +481,18 @@ end
 @inline tess_coord_u() = tess_coord(1)
 @inline tess_coord_v() = tess_coord(2)
 @inline tess_coord_w() = tess_coord(3)
+"""
+    tess_coord_uvw() -> Vec3f
+
+All three components of `TessCoord`.
+"""
 @inline tess_coord_uvw() = Vec3f(tess_coord(1), tess_coord(2), tess_coord(3))
 
+"""
+    set_tess_level_outer!(idx::UInt32, level::Float32)
+
+Set outer tessellation level `idx`, from zero, in a tessellation control stage.
+"""
 @inline function set_tess_level_outer!(idx::UInt32, val::Float32)
     Base.llvmcall(("""
         declare void @_lava_gfx_set_tess_level_outer(i32, float) #0
@@ -380,6 +504,11 @@ end
     """, "entry"), Cvoid, Tuple{UInt32, Float32}, idx, val)
 end
 
+"""
+    set_tess_level_inner!(idx::UInt32, level::Float32)
+
+Set inner tessellation level `idx`, from zero, in a tessellation control stage.
+"""
 @inline function set_tess_level_inner!(idx::UInt32, val::Float32)
     Base.llvmcall(("""
         declare void @_lava_gfx_set_tess_level_inner(i32, float) #0
@@ -393,7 +522,7 @@ end
 
 # ── Texture Sampling ──
 
-@inline function sample_texture_2d(binding::UInt32, u::Float32, v::Float32, component::UInt32)
+@lava_device_override @inline function sample_texture_2d(binding::UInt32, u::Float32, v::Float32, component::UInt32)
     Base.llvmcall(("""
         declare float @_lava_gfx_sample_2d(i32, float, float, i32) #0
         define float @entry(i32 %binding, float %u, float %v, i32 %comp) #0 {
@@ -437,6 +566,17 @@ end
     """, "entry"), Float32, Tuple{UInt32, UInt32}, location, component)
 end
 
+@inline function gfx_input_flat_vec3(location::UInt32, component::UInt32)
+    Base.llvmcall(("""
+        declare float @_lava_gfx_input_flat_vec3(i32, i32) #0
+        define float @entry(i32 %loc, i32 %comp) #0 {
+            %val = call float @_lava_gfx_input_flat_vec3(i32 %loc, i32 %comp)
+            ret float %val
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Float32, Tuple{UInt32, UInt32}, location, component)
+end
+
 @inline function gfx_input_flat_vec2(location::UInt32, component::UInt32)
     Base.llvmcall(("""
         declare float @_lava_gfx_input_flat_vec2(i32, i32) #0
@@ -460,15 +600,91 @@ end
 end
 
 # High-level dispatch: gfx_input_flat(Type, location) → Vec
+"""
+    gfx_input_flat(T, location) -> T
+
+Read a `Flat` stage input of type `T` at `location`.
+"""
 @inline gfx_input_flat(::Type{Vec4f}, loc::Integer) = Vec4f(
     gfx_input_flat_vec4(UInt32(loc), UInt32(0)),
     gfx_input_flat_vec4(UInt32(loc), UInt32(1)),
     gfx_input_flat_vec4(UInt32(loc), UInt32(2)),
     gfx_input_flat_vec4(UInt32(loc), UInt32(3)))
+@inline gfx_input_flat(::Type{Vec3f}, loc::Integer) = Vec3f(
+    gfx_input_flat_vec3(UInt32(loc), UInt32(0)),
+    gfx_input_flat_vec3(UInt32(loc), UInt32(1)),
+    gfx_input_flat_vec3(UInt32(loc), UInt32(2)))
 @inline gfx_input_flat(::Type{Vec2f}, loc::Integer) = Vec2f(
     gfx_input_flat_vec2(UInt32(loc), UInt32(0)),
     gfx_input_flat_vec2(UInt32(loc), UInt32(1)))
 @inline gfx_input_flat(::Type{Float32}, loc::Integer) = gfx_input_flat_f32(UInt32(loc))
+
+# ── Per-primitive input intrinsics (fragment reads a mesh stage's primitive plane) ──
+#
+# What a mesh stage writes per PRIMITIVE arrives here as a `PerPrimitiveEXT` input:
+# Vulkan's interface matching wants the decoration the same on both sides of a
+# location, so the fragment stage has to know which plane it is reading. That
+# makes this a third reading of an input and not a flavour of the flat one, even
+# though both deliver one value per primitive — a flat varying is the provoking
+# VERTEX's value, a per-primitive one is the primitive's own.
+
+@inline function gfx_input_primitive_vec4(location::UInt32, component::UInt32)
+    Base.llvmcall(("""
+        declare float @_lava_gfx_input_primitive_vec4(i32, i32) #0
+        define float @entry(i32 %loc, i32 %comp) #0 {
+            %val = call float @_lava_gfx_input_primitive_vec4(i32 %loc, i32 %comp)
+            ret float %val
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Float32, Tuple{UInt32, UInt32}, location, component)
+end
+
+@inline function gfx_input_primitive_vec3(location::UInt32, component::UInt32)
+    Base.llvmcall(("""
+        declare float @_lava_gfx_input_primitive_vec3(i32, i32) #0
+        define float @entry(i32 %loc, i32 %comp) #0 {
+            %val = call float @_lava_gfx_input_primitive_vec3(i32 %loc, i32 %comp)
+            ret float %val
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Float32, Tuple{UInt32, UInt32}, location, component)
+end
+
+@inline function gfx_input_primitive_vec2(location::UInt32, component::UInt32)
+    Base.llvmcall(("""
+        declare float @_lava_gfx_input_primitive_vec2(i32, i32) #0
+        define float @entry(i32 %loc, i32 %comp) #0 {
+            %val = call float @_lava_gfx_input_primitive_vec2(i32 %loc, i32 %comp)
+            ret float %val
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Float32, Tuple{UInt32, UInt32}, location, component)
+end
+
+@inline function gfx_input_primitive_f32(location::UInt32)
+    Base.llvmcall(("""
+        declare float @_lava_gfx_input_primitive_f32(i32) #0
+        define float @entry(i32 %loc) #0 {
+            %val = call float @_lava_gfx_input_primitive_f32(i32 %loc)
+            ret float %val
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Float32, Tuple{UInt32}, location)
+end
+
+@inline gfx_input_primitive(::Type{Vec4f}, loc::Integer) = Vec4f(
+    gfx_input_primitive_vec4(UInt32(loc), UInt32(0)),
+    gfx_input_primitive_vec4(UInt32(loc), UInt32(1)),
+    gfx_input_primitive_vec4(UInt32(loc), UInt32(2)),
+    gfx_input_primitive_vec4(UInt32(loc), UInt32(3)))
+@inline gfx_input_primitive(::Type{Vec3f}, loc::Integer) = Vec3f(
+    gfx_input_primitive_vec3(UInt32(loc), UInt32(0)),
+    gfx_input_primitive_vec3(UInt32(loc), UInt32(1)),
+    gfx_input_primitive_vec3(UInt32(loc), UInt32(2)))
+@inline gfx_input_primitive(::Type{Vec2f}, loc::Integer) = Vec2f(
+    gfx_input_primitive_vec2(UInt32(loc), UInt32(0)),
+    gfx_input_primitive_vec2(UInt32(loc), UInt32(1)))
+@inline gfx_input_primitive(::Type{Float32}, loc::Integer) = gfx_input_primitive_f32(UInt32(loc))
 
 # ── NamedTuple-based I/O ──
 # Vertex shaders can return a NamedTuple with :position and varying fields.
@@ -476,7 +692,7 @@ end
 # Location assignment: non-position fields in declaration order, starting at 0.
 
 """Unpack a vertex shader's NamedTuple return value into set_position! + gfx_output calls."""
-@generated function emit_vertex_outputs(result::NT) where NT <: NamedTuple
+@generated function emit_vertex_outputs(result::NT, ::Val{Flats}) where {NT <: NamedTuple, Flats}
     exprs = Expr[]
     if hasfield(NT, :position)
         push!(exprs, :(set_position!(result.position)))
@@ -484,15 +700,25 @@ end
     loc = 0
     for name in fieldnames(NT)
         name === :position && continue
-        push!(exprs, :(gfx_output($loc, result.$name)))
+        out = name in Flats ? :gfx_output_flat : :gfx_output
+        push!(exprs, :($out($loc, result.$name)))
         loc += 1
     end
     push!(exprs, :(return nothing))
     return Expr(:block, exprs...)
 end
 
-"""Build a NamedTuple of fragment inputs from gfx_input calls, matching the vertex output type."""
-@generated function load_fragment_inputs(::Type{NT}) where NT <: NamedTuple
+# The declaration-free form, for a stage whose pipeline declared no `Flat`.
+@inline emit_vertex_outputs(result::NamedTuple) = emit_vertex_outputs(result, Val(()))
+
+"""
+Build a NamedTuple of fragment inputs from gfx_input calls, matching the vertex output type.
+
+`Flats` are read flat, and `Prims` — the names a mesh stage wrote per PRIMITIVE —
+as per-primitive inputs; see [`FragmentWrapper`](@ref).
+"""
+@generated function load_fragment_inputs(::Type{NT}, ::Val{Flats},
+                                         ::Val{Prims}) where {NT <: NamedTuple, Flats, Prims}
     exprs = Expr[]
     names_list = Symbol[]
     loc = 0
@@ -500,13 +726,20 @@ end
         name === :position && continue
         T = fieldtype(NT, name)
         push!(names_list, name)
-        push!(exprs, :(gfx_input($T, $loc)))
+        inp = name in Prims ? :gfx_input_primitive :
+              name in Flats ? :gfx_input_flat : :gfx_input
+        push!(exprs, :($inp($T, $loc)))
         loc += 1
     end
     keys_expr = Expr(:tuple, QuoteNode.(names_list)...)
     vals_expr = Expr(:tuple, exprs...)
     return :(NamedTuple{$keys_expr}($vals_expr))
 end
+
+@inline load_fragment_inputs(::Type{NT}, flats::Val) where {NT <: NamedTuple} =
+    load_fragment_inputs(NT, flats, Val(()))
+@inline load_fragment_inputs(::Type{NT}) where {NT <: NamedTuple} =
+    load_fragment_inputs(NT, Val(()), Val(()))
 
 """
 Emit fragment output: `Vec4f` → location 0, NamedTuple with `:color` → location 0,
@@ -518,6 +751,8 @@ are positional everywhere else — `location = 0` is the first colour attachment
 the pass, not a name the shader chooses.
 """
 @inline emit_fragment_output(color::Vec4f) = gfx_output(0, color)
+@inline emit_fragment_output(ids::Vec{2,UInt32}) = gfx_output(0, ids)
+@inline emit_fragment_output(id::UInt32) = gfx_output(0, id)
 
 # A fragment shader that returns `nothing` writes no attachment, which is what a
 # depth-only pass wants: the depth test and the depth write are the whole of it,
@@ -525,6 +760,12 @@ the pass, not a name the shader chooses.
 @inline emit_fragment_output(::Nothing) = nothing
 
 @generated function emit_fragment_output(colors::T) where {T<:Tuple}
+    # A colour IS a four-tuple, so `T <: Tuple` alone read a fragment returning
+    # an `NTuple{4,Float32}` varying as four targets of one float each, and the
+    # attachment got a red channel's worth of the colour. The test is on the
+    # ELEMENT: a per-target tuple holds colours and a colour is not a `Real`.
+    # The same rule as Metal's `stage_fragment_out`.
+    fieldcount(T) > 0 && fieldtype(T, 1) <: Real && return :(gfx_output(0, colors))
     # Literal locations, so each reaches the emitter as the constant it needs.
     stores = [:(gfx_output($(i - 1), colors[$i])) for i in 1:fieldcount(T)]
     quote
@@ -555,6 +796,12 @@ end
 # `geom_input_position(vertex_idx, component)` reads `gl_in[vertex_idx].gl_Position[component]`
 # vertex_idx is 0-based (matching GLSL gl_in[0..N-1]).
 
+"""
+    geom_input_position(vertex) -> Vec4f
+    geom_input_position(vertex::UInt32, component::UInt32) -> Float32
+
+The position of input vertex `vertex`, from zero, in a geometry stage.
+"""
 @inline function geom_input_position(vertex_idx::UInt32, component::UInt32)
     Base.llvmcall(("""
         declare float @_lava_geom_input_position(i32, i32) #0
@@ -623,6 +870,12 @@ end
 
 # High-level dispatch: geom_input(Type, location, vertex_idx)
 # vertex_idx is 0-based (matches GLSL gl_in[0], gl_in[1], ...)
+"""
+    geom_input(T, location, vertex) -> T
+
+Read the stage input of type `T` at `location` for input vertex `vertex`, from zero,
+in a geometry stage.
+"""
 @inline geom_input(::Type{Vec4f}, loc::Integer, vidx::Integer) = Vec4f(
     geom_input_vec4(UInt32(loc), UInt32(vidx), UInt32(0)),
     geom_input_vec4(UInt32(loc), UInt32(vidx), UInt32(1)),
@@ -651,35 +904,487 @@ end
 # These callable structs wrap user functions to translate NamedTuple returns
 # into the low-level gfx_output/gfx_input intrinsic calls.
 
-"""Wraps a vertex shader that returns a NamedTuple."""
-struct VertexWrapper{F} end
+# `VID` is whether the body takes a leading `VertexIndex`, decided on
+# the host (`wantsvertexindex`): a `@generated` body may not call
+# `hasmethod`. A portable body takes one so it also runs where it is lowered onto a
+# mesh stage, which has no `vertex_index()`.
+"""
+Wraps a vertex (or geometry) stage that RETURNS `(position = …, varyings…)`.
 
-@generated function (::VertexWrapper{F})(args...) where F
+`Flats` is the tuple of names the pipeline declared `Flat`; they are written
+with the flat intrinsics so the rasteriser delivers them per primitive instead
+of interpolating them. It is a type parameter and not a field for the reason the
+whole wrapper is `@generated`: the location of each varying is a constant, and a
+stage that decided one at runtime could not be a stage.
+"""
+struct VertexWrapper{F, Flats, VID} end
+
+VertexWrapper{F}() where {F} = VertexWrapper{F, (), false}()
+VertexWrapper{F, Flats}() where {F, Flats} = VertexWrapper{F, Flats, false}()
+
+# Every wrapper hands the body its arguments WRITTEN OUT, never as `args...`:
+# inference resolves a splat of at most 32 elements, and past that the call
+# stays a dynamic `_apply_iterate`, which does not compile to SPIR-V. RayMakie's
+# mesh shader takes 51. A comprehension over `args`, not a helper function: a
+# generator runs in the world its method was defined in.
+@generated function (::VertexWrapper{F, Flats, VID})(args...) where {F, Flats, VID}
+    # `Val{Flats}()` and not `Val($Flats)`: splicing a tuple of SYMBOLS into an
+    # expression puts each symbol in value position, where it reads as a
+    # variable — ten undefined names, and a `MethodError` thrown from inside a
+    # vertex shader. The parameter is already a type parameter here; using it
+    # directly is both correct and one less thing to evaluate.
+    lead = VID ? (:(VertexIndex(vertex_index())),) : ()
     quote
-        result = F.instance(args...)
-        emit_vertex_outputs(result)
+        result = F.instance($(lead...), $((:(args[$i]) for i in 1:length(args))...))
+        emit_vertex_outputs(result, Val{Flats}())
     end
 end
 
-"""Wraps a fragment shader that takes a NamedTuple of varyings as first arg."""
-struct FragmentWrapper{F, VOut} end
+# The interpolation qualifier lives on the intrinsic here (`gfx_output` against
+# `gfx_output_flat`), which is how the emitter learns to decorate the output
+# variable at all — so the lowering reads both parameters off the emitter type,
+# which is what `mesh.jl` says an emitter is for.
+@lava_device_override @generated function emit!(
+        ::NativeEmitter{Out, Flats}, v::NamedTuple) where {Out, Flats}
+    exprs = Expr[:(set_position!(v.position))]
+    loc = 0
+    for name in fieldnames(Out)
+        name === :position && continue
+        out = name in Flats ? :gfx_output_flat : :gfx_output
+        push!(exprs, :($out($loc, v.$name)))
+        loc += 1
+    end
+    push!(exprs, :(emit_vertex!()))
+    return Expr(:block, exprs..., :(return nothing))
+end
 
-@generated function (::FragmentWrapper{F, VOut})(args...) where {F, VOut}
+@lava_device_override endprimitive!(::NativeEmitter) =
+    (end_primitive!(); nothing)
+
+"""
+Wraps a geometry stage that takes `(emitter, primitive, args...)`.
+
+`VIn` is the producing stage's output type — what the rasteriser arrays across
+the input primitive — and `NV` how many vertices that primitive has, which the
+input topology decides (four for a line adjacency, three for a triangle). The
+body reads `prim.<name>[i]` with `i` ONE-BASED, like every index in this stack;
+`geom_input` counts from zero, and this is the one place that difference is
+resolved.
+
+The primitive is built EAGERLY, one `NTuple{NV}` per declared varying: a
+geometry body reads a handful of them and the reads are `OpLoad`s from an input
+array, so materialising the tuple is what lets the body index it with a value
+the compiler can fold.
+"""
+struct GeometryWrapper{F, VIn, Out, Flats, NV} end
+
+@generated function (::GeometryWrapper{F, VIn, Out, Flats, NV})(args...) where {F, VIn, Out, Flats, NV}
+    names = Symbol[]
+    vals = Expr[]
+    push!(names, :position)
+    push!(vals, Expr(:tuple, [:(geom_input_position(UInt32($(i - 1)))) for i in 1:NV]...))
+    loc = 0
+    for name in fieldnames(VIn)
+        name === :position && continue
+        T = fieldtype(VIn, name)
+        push!(names, name)
+        push!(vals, Expr(:tuple, [:(geom_input($T, $loc, $(i - 1))) for i in 1:NV]...))
+        loc += 1
+    end
+    prim = :(NamedTuple{$(Expr(:tuple, QuoteNode.(names)...))}($(Expr(:tuple, vals...))))
     quote
-        inputs = load_fragment_inputs($VOut)
-        result = F.instance(inputs, args...)
+        F.instance(NativeEmitter{Out, Flats}(), $prim,
+                   $((:(args[$i]) for i in 1:length(args))...))
+        return nothing
+    end
+end
+
+"""
+Wraps a fragment stage that takes the varyings as its first argument.
+
+`VOut` is the producing stage's output type — what the rasteriser hands this one
+— and `Flats` says which of those names were declared flat, so this side reads
+them with the matching intrinsic. Vulkan requires the two sides to agree, and a
+disagreement is a link error rather than a wrong picture.
+
+`Prims` is the names, among `Flats`, the producing stage wrote PER PRIMITIVE:
+every `Flat` output of a mesh stage (`MeshWrapper`), and nothing a vertex
+or geometry stage produces, which has no primitive to write to and delivers a
+flat value from its provoking vertex. They are read as `PerPrimitiveEXT` inputs,
+the decoration a mesh stage's primitive plane carries, and the two sides have to
+agree on it as they do on `Flat`.
+"""
+struct FragmentWrapper{F, VOut, Flats, Prims} end
+
+FragmentWrapper{F, VOut}() where {F, VOut} = FragmentWrapper{F, VOut, (), ()}()
+FragmentWrapper{F, VOut, Flats}() where {F, VOut, Flats} = FragmentWrapper{F, VOut, Flats, ()}()
+
+@generated function (::FragmentWrapper{F, VOut, Flats, Prims})(args...) where {F, VOut, Flats, Prims}
+    quote
+        inputs = load_fragment_inputs(VOut, Val{Flats}(), Val{Prims}())
+        result = F.instance(inputs, $((:(args[$i]) for i in 1:length(args))...))
         emit_fragment_output(result)
     end
 end
 
+# ── Mesh Shader ──
+#
+# These implement KernelInterface's mesh verbs for this backend. The `out`
+# handle is a `LavaMeshOut`, a zero-field marker: on Metal the output object is
+# a real pointer the stage is handed, while in SPIR-V the outputs are module
+# variables and there is nothing to pass. The parameter stays because the
+# PORTABLE signature has it, and a body written against it compiles on both.
+#
+# Slots are one-based at this boundary, like every other index in the API, and
+# are converted once here — the SPIR-V arrays are zero-based.
+
+"""
+    LavaMeshOut{Out, Flats, T}()
+
+The mesh stage's output object: nothing at run time, the stage's DECLARATION in
+its type.
+
+`Out` is the declared output type, `position` plus the varyings with `Flat`
+stripped — the same `VOut` the fragment stage's [`FragmentWrapper`](@ref) reads —
+and a varying's Location is its position in `Out` with `position` skipped, which
+is the rule the fragment side numbers by. `Flats` are the names declared `Flat`,
+which in a mesh stage means the PRIMITIVE plane (`Flat`): a
+`PerPrimitiveEXT` output array, one element per primitive slot. `T` is the
+output topology, which is how many vertices a primitive has.
+
+The declaration has to be here and not read off what the body writes. A body that
+writes its varyings in another order than it declared them, or leaves its flat
+fields out of `set_mesh_vertex!` and names them through
+`set_mesh_primitive_data!` instead — which is what `MeshEmitter`
+does for every lowered geometry stage — would otherwise put them at locations the
+fragment stage does not read. That was the case: locations were numbered in the
+order of the tuple written, which agreed with the declaration only for a body
+that wrote every output per vertex, in order.
+"""
+struct LavaMeshOut{Out, Flats, T} end
+
+"""
+    MeshWrapper{F, Out, Flats, T}()
+
+Wraps a mesh stage that takes `(out, args...)`, handing it the
+[`LavaMeshOut`](@ref) its declaration describes.
+
+The same role `VertexWrapper` plays for a vertex body: a stage is declared
+portably and compiled here, and the wrapper is where the two meet. `Out`, `Flats`
+and `T` are the stage's output type, its `Flat` names and its topology, and they
+are what the writers number and place each field by.
+"""
+struct MeshWrapper{F, Out, Flats, T} end
+
+@generated function (::MeshWrapper{F, Out, Flats, T})(args...) where {F, Out, Flats, T}
+    quote
+        F.instance(LavaMeshOut{Out, Flats, T}(), $((:(args[$i]) for i in 1:length(args))...))
+        return nothing
+    end
+end
+
+"""
+    mesh_location(Out, name) -> UInt32
+
+The Location of the declared varying `name`: its position among `Out`'s fields,
+`position` skipped and counting from zero. The fragment stage's
+`load_fragment_inputs` numbers the same way, which is what links the two.
+
+Called by the writers' generators, so a name the stage never declared is reported
+there, naming the declaration.
+"""
+function mesh_location(@nospecialize(Out::Type), name::Symbol)
+    names = filter(!=(:position), fieldnames(Out))
+    i = findfirst(==(name), names)
+    i === nothing && error("`$name` is not an output of this mesh stage, which declares " *
+                           "$(names). Declare it in the stage's `outputs`, or the " *
+                           "fragment stage has no location to read it from.")
+    return UInt32(i - 1)
+end
+
+@lava_device_override @inline function set_mesh_outputs!(::LavaMeshOut,
+                                                                        nvertices::Integer,
+                                                                        nprimitives::Integer)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_set_outputs(i32, i32) #0
+        define void @entry(i32 %nv, i32 %np) #0 {
+            call void @_lava_mesh_set_outputs(i32 %nv, i32 %np)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{Int32, Int32}, Int32(nvertices), Int32(nprimitives))
+end
+
+# Which invocation and which threadgroup. A mesh stage is a workgroup, so these
+# are the SAME builtins a compute kernel reads — `LocalInvocationId` and
+# `WorkgroupId` — rather than anything mesh-specific. One-based, like every
+# other index in this API.
+@lava_device_override @inline mesh_thread_index() =
+    Int32(lava_local_invocation_id(1)) + Int32(1)
+@lava_device_override @inline mesh_group_index() =
+    Int32(lava_workgroup_id(1)) + Int32(1)
+
+@inline function mesh_set_position!(slot::Int32, x::Float32, y::Float32, z::Float32, w::Float32)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_set_position(i32, float, float, float, float) #0
+        define void @entry(i32 %s, float %x, float %y, float %z, float %w) #0 {
+            call void @_lava_mesh_set_position(i32 %s, float %x, float %y, float %z, float %w)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{Int32, Float32, Float32, Float32, Float32}, slot, x, y, z, w)
+end
+
+# One vertex, split by name at compile time. `@generated` because where each field
+# goes is a property of the TYPES: its Location is a literal the emitter reads to
+# find the output array, and whether it is a varying or the primitive's is the
+# declaration's `Flat`.
+#
+# A `Flat` field in the vertex tuple is legal and goes to the PRIMITIVE plane,
+# because that is where the declaration put it and where the fragment stage reads
+# it (`PerPrimitiveEXT`); a portable body may write its flat fields per vertex —
+# Mantle's contract is that every declared output is a vertex output and `Flat`
+# only says how it is delivered. The vertex that writes it is the primitive's
+# PROVOKING vertex, the first, which is Vulkan's rule for a flat varying: slot
+# `s` (zero-based) provokes primitive `s ÷ n` when `s % n == 0`, for `n` vertices
+# a primitive. That reads the primitive off the vertex slot rather than the index
+# list, so it is exact when primitives own their vertices in order — what a stage
+# that COMPUTES its geometry writes, and `set_mesh_triangle!(out, t, 3t-2, 3t-1,
+# 3t)` — and it is the rule Metal's backend applies too, so both backends draw the
+# same frame from the same body. A stage that shares vertices between primitives
+# has no single primitive to attribute one to, and names the primitive with
+# `set_mesh_primitive_data!`.
+@lava_device_override @generated function set_mesh_vertex!(
+        ::LavaMeshOut{Out, Flats, T}, slot::Integer, v::NamedTuple) where {Out, Flats, T}
+    hasfield(v, :position) ||
+        error("a mesh vertex needs a `position`; got $(fieldnames(v))")
+    vpp = Int32(primitivevertices(T()))
+    writes = Expr[:(mesh_set_position!(s, p[1], p[2], p[3], p[4]))]
+    flat = Expr[]
+    for name in fieldnames(v)
+        name === :position && continue
+        loc = mesh_location(Out, name)
+        if name in Flats
+            push!(flat, :(mesh_primitive_output!($loc, s ÷ $vpp, v.$name)))
+        else
+            push!(writes, :(mesh_output!($loc, s, v.$name)))
+        end
+    end
+    isempty(flat) || push!(writes, Expr(:if, :(s % $vpp == Int32(0)), Expr(:block, flat...)))
+    return quote
+        s = Int32(slot) - Int32(1)
+        p = v.position
+        $(writes...)
+        return nothing
+    end
+end
+
+# The portable spelling for a primitive's own values: `slot` names the primitive,
+# so nothing is inferred from vertex slots. Only `Flat` names belong here — a
+# smooth varying has one value per vertex and no primitive to give one to.
+@lava_device_override @generated function set_mesh_primitive_data!(
+        ::LavaMeshOut{Out, Flats, T}, slot::Integer, d::NamedTuple) where {Out, Flats, T}
+    writes = Expr[]
+    for name in fieldnames(d)
+        name in Flats || error(
+            "`$name` is written per primitive, and this mesh stage does not declare " *
+            "it `Flat` (its flat outputs are $(Flats)). A per-primitive value is the " *
+            "primitive's plane, which is what `Flat` declares.")
+        push!(writes, :(mesh_primitive_output!($(mesh_location(Out, name)), prim, d.$name)))
+    end
+    return quote
+        prim = Int32(slot) - Int32(1)
+        $(writes...)
+        return nothing
+    end
+end
+
+@lava_device_override @inline function set_mesh_triangle!(::LavaMeshOut,
+                                                                         slot::Integer,
+                                                                         i0::Integer, i1::Integer, i2::Integer)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_set_primitive3(i32, i32, i32, i32) #0
+        define void @entry(i32 %s, i32 %a, i32 %b, i32 %c) #0 {
+            call void @_lava_mesh_set_primitive3(i32 %s, i32 %a, i32 %b, i32 %c)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{Int32, Int32, Int32, Int32},
+    Int32(slot) - Int32(1), Int32(i0) - Int32(1), Int32(i1) - Int32(1), Int32(i2) - Int32(1))
+end
+
+@lava_device_override @inline function set_mesh_line!(::LavaMeshOut,
+                                                                     slot::Integer,
+                                                                     i0::Integer, i1::Integer)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_set_primitive2(i32, i32, i32) #0
+        define void @entry(i32 %s, i32 %a, i32 %b) #0 {
+            call void @_lava_mesh_set_primitive2(i32 %s, i32 %a, i32 %b)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{Int32, Int32, Int32},
+    Int32(slot) - Int32(1), Int32(i0) - Int32(1), Int32(i1) - Int32(1))
+end
+
+@lava_device_override @inline function set_mesh_point!(::LavaMeshOut,
+                                                                      slot::Integer, i0::Integer)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_set_primitive1(i32, i32) #0
+        define void @entry(i32 %s, i32 %a) #0 {
+            call void @_lava_mesh_set_primitive1(i32 %s, i32 %a)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{Int32, Int32}, Int32(slot) - Int32(1), Int32(i0) - Int32(1))
+end
+
+# The mesh stage's user varyings.
+#
+# One per width, and each takes `(location, slot, components...)` — the slot is
+# separate from the value because a mesh stage writes a whole ARRAY of each
+# varying, one element per vertex it emits, where a vertex stage writes one.
+#
+# There is no integer width here on purpose. The only integer varying anything
+# has wanted is an id that is constant across its primitive, and that is exactly
+# what a FLAT fragment input delivers: flat takes the provoking vertex's value
+# rather than interpolating, so an `f32` carrying a small integer arrives
+# unchanged. An integer output plane can be added when something needs one that
+# is not per-primitive constant.
+
+@inline function mesh_output!(loc::UInt32, slot::Int32, v::Float32)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_output_f32(i32, i32, float) #0
+        define void @entry(i32 %l, i32 %s, float %v) #0 {
+            call void @_lava_mesh_output_f32(i32 %l, i32 %s, float %v)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32, Int32, Float32}, loc, slot, v)
+end
+
+@inline function mesh_output!(loc::UInt32, slot::Int32, v::Vec2f)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_output_vec2(i32, i32, float, float) #0
+        define void @entry(i32 %l, i32 %s, float %x, float %y) #0 {
+            call void @_lava_mesh_output_vec2(i32 %l, i32 %s, float %x, float %y)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32, Int32, Float32, Float32}, loc, slot, v[1], v[2])
+end
+
+@inline function mesh_output!(loc::UInt32, slot::Int32, v::Vec3f)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_output_vec3(i32, i32, float, float, float) #0
+        define void @entry(i32 %l, i32 %s, float %x, float %y, float %z) #0 {
+            call void @_lava_mesh_output_vec3(i32 %l, i32 %s, float %x, float %y, float %z)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32, Int32, Float32, Float32, Float32}, loc, slot, v[1], v[2], v[3])
+end
+
+@inline function mesh_output!(loc::UInt32, slot::Int32, v::Vec4f)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_output_vec4(i32, i32, float, float, float, float) #0
+        define void @entry(i32 %l, i32 %s, float %x, float %y, float %z, float %w) #0 {
+            call void @_lava_mesh_output_vec4(i32 %l, i32 %s, float %x, float %y, float %z, float %w)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32, Int32, Float32, Float32, Float32, Float32},
+    loc, slot, v[1], v[2], v[3], v[4])
+end
+
+# The TUPLE spellings of a varying. `NTuple{N,Float32}` is the same N floats as
+# `Vec{N,Float32}`, and a portable stage may declare and write either: Metal's
+# mesh and vertex stages take both. The interface variable is typed by the
+# intrinsic the value goes through, so a tuple routed through the vector one
+# links against a stage that spelled it as a vector. Without these a tuple
+# varying had no method, the stage inferred to `Union{}`, and Mantle's access
+# walk refused the draw.
+const FloatTuple = Union{NTuple{2,Float32}, NTuple{3,Float32}, NTuple{4,Float32}}
+
+@inline gfx_output(loc::Integer, v::FloatTuple) = gfx_output(loc, Vec(v))
+@inline gfx_output_flat(loc::Integer, v::FloatTuple) = gfx_output_flat(loc, Vec(v))
+@inline mesh_output!(loc::UInt32, slot::Int32, v::FloatTuple) = mesh_output!(loc, slot, Vec(v))
+@inline gfx_input(::Type{NTuple{N,Float32}}, loc::Integer) where {N} =
+    Tuple(gfx_input(Vec{N,Float32}, loc))
+@inline gfx_input_flat(::Type{NTuple{N,Float32}}, loc::Integer) where {N} =
+    Tuple(gfx_input_flat(Vec{N,Float32}, loc))
+@inline geom_input(::Type{NTuple{N,Float32}}, loc::Integer, vidx::Integer) where {N} =
+    Tuple(geom_input(Vec{N,Float32}, loc, vidx))
+
+# The mesh stage's PER-PRIMITIVE outputs: the same widths and the same
+# `(location, slot, components...)` shape as the per-vertex ones above, with the
+# slot a PRIMITIVE slot. The emitter gives each its own `PerPrimitiveEXT` array of
+# `max_primitives` elements, so these are a separate family of intrinsics rather
+# than a flag on those — the array a location names is decided in the prescan,
+# before any call is emitted.
+
+@inline function mesh_primitive_output!(loc::UInt32, prim::Int32, v::Float32)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_primitive_output_f32(i32, i32, float) #0
+        define void @entry(i32 %l, i32 %p, float %v) #0 {
+            call void @_lava_mesh_primitive_output_f32(i32 %l, i32 %p, float %v)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32, Int32, Float32}, loc, prim, v)
+end
+
+@inline function mesh_primitive_output!(loc::UInt32, prim::Int32, v::Vec2f)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_primitive_output_vec2(i32, i32, float, float) #0
+        define void @entry(i32 %l, i32 %p, float %x, float %y) #0 {
+            call void @_lava_mesh_primitive_output_vec2(i32 %l, i32 %p, float %x, float %y)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32, Int32, Float32, Float32}, loc, prim, v[1], v[2])
+end
+
+@inline function mesh_primitive_output!(loc::UInt32, prim::Int32, v::Vec3f)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_primitive_output_vec3(i32, i32, float, float, float) #0
+        define void @entry(i32 %l, i32 %p, float %x, float %y, float %z) #0 {
+            call void @_lava_mesh_primitive_output_vec3(i32 %l, i32 %p, float %x, float %y, float %z)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32, Int32, Float32, Float32, Float32},
+    loc, prim, v[1], v[2], v[3])
+end
+
+@inline function mesh_primitive_output!(loc::UInt32, prim::Int32, v::Vec4f)
+    Base.llvmcall(("""
+        declare void @_lava_mesh_primitive_output_vec4(i32, i32, float, float, float, float) #0
+        define void @entry(i32 %l, i32 %p, float %x, float %y, float %z, float %w) #0 {
+            call void @_lava_mesh_primitive_output_vec4(i32 %l, i32 %p, float %x, float %y, float %z, float %w)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{UInt32, Int32, Float32, Float32, Float32, Float32},
+    loc, prim, v[1], v[2], v[3], v[4])
+end
+
+@inline mesh_primitive_output!(loc::UInt32, prim::Int32, v::FloatTuple) =
+    mesh_primitive_output!(loc, prim, Vec(v))
+@inline gfx_input_primitive(::Type{NTuple{N,Float32}}, loc::Integer) where {N} =
+    Tuple(gfx_input_primitive(Vec{N,Float32}, loc))
+
 # ── Register intrinsic names for GPUCompiler validation ──
 # These are the LLVM IR function names (not the Julia names)
+push!(KNOWN_INTRINSICS, "_lava_gfx_discard")
 push!(KNOWN_INTRINSICS, "_lava_gfx_set_position")
 push!(KNOWN_INTRINSICS, "_lava_gfx_set_point_size")
 push!(KNOWN_INTRINSICS, "_lava_gfx_output_f32")
 push!(KNOWN_INTRINSICS, "_lava_gfx_output_vec4")
 push!(KNOWN_INTRINSICS, "_lava_gfx_output_vec3")
 push!(KNOWN_INTRINSICS, "_lava_gfx_output_vec2")
+push!(KNOWN_INTRINSICS, "_lava_gfx_output_uvec2")
+push!(KNOWN_INTRINSICS, "_lava_gfx_output_u32")
 push!(KNOWN_INTRINSICS, "_lava_gfx_output_flat_f32")
 push!(KNOWN_INTRINSICS, "_lava_gfx_output_flat_vec4")
 push!(KNOWN_INTRINSICS, "_lava_gfx_output_flat_vec3")
@@ -689,8 +1394,13 @@ push!(KNOWN_INTRINSICS, "_lava_gfx_input_vec3")
 push!(KNOWN_INTRINSICS, "_lava_gfx_input_vec2")
 push!(KNOWN_INTRINSICS, "_lava_gfx_input_f32")
 push!(KNOWN_INTRINSICS, "_lava_gfx_input_flat_vec4")
+push!(KNOWN_INTRINSICS, "_lava_gfx_input_flat_vec3")
 push!(KNOWN_INTRINSICS, "_lava_gfx_input_flat_vec2")
 push!(KNOWN_INTRINSICS, "_lava_gfx_input_flat_f32")
+push!(KNOWN_INTRINSICS, "_lava_gfx_input_primitive_vec4")
+push!(KNOWN_INTRINSICS, "_lava_gfx_input_primitive_vec3")
+push!(KNOWN_INTRINSICS, "_lava_gfx_input_primitive_vec2")
+push!(KNOWN_INTRINSICS, "_lava_gfx_input_primitive_f32")
 push!(KNOWN_INTRINSICS, "_lava_gfx_dFdx_f32")
 push!(KNOWN_INTRINSICS, "_lava_gfx_dFdy_f32")
 push!(KNOWN_INTRINSICS, "_lava_gfx_emit_vertex")
@@ -698,6 +1408,20 @@ push!(KNOWN_INTRINSICS, "_lava_gfx_end_primitive")
 push!(KNOWN_INTRINSICS, "_lava_gfx_set_tess_level_outer")
 push!(KNOWN_INTRINSICS, "_lava_gfx_set_tess_level_inner")
 push!(KNOWN_INTRINSICS, "_lava_gfx_sample_2d")
+# Mesh stage
+push!(KNOWN_INTRINSICS, "_lava_mesh_set_outputs")
+push!(KNOWN_INTRINSICS, "_lava_mesh_set_position")
+push!(KNOWN_INTRINSICS, "_lava_mesh_set_primitive1")
+push!(KNOWN_INTRINSICS, "_lava_mesh_set_primitive2")
+push!(KNOWN_INTRINSICS, "_lava_mesh_set_primitive3")
+push!(KNOWN_INTRINSICS, "_lava_mesh_output_f32")
+push!(KNOWN_INTRINSICS, "_lava_mesh_output_vec2")
+push!(KNOWN_INTRINSICS, "_lava_mesh_output_vec3")
+push!(KNOWN_INTRINSICS, "_lava_mesh_output_vec4")
+push!(KNOWN_INTRINSICS, "_lava_mesh_primitive_output_f32")
+push!(KNOWN_INTRINSICS, "_lava_mesh_primitive_output_vec2")
+push!(KNOWN_INTRINSICS, "_lava_mesh_primitive_output_vec3")
+push!(KNOWN_INTRINSICS, "_lava_mesh_primitive_output_vec4")
 # Geometry shader arrayed inputs
 push!(KNOWN_INTRINSICS, "_lava_geom_input_position")
 push!(KNOWN_INTRINSICS, "_lava_geom_input_vec4")

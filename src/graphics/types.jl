@@ -1,82 +1,40 @@
-# Graphics pipeline configuration types for Lava.jl
-#
-# Pure Julia types — no Vulkan dependency, used for dispatch everywhere.
-# Pipeline state encoded in type parameters for zero-cost dispatch.
+# Tessellation stage configuration. `Topology` and `GeometryConfig` are the
+# vocabulary's (`vocabulary/topology.jl`, `vocabulary/graphics.jl`); blend, cull,
+# depth and render-target state are the runtime's.
 
-# ── Shader Stage Types ──
-
-abstract type ShaderStage end
-struct VertexStage      <: ShaderStage end
-struct FragmentStage    <: ShaderStage end
-struct GeometryStage    <: ShaderStage end
-struct TessControlStage <: ShaderStage end
-struct TessEvalStage    <: ShaderStage end
-
-# ── Blend Modes ──
-
-abstract type BlendMode end
-struct Opaque        <: BlendMode end   # no blending
-struct AlphaBlend    <: BlendMode end   # src.a * src + (1-src.a) * dst
-struct Additive      <: BlendMode end   # src + dst
-struct Premultiplied <: BlendMode end   # premultiplied alpha
-
-# ── Culling ──
-
-abstract type CullFace end
-struct NoCull    <: CullFace end
-struct CullBack  <: CullFace end
-struct CullFront <: CullFace end
-
-# ── Input Topology ──
-
-abstract type Topology end
-struct TriangleList  <: Topology end
-struct TriangleStrip <: Topology end
-struct LineList      <: Topology end
-struct LineStrip     <: Topology end
-struct PointList     <: Topology end
-struct PatchList          <: Topology end  # for tessellation
-struct LineListAdjacency  <: Topology end  # for geometry shader line processing
-
-# ── Depth Test ──
-
-abstract type DepthMode end
-struct DepthLess     <: DepthMode end   # default: closer wins
-struct DepthLessEq   <: DepthMode end
-struct DepthGreater  <: DepthMode end
-struct DepthAlways   <: DepthMode end
-struct DepthOff      <: DepthMode end   # no depth test/write
-
-# ── Geometry Shader Config ──
-
-struct GeometryConfig
-    input_topology::Topology
-    output_topology::Topology
-    max_vertices::Int
-    invocations::Int
-end
-
-function GeometryConfig(; input::Topology=TriangleList(), output::Topology=TriangleStrip(),
-                          max_vertices::Integer=3, invocations::Integer=1)
-    GeometryConfig(input, output, max_vertices, invocations)
-end
-
-# ── Tessellation Config ──
-
+"""How a tessellation evaluation stage spaces the generated vertices along an edge."""
 abstract type TessSpacing end
+"""Equal spacing: the tessellation level is rounded up to an integer."""
 struct EqualSpacing          <: TessSpacing end
+"""Fractional spacing with an even number of segments."""
 struct FractionalEvenSpacing <: TessSpacing end
+"""Fractional spacing with an odd number of segments."""
 struct FractionalOddSpacing  <: TessSpacing end
 
+"""The winding order of the triangles a tessellation evaluation stage generates."""
 abstract type TessWinding end
+"""Clockwise winding."""
 struct WindingCW  <: TessWinding end
+"""Counter-clockwise winding."""
 struct WindingCCW <: TessWinding end
 
+"""The domain a tessellation evaluation stage subdivides."""
 abstract type TessDomain end
+"""Triangle domain: `tess_coord_uvw` is barycentric."""
 struct TessTriangles <: TessDomain end
+"""Quad domain: `tess_coord` is a point in the unit square."""
 struct TessQuads     <: TessDomain end
+"""Isoline domain: sets of lines across the unit square."""
 struct TessIsolines  <: TessDomain end
 
+"""
+    TessConfig(; vertices = 3, spacing = EqualSpacing(), winding = WindingCCW(),
+                 domain = TessTriangles())
+
+The execution modes of a tessellation stage pair: `vertices` per input patch and how
+the evaluation stage spaces, winds and parameterizes what it generates. Passed as
+`config` to [`lava_compile`](@ref) for `:tess_control` and `:tess_eval`.
+"""
 struct TessConfig
     patch_vertices::Int
     spacing::TessSpacing
@@ -88,7 +46,3 @@ function TessConfig(; vertices::Integer=3, spacing::TessSpacing=EqualSpacing(),
                       winding::TessWinding=WindingCCW(), domain::TessDomain=TessTriangles())
     TessConfig(vertices, spacing, winding, domain)
 end
-
-# ── Render Target ──
-
-abstract type RenderTarget end

@@ -1,65 +1,53 @@
 name = "Lava"
 uuid = "3a680b1f-cb25-4bee-9cf7-bc880b76dc8c"
+authors = ["Simon Danisch and contributors"]
 version = "0.1.0"
 
 [deps]
-AcceleratedKernels = "6a4ca0a5-0e36-4168-a932-d9be78d558f1"
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 Atomix = "a9b6321e-bd34-4604-b9c9-b65b8de01458"
-GLFW = "f7f18e0c-5ee9-5ccd-a5bf-e8befd85ed98"
 GPUArrays = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
-GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
 GPUCompiler = "61eb1bfa-7361-4325-ad38-22787b887f55"
 GeometryBasics = "5c1252a2-5f33-56bf-86c9-59e7332b4326"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+KernelInterface = "4ee993da-d684-4d17-a7dd-4e58e78d92bf"
 LLVM = "929cbde3-209d-540e-8aea-75f648917ca0"
-LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
-Raycore = "afc56b53-c9a9-482a-a956-d1d800e05559"
-SPIRV_LLVM_Backend_jll = "4376b9bf-cff8-51b6-bb48-39421dff0d0c"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
-Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 SPIRV_Tools_jll = "6ac6d60f-d740-5983-97d7-a4482c0689f4"
+Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 UnsafeAtomics = "013be700-e6cd-48c3-b4a1-df204f14c38f"
+# Only `Vulkan.HAS_LOADER` is used: the compiler is built where a Vulkan loader exists.
 Vulkan = "9f14b124-c50e-4008-a7d4-969b3a6cd68a"
 
-[sources]
-Raycore = {url = "https://github.com/JuliaGeometry/Raycore.jl", rev = "master"}
-
 [compat]
-# Lava depends on a few GPUCompiler internals (rm_trap! was one, now vendored;
-# kernel_state_type, methodinstance, method_table, cached_compilation remain).
-# GPUCompiler removes/renames internals across PATCH releases (1.13.1 → 1.13.3
-# dropped rm_trap!), so a bump is only ever made after testing. Validated on
-# 1.23.0: no source changes needed, kernels bit-identical, and ~20% faster
-# end-to-end than 1.13.3.
-#
-# 2 is allowed, and has to be: CUDA's own `CUDACore` requires `GPUCompiler = 2.1`
-# from 6.2.1 on, so pinning Lava to 1 is what would make the two unsatisfiable in
-# one project — the reverse of what an earlier note here claimed.
-GPUCompiler = "1, 2"
-
-# Only the test suite touches this jll: test/spirv_test_utils.jl runs `llc` as a
-# reference oracle against our own emitter. Nothing in src/ uses it, so the
-# emitted SPIR-V is unaffected by the backend version. 22 is allowed so OpenCL
-# (which requires 22 from 0.10.10 on) can coexist here — that is what unblocks
-# GPUCompiler 2, since no registered OpenCL allows GPUCompiler 2.
-SPIRV_LLVM_Backend_jll = "21.1.4, 22"
+# Lava extends GPUCompiler internals (`finish_ir!`, `validate_ir`, the method table
+# and caching hooks), which change between minor releases; LLVM.jl 10 changed type
+# accessors. The lower bounds are the releases the suite passes on.
+GPUCompiler = "2.22"
+LLVM = "10.4"
+# Lava overrides KernelInterface's `localmemory(T, Val(dims))`, which KernelAbstractions'
+# `@localmem` lowers to, and `sub_group_reduce(+, x)`.
+KernelInterface = "0.4.6"
+KernelAbstractions = "0.10.7"
+# `spirv-opt` and `spirv-val`. The emitter works around `spirv-opt` folding
+# `OpConvertSToF` of a constant by the operand type's signedness.
+SPIRV_Tools_jll = "2025.4"
+Adapt = "4"
+Atomix = "1.5"
+GPUArrays = "12"
+GeometryBasics = "0.5"
+PrecompileTools = "1"
+Serialization = "1"
 StaticArrays = "1.9.17"
+UnsafeAtomics = "0.4"
+Vulkan = "0.7"
 julia = "1.12"
 
 [extras]
-ColorTypes = "3da002f7-5984-5a60-b8a6-cbb66c0b333f"
-JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
-Raycore = "afc56b53-c9a9-482a-a956-d1d800e05559"
-SPIRV_LLVM_Backend_jll = "4376b9bf-cff8-51b6-bb48-39421dff0d0c"
-SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
-StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
-Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
-StructArrays = "09ab397b-f2b6-538f-b94a-2f83cf4a842a"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["ColorTypes", "JLD2", "Logging", "Random", "SPIRV_LLVM_Backend_jll", "SparseArrays", "StaticArrays", "Statistics", "StructArrays", "Test"]
+test = ["Logging", "Random", "Test"]

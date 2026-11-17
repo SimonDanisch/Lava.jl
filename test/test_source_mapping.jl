@@ -1,237 +1,249 @@
-# Tests for source mapping (SPIR-V ID → Julia source) and compilation error handling
+# Source maps (SPIR-V result id → Julia file and line) and the compile errors
+# built from GPUCompiler's `InvalidIRError` (`LavaCompilationError`).
 #
 # Covers:
 # - Source map population during SPIR-V emission
 # - Inlined-at chain walking (user code, not Base internals)
 # - Complex kernels (structs, control flow, math)
 # - File-based kernels (real file paths)
-# - LavaCompilationError for common GPU-incompatible patterns
-# - CompilationResult carries source_map
-# - Validation message leak fix
+# - LavaCompilationError for common GPU-incompatible patterns, on `lava_compile`
+#   and on the job path a launch compiles through
+# - Call chains through user helpers, deduplicated
+#
+# Moved here from Mantle's `test/vulkan/test_source_mapping.jl`. Its two device
+# testsets did not move: "OOM validation messages don't leak" is Mantle's
+# `test/vulkan/test_tolerated_alloc_failure.jl`, which asserts the same thing
+# with the ring drained first; "source mapping doesn't break kernel execution"
+# ran a broadcast, a `sum` and a struct kernel, and every compile builds a source
+# map, so every kernel test in Mantle runs that path.
 
-using Test
-using Lava
-using KernelAbstractions
+using Test, Lava
 using Lava: LavaDeviceArray, lava_compile, CompilationResult,
             LavaCompilationError, shorten_path
 
+# Simple kernel: load, compute, store
+function srcmap_add!(A::LavaDeviceArray{Float32,1}, val::Float32)
+    i = Lava.lava_global_invocation_id_x() + UInt32(1)
+    @inbounds A[i] = A[i] + val
+    return nothing
+end
+
+# Complex kernel: multiple ops, control flow
+function srcmap_complex!(A::LavaDeviceArray{Float32,1}, B::LavaDeviceArray{Float32,1},
+                         scale::Float32, threshold::Float32)
+    i = Lava.lava_global_invocation_id_x() + UInt32(1)
+    @inbounds begin
+        x = A[i]
+        y = B[i]
+        result = x * scale + y * (1.0f0 - scale)
+        if result > threshold
+            A[i] = result
+        else
+            A[i] = threshold
+        end
+    end
+    return nothing
+end
+
+# Struct kernel: NTuple/struct field access
+struct SrcMapVec3
+    x::Float32
+    y::Float32
+    z::Float32
+end
+
+function srcmap_struct!(dst::LavaDeviceArray{SrcMapVec3,1},
+                        src::LavaDeviceArray{SrcMapVec3,1},
+                        scale::Float32)
+    i = Lava.lava_global_invocation_id_x() + UInt32(1)
+    @inbounds begin
+        v = src[i]
+        dst[i] = SrcMapVec3(v.x * scale, v.y * scale, v.z * scale)
+    end
+    return nothing
+end
+
+# Integer kernel: different types
+function srcmap_int!(A::LavaDeviceArray{Int32,1}, mask::Int32)
+    i = Lava.lava_global_invocation_id_x() + UInt32(1)
+    @inbounds A[i] = A[i] & mask
+    return nothing
+end
+
+# Multi-array kernel
+function srcmap_multi!(A::LavaDeviceArray{Float32,1}, B::LavaDeviceArray{Float32,1},
+                       C::LavaDeviceArray{Float32,1})
+    i = Lava.lava_global_invocation_id_x() + UInt32(1)
+    @inbounds C[i] = A[i] * B[i]
+    return nothing
+end
+
+# ── Intentionally broken kernels for error testing ──
+
+# Heap allocation (rand uses RNG state allocation)
+function srcmap_bad_alloc!(A::LavaDeviceArray{Float32,1})
+    i = Lava.lava_global_invocation_id_x() + UInt32(1)
+    x = rand()
+    @inbounds A[i] = Float32(x)
+    return nothing
+end
+
+# The same, compiled only through the launch path (`compile_or_lookup`).
+function srcmap_launch_bad_alloc!(A::LavaDeviceArray{Float32,1})
+    i = Lava.lava_global_invocation_id_x() + UInt32(1)
+    x = rand()
+    @inbounds A[i] = Float32(x)
+    return nothing
+end
+
+# Type instability (Any element type → dynamic dispatch)
+function srcmap_bad_unstable!(A::LavaDeviceArray{Any,1})
+    i = Lava.lava_global_invocation_id_x() + UInt32(1)
+    @inbounds A[i] = A[i] * 2
+    return nothing
+end
+
+# Non-const global access
+srcmap_mutable_global = 42
+function srcmap_bad_global!(A::LavaDeviceArray{Float32,1})
+    i = Lava.lava_global_invocation_id_x() + UInt32(1)
+    @inbounds A[i] = Float32(srcmap_mutable_global)
+    return nothing
+end
+
+# ── Deep call chain error patterns ──
+
+# Pattern A: String interpolation buried 3 levels deep in physics simulation
+struct SrcMapParticle
+    x::Float32; y::Float32; vx::Float32; vy::Float32
+end
+
+function srcmap_update_velocity(p::SrcMapParticle, dt::Float32)
+    SrcMapParticle(p.x + p.vx * dt, p.y + p.vy * dt, p.vx, p.vy)
+end
+
+function srcmap_check_collision(p::SrcMapParticle)
+    if p.x < 0.0f0
+        msg = "collision at $(p.x)"  # String interpolation → heap alloc
+        return length(msg)
+    end
+    return Int(0)
+end
+
+function srcmap_physics_step(p::SrcMapParticle, dt::Float32)
+    p2 = srcmap_update_velocity(p, dt)
+    n = srcmap_check_collision(p2)
+    return SrcMapParticle(p2.x, p2.y, p2.vx * (1.0f0 - Float32(n) * 0.01f0), p2.vy)
+end
+
+function srcmap_deep_physics!(particles::LavaDeviceArray{SrcMapParticle,1}, dt::Float32)
+    i = Lava.lava_global_invocation_id_x() + UInt32(1)
+    @inbounds particles[i] = srcmap_physics_step(particles[i], dt)
+    return nothing
+end
+
+# Pattern B: Abstract field accessed 4 levels deep in a scene renderer
+struct SrcMapSceneObject
+    transform::NTuple{4, Float32}
+    material_id::Int32
+    data  # Any-typed — the bug
+end
+
+function srcmap_get_albedo(obj::SrcMapSceneObject)
+    d = obj.data  # type unstable — d is Any
+    return d * 0.5f0
+end
+
+function srcmap_compute_lighting(obj::SrcMapSceneObject, light_dir::Float32)
+    albedo = srcmap_get_albedo(obj)
+    return albedo * max(0.0f0, light_dir)
+end
+
+function srcmap_render_pixel(obj::SrcMapSceneObject, uv::Float32)
+    light = sin(uv * 3.14159f0)
+    return srcmap_compute_lighting(obj, light)
+end
+
+function srcmap_deep_scene!(out::LavaDeviceArray{Float32,1},
+                            objects::LavaDeviceArray{SrcMapSceneObject,1})
+    i = Lava.lava_global_invocation_id_x() + UInt32(1)
+    @inbounds out[i] = srcmap_render_pixel(objects[i], Float32(i) * 0.01f0)
+    return nothing
+end
+
+# Pattern C: error() in validation function 3 levels deep (the classic "I'll just
+# add a bounds check with a nice error message" mistake)
+function srcmap_validate_range(x::Float32)
+    if x < 0.0f0 || x > 1.0f0
+        error("value out of range: $x")  # String alloc + throw
+    end
+    return x
+end
+
+function srcmap_apply_tonemap(x::Float32, exposure::Float32)
+    y = x * exposure
+    return srcmap_validate_range(y / (y + 1.0f0))
+end
+
+function srcmap_deep_error!(out::LavaDeviceArray{Float32,1},
+                            input::LavaDeviceArray{Float32,1},
+                            exposure::Float32)
+    i = Lava.lava_global_invocation_id_x() + UInt32(1)
+    @inbounds out[i] = srcmap_apply_tonemap(input[i], exposure)
+    return nothing
+end
+
+# Pattern D: Accidentally using a CPU-only function from a helper
+# (e.g., calling an IO function for "logging")
+function srcmap_normalize_vec(x::Float32, y::Float32, z::Float32)
+    len = sqrt(x*x + y*y + z*z)
+    return (x/len, y/len, z/len)
+end
+
+function srcmap_process_normal(nx::Float32, ny::Float32, nz::Float32)
+    n = srcmap_normalize_vec(nx, ny, nz)
+    # Accidentally left debug logging in
+    @info "normal: $n"  # Allocates + IO
+    return n
+end
+
+function srcmap_deep_logging!(out::LavaDeviceArray{Float32,1},
+                              normals::LavaDeviceArray{NTuple{3,Float32},1})
+    i = Lava.lava_global_invocation_id_x() + UInt32(1)
+    @inbounds begin
+        n = normals[i]
+        result = srcmap_process_normal(n[1], n[2], n[3])
+        out[i] = result[1] + result[2] + result[3]
+    end
+    return nothing
+end
+
+@testset "source maps and compile errors" begin
+
 # ═══════════════════════════════════════════════════════════════════════
-# Helper: define test kernels inside Lava module to avoid world age issues
-# with GPUCompiler (functions defined in Main can't access Lava internals)
-# ═══════════════════════════════════════════════════════════════════════
-
-Lava.eval(quote
-    # Simple kernel: load, compute, store
-    function _srcmap_add!(A::LavaDeviceArray{Float32,1}, val::Float32)
-        i = lava_global_invocation_id_x() + UInt32(1)
-        @inbounds A[i] = A[i] + val
-        return nothing
-    end
-
-    # Complex kernel: multiple ops, control flow
-    function _srcmap_complex!(A::LavaDeviceArray{Float32,1}, B::LavaDeviceArray{Float32,1},
-                               scale::Float32, threshold::Float32)
-        i = lava_global_invocation_id_x() + UInt32(1)
-        @inbounds begin
-            x = A[i]
-            y = B[i]
-            result = x * scale + y * (1.0f0 - scale)
-            if result > threshold
-                A[i] = result
-            else
-                A[i] = threshold
-            end
-        end
-        return nothing
-    end
-
-    # Struct kernel: NTuple/struct field access
-    struct _SrcMapVec3
-        x::Float32
-        y::Float32
-        z::Float32
-    end
-
-    function _srcmap_struct!(dst::LavaDeviceArray{_SrcMapVec3,1},
-                              src::LavaDeviceArray{_SrcMapVec3,1},
-                              scale::Float32)
-        i = lava_global_invocation_id_x() + UInt32(1)
-        @inbounds begin
-            v = src[i]
-            dst[i] = _SrcMapVec3(v.x * scale, v.y * scale, v.z * scale)
-        end
-        return nothing
-    end
-
-    # Integer kernel: different types
-    function _srcmap_int!(A::LavaDeviceArray{Int32,1}, mask::Int32)
-        i = lava_global_invocation_id_x() + UInt32(1)
-        @inbounds A[i] = A[i] & mask
-        return nothing
-    end
-
-    # Multi-array kernel
-    function _srcmap_multi!(A::LavaDeviceArray{Float32,1}, B::LavaDeviceArray{Float32,1},
-                             C::LavaDeviceArray{Float32,1})
-        i = lava_global_invocation_id_x() + UInt32(1)
-        @inbounds C[i] = A[i] * B[i]
-        return nothing
-    end
-
-    # ── Intentionally broken kernels for error testing ──
-
-    # Heap allocation (rand uses RNG state allocation)
-    function _srcmap_bad_alloc!(A::LavaDeviceArray{Float32,1})
-        i = lava_global_invocation_id_x() + UInt32(1)
-        x = rand()
-        @inbounds A[i] = Float32(x)
-        return nothing
-    end
-
-    # Type instability (Any element type → dynamic dispatch)
-    function _srcmap_bad_unstable!(A::LavaDeviceArray{Any,1})
-        i = lava_global_invocation_id_x() + UInt32(1)
-        @inbounds A[i] = A[i] * 2
-        return nothing
-    end
-
-    # Non-const global access
-    _srcmap_mutable_global = 42
-    function _srcmap_bad_global!(A::LavaDeviceArray{Float32,1})
-        i = lava_global_invocation_id_x() + UInt32(1)
-        @inbounds A[i] = Float32(_srcmap_mutable_global)
-        return nothing
-    end
-
-    # ── Deep call chain error patterns ──
-
-    # Pattern A: String interpolation buried 3 levels deep in physics simulation
-    struct _TestParticle
-        x::Float32; y::Float32; vx::Float32; vy::Float32
-    end
-
-    function _update_velocity(p::_TestParticle, dt::Float32)
-        _TestParticle(p.x + p.vx * dt, p.y + p.vy * dt, p.vx, p.vy)
-    end
-
-    function _check_collision(p::_TestParticle)
-        if p.x < 0.0f0
-            msg = "collision at $(p.x)"  # String interpolation → heap alloc
-            return length(msg)
-        end
-        return Int(0)
-    end
-
-    function _physics_step(p::_TestParticle, dt::Float32)
-        p2 = _update_velocity(p, dt)
-        n = _check_collision(p2)
-        return _TestParticle(p2.x, p2.y, p2.vx * (1.0f0 - Float32(n) * 0.01f0), p2.vy)
-    end
-
-    function _srcmap_deep_physics!(particles::LavaDeviceArray{_TestParticle,1}, dt::Float32)
-        i = lava_global_invocation_id_x() + UInt32(1)
-        @inbounds particles[i] = _physics_step(particles[i], dt)
-        return nothing
-    end
-
-    # Pattern B: Abstract field accessed 4 levels deep in a scene renderer
-    struct _SceneObject
-        transform::NTuple{4, Float32}
-        material_id::Int32
-        data  # Any-typed — the bug
-    end
-
-    function _get_albedo(obj::_SceneObject)
-        d = obj.data  # type unstable — d is Any
-        return d * 0.5f0
-    end
-
-    function _compute_lighting(obj::_SceneObject, light_dir::Float32)
-        albedo = _get_albedo(obj)
-        return albedo * max(0.0f0, light_dir)
-    end
-
-    function _render_pixel(obj::_SceneObject, uv::Float32)
-        light = sin(uv * 3.14159f0)
-        return _compute_lighting(obj, light)
-    end
-
-    function _srcmap_deep_scene!(out::LavaDeviceArray{Float32,1},
-                                  objects::LavaDeviceArray{_SceneObject,1})
-        i = lava_global_invocation_id_x() + UInt32(1)
-        @inbounds out[i] = _render_pixel(objects[i], Float32(i) * 0.01f0)
-        return nothing
-    end
-
-    # Pattern C: error() in validation function 3 levels deep (the classic "I'll just
-    # add a bounds check with a nice error message" mistake)
-    function _validate_range(x::Float32)
-        if x < 0.0f0 || x > 1.0f0
-            error("value out of range: $x")  # String alloc + throw
-        end
-        return x
-    end
-
-    function _apply_tonemap(x::Float32, exposure::Float32)
-        y = x * exposure
-        return _validate_range(y / (y + 1.0f0))
-    end
-
-    function _srcmap_deep_error!(out::LavaDeviceArray{Float32,1},
-                                  input::LavaDeviceArray{Float32,1},
-                                  exposure::Float32)
-        i = lava_global_invocation_id_x() + UInt32(1)
-        @inbounds out[i] = _apply_tonemap(input[i], exposure)
-        return nothing
-    end
-
-    # Pattern D: Accidentally using a CPU-only function from a helper
-    # (e.g., calling an IO function for "logging")
-    function _normalize_vec(x::Float32, y::Float32, z::Float32)
-        len = sqrt(x*x + y*y + z*z)
-        return (x/len, y/len, z/len)
-    end
-
-    function _process_normal(nx::Float32, ny::Float32, nz::Float32)
-        n = _normalize_vec(nx, ny, nz)
-        # Accidentally left debug logging in
-        @info "normal: $n"  # Allocates + IO
-        return n
-    end
-
-    function _srcmap_deep_logging!(out::LavaDeviceArray{Float32,1},
-                                    normals::LavaDeviceArray{NTuple{3,Float32},1})
-        i = lava_global_invocation_id_x() + UInt32(1)
-        @inbounds begin
-            n = normals[i]
-            result = _process_normal(n[1], n[2], n[3])
-            out[i] = result[1] + result[2] + result[3]
-        end
-        return nothing
-    end
-end)
-
-# ═══════════════════════════════════════════════════════════════════════
-# Test 1: Source map is populated for a simple kernel
+# Source map is populated for a simple kernel
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Source map: simple kernel has mapped instructions" begin
-    r = lava_compile(Lava._srcmap_add!,
+    r = lava_compile(srcmap_add!,
         Tuple{LavaDeviceArray{Float32,1}, Float32})
 
     @test r isa CompilationResult
     @test hasfield(CompilationResult, :source_map)
     @test r.source_map isa Dict{UInt32, Tuple{String, Int}}
-    # A simple add kernel should produce at least 10 mapped instructions
-    @test length(r.source_map) >= 10
+    # At least the load, the add and the store, each on this file's lines. Not an
+    # instruction count: `!range` on the invocation ids (Lava 532e128) dropped the
+    # sign handling around `i`, and the 10 this asked for became 7.
+    @test length(r.source_map) >= 3
+    @test count(((f, _),) -> endswith(f, basename(@__FILE__)), values(r.source_map)) >= 3
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 2: Source map points to user code, not Base internals
+# Source map points to user code, not Base internals
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Source map: points to user code (inlined_at chain)" begin
-    r = lava_compile(Lava._srcmap_add!,
+    r = lava_compile(srcmap_add!,
         Tuple{LavaDeviceArray{Float32,1}, Float32})
 
     # Collect all unique source files
@@ -256,11 +268,11 @@ end
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 3: Source map covers multiple source lines
+# Source map covers multiple source lines
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Source map: complex kernel maps to multiple source lines" begin
-    r = lava_compile(Lava._srcmap_complex!,
+    r = lava_compile(srcmap_complex!,
         Tuple{LavaDeviceArray{Float32,1}, LavaDeviceArray{Float32,1}, Float32, Float32})
 
     # Group by line number
@@ -272,17 +284,18 @@ end
     # A complex kernel with branches should map to at least 4 different lines
     @test length(lines_seen) >= 4
 
-    # Should have more mapped instructions than the simple kernel
-    @test length(r.source_map) >= 20
+    # More mapped instructions than the simple kernel
+    simple = lava_compile(srcmap_add!, Tuple{LavaDeviceArray{Float32,1}, Float32})
+    @test length(r.source_map) > length(simple.source_map)
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 4: Source map works for struct kernels
+# Source map works for struct kernels
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Source map: struct kernel" begin
-    r = lava_compile(Lava._srcmap_struct!,
-        Tuple{LavaDeviceArray{Lava._SrcMapVec3,1}, LavaDeviceArray{Lava._SrcMapVec3,1}, Float32})
+    r = lava_compile(srcmap_struct!,
+        Tuple{LavaDeviceArray{SrcMapVec3,1}, LavaDeviceArray{SrcMapVec3,1}, Float32})
 
     @test length(r.source_map) >= 15
 
@@ -294,36 +307,36 @@ end
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 5: Source map works for integer kernels
+# Source map works for integer kernels
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Source map: integer kernel" begin
-    r = lava_compile(Lava._srcmap_int!,
+    r = lava_compile(srcmap_int!,
         Tuple{LavaDeviceArray{Int32,1}, Int32})
 
     @test length(r.source_map) >= 5
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 6: Source map for multi-array kernel
+# Source map for multi-array kernel
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Source map: multi-array kernel" begin
-    r = lava_compile(Lava._srcmap_multi!,
+    r = lava_compile(srcmap_multi!,
         Tuple{LavaDeviceArray{Float32,1}, LavaDeviceArray{Float32,1}, LavaDeviceArray{Float32,1}})
 
     @test length(r.source_map) >= 10
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 7: Source map with file-based kernel (real file paths)
+# Source map with file-based kernel (real file paths)
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Source map: file-based kernel has real file paths" begin
     # Write a kernel to a real file
     test_file = tempname() * "_srcmap_test.jl"
     write(test_file, """
-    module _SrcMapTestMod
+    module SrcMapFileKernel
     using Lava: LavaDeviceArray, lava_global_invocation_id_x
 
     function file_kernel!(A::LavaDeviceArray{Float32,1}, B::LavaDeviceArray{Float32,1})
@@ -340,8 +353,9 @@ end
     """)
 
     try
-        include(test_file)
-        r = lava_compile(Main._SrcMapTestMod.file_kernel!,
+        # `include` returns the module the file defines.
+        filemod = include(test_file)
+        r = lava_compile(filemod.file_kernel!,
             Tuple{LavaDeviceArray{Float32,1}, LavaDeviceArray{Float32,1}})
 
         # Check that source map contains real file paths
@@ -371,11 +385,11 @@ end
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 8: SPIR-V disassembly can be annotated with source map
+# SPIR-V disassembly can be annotated with source map
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Source map: SPIR-V disassembly annotations" begin
-    r = lava_compile(Lava._srcmap_add!,
+    r = lava_compile(srcmap_add!,
         Tuple{LavaDeviceArray{Float32,1}, Float32})
 
     # Parse SPIR-V disassembly for IDs and check they can be annotated
@@ -393,7 +407,31 @@ end
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 9: shorten_path works correctly
+# Source map IDs are valid SPIR-V result IDs
+# ═══════════════════════════════════════════════════════════════════════
+
+@testset "Source map: IDs are valid SPIR-V result IDs" begin
+    r = lava_compile(srcmap_add!,
+        Tuple{LavaDeviceArray{Float32,1}, Float32})
+
+    # Parse all result IDs from SPIR-V disassembly
+    valid_ids = Set{UInt32}()
+    for line in split(r.spirv_disasm, '\n')
+        m = match(r"^\s*%(\d+)\s*=", line)
+        m !== nothing && push!(valid_ids, parse(UInt32, m.captures[1]))
+    end
+
+    # Most source map IDs should be valid SPIR-V result IDs.
+    # Some IDs may be for non-result instructions (OpStore, OpBranch, etc.)
+    # which don't appear as %id = in disassembly.
+    matched = count(id -> id in valid_ids, keys(r.source_map))
+    total = length(r.source_map)
+    @test total > 0
+    @test matched / total >= 0.5  # at least half should be result IDs
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# shorten_path works correctly
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "shorten_path" begin
@@ -404,12 +442,12 @@ end
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 10: LavaCompilationError for heap allocation
+# LavaCompilationError for heap allocation
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Compilation error: heap allocation" begin
     err = try
-        lava_compile(Lava._srcmap_bad_alloc!, Tuple{LavaDeviceArray{Float32,1}})
+        lava_compile(srcmap_bad_alloc!, Tuple{LavaDeviceArray{Float32,1}})
         nothing
     catch e
         e
@@ -418,19 +456,19 @@ end
     @test err !== nothing
     @test err isa LavaCompilationError
     @test err.operation == "kernel compilation"
-    @test occursin("_srcmap_bad_alloc!", err.message)
+    @test occursin("srcmap_bad_alloc!", err.message)
     @test occursin("allocat", lowercase(err.suggestion)) ||
           occursin("heap", lowercase(err.suggestion))
     @test !isempty(err.raw_error)
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 11: LavaCompilationError for type instability
+# LavaCompilationError for type instability
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Compilation error: type instability" begin
     err = try
-        lava_compile(Lava._srcmap_bad_unstable!, Tuple{LavaDeviceArray{Any,1}})
+        lava_compile(srcmap_bad_unstable!, Tuple{LavaDeviceArray{Any,1}})
         nothing
     catch e
         e
@@ -438,19 +476,19 @@ end
 
     @test err !== nothing
     @test err isa LavaCompilationError
-    @test occursin("_srcmap_bad_unstable!", err.message)
+    @test occursin("srcmap_bad_unstable!", err.message)
     @test occursin("instab", lowercase(err.suggestion)) ||
           occursin("dispatch", lowercase(err.suggestion)) ||
           occursin("inferr", lowercase(err.suggestion))
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 12: LavaCompilationError for global variable access
+# LavaCompilationError for global variable access
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Compilation error: global variable access" begin
     err = try
-        lava_compile(Lava._srcmap_bad_global!, Tuple{LavaDeviceArray{Float32,1}})
+        lava_compile(srcmap_bad_global!, Tuple{LavaDeviceArray{Float32,1}})
         nothing
     catch e
         e
@@ -458,7 +496,7 @@ end
 
     @test err !== nothing
     @test err isa LavaCompilationError
-    @test occursin("_srcmap_bad_global!", err.message)
+    @test occursin("srcmap_bad_global!", err.message)
     # Should suggest one of: global, const, type instability
     suggestion_lower = lowercase(err.suggestion)
     @test occursin("global", suggestion_lower) ||
@@ -468,12 +506,12 @@ end
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 13: LavaCompilationError has proper showerror
+# LavaCompilationError has proper showerror
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "LavaCompilationError: showerror formatting" begin
     err = try
-        lava_compile(Lava._srcmap_bad_alloc!, Tuple{LavaDeviceArray{Float32,1}})
+        lava_compile(srcmap_bad_alloc!, Tuple{LavaDeviceArray{Float32,1}})
         nothing
     catch e
         e
@@ -490,18 +528,30 @@ end
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 14: Runtime path also produces LavaCompilationError
+# The launch path also produces LavaCompilationError
 # ═══════════════════════════════════════════════════════════════════════
 
-@testset "Compilation error: runtime dispatch path" begin
-    @kernel function _srcmap_bad_ka!(A)
-        i = @index(Global)
-        @inbounds A[i] = rand()
-    end
-
-    a = Lava.LavaArray(Float32[1, 2, 3])
-    err = try
-        _srcmap_bad_ka!(Lava.LavaBackend())(a; ndrange=3)
+# A launch does not call `lava_compile`: the runtime builds the job with
+# `lava_kernel_job` and compiles it through `compile_or_lookup`, which reaches
+# `lava_compile_gpu_from_job` and wraps the error from the job's signature
+# rather than from a function and a tuple type. In Mantle's suite this was a
+# KernelAbstractions kernel launched on the Vulkan backend; this is the same
+# call without the device.
+#
+# Two things this path got wrong and the device test did not look at. The
+# message named the kernel `DataType` ("Cannot compile DataType(var\"#k\", ...)"):
+# it was given the signature type and took the name of ITS type. And the error
+# was printed in the frozen world, where a kernel defined after Lava loaded has
+# no binding yet, so Julia 1.12 printed "Detected access to binding ... in a
+# world prior to its definition world" on stderr; `--depwarn=error` makes that
+# read an error, which would replace this one. `srcmap_launch_bad_alloc!` is a
+# global defined after Lava loaded, as every user kernel is, and compiled by no
+# other testset, so the warning would print here.
+@testset "Compilation error: launch path (compile_or_lookup)" begin
+    job = Lava.lava_kernel_job(srcmap_launch_bad_alloc!, Tuple{LavaDeviceArray{Float32,1}};
+                               workgroup_size = (64, 1, 1))
+    err = @test_nowarn try
+        Lava.compile_or_lookup(job)
         nothing
     catch e
         e
@@ -509,18 +559,22 @@ end
 
     @test err !== nothing
     @test err isa LavaCompilationError
+    # Named as `lava_compile` names it: the kernel, then its argument types.
+    @test occursin("srcmap_launch_bad_alloc!(", err.message)
+    @test occursin("LavaDeviceArray{Float32, 1})", err.message)
+    @test !occursin("DataType", err.message)
     @test occursin("allocat", lowercase(err.suggestion)) ||
           occursin("heap", lowercase(err.suggestion))
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 15: Deep call chain — string interpolation in physics helper (3 levels)
+# Deep call chain — string interpolation in physics helper (3 levels)
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Deep chain: string interpolation in collision check" begin
     err = try
-        lava_compile(Lava._srcmap_deep_physics!,
-            Tuple{LavaDeviceArray{Lava._TestParticle,1}, Float32})
+        lava_compile(srcmap_deep_physics!,
+            Tuple{LavaDeviceArray{SrcMapParticle,1}, Float32})
         nothing
     catch e
         e
@@ -529,10 +583,10 @@ end
     @test err isa LavaCompilationError
     @test !isempty(err.call_chains)
 
-    # Call chain should show the path: kernel → _physics_step → _check_collision
-    @test occursin("_srcmap_deep_physics!", err.call_chains)
-    @test occursin("_physics_step", err.call_chains)
-    @test occursin("_check_collision", err.call_chains)
+    # Call chain should show the path: kernel → physics_step → check_collision
+    @test occursin("srcmap_deep_physics!", err.call_chains)
+    @test occursin("srcmap_physics_step", err.call_chains)
+    @test occursin("srcmap_check_collision", err.call_chains)
 
     # Should identify heap allocation as the problem
     @test occursin("heap", lowercase(err.call_chains)) ||
@@ -543,18 +597,18 @@ end
     @test occursin("allocat", lowercase(err.suggestion)) ||
           occursin("heap", lowercase(err.suggestion))
 
-    # The _update_velocity helper is fine — should NOT appear as a problem source
+    # The update_velocity helper is fine — should NOT appear as a problem source
     # (it may appear in the chain path but not as the deepest problematic function)
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 16: Deep call chain — abstract field causing dynamic dispatch (4 levels)
+# Deep call chain — abstract field causing dynamic dispatch (4 levels)
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Deep chain: abstract field in scene renderer" begin
     err = try
-        lava_compile(Lava._srcmap_deep_scene!,
-            Tuple{LavaDeviceArray{Float32,1}, LavaDeviceArray{Lava._SceneObject,1}})
+        lava_compile(srcmap_deep_scene!,
+            Tuple{LavaDeviceArray{Float32,1}, LavaDeviceArray{SrcMapSceneObject,1}})
         nothing
     catch e
         e
@@ -563,9 +617,9 @@ end
     @test err isa LavaCompilationError
     @test !isempty(err.call_chains)
 
-    # Call chain should trace through: kernel → _render_pixel → _compute_lighting → _get_albedo
-    @test occursin("_srcmap_deep_scene!", err.call_chains)
-    @test occursin("_get_albedo", err.call_chains)
+    # Call chain should trace through: kernel → render_pixel → compute_lighting → get_albedo
+    @test occursin("srcmap_deep_scene!", err.call_chains)
+    @test occursin("srcmap_get_albedo", err.call_chains)
 
     # Should identify type instability / dynamic dispatch
     @test occursin("dispatch", lowercase(err.call_chains)) ||
@@ -576,12 +630,12 @@ end
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 17: Deep call chain — error() in validation function (3 levels)
+# Deep call chain — error() in validation function (3 levels)
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Deep chain: error() in validation helper" begin
     err = try
-        lava_compile(Lava._srcmap_deep_error!,
+        lava_compile(srcmap_deep_error!,
             Tuple{LavaDeviceArray{Float32,1}, LavaDeviceArray{Float32,1}, Float32})
         nothing
     catch e
@@ -591,10 +645,10 @@ end
     @test err isa LavaCompilationError
     @test !isempty(err.call_chains)
 
-    # Should show: kernel → _apply_tonemap → _validate_range
-    @test occursin("_srcmap_deep_error!", err.call_chains)
-    @test occursin("_apply_tonemap", err.call_chains)
-    @test occursin("_validate_range", err.call_chains)
+    # Should show: kernel → apply_tonemap → validate_range
+    @test occursin("srcmap_deep_error!", err.call_chains)
+    @test occursin("srcmap_apply_tonemap", err.call_chains)
+    @test occursin("srcmap_validate_range", err.call_chains)
 
     # Should identify allocation (from string interpolation in error())
     @test occursin("alloc", lowercase(err.call_chains)) ||
@@ -602,12 +656,12 @@ end
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 18: Deep call chain — @info logging left in GPU code (3 levels)
+# Deep call chain — @info logging left in GPU code (3 levels)
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Deep chain: @info logging in helper" begin
     err = try
-        lava_compile(Lava._srcmap_deep_logging!,
+        lava_compile(srcmap_deep_logging!,
             Tuple{LavaDeviceArray{Float32,1}, LavaDeviceArray{NTuple{3,Float32},1}})
         nothing
     catch e
@@ -620,20 +674,20 @@ end
     # where in the pipeline it fails (GPUCompiler vs emitter)
     if err isa LavaCompilationError
         @test !isempty(err.call_chains) || !isempty(err.raw_error)
-        @test occursin("_process_normal", err.call_chains) ||
-              occursin("_process_normal", err.raw_error)
+        @test occursin("srcmap_process_normal", err.call_chains) ||
+              occursin("srcmap_process_normal", err.raw_error)
     end
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 19: Call chain deduplication — many reasons, few unique chains
+# Call chain deduplication — many reasons, few unique chains
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Deep chain: deduplication reduces noise" begin
     # The physics kernel triggers ~16 GPUCompiler reasons but only ~2 unique user chains
     err = try
-        lava_compile(Lava._srcmap_deep_physics!,
-            Tuple{LavaDeviceArray{Lava._TestParticle,1}, Float32})
+        lava_compile(srcmap_deep_physics!,
+            Tuple{LavaDeviceArray{SrcMapParticle,1}, Float32})
         nothing
     catch e
         e
@@ -655,13 +709,13 @@ end
 end
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test 20: showerror formatting with call chains
+# showerror formatting with call chains
 # ═══════════════════════════════════════════════════════════════════════
 
 @testset "Deep chain: showerror shows call chains before raw error" begin
     err = try
-        lava_compile(Lava._srcmap_deep_scene!,
-            Tuple{LavaDeviceArray{Float32,1}, LavaDeviceArray{Lava._SceneObject,1}})
+        lava_compile(srcmap_deep_scene!,
+            Tuple{LavaDeviceArray{Float32,1}, LavaDeviceArray{SrcMapSceneObject,1}})
         nothing
     catch e
         e
@@ -684,89 +738,4 @@ end
     @test first(suggestion_pos) < first(raw_pos)
 end
 
-# ═══════════════════════════════════════════════════════════════════════
-# Test 21: Validation message leak fix (OOM doesn't poison next compile)
-# ═══════════════════════════════════════════════════════════════════════
-
-@testset "OOM validation messages don't leak to next compilation" begin
-    # Trigger OOM — will generate validation layer warnings.
-    #
-    # `_try_vk_alloc(nbytes)` was renamed to `try_vk_alloc(bq, nbytes)` in
-    # 0d8ae85 ("refactor for stability", 2026-04-06): the underscore was dropped
-    # and it now takes the BatchQueue it allocates against. This test kept calling
-    # the old name and threw UndefVarError; nobody saw it because the file was not
-    # registered in runtests.jl.
-    Lava.try_vk_alloc(Lava.vk_context().default_bq, 40_000_000_000)  # 40GB, will fail
-
-    # Validation messages should be drained by the failed alloc
-    @test isempty(Lava.vk_context().validation.messages)
-
-    # Next compilation should succeed without stale validation errors
-    r = lava_compile(Lava._srcmap_add!,
-        Tuple{LavaDeviceArray{Float32,1}, Float32})
-    @test length(r.spirv_bytes) > 0
-    @test length(r.source_map) > 0
-end
-
-# ═══════════════════════════════════════════════════════════════════════
-# Test 16: Source map IDs are valid SPIR-V result IDs
-# ═══════════════════════════════════════════════════════════════════════
-
-@testset "Source map: IDs are valid SPIR-V result IDs" begin
-    r = lava_compile(Lava._srcmap_add!,
-        Tuple{LavaDeviceArray{Float32,1}, Float32})
-
-    # Parse all result IDs from SPIR-V disassembly
-    valid_ids = Set{UInt32}()
-    for line in split(r.spirv_disasm, '\n')
-        m = match(r"^\s*%(\d+)\s*=", line)
-        m !== nothing && push!(valid_ids, parse(UInt32, m.captures[1]))
-    end
-
-    # Most source map IDs should be valid SPIR-V result IDs.
-    # Some IDs may be for non-result instructions (OpStore, OpBranch, etc.)
-    # which don't appear as %id = in disassembly.
-    matched = count(id -> id in valid_ids, keys(r.source_map))
-    total = length(r.source_map)
-    @test total > 0
-    @test matched / total >= 0.5  # at least half should be result IDs
-end
-
-# ═══════════════════════════════════════════════════════════════════════
-# Test 17: Compiled kernel still executes correctly with source mapping
-# ═══════════════════════════════════════════════════════════════════════
-
-@testset "Source mapping doesn't break kernel execution" begin
-    # Simple add
-    a = Lava.LavaArray(Float32[1, 2, 3, 4])
-    b = a .+ 10.0f0
-    Lava.vk_flush!(Lava.vk_context())
-    @test Array(b) == Float32[11, 12, 13, 14]
-
-    # Reduction
-    @test sum(a) ≈ 10.0f0
-
-    # Struct operations
-    struct SrcMapTestStruct
-        a::Float32
-        b::Float32
-    end
-
-    @kernel function srcmap_struct_ka!(dst, src, s)
-        i = @index(Global)
-        @inbounds begin
-            v = src[i]
-            dst[i] = SrcMapTestStruct(v.a * s, v.b * s)
-        end
-    end
-
-    src = Lava.LavaArray([SrcMapTestStruct(1.0f0, 2.0f0), SrcMapTestStruct(3.0f0, 4.0f0)])
-    dst = Lava.LavaArray{SrcMapTestStruct}(undef, 2)
-    srcmap_struct_ka!(Lava.LavaBackend())(dst, src, 2.0f0; ndrange=2)
-    Lava.vk_flush!(Lava.vk_context())
-    result = Array(dst)
-    @test result[1].a ≈ 2.0f0
-    @test result[1].b ≈ 4.0f0
-    @test result[2].a ≈ 6.0f0
-    @test result[2].b ≈ 8.0f0
-end
+end  # @testset "source maps and compile errors"

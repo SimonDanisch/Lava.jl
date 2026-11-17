@@ -28,10 +28,6 @@ end
     return nothing
 end
 
-@lava_device_override function Base.throw_domerr_powbysq(::Integer, p)
-    return nothing
-end
-
 @lava_device_override function Base.Checked.throw_overflowerr_binaryop(op, x, y)
     return nothing
 end
@@ -75,16 +71,18 @@ end
 
 # ── CartesianIndices indexing ──
 # CartesianIndices{N}[Int] for N>1 calls _ind2sub which has throw paths.
-# Override to avoid the dynamic dispatch.
-@lava_device_override function Base.getindex(iter::CartesianIndices{N,R}, I::Vararg{Int, N}) where {N,R}
-    CartesianIndex(I...)
+# Override to avoid the dynamic dispatch. One overlay for both shapes, which would overlap at
+# N = 1 as two, see `@lava_device_override`.
+@lava_device_override function Base.getindex(iter::CartesianIndices{N,R}, I::Vararg{Int,M}) where {N,R,M}
+    cartesian_at(iter, I...)
 end
+
+cartesian_at(iter::CartesianIndices{N}, I::Vararg{Int,N}) where {N} = CartesianIndex(I...)
 
 # Linear indexing: CartesianIndices{N}[linear_idx::Int] → CartesianIndex{N}
 # Computes _ind2sub without throws. Required for KA's expand() on 2D+ dispatch.
-@lava_device_override function Base.getindex(iter::CartesianIndices{N,R}, i::Int) where {N,R}
-    @inbounds gpu_ind2sub(iter, i)
-end
+cartesian_at(iter::CartesianIndices, i::Int) = @inbounds gpu_ind2sub(iter, i)
+cartesian_at(iter::CartesianIndices{1}, i::Int) = @inbounds gpu_ind2sub(iter, i)
 
 # Convert 1-based linear index to CartesianIndex over CartesianIndices ranges
 @inline function gpu_ind2sub(iter::CartesianIndices{0}, i::Int)
@@ -160,9 +158,14 @@ end
 # Int32(x::Int64) calls checked_trunc_sint → throw_inexacterror which we suppress.
 
 # ── Multiplicative inverse without i128 ──
-# _mul_high(Int64, Int64) calls widen(Int64) → Int128 which SPIR-V doesn't support.
-# Implement via 32-bit decomposition instead.
-@lava_device_override function Base.MultiplicativeInverses._mul_high(a::UInt64, b::UInt64)
+# The high half of a 64x64 multiply widens to Int128, which SPIR-V has no type
+# for, so it is computed by 32-bit decomposition instead.
+#
+# Julia 1.13 renamed this from `Base.MultiplicativeInverses._mul_high` to
+# `Base.mul_hi` and moved it to int.jl, generalised to `T<:Integer`. Both
+# spellings go through `widen`, so the override is needed on either version and
+# only the name to overlay differs -- the implementation below is shared.
+function mul_high_u64(a::UInt64, b::UInt64)
     shift = UInt64(32)
     mask = UInt64(0xFFFFFFFF)
     a1, a2 = a >>> shift, a & mask
@@ -175,18 +178,28 @@ end
     a1b1 + (a1b2 >>> shift) + (a2b1 >>> shift) + carry
 end
 
-@lava_device_override function Base.MultiplicativeInverses._mul_high(a::Int64, b::Int64)
+function mul_high_i64(a::Int64, b::Int64)
     # Signed mul_high from unsigned mul_high (same pattern as Julia's Int128 version)
     t1 = (a >> 63) & (b % UInt64)
     t2 = (b >> 63) & (a % UInt64)
-    (Base.MultiplicativeInverses._mul_high(a % UInt64, b % UInt64) - t1 - t2) % Int64
+    (mul_high_u64(a % UInt64, b % UInt64) - t1 - t2) % Int64
 end
 
-# NOTE: `Base.isless(::IEEEFloat,...)` used to be overridden here with a
-# branchless version to dodge an NVIDIA miscompile. That was a band-aid: the real
-# bug was loop unswitching turning the isless NaN-guard branch into a double-loop
-# NVIDIA mis-structures. It's now fixed generally by disabling SimpleLoopUnswitch
-# in `compiler/target.jl`, so no isless override is needed.
+@static if isdefined(Base, :mul_hi)
+    @lava_device_override Base.mul_hi(a::UInt64, b::UInt64) = mul_high_u64(a, b)
+    @lava_device_override Base.mul_hi(a::Int64, b::Int64) = mul_high_i64(a, b)
+else
+    @lava_device_override Base.MultiplicativeInverses._mul_high(a::UInt64, b::UInt64) =
+        mul_high_u64(a, b)
+    @lava_device_override Base.MultiplicativeInverses._mul_high(a::Int64, b::Int64) =
+        mul_high_i64(a, b)
+end
+
+# No `Base.isless(::IEEEFloat,...)` override: a branchless version dodges the
+# NVIDIA miscompile as a band-aid, where the real bug is loop unswitching
+# turning the isless NaN-guard branch into a double-loop NVIDIA mis-structures.
+# That is fixed generally by disabling SimpleLoopUnswitch in
+# `compiler/target.jl`.
 
 # ── sincos domain error ──
 @lava_device_override function Base.Math.sincos_domain_error(x)

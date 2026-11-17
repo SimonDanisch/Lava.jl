@@ -25,7 +25,7 @@
 export @lava_printf
 
 # Julia arg type → (LLVM type string, canonical Julia type passed to llvmcall).
-@inline function _lava_printf_canon(@nospecialize(T))
+@inline function lava_printf_canon(@nospecialize(T))
     T <: Bool                               && return ("i32", Int32)
     T <: Union{Int8, Int16, Int32}          && return ("i32", Int32)
     T <: Union{UInt8, UInt16, UInt32}       && return ("i32", UInt32)
@@ -42,7 +42,7 @@ end
     llvm_types = Vector{String}(undef, N)
     canon_types = Vector{Any}(undef, N)
     for i in 1:N
-        lty, cty = _lava_printf_canon(args[i])
+        lty, cty = lava_printf_canon(args[i])
         llvm_types[i] = lty
         canon_types[i] = cty
     end
@@ -92,18 +92,24 @@ macro lava_printf(fmt, args...)
     return Expr(:call, impl, :(Val($(QuoteNode(Symbol(fmt))))), map(esc, args)...)
 end
 
-# ── Backend-independent KernelAbstractions.@print support ──
+# ── Backend-independent device printing ──
 #
-# KA lowers `@print(items...)` to `KernelAbstractions.__print(items...)`, interning
-# string literals as `Val{Symbol}` and leaving runtime values as-is; the default
-# __print just calls `Base.print` (the CPU path). We override __print for the Lava
-# device so `@print` (the portable API, same as CUDA/AMDGPU) works on Lava: build a
-# printf format string with specifiers auto-selected from the runtime arg types and
-# route through the same DebugPrintf path as @lava_printf. Enable output with
+# Two portable APIs lower to the same thing here. KA lowers `@print(items...)` to
+# `KernelAbstractions.__print(items...)`, and `KernelInterface` spells the same
+# operation `KI._print(items...)`; both intern string literals as `Val{Symbol}`,
+# leave runtime values as-is, and default to `Base.print` on the host. Lava
+# overrides both for the device so `@print` (the portable API, same as
+# CUDA/AMDGPU) works: build a printf format string with specifiers auto-selected
+# from the runtime arg types and route through the same DebugPrintf path as
+# `@lava_printf`. Enable output with
 # `Lava.vk_reset_device!(debug = DebugConfig(printf = true))`.
+#
+# The format-building lives in `lava_device_print` and the two overrides forward
+# to it, so the two names cannot drift into two behaviours. `KI._print`'s
+# override is in `device/kernelinterface.jl`, beside the rest of KI.
 
 # Runtime value type → printf specifier, matching _lava_printf_impl's canonical width.
-@inline function _ka_print_spec(@nospecialize(T))
+@inline function ka_print_spec(@nospecialize(T))
     T <: Bool                          && return "%d"
     T <: Union{Int8, Int16, Int32}     && return "%d"
     T <: Union{UInt8, UInt16, UInt32}  && return "%u"
@@ -115,7 +121,14 @@ end
           "floating-point scalars are supported.")
 end
 
-@lava_device_override @generated function KernelAbstractions.__print(items...)
+"""
+The device side of `@print` and `KI._print`: a format string built from the
+argument types, and the runtime values that go with it.
+
+Both portable spellings forward here rather than each generating their own, so
+"what Lava prints" is one answer.
+"""
+@generated function lava_device_print(items...)
     fmt = IOBuffer()
     argexprs = Any[]
     for i in 1:length(items)
@@ -126,7 +139,7 @@ end
             lit = string(T.parameters[1])
             print(fmt, replace(lit, "%" => "%%"))
         else
-            print(fmt, _ka_print_spec(T))
+            print(fmt, ka_print_spec(T))
             push!(argexprs, :(items[$i]))
         end
     end
@@ -134,3 +147,6 @@ end
     impl = GlobalRef(@__MODULE__, :_lava_printf_impl)
     return Expr(:call, impl, :(Val($fmtsym)), argexprs...)
 end
+
+@lava_device_override @inline KernelAbstractions.__print(items...) =
+    lava_device_print(items...)

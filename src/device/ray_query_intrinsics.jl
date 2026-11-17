@@ -1,24 +1,19 @@
-# Lava - Julia intrinsics for VK_KHR_ray_query.
+# Julia intrinsics for VK_KHR_ray_query.
 #
-# Two layers:
-#   1. Typed wrappers (Ray, Vec3f, etc.) -- what user kernels call.
-#   2. Scalar `llvmcall` stubs -- what the SPIR-V emitter recognizes by name.
-# Multiple dispatch picks the wrapper for `::Ray` and the wrapper destructures
-# into scalars for the stub.
+# Two layers: a method on GeometryBasics' point and vector, which kernels call, and
+# the scalar `llvmcall` stub the SPIR-V emitter recognizes by name.
 
 """
-    lava_ray_query_init(ray::Ray; flags=UInt32(0), mask=UInt32(0xFF))
+    lava_ray_query_init(origin::Point3f, direction::Vec3f, tmin::Float32, tmax::Float32;
+                        flags = UInt32(0), mask = UInt32(0xFF))
 
-Initialize the implicit per-function ray-query variable. Lowers to
-`OpRayQueryInitializeKHR` over the bound TLAS descriptor. `ray` is a
-`Raycore.Ray` (re-exported by Lava).
+Start a ray query against the bound top-level acceleration structure. Lowers to
+`OpRayQueryInitializeKHR` on the function's implicit ray-query variable.
 """
-@inline function lava_ray_query_init(ray::Ray;
+@inline function lava_ray_query_init(o::Point3f, d::Vec3f, tmin::Float32, tmax::Float32;
                                      flags::UInt32 = UInt32(0),
                                      mask::UInt32  = UInt32(0xFF))
-    o = ray.o; d = ray.d
-    lava_ray_query_init(flags, mask, o[1], o[2], o[3], ray.t_min,
-                        d[1], d[2], d[3], ray.t_max)
+    lava_ray_query_init(flags, mask, o[1], o[2], o[3], tmin, d[1], d[2], d[3], tmax)
 end
 
 # Scalar method -- the symbol `lava_ray_query_init` from this `llvmcall` is
@@ -91,6 +86,52 @@ end
         """, "entry"), Cvoid, Tuple{})
     return nothing
 end
+
+# ── Procedural geometry on the inline path ──────────────────────────────────
+#
+# A triangle candidate is answered by the hardware. An AABB candidate is not:
+# the traversal only says "the ray entered this box", and the shader has to
+# decide whether and where it actually hits. These three are what that needs —
+# the object-space ray to solve against, and the call that commits the answer.
+
+@inline function lava_ray_query_generate_intersection(t::Float32)::Nothing
+    Base.llvmcall(("""
+        declare void @lava_ray_query_generate_intersection(float) #0
+        define void @entry(float %t) #0 {
+            call void @lava_ray_query_generate_intersection(float %t)
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+        """, "entry"), Cvoid, Tuple{Float32}, t)
+    return nothing
+end
+
+@inline function lava_ray_query_get_object_ray_origin(committed::Int32, dim::UInt32)
+    Base.llvmcall(("""
+        declare float @lava_ray_query_get_object_ray_origin(i32, i32) #0
+        define float @entry(i32 %c, i32 %d) #0 {
+            %v = call float @lava_ray_query_get_object_ray_origin(i32 %c, i32 %d)
+            ret float %v
+        }
+        attributes #0 = { alwaysinline }
+        """, "entry"), Float32, Tuple{Int32, UInt32}, committed, dim)
+end
+
+@inline function lava_ray_query_get_object_ray_direction(committed::Int32, dim::UInt32)
+    Base.llvmcall(("""
+        declare float @lava_ray_query_get_object_ray_direction(i32, i32) #0
+        define float @entry(i32 %c, i32 %d) #0 {
+            %v = call float @lava_ray_query_get_object_ray_direction(i32 %c, i32 %d)
+            ret float %v
+        }
+        attributes #0 = { alwaysinline }
+        """, "entry"), Float32, Tuple{Int32, UInt32}, committed, dim)
+end
+
+lava_ray_query_get_object_ray_origin(committed::Bool, dim::Integer) =
+    lava_ray_query_get_object_ray_origin(committed_to_int32(committed), UInt32(dim - 1))
+lava_ray_query_get_object_ray_direction(committed::Bool, dim::Integer) =
+    lava_ray_query_get_object_ray_direction(committed_to_int32(committed), UInt32(dim - 1))
 
 # Typed user-facing getters: take `committed::Bool`, dispatch to scalar form.
 
@@ -184,6 +225,9 @@ end
 # Register all new intrinsics with GPUCompiler validation.
 push!(KNOWN_INTRINSICS, "lava_ray_query_proceed")
 push!(KNOWN_INTRINSICS, "lava_ray_query_confirm")
+push!(KNOWN_INTRINSICS, "lava_ray_query_get_object_ray_direction")
+push!(KNOWN_INTRINSICS, "lava_ray_query_get_object_ray_origin")
+push!(KNOWN_INTRINSICS, "lava_ray_query_generate_intersection")
 push!(KNOWN_INTRINSICS, "lava_ray_query_terminate")
 push!(KNOWN_INTRINSICS, "lava_ray_query_get_type")
 push!(KNOWN_INTRINSICS, "lava_ray_query_get_t")

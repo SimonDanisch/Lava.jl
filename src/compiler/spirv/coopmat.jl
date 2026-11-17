@@ -11,23 +11,40 @@
 # built from literal constants -- component type, rows, columns, use -- and none
 # of those can be a runtime operand.
 
-"""`Use` operand of OpTypeCooperativeMatrixKHR."""
+# `Use` operand of OpTypeCooperativeMatrixKHR.
 module CoopMatUse
 const MatrixA           = UInt32(0)
 const MatrixB           = UInt32(1)
 const MatrixAccumulator = UInt32(2)
 end
 
-"""`MemoryLayout` operand of OpCooperativeMatrix{Load,Store}KHR."""
+# `MemoryLayout` operand of OpCooperativeMatrix{Load,Store}KHR.
 module CoopMatLayout
 const RowMajor    = UInt32(0)
 const ColumnMajor = UInt32(1)
 end
 
-const COOPMAT_SCOPE_SUBGROUP = UInt32(3)
+# `Scope` operand of OpTypeCooperativeMatrixKHR. Both values are read off
+# glslang's output for `gl_ScopeSubgroup` / `gl_ScopeWorkgroup` — see
+# `test/glsl/workgroup_scope_coopmat.comp`, whose `TypeCooperativeMatrixKHR`
+# names a constant 2. Nothing else about a workgroup-scope module differs: the
+# capability and extension list is identical, and so is every instruction that
+# consumes the type.
+const COOPMAT_SCOPE_WORKGROUP = UInt32(2)
+const COOPMAT_SCOPE_SUBGROUP  = UInt32(3)
+
+# `OpTypeTensorLayoutNV`'s clamp mode. Values observed, not remembered: a shader
+# declaring one layout per `gl_CooperativeMatrixClampMode*NV` emits
+# `TypeTensorLayoutNV %dim %0`, `%1` and `%2` in that order.
+#
+# `TENSOR_CLAMP_CONSTANT` is the one that matters for the GEMM. Under it the
+# driver bounds-checks the load itself and substitutes a constant out of range,
+# which is what makes an unpadded extent legal — i.e. what would retire
+# `gemm_padn`, the `GEMM_BLOCK` pad on M and `padtile`/`crsextent` on K.
+# KernelInterface's, so a kernel names them without naming this compiler.
 
 """
-    parse_coopmat_name(fn_name) -> (op, T, M, N, use) | nothing
+    parse_coopmat_name(fn_name) -> (op, T, M, N, use, rowmajor, scope) | nothing
 
 Invert `coopmat_intrinsic_name`. Returns `nothing` for names that are not
 cooperative-matrix intrinsics.
@@ -35,8 +52,10 @@ cooperative-matrix intrinsics.
 function parse_coopmat_name(fn_name::AbstractString)
     startswith(fn_name, "_lava_coopmat_") || return nothing
     parts = split(fn_name, '_')
-    # ["", "lava", "coopmat", op, dtype, "MxN", use] with an optional trailing
-    # "row" on a load or store — see `coopmat_intrinsic_name`.
+    # ["", "lava", "coopmat", op, dtype, "MxN", use] with optional trailing flags
+    # "wg" (workgroup scope) and "row" (row-major memory layout) — see
+    # `coopmat_intrinsic_name`. Absence of "wg" is subgroup scope, which is what
+    # keeps every pre-existing name byte-identical.
     length(parts) >= 7 || return nothing
     op = parts[4]
     dtype = parts[5]
@@ -46,33 +65,139 @@ function parse_coopmat_name(fn_name::AbstractString)
     N = parse(Int, dims[2])
     use = parts[7] == "a" ? CoopMatUse.MatrixA :
           parts[7] == "b" ? CoopMatUse.MatrixB : CoopMatUse.MatrixAccumulator
-    rowmajor = length(parts) >= 8 && parts[8] == "row"
-    (op, dtype, M, N, use, rowmajor)
+    flags = @view parts[8:end]
+    rowmajor = "row" in flags
+    scope = "wg" in flags ? COOPMAT_SCOPE_WORKGROUP : COOPMAT_SCOPE_SUBGROUP
+    (op, dtype, M, N, use, rowmajor, scope)
 end
 
-"""Component type id for the dtype suffix used in the intrinsic name."""
+"""Size in bytes of the dtype suffix used in the intrinsic name — the alignment
+a `PhysicalStorageBuffer` access has to declare."""
+function coopmat_component_bytes(dtype::AbstractString)
+    dtype == "f16" && return 2
+    dtype == "f32" && return 4
+    dtype == "f64" && return 8
+    (dtype == "i8" || dtype == "u8") && return 1
+    (dtype == "i32" || dtype == "u32") && return 4
+    error("unsupported cooperative-matrix component type: $dtype")
+end
+
+"""
+Component type id for the dtype suffix used in the intrinsic name.
+
+Integers are SIGNLESS, like every other integer this emitter makes (`types.jl`
+emits `OpTypeInt <width> 0` for all of them). A cooperative matrix loads out of
+an ordinary array and SPIR-V requires an access chain's result type to match the
+base's element type, so a signed component type on a signless array is a module
+that fails validation before it reaches the driver:
+
+    OpAccessChain result type (OpTypeInt) does not match the type that results
+    from indexing into the base <id> (OpTypeInt)
+    %211 = OpAccessChain %_ptr_Workgroup_char %37 %uint_0
+
+Signedness is a property of the OPERATION for integer matrices, not of the type:
+it rides on `OpCooperativeMatrixMulAddKHR`'s operands word, which is what
+`coopmat_muladd_operands` builds from the dtype suffixes.
+"""
 function coopmat_component_type!(state::SPIRVEmitterState, dtype::AbstractString)
     mod = state.mod
     dtype == "f16" && return emit_type_float!(mod, UInt32(16))
     dtype == "f32" && return emit_type_float!(mod, UInt32(32))
     dtype == "f64" && return emit_type_float!(mod, UInt32(64))
-    dtype == "i8" && return emit_type_int!(mod, UInt32(8), UInt32(1))
-    dtype == "u8" && return emit_type_int!(mod, UInt32(8), UInt32(0))
-    dtype == "i32" && return emit_type_int!(mod, UInt32(32), UInt32(1))
-    dtype == "u32" && return emit_type_int!(mod, UInt32(32), UInt32(0))
+    (dtype == "i8" || dtype == "u8") && return emit_type_int!(mod, UInt32(8), UInt32(0))
+    (dtype == "i32" || dtype == "u32") && return emit_type_int!(mod, UInt32(32), UInt32(0))
     error("unsupported cooperative-matrix component type: $dtype")
 end
 
+# `Cooperative Matrix Operands`, from SPV_KHR_cooperative_matrix. Absent, every
+# integer operand is read as unsigned — which for an int8 weight is not a
+# rounding difference but a different number.
+const COOPMAT_OPERAND_A_SIGNED = UInt32(0x1)
+const COOPMAT_OPERAND_B_SIGNED = UInt32(0x2)
+const COOPMAT_OPERAND_C_SIGNED = UInt32(0x4)
+const COOPMAT_OPERAND_RESULT_SIGNED = UInt32(0x8)
+
+"""Whether a dtype suffix names a signed integer component."""
+coopmat_signed(dtype::AbstractString) = dtype == "i8" || dtype == "i32"
+
+"""Whether a dtype suffix names an integer component at all."""
+coopmat_integer(dtype::AbstractString) =
+    dtype in ("i8", "u8", "i32", "u32")
+
 """
-    emit_coopmat_type!(state, dtype, M, N, use) -> UInt32
+    coopmat_muladd_operands(state, a_val, b_val, dtype) -> UInt32
+
+The operands word for one `OpCooperativeMatrixMulAddKHR`, or zero for a float
+product, which needs none.
+
+The intrinsic's name carries only the ACCUMULATOR's component type — A and B
+are whatever was multiplied — so their signedness is read back from the emitted
+type ids, the same inversion `coopmat_type_use` does for a conversion.
+"""
+function coopmat_muladd_operands(state::SPIRVEmitterState, a_val, b_val,
+                                 dtype::AbstractString)
+    coopmat_integer(dtype) || return UInt32(0)
+    akey = coopmat_type_key(state, get(state.coopmat_value_types, a_val, UInt32(0)))
+    bkey = coopmat_type_key(state, get(state.coopmat_value_types, b_val, UInt32(0)))
+    operands = UInt32(0)
+    (akey !== nothing && coopmat_signed(akey[1])) &&
+        (operands |= COOPMAT_OPERAND_A_SIGNED)
+    (bkey !== nothing && coopmat_signed(bkey[1])) &&
+        (operands |= COOPMAT_OPERAND_B_SIGNED)
+    if coopmat_signed(dtype)
+        operands |= COOPMAT_OPERAND_C_SIGNED | COOPMAT_OPERAND_RESULT_SIGNED
+    end
+    operands
+end
+
+"""
+    coopmat_type_use(state, ty_id) -> UInt32 | nothing
+
+The `Use` of an already-emitted cooperative-matrix type, by inverting
+`state.coopmat_type_ids` (keyed `(dtype, M, N, use, scope)`).
+
+Needed because the conversion instruction depends on it: `OpFConvert` is legal
+only when source and destination agree on use, and a use change is
+`OpCooperativeMatrixConvertNV`. Returns `nothing` for an id that is not a
+cooperative-matrix type.
+"""
+function coopmat_type_use(state::SPIRVEmitterState, ty_id::UInt32)
+    k = coopmat_type_key(state, ty_id)
+    return k === nothing ? nothing : k[4]
+end
+
+"""
+    coopmat_type_key(state, ty_id) -> (dtype, M, N, use, scope) | nothing
+
+The full `coopmat_type_ids` key behind an emitted type id. `coopmat_type_use`
+wants only the use; a conversion that changes BOTH component type and use needs
+the rest as well, to build the intermediate type it goes through.
+"""
+function coopmat_type_key(state::SPIRVEmitterState, ty_id::UInt32)
+    for (k, v) in state.coopmat_type_ids
+        v == ty_id && return k
+    end
+    return nothing
+end
+
+"""
+    emit_coopmat_type!(state, dtype, M, N, use, scope) -> UInt32
 
 `OpTypeCooperativeMatrixKHR`, deduplicated per module. Declares the capability
-and extension on first use. Scope is always Subgroup — the only scope Vulkan
-exposes, and the one every driver-reported shape carries.
+and extension on first use.
+
+`scope` defaults to Subgroup, which is the portable one: every KHR-reported
+shape carries it and it is what AMD's WMMA path has. Workgroup scope needs
+`VK_NV_cooperative_matrix2`'s `cooperativeMatrixWorkgroupScope` — enabled at
+device creation and reported as `ctx.coopmat2.workgroup_scope` — and the shape
+must then match the granularity that device reports **for the workgroup size the
+kernel launches with**. Nothing else in the module changes; see
+`test/glsl/workgroup_scope_coopmat.comp`.
 """
 function emit_coopmat_type!(state::SPIRVEmitterState, dtype::AbstractString,
-                            M::Integer, N::Integer, use::UInt32)
-    key = (dtype, Int(M), Int(N), use)
+                            M::Integer, N::Integer, use::UInt32,
+                            scope::UInt32 = COOPMAT_SCOPE_SUBGROUP)
+    key = (dtype, Int(M), Int(N), use, scope)
     cached = get(state.coopmat_type_ids, key, nothing)
     cached === nothing || return cached
 
@@ -82,7 +207,7 @@ function emit_coopmat_type!(state::SPIRVEmitterState, dtype::AbstractString,
 
     comp_ty = coopmat_component_type!(state, dtype)
     # Scope/Rows/Columns/Use are <id>s of constants, not literals.
-    scope_id = emit_constant_u32!(mod, COOPMAT_SCOPE_SUBGROUP)
+    scope_id = emit_constant_u32!(mod, scope)
     rows_id = emit_constant_u32!(mod, UInt32(M))
     cols_id = emit_constant_u32!(mod, UInt32(N))
     use_id = emit_constant_u32!(mod, use)
@@ -91,6 +216,71 @@ function emit_coopmat_type!(state::SPIRVEmitterState, dtype::AbstractString,
     encode_instruction!(mod.types_constants, Op.OpTypeCooperativeMatrixKHR, id,
                         comp_ty, scope_id, rows_id, cols_id, use_id)
     state.coopmat_type_ids[key] = id
+    return id
+end
+
+"""
+    emit_tensor_layout_type!(state, dim, clampmode) -> UInt32
+
+`OpTypeTensorLayoutNV`, deduplicated per module.
+
+`dim` and `clampmode` are **constant <id>s, not literals** — the same shape as
+`OpTypeCooperativeMatrixKHR`'s rows/columns, and not what the operand list
+suggests. Read off a glslang binary; see `test/glsl/tensor_addressing_opcodes.comp`.
+
+The capability is `TensorAddressingNV` from `SPV_NV_tensor_addressing`, a
+DIFFERENT extension from the coopmat2 one that supplies the load. Declaring only
+`CooperativeMatrixTensorAddressingNV` yields a module the driver rejects.
+"""
+function emit_tensor_layout_type!(state::SPIRVEmitterState, dim::Integer,
+                                  clampmode::UInt32 = TENSOR_CLAMP_UNDEFINED)
+    key = (Int(dim), clampmode)
+    cached = get(state.tensor_layout_type_ids, key, nothing)
+    cached === nothing || return cached
+
+    mod = state.mod
+    require_capability!(mod, Cap.TensorAddressingNV)
+    require_extension!(mod, "SPV_NV_tensor_addressing")
+
+    dim_id = emit_constant_u32!(mod, UInt32(dim))
+    clamp_id = emit_constant_u32!(mod, clampmode)
+    id = fresh_id!(mod)
+    encode_instruction!(mod.types_constants, Op.OpTypeTensorLayoutNV, id, dim_id, clamp_id)
+    state.tensor_layout_type_ids[key] = id
+    return id
+end
+
+"""
+    emit_tensor_view_type!(state, dim, hasdims, perm) -> UInt32
+
+`OpTypeTensorViewNV`, deduplicated per module. `perm` is the dimension
+permutation — `(1, 0)` is the transpose that `mul_mm_cm2.comp` uses for its B
+operand, and it is what replaces staging a transposed copy.
+
+Operands are `%Dim %HasDimensions %p0 %p1 …`, all constant <id>s; `HasDimensions`
+is a Bool constant, so it is `OpConstantTrue`/`OpConstantFalse` rather than an
+integer.
+"""
+function emit_tensor_view_type!(state::SPIRVEmitterState, dim::Integer,
+                                hasdims::Bool, perm::AbstractVector{<:Integer})
+    length(perm) == dim ||
+        error("tensor view permutation has $(length(perm)) entries for dim $dim")
+    permu = UInt32[UInt32(p) for p in perm]
+    key = (Int(dim), hasdims, permu)
+    cached = get(state.tensor_view_type_ids, key, nothing)
+    cached === nothing || return cached
+
+    mod = state.mod
+    require_capability!(mod, Cap.TensorAddressingNV)
+    require_extension!(mod, "SPV_NV_tensor_addressing")
+
+    dim_id = emit_constant_u32!(mod, UInt32(dim))
+    has_id = emit_constant_bool!(mod, hasdims)
+    perm_ids = UInt32[emit_constant_u32!(mod, p) for p in permu]
+    id = fresh_id!(mod)
+    encode_instruction!(mod.types_constants, Op.OpTypeTensorViewNV, id,
+                        dim_id, has_id, perm_ids...)
+    state.tensor_view_type_ids[key] = id
     return id
 end
 
@@ -154,16 +344,16 @@ pre-scan is not optional.
 """
 function prescan_function_for_coopmat_components!(state::SPIRVEmitterState,
                                                   fn::LLVM.Function)
-    isempty(LLVM.blocks(fn)) && return nothing
-    for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+    isempty(fn.blocks) && return nothing
+    for bb in fn.blocks, inst in bb.instructions
         inst isa LLVM.CallInst || continue
-        callee = LLVM.called_operand(inst)
+        callee = inst.called_operand
         callee isa LLVM.Function || continue
-        parsed = parse_coopmat_name(LLVM.name(callee))
+        parsed = parse_coopmat_name(callee.name)
         parsed === nothing && continue
-        op, dtype, M, N, use, _ = parsed
+        op, dtype, M, N, use, _, scope = parsed
         (op == "getcomp" || op == "setcomp") || continue
-        coopmat_component_var!(state, emit_coopmat_type!(state, dtype, M, N, use))
+        coopmat_component_var!(state, emit_coopmat_type!(state, dtype, M, N, use, scope))
     end
     return nothing
 end
@@ -207,8 +397,8 @@ reach one component. Done literally that is quadratic in the obvious usage: an
 epilogue or a rescale that touches all `n` components spills and reloads the
 entire matrix `n` times to change `n` values.
 
-**This is worth doing and it bought no measured time.** It was built to explain
-why holding SAM 2's attention `O` in accumulators loses, and it does not: the
+**Worth doing, and it buys no measured time.** It does not explain why holding
+SAM 2's attention `O` in accumulators loses: the
 flash kernel measured 4.955 ms before and 4.950 after, the GEMM's gelu epilogue
 is unchanged at 255 registers, and the real cause turned out to be occupancy
 (see `DNNKernels`' `FLASHCM_HELD`). NVIDIA's shader compiler evidently coalesces
@@ -234,6 +424,239 @@ function coopmat_spill_once!(state::SPIRVEmitterState, var_id::UInt32, m_id::UIn
 end
 
 """
+    parse_tensor_name(fn_name) -> (op, dim, clamp, rest) | nothing
+
+Invert the tensor-addressing intrinsic names, which are
+`_lava_tensor_<op>_<dim>_<clamp>[_<rest>]`. `dim` and `clamp` ride in the name
+for the same reason the matrix shape does: they are operands of the TYPE, built
+from constants, and no constant can be a runtime value.
+"""
+function parse_tensor_name(fn_name::AbstractString)
+    startswith(fn_name, "_lava_tensor_") || return nothing
+    parts = split(fn_name, '_')
+    # ["", "lava", "tensor", op, dim, clamp, rest...]
+    length(parts) >= 6 || return nothing
+    op = parts[4]
+    dim = tryparse(Int, parts[5]);   dim === nothing && return nothing
+    cl  = tryparse(UInt32, parts[6]); cl === nothing && return nothing
+    (op, dim, cl, parts[7:end])
+end
+
+"""
+    emit_tensor_call!(state, inst, fn_name) -> nothing
+
+Lower one `_lava_tensor_*` call — the `SPV_NV_tensor_addressing` half of the
+coopmat2 staging path. Dispatched from `emit_call!`.
+
+A layout is an SSA value exactly as a cooperative matrix is, so the handle's
+LLVM value maps straight to the SPIR-V result id and needs no variable or slot.
+Every operand other than the type parameters is a runtime `<id>`: the dimensions
+and the slice offsets are ordinary i32 values, which is the entire point — the
+block a workgroup owns is computed, not baked.
+"""
+function emit_tensor_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
+                           fn_name::AbstractString)
+    parsed = parse_tensor_name(fn_name)
+    parsed === nothing && error("not a tensor-addressing intrinsic: $fn_name")
+    op, dim, clamp, rest = parsed
+
+    mod = state.mod
+    args = inst.operands          # trailing operand is the callee
+    nargs = length(args) - 1
+    layout_ty = emit_tensor_layout_type!(state, dim, clamp)
+    require_capability!(mod, Cap.TensorAddressingNV)
+    require_extension!(mod, "SPV_NV_tensor_addressing")
+
+    if op == "create"
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpCreateTensorLayoutNV, layout_ty, id)
+        state.value_map[inst] = id
+        state.tensor_value_types[inst] = layout_ty
+
+    elseif op == "view"
+        # `_lava_tensor_view_<dim>_0_<p0>x<p1>...` — the clamp field is unused
+        # (a view has no clamp mode) and carries 0 so the shared name parser
+        # still applies. `perm` is the dimension permutation: (1, 0) is the
+        # transpose that lets K be read in place instead of staged as a copy.
+        length(rest) == 1 || error("malformed tensor view name: $fn_name")
+        perm = [parse(Int, x) for x in split(rest[1], 'x')]
+        view_ty = emit_tensor_view_type!(state, dim, false, perm)
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpCreateTensorViewNV, view_ty, id)
+        state.value_map[inst] = id
+        state.tensor_value_types[inst] = view_ty
+
+    elseif op == "setdim"
+        # %layout followed by one <id> per dimension.
+        nargs == dim + 1 ||
+            error("tensor setdim for dim $dim takes $(dim + 1) arguments, got $nargs")
+        ids = UInt32[get_value_id!(state, args[k]) for k in 1:nargs]
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpTensorLayoutSetDimensionNV,
+                            layout_ty, id, ids...)
+        state.value_map[inst] = id
+        state.tensor_value_types[inst] = layout_ty
+
+    elseif op == "setstride"
+        # Same operand shape as `setdim`: %layout followed by one <id> per
+        # dimension. What it carries is the distance in ELEMENTS between
+        # successive indices of that dimension, which is how a layout describes a
+        # slab of a larger array rather than a packed one.
+        nargs == dim + 1 ||
+            error("tensor setstride for dim $dim takes $(dim + 1) arguments, got $nargs")
+        ids = UInt32[get_value_id!(state, args[k]) for k in 1:nargs]
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpTensorLayoutSetStrideNV,
+                            layout_ty, id, ids...)
+        state.value_map[inst] = id
+        state.tensor_value_types[inst] = layout_ty
+
+    elseif op == "setclampvalue"
+        # %layout %value — ONE operand whatever the rank, unlike setdim and
+        # setstride, because the fill is a single element and not a per-axis
+        # quantity.
+        nargs == 2 ||
+            error("tensor setclampvalue takes 2 arguments, got $nargs")
+        ids = UInt32[get_value_id!(state, args[k]) for k in 1:nargs]
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpTensorLayoutSetClampValueNV,
+                            layout_ty, id, ids...)
+        state.value_map[inst] = id
+        state.tensor_value_types[inst] = layout_ty
+
+    elseif op == "slice"
+        # %layout then OFFSET/SIZE PAIRS, one pair per dimension — not all the
+        # offsets followed by all the sizes, which is the natural mis-reading.
+        nargs == 2dim + 1 ||
+            error("tensor slice for dim $dim takes $(2dim + 1) arguments, got $nargs")
+        ids = UInt32[get_value_id!(state, args[k]) for k in 1:nargs]
+        id = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpTensorLayoutSliceNV,
+                            layout_ty, id, ids...)
+        state.value_map[inst] = id
+        state.tensor_value_types[inst] = layout_ty
+
+    elseif op == "load" || op == "loadv"
+        # `_lava_tensor_load_<dim>_<clamp>_<dtype>_<M>x<N>_<use>`, and `loadv`
+        # for the same thing through a TensorView — a separate name because the
+        # arity differs and one LLVM symbol cannot carry both signatures.
+        #   (i64 address, i32 object-handle, i32 layout-handle) -> i32 matrix
+        3 <= length(rest) <= 4 || error("malformed tensor load name: $fn_name")
+        dtype = rest[1]
+        dims = split(rest[2], 'x'); length(dims) == 2 || error("bad shape in $fn_name")
+        M = parse(Int, dims[1]); N = parse(Int, dims[2])
+        # The use rides as the same "a"/"b"/"acc" suffix `parse_coopmat_name`
+        # decodes, not as a number — and so does the optional "wg" scope flag
+        # after it.
+        use = rest[3] == "a" ? CoopMatUse.MatrixA :
+              rest[3] == "b" ? CoopMatUse.MatrixB : CoopMatUse.MatrixAccumulator
+        scope = (length(rest) == 4 && rest[4] == "wg") ? COOPMAT_SCOPE_WORKGROUP :
+                                                         COOPMAT_SCOPE_SUBGROUP
+        wantargs = op == "loadv" ? 4 : 3
+        nargs == wantargs || error("tensor $op takes $wantargs arguments, got $nargs")
+
+        mat_ty = emit_coopmat_type!(state, dtype, M, N, use, scope)
+        comp_ty = coopmat_component_type!(state, dtype)
+        ptr_id = coopmat_base_pointer!(state, args[1], comp_ty)
+        obj_id = get_value_id!(state, args[2])
+        layout_id = get_value_id!(state, args[3])
+
+        # The load is the coopmat2 half, so it needs THAT capability as well as
+        # the tensor-addressing one declared above — two extensions, one
+        # instruction sequence.
+        require_capability!(mod, Cap.CooperativeMatrixTensorAddressingNV)
+        require_extension!(mod, "SPV_NV_cooperative_matrix2")
+
+        id = fresh_id!(mod)
+        # MemoryOperands must be `Aligned` with a literal alignment, NOT `None`.
+        # glslang's reference emits `None None` — but its shader loads from a
+        # descriptor binding, and ours is a `PhysicalStorageBuffer` address, where
+        # VUID-StandaloneSpirv-PhysicalStorageBuffer64-04708 requires the
+        # alignment. spirv-val says so precisely; copying the reference verbatim
+        # would have produced a module that only fails on the buffer-device-address
+        # path this actually uses.
+        # And `TensorAddressingOperands` is then NOT optional: with the alignment
+        # present the decoder expects the trailing word, and omitting it aborts
+        # with "expected more operands after 8 words" rather than anything about
+        # tensors. Order is MemoryOperands, its literal, then the tensor mask.
+        align = coopmat_component_bytes(dtype)
+        if op == "loadv"
+            # With a view, the trailing mask names it and the view's <id> follows
+            # the mask. `TENSOR_ADDR_TENSORVIEW` is read from the SPIR-V headers,
+            # not inferred — the wrong bit loads the wrong elements silently.
+            view_id = get_value_id!(state, args[4])
+            encode_instruction!(mod.functions, Op.OpCooperativeMatrixLoadTensorNV,
+                                mat_ty, id, ptr_id, obj_id, layout_id,
+                                MemOp.Aligned, UInt32(align),
+                                Op.TENSOR_ADDR_TENSORVIEW, view_id)
+        else
+            encode_instruction!(mod.functions, Op.OpCooperativeMatrixLoadTensorNV,
+                                mat_ty, id, ptr_id, obj_id, layout_id,
+                                MemOp.Aligned, UInt32(align), Op.TENSOR_ADDR_NONE)
+        end
+        state.value_map[inst] = id
+        state.coopmat_value_types[inst] = mat_ty
+
+    elseif op == "store" || op == "storev"
+        # `_lava_tensor_store_<dim>_<clamp>_<dtype>_<M>x<N>_<use>`, and `storev`
+        # for the same thing through a TensorView — separate names because the
+        # arity differs, exactly as for the load.
+        #   (i64 address, i32 matrix-handle, i32 layout-handle[, i32 view]) -> nothing
+        #
+        # The mirror of the load, and the half that makes a ragged OUTPUT legal:
+        # under a clamping layout the store writes only the elements the layout's
+        # dimensions admit, so an edge tile stops at the extent instead of running
+        # past it. That is what lets a GEMM skip `gemm_padn`/`GEMM_BLOCK` on the
+        # DESTINATION as well as the operands.
+        3 <= length(rest) <= 4 || error("malformed tensor store name: $fn_name")
+        dtype = rest[1]
+        dims = split(rest[2], 'x'); length(dims) == 2 || error("bad shape in $fn_name")
+        M = parse(Int, dims[1]); N = parse(Int, dims[2])
+        use = rest[3] == "a" ? CoopMatUse.MatrixA :
+              rest[3] == "b" ? CoopMatUse.MatrixB : CoopMatUse.MatrixAccumulator
+        scope = (length(rest) == 4 && rest[4] == "wg") ? COOPMAT_SCOPE_WORKGROUP :
+                                                         COOPMAT_SCOPE_SUBGROUP
+        wantargs = op == "storev" ? 4 : 3
+        nargs == wantargs || error("tensor $op takes $wantargs arguments, got $nargs")
+
+        emit_coopmat_type!(state, dtype, M, N, use, scope)   # declares caps/extension
+        comp_ty = coopmat_component_type!(state, dtype)
+        ptr_id = coopmat_base_pointer!(state, args[1], comp_ty)
+        mat_id = get_value_id!(state, args[2])
+        layout_id = get_value_id!(state, args[3])
+
+        require_capability!(mod, Cap.CooperativeMatrixTensorAddressingNV)
+        require_extension!(mod, "SPV_NV_cooperative_matrix2")
+
+        # Same two operand rules as the load, for the same reasons: `Aligned` with
+        # a literal rather than `None`, because ours is a `PhysicalStorageBuffer`
+        # address (VUID-…-04708) where glslang's reference uses a descriptor
+        # binding and emits `None`; and `TensorAddressingOperands` is then
+        # mandatory, not optional. No result type, no result id.
+        align = coopmat_component_bytes(dtype)
+        if op == "storev"
+            # The view names itself in the trailing mask and its <id> follows —
+            # the same encoding as the load's, which is why the bit is read from
+            # the SPIR-V headers once and shared.
+            view_id = get_value_id!(state, args[4])
+            encode_instruction!(mod.functions, Op.OpCooperativeMatrixStoreTensorNV,
+                                ptr_id, mat_id, layout_id,
+                                MemOp.Aligned, UInt32(align),
+                                Op.TENSOR_ADDR_TENSORVIEW, view_id)
+        else
+            encode_instruction!(mod.functions, Op.OpCooperativeMatrixStoreTensorNV,
+                                ptr_id, mat_id, layout_id,
+                                MemOp.Aligned, UInt32(align), Op.TENSOR_ADDR_NONE)
+        end
+        # A store produces no value, so nothing is recorded in `value_map`.
+
+    else
+        error("unsupported tensor-addressing op `$op` in $fn_name")
+    end
+    return nothing
+end
+
+"""
     emit_coopmat_call!(state, inst, fn_name) -> nothing
 
 Lower one `_lava_coopmat_*` call. Dispatched from `emit_call!`.
@@ -242,11 +665,11 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
                             fn_name::AbstractString)
     parsed = parse_coopmat_name(fn_name)
     parsed === nothing && error("not a cooperative-matrix intrinsic: $fn_name")
-    op, dtype, M, N, use, rowmajor = parsed
+    op, dtype, M, N, use, rowmajor, scope = parsed
 
     mod = state.mod
-    mat_ty = emit_coopmat_type!(state, dtype, M, N, use)
-    args = LLVM.operands(inst)
+    mat_ty = emit_coopmat_type!(state, dtype, M, N, use, scope)
+    args = inst.operands
     # Both layouts, because the operands want different ones from the same block:
     # `mul_mm.comp` stages A and B identically and reads A `RowMajor`, B
     # `ColumnMajor`. Hardcoding one forces a transposing staging pass for the
@@ -263,15 +686,28 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
     # is the whole correctness of a staged GEMM: without it the tiles a
     # cooperative-matrix load reads are whatever the driver felt like leaving in
     # shared memory. See `nonprivate` and the barrier in `emit.jl`.
-    if op == "load" || op == "loadw" || op == "loadw2"
+    if op == "load" || op == "loadw" || startswith(op, "loadw")
         comp_ty = coopmat_component_type!(state, dtype)
-        # `loadw2` addresses a `@localmem` of 2-wide vectors, so the access chain
-        # must yield a pointer to the *vector*: `OpCooperativeMatrixLoadKHR`
+        # `loadw<W>` addresses a `@localmem` of W-wide vectors, so the access
+        # chain must yield a pointer to the *vector*: `OpCooperativeMatrixLoadKHR`
         # accepts a vector pointee whose component type matches the matrix, and
         # counts `Stride` in those vectors. That is how `mul_mm.comp` gets 32-bit
-        # shared accesses out of an fp16 tile. See `coopmat_vec2`.
-        pointee = op == "loadw2" ?
-            emit_type_vector!(mod, comp_ty, UInt32(2)) : comp_ty
+        # shared accesses out of an fp16 tile. See `coopmat_vecwidth`.
+        #
+        # The width is read from the name rather than fixed at 2, so 4-wide
+        # (64-bit) shared accesses work by the same path. SPIR-V vectors are 2, 3
+        # or 4 components, which is the ceiling here; `coopmat_sharedok` rejects
+        # anything else before a name is ever built.
+        #
+        # `loadwu4` is a uvec4 pointee whatever the matrix's component type: the
+        # one 128-bit shared access SPIR-V can name. See `coopmat_uvec4`.
+        pointee = if op == "load" || op == "loadw"
+            comp_ty
+        elseif op == "loadwu4"
+            emit_type_vector!(mod, emit_type_int!(mod, UInt32(32), UInt32(0)), UInt32(4))
+        else
+            emit_type_vector!(mod, comp_ty, UInt32(parse(Int, op[6:end])))
+        end
         # `loadw`/`loadw2` carry an extra element-index argument; see below.
         ptr_id, stride_arg = op != "load" ?
             (coopmat_workgroup_pointer!(state, args[1], args[2], pointee), args[3]) :
@@ -313,13 +749,34 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         state.value_map[inst] = id
         state.coopmat_value_types[inst] = mat_ty
 
+    elseif op == "undef"
+        # An UNINITIALISED matrix, for a destination whose prior contents cannot
+        # be observed — which is what `tensor_load` under a CONSTANT clamp mode
+        # has: out-of-range elements come from the layout's clamp value, not from
+        # the destination. GLSL gets this for free by declaring `coopmat mat_a;`
+        # and never assigning it; we were passing `coopmat_zero`, which is a real
+        # value the allocator has to hold until the load overwrites it.
+        id = fresh_id!(mod)
+        encode_instruction!(mod.types_constants, Op.OpUndef, mat_ty, id)
+        state.value_map[inst] = id
+        state.coopmat_value_types[inst] = mat_ty
+
     elseif op == "muladd"
         a_id = get_value_id!(state, args[1])
         b_id = get_value_id!(state, args[2])
         c_id = get_value_id!(state, args[3])
         id = fresh_id!(mod)
-        encode_instruction!(mod.functions, Op.OpCooperativeMatrixMulAddKHR,
-                            mat_ty, id, a_id, b_id, c_id)
+        # The trailing operands word is emitted only where it says something:
+        # a float product has no signedness and every name that existed before
+        # integer matrices did keeps the instruction it had.
+        operands = coopmat_muladd_operands(state, args[1], args[2], dtype)
+        if operands == 0
+            encode_instruction!(mod.functions, Op.OpCooperativeMatrixMulAddKHR,
+                                mat_ty, id, a_id, b_id, c_id)
+        else
+            encode_instruction!(mod.functions, Op.OpCooperativeMatrixMulAddKHR,
+                                mat_ty, id, a_id, b_id, c_id, operands)
+        end
         state.value_map[inst] = id
         state.coopmat_value_types[inst] = mat_ty
 
@@ -330,8 +787,39 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         # `mat_ty` is the *result* type, from the intrinsic's name; the source
         # type comes with the operand.
         src_id = get_value_id!(state, args[1])
+        src_ty = get(state.coopmat_value_types, args[1], UInt32(0))
         id = fresh_id!(mod)
-        encode_instruction!(mod.functions, Op.OpFConvert, mat_ty, id, src_id)
+        # `OpFConvert` requires the two matrix types to agree on USE as well as
+        # shape. A conversion that also changes use — fp32 Accumulator to fp16
+        # MatrixA, which is what feeds the second product of a flash kernel — is
+        # `OpCooperativeMatrixConvertNV`. Choosing on the emitted type ids keeps
+        # the same intrinsic serving both, so callers do not have to know which
+        # instruction their conversion turns into.
+        sk = src_ty == UInt32(0) ? nothing : coopmat_type_key(state, src_ty)
+        dk = coopmat_type_key(state, mat_ty)
+        if sk !== nothing && dk !== nothing && sk[4] != dk[4]
+            # A use change is `OpCooperativeMatrixConvertNV`, and that instruction
+            # requires the two component types to be IDENTICAL — spirv-val:
+            # "Result Type and Matrix component types mismatch". So a conversion
+            # that changes BOTH (fp32 Accumulator -> fp16 MatrixA, which is what
+            # feeds a flash kernel's second product) is two instructions: convert
+            # the component type first, at the SOURCE use, then the use. The
+            # reference sidesteps this by keeping `P` in fp16 throughout, so only
+            # the use ever changes there.
+            require_capability!(mod, Cap.CooperativeMatrixConversionsNV)
+            require_extension!(mod, "SPV_NV_cooperative_matrix2")
+            from = src_id
+            if sk[1] != dk[1]
+                mid_ty = emit_coopmat_type!(state, dk[1], sk[2], sk[3], sk[4], sk[5])
+                mid_id = fresh_id!(mod)
+                encode_instruction!(mod.functions, Op.OpFConvert, mid_ty, mid_id, src_id)
+                from = mid_id
+            end
+            encode_instruction!(mod.functions, Op.OpCooperativeMatrixConvertNV,
+                                mat_ty, id, from)
+        else
+            encode_instruction!(mod.functions, Op.OpFConvert, mat_ty, id, src_id)
+        end
         state.value_map[inst] = id
         state.coopmat_value_types[inst] = mat_ty
 
@@ -396,9 +884,17 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         state.value_map[inst] = id
         state.coopmat_value_types[inst] = mat_ty
 
-    elseif op == "perelem"
+    elseif op == "perelem" || op == "perelemm"
         # `OpCooperativeMatrixPerElementOpNV` — apply a function to every element
         # of the matrix, with the element's (row, column) handed to it.
+        #
+        # `perelemm` is the same instruction with a MATRIX as its extra operand,
+        # which the spec allows and for which the callback receives that
+        # matrix's corresponding ELEMENT. Its operand cannot come from the marker
+        # call the way a scalar extra does: the marker fixes the callback's
+        # signature and so must carry an element, while the instruction needs the
+        # matrix. The matrix therefore rides on the `llvmcall` as a handle, and
+        # is resolved here.
         #
         # The whole point is that the driver reaches the elements itself. Written
         # with `getcomp`/`setcomp` the same rescale costs a `Function`-storage
@@ -420,19 +916,29 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
             error("cooperative-matrix per-element callback did not survive as a call; " *
                   "the callback must be a top-level `@noinline` function of " *
                   "(::UInt32, ::UInt32, ::$dtype), not a closure")
-        callee = LLVM.called_operand(marker)
+        callee = marker.called_operand
         callee isa LLVM.Function ||
             error("cooperative-matrix per-element callback is an indirect call")
         func_id = get(state.value_map, callee, nothing)
         func_id === nothing &&
-            error("cooperative-matrix per-element callback $(LLVM.name(callee)) has no " *
+            error("cooperative-matrix per-element callback $(callee.name) has no " *
                   "SPIR-V function; it was probably inlined away")
         # Everything the callback needs beyond (row, col, element) rides along as
         # a trailing operand. They are read off the marker call, where they are
         # the real values — only the first three arguments there are dummies.
         # A CallInst's operand list ends with the callee, hence `end - 1`.
-        margs = LLVM.operands(marker)
-        extras = UInt32[get_value_id!(state, margs[k]) for k in 4:(length(margs) - 1)]
+        margs = marker.operands
+        extras = if op == "perelemm"
+            # args = (matrix, marker, other-matrix); the marker's own trailing
+            # argument is the dummy element that gave `f` its signature.
+            # `nargs` belongs to the tensor emitter; here the count is the
+            # operand list minus its trailing callee.
+            length(args) - 1 == 3 ||
+                error("perelemm takes 3 arguments, got $(length(args) - 1)")
+            UInt32[get_value_id!(state, args[3])]
+        else
+            UInt32[get_value_id!(state, margs[k]) for k in 4:(length(margs) - 1)]
+        end
         id = fresh_id!(mod)
         encode_instruction!(mod.functions, Op.OpCooperativeMatrixPerElementOpNV,
                             mat_ty, id, m_id, func_id, extras...)
@@ -471,12 +977,12 @@ function emit_coopmat_call!(state::SPIRVEmitterState, inst::LLVM.CallInst,
         marker isa LLVM.CallInst ||
             error("cooperative-matrix reduce callback did not survive as a call; " *
                   "it must be a top-level function of (::$dtype, ::$dtype), not a closure")
-        callee = LLVM.called_operand(marker)
+        callee = marker.called_operand
         callee isa LLVM.Function ||
             error("cooperative-matrix reduce callback is an indirect call")
         func_id = get(state.value_map, callee, nothing)
         func_id === nothing &&
-            error("cooperative-matrix reduce callback $(LLVM.name(callee)) has no " *
+            error("cooperative-matrix reduce callback $(callee.name) has no " *
                   "SPIR-V function; it was probably inlined away")
         id = fresh_id!(mod)
         encode_instruction!(mod.functions, Op.OpCooperativeMatrixReduceNV,
@@ -509,44 +1015,59 @@ its call, and the pattern degrades to a redundant evaluation rather than to a
 missing one.
 """
 function coopmat_perelement_marker(inst::LLVM.CallInst)
-    callee = LLVM.called_operand(inst)
+    callee = inst.called_operand
     callee isa LLVM.Function || return false
-    startswith(LLVM.name(callee), "_lava_") && return false
+    startswith(callee.name, "_lava_") && return false
     n = 0
-    for use in LLVM.uses(inst)
-        user = LLVM.user(use)
+    for use in inst.uses
+        user = use.user
         user isa LLVM.CallInst || return false
-        target = LLVM.called_operand(user)
+        target = user.called_operand
         target isa LLVM.Function || return false
-        parsed = parse_coopmat_name(LLVM.name(target))
-        (parsed !== nothing && parsed[1] == "perelem") || return false
+        parsed = parse_coopmat_name(target.name)
+        # `perelemm` — the MATRIX-operand form — is a per-element op too. Matching
+        # `perelem` exactly excluded it here and in `collect_inline_callbacks!`
+        # below, so its callback was never marked `Inline` and the driver emitted
+        # a real function call per element. That is the 8.5x documented on
+        # `coopmat_perelement`, and it made the fused softmax measure +30% and
+        # read as "fewer passes do not pay".
+        (parsed !== nothing && startswith(parsed[1], "perelem")) || return false
         n += 1
     end
     return n > 0
 end
 
 """
-    collect_perelement_callbacks!(state, llvm_mod) -> nothing
+    collect_inline_callbacks!(state, llvm_mod) -> nothing
 
 Record every function that an `OpCooperativeMatrixPerElementOpNV` will name.
 
 Runs over the whole module before any function is emitted, because a callback is
 emitted *ahead of* the entry function that names it and `emit_function!` has to
-already know not to mark it `DontInline`. See `perelement_callbacks`.
+already know not to mark it `DontInline`. See `inline_callbacks`.
 """
-function collect_perelement_callbacks!(state::SPIRVEmitterState, llvm_mod::LLVM.Module)
-    for fn in LLVM.functions(llvm_mod)
-        isempty(LLVM.blocks(fn)) && continue
-        for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+function collect_inline_callbacks!(state::SPIRVEmitterState, llvm_mod::LLVM.Module)
+    for fn in llvm_mod.functions
+        isempty(fn.blocks) && continue
+        for bb in fn.blocks, inst in bb.instructions
             inst isa LLVM.CallInst || continue
-            callee = LLVM.called_operand(inst)
+            callee = inst.called_operand
             callee isa LLVM.Function || continue
-            parsed = parse_coopmat_name(LLVM.name(callee))
-            (parsed !== nothing && parsed[1] == "perelem") || continue
-            marker = LLVM.operands(inst)[2]
+            parsed = parse_coopmat_name(callee.name)
+            parsed === nothing && continue
+            # `reduce<mask>` too. `OpCooperativeMatrixReduceNV` names a combiner
+            # the driver is meant to inline into its reduction loop for exactly
+            # the same reason, and `coopmat_reduce`'s docstring already said so
+            # — but nothing put it in this set, so every combiner was emitted
+            # `DontInline` and each combine step was a real function call.
+            (startswith(parsed[1], "perelem") || startswith(parsed[1], "reduce")) || continue
+            # Operand 2 is the marker in all three forms: the scalar llvmcall is
+            # `(i32 %m, T %p)`, the matrix one `(i32 %m, T %p, i32 %o)`, and the
+            # reduce one `(i32 %m, T %p)`.
+            marker = inst.operands[2]
             marker isa LLVM.CallInst || continue
-            cb = LLVM.called_operand(marker)
-            cb isa LLVM.Function && push!(state.perelement_callbacks, cb)
+            cb = marker.called_operand
+            cb isa LLVM.Function && push!(state.inline_callbacks, cb)
         end
     end
     return nothing

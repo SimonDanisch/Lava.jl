@@ -1,0 +1,211 @@
+#
+# Lava's implementation of `KernelInterface` (KI).
+#
+# KI is the cross-backend device/host/launch contract from
+# `KernelAbstractions/lib/KernelInterface`. Every backend implements it, and
+# kernels written against it compile on all of them — that is the whole point,
+# and it is why these names, not Lava's own, are what Lava uses internally.
+#
+# The device vocabulary KI does not have yet (cooperative matrices, tensors,
+# graphics and mesh stages, `DeviceCaps`) is in `src/vocabulary/`, generic
+# functions every backend overlays; `matrix_shapes` below is its backend hook.
+#
+# ── Conventions this file reconciles ────────────────────────────────────────
+#
+# KI returns **1-based** indices, as `@NamedTuple{x::Int, y::Int, z::Int}` for
+# the 3D queries. SPIR-V's builtins are 0-based vectors of `u32`. So every id
+# gains one here, and every *size* does not — a count is a count in both.
+#
+# The raw intrinsics stay 0-based on purpose: they feed `subgroup_shuffle` and
+# friends, which are specified in SPIR-V's numbering, and `shuffle(v, lane())`
+# would read the neighbouring lane if `lane()` were shifted. The offset belongs
+# at this boundary and nowhere else.
+
+import KernelInterface as KI
+
+# ── Indexing ────────────────────────────────────────────────────────────────
+
+# **Typed**, which is KernelInterface's contract for the 3D queries: a
+# backend implements `f(::Type{T})` and KI itself owns the zero-argument form as
+# `f() = f(Int)`. Implementing the zero-argument one here instead OVERWRITES
+# that definition, and method overwriting is an error during precompilation —
+# `Method definition get_global_id() in module KernelInterface … overwritten in
+# module Lava`, which takes the whole tree down.
+#
+# The element type is what a kernel wanting `Int32` indices asks for, so it no
+# longer has to convert after the fact. `% T` rather than `T(x)`, as KI asks: a
+# checked conversion leaves an error branch in every kernel.
+#
+# In Lava's own method table, like the subgroup queries below and for the same
+# reason: a plain method is what every other backend's compiler finds too.
+@lava_device_override @inline KI.get_global_id(::Type{T}) where {T} =
+    (x = lava_global_invocation_id(1) % T + one(T),
+     y = lava_global_invocation_id(2) % T + one(T),
+     z = lava_global_invocation_id(3) % T + one(T))
+
+@lava_device_override @inline KI.get_local_id(::Type{T}) where {T} =
+    (x = lava_local_invocation_id(1) % T + one(T),
+     y = lava_local_invocation_id(2) % T + one(T),
+     z = lava_local_invocation_id(3) % T + one(T))
+
+@lava_device_override @inline KI.get_group_id(::Type{T}) where {T} =
+    (x = lava_workgroup_id(1) % T + one(T),
+     y = lava_workgroup_id(2) % T + one(T),
+     z = lava_workgroup_id(3) % T + one(T))
+
+# A COUNT, so no `+ 1` — see this file's header on the 1-based convention.
+@lava_device_override @inline KI.get_num_groups(::Type{T}) where {T} =
+    (x = lava_num_workgroups(1) % T,
+     y = lava_num_workgroups(2) % T,
+     z = lava_num_workgroups(3) % T)
+
+# `get_local_size` and `get_global_size` are NOT implemented yet, and the reason
+# is a bug they uncovered rather than an oversight.
+#
+# Both need the workgroup size, and `lava_workgroup_size` (BUILTIN_3D in
+# runtime/intrinsics.jl) emits it as an Input *variable*. Vulkan does not allow
+# that: spirv-val rejects the module with
+#
+#     BuiltIn decoration on target '%__spirv_BuiltInWorkgroupSize'
+#     must be a constant for WorkgroupSize
+#
+# The workgroup size is fixed when the kernel is compiled — the launch plan
+# picks it — so SPIR-V wants it as an `OpConstantComposite` carrying the
+# decoration, not a load. `lava_workgroup_size` was declared and never called by
+# anything in src/ or test/, so it has produced invalid SPIR-V unnoticed; this
+# was its first caller. Emitting the constant is the fix, and it belongs with
+# the emitter rather than smuggled in here.
+#
+# `get_global_size` is then `num_groups * local_size` per dimension, which is
+# exact: a dispatch covers whole workgroups, and that is what makes the tail
+# real for a kernel to bound itself against.
+
+# ── Subgroups ───────────────────────────────────────────────────────────────
+
+# Every method in this section is `@lava_device_override`, in Lava's own method
+# table. A plain method on a KernelInterface function would be what every other
+# backend's compiler finds where it has no override of its own (ROCm would compile
+# a subgroup reduction to `_lava_subgroup_reduce_add_f32`, an unknown function in a
+# GCN module). A backend without the capability has a missing method, not Lava's.
+#
+# Typed, as KI defines them, and the zero-argument forms kept in `UInt32` beside
+# them: KI's own zero-argument forms answer `Int`, and the kernels here do their
+# lane arithmetic in the builtins' 32 bits.
+@lava_device_override @inline KI.get_sub_group_size(::Type{T}) where {T} =
+    lava_subgroup_size() % T
+@lava_device_override @inline KI.get_num_sub_groups(::Type{T}) where {T} =
+    lava_num_subgroups() % T
+@lava_device_override @inline KI.get_sub_group_id(::Type{T}) where {T} =
+    (lava_subgroup_id() + UInt32(1)) % T
+@lava_device_override @inline KI.get_sub_group_local_id(::Type{T}) where {T} =
+    (lava_subgroup_local_id() + UInt32(1)) % T
+
+@lava_device_override @inline KI.get_sub_group_size()     = lava_subgroup_size()
+@lava_device_override @inline KI.get_num_sub_groups()     = lava_num_subgroups()
+@lava_device_override @inline KI.get_sub_group_id()       = lava_subgroup_id() + UInt32(1)
+@lava_device_override @inline KI.get_sub_group_local_id() = lava_subgroup_local_id() + UInt32(1)
+
+# `get_max_sub_group_size` is missing on purpose: SPIR-V puts SubgroupMaxSize
+# under the Kernel (OpenCL) capability and spirv-val rejects it in a Vulkan
+# module. Getting the device's maximum into a shader means a specialization
+# constant fed from `subgroup_size_control(ctx).max` — its own task.
+
+# `shfl_down` is KI's name for the down-shuffle. Lava generates the family for
+# six element types; KI's `supports_shuffle` is what tells its own test suite
+# which ones to exercise, so the two lists are derived from one place.
+# KI's `shfl` takes the 1-based lane `get_sub_group_local_id` returns
+# (KernelInterface 0.4); SPIR-V's shuffle id is 0-based, so the one is
+# subtracted here and nowhere else.
+const KI_SHFL_TYPES = (Float32, Float64, Int32, UInt32, Int64, UInt64)
+
+for T in KI_SHFL_TYPES
+    @eval @lava_device_override @inline KI.shfl(val::$T, lane::Integer) =
+        subgroup_shuffle(val, lane - one(lane))
+    # KernelInterface 0.4: a lane whose source is past the sub-group keeps its own
+    # value. SPIR-V leaves that lane undefined, so it is selected here.
+    @eval @lava_device_override @inline function KI.shfl_down(val::$T, offset::Integer)
+        moved = subgroup_shuffle_down(val, offset)
+        return lava_subgroup_local_id() + (offset % UInt32) < lava_subgroup_size() ? moved : val
+    end
+end
+
+# Mantle's `KI.supports_shuffle(backend, T)` reads this list but dispatches on a
+# backend, which is a host handle — so it is in the host half, and this is the
+# one list both sides derive from.
+
+# `KI.sub_group_reduce(+, x)` of these types is one SPIR-V
+# `OpGroupNonUniformFAdd`/`IAdd` with a `Reduce` group operation (`subgroup_add`),
+# where KI's fallback is a butterfly of shuffles; KI allows a native `+` to combine in
+# another order. Over the active invocations, which is KI's sub-group in a partial one.
+#
+# Its own type list rather than a reuse of `KI_SHFL_TYPES`, even though the six
+# coincide today: the shuffle family and the reductions are separate SPIR-V
+# capabilities, and a backend can have one without the other.
+const KI_REDUCE_ADD_TYPES = (Float32, Float64, Int32, UInt32, Int64, UInt64)
+
+for T in KI_REDUCE_ADD_TYPES
+    @eval @lava_device_override @inline KI.sub_group_reduce(::typeof(+), val::$T) = subgroup_add(val)
+end
+
+# `sub_group_ballot`: the mask of the sub-group's lanes whose `pred` is true, lane
+# `i` (1-based) at bit `i - 1`, as `OpGroupNonUniformBallot`'s low two words.
+@lava_device_override @inline KI.sub_group_ballot(pred::Bool) = subgroup_ballot(pred)
+
+# ── Integer dot product ─────────────────────────────────────────────────────
+#
+# `OpSDotKHR` on two packed words (see `emit_lava_sdot4x8!`). The vocabulary's reference
+# definition is four sign extensions and multiply-adds, which RADV does not turn
+# back into `v_dot4`.
+@inline lava_sdot4x8(a::UInt32, b::UInt32) = Base.llvmcall(("""
+    declare i32 @_lava_sdot4x8(i32, i32)
+    define i32 @entry(i32 %a, i32 %b) #0 {
+        %r = call i32 @_lava_sdot4x8(i32 %a, i32 %b)
+        ret i32 %r
+    }
+    attributes #0 = { alwaysinline }
+    """, "entry"), Int32, Tuple{UInt32, UInt32}, a, b)
+push!(KNOWN_INTRINSICS, "_lava_sdot4x8")
+
+@lava_device_override @inline dot4x8(a::UInt32, b::UInt32) = lava_sdot4x8(a, b)
+
+# ── Barriers ────────────────────────────────────────────────────────────────
+#
+# `@lava_device_override` like everything above, and here for a second reason as
+# well: KI gives `barrier` a HOST method that errors, so a plain method would
+# shadow it and a host-side call would reach an `llvmcall` of a SPIR-V intrinsic
+# on the CPU.
+#
+# Same instruction `KA.@synchronize` lowers to: `OpControlBarrier Workgroup
+# Workgroup` with AcquireRelease | WorkgroupMemory | MakeAvailable | MakeVisible
+# (emit.jl:7529). One barrier, two portable spellings.
+@lava_device_override @inline KI.barrier() = lava_workgroup_barrier()
+
+# `KI.sub_group_barrier` is DELIBERATELY not implemented. A subgroup-scoped
+# barrier is a different instruction — `OpControlBarrier Subgroup Subgroup` — and
+# lowering it means teaching that path a scope argument.
+#
+# Aliasing it to the workgroup barrier would "pass" while synchronising the
+# wrong set of invocations, so the method is left missing: KI's own convention
+# is that a capability a backend lacks is a missing method, not a wrong one, and
+# KI's host method then reports it by name.
+
+# ── Workgroup memory ────────────────────────────────────────────────────────
+#
+# Its own memory per call site (`lava_alloc_shared`), which is KI's contract and what
+# `KA.@localmem` lowers to.
+@lava_device_override @inline function KI.localmemory(::Type{T}, ::Val{Dims}) where {T, Dims}
+    N = prod(Dims)
+    LavaSharedArray{T, Dims}(lava_alloc_shared(T, Val(N)), N)
+end
+
+# ── Printing ────────────────────────────────────────────────────────────────
+#
+# The same builder `KernelAbstractions.__print` uses (device/printf.jl), so the
+# two portable spellings cannot print differently. `@lava_device_override` for
+# the reason `barrier` is: KI's `_print` has a host fallback that prints with
+# `Base.print`, and that has to keep working off-device.
+@lava_device_override @inline KI._print(items...) = lava_device_print(items...)
+
+# The HOST half of KI — `synchronize`, `allocate`, the device queries and the
+# launch — is in `array/kernelinterface_host.jl`. It needs a queue, a pool and a
+# batch; nothing above this line does. See that file's header for the split.

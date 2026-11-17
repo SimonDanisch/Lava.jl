@@ -1,67 +1,69 @@
-# Graphics
+# Graphics stages
 
-Vertex, fragment, geometry, and tessellation shaders are written as plain Julia functions and compiled to SPIR-V. There is no GLSL, no shader file format, no external preprocessor — your shaders live in the same module as your CPU code, share types and helpers with the rest of your codebase, and are subject to the same Julia tooling.
+Lava compiles Julia functions to vertex, fragment, geometry, tessellation control,
+tessellation evaluation, task and mesh stages. Mantle builds pipelines from them;
+this page is about what a stage body can do and how it is compiled.
 
-!!! note "API stability"
-    The graphics surface area is functional and exercised by real-world renderers, but the public API is still being refined. Expect minor breaking changes between 0.x releases.
+## Stage bodies
 
-## Pipelines
-
-The high-level entry points are `Rasterizer`, `TrianglePipeline`, and `LinePipeline`. Each takes a vertex and fragment shader plus optional state (blend mode, cull face, depth test, topology):
+A stage body is a plain function. It reads builtins from the
+[device vocabulary](vocabulary.md) and writes its results through Lava's stage
+intrinsics:
 
 ```julia
 using Lava, GeometryBasics
 
-vertex(pos, mvp) = mvp * pos                       # → vec4 clip-space position
-fragment(color)  = color                            # → vec4 RGBA
-
-pipeline = Rasterizer(
-    vertex   = vertex,
-    fragment = fragment,
-    blend    = :alpha,
-    cull     = :back,
-    depth    = :less,
-    topology = :triangle_list,
-)
-```
-
-The shader functions are regular Julia: they can call each other, dispatch on types, use packages (`GeometryBasics`, `LinearAlgebra`, `StaticArrays`, …), and are compiled per-instantiation just like compute kernels.
-
-## Render targets and present
-
-```julia
-window = RenderWindow(width=1280, height=720, title="demo")
-framebuffer = window.framebuffer
-
-while window_should_close(window) == false
-    draw!(pipeline, framebuffer; vertices=mesh, uniforms=params)
-    present_frame!(window)
+function triangle()
+    i = Lava.vertex_index()                     # one-based
+    x = i == Int32(1) ? -1f0 : i == Int32(2) ? 1f0 : 0f0
+    y = i == Int32(3) ? 1f0 : -1f0
+    set_position!(Vec4f(x, y, 0f0, 1f0))
+    return nothing
 end
+
+r = lava_compile(triangle, Tuple{}; stage = :vertex)
 ```
 
-Offscreen rendering uses `LavaFramebuffer(width, height)` directly without opening a window:
+Mantle's pipelines take bodies that return a `NamedTuple`, `(position = ..., color =
+...)`, and read the previous stage's outputs as one argument. The stage wrappers
+[`VertexWrapper`](@ref), [`FragmentWrapper`](@ref), [`GeometryWrapper`](@ref) and
+`MeshWrapper` translate between the two forms: each field becomes an interface
+variable at a fixed location, and a field declared `Flat` is passed without
+interpolation.
+
+## Interface and builtins
+
+| | |
+|---|---|
+| position | [`set_position!`](@ref) |
+| outputs and inputs by location | [`gfx_output`](@ref), [`gfx_output_flat`](@ref), [`gfx_input`](@ref), [`gfx_input_flat`](@ref) |
+| geometry stage inputs | [`geom_input`](@ref), [`geom_input_position`](@ref), [`invocation_id`](@ref) |
+| tessellation | [`tess_coord`](@ref), [`tess_coord_uvw`](@ref), [`set_tess_level_outer!`](@ref), [`set_tess_level_inner!`](@ref) |
+| fragment | [`front_facing`](@ref), and the vocabulary's `frag_coord`, `dFdx`, `dFdy`, `discard`, `sample_texture_2d` |
+| vertex | the vocabulary's `vertex_index`, `instance_index`, `set_point_size!` |
+
+Indices a shader reads from the vocabulary (`vertex_index`, `instance_index`) count
+from one, like every index in Julia. The location and vertex arguments of the stage
+intrinsics count from zero, as SPIR-V does.
+
+## Configuration
+
+A stage whose execution modes are part of the module takes a `config`:
+
+* geometry: `GeometryConfig(; input, output, max_vertices, invocations)`, with the
+  input and output [`Topology`](@ref);
+* tessellation: [`TessConfig`](@ref)`(; vertices, spacing, winding, domain)`;
+* mesh: `MeshConfig`, the vertex and primitive limits and the output topology.
 
 ```julia
-fb = LavaFramebuffer(1920, 1080)
-draw!(pipeline, fb; vertices=mesh, uniforms=params)
-img = Array(fb)   # → Matrix{RGBA{N0f8}}
+cfg = GeometryConfig(; input = TriangleList(), output = LineStrip(), max_vertices = 4)
+lava_compile(edges, Tuple{}; stage = :geometry, config = cfg)
 ```
 
-## Textures and samplers
+## Mesh stages
 
-```julia
-img = LavaTexture2D(load("brick.png"))
-sampler = LavaSampler(; filter=:linear, wrap=:clamp_to_edge)
-
-fragment(uv, tex, smp) = sample(tex, smp, uv)
-```
-
-Textures and samplers participate in the same BDA arg-packing as buffer arguments; descriptor set management is hidden from the user.
-
-## Geometry and tessellation
-
-Geometry and tessellation control / evaluation stages are wired in the same way: you pass `geometry=...` and `tess_control=...` / `tess_eval=...` to `Rasterizer`. The custom emitter handles all five graphics stages — Lava does not delegate to `llc`, which still crashes on geometry shaders today.
-
-## Pixel readback
-
-For most workflows you'll just call `Array(framebuffer)` to grab the final image after `vk_flush!`. The conversion handles the GPU → CPU staging, pixel format, and row-pitch unswizzling.
+A mesh stage body emits vertices and primitives through a `MeshEmitter`
+(`emit!`, `set_mesh_vertex!`, `set_mesh_triangle!`, `set_mesh_outputs!`). The same
+body runs on the host through `Lava.HostMeshOutput`, which records what it emitted,
+so a mesh stage can be tested without a device. Mantle lowers geometry stages onto
+mesh stages on backends without a geometry stage.

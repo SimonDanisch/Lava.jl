@@ -9,6 +9,16 @@
 
 # ── 3D Builtin Variables ──
 # Each produces a load from `<3 x i32>` global, extracting one component.
+#
+# No `!range` metadata on these loads, on purpose. 532e128 attached it (ids
+# non-negative, local ids below 1024), so `÷`/`%` by constants became unsigned and
+# widenings zero-extends; reverted in 1917966. With the ranges known LLVM turns
+# additions into `or disjoint`, and that is the pattern ACO's GFX11 VOPD scheduling
+# bug miscompiles on Mesa 26.2 before 26.2.4: wrong staged-GEMM results and SAM 2
+# GPU faults on an 8060S (26.2.1), two device losses on a 7900 XTX (26.2.3).
+# Mesa 26.0.8 was fine, and SAM 2 measured no gain from it. Worth retrying only
+# once every machine runs Mesa 26.2.4 or later, and only with a benchmark that
+# shows the gain.
 
 const BUILTIN_3D = (
     :lava_global_invocation_id => :__spirv_BuiltInGlobalInvocationId,
@@ -78,6 +88,28 @@ end
         }
         attributes #0 = { alwaysinline }
     """, "entry"), UInt32, Tuple{})
+end
+
+# The rest of the subgroup set `KernelInterface` declares, minus SubgroupMaxSize:
+# spirv-val rejects that one under the Kernel (OpenCL) capability, so Vulkan
+# cannot have it device-side at all — `subgroup_size_control(ctx).max` is the
+# host-side answer. Both of these are compute builtins carrying
+# Cap.GroupNonUniform (see SPIRV_BUILTIN_CAPABILITY). Values are raw and 0-based
+# where the builtin is an index; KernelInterface's 1-based convention is applied
+# at its own boundary.
+for (jl_name, spirv_name) in ((:lava_num_subgroups, :__spirv_BuiltInNumSubgroups),
+                              (:lava_subgroup_id,   :__spirv_BuiltInSubgroupId))
+    ir = """
+        @$(spirv_name) = external addrspace(7) global i32
+        define i32 @entry() #0 {
+            %val = load i32, ptr addrspace(7) @$(spirv_name), align 4
+            ret i32 %val
+        }
+        attributes #0 = { alwaysinline }
+    """
+    @eval @inline function $jl_name()
+        Base.llvmcall(($ir, "entry"), UInt32, Tuple{})
+    end
 end
 
 @inline function lava_subgroup_local_id()

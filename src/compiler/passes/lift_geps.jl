@@ -38,15 +38,28 @@ function compute_zero_index_path(ty::LLVM.LLVMType)
     while current isa LLVM.StructType || current isa LLVM.ArrayType
         push!(path, 0)
         if current isa LLVM.StructType
-            elems = LLVM.elements(current)
+            elems = current.elements
             isempty(elems) && return nothing
             current = first(elems)
         elseif current isa LLVM.ArrayType
-            LLVM.length(current) == 0 && return nothing
-            current = LLVM.eltype(current)
+            current.length == 0 && return nothing
+            current = current.element_type
         end
     end
     return path
+end
+
+"""
+    zero_leaf_type(ty) -> LLVM.LLVMType
+
+The scalar at the end of `ty`'s zero-index path (see [`compute_zero_index_path`](@ref)):
+what a load or store at offset 0 of a `ty` reads or writes, unless it is type-punned.
+"""
+function zero_leaf_type(ty::LLVM.LLVMType)
+    while ty isa LLVM.StructType || ty isa LLVM.ArrayType
+        ty = ty isa LLVM.StructType ? first(ty.elements) : ty.element_type
+    end
+    return ty
 end
 
 """
@@ -93,10 +106,10 @@ function resolve_offset!(indices::Vector{Int}, type::LLVM.LLVMType, offset::Int,
         return false  # offset lands in padding
 
     elseif type isa LLVM.ArrayType
-        elem_type = LLVM.eltype(type)
+        elem_type = type.element_type
         elem_size = Int(LLVM.storage_size(dl, elem_type))
         elem_size == 0 && return false
-        n = LLVM.length(type)
+        n = type.length
         idx = div(offset, elem_size)
         idx < n || return false
         push!(indices, idx)
@@ -113,12 +126,62 @@ the entry block (allocas). This ensures GEPs placed here dominate all uses."""
 function position_after!(builder::LLVM.IRBuilder, inst::LLVM.Instruction)
     next = LLVM.API.LLVMGetNextInstruction(inst)
     if next != C_NULL
-        LLVM.position!(builder, LLVM.Instruction(next))
+        LLVM.position!(builder, insertion_point(LLVM.Instruction(next)))
     else
         # inst is last in block — position at end
-        bb = LLVM.parent(inst)
-        LLVM.position!(builder, bb)
+        bb = inst.parent
+        LLVM.position!(builder, insertion_point(bb))
     end
+end
+
+"""
+    split_wide_access!(access, alloca, array_type) -> Bool
+
+Split a load or store that covers several integer elements of an array alloca, such as
+`store i64 %v, ptr %a` on `%a = alloca [2 x i32]`, into one access per element, and say
+whether it did. LLVM merges a pair of `UInt32` fields into one `i64` like this, e.g. for a
+`Raycore.SetKey` that a `phi` picks. The alloca retyping pass splits these too, but it
+leaves alone an alloca that is also passed to a call, and indexing such an alloca in `i64`
+gives a pointer whose type differs from the stored object's, which SPIR-V rejects.
+
+Floating-point elements are split the same way, each part bitcast to and from the
+element: a `ComplexF32` argument lands in a `[2 x float]` alloca as one `i64` store.
+"""
+function split_wide_access!(access::LLVM.Instruction, alloca::LLVM.Instruction, array_type::LLVM.ArrayType)
+    elem = array_type.element_type
+    (elem isa LLVM.IntegerType || elem isa LLVM.FloatingPointType) || return false
+    wide = access isa LLVM.StoreInst ? access.operands[1].value_type : access.value_type
+    wide isa LLVM.IntegerType || return false
+    bits = scalar_bit_width(elem)
+    bits === nothing && return false
+    (wide.width > bits && wide.width % bits == 0) || return false
+    parts = wide.width ÷ bits
+    parts <= array_type.length || return false
+    i64 = LLVM.Int64Type()
+    part_ty = LLVM.IntType(bits)
+    LLVM.@dispose builder=LLVM.IRBuilder() begin
+        LLVM.position!(builder, insertion_point(access))
+        slot(p) = LLVM.gep!(builder, array_type, alloca,
+                            LLVM.Value[LLVM.ConstantInt(i64, 0), LLVM.ConstantInt(i64, p)], "wide_part")
+        as_elem(v) = elem == part_ty ? v : LLVM.bitcast!(builder, v, elem)
+        as_part(v) = elem == part_ty ? v : LLVM.bitcast!(builder, v, part_ty)
+        if access isa LLVM.StoreInst
+            v = access.operands[1]
+            for p in 0:(parts - 1)
+                shifted = p == 0 ? v : LLVM.lshr!(builder, v, LLVM.ConstantInt(wide, p * bits))
+                LLVM.store!(builder, as_elem(LLVM.trunc!(builder, shifted, part_ty)), slot(p))
+            end
+        else
+            combined = nothing
+            for p in 0:(parts - 1)
+                part = LLVM.zext!(builder, as_part(LLVM.load!(builder, elem, slot(p))), wide)
+                part = p == 0 ? part : LLVM.shl!(builder, part, LLVM.ConstantInt(wide, p * bits))
+                combined = combined === nothing ? part : LLVM.or!(builder, combined, part)
+            end
+            LLVM.replace_uses!(access, combined)
+        end
+    end
+    return true
 end
 
 """
@@ -138,15 +201,17 @@ Handles four sub-patterns:
 3. Direct store/load of element type to array alloca
 4. Flat GEP chains on alloca-derived typed GEPs (merged iteratively)
 """
+#     split_wide_access!(access, alloca, array_type) -> Bool
+#
 function lift_byte_geps_on_allocas!(mod::LLVM.Module)
-    dl = LLVM.datalayout(mod)
+    dl = mod.datalayout
 
-    for f in LLVM.functions(mod)
-        isempty(LLVM.blocks(f)) && continue
+    for f in mod.functions
+        isempty(f.blocks) && continue
 
         # Collect all allocas with aggregate types (struct or array)
         allocas = Pair{LLVM.Instruction, LLVM.LLVMType}[]
-        for inst in LLVM.instructions(first(LLVM.blocks(f)))
+        for inst in first(f.blocks).instructions
             inst isa LLVM.AllocaInst || continue
             at = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(inst))
             (at isa LLVM.StructType || at isa LLVM.ArrayType) || continue
@@ -161,8 +226,8 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
             # Pattern 1: Byte-offset GEPs that use this alloca as base.
             #   %p = getelementptr [inbounds] i8, ptr %alloca, i64 <const>
             # ------------------------------------------------------------------
-            for use in LLVM.uses(alloca_inst)
-                user = LLVM.user(use)
+            for use in alloca_inst.uses
+                user = use.user
                 user isa LLVM.GetElementPtrInst || continue
 
                 # Check if this is a byte-offset GEP (source element type = i8)
@@ -170,7 +235,7 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
                 src_ty == LLVM.Int8Type() || continue
 
                 # Get the byte offset (must be a constant)
-                ops = LLVM.operands(user)
+                ops = user.operands
                 length(ops) == 2 || continue  # expecting: ptr, offset
                 offset_val = ops[2]
                 offset_val isa LLVM.ConstantInt || continue
@@ -180,8 +245,8 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
                 # load/store users need leaf depth.
                 has_typed_gep_users = false
                 has_leaf_users = false
-                for u in LLVM.uses(user)
-                    usr = LLVM.user(u)
+                for u in user.uses
+                    usr = u.user
                     if usr isa LLVM.GetElementPtrInst
                         u_src = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(usr))
                         if u_src != LLVM.Int8Type()
@@ -197,7 +262,7 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
                 is_inbounds = LLVM.API.LLVMIsInBounds(user)
 
                 # Helper to build a typed GEP from index path
-                function _build_typed_gep(builder, indices, name)
+                function build_typed_gep(builder, indices, name)
                     idx_vals = LLVM.Value[LLVM.ConstantInt(LLVM.Int32Type(), 0)]
                     for idx in indices
                         push!(idx_vals, LLVM.ConstantInt(LLVM.Int32Type(), idx))
@@ -223,8 +288,8 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
                     # Collect typed-GEP users FIRST -- modifying operands
                     # invalidates the use iterator.
                     typed_gep_users = LLVM.Instruction[]
-                    for u in LLVM.uses(user)
-                        usr = LLVM.user(u)
+                    for u in user.uses
+                        usr = u.user
                         if usr isa LLVM.GetElementPtrInst
                             u_src = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(usr))
                             if u_src != LLVM.Int8Type()
@@ -238,8 +303,8 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
                         # goes directly from the alloca through the aggregate
                         # path and then the user's own indices.
                         for usr in typed_gep_users
-                            LLVM.position!(builder, usr)
-                            usr_ops = LLVM.operands(usr)
+                            LLVM.position!(builder, insertion_point(usr))
+                            usr_ops = usr.operands
                             # Build merged index path: [0, agg_path..., user_indices...]
                             merged_vals = LLVM.Value[LLVM.ConstantInt(LLVM.Int32Type(), 0)]
                             for idx in agg_indices
@@ -257,8 +322,8 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
                         end
 
                         # Redirect all remaining uses (loads/stores) to leaf GEP
-                        LLVM.position!(builder, user)
-                        leaf_gep = _build_typed_gep(builder, leaf_indices, "typed_gep_leaf")
+                        LLVM.position!(builder, insertion_point(user))
+                        leaf_gep = build_typed_gep(builder, leaf_indices, "typed_gep_leaf")
                         LLVM.replace_uses!(user, leaf_gep)
                     end
                 else
@@ -269,8 +334,8 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
                     indices === nothing && continue
 
                     LLVM.@dispose builder=LLVM.IRBuilder() begin
-                        LLVM.position!(builder, user)
-                        new_gep = _build_typed_gep(builder, indices, "typed_gep")
+                        LLVM.position!(builder, insertion_point(user))
+                        new_gep = build_typed_gep(builder, indices, "typed_gep")
                         LLVM.replace_uses!(user, new_gep)
                     end
                 end
@@ -283,9 +348,9 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
             #   SPIR-V needs:   gep [3 x float], ptr %alloca, i64 0, %idx
             # ------------------------------------------------------------------
             if alloca_type isa LLVM.ArrayType
-                elem_type = LLVM.eltype(alloca_type)
-                for use in LLVM.uses(alloca_inst)
-                    user = LLVM.user(use)
+                elem_type = alloca_type.element_type
+                for use in alloca_inst.uses
+                    user = use.user
                     user isa LLVM.GetElementPtrInst || continue
                     user in to_erase && continue
 
@@ -294,12 +359,12 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
                     src_ty == elem_type || continue
                     src_ty == alloca_type && continue  # already correct
 
-                    ops = LLVM.operands(user)
+                    ops = user.operands
                     length(ops) == 2 || continue  # gep elem, ptr, idx
 
                     is_inbounds = LLVM.API.LLVMIsInBounds(user)
                     LLVM.@dispose builder=LLVM.IRBuilder() begin
-                        LLVM.position!(builder, user)
+                        LLVM.position!(builder, insertion_point(user))
                         idx_vals = LLVM.Value[
                             LLVM.ConstantInt(LLVM.Int64Type(), 0),
                             ops[2]  # the original index (may be variable)
@@ -319,11 +384,15 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
                 #   Fix: insert gep [3 x float], ptr %alloca, 0, 0 before each such use.
                 # ------------------------------------------------------------------
                 direct_users = LLVM.Instruction[]
-                for use in LLVM.uses(alloca_inst)
-                    usr = LLVM.user(use)
+                for use in alloca_inst.uses
+                    usr = use.user
                     usr in to_erase && continue
                     if usr isa LLVM.StoreInst || usr isa LLVM.LoadInst
-                        push!(direct_users, usr)
+                        if split_wide_access!(usr, alloca_inst, alloca_type)
+                            push!(to_erase, usr)
+                        else
+                            push!(direct_users, usr)
+                        end
                     end
                 end
                 if !isempty(direct_users)
@@ -336,14 +405,52 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
                         ]
                         elem0_gep = LLVM.gep!(builder, alloca_type, alloca_inst,
                                                idx_vals, "arr_elem0")
+                        # A GEP indexed in the ACCESSED type, for the users whose
+                        # type is not the array's element type. `arr_elem0` says
+                        # "element zero of `[N x E]`", which is the right pointer
+                        # only when the access IS an `E`; handing it a narrower
+                        # access describes a sub-element write as though it
+                        # covered the whole slot. That store then carries a
+                        # three-operand GEP, and every pass that lowers a
+                        # mismatched access matches a two-operand one, so it
+                        # reached the emitter untouched and the module failed
+                        # validation with the pointer and object types
+                        # disagreeing. Indexing in the access type instead gives
+                        # exactly the form `convert_typepunned_geps_to_byte_geps!`
+                        # takes, which is where a narrow access belongs.
+                        # An element that is itself a struct or an array, accessed
+                        # as its first scalar (a `ptr` read out of an array of device
+                        # arrays, `{ ptr, [1 x i64] }` each), is that scalar's
+                        # zero-index path, as Pattern 3b below gives a composite
+                        # alloca; a GEP indexed in the access type would claim a
+                        # pointer to it where the indexing yields the composite.
+                        leaf_path = (elem_type isa LLVM.StructType || elem_type isa LLVM.ArrayType) ?
+                                    compute_zero_index_path(elem_type) : nothing
+                        typed_elem0 = IdDict{LLVM.LLVMType,LLVM.Value}()
+                        function elem0_for(access_ty)
+                            access_ty == elem_type && return elem0_gep
+                            get!(typed_elem0, access_ty) do
+                                if leaf_path !== nothing && zero_leaf_type(elem_type) == access_ty
+                                    idx = LLVM.Value[LLVM.ConstantInt(LLVM.Int32Type(), 0), LLVM.ConstantInt(LLVM.Int32Type(), 0)]
+                                    append!(idx, [LLVM.ConstantInt(LLVM.Int32Type(), k) for k in leaf_path])
+                                    LLVM.gep!(builder, alloca_type, alloca_inst, idx, "arr_elem0_leaf")
+                                else
+                                    LLVM.gep!(builder, access_ty, alloca_inst,
+                                              LLVM.Value[LLVM.ConstantInt(LLVM.Int64Type(), 0)],
+                                              "arr_elem0_typed")
+                                end
+                            end
+                        end
                         # Redirect all direct load/store uses from alloca to elem0_gep
                         for usr in direct_users
                             if usr isa LLVM.StoreInst
                                 # store val, ptr %alloca -> store val, ptr %elem0_gep
                                 # The pointer is operand 2 (value=op1, ptr=op2)
-                                LLVM.API.LLVMSetOperand(usr, 1, elem0_gep)
+                                LLVM.API.LLVMSetOperand(usr, 1,
+                                    elem0_for(usr.operands[1].value_type))
                             elseif usr isa LLVM.LoadInst
-                                LLVM.API.LLVMSetOperand(usr, 0, elem0_gep)
+                                LLVM.API.LLVMSetOperand(usr, 0,
+                                    elem0_for(usr.value_type))
                             end
                         end
                     end
@@ -359,19 +466,19 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
             # ------------------------------------------------------------------
             if alloca_type isa LLVM.StructType || alloca_type isa LLVM.ArrayType
                 mismatched_users = LLVM.Instruction[]
-                for use in LLVM.uses(alloca_inst)
-                    usr = LLVM.user(use)
+                for use in alloca_inst.uses
+                    usr = use.user
                     usr in to_erase && continue
                     if usr isa LLVM.LoadInst
-                        loaded_ty = LLVM.value_type(usr)
+                        loaded_ty = usr.value_type
                         if loaded_ty != alloca_type
                             push!(mismatched_users, usr)
                         end
                     elseif usr isa LLVM.StoreInst
-                        stored_val = LLVM.operands(usr)[1]
-                        stored_ty = LLVM.value_type(stored_val)
+                        stored_val = usr.operands[1]
+                        stored_ty = stored_val.value_type
                         # Only fix if store is TO the alloca (ptr is operand 2)
-                        if stored_ty != alloca_type && LLVM.operands(usr)[2] === alloca_inst
+                        if stored_ty != alloca_type && usr.operands[2] === alloca_inst
                             push!(mismatched_users, usr)
                         end
                     end
@@ -417,8 +524,8 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
         #     load i64, ptr %p                      -> needs gep to i64 leaf
         # ------------------------------------------------------------------
         for (alloca_inst, alloca_type) in allocas
-            for use in LLVM.uses(alloca_inst)
-                gep_user = LLVM.user(use)
+            for use in alloca_inst.uses
+                gep_user = use.user
                 gep_user isa LLVM.GetElementPtrInst || continue
 
                 # Compute what type this GEP result points to
@@ -429,15 +536,15 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
 
                 # Check for mismatched load/store users
                 mismatched = LLVM.Instruction[]
-                for u in LLVM.uses(gep_user)
-                    usr = LLVM.user(u)
+                for u in gep_user.uses
+                    usr = u.user
                     if usr isa LLVM.LoadInst
-                        loaded_ty = LLVM.value_type(usr)
+                        loaded_ty = usr.value_type
                         loaded_ty != result_ty && push!(mismatched, usr)
                     elseif usr isa LLVM.StoreInst
-                        stored_val = LLVM.operands(usr)[1]
-                        stored_ty = LLVM.value_type(stored_val)
-                        if stored_ty != result_ty && LLVM.operands(usr)[2] === gep_user
+                        stored_val = usr.operands[1]
+                        stored_ty = stored_val.value_type
+                        if stored_ty != result_ty && usr.operands[2] === gep_user
                             push!(mismatched, usr)
                         end
                     end
@@ -481,16 +588,16 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
         while changed
             changed = false
             alloca_set = Set{LLVM.Instruction}(first(p) for p in allocas)
-            for bb in LLVM.blocks(f)
+            for bb in f.blocks
                 chain_to_fix = Tuple{LLVM.GetElementPtrInst, LLVM.GetElementPtrInst}[]
-                for inst in LLVM.instructions(bb)
+                for inst in bb.instructions
                     inst isa LLVM.GetElementPtrInst || continue
-                    ops = LLVM.operands(inst)
+                    ops = inst.operands
                     length(ops) >= 3 || continue  # need: ptr, first_idx, member_idx...
                     base = ops[1]
                     base isa LLVM.GetElementPtrInst || continue
                     # Check that the base GEP targets one of our allocas
-                    base_ops = LLVM.operands(base)
+                    base_ops = base.operands
                     base_ptr = base_ops[1]
                     base_ptr in alloca_set || continue
                     # Walk base GEP indices through the type hierarchy to find
@@ -510,7 +617,7 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
                             member = convert(Int, idx_op)
                             cur_type = LLVM.LLVMType(LLVM.API.LLVMStructGetTypeAtIndex(cur_type, member))
                         elseif cur_type isa LLVM.ArrayType
-                            cur_type = LLVM.eltype(cur_type)
+                            cur_type = cur_type.element_type
                         else
                             valid = false; break
                         end
@@ -528,17 +635,17 @@ function lift_byte_geps_on_allocas!(mod::LLVM.Module)
                     changed = true
                     LLVM.@dispose builder=LLVM.IRBuilder() begin
                         for (gep, base_gep) in chain_to_fix
-                            LLVM.position!(builder, gep)
-                            gep_ops = LLVM.operands(gep)
-                            base_ops = LLVM.operands(base_gep)
+                            LLVM.position!(builder, insertion_point(gep))
+                            gep_ops = gep.operands
+                            base_ops = base_gep.operands
                             # base_gep indices: [..., %last_idx]
                             # gep indices: [%offset, member_indices...]
                             # merged: [..., %last_idx + %offset, member_indices...]
                             base_last_idx = base_ops[length(base_ops)]
                             chain_first_idx = gep_ops[2]  # the pointer arithmetic offset
                             # Type-match for add
-                            idx_ty = LLVM.value_type(base_last_idx)
-                            off_ty = LLVM.value_type(chain_first_idx)
+                            idx_ty = base_last_idx.value_type
+                            off_ty = chain_first_idx.value_type
                             if off_ty != idx_ty
                                 chain_first_idx = LLVM.sext!(builder, chain_first_idx, idx_ty, "chain_off_ext")
                             end
@@ -577,52 +684,105 @@ end
 # PhysicalStorageBuffer struct pointers. Combining them into a single GEP
 # produces a single OpPtrAccessChain that works correctly.
 
+"Whether nothing uses `v` any more."
+unused(v::LLVM.Value) = iterate(v.uses) === nothing
+
+"""
+    indexed_type(gep) -> LLVM.LLVMType or nothing
+
+The type `gep` points at: its source element type, stepped through every index after
+the first (which only moves the pointer).
+"""
+function indexed_type(gep::LLVM.GetElementPtrInst)
+    ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
+    for idx in gep.operands[3:end]
+        if ty isa LLVM.ArrayType || ty isa LLVM.VectorType
+            ty = ty.element_type
+        elseif ty isa LLVM.StructType
+            idx isa LLVM.ConstantInt || return nothing
+            ty = ty.elements[convert(Int, idx) + 1]
+        else
+            return nothing
+        end
+    end
+    return ty
+end
+
+"""
+    whole_elements(gep, base, dl) -> (element type, index) or nothing
+
+A byte-offset step `gep i8, ptr %base, C` as a step of `C ÷ sizeof(T)` elements, when
+`%base` points at a `T` and `C` is a multiple of its size. LLVM 19 on writes every
+constant offset in bytes, so `gep float, (gep float, %p, %i), -1` reaches this pass as
+`gep i8, (gep float, %p, %i), -4`.
+"""
+function whole_elements(gep::LLVM.GetElementPtrInst, base::LLVM.GetElementPtrInst,
+                        dl::LLVM.DataLayout)
+    LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep)) == LLVM.Int8Type() || return nothing
+    offset = gep.operands[2]
+    offset isa LLVM.ConstantInt || return nothing
+    elem = indexed_type(base)
+    (elem === nothing || elem == LLVM.Int8Type()) && return nothing
+    size = Int(LLVM.abi_size(dl, elem))
+    bytes = convert(Int, offset)
+    (size > 0 && bytes % size == 0) || return nothing
+    last_idx = base.operands[end]
+    return elem, LLVM.ConstantInt(last_idx.value_type, bytes ÷ size, true)
+end
+
 function combine_chained_geps!(mod::LLVM.Module)
-    for fn in LLVM.functions(mod)
-        isempty(LLVM.blocks(fn)) && continue
+    dl = mod.datalayout
+    for fn in mod.functions
+        isempty(fn.blocks) && continue
         changed = true
         while changed
             changed = false
-            for bb in LLVM.blocks(fn)
+            for bb in fn.blocks
                 # Snapshot the block: a combine erases the current GEP and its
                 # `base` (a dominating def — always already visited), so iterating
                 # a snapshot stays valid while we fold EVERY combinable GEP in one
                 # sweep. The old code `break`d after the first fold per block and
                 # let `while changed` rescan the whole function, which is O(n²) on
                 # a large shader (folds one GEP per full-function pass).
-                for inst in collect(LLVM.instructions(bb))
+                for inst in collect(bb.instructions)
                     inst isa LLVM.GetElementPtrInst || continue
-                    ops = LLVM.operands(inst)
+                    ops = inst.operands
                     length(ops) != 2 && continue  # Single-index outer GEP only
 
                     base = ops[1]
+                    if base isa LLVM.ConstantExpr
+                        fold_constant_base_gep!(inst, base) && (changed = true)
+                        continue
+                    end
                     base isa LLVM.GetElementPtrInst || continue
-                    base_ops = LLVM.operands(base)
+                    base_ops = base.operands
 
                     src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inst))
                     base_src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(base))
                     idx_outer = ops[2]
+                    elements = whole_elements(inst, base, dl)
+                    elements === nothing || ((src_ty, idx_outer) = elements)
 
-                    # The base GEP must only be used by this GEP (safe to eliminate)
-                    n_uses = 0
-                    for _ in LLVM.uses(base)
-                        n_uses += 1
-                    end
-                    n_uses == 1 || continue
+                    # Every user of the base gets a GEP of its own, and the base goes
+                    # once the last is folded. Folding only a base's single user left
+                    # `gep float, (gep [9 x float], %a, 0, %i), -3` standing beside its
+                    # siblings at -2 and -1 (a matrix's column read with a run-time
+                    # index): logical SPIR-V has no arithmetic on an element pointer,
+                    # the offsets were lost and all three loads read element `%i`.
 
                     if length(base_ops) == 2
                         # Case 1: both are single-index GEPs with same source type
                         src_ty == base_src_ty || continue
                         idx_inner = base_ops[2]
-                        LLVM.value_type(idx_outer) == LLVM.value_type(idx_inner) || continue
+                        idx_outer.value_type == idx_inner.value_type || continue
 
                         LLVM.@dispose builder=LLVM.IRBuilder() begin
-                            LLVM.position!(builder, inst)
+                            LLVM.position!(builder, insertion_point(inst))
                             combined_idx = LLVM.add!(builder, idx_inner, idx_outer, "gep_combined_idx")
                             new_gep = LLVM.gep!(builder, src_ty, base_ops[1], [combined_idx], "gep_combined")
                             LLVM.replace_uses!(inst, new_gep)
                             LLVM.erase!(inst)
-                            LLVM.erase!(base)
+                            unused(base) && LLVM.erase!(base)
                         end
                         changed = true
                     else
@@ -633,12 +793,12 @@ function combine_chained_geps!(mod::LLVM.Module)
                         last_idx = base_ops[end]
                         # Last index must be dynamic (not a constant struct member index)
                         # and same integer type as the outer index
-                        LLVM.value_type(idx_outer) == LLVM.value_type(last_idx) || continue
+                        idx_outer.value_type == last_idx.value_type || continue
                         # Verify the base GEP's last index accesses an array of src_ty
                         base_last_index_is_array_of(base, src_ty) || continue
 
                         LLVM.@dispose builder=LLVM.IRBuilder() begin
-                            LLVM.position!(builder, inst)
+                            LLVM.position!(builder, insertion_point(inst))
                             combined_idx = LLVM.add!(builder, last_idx, idx_outer, "gep_combined_idx")
                             # Rebuild base GEP with modified last index
                             indices = LLVM.Value[base_ops[i] for i in 2:length(base_ops)-1]
@@ -647,7 +807,7 @@ function combine_chained_geps!(mod::LLVM.Module)
                             LLVM.API.LLVMSetIsInBounds(new_gep, LLVM.API.LLVMIsInBounds(base))
                             LLVM.replace_uses!(inst, new_gep)
                             LLVM.erase!(inst)
-                            LLVM.erase!(base)
+                            unused(base) && LLVM.erase!(base)
                         end
                         changed = true
                     end
@@ -658,13 +818,49 @@ function combine_chained_geps!(mod::LLVM.Module)
 end
 
 """
+    fold_constant_base_gep!(gep, base) -> Bool
+
+`gep T, (gep [N x T], @g, c0, c1), %x`  →  `gep [N x T], @g, 0, (c0*N + c1) + %x`.
+
+Julia's one-based indexing into a global array (`@localmem`, a constant table)
+folds to the left form with `c0 = -1, c1 = N - 1`: element -1, just before the
+array. Emitted as written, that is an `OpPtrAccessChain` by -1 off element 0, a
+pointer outside the array it came from, and then one by `%x` back into it. RADV
+computes the address in bytes and gets it right; NVIDIA and AMD's Windows driver
+do not: AcceleratedKernels' block scan, whose tile and totals are neighbouring
+members of one workgroup block, read `_Lane`s with the flag byte in the value.
+One index into the array, in bounds at run time, reads the same everywhere.
+"""
+function fold_constant_base_gep!(gep::LLVM.GetElementPtrInst, base::LLVM.ConstantExpr)
+    base.opcode == LLVM.API.LLVMGetElementPtr || return false
+    ops = base.operands
+    length(ops) == 3 || return false
+    arr_ty = base.source_element_type
+    arr_ty isa LLVM.ArrayType || return false
+    arr_ty.element_type == LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep)) || return false
+    c0, c1 = ops[2], ops[3]
+    (c0 isa LLVM.ConstantInt && c1 isa LLVM.ConstantInt) || return false
+    x = gep.operands[2]
+    k = convert(Int, c0) * arr_ty.length + convert(Int, c1)
+    LLVM.@dispose builder=LLVM.IRBuilder() begin
+        LLVM.position!(builder, insertion_point(gep))
+        idx = LLVM.add!(builder, x, LLVM.ConstantInt(x.value_type, k, true), "gep_global_idx")
+        new_gep = LLVM.gep!(builder, arr_ty, ops[1], [LLVM.ConstantInt(x.value_type, 0), idx],
+                            "gep_global")
+        LLVM.replace_uses!(gep, new_gep)
+        LLVM.erase!(gep)
+    end
+    return true
+end
+
+"""
 Check if a multi-index GEP's last index accesses an array whose element type matches `elem_ty`.
 E.g., `gep { { ptr, [2 x i64] } }, ptr %p, i64 0, i32 0, i32 1, i64 %idx`
 The last index `%idx` indexes into `[2 x i64]`, so this returns true if `elem_ty == i64`.
 """
 function base_last_index_is_array_of(gep::LLVM.GetElementPtrInst, elem_ty::LLVM.LLVMType)
     src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
-    ops = LLVM.operands(gep)
+    ops = gep.operands
     n_indices = length(ops) - 1
     n_indices < 2 && return false
 
@@ -678,16 +874,16 @@ function base_last_index_is_array_of(gep::LLVM.GetElementPtrInst, elem_ty::LLVM.
             idx = ops[i]
             idx isa LLVM.ConstantInt || return false
             member_idx = convert(Int, idx)
-            elems = collect(LLVM.elements(current_ty))
+            elems = collect(current_ty.elements)
             member_idx < length(elems) || return false
             current_ty = elems[member_idx + 1]
         elseif current_ty isa LLVM.ArrayType
-            current_ty = LLVM.eltype(current_ty)
+            current_ty = current_ty.element_type
         else
             return false
         end
     end
 
     # current_ty should now be an array type whose element matches elem_ty
-    return current_ty isa LLVM.ArrayType && LLVM.eltype(current_ty) == elem_ty
+    return current_ty isa LLVM.ArrayType && current_ty.element_type == elem_ty
 end

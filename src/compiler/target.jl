@@ -10,22 +10,66 @@
 struct LavaCompilerParams <: GPUCompiler.AbstractCompilerParams
     workgroup_size::NTuple{3,Int}
     enable_ray_query::Bool
+    # What the target device lets the module declare. In the params so it is part
+    # of the job GPUCompiler caches on and of every frozen key derived from it:
+    # two devices with different feature sets compile the same kernel twice, as
+    # they must.
+    features::TargetFeatures
+    # Bit `k - 1` set for each argument `k` of the kernel's signature whose memory nothing
+    # writes while the kernel runs (Mantle's access walk decides). Its loads are marked
+    # invariant (`mark_readonly_loads!`). A flag rather than a `Lava.Const` argument type, so
+    # the compile infers the signature the walk inferred. Bits, not a vector: the params are
+    # in the inference cache's owner token, which Julia compares with `===`, so a vector
+    # (even an empty one) gave every job a cache of its own.
+    readonly::UInt64
 end
-LavaCompilerParams() = LavaCompilerParams((64, 1, 1), false)
-LavaCompilerParams(workgroup_size::NTuple{3,Int}) = LavaCompilerParams(workgroup_size, false)
+LavaCompilerParams() = LavaCompilerParams((64, 1, 1), false, TargetFeatures(), UInt64(0))
+LavaCompilerParams(workgroup_size::NTuple{3,Int}) =
+    LavaCompilerParams(workgroup_size, false, TargetFeatures(), UInt64(0))
 
 const LavaCompilerConfig = GPUCompiler.CompilerConfig{GPUCompiler.SPIRVCompilerTarget, LavaCompilerParams}
 const LavaCompilerJob = GPUCompiler.CompilerJob{GPUCompiler.SPIRVCompilerTarget, LavaCompilerParams}
 
+# These parameters are read only after Julia inference: they select the entry wrapper,
+# SPIR-V capabilities and which loads are invariant. Keep one inference cache for them, so Mantle's access walk and the
+# launch reuse each other's CodeInstances. GPUCompiler keys compiled results separately on
+# the full CompilerConfig, so different workgroup sizes and capabilities keep their own code.
+GPUCompiler.cache_owner(target::GPUCompiler.SPIRVCompilerTarget, ::LavaCompilerParams,
+                        always_inline::Bool) =
+    GPUCompiler.GPUCompilerCacheToken(target, LavaCompilerParams(), always_inline)
+
 # ── Device runtime stubs ──
 #
 # GPUCompiler's lower_throw! pass converts `throw(...)` into calls to these
-# runtime functions. On GPU we can't throw, so they're no-ops. The pass then
-# inserts `llvm.trap` + `unreachable` after these calls, which our LLVM passes
-# (rm_trap!, replace_unreachable!) clean up before SPIR-V emission.
+# runtime functions, then inserts `llvm.trap` + `unreachable` after them, which
+# `finish_ir!` turns into a return: the invocation stops there.
+#
+# `signal_exception` is the one that does something. It raises a word in device
+# memory, the device's exception flag, whose address a compute stage reads from
+# its push constants (`wrap_entry_for_vulkan!`); the host finds the word raised
+# when it next waits for the device, and throws. That is Metal.jl's contract for a
+# device-side exception, and CUDA's: the invocation stops, the device records it,
+# the next synchronize reports it. The rest stay no-ops: there is no mailbox to
+# record a name or a frame in.
 
 module LavaRuntime
-    signal_exception() = return
+    """
+    Raise the device's exception flag: one store, of 1, to the word whose address
+    a compute stage reads from its push constants. A call to an intrinsic the
+    entry wrapper lowers (`wrap_entry_for_vulkan!`), and not that store spelled
+    here, so the throwing block stays straight-line: a branch around the store
+    would hide the throw from `fix_barrier_skipping_paths!`, which recognises an
+    error path by its shape. Where nothing collects the flag — a graphics or
+    ray-tracing stage — the call is deleted and a throw only stops the invocation.
+    """
+    signal_exception() = Base.llvmcall(("""
+        declare void @_lava_signal_exception()
+        define void @entry() #0 {
+            call void @_lava_signal_exception()
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+        """, "entry"), Cvoid, Tuple{})
     report_exception(ex) = return
     report_oom(sz) = return
     report_exception_name(ex) = return
@@ -44,6 +88,13 @@ end
 # @lava_device_override puts methods on this table, which GPUCompiler uses
 # instead of the regular method table during compilation. This lets us
 # replace CPU functions with GPU-safe versions (e.g., intrinsics, math).
+#
+# Two overlays must not overlap. When a package image loads, Julia accepts an edge to an
+# overlay only because nothing else can answer its signature (`METHOD_SIG_LATEST_ONLY`). With
+# an overlapping sibling it looks the call up in the host's table instead, does not find the
+# overlay there, and drops the kernel from the image, so it compiles again in every session.
+# Where two shapes overlap, the second is an ordinary method on our own type, or both are one
+# overlay calling an ordinary function that tells them apart.
 
 Base.Experimental.@MethodTable lava_method_table
 
@@ -59,8 +110,188 @@ GPUCompiler.runtime_module(::LavaCompilerJob) = LavaRuntime
 
 GPUCompiler.method_table(::LavaCompilerJob) = lava_method_table
 
+"""
+    kernelinterpreter(f, tt) -> AbstractInterpreter
+
+The interpreter `f(tt...)` will be inferred through when it is compiled, so that
+anything reasoning about a kernel ahead of time reasons about the DEVICE code.
+
+Without it, `code_typed` on a kernel is the host's: `LavaDeviceArray`'s indexing
+lives on `lava_method_table` and nowhere else, so plain inference walks into
+`error_if_canonical_getindex` and concludes the kernel does nothing at all.
+Mantle's dispatch-access analysis is the caller; it is exported for anyone else
+reading a kernel before it runs.
+"""
+function kernelinterpreter(@nospecialize(f), @nospecialize(tt);
+                           workgroup_size::NTuple{3,Int} = (64, 1, 1))
+    config = lava_compiler_config(; workgroup_size)
+    source = GPUCompiler.methodinstance(typeof(f), tt)
+    return GPUCompiler.get_interpreter(GPUCompiler.CompilerJob(source, config))
+end
+
 # Vulkan doesn't use GPUCompiler's kernel state mechanism
 GPUCompiler.kernel_state_type(::LavaCompilerJob) = Nothing
+
+# ── Finishing the IR for Lava's emitter ──
+#
+# Since 2.13, GPUCompiler's SPIR-V target selects `__spirv_Atomic*` builtins for
+# LLVM's atomics in `finish_ir!`, and its `validate_ir` rejects atomics outside
+# address spaces 1, 3 and 4. Both are for the Khronos translator and LLVM's SPIR-V
+# back-end. Lava emits SPIR-V itself: it lowers `atomicrmw` and `cmpxchg` to the
+# atomic instructions, on PhysicalStorageBuffer pointers, which are address space 0.
+# So these two keep the target's other steps and leave the atomics to the emitter.
+function GPUCompiler.validate_ir(job::LavaCompilerJob, mod::LLVM.Module)
+    errors = GPUCompiler.IRError[]
+    target = job.config.target
+    target.supports_fp16 || append!(errors, GPUCompiler.check_ir_values(mod, LLVM.HalfType()))
+    target.supports_fp64 || append!(errors, GPUCompiler.check_ir_values(mod, LLVM.DoubleType()))
+    target.supports_bfloat16 ||
+        append!(errors, GPUCompiler.check_ir_values(mod, LLVM.BFloatType()))
+    return errors
+end
+
+# GPUCompiler's datalayout for SPIR-V names no native integer widths; LLVM's own SPIR-V
+# target's does (`n8:16:32:64`). Without them InstCombine narrows an integer to any
+# width it proves enough: a switch over `1:6` on a counter became a switch on an
+# `i63`, for which SPIR-V has no type. With them it keeps to the native widths. Set
+# once the run-time library is linked in (its layout has to match), before optimizing.
+function GPUCompiler.finish_linked_module!(job::LavaCompilerJob, mod::LLVM.Module)
+    native!(mod)
+    inline_managed_arguments!(mod)
+    uninitialized_allocations!(mod)
+    return nothing
+end
+
+# Julia's allocation optimizer zero-fills an object it moves to the stack unless
+# the allocation is marked uninitialized, which codegen does only when the
+# constructor writes every field. `MArray(undef)`, and `@private` with it, get a
+# fill of the whole array each time the allocation runs; for a 1.7 KB array of
+# BSDF records that was every store of every shading hit. Julia leaves undefined
+# isbits fields undefined, and device code has no GC to see an uninitialized
+# reference, so every allocation here is uninitialized.
+function uninitialized_allocations!(mod::LLVM.Module)
+    alloc = get(LLVM.functions(mod), "julia.gc_alloc_obj", nothing)
+    alloc === nothing && return mod
+    kind = LLVM.EnumAttribute("allockind", UInt64(1 | 8))  # alloc | uninitialized
+    for use in collect(LLVM.uses(alloc))
+        call = LLVM.user(use)
+        call isa LLVM.CallInst || continue
+        attributes = LLVM.function_attributes(call)
+        delete!(attributes, LLVM.EnumAttribute("allockind"))
+        push!(attributes, kind)
+    end
+    return mod
+end
+
+# Inline only helpers reached by a newly allocated Julia object. Allocation
+# optimization needs to see their uses before GPU GC lowering replaces an
+# unpromoted heap allocation with the unsupported allocator. A derived argument
+# can instead be an immutable by-reference value, so its address space alone is
+# not a reason to override inlining. Follow stack-held wrappers as well.
+#
+# Julia never inlines at the LLVM level, so it tags each function's memory
+# accesses as if compiled alone: a load through a by-reference argument claims
+# (`!noalias`, TBAA, `!invariant.load`) that it reads no stack memory of the
+# caller. Inlined into a caller that passes its own stack object, the claim is
+# false, and GVN folded such loads to `undef` (the pbrt CoatedDiffuse guide
+# lost every return). Force-inlined functions drop those claims.
+function inline_managed_arguments!(mod::LLVM.Module)
+    alloc = get(mod.functions, "julia.gc_alloc_obj", nothing)
+    alloc === nothing && return nothing
+    todo = LLVM.Value[u.user for u in alloc.uses]
+    seen = Set{LLVM.Value}()
+    function enqueue(value)
+        value in seen || push!(todo, value)
+    end
+    function carrier(value)
+        while value isa Union{LLVM.GetElementPtrInst, LLVM.BitCastInst, LLVM.AddrSpaceCastInst}
+            value = value.operands[1]
+        end
+        value isa LLVM.AllocaInst && enqueue(value)
+    end
+    while !isempty(todo)
+        value = pop!(todo)
+        value in seen && continue
+        push!(seen, value)
+        for use in value.uses
+            user = use.user
+            if user isa LLVM.CallInst
+                fn = user.called_operand
+                fn isa LLVM.Function || continue
+                if isempty(fn.blocks)
+                    user.value_type isa LLVM.PointerType && enqueue(user)
+                    if startswith(fn.name, "llvm.memcpy") && user.arguments[2] == value
+                        carrier(user.arguments[1])
+                    end
+                    continue
+                end
+                for (argument, parameter) in zip(user.arguments, fn.parameters)
+                    argument == value || continue
+                    force_inline!(fn)
+                    enqueue(parameter)
+                end
+            elseif user isa LLVM.StoreInst
+                user.operands[1] == value && carrier(user.operands[2])
+            elseif user isa LLVM.RetInst
+                fn = user.parent.parent
+                force_inline!(fn)
+                for call in fn.uses
+                    call.user isa LLVM.CallInst && enqueue(call.user)
+                end
+            elseif user isa LLVM.Instruction && user.value_type isa Union{LLVM.PointerType, LLVM.StructType, LLVM.ArrayType}
+                enqueue(user)
+            end
+        end
+    end
+    return nothing
+end
+
+function force_inline!(fn::LLVM.Function)
+    delete!(fn.function_attributes, LLVM.EnumAttribute("noinline"))
+    push!(fn.function_attributes, LLVM.EnumAttribute("alwaysinline"))
+    for bb in LLVM.blocks(fn), inst in LLVM.instructions(bb)
+        md = LLVM.metadata(inst)
+        for kind in (LLVM.MD_alias_scope, LLVM.MD_noalias, LLVM.MD_tbaa, LLVM.MD_tbaa_struct, LLVM.MD_invariant_load)
+            haskey(md, kind) && delete!(md, kind)
+        end
+    end
+    return fn
+end
+
+"Declare SPIR-V's native integer widths in `mod`'s datalayout, unless it declares some (`n32:64`, not Julia's `ni:10:11`)."
+function native!(mod::LLVM.Module)
+    dl = string(mod.datalayout)
+    any(startswith(r"n\d"), split(dl, '-')) || LLVM.datalayout!(mod, dl * "-n8:16:32:64")
+    return mod
+end
+
+function GPUCompiler.finish_ir!(job::LavaCompilerJob, mod::LLVM.Module, entry::LLVM.Function)
+    # SPIR-V cannot abort a compute kernel: `trap` goes, `unreachable` becomes `ret`
+    GPUCompiler.lower_unreachable_control_flow!(job, mod)
+    # LLVM's minimum/maximum order signed zeros and propagate NaNs
+    GPUCompiler.lower_minimum_maximum!(mod)
+    # byval parameters wrapped in a struct, which the entry wrapper expects
+    job.config.kernel && (entry = GPUCompiler.wrap_byval(job, mod, entry))
+    # SPIR-V has no i128: alloca arrays of it become vectors
+    GPUCompiler.convert_i128_allocas!(mod)
+    push!(get!(mod.metadata, "opencl.ocl.version").operands,
+          LLVM.MDNode([LLVM.ConstantInt(Int32(2)), LLVM.ConstantInt(Int32(0))]))
+    push!(get!(mod.metadata, "opencl.spirv.version").operands,
+          LLVM.MDNode([LLVM.ConstantInt(Int32(1)), LLVM.ConstantInt(Int32(5))]))
+    return entry
+end
+
+# Relocatable code, so compiled SPIR-V can go into a package image with its
+# `CodeInstance` (`compiler/cache.jl`): GPUCompiler keeps results across sessions
+# only for the `:patch` and `:table` lowerings. `:table` is the one Vulkan can
+# take — code cannot be patched after `vkCreateShaderModule` — and no Lava kernel
+# needs it: SPIR-V cannot reach host memory, so a kernel that names a host
+# object (a Julia value's address, a global binding) is refused here.
+GPUCompiler.relocation_lowering(::LavaCompilerJob) = :table
+GPUCompiler.relocation_table_pointer(job::LavaCompilerJob, builder, fun) =
+    error("$(job.source) refers to a host object (a Julia value's address or a global " *
+          "binding). A Vulkan kernel cannot reach host memory: pass the value as an " *
+          "argument, or make it a constant the kernel can hold.")
 
 # ── Disable loop unswitching ──
 #
@@ -95,7 +326,7 @@ function GPUCompiler.buildLoopOptimizerPipeline(fpm, job::LavaCompilerJob, opt_l
     # All pass/helper symbols are qualified `GPUCompiler.` — that's the namespace
     # the original pipeline uses them from (some, e.g. LowerSIMDLoopPass /
     # JuliaLICMPass, live in LLVM.Interop and are not bare `LLVM` bindings).
-    GPUCompiler.add!(fpm, GPUCompiler.NewPMLoopPassManager(; use_memory_ssa=true)) do lpm
+    GPUCompiler.add!(fpm, GPUCompiler.LoopPassManager(; use_memory_ssa=true)) do lpm
         GPUCompiler.add!(lpm, GPUCompiler.LowerSIMDLoopPass())
         if opt_level >= 2
             GPUCompiler.add!(lpm, GPUCompiler.LoopInstSimplifyPass())
@@ -116,7 +347,7 @@ function GPUCompiler.buildLoopOptimizerPipeline(fpm, job::LavaCompilerJob, opt_l
     end
     GPUCompiler.add!(fpm, GPUCompiler.SimplifyCFGPass(; GPUCompiler.BasicSimplifyCFGOptions...))
     GPUCompiler.add!(fpm, GPUCompiler.instcombine_pass(job))
-    GPUCompiler.add!(fpm, GPUCompiler.NewPMLoopPassManager()) do lpm
+    GPUCompiler.add!(fpm, GPUCompiler.LoopPassManager()) do lpm
         if opt_level >= 2
             GPUCompiler.add!(lpm, GPUCompiler.LoopIdiomRecognizePass())
             GPUCompiler.add!(lpm, GPUCompiler.IndVarSimplifyPass())
@@ -141,10 +372,22 @@ function GPUCompiler.isintrinsic(::LavaCompilerJob, fn::String)
     startswith(fn, "llvm.spv.") && return true
     # Custom _lava_glsl_* externals → SPIR-V emitter maps to GLSL.std.450
     startswith(fn, "_lava_glsl_") && return true
-    # RT intrinsics → SPIR-V emitter maps to OpTraceRayKHR, payload load/store
-    startswith(fn, "_lava_rt_") && return true
     # @lava_printf externals → SPIR-V emitter maps to NonSemantic.DebugPrintf
     startswith(fn, "_lava_debug_printf_") && return true
+    # Cooperative-matrix and tensor-addressing intrinsics carry their shape in
+    # the NAME (`_lava_coopmat_<op>_<dtype>_<M>x<N>_<use>`), which the emitter
+    # parses back out. Enumerating the shapes here instead — as this did — makes
+    # the gate, not the hardware, decide which shapes exist: coopmat2 FLEXIBLE
+    # DIMENSIONS allows any M/N the device's max-dimension limit permits, and a
+    # 64x16 matrix was rejected before reaching the emitter that would have
+    # handled it fine. A prefix rule defers the decision to the emitter, which
+    # errors precisely ("bad shape in …", "not a cooperative-matrix intrinsic",
+    # "unsupported tensor-addressing op") rather than silently accepting.
+    startswith(fn, "_lava_coopmat_") && return true
+    startswith(fn, "_lava_tensor_") && return true
+    # A throw's flag store, which `wrap_entry_for_vulkan!` lowers (or deletes)
+    # before anything is emitted.
+    fn == "_lava_signal_exception" && return true
     # OpenCL C++ mangled builtins (thread indices, barriers, math)
     fn in KNOWN_INTRINSICS && return true
     return false
@@ -196,7 +439,8 @@ end
 
 # ── Compiler configuration cache ──
 
-const COMPILER_CONFIGS = Dict{UInt, LavaCompilerConfig}()
+# Locked: kernels compile on several threads (Mantle compiles a plan's at once).
+const COMPILER_CONFIGS = Base.Lockable(Dict{UInt, LavaCompilerConfig}())
 
 """
     lava_compiler_config(; workgroup_size=(64,1,1)) -> LavaCompilerConfig
@@ -211,15 +455,14 @@ GPUCompiler's SPIRVCompilerTarget with:
 """
 function lava_compiler_config(; workgroup_size::NTuple{3,Int} = (64, 1, 1),
                                enable_ray_query::Bool = false,
+                               features::TargetFeatures = TargetFeatures(),
                                kwargs...)
-    h = hash((workgroup_size, enable_ray_query, kwargs))
-    config = get(COMPILER_CONFIGS, h, nothing)
-    if config !== nothing
-        return config
+    h = hash((workgroup_size, enable_ray_query, features, kwargs))
+    return lock(COMPILER_CONFIGS) do configs
+        get!(configs, h) do
+            lava_full_compiler_config(; workgroup_size, enable_ray_query, features, kwargs...)
+        end
     end
-    config = lava_full_compiler_config(; workgroup_size, enable_ray_query, kwargs...)
-    COMPILER_CONFIGS[h] = config
-    return config
 end
 
 @noinline function lava_full_compiler_config(;
@@ -231,18 +474,20 @@ end
         # Lava's SPIR-V emitter could only handle single-OpFunction kernels, but
         # now that Lava's force_inline_all! supports multi-OpFunction output
         # (force_inline_all=false default), we want Julia/GPUCompiler to respect
-        # `@noinline` so callees like `trace_shadow_transmittance` (which has a
-        # self-contained ray-query lifecycle) can survive as a separate
+        # `@noinline` so callees with a self-contained ray-query lifecycle
+        # (a shadow trace) can survive as a separate
         # OpFunction and keep their state out of the caller's register frame.
         always_inline = false,
         workgroup_size::NTuple{3,Int} = (64, 1, 1),
         enable_ray_query::Bool = false,
+        features::TargetFeatures = TargetFeatures(),
+        readonly::UInt64 = UInt64(0),
         kwargs...)
     target = GPUCompiler.SPIRVCompilerTarget(;
         backend = :llvm,       # gives spirv64-unknown-unknown-unknown triple
         validate = false,      # we validate after our custom SPIR-V emitter
         supports_fp64 = true,  # AMD RX 7900 XTX supports Float64
     )
-    params = LavaCompilerParams(workgroup_size, enable_ray_query)
+    params = LavaCompilerParams(workgroup_size, enable_ray_query, features, readonly)
     GPUCompiler.CompilerConfig(target, params; kernel, name, always_inline)
 end

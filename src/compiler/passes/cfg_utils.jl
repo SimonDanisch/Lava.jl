@@ -14,17 +14,31 @@
 #     across every intermediate call-graph state.
 
 """
-    compute_rpo(f::LLVM.Function) -> Vector{LLVM.BasicBlock}
+    insertion_point(bb::LLVM.BasicBlock)
+    insertion_point(inst::LLVM.Instruction)
+
+Where `LLVM.position!` puts a builder: at the end of a block, or before an
+instruction. LLVM.jl 10 takes an explicit `LLVM.InsertionPoint`; these are the
+two positions its earlier `position!(builder, bb)` and `position!(builder, inst)`
+meant.
+"""
+insertion_point(bb::LLVM.BasicBlock) = LLVM.at_end(bb)
+insertion_point(inst::LLVM.Instruction) = LLVM.before(inst)
+
+"""
+    reverse_postorder(f::LLVM.Function) -> Vector{LLVM.BasicBlock}
 
 Reverse post-order of `f`'s basic blocks. The DFS starts at the function's
 first block (the entry) and appends unreachable blocks at the end so every
 block in `f` appears exactly once.
 
 RPO is the canonical ordering for identifying natural loops: block `A` has a
-back-edge to block `B` iff `B` precedes `A` in RPO.
+back-edge to block `B` iff `B` precedes `A` in RPO. The emitter writes blocks in
+this order, so dominators come before the blocks they dominate and no non-phi
+instruction references a value ahead of it.
 """
-function compute_rpo(f::LLVM.Function)
-    blocks = collect(LLVM.blocks(f))
+function reverse_postorder(f::LLVM.Function)
+    blocks = collect(f.blocks)
     isempty(blocks) && return blocks
 
     visited = Set{LLVM.BasicBlock}()
@@ -33,8 +47,8 @@ function compute_rpo(f::LLVM.Function)
     function dfs(bb)
         bb in visited && return
         push!(visited, bb)
-        term = LLVM.terminator(bb)
-        for succ in LLVM.successors(term)
+        term = bb.terminator
+        for succ in term.successors
             dfs(succ)
         end
         push!(postorder, bb)
@@ -74,14 +88,14 @@ function insert_edge_trampoline!(f::LLVM.Function,
     source_set = Set(sources)
     tramp = LLVM.BasicBlock(f, name)
     LLVM.@dispose builder=LLVM.IRBuilder() begin
-        LLVM.position!(builder, tramp)
+        LLVM.position!(builder, insertion_point(tramp))
         LLVM.br!(builder, target)
     end
 
     # Redirect every source's terminator away from `target` and into `tramp`.
     for src in sources
-        term = LLVM.terminator(src)
-        succs = LLVM.successors(term)
+        term = src.terminator
+        succs = term.successors
         for i in 1:length(succs)
             if succs[i] == target
                 succs[i] = tramp
@@ -93,12 +107,12 @@ function insert_edge_trampoline!(f::LLVM.Function,
     # coming from `sources` vs. those coming from elsewhere. Collapse the
     # `sources` side to a single operand (either a shared value or a fresh
     # phi in `tramp`).
-    for inst in collect(LLVM.instructions(target))
+    for inst in collect(target.instructions)
         inst isa LLVM.PHIInst || break
 
         inside_pairs  = Tuple{LLVM.Value, LLVM.BasicBlock}[]
         outside_pairs = Tuple{LLVM.Value, LLVM.BasicBlock}[]
-        for (val, blk) in LLVM.incoming(inst)
+        for (val, blk) in inst.incoming
             if blk in source_set
                 push!(inside_pairs, (val, blk))
             else
@@ -113,9 +127,9 @@ function insert_edge_trampoline!(f::LLVM.Function,
         else
             # Heterogeneous sources — materialize a phi in the trampoline.
             LLVM.@dispose builder=LLVM.IRBuilder() begin
-                LLVM.position!(builder, LLVM.terminator(tramp))
-                phi = LLVM.phi!(builder, LLVM.value_type(inst), "tramp.phi")
-                append!(LLVM.incoming(phi), inside_pairs)
+                LLVM.position!(builder, insertion_point(tramp.terminator))
+                phi = LLVM.phi!(builder, inst.value_type, "tramp.phi")
+                append!(phi.incoming, inside_pairs)
                 phi
             end
         end
@@ -125,10 +139,10 @@ function insert_edge_trampoline!(f::LLVM.Function,
         new_pairs = copy(outside_pairs)
         push!(new_pairs, (tramp_val, tramp))
         LLVM.@dispose builder=LLVM.IRBuilder() begin
-            LLVM.position!(builder, inst)
-            new_phi = LLVM.phi!(builder, LLVM.value_type(inst),
-                                LLVM.name(inst) * ".tramp")
-            append!(LLVM.incoming(new_phi), new_pairs)
+            LLVM.position!(builder, insertion_point(inst))
+            new_phi = LLVM.phi!(builder, inst.value_type,
+                                inst.name * ".tramp")
+            append!(new_phi.incoming, new_pairs)
             LLVM.replace_uses!(inst, new_phi)
             LLVM.erase!(inst)
         end
