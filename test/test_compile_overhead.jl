@@ -2,7 +2,7 @@
 #
 # Pins two fixed per-kernel overheads that were pure waste — no runtime trade,
 # no codegen effect — and that are both easy to reintroduce because neither
-# announces itself. See benchmarks/compile_baseline/FINDINGS.md §1a.
+# announces itself.
 #
 #  1. `lava_compile_gpu_from_job` calling `string(mod)` and writing a `.ll` and
 #     a `.spv` on EVERY compile, ungated, fills `dev/tmp_kernels` (5675 files /
@@ -97,8 +97,7 @@ using GPUCompiler, LLVM
         # the whole `inlined_at` chain, so in inlined code its cost per
         # instruction grew with the inline depth — which grows with the
         # instruction count. That made the SPIR-V emitter QUADRATIC in function
-        # size (measured exponent 2.6 against IR bytes; see
-        # benchmarks/compile_baseline/FINDINGS.md).
+        # size (measured exponent 2.6 against IR bytes).
         #
         # `diloc_outermost` is the same walk expressed recursively so each LINK
         # can be memoised. Caching only the instruction's own DILocation is not

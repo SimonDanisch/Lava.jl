@@ -36,9 +36,9 @@
 # transcendental narrowed and stored stays one instruction.
 #
 # Doing EVERY narrowing in integers was measured and is too slow: SAM 2's encode +
-# decode on the Radeon 8060S (benchmarks/jobs.jl, median of 20 per session, one
-# fresh session each) took 160.1 and 160.1 ms before these passes, 169.4, 188.6
-# and 176.5 ms with every narrowing in integers, and 155.7 and 167.3 ms with this
+# decode on the Radeon 8060S (median of 20 per session, one fresh session each)
+# took 160.1 and 160.1 ms before these passes, 169.4, 188.6 and 176.5 ms with
+# every narrowing in integers, and 155.7 and 167.3 ms with this
 # rule. A flash-attention kernel narrows `exp` results inside its loop; a
 # memory-bound kernel storing halves does not show the twenty integer operations.
 #

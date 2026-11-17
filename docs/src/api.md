@@ -1,67 +1,63 @@
-# API Reference
+# API reference
 
-This page lists the public surface of Lava. Items marked stable belong to the GPUArrays / KernelAbstractions interface and follow semver. Graphics and ray-tracing items are still evolving.
+Exported names are reachable after `using Lava`. The device vocabulary has its own
+[reference page](vocabulary_api.md).
 
-## Backend & arrays
+## Compiling
 
 ```@docs
-LavaBackend
-LavaArray
+lava_compile
+CompilationResult
+LavaGfxShader
 LavaDeviceArray
-```
-
-## Compute kernels
-
-```@docs
-Lava.lava_launch!
-Lava.vk_flush!
-Lava.clear_kernel_cache!
-Lava.clear_spirv_disk_cache!
-```
-
-## Hardware ray tracing
-
-```@docs
-HWTLAS
-HardwareAccel
-RayTracingPipeline
-trace_closest_hits!
-```
-
-## Graphics
-
-```@docs
-Rasterizer
-TrianglePipeline
-LinePipeline
-GraphicsPipeline
-RenderWindow
-LavaFramebuffer
-LavaTexture2D
-LavaSampler
-present_frame!
-```
-
-## Debugging
-
-```@docs
-Lava.vk_context
-vk_reset_device!
-dump_state
-gpu_memory_usage
-set_dispatch_logging!
-get_dispatch_log
-```
-
-### Printing from kernels
-
-```@docs
 @lava_printf
-Lava.get_printf_output
-Lava.clear_printf_output!
 ```
 
-## Index
+## Stage configuration
 
-```@index
+```@docs
+Topology
+TriangleList
+TriangleStrip
+LineList
+LineStrip
+PointList
+PatchList
+LineListAdjacency
+LineStripAdjacency
+GeometryConfig
+TessConfig
+TessSpacing
+EqualSpacing
+FractionalEvenSpacing
+FractionalOddSpacing
+TessWinding
+WindingCW
+WindingCCW
+TessDomain
+TessTriangles
+TessQuads
+TessIsolines
+```
+
+## Stage intrinsics
+
+```@docs
+set_position!
+gfx_output
+gfx_output_flat
+gfx_input
+gfx_input_flat
+front_facing
+invocation_id
+geom_input
+geom_input_position
+tess_coord
+tess_coord_uvw
+set_tess_level_outer!
+set_tess_level_inner!
+GfxTexture2D
+VertexWrapper
+FragmentWrapper
+GeometryWrapper
 ```

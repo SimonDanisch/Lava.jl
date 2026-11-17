@@ -1,11 +1,10 @@
-# The array a KERNEL receives, and how a kernel indexes it. Nothing here is
+# The array a kernel receives, and how a kernel indexes it. Nothing here is
 # Vulkan's.
 #
-# Split out of `array/lavaarray.jl`, which holds the host-side `LavaArray` — the
-# buffer, its lifetime, the pool it came from and the transfers. Those are the
-# runtime's and are Mantle's now. This is not: a `(pointer, dims)` pair is what
-# the compiler emits loads and stores against, `device/atomics.jl` builds
-# `Atomix` references over it, and neither needs a device to exist.
+# The host-side array, its buffer and transfers are the runtime's (Mantle's
+# `LavaArray`). A `(pointer, dims)` pair is what the compiler emits loads and
+# stores against, `device/atomics.jl` builds `Atomix` references over it, and
+# neither needs a device to exist.
 #
 # The two are still a pair — `LavaDeviceArray(a::LavaArray)` is beside the host
 # type, because it is that type that knows its own buffer address.

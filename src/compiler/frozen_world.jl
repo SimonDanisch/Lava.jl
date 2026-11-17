@@ -1,12 +1,7 @@
 # Keeping the compiler's own precompiled code alive, and putting it there.
 #
-# Both halves are about the COMPILATION PIPELINE, not about a device, which is
-# why they stayed in Lava when the runtime moved out on 2026-08-27. They were the
-# tail of `Lava.jl` and briefly travelled with the diagnostics next to them,
-# which was adjacency rather than a reason.
-#
-# `invoke_frozen` is called from the launch path, which is Mantle's now — one of
-# the names it imports from here.
+# Both halves are about the compilation pipeline, not about a device.
+# `invoke_frozen` is called from the runtime's launch path (Mantle).
 
 # ── Frozen world ────────────────────────────────────────────────────────────
 #

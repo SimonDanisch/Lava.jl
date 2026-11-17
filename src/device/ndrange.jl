@@ -10,9 +10,6 @@
 # The `ctx` argument is KA's `CompilerMetadata`, which carries the ndrange and
 # the iteration space. It is a compile-time value, so everything below folds
 # away except the builtin reads.
-#
-# Came from `array/ka_backend.jl` when the runtime moved to Mantle — see
-# `device/devicearray.jl`'s header for how it got left behind and what that cost.
 
 import KernelAbstractions as KA
 
