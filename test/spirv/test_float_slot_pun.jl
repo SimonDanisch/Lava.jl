@@ -60,13 +60,25 @@ function pun_trimatvec!(C, A, B, upper::Bool, unit::Bool, oA::ComplexF32)
     return nothing
 end
 
+"Bytes a module stores through PhysicalStorageBuffer pointers, by pointee width."
+function psb_bytes_stored(d::AbstractString)
+    width = Dict("uchar" => 1, "ushort" => 2, "uint" => 4, "ulong" => 8,
+                 "half" => 2, "float" => 4, "double" => 8)
+    pointee = Dict(m[1] => m[2] for m in
+                   eachmatch(r"(%\w+) = Op\w+ %_ptr_PhysicalStorageBuffer_(\w+) ", d))
+    return sum((get(width, get(pointee, m[1], ""), 0) for m in eachmatch(r"OpStore (%\w+) ", d));
+               init = 0)
+end
+
 @testset "a narrow load at offset zero of a floating-point slot" begin
     for T in (PunThreeF64, PunTwoF64)
         # `validate = true` is the assertion: before the fix spirv-val threw on
         # `OpLoad Result Type %uint does not match Pointer`.
         d, _ = compile_and_disasm(pun_fill!, Tuple{Lava.LavaDeviceArray{T,1}, T};
                                   validate = true)
-        @test occursin("OpBitcast", d)
+        # Every byte of the value reaches the element, the chunk at offset zero
+        # included, however the stores are split.
+        @test psb_bytes_stored(d) == sizeof(T)
     end
 end
 

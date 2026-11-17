@@ -978,6 +978,41 @@ function unroll_loops!(mod::LLVM.Module)
     return mod
 end
 
+"""
+    unroll_hinted_loops!(mod)
+
+Apply the explicit unroll hints of `mod`'s loops (`llvm.loop.unroll.count N`, `.full`,
+`.enable`, as `Expr(:loopinfo, …)` writes them). Julia's own pipeline applies these hints
+on 1.12 and not on 1.13, which left a count-4 hint to the driver as `PartialCount 4`
+there. Runs only when a hint is still unapplied, so a module whose hints Julia applied
+is untouched, and with partial, runtime, peeled and upper-bound unrolling off: a pragma
+count is applied regardless, and an unhinted loop is only fully unrolled under the same
+threshold Julia's pipeline already used on it.
+"""
+function unroll_hinted_loops!(mod::LLVM.Module)
+    any(hinted_loop, mod.functions) || return mod
+    @dispose pb = LLVM.PassBuilder() begin
+        LLVM.add!(pb, LLVM.FunctionPassManager()) do fpm
+            LLVM.add!(fpm, LLVM.LoopUnrollPass(; opt_level = 2, partial = false, runtime = false,
+                                               peeling = false, upperbound = false,
+                                               profile_peeling = false))
+        end
+        LLVM.run!(pb, mod)
+    end
+    return mod
+end
+
+"""Whether a loop in `f` carries an unroll hint that asks for unrolling."""
+function hinted_loop(f::LLVM.Function)
+    for bb in f.blocks
+        md = bb.terminator.metadata
+        haskey(md, LLVM.MD_loop) || continue
+        words = loop_control_words(md[LLVM.MD_loop]::LLVM.MDNode)
+        words === nothing || words[1] == LOOP_CONTROL_DONT_UNROLL || return true
+    end
+    return false
+end
+
 function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
                            force_inline_all::Bool=false,
                            kernelname::AbstractString="",
@@ -1094,6 +1129,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # variable first, or the unroller cannot see the trip count. This runs before
     # structurization, which needs to see the final CFG.
     unroll_loops!(mod)
+    unroll_hinted_loops!(mod)
     verify_ir!("loop_unroll")
 
     if get(ENV, "LAVA_DEBUG_PASSES", "") == "1"
@@ -1328,11 +1364,11 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     verify_ir!("lower_phi_select_func_ptrs")
     checkpoint("lower_phi_select_function_ptrs!")
 
-    # ── Lift byte-offset GEPs on workgroup globals ──
-    # The decompose passes above may create byte-offset ConstantExpr GEPs like
-    # `gep i8, @shared, <offset>` when splitting struct loads from workgroup globals.
-    # Convert these to typed struct-member GEPs so the emitter produces proper OpAccessChain.
-    lift_byte_geps_on_workgroup_globals!(mod, dl)
+    # ── Lift byte-offset GEPs on workgroup and push-constant globals ──
+    # The decompose passes above, and LLVM 19+'s canonicalization of every constant
+    # offset, leave byte-offset ConstantExpr GEPs like `gep i8, @shared, <offset>`.
+    # Convert these to typed member GEPs so the emitter produces proper OpAccessChain.
+    lift_byte_geps_on_globals!(mod, dl)
 
     # ── Final cleanup: fix GEPs with mismatched source types on allocas ──
     # LLVM's SROA/memcpy lowering can create typed GEPs using wrong source types

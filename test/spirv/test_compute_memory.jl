@@ -130,7 +130,16 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
             return nothing
         end
         d, _ = compile_and_disasm(stored_read, Tuple{DA{Float32,1}, DA{DA{Float32,1},1}})
-        # Three levels of address, every one a typed PhysicalStorageBuffer pointer.
+        check(d, "OpLoad %float")
+        # Julia 1.13 may load a stored array's address as an integer; a table of raw
+        # pointers is a `load ptr` chain on every version. Three levels of address,
+        # every one a typed PhysicalStorageBuffer pointer.
+        function stored_ptr_read(out, table)
+            i = Lava.lava_global_invocation_id_x() + 1
+            @inbounds out[i] = unsafe_load(table[1], i)
+            return nothing
+        end
+        d, _ = compile_and_disasm(stored_ptr_read, Tuple{DA{Float32,1}, DA{Ptr{Float32},1}})
         check(d, "%_ptr_PhysicalStorageBuffer__ptr_PhysicalStorageBuffer__ptr_PhysicalStorageBuffer_float")
 
         # A handle at a computed slot, and a handle WRITTEN by the kernel.

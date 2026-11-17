@@ -1301,6 +1301,13 @@ function emit_icmp!(state::SPIRVEmitterState, inst::LLVM.ICmpInst)
     ops = inst.operands
     lhs_val = ops[1]
     rhs_val = ops[2]
+    if lhs_val isa LLVM.Constant && rhs_val isa LLVM.Constant && lhs_val.value_type isa LLVM.PointerType
+        folded = constant_pointer_comparison(LLVM.API.LLVMGetICmpPredicate(inst), lhs_val, rhs_val)
+        if folded !== nothing
+            state.value_map[inst] = emit_constant_bool!(state.mod, folded)
+            return
+        end
+    end
     # Pointers compare as addresses. Julia's `===` on two structs holding device
     # arrays compares them field by field, and a field LLVM loaded as `ptr` stays
     # an `icmp` on pointers, which `OpIEqual` does not take.
@@ -8751,11 +8758,15 @@ function constexpr_private_constant_pointer(value)
         value.linkage in (LLVM.API.LLVMPrivateLinkage,LLVM.API.LLVMInternalLinkage)
 end
 
-function constexpr_pointer_comparison(value::LLVM.ConstantExpr)
-    value.opcode==LLVM.API.LLVMICmp || return nothing
-    predicate=LLVM.API.LLVMGetICmpPredicate(value)
+"""
+    constant_pointer_comparison(predicate, a, b) -> Union{Bool, Nothing}
+
+The value of an `eq`/`ne` comparison of two constant pointers, when this backend can
+decide it, else `nothing`. LLVM 18 writes such a comparison as a constant expression,
+LLVM 19 on as an `icmp` instruction with constant operands; both come here.
+"""
+function constant_pointer_comparison(predicate, a, b)
     predicate in (LLVM.API.LLVMIntEQ,LLVM.API.LLVMIntNE) || return nothing
-    a,b=value.operands
     # Address-space casts are identity mappings in this logical-pointer
     # backend. A defined private constant table is an allocated, non-null
     # OpVariable, including when LLVM retains a cast-null bounds guard.
@@ -8764,6 +8775,11 @@ function constexpr_pointer_comparison(value::LLVM.ConstantExpr)
     equal=constexpr_null_pointer(a) && constexpr_null_pointer(b)
     (equal || unequal) || return nothing
     return predicate==LLVM.API.LLVMIntEQ ? equal : unequal
+end
+
+function constexpr_pointer_comparison(value::LLVM.ConstantExpr)
+    value.opcode==LLVM.API.LLVMICmp || return nothing
+    return constant_pointer_comparison(LLVM.API.LLVMGetICmpPredicate(value), value.operands...)
 end
 
 function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)

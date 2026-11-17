@@ -805,18 +805,22 @@ function fields_in_byte_range(struct_ty::LLVM.StructType, dl::LLVM.DataLayout,
 end
 
 """
-    lift_byte_geps_on_workgroup_globals!(mod::LLVM.Module, dl::LLVM.DataLayout)
+    lift_byte_geps_on_globals!(mod::LLVM.Module, dl::LLVM.DataLayout)
 
-Convert byte-offset ConstantExpr GEPs on workgroup globals to typed struct-member GEPs.
+Convert byte-offset ConstantExpr GEPs on workgroup and push-constant globals to typed
+member GEPs.
 
-LLVM may generate `getelementptr i8, ptr addrspace(3) @shared, i64 <offset>` to access
-struct fields in shared memory. The SPIR-V emitter doesn't handle byte-offset ConstantExpr GEPs
-on workgroup variables — it falls back to OpBitcast, losing the offset.
+LLVM writes a constant offset into a global as `getelementptr i8, ptr addrspace(3)
+@shared, i64 <offset>`, and from LLVM 19 on every constant-offset GEP is folded to that
+form, the push-constant block's second word included. The SPIR-V emitter does not handle
+byte-offset ConstantExpr GEPs on these variables: it falls back to the base pointer and
+loses the offset.
 
-This pass replaces such ConstantExpr operands with typed GEP instructions that access the
-correct struct member, so the emitter can generate proper OpAccessChain.
+This pass replaces such ConstantExpr operands of loads and stores with typed GEP
+instructions that access the member at that offset, so the emitter can generate
+OpAccessChain.
 """
-function lift_byte_geps_on_workgroup_globals!(mod::LLVM.Module, dl::LLVM.DataLayout)
+function lift_byte_geps_on_globals!(mod::LLVM.Module, dl::LLVM.DataLayout)
     T_i32 = LLVM.Int32Type()
 
     for f in mod.functions
@@ -828,13 +832,13 @@ function lift_byte_geps_on_workgroup_globals!(mod::LLVM.Module, dl::LLVM.DataLay
                 if inst isa LLVM.LoadInst
                     ptr = inst.operands[1]
                     ptr isa LLVM.ConstantExpr || continue
-                    new_ptr = lift_wg_byte_gep(ptr, dl, inst, T_i32)
+                    new_ptr = lift_global_byte_gep(ptr, dl, inst, T_i32)
                     new_ptr === nothing && continue
                     inst.operands[1] = new_ptr
                 elseif inst isa LLVM.StoreInst
                     ptr = inst.operands[2]
                     ptr isa LLVM.ConstantExpr || continue
-                    new_ptr = lift_wg_byte_gep(ptr, dl, inst, T_i32)
+                    new_ptr = lift_global_byte_gep(ptr, dl, inst, T_i32)
                     new_ptr === nothing && continue
                     inst.operands[2] = new_ptr
                 end
@@ -844,12 +848,13 @@ function lift_byte_geps_on_workgroup_globals!(mod::LLVM.Module, dl::LLVM.DataLay
 end
 
 """
-    lift_wg_byte_gep(cexpr, dl, insert_before, T_i32) -> LLVM.Value or nothing
+    lift_global_byte_gep(cexpr, dl, insert_before, T_i32) -> LLVM.Value or nothing
 
-If `cexpr` is a byte-offset ConstantExpr GEP (source type i8) on an addrspace(3) global,
-create a typed GEP instruction that accesses the correct struct field and return it.
+If `cexpr` is a byte-offset ConstantExpr GEP (source type i8) on a workgroup
+(addrspace 3) or push-constant (addrspace 2) global, create a typed GEP instruction
+that accesses the member at that offset and return it.
 """
-function lift_wg_byte_gep(cexpr::LLVM.ConstantExpr, dl::LLVM.DataLayout,
+function lift_global_byte_gep(cexpr::LLVM.ConstantExpr, dl::LLVM.DataLayout,
                             insert_before::LLVM.Instruction, T_i32::LLVM.IntegerType)
     opcode = LLVM.API.LLVMGetConstOpcode(cexpr)
     opcode == LLVM.API.LLVMGetElementPtr || return nothing
@@ -864,10 +869,10 @@ function lift_wg_byte_gep(cexpr::LLVM.ConstantExpr, dl::LLVM.DataLayout,
     n_ops == 2 || return nothing  # i8 GEP: base_ptr + one index
     base_ptr = LLVM.Value(LLVM.API.LLVMGetOperand(cexpr, 0))
 
-    # Check addrspace(3)
+    # Workgroup or push-constant storage: a global whose value type is the declared type.
     ptr_ty = base_ptr.value_type
     ptr_ty isa LLVM.PointerType || return nothing
-    ptr_ty.addrspace == 3 || return nothing
+    ptr_ty.addrspace in (2, 3) || return nothing
 
     # Get constant byte offset
     idx_val = LLVM.Value(LLVM.API.LLVMGetOperand(cexpr, 1))

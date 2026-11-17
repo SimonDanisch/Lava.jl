@@ -687,7 +687,51 @@ end
 "Whether nothing uses `v` any more."
 unused(v::LLVM.Value) = iterate(v.uses) === nothing
 
+"""
+    indexed_type(gep) -> LLVM.LLVMType or nothing
+
+The type `gep` points at: its source element type, stepped through every index after
+the first (which only moves the pointer).
+"""
+function indexed_type(gep::LLVM.GetElementPtrInst)
+    ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep))
+    for idx in gep.operands[3:end]
+        if ty isa LLVM.ArrayType || ty isa LLVM.VectorType
+            ty = ty.element_type
+        elseif ty isa LLVM.StructType
+            idx isa LLVM.ConstantInt || return nothing
+            ty = ty.elements[convert(Int, idx) + 1]
+        else
+            return nothing
+        end
+    end
+    return ty
+end
+
+"""
+    whole_elements(gep, base, dl) -> (element type, index) or nothing
+
+A byte-offset step `gep i8, ptr %base, C` as a step of `C ÷ sizeof(T)` elements, when
+`%base` points at a `T` and `C` is a multiple of its size. LLVM 19 on writes every
+constant offset in bytes, so `gep float, (gep float, %p, %i), -1` reaches this pass as
+`gep i8, (gep float, %p, %i), -4`.
+"""
+function whole_elements(gep::LLVM.GetElementPtrInst, base::LLVM.GetElementPtrInst,
+                        dl::LLVM.DataLayout)
+    LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep)) == LLVM.Int8Type() || return nothing
+    offset = gep.operands[2]
+    offset isa LLVM.ConstantInt || return nothing
+    elem = indexed_type(base)
+    (elem === nothing || elem == LLVM.Int8Type()) && return nothing
+    size = Int(LLVM.abi_size(dl, elem))
+    bytes = convert(Int, offset)
+    (size > 0 && bytes % size == 0) || return nothing
+    last_idx = base.operands[end]
+    return elem, LLVM.ConstantInt(last_idx.value_type, bytes ÷ size, true)
+end
+
 function combine_chained_geps!(mod::LLVM.Module)
+    dl = mod.datalayout
     for fn in mod.functions
         isempty(fn.blocks) && continue
         changed = true
@@ -716,6 +760,8 @@ function combine_chained_geps!(mod::LLVM.Module)
                     src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inst))
                     base_src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(base))
                     idx_outer = ops[2]
+                    elements = whole_elements(inst, base, dl)
+                    elements === nothing || ((src_ty, idx_outer) = elements)
 
                     # Every user of the base gets a GEP of its own, and the base goes
                     # once the last is folded. Folding only a base's single user left
