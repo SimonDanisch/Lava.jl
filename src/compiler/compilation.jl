@@ -1234,7 +1234,9 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # Replace [32 x [2 x float]] → [64 x float] in addrspace(3).
     # Without VK_KHR_workgroup_memory_explicit_layout, SPIR-V Workgroup arrays
     # cannot have ArrayStride decorations, and NVIDIA miscomputes the stride
-    # for nested arrays. Flattening to scalar arrays avoids this.
+    # for nested arrays. Flattening to scalar arrays avoids this. First, constant
+    # element addresses LLVM 19+ wrote in bytes go back to the element form.
+    type_workgroup_byte_constants!(mod)
     flatten_nested_workgroup_arrays!(mod)
     verify_ir!("flatten_wg_arrays")
 

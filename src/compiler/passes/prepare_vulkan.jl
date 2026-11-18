@@ -1304,6 +1304,56 @@ function count_uses(val::LLVM.Value)
 end
 
 # ============================================================================
+# Sub-pass: Workgroup element addresses written in bytes
+# ============================================================================
+
+"""
+    type_workgroup_byte_constants!(mod::LLVM.Module)
+
+Write each constant `gep i8, @g, c` on a workgroup array `@g` of type `[N x T]` as the
+element or member address it is: `gep [N x T], @g, c0, c1, path...`, element
+`k = fld(c, sizeof(T))` with `c0 * N + c1 = k` and `0 <= c1 < N`, and `path` the member the
+remaining bytes start (`member_path`; left in bytes when they start none). LLVM 19 and
+later (Julia 1.13) write every constant GEP in bytes, so the element just before the array
+that one-based indexing starts from (`k = -1`) and constant indices reach the workgroup
+passes and the emitter as byte offsets, where they handle the form LLVM 18 writes.
+AcceleratedKernels' block scan over 28-byte `Optional{Bounds3}`s read `totals[N]` and its
+fields at 1764, 1768, … bytes. Runs after the last InstCombine, which writes them in bytes
+again.
+"""
+function type_workgroup_byte_constants!(mod::LLVM.Module)
+    dl = mod.datalayout
+    T_i8 = LLVM.Int8Type()
+    T_i64 = LLVM.Int64Type()
+    for gv in collect(mod.globals)
+        ptr_ty = gv.value_type
+        (ptr_ty isa LLVM.PointerType && ptr_ty.addrspace == 3) || continue
+        arr_ty = gv.global_value_type
+        arr_ty isa LLVM.ArrayType || continue
+        size = Int(LLVM.abi_size(dl, arr_ty.element_type))
+        size > 0 || continue
+        for use in collect(gv.uses)
+            ce = use.user
+            ce isa LLVM.ConstantExpr || continue
+            LLVM.API.LLVMGetConstOpcode(ce) == LLVM.API.LLVMGetElementPtr || continue
+            LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(ce)) == T_i8 || continue
+            ops = ce.operands
+            (length(ops) == 2 && ops[2] isa LLVM.ConstantInt) || continue
+            bytes = convert(Int, ops[2])
+            k = fld(bytes, size)
+            path = member_path(arr_ty.element_type, bytes - k * size, dl)
+            path === nothing && continue
+            c0 = fld(k, arr_ty.length)
+            indices = LLVM.Constant[LLVM.ConstantInt(T_i64, c0), LLVM.ConstantInt(T_i64, k - c0 * arr_ty.length)]
+            append!(indices, path)
+            typed = LLVM.const_gep(arr_ty, gv, indices; inbounds = Bool(LLVM.API.LLVMIsInBounds(ce)))
+            LLVM.replace_uses!(ce, typed)
+        end
+    end
+    return mod
+end
+
+# ============================================================================
 # Sub-pass: Flatten nested workgroup array globals
 # ============================================================================
 

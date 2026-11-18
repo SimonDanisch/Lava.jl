@@ -114,6 +114,40 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         check_not(d, "OpPtrAccessChain %_ptr_Workgroup")
     end
 
+    @testset "a struct array in workgroup memory at computed and constant indices" begin
+        # AcceleratedKernels' block-scan up-sweep over `Optional{Bounds3}`, laid out as
+        # `{ [2 x [1 x [3 x float]]], i32 }` (28 bytes): `totals[ai + 1]` with
+        # `ai = offset * (2i + 1) - 1`, then a field of `totals[64]`. LLVM 19 and later
+        # write the fields of element `ai` as -28, -24, … bytes off element `ai + 1`,
+        # and that field of element 63 as 1768 bytes off the array; taken as byte
+        # offsets they became `OpPtrAccessChain`s by -24 ÷ 28 and byte loads from
+        # element 0, which spirv-val rejects (`compile_and_disasm` validates).
+        combine(a, b) = (((min.(a[1][1][1], b[1][1][1]),), (max.(a[1][2][1], b[1][2][1]),)), a[2] | b[2])
+        function upsweep_kernel(out)
+            totals = Lava.KI.localmemory(Tuple{NTuple{2,Tuple{NTuple{3,Float32}}}, Int32}, Val((64,)))
+            ithread = UInt32(Lava.lava_local_invocation_id_x())
+            gid = Lava.lava_global_invocation_id_x() + 1
+            @inbounds totals[ithread + 0x1] = (((Float32(gid), 0f0, 0f0),), ((1f0, 2f0, 3f0),)), Int32(1)
+            offset = one(ithread)
+            half = UInt32(64) >> 0x1
+            while half > 0x0
+                Lava.lava_workgroup_barrier()
+                if ithread < half
+                    ai = offset * (0x2 * ithread + 0x1) - 0x1
+                    bi = offset * (0x2 * ithread + 0x2) - 0x1
+                    @inbounds totals[bi + 0x1] = combine(totals[ai + 0x1], totals[bi + 0x1])
+                end
+                offset = offset << 0x1
+                half = half >> 0x1
+            end
+            Lava.lava_workgroup_barrier()
+            @inbounds out[gid] = totals[64][1][1][1][2]
+            return nothing
+        end
+        d, _ = compile_and_disasm(upsweep_kernel, Tuple{Lava.LavaDeviceArray{Float32,1}})
+        check(d, "Workgroup")
+    end
+
     @testset "a device array stored in device memory" begin
         # A table of device-array handles, the way Raycore's `store_texture`
         # keeps its textures and Mantle's `test_stored_device_array.jl` reads one:

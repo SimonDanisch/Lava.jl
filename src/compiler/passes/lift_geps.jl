@@ -709,25 +709,60 @@ function indexed_type(gep::LLVM.GetElementPtrInst)
 end
 
 """
-    whole_elements(gep, base, dl) -> (element type, index) or nothing
+    element_step(gep, base, dl) -> (element type, index, member path) or nothing
 
-A byte-offset step `gep i8, ptr %base, C` as a step of `C ÷ sizeof(T)` elements, when
-`%base` points at a `T` and `C` is a multiple of its size. LLVM 19 on writes every
+A byte-offset step `gep i8, ptr %base, C` off a pointer `%base` to a `T`, as a step of
+`fld(C, sizeof(T))` elements and the indices of the member of that element the remaining
+bytes start (`member_path`; none for a multiple of the size). LLVM 19 on writes every
 constant offset in bytes, so `gep float, (gep float, %p, %i), -1` reaches this pass as
-`gep i8, (gep float, %p, %i), -4`.
+`gep i8, (gep float, %p, %i), -4`, and a field of the element before `%i` as
+`gep i8, (gep T, %p, %i), -sizeof(T) + offset`: AcceleratedKernels' block scan reads
+`totals[ai + 1]` of 28-byte `Optional{Bounds3}`s at -24, -20, … off element `ai + 1`.
 """
-function whole_elements(gep::LLVM.GetElementPtrInst, base::LLVM.GetElementPtrInst,
-                        dl::LLVM.DataLayout)
+function element_step(gep::LLVM.GetElementPtrInst, base::LLVM.GetElementPtrInst,
+                      dl::LLVM.DataLayout)
     LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep)) == LLVM.Int8Type() || return nothing
     offset = gep.operands[2]
     offset isa LLVM.ConstantInt || return nothing
     elem = indexed_type(base)
     (elem === nothing || elem == LLVM.Int8Type()) && return nothing
     size = Int(LLVM.abi_size(dl, elem))
+    size > 0 || return nothing
     bytes = convert(Int, offset)
-    (size > 0 && bytes % size == 0) || return nothing
+    steps = fld(bytes, size)
+    path = member_path(elem, bytes - steps * size, dl)
+    path === nothing && return nothing
     last_idx = base.operands[end]
-    return elem, LLVM.ConstantInt(last_idx.value_type, bytes ÷ size, true)
+    return elem, LLVM.ConstantInt(last_idx.value_type, steps, true), path
+end
+
+"""
+    member_path(ty, offset, dl) -> Vector{LLVM.ConstantInt} or nothing
+
+The GEP indices from a `ty` to the member that starts `offset` bytes into it, outermost
+first: empty for 0, nothing when `offset` falls inside a scalar or in padding.
+"""
+function member_path(ty::LLVM.LLVMType, offset::Int, dl::LLVM.DataLayout)
+    path = LLVM.ConstantInt[]
+    while offset != 0
+        if ty isa LLVM.StructType
+            members = ty.elements
+            i = findlast(k -> Int(LLVM.API.LLVMOffsetOfElement(dl, ty, k)) <= offset, 0:length(members)-1) - 1
+            offset -= Int(LLVM.API.LLVMOffsetOfElement(dl, ty, i))
+            ty = members[i + 1]
+            offset < Int(LLVM.abi_size(dl, ty)) || return nothing
+            push!(path, LLVM.ConstantInt(LLVM.Int32Type(), i))
+        elseif ty isa LLVM.ArrayType
+            size = Int(LLVM.abi_size(dl, ty.element_type))
+            i = offset ÷ size
+            offset -= i * size
+            ty = ty.element_type
+            push!(path, LLVM.ConstantInt(LLVM.Int64Type(), i))
+        else
+            return nothing
+        end
+    end
+    return path
 end
 
 function combine_chained_geps!(mod::LLVM.Module)
@@ -760,8 +795,10 @@ function combine_chained_geps!(mod::LLVM.Module)
                     src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inst))
                     base_src_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(base))
                     idx_outer = ops[2]
-                    elements = whole_elements(inst, base, dl)
-                    elements === nothing || ((src_ty, idx_outer) = elements)
+                    # (after the combined index: the member a byte step lands on)
+                    path = LLVM.ConstantInt[]
+                    step = element_step(inst, base, dl)
+                    step === nothing || ((src_ty, idx_outer, path) = step)
 
                     # Every user of the base gets a GEP of its own, and the base goes
                     # once the last is folded. Folding only a base's single user left
@@ -779,7 +816,8 @@ function combine_chained_geps!(mod::LLVM.Module)
                         LLVM.@dispose builder=LLVM.IRBuilder() begin
                             LLVM.position!(builder, insertion_point(inst))
                             combined_idx = LLVM.add!(builder, idx_inner, idx_outer, "gep_combined_idx")
-                            new_gep = LLVM.gep!(builder, src_ty, base_ops[1], [combined_idx], "gep_combined")
+                            new_gep = LLVM.gep!(builder, src_ty, base_ops[1], LLVM.Value[combined_idx; path],
+                                                "gep_combined")
                             LLVM.replace_uses!(inst, new_gep)
                             LLVM.erase!(inst)
                             unused(base) && LLVM.erase!(base)
@@ -803,6 +841,7 @@ function combine_chained_geps!(mod::LLVM.Module)
                             # Rebuild base GEP with modified last index
                             indices = LLVM.Value[base_ops[i] for i in 2:length(base_ops)-1]
                             push!(indices, combined_idx)
+                            append!(indices, path)
                             new_gep = LLVM.gep!(builder, base_src_ty, base_ops[1], indices, "gep_combined")
                             LLVM.API.LLVMSetIsInBounds(new_gep, LLVM.API.LLVMIsInBounds(base))
                             LLVM.replace_uses!(inst, new_gep)
