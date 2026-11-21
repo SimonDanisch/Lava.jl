@@ -20,6 +20,13 @@ UnsafeAtomics = "013be700-e6cd-48c3-b4a1-df204f14c38f"
 # Only `Vulkan.HAS_LOADER` is used: the compiler is built where a Vulkan loader exists.
 Vulkan = "9f14b124-c50e-4008-a7d4-969b3a6cd68a"
 
+[weakdeps]
+BFloat16s = "ab4f0b2a-ad5b-11e8-123f-65d77653426b"
+Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
+
+[extensions]
+LavaMetalExt = ["Metal", "BFloat16s"]
+
 [compat]
 # Lava extends GPUCompiler internals (`finish_ir!`, `validate_ir`, the method table
 # and caching hooks), which change between minor releases; LLVM.jl 10 changed type
@@ -35,8 +42,12 @@ KernelAbstractions = "0.10.7"
 SPIRV_Tools_jll = "2025.4"
 Adapt = "4"
 Atomix = "1.5"
+BFloat16s = "0.5, 0.6"
 GPUArrays = "12"
 GeometryBasics = "0.5"
+# `@device_override`, `method_table` and `@device_function` are public from the
+# release with JuliaGPU/Metal.jl#1169.
+Metal = "1.12"
 PrecompileTools = "1"
 Serialization = "1"
 StaticArrays = "1.9.17"
