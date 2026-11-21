@@ -574,6 +574,11 @@ function infer_type_from_gep_users(gep::LLVM.GetElementPtrInst, visited::Set{LLV
             if sub_src isa LLVM.IntegerType && sub_src.width == 8
                 result = infer_type_from_gep_users(user, visited)
                 result !== nothing && return result
+            else
+                # A typed GEP from this address states its pointee. LLVM 19+ LICM
+                # hoists a loop's invariant byte offset (`gep i8, p, -4`) and leaves
+                # the element GEP (`gep [1 x float], %hoisted, %i`) in the loop.
+                return sub_src
             end
         elseif user isa LLVM.PHIInst || user isa LLVM.SelectInst
             result = infer_pointee_from_users(user, visited)

@@ -4479,9 +4479,12 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
         # A dynamic offset that is not provably a whole number of elements, `(i << 4) | 8`
         # into `[4 x float]` elements say, must not be divided by the element size: that
         # drops the remainder, the float it picks, and every store lands on the first
-        # one. On a PSB pointer it is address arithmetic like any other byte offset (the
-        # non-composite path below, typed by its users).
-        if !(sc == SC.PhysicalStorageBuffer && elem_size > 0 && !divisible(ops[2], elem_size))
+        # one. Nor is a constant offset outside the array an index into it: LLVM 19+
+        # LICM hoists `gep i8, p, -4` out of a 1-based loop over `[1 x float]` elements,
+        # a step back by one element. On a PSB pointer both are address arithmetic like
+        # any other byte offset (the non-composite path below, typed by its users).
+        if !(sc == SC.PhysicalStorageBuffer && elem_size > 0 &&
+             (!divisible(ops[2], elem_size) || leaves(ops[2], compute_type_size(base_pointee, state.data_layout))))
             # Simple case: byte offset evenly divides by element size
             # Result is a pointer to the element type (not the array type)
             elem_spirv = if sc == SC.Workgroup

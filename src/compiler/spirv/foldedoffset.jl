@@ -65,6 +65,16 @@ function divisible(v::LLVM.Value, n::Integer)
 end
 
 """
+    leaves(offset, size) -> Bool
+
+Whether the byte offset `offset` provably lands outside an object of `size` bytes:
+a constant below 0 or at `size` and beyond. Such a byte GEP steps the pointer to a
+neighbour, so it is not an index into the object. `false` when it cannot tell.
+"""
+leaves(offset::LLVM.ConstantInt, size::Integer) = !(0 <= convert(Int64, offset) < size)
+leaves(::LLVM.Value, ::Integer) = false
+
+"""
     foldedoffset(dl, v) -> Int64
 
 The constant byte offset RADV folds out of the PSB address `v`: every constant

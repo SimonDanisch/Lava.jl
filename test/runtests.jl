@@ -93,6 +93,7 @@ import .SPIRVTestUtils: check, check_not, check_dag, check_sequence, check_count
         include(joinpath(@__DIR__, "test_pointer_field_integer_load.jl"))
         include(joinpath(@__DIR__, "test_typepun_layout_cache.jl"))
         include(joinpath(@__DIR__, "test_phi_pointee_recovery.jl"))
+        include(joinpath(@__DIR__, "test_byte_step_before_typed_gep.jl"))
         include(joinpath(@__DIR__, "test_pointer_select_storage.jl"))
         include(joinpath(@__DIR__, "test_retype_float_lanes.jl"))
         include(joinpath(@__DIR__, "test_retype_word_lanes.jl"))
