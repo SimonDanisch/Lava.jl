@@ -452,7 +452,7 @@ pre-StructurizeCFG fixup pass inserted:
 1. SimplifyCFG - merges nested conditionals sharing exit blocks
 2. fixup_structured_cfg! - trampoline insertion for shared merge targets
 3. LowerSwitch - converts switch to if-else chains (SPIR-V OpSwitch has limitations)
-4. UnifyFunctionExitNodes - ensures single return point (required by StructurizeCFG)
+4. UnifyFunctionExitNodes - merges returns and unreachable exits separately (local replacement for LLVM's removed pass)
 5. FixIrreducible - converts irreducible loops to reducible ones
 6. LoopSimplify - creates dedicated exit blocks for nested loops, preventing
    StructurizeCFG from producing constant `br i1 true` on inner loop back-edges
@@ -485,13 +485,62 @@ function skip_pass(name::AbstractString)
     name in split(skips, ',')
 end
 
+"""Merge each function's returns and unreachable exits as LLVM's removed `mergereturn` did."""
+function unify_function_exit_nodes!(mod::LLVM.Module)
+
+    for f in mod.functions, T in (LLVM.RetInst, LLVM.UnreachableInst)
+
+        # skip function if we only have one exit point
+        terms = [bb.terminator for bb in f.blocks if bb.terminator isa T]
+        length(terms) <= 1 && continue
+
+        # build exit block minding resource deallocation.
+        LLVM.@dispose builder=LLVM.IRBuilder() begin
+
+            # begin block-building
+            exit = LLVM.BasicBlock(f,
+                T === LLVM.RetInst ?
+                    "UnifiedReturnBlock" :
+                    "UnifiedUnreachableBlock",
+            )
+
+            LLVM.position!(builder, insertion_point(exit))
+
+            # get type info for non-null return types
+            phi = T === LLVM.RetInst && !isempty(first(terms).operands) ?
+                LLVM.phi!(builder, first(terms).operands[1].value_type, "UnifiedRetVal") :
+                nothing
+
+            # emit typed/untyped return, or unreachable.
+            if T === LLVM.UnreachableInst
+                LLVM.unreachable!(builder)
+            else
+                isnothing(phi) ?
+                    LLVM.ret!(builder) :
+                    LLVM.ret!(builder, phi)
+            end
+
+            # replace early returns with branches to return point.
+            for term in terms
+                isnothing(phi) || push!(phi.incoming,
+                    (term.operands[1], term.parent),
+                )
+                LLVM.position!(builder, insertion_point(term))
+                LLVM.br!(builder, exit)
+                LLVM.erase!(term)
+            end
+        end
+    end
+    return nothing
+end
+
 function run_structurize_cfg_pipeline!(mod::LLVM.Module)
     checkpoint = PhaseTimer("        [structurize] ")
     run_or_skip(name, f) = skip_pass(name) ? nothing : (f(); checkpoint(name))
     run_or_skip("SimplifyCFG",            () -> LLVM.run!(LLVM.SimplifyCFGPass(), mod))
     run_or_skip("fixup_structured_cfg",   () -> fixup_structured_cfg!(mod))
     run_or_skip("LowerSwitch",            () -> LLVM.run!(LLVM.LowerSwitchPass(), mod))
-    run_or_skip("UnifyFunctionExitNodes", () -> LLVM.run!(LLVM.UnifyFunctionExitNodesPass(), mod))
+    run_or_skip("UnifyFunctionExitNodes", () -> unify_function_exit_nodes!(mod))
     run_or_skip("FixIrreducible",         () -> LLVM.run!(LLVM.FixIrreduciblePass(), mod))
     run_or_skip("LoopSimplify",           () -> LLVM.run!(LLVM.LoopSimplifyPass(), mod))
     # Last thing before StructurizeCFG, which drops every `!llvm.loop` it touches.
