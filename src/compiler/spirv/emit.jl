@@ -26,6 +26,18 @@ end
 
 LoopInfo() = LoopInfo(Dict{LLVM.BasicBlock, Tuple{LLVM.BasicBlock, LLVM.BasicBlock}}())
 
+"""
+The ids of a WebGPU module's bindings and the types an access into them needs:
+`heap` (set 0, binding 0) and `args` (set 0, binding 1), each a block of one
+runtime array of 32-bit words.
+"""
+struct WebGPUBindings
+    heaps::UInt32           # the array of heaps
+    args::UInt32
+    uint::UInt32
+    heap_word_ptr::UInt32   # StorageBuffer pointer to one word
+end
+
 mutable struct SPIRVEmitterState
     # The SPIR-V module being built
     mod::SPIRVModule
@@ -202,6 +214,8 @@ mutable struct SPIRVEmitterState
     # an index shares its subexpressions with others, and narrowing each anew
     # repeated a shared DAG once per path through it.
     narrowed_index::Dict{Tuple{LLVM.Value, UInt32}, UInt32}
+    # A WebGPU module's heap and argument bindings (`emit_webgpu_bindings!`).
+    webgpu::Union{Nothing, WebGPUBindings}
 end
 
 function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
@@ -241,6 +255,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         nothing,  # source_instruction_indices (function objects only)
         TargetFeatures(),  # features (set by the RT emitter from the job)
         Dict{Tuple{LLVM.Value, UInt32}, UInt32}(),  # narrowed_index
+        nothing,  # webgpu bindings
     )
 end
 
@@ -2104,6 +2119,16 @@ function member_path_at_offset!(path::Vector{Int}, ty::LLVM.StructType, target_o
         end
     end
     return nothing
+end
+
+# A vector component: logical pointers reach one through an access chain index.
+function member_path_at_offset!(path::Vector{Int}, ty::LLVM.VectorType, target_offset::Int, dl)
+    elem_size = Int(compute_type_size(ty.element_type, dl))
+    (elem_size == 0 || target_offset % elem_size != 0) && return nothing
+    k = target_offset ÷ elem_size
+    k < Int(LLVM.API.LLVMGetVectorSize(ty)) || return nothing
+    push!(path, k)
+    return ty.element_type
 end
 
 function member_path_at_offset!(path::Vector{Int}, ty::LLVM.LLVMType, target_offset::Int, dl)
@@ -4341,7 +4366,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                     # Record byte offset for alignment computation in store/load
                     state.psb_known_byte_offsets[inst] = const_offset
                     return
-                elseif elem_ty isa LLVM.ArrayType || elem_ty isa LLVM.StructType
+                elseif elem_ty isa LLVM.ArrayType || elem_ty isa LLVM.StructType || elem_ty isa LLVM.VectorType
                     # Sub-element access: decompose recursively through nested types
                     index_path, leaf_ty = member_path_at_offset(base_pointee, const_offset, state.data_layout)
                     if index_path !== nothing
@@ -4990,7 +5015,21 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
             # E.g., gep i8, ptr (AccessChain array[a]), -4  →  AccessChain array[a + (-4/elemsize)]
             arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
             if ops[2] isa LLVM.ConstantInt && convert(Int64, ops[2]) % elem_size != 0
-                function_ptr_offset_error(inst, "a byte offset into the middle of an element of $arr_type")
+                # Inside the element the base points to (a vector's component, a
+                # struct's field): an access chain from the element, not a step.
+                off = convert(Int64, ops[2])
+                elty = arr_type.element_type
+                path, leaf = 0 < off < compute_type_size(elty, state.data_layout) ?
+                    member_path_at_offset(elty, Int(off), state.data_layout) : (nothing, nothing)
+                path === nothing &&
+                    function_ptr_offset_error(inst, "a byte offset into the middle of an element of $arr_type")
+                leaf_ptr_ty = map_pointer_type!(state.type_ctx, map_type!(state.type_ctx, leaf), sc)
+                idx_ids = UInt32[emit_int_constant!(state, LLVM.IntType(32), Int64(k)) for k in path]
+                result_id = fresh_id!(state.mod)
+                encode_instruction!(state.mod.functions, Op.OpAccessChain, leaf_ptr_ty, result_id, base_id, idx_ids...)
+                state.value_map[inst] = result_id
+                set_pointee_type!(state.type_ctx.ptm, inst, leaf; priority = 4)
+                return
             end
             # idx_id is already byte_offset / elem_size (computed above as SDiv)
             # Convert idx_id to i32 for OpAccessChain
@@ -7447,6 +7486,10 @@ function emit_call!(state::SPIRVEmitterState, inst::LLVM.CallInst)
 
         if fn_name == "_lava_sdot4x8"
             return emit_lava_sdot4x8!(state, inst)
+        end
+
+        if startswith(fn_name, "_lava_wgpu_")
+            return emit_lava_wgpu!(state, inst, fn_name)
         end
 
         # Regular function call

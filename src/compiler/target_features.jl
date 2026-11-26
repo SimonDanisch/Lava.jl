@@ -19,12 +19,16 @@
 # Vulkan extensions that gate SPIR-V emission, so they are Lava's.
 
 """
-    TargetFeatures(; ray_query = false)
+    TargetFeatures(; ray_query = false, webgpu = false)
 
-Vulkan extensions the emitter may declare capabilities for.
+What the emitter may declare for the target device.
 
     ray_query   VK_KHR_ray_query: `OpRayQueryInitializeKHR` and friends, for
                 tracing from an ordinary shader.
+    webgpu      A WebGPU device: the module must be printable as WGSL. Logical
+                addressing, no device addresses; memory is the heap binding
+                (`HeapPtr`) and the arguments come from a read-only binding
+                (`wrap_entry_for_webgpu!`).
 
 Defaults to `false`: an emitter test with no device running gets the
 conservative module, which is the one that is valid everywhere. A compile for a
@@ -34,7 +38,8 @@ context as `ctx.features`.
 """
 Base.@kwdef struct TargetFeatures
     ray_query::Bool = false
+    webgpu::Bool = false
 end
 
 # Content-hashed, so a frozen key that mixes it in is the same across sessions.
-Base.hash(f::TargetFeatures, h::UInt) = hash(f.ray_query, hash(:TargetFeatures, h))
+Base.hash(f::TargetFeatures, h::UInt) = hash(f.webgpu, hash(f.ray_query, hash(:TargetFeatures, h)))

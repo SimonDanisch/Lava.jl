@@ -89,6 +89,7 @@ include("compiler/passes/lower_intrinsics.jl")
 include("compiler/passes/exact_narrowing.jl")
 include("compiler/passes/wide_division.jl")
 include("compiler/passes/odd_integers.jl")
+include("compiler/passes/pointer_phis.jl")     # merges of pointers into one array, as index merges (WebGPU)
 
 # The GPUCompiler target, the entry wrapper and the compilation pipeline.
 include("compiler/target.jl")
@@ -103,6 +104,10 @@ include("compiler/function_cache.jl")
 include("compiler/spirv/rayquery.jl")       # VK_KHR_ray_query
 include("compiler/spirv/coopmat.jl")        # cooperative matrices
 include("compiler/spirv/graphics.jl")       # graphics stages and their interface variables
+include("compiler/spirv/webgpu.jl")         # the heap and argument bindings of a WebGPU module
+include("compiler/wgsl/spirv.jl")           # reading SPIR-V back, for the WGSL printer
+include("compiler/wgsl/printer.jl")         # SPIR-V -> WGSL: values, instructions, control flow
+include("compiler/wgsl/module.jl")          # SPIR-V -> WGSL: bindings, entry point, prelude
 
 # Device functions.
 include("device/math.jl")
@@ -112,6 +117,7 @@ include("device/ray_query_intrinsics.jl")
 include("device/gfx_intrinsics.jl")         # graphics builtins and stage I/O
 include("device/printf.jl")                 # @lava_printf through NonSemantic.DebugPrintf
 include("runtime/intrinsics.jl")
+include("device/heap.jl")                  # HeapPtr, HeapDeviceArray: memory on WebGPU
 include("device/devicearray.jl")            # LavaDeviceArray
 include("device/constarray.jl")             # Const: a LavaDeviceArray the kernel only reads
 include("device/atomics.jl")

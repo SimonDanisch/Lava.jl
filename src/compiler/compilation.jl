@@ -706,11 +706,16 @@ function lava_gpu_kernel(mod::LLVM.Module, meta, job::GPUCompiler.CompilerJob;
     end
     entry_fn = meta.entry
     entry_name = entry_fn.name
+    # A WebGPU module is printed as WGSL from one SPIR-V function: no separately
+    # emitted, linked helpers.
+    webgpu = features.webgpu
+    force_inline_all |= webgpu
     return phase_kernel(entry_name) do
-        # ── Stage 0: BDA entry wrapper ──
+        # ── Stage 0: entry wrapper ──
         # Must happen BEFORE passes — the wrapper becomes the new entry point
-        push_info = timed_phase("stage", "wrap_entry_for_vulkan!") do
-            wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size, exceptions = true)
+        push_info = timed_phase("stage", "wrap_entry") do
+            webgpu ? wrap_entry_for_webgpu!(mod, entry_fn) :
+                     wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size, exceptions = true)
         end
         wrapper_name = push_info.wrapper_name
 
@@ -722,6 +727,11 @@ function lava_gpu_kernel(mod::LLVM.Module, meta, job::GPUCompiler.CompilerJob;
         # ── Stage 1: LLVM passes ──
         timed_phase("stage", "run_llvm_passes!") do
             run_llvm_passes!(mod, wrapper_fn; force_inline_all, kernelname = entry_name, readonly)
+        end
+        # After the structurizer, whose Flow blocks merge pointers too.
+        webgpu && timed_phase("stage", "index_pointer_phis!") do
+            foreach(fn -> isempty(LLVM.blocks(fn)) || index_pointer_phis!(fn), LLVM.functions(mod))
+            foreach(fn -> isempty(LLVM.blocks(fn)) || gatethrown!(fn), LLVM.functions(mod))
         end
 
         # Materialising the post-pass IR is not free: `string(mod)` is
@@ -751,7 +761,8 @@ function lava_gpu_kernel(mod::LLVM.Module, meta, job::GPUCompiler.CompilerJob;
 
         # ── Stage 2: Custom SPIR-V emission ──
         spirv_bytes, source_map = timed_phase("stage", "emit_spirv_from_llvm") do
-            emit_spirv_from_llvm(mod, wrapper_name, workgroup_size; enable_ray_query)
+            emit_spirv_from_llvm(mod, wrapper_name, workgroup_size; enable_ray_query, features,
+                                 cache_functions = !webgpu && HAS_OBJECT_CACHE)
         end
 
         # ── Stage 2.5: SPIR-V optimization (optional, helps NVIDIA) ──
@@ -1996,7 +2007,8 @@ end
 Emit SPIR-V binary from an LLVM module. Handles type mapping, instruction emission,
 entry point setup, and serialization.
 """
-function compute_emitter(llvm_mod::LLVM.Module; enable_ray_query::Bool = false)
+function compute_emitter(llvm_mod::LLVM.Module; enable_ray_query::Bool = false,
+                         features::TargetFeatures = TargetFeatures())
     emit_check = PhaseTimer("    [emit] "; group="emit")
 
     # Build pointee type map (opaque pointer → typed pointer recovery)
@@ -2007,11 +2019,14 @@ function compute_emitter(llvm_mod::LLVM.Module; enable_ray_query::Bool = false)
     spirv_mod = SPIRVModule()
     type_ctx = SPIRVTypeContext(spirv_mod, ptm)
 
-    # Setup module header
-    setup_memory_model!(spirv_mod; physical_storage_buffer=true)
+    # Setup module header. WebGPU: logical addressing, and no pointer selected or
+    # stored, which WGSL cannot express.
+    setup_memory_model!(spirv_mod; physical_storage_buffer = !features.webgpu)
     require_capability!(spirv_mod, Cap.Shader)
-    require_capability!(spirv_mod, Cap.VariablePointers)
-    require_extension!(spirv_mod, "SPV_KHR_variable_pointers")
+    if !features.webgpu
+        require_capability!(spirv_mod, Cap.VariablePointers)
+        require_extension!(spirv_mod, "SPV_KHR_variable_pointers")
+    end
     if enable_ray_query
         setup_ray_query_capabilities!(spirv_mod)
     end
@@ -2027,6 +2042,7 @@ function compute_emitter(llvm_mod::LLVM.Module; enable_ray_query::Bool = false)
     # Create emitter state
     state = SPIRVEmitterState(spirv_mod, type_ctx)
     state.data_layout = llvm_mod.datalayout
+    state.features = features
 
     # Pre-allocate SPIR-V function IDs for every function with a body so that
     # OpFunctionCall can forward-reference callees regardless of emission order.
@@ -2053,6 +2069,9 @@ function compute_emitter(llvm_mod::LLVM.Module; enable_ray_query::Bool = false)
         emit_compute_tlas_descriptor!(state)
         append!(interface_ids, state.entry_interface_ids)
     end
+    if features.webgpu
+        append!(interface_ids, emit_webgpu_bindings!(state))
+    end
 
     return state, interface_ids
 end
@@ -2060,13 +2079,14 @@ end
 function emit_spirv_from_llvm(llvm_mod::LLVM.Module, entry_name::String,
                                 workgroup_size::NTuple{3,Int};
                                 enable_ray_query::Bool=false,
+                                features::TargetFeatures=TargetFeatures(),
                                 cache_functions::Bool=HAS_OBJECT_CACHE)
     entry_fn = llvm_mod.functions[entry_name]
     reachable = collect_reachable_callees(entry_fn)
     if cache_functions && length(reachable) > 1
         return emit_function_objects(llvm_mod, entry_fn, reachable, workgroup_size; enable_ray_query)
     end
-    state, interface_ids = compute_emitter(llvm_mod; enable_ray_query)
+    state, interface_ids = compute_emitter(llvm_mod; enable_ray_query, features)
     spirv_mod, type_ctx = state.mod, state.type_ctx
     emit_check = PhaseTimer("    [emit] "; group="emit")
 

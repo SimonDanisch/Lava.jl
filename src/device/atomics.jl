@@ -40,7 +40,7 @@ struct LavaAtomicRef{T, N, P}
 end
 LavaAtomicRef{T,N}(ptr::P, dims::NTuple{N,Int}) where {T,N,P} = LavaAtomicRef{T,N,P}(ptr, dims)
 
-@lava_device_override function Atomix.Internal.referenceable(a::LavaDeviceArray{T,N}) where {T,N}
+@lava_device_override function Atomix.Internal.referenceable(a::PointerArray{T,N}) where {T,N}
     LavaAtomicRef{T,N}(a.ptr, a.dims)
 end
 
@@ -128,7 +128,7 @@ end
 # Not an overlay: it would overlap the one-index-per-dimension form below at N = 1, see
 # `@lava_device_override`.
 @inline function Base.modifyindex_atomic!(
-    arr::LavaDeviceArray{T,N}, order::Symbol, op::OP, val, i::Integer
+    arr::PointerArray{T,N}, order::Symbol, op::OP, val, i::Integer
 ) where {T, N, OP}
     v = convert(T, val)
     ref = Atomix.Internal.referenceable(arr)[i]
@@ -136,7 +136,7 @@ end
 end
 
 @lava_device_override @inline function Base.modifyindex_atomic!(
-    arr::LavaDeviceArray{T,N}, order::Symbol, op::OP, val, I::CartesianIndex{N}
+    arr::PointerArray{T,N}, order::Symbol, op::OP, val, I::CartesianIndex{N}
 ) where {T, N, OP}
     v = convert(T, val)
     li = linear_index(arr.dims, I)
@@ -147,7 +147,7 @@ end
 # N-dimensional indexing: `@atomic arr[i, j, ...]` expands to a call with
 # one Integer per dimension. Convert to a linear index and forward.
 @lava_device_override @inline function Base.modifyindex_atomic!(
-    arr::LavaDeviceArray{T,N}, order::Symbol, op::OP, val, I::Vararg{Integer,N}
+    arr::PointerArray{T,N}, order::Symbol, op::OP, val, I::Vararg{Integer,N}
 ) where {T, N, OP}
     v = convert(T, val)
     li = linear_index(arr.dims, CartesianIndex(map(Int, I)))

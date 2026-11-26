@@ -195,8 +195,9 @@ end
 
 @lava_device_override @inline function Base.:^(x::Float32, y::Float32)
     x == 1.0f0 && return 1.0f0
-    # beyond this every result over- or underflows, and the integer test below stays exact
-    if !(abs(y) < 0x1.Ap30)
+    # beyond this every result over- or underflows, and the integer test below stays exact.
+    # `Float32(...)`: a hex literal is a Float64, which made the comparison a Float64 one.
+    if !(abs(y) < Float32(0x1.Ap30))
         isnan(y) && return y
         y = copysign(Float32(0x1.Ap30), y)
     end
@@ -440,7 +441,7 @@ for T in (Float32, Float64)
 end
 
 # No complex `abs` override: Base's `hypot(real(z), imag(z))` scales, so large and
-# small moduli neither overflow nor underflow.
+# small moduli neither overflow nor underflow (Float32's below, in Float32).
 
 # ── Functions that ccall libm and must be overridden to avoid GPU crashes ──
 
@@ -513,5 +514,10 @@ end
     Float64(Float32(s) * Float32(abs(x))^(1.0f0 / 3.0f0))
 end
 
-# No `hypot` override: Base's neither overflows (Float32 is computed in Float64, Float64
-# scaled). `Base.FastMath.hypot_fast` is the unscaled `sqrt(x*x + y*y)`.
+# Float32 `hypot` (complex `abs`) in Float32: Base's computes it in Float64, which a
+# WebGPU device does not have and others run at a fraction of the Float32 rate. Base's
+# generic algorithm instead, which scales (neither overflows nor underflows) and with
+# an fma is correctly rounded; `invoke`, so it is Base's code and not a copy.
+# `Base.FastMath.hypot_fast` is the unscaled `sqrt(x*x + y*y)`.
+@lava_device_override @inline Base.Math._hypot(x::Float32, y::Float32) =
+    invoke(Base.Math._hypot, Tuple{Any, Any}, x, y)

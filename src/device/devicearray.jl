@@ -54,45 +54,50 @@ Base.pointer(a::LavaDeviceArray{T}) where {T} = a.ptr
 Base.pointer(a::LavaDeviceArray{T}, i::Integer) where {T} = a.ptr + (i - 1) * sizeof(T)
 Base.unsafe_convert(::Type{Ptr{T}}, a::LavaDeviceArray{T}) where {T} = a.ptr
 
+"""Device arrays indexed through their `ptr`: a device address, or a heap offset on WebGPU
+(`HeapDeviceArray`). Indexing is the same for both; the pointer type's
+`unsafe_load`/`unsafe_store!` decide what a memory access is."""
+const PointerArray{T,N} = Union{LavaDeviceArray{T,N}, HeapDeviceArray{T,N}}
+
 # ── Device-side indexing for GPU arrays ──
 
 # 0D array indexing (used by broadcasting on scalar-wrapped arrays)
-@lava_device_override @inline function Base.getindex(a::LavaDeviceArray{T,0}) where T
+@lava_device_override @inline function Base.getindex(a::PointerArray{T,0}) where T
     unsafe_load(a.ptr)
 end
 
-@lava_device_override @inline function Base.setindex!(a::LavaDeviceArray{T,0}, v) where T
+@lava_device_override @inline function Base.setindex!(a::PointerArray{T,0}, v) where T
     unsafe_store!(a.ptr, convert(T, v))
     return v
 end
 
 # 0D with CartesianIndex (broadcast dispatches CartesianIndex{1} on 0D arrays). Not overlays:
 # they would overlap `CartesianIndex{N}` below, see `@lava_device_override`.
-@inline function Base.getindex(a::LavaDeviceArray{T,0}, I::CartesianIndex) where T
+@inline function Base.getindex(a::PointerArray{T,0}, I::CartesianIndex) where T
     unsafe_load(a.ptr)
 end
 
-@inline function Base.setindex!(a::LavaDeviceArray{T,0}, v, I::CartesianIndex) where T
+@inline function Base.setindex!(a::PointerArray{T,0}, v, I::CartesianIndex) where T
     unsafe_store!(a.ptr, convert(T, v))
     return v
 end
 
-# LavaDeviceArray{T,N} linear indexing via BDA pointer
-@lava_device_override @inline function Base.getindex(a::LavaDeviceArray{T}, i::Integer) where T
+# Linear indexing through the array's pointer
+@lava_device_override @inline function Base.getindex(a::PointerArray{T}, i::Integer) where T
     unsafe_load(a.ptr, i)
 end
 
-@lava_device_override @inline function Base.setindex!(a::LavaDeviceArray{T}, v, i::Integer) where T
+@lava_device_override @inline function Base.setindex!(a::PointerArray{T}, v, i::Integer) where T
     unsafe_store!(a.ptr, convert(T, v), i)
     return v
 end
 
 # CartesianIndex indexing for multi-dimensional broadcast support (any N)
-@lava_device_override @inline function Base.getindex(a::LavaDeviceArray{T,N}, I::CartesianIndex{N}) where {T,N}
+@lava_device_override @inline function Base.getindex(a::PointerArray{T,N}, I::CartesianIndex{N}) where {T,N}
     @inbounds unsafe_load(a.ptr, linear_index(a.dims, I))
 end
 
-@lava_device_override @inline function Base.setindex!(a::LavaDeviceArray{T,N}, v, I::CartesianIndex{N}) where {T,N}
+@lava_device_override @inline function Base.setindex!(a::PointerArray{T,N}, v, I::CartesianIndex{N}) where {T,N}
     @inbounds unsafe_store!(a.ptr, convert(T, v), linear_index(a.dims, I))
     return v
 end
@@ -108,13 +113,13 @@ end
 # `a[is[1], is[2], 2, 1]` with `is` from a delinearised loop index reads garbage.
 # That is how it reached GPUArrays' `vectorized_getindex` (host/indexing.jl:84),
 # silently truncating every strided `a[:, :, 2:2, :]`.
-@lava_device_override @inline function Base.getindex(a::LavaDeviceArray{T,N},
+@lava_device_override @inline function Base.getindex(a::PointerArray{T,N},
                                                      i1::Integer, i2::Integer,
                                                      Ir::Vararg{Integer}) where {T,N}
     @inbounds unsafe_load(a.ptr, linear_index(a.dims, CartesianIndex(i1, i2, Ir...)))
 end
 
-@lava_device_override @inline function Base.setindex!(a::LavaDeviceArray{T,N}, v,
+@lava_device_override @inline function Base.setindex!(a::PointerArray{T,N}, v,
                                                       i1::Integer, i2::Integer,
                                                       Ir::Vararg{Integer}) where {T,N}
     @inbounds unsafe_store!(a.ptr, convert(T, v),
