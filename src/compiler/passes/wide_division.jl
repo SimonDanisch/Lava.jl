@@ -91,21 +91,55 @@ end
 k64(x::Integer) = LLVM.ConstantInt(LLVM.IntType(64), x % Int64)
 
 """
-    mulhi!(builder, a, m::UInt64) -> LLVM.Value
+    mulhi!(builder, a, m) -> LLVM.Value
 
 The high 64 bits of the unsigned 128-bit product `a * m`, from four 32 x 32-bit
 products, none of which overflows 64 bits.
 """
-function mulhi!(builder::LLVM.IRBuilder, a::LLVM.Value, m::UInt64)
-    lo32 = k64(0xffff_ffff)
-    al, ah = LLVM.and!(builder, a, lo32), LLVM.lshr!(builder, a, k64(32))
-    ml, mh = k64(m & 0xffff_ffff), k64(m >> 32)
+mulhi!(builder::LLVM.IRBuilder, a::LLVM.Value, m::UInt64) = mulhi!(builder, a, k64(m))
+
+function mulhi!(builder::LLVM.IRBuilder, a::LLVM.Value, m::LLVM.Value)
+    lo32, shift = k64(0xffff_ffff), k64(32)
+    al, ah = LLVM.and!(builder, a, lo32), LLVM.lshr!(builder, a, shift)
+    ml, mh = LLVM.and!(builder, m, lo32), LLVM.lshr!(builder, m, shift)
     ll = LLVM.mul!(builder, al, ml)
     t = LLVM.add!(builder, LLVM.mul!(builder, ah, ml), LLVM.lshr!(builder, ll, k64(32)))
     w = LLVM.add!(builder, LLVM.and!(builder, t, lo32), LLVM.mul!(builder, al, mh))
     hh = LLVM.mul!(builder, ah, mh)
     return LLVM.add!(builder, LLVM.add!(builder, hh, LLVM.lshr!(builder, t, k64(32))),
                      LLVM.lshr!(builder, w, k64(32)))
+end
+
+# Julia's precomputed divisors can pull the high word of a runtime
+# 64 x 64-bit product out of a temporary i128. SPIR-V has no i128 type.
+function lower_wide_products!(mod::LLVM.Module)
+    for f in LLVM.functions(mod), bb in LLVM.blocks(f)
+        for inst in collect(LLVM.instructions(bb))
+            inst isa LLVM.TruncInst && LLVM.value_type(inst) == LLVM.Int64Type() || continue
+            shift = only(LLVM.operands(inst))
+            shift isa Union{LLVM.LShrInst,LLVM.AShrInst} || continue
+            product, amount = LLVM.operands(shift)
+            product isa LLVM.MulInst && LLVM.value_type(product) == LLVM.IntType(128) || continue
+            amount isa LLVM.ConstantInt && convert(Int64, amount) == 64 || continue
+            lhs, rhs = LLVM.operands(product)
+            lhs isa LLVM.ZExtInst && rhs isa LLVM.ZExtInst || continue
+            a, b = only(LLVM.operands(lhs)), only(LLVM.operands(rhs))
+            LLVM.value_type(a) == LLVM.value_type(b) == LLVM.Int64Type() || continue
+
+            LLVM.@dispose builder=LLVM.IRBuilder() begin
+                LLVM.position!(builder, LLVM.before(inst))
+                LLVM.replace_uses!(inst, mulhi!(builder, a, b))
+            end
+            LLVM.erase!(inst)
+            unused(shift) || continue
+            LLVM.erase!(shift)
+            unused(product) || continue
+            LLVM.erase!(product)
+            unused(lhs) && LLVM.erase!(lhs)
+            rhs != lhs && unused(rhs) && LLVM.erase!(rhs)
+        end
+    end
+    return nothing
 end
 
 "The high 64 bits of the signed product: the unsigned one, corrected for signs."

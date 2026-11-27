@@ -1418,6 +1418,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # ── No integer of a width SPIR-V has no type for ──
     # SimplifyCFG's switch bitmaps are as wide as their tables, whatever the
     # datalayout's native widths (see the pass). Last: nothing after it narrows.
+    lower_wide_products!(mod)
     widen_odd_integers!(mod)
     checkpoint("widen_odd_integers!")
 
