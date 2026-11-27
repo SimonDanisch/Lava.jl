@@ -265,6 +265,21 @@ function persisted(compile, ns::String, mod::LLVM.Module, settings...)
     return stage
 end
 
+"""Cache the large WGSL sources that are expensive to reconstruct from SPIR-V."""
+function persisted_wgsl(print_shader, words, heaps, linear, flip_y)
+    keep = length(words) >= 8192 && HAS_OBJECT_CACHE && !generating_output() &&
+           !kernel_dump_wanted() && ObjCache.enabled()
+    keep || return print_shader()
+    bytes = Vector{UInt8}(reinterpret(UInt8, words))
+    settings = serialized((compiler_identity(), heaps, linear, flip_y))
+    key = ObjCache.keyhash(PERSISTED_SCHEMA, bytes, settings)
+    found = ObjCache.get("Lava/wgsl", key)
+    found === nothing || return String(found)
+    source = print_shader()
+    ObjCache.put!("Lava/wgsl", key, Vector{UInt8}(codeunits(source)))
+    return source
+end
+
 """
 Held while a kernel is inferred: kernels are inferred one at a time. On the docs build,
 kernels with callees in common inferred on several threads at once gave a shading

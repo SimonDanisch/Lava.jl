@@ -5112,8 +5112,6 @@ function lower_phi_select_function_ptrs!(mod::LLVM.Module)
                     (LLVM.volatile(inst) || LLVM.isatomic(inst)) && continue
                     ptr = inst.operands[1]
                     ptr isa Union{LLVM.PHIInst, LLVM.SelectInst} || continue
-                    at_load = function_ptr_select_tree(ptr, Set{LLVM.Value}())
-                    at_load || function_ptr_mirror_safe(ptr, inst, Set{Tuple{LLVM.Value,LLVM.Value}}()) || continue
                     ptr_ty = ptr.value_type
                     ptr_ty isa LLVM.PointerType || continue
                     ptr_ty.addrspace == 0 || continue
@@ -5128,6 +5126,7 @@ function lower_phi_select_function_ptrs!(mod::LLVM.Module)
                     end
 
                     cache = Dict{LLVM.Value, LLVM.Value}()
+                    at_load = function_ptr_select_tree(ptr, Set{LLVM.Value}())
                     new_val = if at_load
                         # Every operand of a select tree dominates this load.
                         # Read here, after any intervening stores, then select
@@ -5136,8 +5135,10 @@ function lower_phi_select_function_ptrs!(mod::LLVM.Module)
                             LLVM.position!(builder, insertion_point(inst))
                             build_function_ptr_select_mirror!(builder, ptr, access_ty, cache)
                         end
-                    else
+                    elseif function_ptr_mirror_safe(ptr, inst, Set{Tuple{LLVM.Value,LLVM.Value}}())
                         build_function_ptr_value_mirror!(ptr, access_ty, cache)
+                    elseif ptr isa LLVM.PHIInst
+                        load_from_private_phi!(inst, ptr)
                     end
                     new_val === nothing && continue
 
@@ -5155,6 +5156,32 @@ function lower_phi_select_function_ptrs!(mod::LLVM.Module)
                 changed && break
             end
         end
+    end
+end
+
+"""Select the contents of entry-block allocas at the load, after intervening writes."""
+function load_from_private_phi!(load::LLVM.LoadInst, ptr::LLVM.PHIInst)
+    entry = first(ptr.parent.parent.blocks)
+    incoming = collect(ptr.incoming)
+    all(incoming) do (value, _)
+        value isa LLVM.AllocaInst && value.parent == entry
+    end || return nothing
+    ty = load.value_type
+    selector_type = LLVM.Int32Type()
+    LLVM.@dispose builder=LLVM.IRBuilder() begin
+        LLVM.position!(builder, insertion_point(ptr))
+        selector = LLVM.phi!(builder, selector_type, "private_selector")
+        append!(selector.incoming, [(LLVM.ConstantInt(selector_type, i), block)
+                                     for (i, (_, block)) in enumerate(incoming)])
+        LLVM.position!(builder, insertion_point(load))
+        value = load_function_leaf!(builder, first(incoming)[1], ty)
+        for (i, (source, _)) in enumerate(incoming)
+            i == 1 && continue
+            current = load_function_leaf!(builder, source, ty)
+            selected = LLVM.icmp!(builder, LLVM.API.LLVMIntEQ, selector, LLVM.ConstantInt(selector_type, i))
+            value = LLVM.select!(builder, selected, current, value, "private_value")
+        end
+        return value
     end
 end
 

@@ -20,6 +20,7 @@
 
 """The most heaps a module's array of heaps has; a device binds at most this many."""
 const WEBGPU_MAX_HEAPS = 16
+const WEBGPU_FRAGMENT_ARGS_BINDING = WEBGPU_MAX_HEAPS + 1
 
 """A `Block` struct of one runtime array of 32-bit words, not shared with any other variable."""
 function word_block_type!(mod::SPIRVModule, uint::UInt32; readonly::Bool)
@@ -49,10 +50,10 @@ end
 Declare the argument binding and the array of heaps, record them in `state.webgpu`
 and return their ids for the entry point's interface.
 """
-function emit_webgpu_bindings!(state::SPIRVEmitterState)
+function emit_webgpu_bindings!(state::SPIRVEmitterState; argbinding::Int = 0)
     mod = state.mod
     uint = emit_type_int!(mod, UInt32(32), UInt32(0))
-    args = word_block_variable!(mod, word_block_type!(mod, uint; readonly = true), 0, "args")
+    args = word_block_variable!(mod, word_block_type!(mod, uint; readonly = true), argbinding, "args")
     nheaps = emit_constant_int!(mod, uint, 32, UInt64(WEBGPU_MAX_HEAPS))
     heaptype = emit_type_array!(mod, word_block_type!(mod, uint; readonly = false), nheaps)
     heaps = word_block_variable!(mod, heaptype, 1, "heaps")
@@ -122,6 +123,12 @@ function emit_heap_atomic!(state::SPIRVEmitterState, inst::LLVM.CallInst, op::St
     relaxed = emit_constant_int!(mod, b.uint, 32, UInt64(0))
     if op == "store"
         encode_instruction!(mod.functions, Op.OpAtomicStore, ptr, scope, relaxed, get_value_id!(state, ops[3]))
+        return nothing
+    elseif op == "storepart"
+        encode_instruction!(mod.functions, Op.OpAtomicAnd, b.uint, fresh_id!(mod), ptr, scope, relaxed,
+                            get_value_id!(state, ops[3]))
+        encode_instruction!(mod.functions, Op.OpAtomicOr, b.uint, fresh_id!(mod), ptr, scope, relaxed,
+                            get_value_id!(state, ops[4]))
         return nothing
     end
     result = fresh_id!(mod)

@@ -42,6 +42,8 @@ struct SpvVector <: SpvType
     elem::UInt32
     n::Int
 end
+struct SpvImage <: SpvType end
+struct SpvSampledImage <: SpvType end
 struct SpvArray <: SpvType
     elem::UInt32
     len::Int
@@ -126,7 +128,7 @@ end
 # Opcodes with a result type and a result id, so `typeof`/`results` can record them:
 # everything the printer reads as a value, plus the ones it refuses by name.
 const SPV_TYPED_RESULT = Set{UInt16}([
-    1, 12, 57, 59, 61, 65, 66, 67, 70, 77, 78, 79, 80, 81, 82, 83,
+    1, 12, 57, 59, 61, 65, 66, 67, 70, 77, 78, 79, 80, 81, 82, 83, 87,
     109:126..., 126:205..., 207, 208, 209, 227, 229:242..., 245,
     333:366..., 4431, 4450, 4451, 4452, 6035, 5614, 5615])
 
@@ -215,6 +217,10 @@ function readtype!(m::SpvModule, inst::SpvInst)
         SpvFloat(Int(operand(inst, 2)))
     elseif op == 23
         SpvVector(operand(inst, 2), Int(operand(inst, 3)))
+    elseif op == 25
+        SpvImage()
+    elseif op == 27
+        SpvSampledImage()
     elseif op == 28
         len = m.constants[operand(inst, 3)]::SpvScalar
         SpvArray(operand(inst, 2), Int(len.bits))

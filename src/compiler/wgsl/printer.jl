@@ -7,11 +7,10 @@
 # is a binding of its own, reached through functions that switch on the heap
 # (`HEAP` below).
 #
-# Values: every result of a non-pointer type is a function-scope `var`, assigned
-# where SPIR-V defines it, so dominance never has to be matched to WGSL's lexical
-# scopes; WGSL compilers turn these back into SSA. Pointer results (variables,
-# access chains) are not values in WGSL; they print as the reference expression
-# they stand for (`heap.m0[i]`), at each use.
+# Values are assigned where SPIR-V defines them. The module printer turns single
+# assignments with lexically scoped uses into `let` bindings. Phi variables and
+# values that cross WGSL scopes keep function-scope storage. Pointer results
+# print as the reference expression they stand for (`heap.m0[i]`) at each use.
 #
 # Integers: every 32-bit integer type is `u32`; signed operations bitcast through
 # `i32`. 64-bit integers, which WGSL lacks, are `vec2<u32>` (low, high) with the
@@ -45,6 +44,8 @@ mutable struct WGSLPrinter
     heapops::Set{String}                # the heap functions the body calls
     derived::Vector{String}             # entry-point lines defining derived builtins
     uniformloads::Set{UInt32}           # heap loads read through `workgroupUniformLoad`
+    outputs::Vector{String}             # fields of the graphics entry point's result
+    flip_position::UInt32              # vertex position variable when its Y must be mirrored
 end
 
 struct WGSLError <: Exception
@@ -52,6 +53,8 @@ struct WGSLError <: Exception
 end
 Base.showerror(io::IO, e::WGSLError) = print(io, "WGSL printer: ", e.msg)
 refuse(msg) = throw(WGSLError(msg))
+
+executionmodel(p::WGSLPrinter) = operand(p.m.entry, 1)
 
 line!(p::WGSLPrinter, s::AbstractString) = (print(p.out, "    "^p.indent, s, "\n"); nothing)
 
@@ -274,6 +277,8 @@ function emit!(p::WGSLPrinter, inst::SpvInst)
         id, ptr = operand(inst, 2), operand(inst, 3)
         if haskey(p.builtins, ptr)
             p.refs[id] = p.builtins[ptr]
+        elseif spvtype(p, operand(inst, 1)) isa SpvSampledImage
+            p.refs[id] = reference(p, ptr)
         elseif id in p.uniformloads
             line!(p, "if (local_invocation_index == 0u) { lava_uload$id = $(heapcall(p, "load", ptr)); }")
             assign!(p, id, "workgroupUniformLoad(&lava_uload$id)")
@@ -284,8 +289,15 @@ function emit!(p::WGSLPrinter, inst::SpvInst)
         end
     elseif op == 62                                   # OpStore
         ptr, v = operand(inst, 1), value(p, operand(inst, 2))
+        ptr == p.flip_position && (v = "vec4<f32>(($v).x, -($v).y, ($v).z, ($v).w)")
         if haskey(p.heapwords, ptr)
-            line!(p, heapcall(p, "store", ptr, v) * ";")
+            if executionmodel(p) == ExecModel.GLCompute
+                line!(p, heapcall(p, "store", ptr, v) * ";")
+            elseif p.heapwords[ptr] == ("0u", "0u") && v == "1u"
+                rasterthrow!(p)
+            else
+                refuse("graphics stages require read-only heaps")
+            end
         else
             line!(p, isatomic(p, ptr) ? "atomicStore(&$(reference(p, ptr)), $v);" : "$(reference(p, ptr)) = $v;")
         end
@@ -309,6 +321,9 @@ function emit!(p::WGSLPrinter, inst::SpvInst)
         binary!(p, inst)
     elseif op in (126, 127, 200, 168)                 # SNegate, FNegate, Not, LogicalNot
         unary!(p, inst)
+    elseif op in (204, 205)                           # OpBitReverse, OpBitCount
+        builtin = op == 204 ? "reverseBits" : "countOneBits"
+        assign!(p, operand(inst, 2), "$builtin($(value(p, operand(inst, 3))))")
     elseif op in 109:124 || op == 124
         conversion!(p, inst)
     elseif op == 169                                  # OpSelect
@@ -316,9 +331,15 @@ function emit!(p::WGSLPrinter, inst::SpvInst)
         c, a, b = value(p, operand(inst, 3)), value(p, operand(inst, 4)), value(p, operand(inst, 5))
         assign!(p, id, "select($b, $a, $c)")
     elseif op in (156, 157)                           # OpIsNan, OpIsInf
-        x = value(p, operand(inst, 3))
-        bits = lanes(p, p.m.typeof[operand(inst, 3)]) == 1 ? "bitcast<u32>($x)" :
-               "bitcast<vec$(lanes(p, p.m.typeof[operand(inst, 3)]))<u32>>($x)"
+        src = operand(inst, 3)
+        type = p.m.typeof[src]
+        x = value(p, src)
+        n = lanes(p, type)
+        if (spvtype(p, scalartype(p, type))::SpvFloat).width == 16
+            # Widening a half preserves whether it is finite, infinite or NaN.
+            x = n == 1 ? "f32($x)" : "vec$(n)<f32>($x)"
+        end
+        bits = n == 1 ? "bitcast<u32>($x)" : "bitcast<vec$(n)<u32>>($x)"
         cmp = op == 156 ? ">" : "=="
         assign!(p, operand(inst, 2), "(($bits & 0x7fffffffu) $cmp 0x7f800000u)")
     elseif op in (154, 155)                           # OpAny, OpAll
@@ -336,8 +357,17 @@ function emit!(p::WGSLPrinter, inst::SpvInst)
         shuffle!(p, inst)
     elseif op == 77                                   # OpVectorExtractDynamic
         assign!(p, operand(inst, 2), "$(value(p, operand(inst, 3)))[$(value(p, operand(inst, 4)))]")
+    elseif op == 87                                   # OpImageSampleImplicitLod
+        texture = reference(p, operand(inst, 3))
+        coord = value(p, operand(inst, 4))
+        assign!(p, operand(inst, 2), "textureSample($texture, $(texture)_sampler, $coord)")
     elseif op == 12                                   # OpExtInst
         extinst!(p, inst)
+    elseif op in (207, 208, 209)                       # OpDPdx, OpDPdy, OpFwidth
+        builtin = op == 207 ? "dpdx" : op == 208 ? "dpdy" : "fwidth"
+        assign!(p, operand(inst, 2), "$builtin($(value(p, operand(inst, 3))))")
+    elseif op == 5380                                 # OpDemoteToHelperInvocation
+        line!(p, "discard;")
     elseif op == 224                                  # OpControlBarrier
         barrier!(p, inst)
     elseif 333 <= op <= 366 || op == 4431
@@ -351,6 +381,24 @@ function emit!(p::WGSLPrinter, inst::SpvInst)
     else
         refuse("SPIR-V opcode $(op) is not supported yet")
     end
+    return nothing
+end
+
+"""A graphics invocation cannot publish a failure through a writable heap."""
+function rasterthrow!(p::WGSLPrinter)
+    if executionmodel(p) == ExecModel.Fragment
+        line!(p, "discard;")
+    else
+        for g in p.m.globals
+            operand(g, 3) == 3 || continue
+            id = operand(g, 2)
+            bi = decoration(p.m, id, 11)
+            (bi === nothing || bi[1] != BuiltIn.Position) && continue
+            line!(p, "$(p.refs[id]) = vec4<f32>(0.0f, 0.0f, 2.0f, 1.0f);")
+            break
+        end
+    end
+    line!(p, isempty(p.outputs) ? "return;" : "return lava_out;")
     return nothing
 end
 
@@ -495,11 +543,11 @@ function conversion!(p::WGSLPrinter, inst::SpvInst)
         from64 && (p.uses_i64 = true; return assign!(p, id, "$(wgsl(p, type))(i64_to_f32($a))"))
         return assign!(p, id, "$(wgsl(p, type))($(signed(p, from, a)))")
     elseif op == 109                                   # OpConvertFToU
-        to64 && return assign!(p, id, "vec2<u32>(u32($a), 0u)")
+        to64 && (p.uses_i64 = true; return assign!(p, id, "u64_from_f32(f32($a))"))
         # Cut to a narrow width: a narrow integer is a masked u32.
         return assign!(p, id, cut(p, type, "$(wgsl(p, type))($a)"))
     elseif op == 110                                   # OpConvertFToS
-        to64 && (p.uses_i64 = true; return assign!(p, id, "i64_from_i32(i32($a))"))
+        to64 && (p.uses_i64 = true; return assign!(p, id, "i64_from_f32(f32($a))"))
         # A negative narrow result would otherwise keep its sign bits above its width.
         return assign!(p, id, cut(p, type, unsigned(p, type, "$(signedtype(p, type))($a)")))
     elseif op == 115                                   # OpFConvert
@@ -775,8 +823,9 @@ function terminator!(p::WGSLPrinter, blk::SpvBlock, stack::Vector{Construct})
     elseif op == 251                                   # OpSwitch
         blk.merge === nothing && refuse("switch without a selection merge")
         return switch!(p, blk, stack)
-    elseif op == 253 || op == 252 || op == 255         # OpReturn, OpKill, OpUnreachable
-        line!(p, "return;")
+    elseif op in (252, 253, 255)                      # OpKill, OpReturn, OpUnreachable
+        op == 252 && line!(p, "discard;")
+        line!(p, isempty(p.outputs) ? "return;" : "return lava_out;")
         return nothing
     elseif op == 254
         line!(p, "return $(value(p, operand(t, 1)));")
@@ -1188,9 +1237,12 @@ end
 """The binding of each of the device's heaps: the array of heaps' binding, then on."""
 function declareheaps!(p::WGSLPrinter, id::UInt32, set::UInt32, binding::UInt32)
     p.heaparray = id
+    compute = executionmodel(p) == ExecModel.GLCompute
+    !compute && id in p.atomics && refuse("graphics stages require read-only heaps")
+    access = compute ? "read_write" : "read"
     T = id in p.atomics ? "array<atomic<u32>>" : "array<u32>"
     for k in 0:p.heaps - 1
-        line!(p, "@group($set) @binding($(binding + k)) var<storage, read_write> lava_heap$k: $T;")
+        line!(p, "@group($set) @binding($(binding + k)) var<storage, $access> lava_heap$k: $T;")
     end
     return nothing
 end
@@ -1214,6 +1266,7 @@ function heapfunctions(p::WGSLPrinter)
             print(out, "fn lava_heap_load(h: u32, w: u32) -> u32 {\n",
                   heapswitch(p, k -> atomic ? "return atomicLoad(&lava_heap$k[w]);" : "return lava_heap$k[w];"), "}\n")
         elseif op == "store"
+            executionmodel(p) == ExecModel.GLCompute || refuse("graphics stages require read-only heaps")
             print(out, "fn lava_heap_store(h: u32, w: u32, v: u32) {\n",
                   heapswitch(p, k -> atomic ? "atomicStore(&lava_heap$k[w], v);" : "lava_heap$k[w] = v;"), "}\n")
         elseif op == "cas"

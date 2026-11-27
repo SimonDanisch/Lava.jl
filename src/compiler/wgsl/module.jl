@@ -7,6 +7,11 @@ const WGSL_COMPUTE_BUILTINS = Dict{UInt32, String}(
     24 => "num_workgroups", 29 => "local_invocation_index",
     41 => "subgroup_invocation_id", 36 => "subgroup_size")
 
+const WGSL_VERTEX_BUILTINS = Dict(
+    BuiltIn.VertexIndex => "vertex_index", BuiltIn.InstanceIndex => "instance_index")
+const WGSL_FRAGMENT_BUILTINS = Dict(
+    BuiltIn.FragCoord => "position", BuiltIn.FrontFacing => "front_facing")
+
 const WGSL_RESERVED = Set(["array", "bool", "break", "case", "const", "continue", "continuing",
     "default", "diagnostic", "discard", "else", "enable", "f16", "f32", "false", "fn", "for", "i32",
     "if", "let", "loop", "override", "requires", "return", "struct", "switch", "true", "u32", "var",
@@ -57,24 +62,66 @@ function derivedbuiltin!(p::WGSLPrinter, params::Vector{String}, bi::UInt32)
     return name
 end
 
-"""Declare the module-scope variables; return the entry point's builtin parameters."""
-function declare_globals!(p::WGSLPrinter)
+"""An input or output location, including the producer/consumer interpolation."""
+function location_attribute(p::WGSLPrinter, id::UInt32, varying::Bool)
+    loc = decoration(p.m, id, 30)
+    loc === nothing && refuse("interface variable %$id without a Location decoration")
+    attr = "@location($(loc[1]))"
+    if varying
+        decoration(p.m, id, 14) !== nothing && return attr * " @interpolate(flat)"
+        decoration(p.m, id, 13) !== nothing && return attr * " @interpolate(linear)"
+    end
+    return attr
+end
+
+"""Declare the module-scope variables and collect the entry point's interface."""
+function declare_globals!(p::WGSLPrinter; flip_y::Bool)
     params = String[]
+    model = executionmodel(p)
     for g in p.m.globals
         ptrtype, id, storage = operand(g, 1), operand(g, 2), operand(g, 3)
         type = (spvtype(p, ptrtype)::SpvPointer).pointee
-        if storage == 1                                    # Input: a builtin
+        if storage == 1                                    # Input
             bi = decoration(p.m, id, 11)
-            bi === nothing && refuse("an Input variable without a BuiltIn decoration")
-            if haskey(WGSL_DERIVED_BUILTINS, bi[1])
+            if bi === nothing
+                model == ExecModel.GLCompute && refuse("compute input without a BuiltIn decoration")
+                name = "lava_in$id"
+                attr = location_attribute(p, id, model == ExecModel.Fragment)
+                push!(params, "$attr $name: $(wgsl(p, type))")
+            elseif model == ExecModel.GLCompute && haskey(WGSL_DERIVED_BUILTINS, bi[1])
                 p.builtins[id] = derivedbuiltin!(p, params, bi[1])
                 continue
+            else
+                builtins = model == ExecModel.Vertex ? WGSL_VERTEX_BUILTINS :
+                           model == ExecModel.Fragment ? WGSL_FRAGMENT_BUILTINS : WGSL_COMPUTE_BUILTINS
+                name = get(builtins, bi[1]) do
+                    refuse("builtin $(bi[1]) has no WGSL equivalent for execution model $model")
+                end
+                builtinparam!(p, params, name, wgsl(p, type))
             end
-            name = get(WGSL_COMPUTE_BUILTINS, bi[1]) do
-                refuse("builtin $(bi[1]) has no WGSL compute equivalent")
-            end
-            builtinparam!(p, params, name, wgsl(p, type))
             p.builtins[id] = name
+            p.refs[id] = name
+        elseif storage == 3                                # Output
+            bi = decoration(p.m, id, 11)
+            attr = if bi === nothing
+                location_attribute(p, id, model == ExecModel.Vertex)
+            elseif model == ExecModel.Vertex && bi[1] == BuiltIn.Position
+                flip_y && (p.flip_position = id)
+                "@builtin(position)"
+            else
+                refuse("output builtin $(bi[1]) for execution model $model")
+            end
+            push!(p.outputs, "$attr m$id: $(wgsl(p, type)),")
+            p.refs[id] = "lava_out.m$id"
+        elseif storage == 0                                # UniformConstant: combined sampler
+            spvtype(p, type) isa SpvSampledImage || refuse("unsupported UniformConstant type %$type")
+            binding = decoration(p.m, id, 33)
+            binding === nothing && refuse("a sampled image without a binding")
+            slot = Int(binding[1])
+            name = "lava_texture$slot"
+            line!(p, "@group(1) @binding($(2slot)) var $name: texture_2d<f32>;")
+            line!(p, "@group(1) @binding($(2slot + 1)) var $(name)_sampler: sampler;")
+            p.refs[id] = name
         elseif storage == 12                               # StorageBuffer
             set = decoration(p.m, id, 34)
             binding = decoration(p.m, id, 33)
@@ -101,10 +148,87 @@ function declare_globals!(p::WGSLPrinter)
     return params
 end
 
-"""
-    spirv_to_wgsl(words; heaps = 1, linear = false) -> String
+const WGSL_RESULT_USE = r"\bv([0-9]+)\b"
+const WGSL_RESULT_ASSIGNMENT = r"^ +v([0-9]+) = "
 
-WGSL for a compute module of Lava's WebGPU target, on a device with `heaps` heaps
+"""
+Find the single assignments whose results are read only within the scope of
+the assignment. Follow the emitted body because pointer expressions can
+include operands defined earlier, and structured branches can emit a block
+more than once. The printer indents every lexical scope by four spaces.
+"""
+function lexical_result_bindings(lines, assigned, results)
+    bindings = Dict{UInt32, Tuple{Int, Int}}() # result => (definition line, scope)
+    mutable_results = Set{UInt32}()
+    for id in assigned
+        # Composite inserts write a member after the initial assignment. Phi
+        # nodes and strong CAS may be assigned on more than one control path.
+        results[id].opcode in (82, 230, 245) && push!(mutable_results, id)
+    end
+    scopes = [1]
+    parents = [0]
+    for (number, line) in enumerate(lines)
+        start = findfirst(!=(' '), line)
+        start === nothing && continue
+        level = (start - 1) ÷ 4
+        while length(scopes) > level
+            pop!(scopes)
+        end
+        while length(scopes) < level
+            push!(parents, last(scopes))
+            push!(scopes, length(parents))
+        end
+        scope = last(scopes)
+        definition = match(WGSL_RESULT_ASSIGNMENT, line)
+        reads = definition === nothing ? line : SubString(line, ncodeunits(definition.match) + 1)
+        for operand in eachmatch(WGSL_RESULT_USE, reads)
+            id = parse(UInt32, operand.captures[1])
+            id in assigned && !(id in mutable_results) || continue
+            _, declared_in = get(bindings, id, (0, 0))
+            # Parents always have smaller ids. A use before its assignment
+            # or in a sibling scope requires the function-scope variable.
+            ancestor = scope
+            while ancestor > declared_in
+                ancestor = parents[ancestor]
+            end
+            if iszero(declared_in) || ancestor != declared_in
+                delete!(bindings, id)
+                push!(mutable_results, id)
+            end
+        end
+        definition === nothing && continue
+        id = parse(UInt32, definition.captures[1])
+        id in assigned && !(id in mutable_results) || continue
+        if haskey(bindings, id)
+            delete!(bindings, id)
+            push!(mutable_results, id)
+        else
+            bindings[id] = (number, scope)
+        end
+    end
+    return bindings
+end
+
+function write_wgsl_body(out::IO, lines, bindings, types)
+    definitions = Dict(line => id for (id, (line, _)) in bindings)
+    for (number, line) in enumerate(lines)
+        id = get(definitions, number, UInt32(0))
+        if iszero(id)
+            println(out, line)
+        else
+            start = findfirst(!=(' '), line)
+            name = valname(id)
+            println(out, SubString(line, 1, start - 1), "let ", name, ": ", types[id],
+                    SubString(line, start + ncodeunits(name)))
+        end
+    end
+    return nothing
+end
+
+"""
+    spirv_to_wgsl(words; heaps = 1, linear = false, flip_y = true) -> String
+
+WGSL for a compute, vertex or fragment module of Lava's WebGPU target, on a device with `heaps` heaps
 (at most `WEBGPU_MAX_HEAPS`), bound after the module's array of heaps' binding.
 
 `linear` is for a one-dimensional grid of workgroups dispatched as a 2- or 3-D one,
@@ -113,14 +237,29 @@ kernel's `workgroup_id`, `num_workgroups` and `global_invocation_id` are the 1-D
 ones, recovered from the dispatched grid. A kernel built through
 KernelAbstractions does not need it (Lava's `linear_block_index` reads the grid);
 a KernelInterface one reads its ids straight from the builtins.
+
+Vertex entry points mirror clip Y by default, preserving Lava's Y-down
+convention in a WebGPU viewport. A draw with a flipped viewport disables this.
 """
-function spirv_to_wgsl(words::AbstractVector{UInt32}; heaps::Integer = 1, linear::Bool = false)
+function spirv_to_wgsl(words::AbstractVector{UInt32}; heaps::Integer = 1, linear::Bool = false,
+                       flip_y::Bool = true)
     1 <= heaps <= WEBGPU_MAX_HEAPS || throw(ArgumentError("$heaps heaps; a module binds 1 to $WEBGPU_MAX_HEAPS"))
+    return persisted_wgsl(words, heaps, linear, flip_y) do
+        print_wgsl(words, heaps, linear, flip_y)
+    end
+end
+
+function print_wgsl(words, heaps, linear, flip_y)
     m = SpvModule(words)
     p = WGSLPrinter(m, IOBuffer(), 0, Dict(), Dict(), Dict(), Dict(), false, false, false, false, Set{UInt32}(),
                     Dict{UInt32, UInt32}(), Set{UInt32}(), Int(heaps), UInt32(0),
-                    Dict{UInt32, Tuple{String, String}}(), Set{String}(), String[], Set{UInt32}())
-    operand(m.entry, 1) == 5 || refuse("entry point of execution model $(operand(m.entry, 1)); only compute is printed yet")
+                    Dict{UInt32, Tuple{String, String}}(), Set{String}(), String[], Set{UInt32}(),
+                    String[], UInt32(0))
+    model = executionmodel(p)
+    model in (ExecModel.GLCompute, ExecModel.Vertex, ExecModel.Fragment) ||
+        refuse("entry point of execution model $model")
+    compute = model == ExecModel.GLCompute
+    linear && !compute && throw(ArgumentError("only compute entry points have a dispatch grid"))
     length(m.functions) == 1 || refuse("$(length(m.functions)) functions; a WebGPU module is one inlined function")
     fn = only(m.functions)
     for b in fn.blocks
@@ -130,8 +269,8 @@ function spirv_to_wgsl(words::AbstractVector{UInt32}; heaps::Integer = 1, linear
 
     # Declarations first into their own buffer: they decide which enables are needed.
     declare_structs!(p)
-    params = declare_globals!(p)
-    uniformloads!(p, fn, params, p.out)
+    params = declare_globals!(p; flip_y)
+    compute && uniformloads!(p, fn, params, p.out)
     globals = String(take!(p.out))
 
     # The body, so that `assigned` knows every variable it needs.
@@ -142,6 +281,9 @@ function spirv_to_wgsl(words::AbstractVector{UInt32}; heaps::Integer = 1, linear
     end
     region!(p, fn.blocks[1].label, Construct[])
     body = String(take!(p.out))
+    lines = split(body, '\n'; keepempty=false)
+    bindings = lexical_result_bindings(lines, p.assigned, m.results)
+    result_types = Dict(id => wgsl(p, m.typeof[id]) for id in p.assigned)
 
     ls = m.local_size
     preamble = linear ? lineargrid!(params, Set(values(p.builtins)), ls) : String[]
@@ -152,13 +294,25 @@ function spirv_to_wgsl(words::AbstractVector{UInt32}; heaps::Integer = 1, linear
     # Subgroup operations act on the invocations that reach them, as in SPIR-V,
     # which is what the kernels assume; WGSL would demand uniform control flow.
     p.uses_subgroups && println(out, "diagnostic(off, subgroup_uniformity);")
+    # Lava's SPIR-V inputs can use derivatives in control flow WGSL cannot
+    # prove uniform. Keep the shader's existing implicit-derivative semantics.
+    model == ExecModel.Fragment && println(out, "diagnostic(off, derivative_uniformity);")
     print(out, globals)
     print(out, heapfunctions(p))
     p.uses_i64 && print(out, WGSL_I64_PRELUDE)
     p.uses_nonfinite && print(out, NONFINITE_PRELUDE)
     p.uses_nonfinite && p.uses_f16 && print(out, NONFINITE_F16_PRELUDE)
-    println(out, "@compute @workgroup_size($(ls[1]), $(ls[2]), $(ls[3]))")
-    println(out, "fn main($(join(params, ", "))) {")
+    if !isempty(p.outputs)
+        println(out, "struct LavaOutput {")
+        foreach(l -> println(out, "    ", l), p.outputs)
+        println(out, "}")
+    end
+    stage = compute ? "@compute @workgroup_size($(ls[1]), $(ls[2]), $(ls[3]))" :
+            model == ExecModel.Vertex ? "@vertex" : "@fragment"
+    result = isempty(p.outputs) ? "" : " -> LavaOutput"
+    println(out, stage)
+    println(out, "fn main($(join(params, ", ")))$result {")
+    isempty(p.outputs) || println(out, "    var lava_out: LavaOutput;")
     foreach(l -> println(out, "    ", l), preamble)
     foreach(l -> println(out, "    ", l), p.derived)
     for l in fn.locals
@@ -168,9 +322,10 @@ function spirv_to_wgsl(words::AbstractVector{UInt32}; heaps::Integer = 1, linear
         println(out, "    var l$(id): $(wgsl(p, type))$(init);")
     end
     for id in sort!(collect(p.assigned))
-        println(out, "    var $(valname(id)): $(wgsl(p, m.typeof[id]));")
+        haskey(bindings, id) && continue
+        println(out, "    var $(valname(id)): $(result_types[id]);")
     end
-    print(out, body)
+    write_wgsl_body(out, lines, bindings, result_types)
     println(out, "}")
     return String(take!(out))
 end
@@ -298,6 +453,15 @@ fn i64_rem(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
     return select(r, i64_neg(r), bitcast<i32>(a.y) < 0);
 }
 fn i64_from_i32(x: u32) -> vec2<u32> { return vec2<u32>(x, select(0u, 0xffffffffu, bitcast<i32>(x) < 0)); }
+fn u64_from_f32(x: f32) -> vec2<u32> {
+    let high = floor(x * (1.0f / 4294967296.0f));
+    let low = x - high * 4294967296.0f;
+    return vec2<u32>(u32(low), u32(high));
+}
+fn i64_from_f32(x: f32) -> vec2<u32> {
+    let magnitude = u64_from_f32(abs(x));
+    return select(magnitude, i64_neg(magnitude), x < 0.0f);
+}
 fn i64_to_f32(a: vec2<u32>) -> f32 {
     if (bitcast<i32>(a.y) < 0) { let n = i64_neg(a); return -(f32(n.y) * 4294967296.0 + f32(n.x)); }
     return f32(a.y) * 4294967296.0 + f32(a.x);

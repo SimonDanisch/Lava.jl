@@ -129,7 +129,8 @@ Same skeleton as `emit_spirv_from_llvm` (compute) but:
 5. User-defined I/O variables with Location decorations
 """
 function emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
-                                     stage::Symbol; config=nothing)
+                                     stage::Symbol; config=nothing,
+                                     features::TargetFeatures = TargetFeatures())
     stage_info = get(GFX_STAGE_INFO, stage, nothing)
     stage_info === nothing && error("Unknown graphics shader stage: $stage")
 
@@ -141,10 +142,12 @@ function emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
     type_ctx = SPIRVTypeContext(spirv_mod, ptm)
 
     # Setup module header
-    setup_memory_model!(spirv_mod; physical_storage_buffer=true)
+    setup_memory_model!(spirv_mod; physical_storage_buffer = !features.webgpu)
     require_capability!(spirv_mod, Cap.Shader)
-    require_capability!(spirv_mod, Cap.VariablePointers)
-    require_extension!(spirv_mod, "SPV_KHR_variable_pointers")
+    if !features.webgpu
+        require_capability!(spirv_mod, Cap.VariablePointers)
+        require_extension!(spirv_mod, "SPV_KHR_variable_pointers")
+    end
 
     # Stage-specific capabilities
     if stage == :geometry
@@ -166,6 +169,7 @@ function emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
     # Create emitter state
     state = SPIRVEmitterState(spirv_mod, type_ctx)
     state.data_layout = llvm_mod.datalayout
+    state.features = features
 
     # Graphics I/O state — stored in a module-level ref during emission
     gfx_io = GfxIOState()
@@ -185,6 +189,10 @@ function emit_spirv_from_llvm_gfx(llvm_mod::LLVM.Module, entry_name::String,
 
     # Emit standard globals (push constants, builtins, constants)
     interface_ids = emit_globals!(state, llvm_mod)
+    if features.webgpu
+        argbinding = stage == :fragment ? WEBGPU_FRAGMENT_ARGS_BINDING : 0
+        append!(interface_ids, emit_webgpu_bindings!(state; argbinding))
+    end
 
     # Pre-scan for graphics intrinsic calls to determine needed I/O variables.
     # This must happen before function emission so variables exist when calls are emitted.
@@ -797,7 +805,7 @@ function gfx_ensure_sampler_var!(state::SPIRVEmitterState, gfx_io::GfxIOState, b
     # OpVariable
     var_id = fresh_id!(mod)
     encode_instruction!(mod.global_vars, Op.OpVariable, ptr_ty, var_id, SC.UniformConstant)
-    emit_decorate!(mod, var_id, Dec.DescriptorSet, UInt32(0))
+    emit_decorate!(mod, var_id, Dec.DescriptorSet, UInt32(state.features.webgpu ? 1 : 0))
     emit_decorate!(mod, var_id, Dec.Binding, binding)
     emit_name!(mod, var_id, "sampler_$(binding)")
 

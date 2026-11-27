@@ -202,7 +202,9 @@ end
         y = copysign(Float32(0x1.Ap30), y)
     end
     n = unsafe_trunc(Int32, y)
-    if y == n
+    # n comes from y. When y has a fractional part, n is exactly representable
+    # as Float32, so checking integrality needs no mixed Int32/Float32 comparison.
+    if y == Float32(n)
         # Base answers an integral exponent with `x^n`; small ones multiply, as there
         n == 0 && return 1.0f0
         n == 1 && return x

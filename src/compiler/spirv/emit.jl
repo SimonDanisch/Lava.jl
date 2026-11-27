@@ -1464,6 +1464,48 @@ function scalar_bit_width(ty)
     return nothing
 end
 
+# LLVM can load a tuple's bytes as an integer when it carries the tuple through
+# an iteration phi. A constant table still has a typed array element in SPIR-V.
+function emit_packed_private_load!(state, ptr_id, array_ty::LLVM.ArrayType,
+                                   load_ty::LLVM.IntegerType, result_ty)
+    elem_ty = array_ty.element_type
+    bits = scalar_bit_width(elem_ty)
+    bits in (8, 16, 32) || return nothing
+    width = UInt32(load_ty.width)
+    n = Int(array_ty.length)
+    n >= 2 && width in (16, 32, 64) && n * bits == width || return nothing
+
+    mod = state.mod
+    elem_spirv = map_type!(state.type_ctx, elem_ty)
+    elem_int = emit_type_int!(mod, UInt32(bits), UInt32(0))
+    array_spirv = map_type!(state.type_ctx, array_ty)
+    raw = fresh_id!(mod)
+    encode_instruction!(mod.functions, Op.OpLoad, array_spirv, raw, ptr_id)
+    packed = UInt32(0)
+    for index in 0:n-1
+        lane = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpCompositeExtract, elem_spirv, lane, raw, UInt32(index))
+        if elem_spirv != elem_int
+            int_lane = fresh_id!(mod)
+            encode_instruction!(mod.functions, Op.OpBitcast, elem_int, int_lane, lane)
+            lane = int_lane
+        end
+        wide = fresh_id!(mod)
+        encode_instruction!(mod.functions, Op.OpUConvert, result_ty, wide, lane)
+        if index == 0
+            packed = wide
+        else
+            shift = emit_constant_uint!(mod, width, UInt64(index * bits))
+            high = fresh_id!(mod)
+            encode_instruction!(mod.functions, Op.OpShiftLeftLogical, result_ty, high, wide, shift)
+            combined = fresh_id!(mod)
+            encode_instruction!(mod.functions, Op.OpBitwiseOr, result_ty, combined, packed, high)
+            packed = combined
+        end
+    end
+    return packed
+end
+
 """
     emit_reconciled_scalar_load!(state, ptr_id, slot_ty, want_ty, sc) -> id
 
@@ -1735,6 +1777,16 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
         end
     else
         sc = get_pointer_storage_class(ptr)
+        if sc == SC.Private && !did_drill_for_load && !needs_bitcast && load_ty isa LLVM.IntegerType
+            pointee_ty = get_pointee_type(state.type_ctx.ptm, ptr)
+            if pointee_ty isa LLVM.ArrayType
+                packed = emit_packed_private_load!(state, ptr_id, pointee_ty, load_ty, result_ty)
+                if packed !== nothing
+                    state.value_map[inst] = packed
+                    return
+                end
+            end
+        end
         load_as_int_then_convert_to_ptr = false
         if (sc == SC.Workgroup || sc == SC.Function) && !did_drill_for_load
             # For Workgroup/Function loads: if load type doesn't match pointer's pointee type,

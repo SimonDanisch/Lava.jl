@@ -838,9 +838,9 @@ current world. Every stage shares one compiler configuration, so the job is the
 function and the world: what a cache of compiled stages looks its entries up
 by (`GPUCompiler.cached_results`), and what `lava_compile_gfx_shader` compiles.
 """
-lava_gfx_job(@nospecialize(f), @nospecialize(tt)) =
+lava_gfx_job(@nospecialize(f), @nospecialize(tt); features::TargetFeatures = TargetFeatures()) =
     GPUCompiler.CompilerJob(GPUCompiler.methodinstance(typeof(f), tt),
-                            lava_compiler_config(; workgroup_size = (1, 1, 1)))
+                            lava_compiler_config(; workgroup_size = (1, 1, 1), features))
 
 """
     lava_compile_gfx_shader(f, tt; stage=:vertex, config=nothing, validate=true,
@@ -866,7 +866,7 @@ function lava_compile_gfx_shader(@nospecialize(f), @nospecialize(tt);
                                    job::GPUCompiler.CompilerJob=lava_gfx_job(f, tt))
     GPUCompiler.JuliaContext() do ctx
         mod, meta = lava_llvm(job)
-        return gfx_shader(mod, meta; stage, config, validate)
+        return gfx_shader(mod, meta; stage, config, validate, features = job.config.params.features)
     end
 end
 
@@ -875,24 +875,31 @@ end
 
 Graphics stage `stage` of the module GPUCompiler made of its job (`lava_llvm`). Consumes `mod`.
 """
-function gfx_shader(mod::LLVM.Module, meta; stage::Symbol, config, validate::Bool)
+function gfx_shader(mod::LLVM.Module, meta; stage::Symbol, config, validate::Bool,
+                    features::TargetFeatures = TargetFeatures())
     entry_fn = meta.entry
     entry_name = entry_fn.name
 
-    # BDA entry wrapper (same as compute — args via push constant buffer)
-    push_info = wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
+    features.webgpu && !(stage in (:vertex, :fragment)) &&
+        throw(ArgumentError("WebGPU does not have a `$stage` shader stage"))
+    push_info = features.webgpu ? wrap_entry_for_webgpu!(mod, entry_fn) :
+                                  wrap_entry_for_vulkan!(mod, entry_fn; workgroup_size=(1, 1, 1))
     wrapper_name = push_info.wrapper_name
     wrapper_fn = mod.functions[wrapper_name]
 
     # LLVM passes; GFX emit has no multi-OpFunction walker, so the module
     # collapses into one.
     run_llvm_passes!(mod, wrapper_fn; force_inline_all=true)
+    if features.webgpu
+        index_pointer_phis!(wrapper_fn)
+        gatethrown!(wrapper_fn)
+    end
 
     ir = string(mod)
     write(lava_debug_path("lava_last_gfx_$(stage).ll"), ir)
 
     # Graphics-specific SPIR-V emission
-    spirv_bytes, source_map = emit_spirv_from_llvm_gfx(mod, wrapper_name, stage; config=config)
+    spirv_bytes, source_map = emit_spirv_from_llvm_gfx(mod, wrapper_name, stage; config, features)
 
     write(lava_debug_path("lava_last_gfx_$(stage).spv"), spirv_bytes)
 

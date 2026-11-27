@@ -30,6 +30,17 @@ import UnsafeAtomics
 
 append!(KNOWN_INTRINSICS, ["_lava_wgpu_heapload", "_lava_wgpu_heapstore", "_lava_wgpu_argload"])
 
+@inline heapstorepart(h::UInt32, w::UInt32, keep::UInt32, bits::UInt32) = Base.llvmcall(("""
+    declare void @_lava_wgpu_atomic_storepart(i32, i32, i32, i32)
+    define void @entry(i32 %h, i32 %w, i32 %keep, i32 %bits) #0 {
+        call void @_lava_wgpu_atomic_storepart(i32 %h, i32 %w, i32 %keep, i32 %bits)
+        ret void
+    }
+    attributes #0 = { alwaysinline }
+    """, "entry"), Nothing, NTuple{4,UInt32}, h, w, keep, bits)
+
+push!(KNOWN_INTRINSICS, "_lava_wgpu_atomic_storepart")
+
 # `_lava_wgpu_argload(word)`, word `word` of the kernel's argument block, is
 # called only from the entry wrapper (`wrap_entry_for_webgpu!`), never from Julia.
 
@@ -214,8 +225,7 @@ invocation touches them. Atomics declare the kernel's heaps atomic (see below).
     shift = 8 * at
     mask = (sizeof(T) == 1 ? 0x000000ff : 0x0000ffff) << shift
     bits = (sizeof(T) == 1 ? UInt32(reinterpret(UInt8, v)) : UInt32(reinterpret(UInt16, v))) << shift
-    heapatomic_and(h, w, ~mask)
-    heapatomic_or(h, w, bits)
+    heapstorepart(h, w, ~mask, bits)
     return nothing
 end
 

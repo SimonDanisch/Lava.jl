@@ -1,5 +1,35 @@
 using Test, Lava, LLVM
 
+@testset "private phi reads after an intervening store" begin
+    LLVM.Context() do ctx
+        mod = parse(LLVM.Module, """
+            define i32 @read_choice(i1 %cond, i32 %x) {
+            entry:
+              %a = alloca i32
+              %b = alloca i32
+              store i32 17, ptr %a
+              store i32 29, ptr %b
+              br i1 %cond, label %left, label %right
+            left:
+              br label %join
+            right:
+              br label %join
+            join:
+              %p = phi ptr [ %a, %left ], [ %b, %right ]
+              store i32 %x, ptr %a
+              %value = load i32, ptr %p
+              ret i32 %value
+            }
+            """)
+        Lava.lower_phi_select_function_ptrs!(mod)
+        @test LLVM.verify(mod) === nothing
+        ir = string(mod)
+        @test !occursin("phi ptr", ir)
+        @test occursin("private_selector = phi i32", ir)
+        @test first(findfirst("store i32 %x, ptr %a", ir)) < first(findfirst("load i32, ptr %a", ir))
+    end
+end
+
 const PRIVATE_ARRAY_CHOICE_IR = """
 @__spirv_BuiltInGlobalInvocationId = external addrspace(7) global <3 x i32>
 @lava_shared_out = internal addrspace(3) global [64 x i32] undef, align 4
