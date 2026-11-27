@@ -4188,6 +4188,9 @@ function decompose_typepun_gep_loads!(mod::LLVM.Module, dl::LLVM.DataLayout)
 
                     alloca = trace_to_alloca(ptr)
                     alloca === nothing && continue
+                    # The field offset is relative to the alloca. A constant
+                    # final GEP can still have a dynamically indexed base.
+                    gep_chain_has_dynamic_indices(ptr) && continue
 
                     alloca_ty = LLVM.LLVMType(LLVM.API.LLVMGetAllocatedType(alloca))
 
