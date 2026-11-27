@@ -1657,10 +1657,29 @@ function total_scalar_count(ty::LLVM.LLVMType)
     return ty.length * total_scalar_count(ty.element_type)
 end
 
+# Convert the source type's byte stride to indices in the flattened scalar
+# array. LLVM can spell a typed stride as a byte or a byte-array GEP.
+function workgroup_index_step!(builder, idx, ty, scalar_ty, dl)
+    index_ty = idx.value_type
+    size = Int(LLVM.abi_size(dl, ty))
+    scalar_size = Int(LLVM.abi_size(dl, scalar_ty))
+    stride, rest = divrem(size, scalar_size)
+    if iszero(rest)
+        return stride == 1 ? idx : LLVM.mul!(builder, idx, LLVM.ConstantInt(index_ty, stride))
+    end
+    if idx isa LLVM.ConstantInt
+        step, rest = divrem(convert(Int, idx) * size, scalar_size)
+        iszero(rest) || error("unaligned byte offset in flattened workgroup array")
+        return LLVM.ConstantInt(index_ty, step, true)
+    end
+    bytes = size == 1 ? idx : LLVM.mul!(builder, idx, LLVM.ConstantInt(index_ty, size))
+    return LLVM.exactsdiv!(builder, bytes, LLVM.ConstantInt(index_ty, scalar_size))
+end
+
 """Rewrite one GetElementPtrInst on a workgroup global to use flat indexing.
 
 Uses `LLVMGetGEPSourceElementType` to determine the stride for each index level:
-- First GEP index does pointer arithmetic (stride = total scalars in source type)
+- First GEP index advances by the source type's stride in flattened scalars
 - Each subsequent index descends one array level (stride = total scalars in element type)
 
 If the GEP doesn't fully resolve to scalar level (e.g., only indexes the outer dimension
@@ -1668,6 +1687,7 @@ of `[N x [6 x float]]`), chained GEP users are recursively folded into a single 
 """
 function rewrite_one_wg_gep!(gep::LLVM.GetElementPtrInst, old_gv, new_gv,
                                 flat_arr_ty, inner_count, T_i64)
+    dl = LLVM.datalayout(LLVM.parent(new_gv))
     ops = gep.operands
     length(ops) >= 2 || return  # need at least base + 1 index
 
@@ -1686,14 +1706,7 @@ function rewrite_one_wg_gep!(gep::LLVM.GetElementPtrInst, old_gv, new_gv,
                 idx = LLVM.sext!(builder, idx, T_i64, "wg_flat_idx64")
             end
 
-            # Stride = total scalar elements in cur_ty
-            stride = total_scalar_count(cur_ty)
-
-            if stride != 1
-                scaled = LLVM.mul!(builder, idx, LLVM.ConstantInt(T_i64, stride), "wg_flat_scale")
-            else
-                scaled = idx
-            end
+            scaled = workgroup_index_step!(builder, idx, cur_ty, flat_arr_ty.element_type, dl)
             flat_idx = LLVM.add!(builder, flat_idx, scaled, "wg_flat_acc")
 
             # Descend into the element type for the next index
@@ -1729,6 +1742,7 @@ scalar GEPs on the new flat global.
 """
 function rewrite_partial_wg_gep_users!(gep, new_gv, flat_arr_ty, base_flat_idx,
                                           remaining_ty, T_i64)
+    dl = LLVM.datalayout(LLVM.parent(new_gv))
     zero = LLVM.ConstantInt(T_i64, 0)
 
     # Collect users before mutation
@@ -1753,12 +1767,7 @@ function rewrite_partial_wg_gep_users!(gep, new_gv, flat_arr_ty, base_flat_idx,
                     if idx.value_type != T_i64
                         idx = LLVM.sext!(builder, idx, T_i64, "wg_chain_idx64")
                     end
-                    stride = total_scalar_count(cur_ty)
-                    if stride != 1
-                        scaled = LLVM.mul!(builder, idx, LLVM.ConstantInt(T_i64, stride), "wg_chain_scale")
-                    else
-                        scaled = idx
-                    end
+                    scaled = workgroup_index_step!(builder, idx, cur_ty, flat_arr_ty.element_type, dl)
                     flat_idx = LLVM.add!(builder, flat_idx, scaled, "wg_chain_acc")
                     if cur_ty isa LLVM.ArrayType
                         cur_ty = cur_ty.element_type
@@ -1814,6 +1823,7 @@ E.g., `gep [2 x i32], ptr %flat_scalar, i64 64` should become `flat_idx + 64 * 2
 Rewrites such users to proper flat index arithmetic.
 """
 function fixup_chained_flat_gep_users!(base_gep, new_gv, flat_arr_ty, base_flat_idx, T_i64)
+    dl = LLVM.datalayout(LLVM.parent(new_gv))
     zero = LLVM.ConstantInt(T_i64, 0)
 
     for use in collect(base_gep.uses)
@@ -1836,12 +1846,7 @@ function fixup_chained_flat_gep_users!(base_gep, new_gv, flat_arr_ty, base_flat_
                 if idx.value_type != T_i64
                     idx = LLVM.sext!(builder, idx, T_i64, "wg_flat_fix_idx64")
                 end
-                stride = total_scalar_count(cur_ty)
-                if stride != 1
-                    scaled = LLVM.mul!(builder, idx, LLVM.ConstantInt(T_i64, stride), "wg_flat_fix_scale")
-                else
-                    scaled = idx
-                end
+                scaled = workgroup_index_step!(builder, idx, cur_ty, flat_arr_ty.element_type, dl)
                 flat_idx = LLVM.add!(builder, flat_idx, scaled, "wg_flat_fix_acc")
                 if cur_ty isa LLVM.ArrayType
                     cur_ty = cur_ty.element_type

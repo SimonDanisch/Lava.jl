@@ -451,11 +451,11 @@ function unify_function_exit_nodes!(mod::LLVM.Module)
 
     LLVM.IRBuilder() do builder
         for f in LLVM.functions(mod)
-            returns = LLVM.ReturnInst[]
+            returns = LLVM.RetInst[]
             unreachables = LLVM.UnreachableInst[]
             for bb in LLVM.blocks(f)
                 term = LLVM.terminator(bb)
-                term isa LLVM.ReturnInst && push!(returns, term)
+                term isa LLVM.RetInst && push!(returns, term)
                 term isa LLVM.UnreachableInst && push!(unreachables, term)
             end
 
