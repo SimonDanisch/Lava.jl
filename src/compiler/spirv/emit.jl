@@ -3517,6 +3517,25 @@ function function_ptr_offset_error(inst::LLVM.Instruction, what::AbstractString)
           "Logical pointers have no arithmetic; the step must fold into an array index.")
 end
 
+# LLVM can index a typed workgroup element through a same-size byte array.
+# Keep the actual element type and translate a constant byte index to its member.
+function workgroup_gep_source(state, source_ty::LLVM.ArrayType, ops)
+    source_ty.element_type == LLVM.Int8Type() || return source_ty, ops
+    origin = get(state.array_element_origin, ops[1], nothing)
+    origin === nothing && return source_ty, ops
+    element = origin[4].element_type
+    dl = state.data_layout
+    LLVM.abi_size(dl, element) == source_ty.length || return source_ty, ops
+    length(ops) == 2 && return element, ops
+    length(ops) == 3 || return source_ty, ops
+    ops[3] isa LLVM.ConstantInt || return source_ty, ops
+    offset = convert(Int, ops[3])
+    0 <= offset < source_ty.length || return source_ty, ops
+    indices, leaf = member_path_at_offset(element, offset, dl)
+    (indices === nothing || leaf isa LLVM.PointerType) && return source_ty, ops
+    return element, LLVM.Value[ops[1], ops[2], (LLVM.ConstantInt(LLVM.Int32Type(), i) for i in indices)...]
+end
+
 function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
     ops = inst.operands
     base_ptr = ops[1]
@@ -3559,15 +3578,17 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
         end
     end
 
-    # Determine the result pointee type
-    result_pointee = compute_gep_result_type(source_ty, inst)
+    # GEP results inherit the base pointer's storage class.
+    sc = get_pointer_storage_class(base_ptr)
+    if sc == SC.Workgroup && source_ty isa LLVM.ArrayType
+        source_ty, ops = workgroup_gep_source(state, source_ty, ops)
+        n_indices = length(ops) - 1
+    end
+    result_pointee = compute_gep_result_type_from_ops(source_ty, ops)
     if result_pointee === nothing
         error("Could not compute GEP result type for: $inst")
     end
 
-    # Get pointer storage class — use map_pointer_type_for_value! logic
-    # GEP results inherit the base pointer's storage class
-    sc = get_pointer_storage_class(base_ptr)
     # Map the result pointee type. When it's a pointer (GEP into struct accessing a ptr member),
     # we need the typed pointer from the struct member map or PTM, not raw map_type!.
     # For Workgroup storage class, use fresh (undecorated) type IDs to avoid layout
@@ -4270,6 +4291,45 @@ function is_padding_gep(gep::LLVM.GetElementPtrInst, dl::Union{Nothing, LLVM.Dat
     return index_path === nothing
 end
 
+# Split a workgroup address into a typed element index and a fixed field.
+# LLVM may spell addition as OR when it can prove the operands are disjoint.
+function emit_workgroup_member_gep!(state, inst, base_id, offset, element, stride)
+    (offset isa LLVM.AddInst || disjointor(offset)) || return false
+    a, b = offset.operands
+    a isa LLVM.ConstantInt && ((a, b) = (b, a))
+    b isa LLVM.ConstantInt && divisible(a, stride) || return false
+    step, remainder = fldmod(convert(Int, b), stride)
+    iszero(remainder) && return false
+    path, leaf = member_path_at_offset(element, remainder, state.data_layout)
+    (path === nothing || leaf isa LLVM.PointerType) && return false
+
+    index_type = a.value_type
+    spirv_index_type = map_type!(state.type_ctx, index_type)
+    index = fresh_id!(state.mod)
+    stride_id = emit_int_constant!(state, index_type, Int64(stride))
+    encode_instruction!(state.mod.functions, Op.OpSDiv, spirv_index_type,
+                        index, get_value_id!(state, a), stride_id)
+    if !iszero(step)
+        result = fresh_id!(state.mod)
+        step_id = emit_int_constant!(state, index_type, Int64(step))
+        encode_instruction!(state.mod.functions, Op.OpIAdd, spirv_index_type, result, index, step_id)
+        index = result
+    end
+    if index_type.width > 32
+        result = fresh_id!(state.mod)
+        u32_type = map_type!(state.type_ctx, LLVM.Int32Type())
+        encode_instruction!(state.mod.functions, Op.OpUConvert, u32_type, result, index)
+        index = result
+    end
+    pointer_type = map_pointer_type!(state.type_ctx, map_workgroup_type!(state.type_ctx, leaf), SC.Workgroup)
+    result = fresh_id!(state.mod)
+    fields = map(i -> emit_constant_u32!(state.mod, UInt32(i)), path)
+    encode_instruction!(state.mod.functions, Op.OpAccessChain, pointer_type, result, base_id, index, fields...)
+    state.value_map[inst] = result
+    set_pointee_type!(state.type_ctx.ptm, inst, leaf; priority=5)
+    return true
+end
+
 """
 Converts `getelementptr i8, ptr %base, i64 %byte_offset` to an OpPtrAccessChain
 using the base pointer's actual element type: idx = byte_offset / sizeof(element).
@@ -4474,6 +4534,10 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                     end
                 end
             end
+        end
+
+        if sc == SC.Workgroup && elem_size > 0 && elem_ty isa Union{LLVM.ArrayType,LLVM.StructType}
+            emit_workgroup_member_gep!(state, inst, base_id, byte_offset_val, elem_ty, elem_size) && return
         end
 
         # A dynamic offset that is not provably a whole number of elements, `(i << 4) | 8`
