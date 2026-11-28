@@ -3510,11 +3510,47 @@ pointers have no arithmetic: a step off one is only representable as an index of
 the array it points into. Emitting the base pointer instead (what this replaced)
 silently read and wrote the wrong element.
 """
-function function_ptr_offset_error(inst::LLVM.Instruction, what::AbstractString)
-    loc = extract_source_location(inst)
+function function_ptr_offset_error(inst::LLVM.Value, what::AbstractString)
+    loc = inst isa LLVM.Instruction ? extract_source_location(inst) : nothing
     where_ = loc === nothing ? "" : " at $(loc[1]):$(loc[2])"
     error("Cannot lower $what in Function storage$where_: $inst. " *
           "Logical pointers have no arithmetic; the step must fold into an array index.")
+end
+
+# Fold a single-index GEP on a logical array element, including constant GEPs.
+function emit_array_element_offset!(state, value, origin, source_ty, index, sc, source_ptr_ty)
+    arr_base_id, static_path, prev_idx_id, arr_type = origin
+    elem_ty = arr_type.element_type
+    elem_size = compute_type_size(elem_ty, state.data_layout)
+    step_size = compute_type_size(source_ty, state.data_layout)
+    whole = elem_size > 0 && step_size % elem_size == 0
+    whole || is_zero_index(index) ||
+        function_ptr_offset_error(value, "a step of $step_size bytes on an element of $arr_type")
+
+    index_id = ensure_index_i32!(state, index)
+    u32_ty = map_type!(state.type_ctx, LLVM.Int32Type())
+    if whole && step_size != elem_size
+        scaled = fresh_id!(state.mod)
+        scale = emit_constant_u32!(state.mod, UInt32(step_size ÷ elem_size))
+        encode_instruction!(state.mod.functions, Op.OpIMul, u32_ty, scaled, index_id, scale)
+        index_id = scaled
+    end
+    combined = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, combined, prev_idx_id, index_id)
+
+    ptr_ty = if elem_ty == source_ty
+        source_ptr_ty
+    else
+        pointee = sc == SC.Workgroup ? map_workgroup_type!(state.type_ctx, elem_ty) :
+                                     map_type!(state.type_ctx, elem_ty)
+        map_pointer_type!(state.type_ctx, pointee, sc)
+    end
+    result = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpAccessChain, ptr_ty, result, arr_base_id,
+                        static_path..., combined)
+    set_pointee_type!(state.type_ctx.ptm, value, elem_ty; priority=5)
+    state.array_element_origin[value] = (arr_base_id, static_path, combined, arr_type)
+    return result
 end
 
 # LLVM can index a typed logical-storage element through a same-size byte array.
@@ -3675,45 +3711,8 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
         # combining the indices on the outer array.
         if haskey(state.array_element_origin, base_ptr) &&
            (sc == SC.Function || sc == SC.Private || sc == SC.Workgroup)
-            arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
-            # The step is `sizeof(source_ty)` bytes, the array's is its element's:
-            # fold a whole number of elements, refuse anything else (a step into
-            # the middle of an element has no access chain).
-            arr_elem_ty = arr_type.element_type
-            elem_size = compute_type_size(arr_elem_ty, state.data_layout)
-            step_size = compute_type_size(source_ty, state.data_layout)
-            whole = elem_size > 0 && step_size % elem_size == 0
-            whole || is_zero_index(ops[2]) ||
-                function_ptr_offset_error(inst, "a step of $step_size bytes on an element of $arr_type")
-            new_idx_i32 = ensure_index_i32!(state, ops[2])
-            u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
-            if whole && step_size != elem_size
-                scaled = fresh_id!(state.mod)
-                encode_instruction!(state.mod.functions, Op.OpIMul, u32_ty, scaled, new_idx_i32,
-                                    emit_constant_u32!(state.mod, UInt32(step_size ÷ elem_size)))
-                new_idx_i32 = scaled
-            end
-            combined_idx = fresh_id!(state.mod)
-            encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, combined_idx, prev_idx_id, new_idx_i32)
-            # The chain ends at an element of the array, whatever `source_ty` says.
-            elem_ptr_ty = if arr_elem_ty == source_ty
-                result_ptr_ty
-            else
-                elem_spirv = sc == SC.Workgroup ? map_workgroup_type!(state.type_ctx, arr_elem_ty) :
-                    map_type!(state.type_ctx, arr_elem_ty)
-                map_pointer_type!(state.type_ctx, elem_spirv, sc)
-            end
-            result_id = fresh_id!(state.mod)
-            all_indices = vcat(static_path, [combined_idx])
-            word_count = UInt32(4 + length(all_indices))
-            push!(state.mod.functions, (word_count << 16) | UInt32(Op.OpAccessChain))
-            push!(state.mod.functions, elem_ptr_ty)
-            push!(state.mod.functions, result_id)
-            push!(state.mod.functions, arr_base_id)
-            append!(state.mod.functions, all_indices)
-            state.value_map[inst] = result_id
-            set_pointee_type!(state.type_ctx.ptm, inst, arr_elem_ty; priority=5)
-            state.array_element_origin[inst] = (arr_base_id, static_path, combined_idx, arr_type)
+            origin = state.array_element_origin[base_ptr]
+            state.value_map[inst] = emit_array_element_offset!(state, inst, origin, source_ty, ops[2], sc, result_ptr_ty)
             if result_pointee isa LLVM.PointerType
                 state.spirv_ptr_element_type[inst] = result_pointee_spirv
             end
@@ -8957,6 +8956,12 @@ function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
         # offset and use OpAccessChain[0] + OpPtrAccessChain.
         n_indices = length(ops) - 1
         first_idx = ops[2] isa LLVM.ConstantInt ? convert(Int64, ops[2]) : 0
+
+        if n_indices == 1 && first_idx != 0 && sc in (SC.Workgroup, SC.Private, SC.Function) &&
+           haskey(state.array_element_origin, base)
+            origin = state.array_element_origin[base]
+            return emit_array_element_offset!(state, val, origin, source_ty, ops[2], sc, result_ptr_ty)
+        end
 
         if first_idx != 0 && source_ty isa LLVM.ArrayType && length(ops) >= 3
             # Non-zero first index on array type: compute flat element offset.

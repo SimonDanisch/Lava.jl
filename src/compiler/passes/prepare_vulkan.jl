@@ -512,17 +512,25 @@ function split_vector_workgroup_accesses!(mod::LLVM.Module, dl::LLVM.DataLayout)
         # GEPs first, so every access below addresses a scalar GEP.
         for bb in f.blocks, inst in bb.instructions
             inst isa LLVM.GetElementPtrInst || continue
-            vec = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inst))
-            vec isa LLVM.VectorType || continue
+            inst.value_type.addrspace == 3 || continue
             ops = inst.operands
             length(ops) == 2 || continue
+            source_ty = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(inst))
+            # LLVM may encode the vector stride as a byte array.
+            vec = if source_ty isa LLVM.ArrayType && source_ty.element_type == LLVM.Int8Type()
+                infer_type_from_gep_users(inst)
+            else
+                source_ty
+            end
+            vec isa LLVM.VectorType || continue
             base, idx = ops[1], ops[2]
             s = wg_split_scalar(base, vec, dl)
             s === nothing && continue
-            n = Int(LLVM.abi_size(dl, vec) ÷ LLVM.abi_size(dl, s))
+            n, remainder = divrem(LLVM.abi_size(dl, source_ty), LLVM.abi_size(dl, s))
+            iszero(remainder) || continue
             LLVM.@dispose builder=LLVM.IRBuilder() begin
                 LLVM.position!(builder, insertion_point(inst))
-                scaled = LLVM.mul!(builder, idx, LLVM.ConstantInt(idx.value_type, n), "wg_vec_idx")
+                scaled = LLVM.mul!(builder, idx, LLVM.ConstantInt(idx.value_type, Int(n)), "wg_vec_idx")
                 LLVM.replace_uses!(inst, LLVM.inbounds_gep!(builder, s, base, [scaled], "wg_vec_gep"))
             end
             push!(to_erase, inst)
