@@ -6077,13 +6077,18 @@ function emit_trunc!(state::SPIRVEmitterState, inst::LLVM.TruncInst)
     # type-punned bitcast users), but OpUConvert requires an integer result type.
     src_ty = inst.operands[1].value_type
     dst_ty = inst.value_type
-    if dst_ty isa LLVM.IntegerType && dst_ty.width == 1
-        # trunc to i1: compare != 0
+    if oddwidth(dst_ty) == 1
+        # Truncation keeps the low bit, including when a nonzero even input
+        # truncates to false. SPIR-V represents i1 as bool.
         src_id = get_value_id!(state, inst.operands[1])
-        zero_id = get_zero_constant!(state, src_ty)
+        src_spirv_ty = map_type!(state.type_ctx, src_ty)
+        one_id = map_constant!(state.type_ctx, intconst(src_ty, UInt64(1)))
+        zero_id = map_constant!(state.type_ctx, intconst(src_ty, UInt64(0)))
+        bit_id = fresh_id!(state.mod)
+        encode_instruction!(state.mod.functions, Op.OpBitwiseAnd, src_spirv_ty, bit_id, src_id, one_id)
         result_ty = map_type!(state.type_ctx, dst_ty)
         result_id = fresh_id!(state.mod)
-        encode_instruction!(state.mod.functions, Op.OpINotEqual, result_ty, result_id, src_id, zero_id)
+        encode_instruction!(state.mod.functions, Op.OpINotEqual, result_ty, result_id, bit_id, zero_id)
         state.value_map[inst] = result_id
     elseif dst_ty isa LLVM.IntegerType
         # Integer truncation: emit OpUConvert with integer result type + OpBitcast if
@@ -6269,16 +6274,6 @@ function infer_inner_ptr_pointee(inttoptr_inst::LLVM.Value)
         end
     end
     return nothing
-end
-
-function get_zero_constant!(state::SPIRVEmitterState, ty::LLVM.IntegerType)
-    # The zero has to carry the same SPIR-V type as the value it is compared
-    # against. `spirv_int_width` keeps 8- and 16-bit integers at their own width
-    # instead of promoting them to 32, so `i8` maps to `%uchar` — and handing a
-    # `%uint 0` to an `OpINotEqual` whose other operand is an `OpLoad %uchar` is
-    # rejected by spirv-val with "Expected both operands to have the same
-    # component bit width". Map the type and match it, at every width.
-    return emit_constant_uint!(state.mod, spirv_int_width(ty.width), UInt64(0))
 end
 
 # ================================================================
