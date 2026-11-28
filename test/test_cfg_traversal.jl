@@ -70,7 +70,7 @@ const CFG_TRAV_TEST_FIXTURES = (
     ("void", "ret void", "ret void"),
     ("i32", "ret i32 1", "ret i32 2"),
     ("void", "unreachable", "unreachable"),
-    ("void", "ret void", "unreachable")
+    ("void", "ret void", "unreachable"),
     ("{ i32, i32 }",
      "ret { i32, i32 } { i32 1, i32 2 }",
      "ret { i32, i32 } { i32 3, i32 4 }"),
