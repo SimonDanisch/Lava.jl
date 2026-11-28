@@ -441,6 +441,17 @@ function header_loop_control(term::LLVM.Instruction)
             for w in (md[LOOP_CONTROL_MD]::LLVM.MDNode).operands]
 end
 
+# LLVM 23 removed UnifyFunctionExitNodes. Keep the single-return and
+# single-unreachable exit blocks expected by the structured CFG passes.
+function unify_function_exit_nodes!(mod::LLVM.Module)
+    if LLVM.version() < v"23"
+        LLVM.run!(LLVM.UnifyFunctionExitNodesPass(), mod)
+        return nothing
+    end
+
+    return merge_function_exits!(mod)
+end
+
 """
     run_structurize_cfg_pipeline!(mod::LLVM.Module)
 
@@ -452,7 +463,7 @@ pre-StructurizeCFG fixup pass inserted:
 1. SimplifyCFG - merges nested conditionals sharing exit blocks
 2. fixup_structured_cfg! - trampoline insertion for shared merge targets
 3. LowerSwitch - converts switch to if-else chains (SPIR-V OpSwitch has limitations)
-4. UnifyFunctionExitNodes - merges returns and unreachable exits separately (local replacement for LLVM's removed pass)
+4. UnifyFunctionExitNodes - merges returns and unreachable exits separately
 5. FixIrreducible - converts irreducible loops to reducible ones
 6. LoopSimplify - creates dedicated exit blocks for nested loops, preventing
    StructurizeCFG from producing constant `br i1 true` on inner loop back-edges
@@ -486,9 +497,9 @@ function skip_pass(name::AbstractString)
 end
 
 """Merge each function's returns and unreachable exits as LLVM's removed `mergereturn` did."""
-function unify_function_exit_nodes!(mod::LLVM.Module)
+function merge_function_exits!(mod::LLVM.Module)
 
-    for f in mod.functions, T in (LLVM.RetInst, LLVM.UnreachableInst)
+    for f in mod.functions, T in (LLVM.UnreachableInst, LLVM.RetInst)
 
         # skip function if we only have one exit point
         terms = [bb.terminator for bb in f.blocks if bb.terminator isa T]

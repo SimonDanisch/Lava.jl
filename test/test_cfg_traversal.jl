@@ -100,7 +100,8 @@ cfg_trav_test_ir(ty, a, b) =
 @testset "Function exit unification" begin
 
     LLVM.Context() do context
-        for (ty, a, b) in CFG_TRAV_TEST_FIXTURES
+        for unify! in (Lava.merge_function_exits!, Lava.unify_function_exit_nodes!),
+            (ty, a, b) in CFG_TRAV_TEST_FIXTURES
 
             ir = cfg_trav_test_ir(ty, a, b)
 
@@ -109,7 +110,7 @@ cfg_trav_test_ir(ty, a, b) =
                 values = [string(v) for bb in mod.functions["fixture"].blocks
                           for v in bb.terminator.operands if bb.terminator isa LLVM.RetInst]
 
-                Lava.unify_function_exit_nodes!(mod)
+                unify!(mod)
                 @test LLVM.verify(mod) === nothing
 
                 terms = [bb.terminator for bb in mod.functions["fixture"].blocks]
@@ -124,7 +125,7 @@ cfg_trav_test_ir(ty, a, b) =
                 end
 
                 unified = string(mod)
-                Lava.unify_function_exit_nodes!(mod)
+                unify!(mod)
                 @test string(mod) == unified
             end
         end

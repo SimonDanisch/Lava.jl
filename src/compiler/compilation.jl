@@ -1404,11 +1404,15 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     propagate_psb_alignment!(mod, dl)
     checkpoint("workgroup_align+propagate_psb_alignment!")
 
+    # Late LLVM optimizations may combine typed shared-memory copies again.
+    decompose_workgroup_typepun_copies!(mod, dl)
+
     # ── Every float-to-half narrowing, in integers ──
     # NVIDIA drops the rounding of a narrowed value used in registers and RADV
     # fuses a multiply into the conversion, whatever the SPIR-V says (see the
     # pass). Last, so no InstCombine runs after it; it adds no blocks.
     narrow_in_integers!(mod)
+    lower_fpclasses!(mod)
     # A divisor that became a constant after the first `lower_wide_divisions!`
     # (inlining, InstCombine, unrolling): straight-line, so safe after the CFG is
     # structurized.
@@ -1418,6 +1422,7 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     # ── No integer of a width SPIR-V has no type for ──
     # SimplifyCFG's switch bitmaps are as wide as their tables, whatever the
     # datalayout's native widths (see the pass). Last: nothing after it narrows.
+    lower_wide_products!(mod)
     widen_odd_integers!(mod)
     checkpoint("widen_odd_integers!")
 
@@ -2672,7 +2677,11 @@ function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
     # validations of a valid kernel failed with a second process rewriting the
     # path. The other direction is silent: an invalid kernel validated as the
     # valid one next door.
-    val_path = tempname() * ".spv"
+    spv_path = lava_debug_path("lava_last.spv")
+    # Keep the validated file on the dump's filesystem so publishing it needs
+    # only a rename. Force-moving across filesystems can remove the shared
+    # destination while another compiler thread is publishing its shader.
+    val_path = tempname(dirname(spv_path)) * ".spv"
     write(val_path, spirv_bytes)
     record_subprocess!("write spirv for spirv-val", 0.0, length(spirv_bytes))
 
@@ -2684,16 +2693,15 @@ function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
                           stderr=val_err_file, stdout=devnull); label="spirv-val")
     # Kept afterwards as the "last compiled kernel" dump the other compile paths
     # write too — moved there, never read back from there.
-    spv_path = lava_debug_path("lava_last.spv")
     if !process_exited(p)
         rm(val_err_file; force=true)
-        mv(val_path, spv_path; force = true)
+        Base.Filesystem.rename(val_path, spv_path)
         return nothing
     end
     val_errors = isfile(val_err_file) ? read(val_err_file, String) : ""
     rm(val_err_file; force=true)
     if p.exitcode == 0
-        mv(val_path, spv_path; force = true)
+        Base.Filesystem.rename(val_path, spv_path)
         return nothing
     end
 
@@ -2716,7 +2724,7 @@ function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
     end
     # The binary that FAILED, where the message says to look. Another process
     # may overwrite it later; the message is built from this call's own copy.
-    mv(val_path, spv_path; force = true)
+    Base.Filesystem.rename(val_path, spv_path)
     dis_path = lava_debug_path("lava_last.dis")
     ll_path = lava_debug_path("lava_last.ll")
     isempty(dis) || write(dis_path, dis)
@@ -2932,6 +2940,61 @@ function lower_unsupported_intrinsics!(mod::LLVM.Module)
     end
 end
 
+# LLVM's fpclass test inspects the representation, including signed zero,
+# subnormals under FTZ, and the quiet bit of a NaN. Integer tests preserve all
+# three. In unsigned IEEE bit order each class occupies a contiguous interval.
+function lower_fpclasses!(mod::LLVM.Module)
+    calls = LLVM.CallInst[use.user for fn in mod.functions if startswith(fn.name, "llvm.is.fpclass.")
+                          for use in fn.uses if use.user isa LLVM.CallInst]
+    for inst in calls
+
+        value, mask = inst.operands[1], convert(Int, inst.operands[2])
+        ty = value.value_type
+        scalar = ty isa LLVM.VectorType ? LLVM.element_type(ty) : ty
+        float_type = scalar isa LLVM.HalfType ? Float16 :
+                     scalar isa LLVM.FloatType ? Float32 :
+                     scalar isa LLVM.DoubleType ? Float64 : nothing
+        float_type === nothing && error("Unsupported llvm.is.fpclass operand type: $ty")
+        uint_type = Base.uinttype(float_type)
+        width = 8 * sizeof(float_type)
+        sign = UInt64(1) << (width - 1)
+        normal = UInt64(reinterpret(uint_type, floatmin(float_type)))
+        inf = UInt64(reinterpret(uint_type, float_type(Inf)))
+        quiet = inf + (normal >> 1)
+        limits = (UInt64(0), UInt64(1), normal, inf, inf + 1, quiet, sign)
+        positive = (6, 7, 8, 9, 0, 1)
+        negative = (5, 4, 3, 2, 0, 1)
+        intervals = Tuple{UInt64,UInt64}[]
+        for (offset, classes) in ((UInt64(0), positive), (sign, negative))
+            for (i, class) in enumerate(classes)
+                iszero(mask & (1 << class)) && continue
+                lo, hi = offset + limits[i], offset + (limits[i + 1] - 1)
+                if !isempty(intervals) && last(intervals)[2] + 1 == lo
+                    intervals[end] = (last(intervals)[1], hi)
+                else
+                    push!(intervals, (lo, hi))
+                end
+            end
+        end
+
+        int_scalar = LLVM.IntType(width)
+        int_ty = ty isa LLVM.VectorType ? LLVM.VectorType(int_scalar, lanes(ty)) : int_scalar
+        LLVM.@dispose builder=LLVM.IRBuilder() begin
+            LLVM.position!(builder, LLVM.before(inst))
+            bits = LLVM.bitcast!(builder, value, int_ty)
+            result = intconst(inst.value_type, UInt64(0))
+            for (lo, hi) in intervals
+                shifted = iszero(lo) ? bits : LLVM.sub!(builder, bits, intconst(int_ty, lo))
+                matches = LLVM.icmp!(builder, LLVM.API.LLVMIntULE, shifted, intconst(int_ty, hi - lo))
+                result = LLVM.or!(builder, result, matches)
+            end
+            LLVM.replace_uses!(inst, result)
+        end
+        LLVM.erase!(inst)
+    end
+    return nothing
+end
+
 """
 Lower a single memcpy call to a typed load + store.
 If the destination is an alloca AND the copy covers the whole of it, use the
@@ -2993,7 +3056,8 @@ function lower_memcpy!(inst::LLVM.CallInst, dl::LLVM.DataLayout; overlapping::Bo
        (dst.value_type.addrspace == 3 || src.value_type.addrspace == 3)
         nbytes = convert(Int, len_val)
         for p in (dst, src)
-            copy_type = leading_type(addressed_type(p), nbytes, dl)
+            pointee = p.value_type.addrspace == 3 ? workgroup_copy_pointee(p, dl) : addressed_type(p)
+            copy_type = leading_type(pointee, nbytes, dl)
             copy_type === nothing || break
         end
     end

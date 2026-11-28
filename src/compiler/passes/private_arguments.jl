@@ -27,7 +27,9 @@ function private_numeric_helper(fn::LLVM.Function, visiting = Set{LLVM.Function}
     for (i, param) in enumerate(fn.parameters)
         param.value_type isa LLVM.PointerType || continue
         attrs = collect(fn.parameter_attributes[i])
-        LLVM.EnumAttribute("nocapture") in attrs || return false
+        # LLVM 21 spells this captures(none), encoded as zero.
+        nocapture = LLVM.EnumAttribute(LLVM.version() >= v"21" ? :captures : :nocapture)
+        nocapture in attrs || return false
         readonly = LLVM.EnumAttribute("readonly") in attrs
         output = any(a -> a isa LLVM.TypeAttribute && a.kind === :sret, attrs) &&
             LLVM.EnumAttribute("noalias") in attrs
