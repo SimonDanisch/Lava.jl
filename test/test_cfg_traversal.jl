@@ -65,3 +65,70 @@ end
         end
     end
 end
+
+const CFG_TRAV_TEST_FIXTURES = (
+    ("void", "ret void", "ret void"),
+    ("i32", "ret i32 1", "ret i32 2"),
+    ("void", "unreachable", "unreachable"),
+    ("void", "ret void", "unreachable"),
+    ("{ i32, i32 }",
+     "ret { i32, i32 } { i32 1, i32 2 }",
+     "ret { i32, i32 } { i32 3, i32 4 }"),
+)
+
+cfg_trav_test_ir(ty, a, b) =
+    """
+    declare void @external()
+
+    define $ty @fixture(i1 %c) {
+        entry:
+            br i1 %c, label %a, label %b
+        a:
+            $a
+        b:
+            $b
+    }
+
+    define void @forever() {
+        entry:
+            br label %loop
+        loop:
+            br label %loop
+    }
+    """
+
+@testset "Function exit unification" begin
+
+    LLVM.Context() do context
+        for unify! in (Lava.merge_function_exits!, Lava.unify_function_exit_nodes!),
+            (ty, a, b) in CFG_TRAV_TEST_FIXTURES
+
+            ir = cfg_trav_test_ir(ty, a, b)
+
+            LLVM.@dispose mod=parse(LLVM.Module, ir) begin
+
+                values = [string(v) for bb in mod.functions["fixture"].blocks
+                          for v in bb.terminator.operands if bb.terminator isa LLVM.RetInst]
+
+                unify!(mod)
+                @test LLVM.verify(mod) === nothing
+
+                terms = [bb.terminator for bb in mod.functions["fixture"].blocks]
+                @test count(t -> t isa LLVM.RetInst, terms) == (a == "unreachable" ? 0 : 1)
+                @test count(t -> t isa LLVM.UnreachableInst, terms) == (b == "unreachable" ? 1 : 0)
+
+                if ty != "void"
+                    phi = first(last(mod.functions["fixture"].blocks).instructions)
+                    @test phi isa LLVM.PHIInst
+                    @test [bb.name for (_, bb) in phi.incoming] == ["a", "b"]
+                    @test [string(v) for (v, _) in phi.incoming] == values
+                end
+
+                unified = string(mod)
+                unify!(mod)
+                @test string(mod) == unified
+            end
+        end
+    end
+end
+

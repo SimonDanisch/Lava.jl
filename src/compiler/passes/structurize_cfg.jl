@@ -449,49 +449,7 @@ function unify_function_exit_nodes!(mod::LLVM.Module)
         return nothing
     end
 
-    LLVM.IRBuilder() do builder
-        for f in LLVM.functions(mod)
-            returns = LLVM.RetInst[]
-            unreachables = LLVM.UnreachableInst[]
-            for bb in LLVM.blocks(f)
-                term = LLVM.terminator(bb)
-                term isa LLVM.RetInst && push!(returns, term)
-                term isa LLVM.UnreachableInst && push!(unreachables, term)
-            end
-
-            if length(unreachables) > 1
-                exit = LLVM.BasicBlock(f, "UnifiedUnreachableBlock")
-                LLVM.position!(builder, LLVM.insertion_point(exit))
-                LLVM.unreachable!(builder)
-                for term in unreachables
-                    LLVM.position!(builder, LLVM.insertion_point(term))
-                    LLVM.br!(builder, exit)
-                    LLVM.erase!(term)
-                end
-            end
-
-            if length(returns) > 1
-                exit = LLVM.BasicBlock(f, "UnifiedReturnBlock")
-                LLVM.position!(builder, LLVM.insertion_point(exit))
-                ops = first(returns).operands
-                if isempty(ops)
-                    LLVM.ret!(builder)
-                else
-                    phi = LLVM.phi!(builder, ops[1].value_type)
-                    for ret in returns
-                        push!(phi.incoming, (ret.operands[1], ret.parent))
-                    end
-                    LLVM.ret!(builder, phi)
-                end
-                for ret in returns
-                    LLVM.position!(builder, LLVM.insertion_point(ret))
-                    LLVM.br!(builder, exit)
-                    LLVM.erase!(ret)
-                end
-            end
-        end
-    end
-    return nothing
+    return merge_function_exits!(mod)
 end
 
 """
@@ -505,7 +463,7 @@ pre-StructurizeCFG fixup pass inserted:
 1. SimplifyCFG - merges nested conditionals sharing exit blocks
 2. fixup_structured_cfg! - trampoline insertion for shared merge targets
 3. LowerSwitch - converts switch to if-else chains (SPIR-V OpSwitch has limitations)
-4. UnifyFunctionExitNodes - ensures single return point (required by StructurizeCFG)
+4. UnifyFunctionExitNodes - merges returns and unreachable exits separately
 5. FixIrreducible - converts irreducible loops to reducible ones
 6. LoopSimplify - creates dedicated exit blocks for nested loops, preventing
    StructurizeCFG from producing constant `br i1 true` on inner loop back-edges
@@ -536,6 +494,55 @@ function skip_pass(name::AbstractString)
     skips = get(ENV, "LAVA_SKIP_PASSES", "")
     isempty(skips) && return false
     name in split(skips, ',')
+end
+
+"""Merge each function's returns and unreachable exits as LLVM's removed `mergereturn` did."""
+function merge_function_exits!(mod::LLVM.Module)
+
+    for f in mod.functions, T in (LLVM.UnreachableInst, LLVM.RetInst)
+
+        # skip function if we only have one exit point
+        terms = [bb.terminator for bb in f.blocks if bb.terminator isa T]
+        length(terms) <= 1 && continue
+
+        # build exit block minding resource deallocation.
+        LLVM.@dispose builder=LLVM.IRBuilder() begin
+
+            # begin block-building
+            exit = LLVM.BasicBlock(f,
+                T === LLVM.RetInst ?
+                    "UnifiedReturnBlock" :
+                    "UnifiedUnreachableBlock",
+            )
+
+            LLVM.position!(builder, insertion_point(exit))
+
+            # get type info for non-null return types
+            phi = T === LLVM.RetInst && !isempty(first(terms).operands) ?
+                LLVM.phi!(builder, first(terms).operands[1].value_type, "UnifiedRetVal") :
+                nothing
+
+            # emit typed/untyped return, or unreachable.
+            if T === LLVM.UnreachableInst
+                LLVM.unreachable!(builder)
+            else
+                isnothing(phi) ?
+                    LLVM.ret!(builder) :
+                    LLVM.ret!(builder, phi)
+            end
+
+            # replace early returns with branches to return point.
+            for term in terms
+                isnothing(phi) || push!(phi.incoming,
+                    (term.operands[1], term.parent),
+                )
+                LLVM.position!(builder, insertion_point(term))
+                LLVM.br!(builder, exit)
+                LLVM.erase!(term)
+            end
+        end
+    end
+    return nothing
 end
 
 function run_structurize_cfg_pipeline!(mod::LLVM.Module)
