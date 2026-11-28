@@ -1404,11 +1404,15 @@ function run_llvm_passes!(mod::LLVM.Module, entry_fn::LLVM.Function;
     propagate_psb_alignment!(mod, dl)
     checkpoint("workgroup_align+propagate_psb_alignment!")
 
+    # Late LLVM optimizations may combine typed shared-memory copies again.
+    decompose_workgroup_typepun_copies!(mod, dl)
+
     # ── Every float-to-half narrowing, in integers ──
     # NVIDIA drops the rounding of a narrowed value used in registers and RADV
     # fuses a multiply into the conversion, whatever the SPIR-V says (see the
     # pass). Last, so no InstCombine runs after it; it adds no blocks.
     narrow_in_integers!(mod)
+    lower_fpclasses!(mod)
     # A divisor that became a constant after the first `lower_wide_divisions!`
     # (inlining, InstCombine, unrolling): straight-line, so safe after the CFG is
     # structurized.
@@ -2933,6 +2937,61 @@ function lower_unsupported_intrinsics!(mod::LLVM.Module)
     end
 end
 
+# LLVM's fpclass test inspects the representation, including signed zero,
+# subnormals under FTZ, and the quiet bit of a NaN. Integer tests preserve all
+# three. In unsigned IEEE bit order each class occupies a contiguous interval.
+function lower_fpclasses!(mod::LLVM.Module)
+    calls = LLVM.CallInst[use.user for fn in mod.functions if startswith(fn.name, "llvm.is.fpclass.")
+                          for use in fn.uses if use.user isa LLVM.CallInst]
+    for inst in calls
+
+        value, mask = inst.operands[1], convert(Int, inst.operands[2])
+        ty = value.value_type
+        scalar = ty isa LLVM.VectorType ? LLVM.element_type(ty) : ty
+        float_type = scalar isa LLVM.HalfType ? Float16 :
+                     scalar isa LLVM.FloatType ? Float32 :
+                     scalar isa LLVM.DoubleType ? Float64 : nothing
+        float_type === nothing && error("Unsupported llvm.is.fpclass operand type: $ty")
+        uint_type = Base.uinttype(float_type)
+        width = 8 * sizeof(float_type)
+        sign = UInt64(1) << (width - 1)
+        normal = UInt64(reinterpret(uint_type, floatmin(float_type)))
+        inf = UInt64(reinterpret(uint_type, float_type(Inf)))
+        quiet = inf + (normal >> 1)
+        limits = (UInt64(0), UInt64(1), normal, inf, inf + 1, quiet, sign)
+        positive = (6, 7, 8, 9, 0, 1)
+        negative = (5, 4, 3, 2, 0, 1)
+        intervals = Tuple{UInt64,UInt64}[]
+        for (offset, classes) in ((UInt64(0), positive), (sign, negative))
+            for (i, class) in enumerate(classes)
+                iszero(mask & (1 << class)) && continue
+                lo, hi = offset + limits[i], offset + (limits[i + 1] - 1)
+                if !isempty(intervals) && last(intervals)[2] + 1 == lo
+                    intervals[end] = (last(intervals)[1], hi)
+                else
+                    push!(intervals, (lo, hi))
+                end
+            end
+        end
+
+        int_scalar = LLVM.IntType(width)
+        int_ty = ty isa LLVM.VectorType ? LLVM.VectorType(int_scalar, lanes(ty)) : int_scalar
+        LLVM.@dispose builder=LLVM.IRBuilder() begin
+            LLVM.position!(builder, LLVM.before(inst))
+            bits = LLVM.bitcast!(builder, value, int_ty)
+            result = intconst(inst.value_type, UInt64(0))
+            for (lo, hi) in intervals
+                shifted = iszero(lo) ? bits : LLVM.sub!(builder, bits, intconst(int_ty, lo))
+                matches = LLVM.icmp!(builder, LLVM.API.LLVMIntULE, shifted, intconst(int_ty, hi - lo))
+                result = LLVM.or!(builder, result, matches)
+            end
+            LLVM.replace_uses!(inst, result)
+        end
+        LLVM.erase!(inst)
+    end
+    return nothing
+end
+
 """
 Lower a single memcpy call to a typed load + store.
 If the destination is an alloca AND the copy covers the whole of it, use the
@@ -2994,7 +3053,8 @@ function lower_memcpy!(inst::LLVM.CallInst, dl::LLVM.DataLayout; overlapping::Bo
        (dst.value_type.addrspace == 3 || src.value_type.addrspace == 3)
         nbytes = convert(Int, len_val)
         for p in (dst, src)
-            copy_type = leading_type(addressed_type(p), nbytes, dl)
+            pointee = p.value_type.addrspace == 3 ? workgroup_copy_pointee(p, dl) : addressed_type(p)
+            copy_type = leading_type(pointee, nbytes, dl)
             copy_type === nothing || break
         end
     end

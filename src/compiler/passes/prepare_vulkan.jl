@@ -788,22 +788,6 @@ function unwrap_to_struct(ty::LLVM.LLVMType)
     return current isa LLVM.StructType ? current : nothing
 end
 
-# Find struct fields fully contained in a byte range [start_byte, end_byte).
-function fields_in_byte_range(struct_ty::LLVM.StructType, dl::LLVM.DataLayout,
-                                start_byte::Int, end_byte::Int)
-    fields = Tuple{Int, LLVM.LLVMType, Int}[]  # (0-based index, type, byte offset)
-    n = Int(LLVM.API.LLVMCountStructElementTypes(struct_ty))
-    for i in 0:(n - 1)
-        field_offset = Int(LLVM.API.LLVMOffsetOfElement(dl, struct_ty, i))
-        field_ty = LLVM.LLVMType(LLVM.API.LLVMStructGetTypeAtIndex(struct_ty, i))
-        field_size = Int(LLVM.storage_size(dl, field_ty))
-        if field_offset >= start_byte && (field_offset + field_size) <= end_byte
-            push!(fields, (i, field_ty, field_offset))
-        end
-    end
-    return fields
-end
-
 """
     lift_byte_geps_on_globals!(mod::LLVM.Module, dl::LLVM.DataLayout)
 
@@ -934,6 +918,27 @@ function lift_global_byte_gep(cexpr::LLVM.ConstantExpr, dl::LLVM.DataLayout,
     end
 end
 
+function workgroup_copy_pointee(ptr::LLVM.Value, dl::LLVM.DataLayout)
+    if ptr isa LLVM.GetElementPtrInst && length(ptr.operands) == 2
+        source = LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(ptr))
+        base = workgroup_copy_pointee(ptr.operands[1], dl)
+        if base isa LLVM.ArrayType
+            stride = Int(LLVM.abi_size(dl, base.element_type))
+            # LLVM may replace a typed element GEP with either byte offsets or
+            # a step through byte arrays of the same size as the element.
+            if source isa LLVM.ArrayType && source.element_type == LLVM.Int8Type() && source.length == stride
+                return base.element_type
+            elseif source == LLVM.Int8Type() && stride > 0 && divisible(ptr.operands[2], stride)
+                return base.element_type
+            end
+        elseif base isa LLVM.StructType && source == LLVM.Int8Type()
+            stride = Int(LLVM.abi_size(dl, base))
+            stride > 0 && divisible(ptr.operands[2], stride) && return base
+        end
+    end
+    return resolve_wg_ptr_type(ptr)
+end
+
 """
     decompose_workgroup_typepun_copies!(mod::LLVM.Module, dl::LLVM.DataLayout)
 
@@ -947,9 +952,6 @@ This pass detects such workgroup-to-workgroup typepun copy pairs and replaces
 them with per-field typed copies.
 """
 function decompose_workgroup_typepun_copies!(mod::LLVM.Module, dl::LLVM.DataLayout)
-    T_i8 = LLVM.Int8Type()
-    T_i64 = LLVM.Int64Type()
-
     for f in mod.functions
         isempty(f.blocks) && continue
 
@@ -957,7 +959,7 @@ function decompose_workgroup_typepun_copies!(mod::LLVM.Module, dl::LLVM.DataLayo
 
         for bb in f.blocks
             for inst in bb.instructions
-                inst isa LLVM.LoadInst || continue
+                inst isa LLVM.LoadInst && !LLVM.volatile(inst) && !LLVM.isatomic(inst) || continue
                 load_ty = inst.value_type
                 load_ty isa LLVM.IntegerType || continue
 
@@ -967,26 +969,22 @@ function decompose_workgroup_typepun_copies!(mod::LLVM.Module, dl::LLVM.DataLayo
                 ptr_ty.addrspace == 3 || continue
 
                 # Resolve what the pointer actually points to
-                pointed_ty = resolve_wg_ptr_type(ptr)
+                pointed_ty = workgroup_copy_pointee(ptr, dl)
                 pointed_ty === nothing && continue
 
                 # Get the struct type (unwrap arrays)
                 struct_ty = unwrap_to_struct(pointed_ty)
                 struct_ty === nothing && continue
 
-                # Check it's actually a typepun (loaded type != pointed type)
-                load_ty == struct_ty && continue
-
                 load_size = div(load_ty.width, 8)
-                fields = fields_in_byte_range(struct_ty, dl, 0, load_size)
-                isempty(fields) && continue
+                0 < load_size <= LLVM.abi_size(dl, struct_ty) || continue
 
                 # Find all store uses in addrspace(3)
                 wg_stores = LLVM.StoreInst[]
                 all_uses_are_wg_stores = true
                 for use in inst.uses
                     user = use.user
-                    if user isa LLVM.StoreInst && user.operands[1] == inst
+                    if user isa LLVM.StoreInst && user.operands[1] == inst && !LLVM.volatile(user) && !LLVM.isatomic(user)
                         store_ptr = user.operands[2]
                         store_ptr_ty = store_ptr.value_type
                         if store_ptr_ty isa LLVM.PointerType && store_ptr_ty.addrspace == 3
@@ -1003,36 +1001,34 @@ function decompose_workgroup_typepun_copies!(mod::LLVM.Module, dl::LLVM.DataLayo
                 all_uses_are_wg_stores || continue
                 isempty(wg_stores) && continue
 
-                # Replace each load+store pair with per-field copies
-                # We need the base pointer that points to the ARRAY (before element indexing).
-                # For ConstantExpr GEPs like `gep [64 x {i8,i64}], ptr @shared, 0, <idx>`,
-                # `ptr` points to the element (struct). We need to generate typed GEPs
-                # using the struct type so the emitter sees proper struct member access.
-                T_i32 = LLVM.Int32Type()
+                all(store -> workgroup_copy_pointee(store.operands[2], dl) == pointed_ty, wg_stores) || continue
+                fields = flatten_type_with_offsets(struct_ty; dl)
+                splits_field = any(fields) do (_, ty, offset)
+                    offset < load_size < offset + Int(LLVM.storage_size(dl, ty))
+                end
+                splits_field && continue
+                filter!(field -> field[3] < load_size, fields)
+                isempty(fields) && continue
 
-                for store in wg_stores
-                    dst_ptr = store.operands[2]
-
-                    LLVM.@dispose builder=LLVM.IRBuilder() begin
-                        LLVM.position!(builder, insertion_point(store))
-
-                        for (field_idx, field_ty, field_offset) in fields
-                            # Source: typed struct-member GEP into the struct
-                            src_field_ptr = LLVM.gep!(builder, struct_ty, ptr,
-                                [LLVM.ConstantInt(T_i32, 0), LLVM.ConstantInt(T_i32, field_idx)],
-                                "wg_copy_src")
-                            src_val = LLVM.load!(builder, field_ty, src_field_ptr, "wg_copy_val")
-                            src_val.alignment = max(1, llvm_type_size(field_ty))
-
-                            # Destination: typed struct-member GEP into the struct
-                            dst_field_ptr = LLVM.gep!(builder, struct_ty, dst_ptr,
-                                [LLVM.ConstantInt(T_i32, 0), LLVM.ConstantInt(T_i32, field_idx)],
-                                "wg_copy_dst")
-                            st = LLVM.store!(builder, src_val, dst_field_ptr)
-                            st.alignment = max(1, llvm_type_size(field_ty))
-                        end
+                LLVM.@dispose builder=LLVM.IRBuilder() begin
+                    LLVM.position!(builder, insertion_point(inst))
+                    field_copies = map(fields) do (path, field_ty, offset)
+                        indices = LLVM.Value[LLVM.ConstantInt(LLVM.Int32Type(), 0)]
+                        append!(indices, (LLVM.ConstantInt(LLVM.Int32Type(), i) for i in path))
+                        src = LLVM.gep!(builder, struct_ty, ptr, indices, "wg_copy_src")
+                        value = LLVM.load!(builder, field_ty, src, "wg_copy_val")
+                        value.alignment = max(1, gcd(inst.alignment, offset))
+                        return indices, value, offset
                     end
-                    push!(to_erase, store)
+                    for store in wg_stores
+                        LLVM.position!(builder, insertion_point(store))
+                        for (indices, value, offset) in field_copies
+                            dst = LLVM.gep!(builder, struct_ty, store.operands[2], indices, "wg_copy_dst")
+                            st = LLVM.store!(builder, value, dst)
+                            st.alignment = max(1, gcd(store.alignment, offset))
+                        end
+                        push!(to_erase, store)
+                    end
                 end
                 push!(to_erase, inst)  # erase the original load
             end

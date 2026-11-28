@@ -3517,23 +3517,28 @@ function function_ptr_offset_error(inst::LLVM.Instruction, what::AbstractString)
           "Logical pointers have no arithmetic; the step must fold into an array index.")
 end
 
-# LLVM can index a typed workgroup element through a same-size byte array.
+# LLVM can index a typed logical-storage element through a same-size byte array.
 # Keep the actual element type and translate a constant byte index to its member.
-function workgroup_gep_source(state, source_ty::LLVM.ArrayType, ops)
+function logical_byte_array_gep_source(state, source_ty::LLVM.ArrayType, ops)
     source_ty.element_type == LLVM.Int8Type() || return source_ty, ops
-    origin = get(state.array_element_origin, ops[1], nothing)
-    origin === nothing && return source_ty, ops
-    element = origin[4].element_type
+    base = ops[1]
+    origin = get(state.array_element_origin, base, nothing)
+    array = origin === nothing ? get_pointee_type(state.type_ctx.ptm, base) : origin[4]
+    array isa LLVM.ArrayType || return source_ty, ops
+    element = array.element_type
     dl = state.data_layout
     LLVM.abi_size(dl, element) == source_ty.length || return source_ty, ops
-    length(ops) == 2 && return element, ops
+    length(ops) == 2 && return origin === nothing ? (source_ty, ops) : (element, ops)
     length(ops) == 3 || return source_ty, ops
     ops[3] isa LLVM.ConstantInt || return source_ty, ops
     offset = convert(Int, ops[3])
     0 <= offset < source_ty.length || return source_ty, ops
     indices, leaf = member_path_at_offset(element, offset, dl)
     (indices === nothing || leaf isa LLVM.PointerType) && return source_ty, ops
-    return element, LLVM.Value[ops[1], ops[2], (LLVM.ConstantInt(LLVM.Int32Type(), i) for i in indices)...]
+    path = LLVM.Value[base, ops[2], (LLVM.ConstantInt(LLVM.Int32Type(), i) for i in indices)...]
+    origin !== nothing && return element, path
+    insert!(path, 2, LLVM.ConstantInt(LLVM.Int32Type(), 0))
+    return array, path
 end
 
 function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
@@ -3580,8 +3585,8 @@ function emit_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPtrInst)
 
     # GEP results inherit the base pointer's storage class.
     sc = get_pointer_storage_class(base_ptr)
-    if sc == SC.Workgroup && source_ty isa LLVM.ArrayType
-        source_ty, ops = workgroup_gep_source(state, source_ty, ops)
+    if sc in (SC.Workgroup, SC.Private) && source_ty isa LLVM.ArrayType
+        source_ty, ops = logical_byte_array_gep_source(state, source_ty, ops)
         n_indices = length(ops) - 1
     end
     result_pointee = compute_gep_result_type_from_ops(source_ty, ops)
@@ -4293,7 +4298,7 @@ end
 
 # Split a workgroup address into a typed element index and a fixed field.
 # LLVM may spell addition as OR when it can prove the operands are disjoint.
-function emit_workgroup_member_gep!(state, inst, base_id, offset, element, stride)
+function emit_workgroup_member_gep!(state, inst, base_id, offset, element, stride; origin=nothing)
     (offset isa LLVM.AddInst || disjointor(offset)) || return false
     a, b = offset.operands
     a isa LLVM.ConstantInt && ((a, b) = (b, a))
@@ -4321,10 +4326,18 @@ function emit_workgroup_member_gep!(state, inst, base_id, offset, element, strid
         encode_instruction!(state.mod.functions, Op.OpUConvert, u32_type, result, index)
         index = result
     end
+    prefix = UInt32[]
+    if origin !== nothing
+        base_id, prefix, previous, _ = origin
+        combined = fresh_id!(state.mod)
+        u32_type = map_type!(state.type_ctx, LLVM.Int32Type())
+        encode_instruction!(state.mod.functions, Op.OpIAdd, u32_type, combined, previous, index)
+        index = combined
+    end
     pointer_type = map_pointer_type!(state.type_ctx, map_workgroup_type!(state.type_ctx, leaf), SC.Workgroup)
     result = fresh_id!(state.mod)
     fields = map(i -> emit_constant_u32!(state.mod, UInt32(i)), path)
-    encode_instruction!(state.mod.functions, Op.OpAccessChain, pointer_type, result, base_id, index, fields...)
+    encode_instruction!(state.mod.functions, Op.OpAccessChain, pointer_type, result, base_id, prefix..., index, fields...)
     state.value_map[inst] = result
     set_pointee_type!(state.type_ctx.ptm, inst, leaf; priority=5)
     return true
@@ -4427,6 +4440,37 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                         set_pointee_type!(state.type_ctx.ptm, inst, leaf_ty; priority=4)
                         return
                     end
+                end
+            end
+        end
+
+        # A byte index into a nested private array can select a scalar inside
+        # an element, as when reading from an LLVM sret box. Dividing by the
+        # outer stride alone would lose the scalar index.
+        if sc in (SC.Function, SC.Private) && elem_ty isa LLVM.ArrayType &&
+           elem_size > 0 && !divisible(byte_offset_val, elem_size)
+            leaf_ty = elem_ty.element_type
+            while leaf_ty isa LLVM.ArrayType
+                leaf_ty = leaf_ty.element_type
+            end
+            access_ty = infer_type_from_gep_users(inst)
+            if access_ty !== nothing && !(access_ty isa LLVM.PointerType) &&
+               !(leaf_ty isa Union{LLVM.StructType,LLVM.PointerType})
+                leaf_size = compute_type_size(leaf_ty, state.data_layout)
+                if leaf_size > 0 && leaf_size == compute_type_size(access_ty, state.data_layout) &&
+                   divisible(byte_offset_val, leaf_size)
+                    flat_index = fresh_id!(state.mod)
+                    u32_ty = map_type!(state.type_ctx, LLVM.Int32Type())
+                    byte_index = ensure_index_i32!(state, byte_offset_val)
+                    divisor = emit_constant_u32!(state.mod, leaf_size)
+                    encode_instruction!(state.mod.functions, Op.OpUDiv, u32_ty, flat_index, byte_index, divisor)
+                    indices = decompose_flat_index_for_composite!(state, base_pointee, leaf_ty, flat_index)
+                    ptr_ty = map_pointer_type!(state.type_ctx, map_type!(state.type_ctx, leaf_ty), sc)
+                    result = fresh_id!(state.mod)
+                    encode_instruction!(state.mod.functions, Op.OpAccessChain, ptr_ty, result, base_id, indices...)
+                    state.value_map[inst] = result
+                    set_pointee_type!(state.type_ctx.ptm, inst, leaf_ty; priority=5)
+                    return
                 end
             end
         end
@@ -4633,23 +4677,23 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
             # the constant offset may span across multiple array elements.
             # E.g., gep i8, (AccessChain arr[%dyn]), 32 where arr element is 16 bytes
             # → the offset 32 means +2 elements from the dynamic index.
-            if (sc == SC.Function || sc == SC.Private) && haskey(state.array_element_origin, base_ptr)
+            if sc in (SC.Function, SC.Private, SC.Workgroup) && haskey(state.array_element_origin, base_ptr)
                 arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
                 arr_elem_ty = arr_type.element_type
                 arr_elem_size = compute_type_size(arr_elem_ty, state.data_layout)
                 if arr_elem_size > 0
-                    arr_idx_adjust = offset ÷ arr_elem_size
-                    sub_offset = offset % arr_elem_size
+                    arr_idx_adjust, sub_offset = fldmod(offset, arr_elem_size)
 
                     # Adjust the dynamic array index
-                    adj_id = emit_constant_u32!(state.mod, UInt32(arr_idx_adjust))
+                    adj_id = emit_constant_u32!(state.mod, arr_idx_adjust % UInt32)
                     u32_ty = map_type!(state.type_ctx, LLVM.IntType(32))
                     combined_idx = fresh_id!(state.mod)
                     encode_instruction!(state.mod.functions, Op.OpIAdd, u32_ty, combined_idx, prev_idx_id, adj_id)
 
                     if sub_offset == 0
                         # Exact element boundary: result is pointer to array element
-                        arr_elem_spirv = map_type!(state.type_ctx, arr_elem_ty)
+                        arr_elem_spirv = sc == SC.Workgroup ? map_workgroup_type!(state.type_ctx, arr_elem_ty) :
+                            map_type!(state.type_ctx, arr_elem_ty)
                         result_ptr_ty = map_pointer_type!(state.type_ctx, arr_elem_spirv, sc)
                         all_indices = vcat(static_path, [combined_idx])
                         result_id = fresh_id!(state.mod)
@@ -4667,7 +4711,8 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                         # Sub-element offset: access array element then struct field
                         sub_path, sub_leaf = member_path_at_offset(arr_elem_ty, sub_offset, state.data_layout)
                         if sub_path !== nothing
-                            sub_leaf_spirv = map_type!(state.type_ctx, sub_leaf)
+                            sub_leaf_spirv = sc == SC.Workgroup ? map_workgroup_type!(state.type_ctx, sub_leaf) :
+                                map_type!(state.type_ctx, sub_leaf)
                             result_ptr_ty = map_pointer_type!(state.type_ctx, sub_leaf_spirv, sc)
                             all_indices = copy(static_path)
                             push!(all_indices, combined_idx)
@@ -4699,7 +4744,7 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
                 return
             end
         else
-            # Dynamic byte offset on struct (Function/Private SC).
+            # Dynamic byte offset on a struct in logical storage.
 
             # First check: if the base is an array element (from a previous dynamic GEP),
             # the dynamic offset may be advancing to another array element, not accessing
@@ -4708,11 +4753,16 @@ function emit_byte_offset_gep!(state::SPIRVEmitterState, inst::LLVM.GetElementPt
             #   gep2 = gep i8, ptr %gep1, i64 (%b*16)         → arr[%a + %b]
             # Without this check, gep2 would try to access a field within struct_28 at
             # offset %b*16, which is wrong when %b selects another array element.
-            if (sc == SC.Function || sc == SC.Private) && haskey(state.array_element_origin, base_ptr)
-                arr_base_id, static_path, prev_idx_id, arr_type = state.array_element_origin[base_ptr]
+            if sc in (SC.Function, SC.Private, SC.Workgroup) && haskey(state.array_element_origin, base_ptr)
+                origin = state.array_element_origin[base_ptr]
+                arr_base_id, static_path, prev_idx_id, arr_type = origin
                 arr_elem_ty = arr_type.element_type
                 arr_elem_size = compute_type_size(arr_elem_ty, state.data_layout)
-                if arr_elem_size > 0
+                if sc == SC.Workgroup && arr_elem_size > 0 &&
+                   emit_workgroup_member_gep!(state, inst, base_id, ops[2], arr_elem_ty, arr_elem_size; origin)
+                    return
+                end
+                if arr_elem_size > 0 && (sc != SC.Workgroup || divisible(ops[2], arr_elem_size))
                     # Compute the dynamic additional index: byte_offset / elem_size
                     sz_id = emit_int_constant!(state, idx_ty, Int64(arr_elem_size))
                     dyn_idx_id = fresh_id!(state.mod)
@@ -6979,8 +7029,8 @@ function resolve_deferred_phis!(state::SPIRVEmitterState)
     for (result_id, type_id, incoming, block_label_id) in state.deferred_phis
         operands = UInt32[]
         for (val, bb) in incoming
-            val_id = if val isa LLVM.UndefValue && val.value_type isa LLVM.PointerType
-                # UndefValue with opaque pointer type — can't map via map_type!.
+            val_id = if val isa Union{LLVM.UndefValue,LLVM.PoisonValue} && val.value_type isa LLVM.PointerType
+                # Undefined opaque pointer — it needs the phi's declared type.
                 # Emitting OpUndef here lets RADV yield a different bit pattern per
                 # consumption, which breaks StructurizeCFG-inserted guard phis: the
                 # guard bool becomes non-deterministic and the branch enters the
@@ -9022,6 +9072,11 @@ function emit_constant_expr!(state::SPIRVEmitterState, val::LLVM.ConstantExpr)
         # Do NOT cache: state.value_map[val] = result_id
         # ConstantExpr GEPs are reused across blocks; caching would cause
         # domination errors. Each use gets a fresh AccessChain.
+        if sc in (SC.Workgroup, SC.Private, SC.Function) && first_idx == 0 &&
+           source_ty isa LLVM.ArrayType && length(index_ids) == 1 &&
+           get_pointee_type(state.type_ctx.ptm, base) == source_ty
+            state.array_element_origin[val] = (base_id, UInt32[], only(index_ids), source_ty)
+        end
         # Update PTM for downstream resolution
         set_pointee_type!(state.type_ctx.ptm, val, result_pointee; priority=4)
         return result_id
