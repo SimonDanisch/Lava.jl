@@ -2677,7 +2677,11 @@ function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
     # validations of a valid kernel failed with a second process rewriting the
     # path. The other direction is silent: an invalid kernel validated as the
     # valid one next door.
-    val_path = tempname() * ".spv"
+    spv_path = lava_debug_path("lava_last.spv")
+    # Keep the validated file on the dump's filesystem so publishing it needs
+    # only a rename. Force-moving across filesystems can remove the shared
+    # destination while another compiler thread is publishing its shader.
+    val_path = tempname(dirname(spv_path)) * ".spv"
     write(val_path, spirv_bytes)
     record_subprocess!("write spirv for spirv-val", 0.0, length(spirv_bytes))
 
@@ -2689,16 +2693,15 @@ function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
                           stderr=val_err_file, stdout=devnull); label="spirv-val")
     # Kept afterwards as the "last compiled kernel" dump the other compile paths
     # write too — moved there, never read back from there.
-    spv_path = lava_debug_path("lava_last.spv")
     if !process_exited(p)
         rm(val_err_file; force=true)
-        mv(val_path, spv_path; force = true)
+        Base.Filesystem.rename(val_path, spv_path)
         return nothing
     end
     val_errors = isfile(val_err_file) ? read(val_err_file, String) : ""
     rm(val_err_file; force=true)
     if p.exitcode == 0
-        mv(val_path, spv_path; force = true)
+        Base.Filesystem.rename(val_path, spv_path)
         return nothing
     end
 
@@ -2721,7 +2724,7 @@ function validate_spirv(spirv_bytes::Vector{UInt8}, llvm_ir::String="",
     end
     # The binary that FAILED, where the message says to look. Another process
     # may overwrite it later; the message is built from this call's own copy.
-    mv(val_path, spv_path; force = true)
+    Base.Filesystem.rename(val_path, spv_path)
     dis_path = lava_debug_path("lava_last.dis")
     ll_path = lava_debug_path("lava_last.ll")
     isempty(dis) || write(dis_path, dis)
