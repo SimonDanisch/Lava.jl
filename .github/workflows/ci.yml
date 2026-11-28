@@ -22,13 +22,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ['1.12', '1']
+        version: ['1.12', '1.13', '1.14']
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
         with:
-          version: ${{ matrix.version }}
+          # Include tagged Julia 1.14 prereleases until the stable release.
+          version: ${{ matrix.version == '1.14' && '~1.14.0-0' || matrix.version }}
       - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
