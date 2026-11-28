@@ -4,6 +4,13 @@
 #
 # Based on CUDA.jl and AMDGPU.jl quirks patterns.
 
+# Keyword dispatch subtracts the accepted names from the supplied names.
+# Filter the tuple directly, including the long-tuple case where `filter`
+# would allocate an array. The names are usually compile-time constants.
+@lava_device_override @inline function Base.diff_names(a::Tuple{Vararg{Symbol}}, b::Tuple{Vararg{Symbol}})
+    return Base.filter_rec(name -> !Base.sym_in(name, b), a)
+end
+
 # ── Exception throwing overrides ──
 # These all become no-ops or traps on GPU to avoid generating
 # dynamic function calls that GPUCompiler rejects.
