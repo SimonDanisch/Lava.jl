@@ -441,6 +441,59 @@ function header_loop_control(term::LLVM.Instruction)
             for w in (md[LOOP_CONTROL_MD]::LLVM.MDNode).operands]
 end
 
+# LLVM 23 removed UnifyFunctionExitNodes. Keep the single-return and
+# single-unreachable exit blocks expected by the structured CFG passes.
+function unify_function_exit_nodes!(mod::LLVM.Module)
+    if LLVM.version() < v"23"
+        LLVM.run!(LLVM.UnifyFunctionExitNodesPass(), mod)
+        return nothing
+    end
+
+    LLVM.IRBuilder() do builder
+        for f in LLVM.functions(mod)
+            returns = LLVM.RetInst[]
+            unreachables = LLVM.UnreachableInst[]
+            for bb in LLVM.blocks(f)
+                term = LLVM.terminator(bb)
+                term isa LLVM.RetInst && push!(returns, term)
+                term isa LLVM.UnreachableInst && push!(unreachables, term)
+            end
+
+            if length(unreachables) > 1
+                exit = LLVM.BasicBlock(f, "UnifiedUnreachableBlock")
+                LLVM.position!(builder, LLVM.insertion_point(exit))
+                LLVM.unreachable!(builder)
+                for term in unreachables
+                    LLVM.position!(builder, LLVM.insertion_point(term))
+                    LLVM.br!(builder, exit)
+                    LLVM.erase!(term)
+                end
+            end
+
+            if length(returns) > 1
+                exit = LLVM.BasicBlock(f, "UnifiedReturnBlock")
+                LLVM.position!(builder, LLVM.insertion_point(exit))
+                ops = first(returns).operands
+                if isempty(ops)
+                    LLVM.ret!(builder)
+                else
+                    phi = LLVM.phi!(builder, ops[1].value_type)
+                    for ret in returns
+                        push!(phi.incoming, (ret.operands[1], ret.parent))
+                    end
+                    LLVM.ret!(builder, phi)
+                end
+                for ret in returns
+                    LLVM.position!(builder, LLVM.insertion_point(ret))
+                    LLVM.br!(builder, exit)
+                    LLVM.erase!(ret)
+                end
+            end
+        end
+    end
+    return nothing
+end
+
 """
     run_structurize_cfg_pipeline!(mod::LLVM.Module)
 
@@ -491,7 +544,7 @@ function run_structurize_cfg_pipeline!(mod::LLVM.Module)
     run_or_skip("SimplifyCFG",            () -> LLVM.run!(LLVM.SimplifyCFGPass(), mod))
     run_or_skip("fixup_structured_cfg",   () -> fixup_structured_cfg!(mod))
     run_or_skip("LowerSwitch",            () -> LLVM.run!(LLVM.LowerSwitchPass(), mod))
-    run_or_skip("UnifyFunctionExitNodes", () -> LLVM.run!(LLVM.UnifyFunctionExitNodesPass(), mod))
+    run_or_skip("UnifyFunctionExitNodes", () -> unify_function_exit_nodes!(mod))
     run_or_skip("FixIrreducible",         () -> LLVM.run!(LLVM.FixIrreduciblePass(), mod))
     run_or_skip("LoopSimplify",           () -> LLVM.run!(LLVM.LoopSimplifyPass(), mod))
     # Last thing before StructurizeCFG, which drops every `!llvm.loop` it touches.

@@ -786,7 +786,7 @@ function combine_chained_geps!(mod::LLVM.Module)
 
                     base = ops[1]
                     if base isa LLVM.ConstantExpr
-                        fold_constant_base_gep!(inst, base) && (changed = true)
+                        fold_constant_base_gep!(inst, base, dl) && (changed = true)
                         continue
                     end
                     base isa LLVM.GetElementPtrInst || continue
@@ -857,7 +857,7 @@ function combine_chained_geps!(mod::LLVM.Module)
 end
 
 """
-    fold_constant_base_gep!(gep, base) -> Bool
+    fold_constant_base_gep!(gep, base, dl) -> Bool
 
 `gep T, (gep [N x T], @g, c0, c1), %x`  →  `gep [N x T], @g, 0, (c0*N + c1) + %x`.
 
@@ -870,17 +870,30 @@ do not: AcceleratedKernels' block scan, whose tile and totals are neighbouring
 members of one workgroup block, read `_Lane`s with the flag byte in the value.
 One index into the array, in bounds at run time, reads the same everywhere.
 """
-function fold_constant_base_gep!(gep::LLVM.GetElementPtrInst, base::LLVM.ConstantExpr)
+function fold_constant_base_gep!(gep::LLVM.GetElementPtrInst, base::LLVM.ConstantExpr,
+                                 dl::LLVM.DataLayout)
     base.opcode == LLVM.API.LLVMGetElementPtr || return false
     ops = base.operands
-    length(ops) == 3 || return false
     arr_ty = base.source_element_type
-    arr_ty isa LLVM.ArrayType || return false
+    if length(ops) == 3 && arr_ty isa LLVM.ArrayType
+        c0, c1 = ops[2], ops[3]
+        (c0 isa LLVM.ConstantInt && c1 isa LLVM.ConstantInt) || return false
+        k = convert(Int, c0) * arr_ty.length + convert(Int, c1)
+    elseif length(ops) == 2 && arr_ty == LLVM.IntType(8) && ops[1] isa LLVM.GlobalVariable
+        # Newer LLVM represents the same address as an offset in bytes.
+        arr_ty = LLVM.global_value_type(ops[1])
+        arr_ty isa LLVM.ArrayType || return false
+        offset = ops[2]
+        offset isa LLVM.ConstantInt || return false
+        stride = Int(LLVM.abi_size(dl, arr_ty.element_type))
+        iszero(stride) && return false
+        k, rest = divrem(convert(Int, offset), stride)
+        iszero(rest) || return false
+    else
+        return false
+    end
     arr_ty.element_type == LLVM.LLVMType(LLVM.API.LLVMGetGEPSourceElementType(gep)) || return false
-    c0, c1 = ops[2], ops[3]
-    (c0 isa LLVM.ConstantInt && c1 isa LLVM.ConstantInt) || return false
     x = gep.operands[2]
-    k = convert(Int, c0) * arr_ty.length + convert(Int, c1)
     LLVM.@dispose builder=LLVM.IRBuilder() begin
         LLVM.position!(builder, insertion_point(gep))
         idx = LLVM.add!(builder, x, LLVM.ConstantInt(x.value_type, k, true), "gep_global_idx")
